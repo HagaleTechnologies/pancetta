@@ -256,19 +256,18 @@ pub(crate) fn strip_width_for(inner_width: usize) -> usize {
 ///
 /// `pub(crate)` so `App::apply_placement` (Task 14) can look up the parked
 /// frequency's bin code using the SAME column/bin math the panel itself
-/// renders with, rather than re-deriving it.
+/// renders with, rather than re-deriving it. Thin wrapper over
+/// `pancetta_core::freq_bin::bin_index_for_freq` — the coordinator's
+/// `parked_bin_coverage` (`pancetta/src/coordinator/autonomous.rs`) calls
+/// the same shared function, so the two sides can no longer disagree at
+/// the range's top edge (issue #97 item 3).
 pub(crate) fn bin_index_for_freq(
     freq_hz: f64,
     range: (f64, f64),
     bin_hz: f64,
     n_bins: usize,
 ) -> Option<usize> {
-    let (lo, hi) = range;
-    if n_bins == 0 || bin_hz <= 0.0 || freq_hz < lo || freq_hz > hi {
-        return None;
-    }
-    let idx = ((freq_hz - lo) / bin_hz).floor().max(0.0) as usize;
-    Some(idx.min(n_bins - 1))
+    pancetta_core::freq_bin::bin_index_for_freq(freq_hz, range, bin_hz, n_bins)
 }
 
 /// Map a frequency (Hz) to a screen column, mirroring

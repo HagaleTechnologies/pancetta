@@ -27,6 +27,13 @@ use qso_status::render_qso_status;
 use station_card::render_station_card;
 use tx_placement::{render_placement_zoom, render_tx_placement};
 
+/// Minimum terminal size `draw()` will lay out panels for; below this it
+/// shows a "resize the window" prompt instead. `hit_test` checks the same
+/// floor so a click on that degraded screen (no panels actually visible)
+/// never resolves to a phantom panel rect.
+const MIN_TERMINAL_WIDTH: u16 = 80;
+const MIN_TERMINAL_HEIGHT: u16 = 20;
+
 // Task 18: `ActivePanel::StationInfo` was removed and `render_station_info`
 // is no longer called from any layout function — the station card
 // (`render_station_card`, above) took its slot in `layout_operate` (and was
@@ -53,9 +60,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     // unreadable empty boxes (and panels silently drop content); show an
     // explicit resize prompt instead so a new operator isn't staring at a
     // broken-looking screen wondering what's wrong.
-    const MIN_W: u16 = 80;
-    const MIN_H: u16 = 20;
-    if size.width < MIN_W || size.height < MIN_H {
+    if size.width < MIN_TERMINAL_WIDTH || size.height < MIN_TERMINAL_HEIGHT {
         let msg = vec![
             Line::from(Span::styled(
                 "Terminal too small",
@@ -65,7 +70,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
             )),
             Line::from(format!(
                 "Have {}x{}, need at least {}x{}.",
-                size.width, size.height, MIN_W, MIN_H
+                size.width, size.height, MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT
             )),
             Line::from("Resize the window (or your SSH/terminal) and the UI returns."),
         ];
@@ -286,25 +291,6 @@ fn layout_operate(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()
     render_dx_hunter(f, r.dx_hunter, app)?;
     render_callers(f, r.callers, app)?;
 
-    // Render active panel highlight. The slice order MUST match the
-    // ActivePanel enum order used by render_active_panel_highlight:
-    // BandActivity, QsoStatus, Callers, DxHunter, TxPlacement. The
-    // full-width banner is not a navigable panel, and neither is the
-    // station card (Task 18) — it has no `ActivePanel` variant, so it's
-    // deliberately absent from this slice (unlike Station Info before it,
-    // which WAS highlightable).
-    render_active_panel_highlight(
-        f,
-        app,
-        &[
-            r.band_activity, // BandActivity
-            r.qso_status,    // QsoStatus
-            r.callers,       // Callers
-            r.dx_hunter,     // DxHunter
-            r.tx_placement,  // TxPlacement
-        ],
-    );
-
     Ok(())
 }
 
@@ -337,12 +323,6 @@ fn compute_monitor_rects(content_area: Rect) -> MonitorRects {
 /// panels (QSO Status / station card / DX Hunter / Callers). Meant for a
 /// glance-and-walk-away big-picture view.
 ///
-/// No `render_active_panel_highlight` call here: Band Activity is the only
-/// navigable panel in this view, and `render_band_activity`'s own
-/// `create_panel_block` already draws an active-styled border when it's the
-/// active panel, so the highlight overlay would be redundant (and — see
-/// `render_active_panel_highlight` — would blank the panel's title, since it
-/// draws a titleless border directly on top).
 fn layout_monitor(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
     let r = compute_monitor_rects(content_area);
 
@@ -430,11 +410,6 @@ fn compute_hunt_rects(content_area: Rect) -> HuntRects {
 /// Activity/QSO Status for a card that would barely fit; a taller terminal
 /// gets the extra 5-row block (3 content lines + 2 border, matching
 /// `render_station_card`'s Operate-view sizing).
-///
-/// No `render_active_panel_highlight` call, same rationale as
-/// `layout_monitor`: each panel renderer draws its own active-styled border
-/// via `create_panel_block` (and the station card is never the active panel
-/// anyway — it has no `ActivePanel` variant).
 fn layout_hunt(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
     let r = compute_hunt_rects(content_area);
 
@@ -489,10 +464,6 @@ fn compute_run_rects(content_area: Rect) -> RunRects {
 /// `layout_hunt`'s doc comment); Callers (the dominant table) keeps its 50%
 /// share, and QSO Status's `Min(5)` absorbs the new fixed-height row same as
 /// it already absorbed the pre-existing remainder.
-///
-/// No `render_active_panel_highlight` call, same rationale as
-/// `layout_monitor`: each panel renderer draws its own active-styled border
-/// via `create_panel_block`.
 fn layout_run(f: &mut Frame<'_>, content_area: Rect, app: &App) -> Result<()> {
     let r = compute_run_rects(content_area);
 
@@ -602,6 +573,17 @@ pub fn hit_test(
     x: u16,
     y: u16,
 ) -> Option<(ActivePanel, u16)> {
+    // `area` here is the CONTENT area (title bar/TX strip/status bar already
+    // stripped off, see `content_area`), which is always a few rows shorter
+    // than the full terminal `draw()`'s resize guard checks against — so the
+    // floor below is the content area's size at the exact MIN_TERMINAL_*
+    // boundary, not those constants themselves (comparing directly against
+    // them would reject clicks on plenty of valid, non-degraded terminals
+    // right at the floor).
+    let min_content = content_area(Rect::new(0, 0, MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT));
+    if area.width < min_content.width || area.height < min_content.height {
+        return None;
+    }
     for (panel, rect) in view_rects(view, zoomed, active_panel, area) {
         if x < rect.x || x >= rect.x + rect.width || y < rect.y || y >= rect.y + rect.height {
             continue;
@@ -1187,25 +1169,6 @@ fn render_waterfall(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(waterfall, area);
 }
 
-fn render_active_panel_highlight(f: &mut Frame<'_>, app: &App, panel_areas: &[Rect]) {
-    let active_area = match app.active_panel {
-        ActivePanel::BandActivity => panel_areas[0],
-        ActivePanel::QsoStatus => panel_areas[1],
-        ActivePanel::Callers => panel_areas[2],
-        ActivePanel::DxHunter => panel_areas[3],
-        ActivePanel::TxPlacement => panel_areas[4],
-    };
-
-    // Draw a subtle highlight border around the active panel
-    let highlight_block = Block::default().borders(Borders::ALL).border_style(
-        Style::default()
-            .fg(app.theme.selected_color())
-            .add_modifier(Modifier::BOLD),
-    );
-
-    f.render_widget(highlight_block, active_area);
-}
-
 /// Create a styled block for panels
 pub fn create_panel_block<'a>(title: &'a str, is_active: bool, app: &App) -> Block<'a> {
     let border_style = if is_active {
@@ -1480,37 +1443,15 @@ mod view_render_tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
 
-    async fn render_view_with_panel(
-        view: crate::view::ActiveView,
-        active_panel: crate::app::ActivePanel,
-    ) -> ratatui::buffer::Buffer {
+    async fn render_view(view: crate::view::ActiveView) -> ratatui::buffer::Buffer {
         let mut app = crate::app::App::new(crate::config::Config::default(), None)
             .await
             .unwrap();
         app.active_view = view;
-        // Pre-existing, out-of-scope-for-this-task quirk: `render_active_panel_highlight`
-        // draws a titleless border directly over the active panel's own area,
-        // which blanks that panel's title text (only its *border color*
-        // changes; ratatui's Block widget overwrites the whole perimeter,
-        // title included). That happens in Operate (which keeps the verbatim
-        // highlight call) but not Monitor (which skips it per the brief).
-        // Callers pick whichever panel they need NOT blanked for their
-        // assertions and set `active_panel` accordingly.
-        app.active_panel = active_panel;
         let backend = TestBackend::new(120, 40);
         let mut term = Terminal::new(backend).unwrap();
         term.draw(|f| draw(f, &app).unwrap()).unwrap();
         term.backend().buffer().clone()
-    }
-
-    async fn render_view(view: crate::view::ActiveView) -> ratatui::buffer::Buffer {
-        // Blanking (see the quirk note above) only ever applies in Operate
-        // (the only view that calls `render_active_panel_highlight`), and
-        // callers of this helper never target Operate directly (they build
-        // their own renders — see `operate_view_shows_all_six_panels`), so
-        // any `ActivePanel` value is fine here. `BandActivity` (the app's
-        // own default) keeps this helper boring.
-        render_view_with_panel(view, crate::app::ActivePanel::BandActivity).await
     }
     fn buffer_contains(buf: &ratatui::buffer::Buffer, needle: &str) -> bool {
         (0..buf.area.height).any(|y| {
@@ -1541,20 +1482,14 @@ mod view_render_tests {
 
     #[tokio::test]
     async fn operate_view_shows_all_six_panels() {
-        // Task 18: `StationInfo` is no longer an `ActivePanel` variant, so
-        // the station card that took its slot (title "Station") is NEVER
-        // blanked by `render_active_panel_highlight` — only one of the 5
-        // remaining NAVIGABLE panels is blanked per render. Two renders with
-        // different active panels still cover all 5 + the always-visible
-        // card.
-        //
-        // Render #1: Band Activity active (blanks Band Activity) — proves
-        // QSO Status / Callers / DX Hunter / TX Placement / the station card
-        // all render. Task 11 swapped the waterfall for the TX-placement
-        // instrument here, so "TX Placement" replaces the old
-        // waterfall-presence assertion.
+        // Task 11 swapped the waterfall for the TX-placement instrument
+        // here, so "TX Placement" replaces the old waterfall-presence
+        // assertion. Task 18: `StationInfo` is no longer an `ActivePanel`
+        // variant; the station card that took its slot (title "Station")
+        // has no active/inactive styling distinction to worry about.
         let buf = render_view(crate::view::ActiveView::Operate).await;
         for t in [
+            "Band Activity",
             "QSO Status",
             "DX Hunter",
             "Callers",
@@ -1563,19 +1498,6 @@ mod view_render_tests {
         ] {
             assert!(buffer_contains(&buf, t), "missing {t}");
         }
-
-        // Render #2: a DIFFERENT panel (DX Hunter) active instead, so Band
-        // Activity's own title is no longer blanked and can be asserted —
-        // completing coverage of all 5 navigable panels.
-        let buf2 = render_view_with_panel(
-            crate::view::ActiveView::Operate,
-            crate::app::ActivePanel::DxHunter,
-        )
-        .await;
-        assert!(
-            buffer_contains(&buf2, "Band Activity"),
-            "missing Band Activity"
-        );
     }
 
     /// Task 18: the S-meter and audio-device spans that used to live only
@@ -1869,7 +1791,7 @@ mod view_render_tests {
             .unwrap();
         // Pin Operate explicitly (App::new loads the OPERATOR's real
         // persisted `~/.pancetta/tui_state.json` view, same footgun
-        // `render_view_with_panel` above already guards against).
+        // `render_view` above already guards against).
         app.active_view = crate::view::ActiveView::Operate;
         app.apply_placement(fixture_placement_view());
         let mut b = fixture_banner("JA1ABC");
@@ -2153,5 +2075,63 @@ mod hit_test_tests {
             area.y + 2 + 5,
         );
         assert_eq!(hit, Some((ActivePanel::DxHunter, 5)));
+    }
+
+    /// Issue #96: below the `draw()` resize-guard floor (MIN_TERMINAL_*),
+    /// no panels are actually rendered (just a "resize the window" prompt),
+    /// so a click must never resolve to a phantom panel rect.
+    #[test]
+    fn hit_test_returns_none_below_resize_guard_floor() {
+        let too_narrow = content_area(Rect::new(0, 0, MIN_TERMINAL_WIDTH - 1, MIN_TERMINAL_HEIGHT));
+        let hit = hit_test(
+            ActiveView::Operate,
+            false,
+            ActivePanel::BandActivity,
+            too_narrow,
+            5,
+            too_narrow.y + 2,
+        );
+        assert_eq!(hit, None, "too-narrow content area must never hit a panel");
+
+        let too_short = content_area(Rect::new(0, 0, MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT - 1));
+        let hit = hit_test(
+            ActiveView::Operate,
+            false,
+            ActivePanel::BandActivity,
+            too_short,
+            5,
+            too_short.y + 2,
+        );
+        assert_eq!(hit, None, "too-short content area must never hit a panel");
+    }
+
+    /// A terminal exactly AT the resize-guard floor is NOT degraded (`draw()`
+    /// only blocks strictly below it) — clicks there must still resolve
+    /// normally, proving the guard uses the content area's own floor rather
+    /// than naively comparing against the full-terminal MIN_TERMINAL_* consts
+    /// (which would reject this valid, non-degraded size too).
+    #[test]
+    fn hit_test_still_works_exactly_at_resize_guard_floor() {
+        let at_floor = content_area(Rect::new(0, 0, MIN_TERMINAL_WIDTH, MIN_TERMINAL_HEIGHT));
+        let rects = view_rects(
+            ActiveView::Operate,
+            false,
+            ActivePanel::BandActivity,
+            at_floor,
+        );
+        let (_, band_activity_rect) = rects
+            .into_iter()
+            .find(|(p, _)| *p == ActivePanel::BandActivity)
+            .unwrap();
+
+        let hit = hit_test(
+            ActiveView::Operate,
+            false,
+            ActivePanel::BandActivity,
+            at_floor,
+            band_activity_rect.x + 2,
+            band_activity_rect.y + 2,
+        );
+        assert_eq!(hit, Some((ActivePanel::BandActivity, 0)));
     }
 }

@@ -25,6 +25,7 @@
 pub mod callsign;
 pub mod diagnostic_level;
 pub mod error;
+pub mod freq_bin;
 pub mod gridsquare;
 pub mod response_step;
 pub mod slot;

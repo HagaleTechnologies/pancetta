@@ -142,19 +142,18 @@ pub fn render_band_activity(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<
 
     // Create table state for potential selection
     let mut table_state = TableState::default();
-    if is_active && !app.decoded_messages.is_empty() {
+    if is_active && !displayed.is_empty() {
         table_state.select(Some(app.band_activity_scroll));
     }
 
     f.render_stateful_widget(table, area, &mut table_state);
 
-    // Show scroll indicator if there are more messages
-    if app.decoded_messages.len() > (area.height as usize).saturating_sub(4) {
-        let scroll_info = format!(
-            "{}/{}",
-            app.band_activity_scroll + 1,
-            app.decoded_messages.len()
-        );
+    // Show scroll indicator if there are more messages. Uses `displayed`
+    // (the view-filtered count, e.g. Hunt's CQs-only filter) rather than
+    // the raw `app.decoded_messages` count, so the "N/total" denominator
+    // matches what's actually visible in this view.
+    if displayed.len() > (area.height as usize).saturating_sub(4) {
+        let scroll_info = format!("{}/{}", app.band_activity_scroll + 1, displayed.len());
 
         let scroll_area = Rect {
             x: area.x + area.width.saturating_sub(scroll_info.len() as u16 + 2),
@@ -215,8 +214,17 @@ fn create_message_row<'a>(
     // Truncate long messages. Raised from 30 to 60 chars (Task 20a) — the
     // Msg column absorbed the space freed by dropping the per-row-constant
     // Freq/Mode columns.
+    //
+    // FT8 payloads are ASCII in practice (callsigns/grids/reports), so
+    // `..57` always lands on a char boundary today — but byte-slicing a
+    // `str` panics if it ever doesn't, so walk back to the nearest valid
+    // boundary first (issue #98 item 3) rather than trust that invariant.
     let msg_str = if msg.message.len() > 60 {
-        format!("{}...", &msg.message[..57])
+        let mut cut = 57.min(msg.message.len());
+        while cut > 0 && !msg.message.is_char_boundary(cut) {
+            cut -= 1;
+        }
+        format!("{}...", &msg.message[..cut])
     } else {
         msg.message.clone()
     };
@@ -531,6 +539,22 @@ mod tests {
         assert!(header.contains("SNR"), "header: {header:?}");
         assert!(header.contains("Call"), "header: {header:?}");
         assert!(header.contains("Msg"), "header: {header:?}");
+    }
+
+    /// Issue #98 item 3: a multi-byte char straddling byte offset 57 used
+    /// to panic on `&msg.message[..57]`. Not reachable with real FT8
+    /// payloads (ASCII only), but the truncation must not panic if it ever
+    /// is. 56 ASCII chars + a 3-byte char (spanning bytes 56-59, so byte 57
+    /// is NOT a char boundary) + padding past the 60-char truncation
+    /// threshold.
+    #[tokio::test]
+    async fn create_message_row_does_not_panic_on_multibyte_boundary() {
+        let mut msg = fixture_message("K1ABC");
+        msg.message = format!("{}日{}", "A".repeat(56), "B".repeat(10));
+        let app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        let _ = create_message_row(&msg, &app, &BandActivityColumn::ALL);
     }
 
     #[test]

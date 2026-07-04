@@ -67,10 +67,13 @@ pub(crate) fn classify_autonomous_opening(
 ///
 /// Returns `None` when `parked_hz == 0` (the `tx_offset_hold_hz` unset
 /// sentinel — matches the convention used elsewhere, e.g.
-/// `coordinator/qso.rs`'s `compute_manual_tx_offset`) or when the computed
-/// bin index falls outside `snap.openness` (shouldn't happen in practice,
-/// but the snapshot's range/bin_hz are a live read and not guaranteed to
-/// cover every possible parked Hz).
+/// `coordinator/qso.rs`'s `compute_manual_tx_offset`) or when the parked
+/// frequency falls outside the snapshot's range.
+///
+/// Uses the shared `pancetta_core::freq_bin::bin_index_for_freq` — the
+/// TUI's own parked-bin lookup (`pancetta-tui`'s `bin_index_for_freq`,
+/// Task 14's `apply_placement`) calls the same function, so the two sides
+/// can no longer disagree at the range's top edge (issue #97 item 3).
 fn parked_bin_coverage(
     parked_hz: u64,
     snap: &pancetta_qso::frequency::PlacementSnapshot,
@@ -78,7 +81,12 @@ fn parked_bin_coverage(
     if parked_hz == 0 {
         return None;
     }
-    let idx = ((parked_hz as f64 - snap.range.0) / snap.bin_hz) as usize;
+    let idx = pancetta_core::freq_bin::bin_index_for_freq(
+        parked_hz as f64,
+        snap.range,
+        snap.bin_hz,
+        snap.openness.len(),
+    )?;
     snap.openness.get(idx).copied()
 }
 
@@ -161,7 +169,7 @@ fn should_repark(
 
 /// Looks up the parked offset's CURRENT score in a
 /// [`pancetta_qso::frequency::PlacementSnapshot`]'s top-N `slices` (the
-/// candidate whose `offset_hz` falls within half a bin width of
+/// NEAREST candidate whose `offset_hz` falls within half a bin width of
 /// `parked_hz`), for feeding [`should_repark`]'s `parked_score` parameter.
 ///
 /// **Documented ambiguity resolution (Task 16 brief):** the snapshot only
@@ -175,6 +183,12 @@ fn should_repark(
 /// (`should_repark`'s call site) maps that to a worst-case `Some(0.0)`,
 /// i.e. "no evidence this is a good slice to stay on," rather than
 /// re-scoring or skipping the repark decision entirely.
+///
+/// Uses `min_by` over ALL candidates within the half-bin-width window
+/// (issue #98 item 2) rather than the first one encountered — today the
+/// allocator guarantees at most one candidate per `bin_hz`-spaced bin, so
+/// the two are equivalent in practice, but nearest-by-distance doesn't rely
+/// on that as an implicit, unenforced invariant.
 fn parked_score_in_slices(
     parked_hz: u64,
     snap: &pancetta_qso::frequency::PlacementSnapshot,
@@ -185,7 +199,12 @@ fn parked_score_in_slices(
     let parked = parked_hz as f64;
     snap.slices
         .iter()
-        .find(|c| (c.offset_hz - parked).abs() <= snap.bin_hz / 2.0)
+        .filter(|c| (c.offset_hz - parked).abs() <= snap.bin_hz / 2.0)
+        .min_by(|a, b| {
+            (a.offset_hz - parked)
+                .abs()
+                .total_cmp(&(b.offset_hz - parked).abs())
+        })
         .map(|c| c.score)
 }
 
@@ -1213,6 +1232,65 @@ impl super::ApplicationCoordinator {
 }
 
 #[cfg(test)]
+mod parked_score_in_slices_tests {
+    use super::*;
+    use pancetta_qso::frequency::{FrequencyCandidate, PlacementSnapshot};
+
+    fn candidate(offset_hz: f64, score: f64) -> FrequencyCandidate {
+        FrequencyCandidate {
+            offset_hz,
+            score,
+            clear_both_slots: true,
+            clear_first: true,
+            clear_second: true,
+            noise_floor: 0.0,
+        }
+    }
+
+    #[test]
+    fn unparked_sentinel_is_none() {
+        let snap = PlacementSnapshot {
+            slices: vec![candidate(920.0, 95.0)],
+            openness: vec![],
+            bin_hz: 25.0,
+            range: (200.0, 2700.0),
+        };
+        assert_eq!(parked_score_in_slices(0, &snap), None);
+    }
+
+    #[test]
+    fn no_candidate_within_half_bin_width_is_none() {
+        let snap = PlacementSnapshot {
+            slices: vec![candidate(920.0, 95.0)],
+            openness: vec![],
+            bin_hz: 25.0,
+            range: (200.0, 2700.0),
+        };
+        // 950 - 920 = 30 Hz, outside the 12.5 Hz half-bin-width window.
+        assert_eq!(parked_score_in_slices(950, &snap), None);
+    }
+
+    /// Issue #98 item 2: with two candidates both within the half-bin-width
+    /// window of the parked frequency, `min_by`-nearest must return the
+    /// CLOSER one's score, not whichever happens to be first in `slices`.
+    #[test]
+    fn picks_nearest_candidate_not_first_match() {
+        let snap = PlacementSnapshot {
+            slices: vec![
+                // Farther from 920 (10 Hz away), but listed FIRST.
+                candidate(910.0, 50.0),
+                // Closer to 920 (5 Hz away), listed second.
+                candidate(915.0, 99.0),
+            ],
+            openness: vec![],
+            bin_hz: 25.0,
+            range: (200.0, 2700.0),
+        };
+        assert_eq!(parked_score_in_slices(920, &snap), Some(99.0));
+    }
+}
+
+#[cfg(test)]
 mod parked_bin_coverage_tests {
     use super::*;
     use pancetta_qso::frequency::PlacementSnapshot;
@@ -1242,6 +1320,21 @@ mod parked_bin_coverage_tests {
             None,
             "bin index past the end of openness"
         );
+    }
+
+    /// Issue #97 item 3: before sharing `pancetta_core::freq_bin`, this
+    /// truncated (never floored+clamped) and landed one bin past the end at
+    /// the exact top edge, returning `None` where the TUI's own lookup
+    /// (`bin_index_for_freq`) resolved the last bin. Now both sides agree.
+    #[test]
+    fn parked_bin_coverage_top_edge_resolves_last_bin() {
+        let snap = PlacementSnapshot {
+            slices: vec![],
+            openness: vec![3, 1, 0],
+            bin_hz: 25.0,
+            range: (200.0, 275.0),
+        };
+        assert_eq!(parked_bin_coverage(275, &snap), Some(0));
     }
 }
 

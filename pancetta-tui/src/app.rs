@@ -1222,6 +1222,12 @@ impl App {
                     }
                 }
                 ActivePanel::QsoStatus => {
+                    // `panel_row_offset`'s border+header subtraction assumes
+                    // the multi-QSO table layout; with exactly one active
+                    // QSO the panel instead renders a non-table detail view
+                    // (issue #97 item 4). Harmless in practice: `row.min(0)`
+                    // collapses to 0 regardless of what `row` resolved to,
+                    // which is always the right (only) cursor position here.
                     if !self.active_qsos.is_empty() {
                         self.qso_cursor = row.min(self.active_qsos.len() - 1);
                         self.repin_qso_selection();

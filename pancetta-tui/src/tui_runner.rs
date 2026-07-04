@@ -2786,7 +2786,36 @@ mod key_tests {
         })
         .await
         .unwrap();
-        // A same-target Warn (e.g. QSO failed) must not count.
+        // A same-target Warn whose text STILL matches the "QSO with" prefix
+        // must not count — isolates the level guard (issue #98 item 4):
+        // varying only `level` here, unlike the combined negative case
+        // below, so a regression in the level check alone is caught.
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Warn,
+            text: "QSO with K1ABC logged (RST -10/-05)".to_string(),
+            qso_id: None,
+            callsign: Some("K1ABC".to_string()),
+        })
+        .await
+        .unwrap();
+        // An Info-level event whose text does NOT match the prefix must not
+        // count — isolates the text-prefix guard, varying only `text` from
+        // the positive cases above.
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: "QSO failed: timeout".to_string(),
+            qso_id: None,
+            callsign: None,
+        })
+        .await
+        .unwrap();
+        // Combined negative case (both level AND prefix differ) — the
+        // original real-world shape (a QSO-failed event), kept alongside
+        // the two isolated cases above rather than in place of them.
         r.handle_message(TuiMessage::DiagnosticEvent {
             ts: chrono::Utc::now(),
             target: "qso",
