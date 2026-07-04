@@ -72,6 +72,91 @@ fn sanitize_decoded_message(decoded_msg: &mut pancetta_ft8::DecodedMessage) {
     }
 }
 
+/// How many recent TX-clear ("quiet") windows feed the rolling decode-count
+/// baseline for [`maybe_flag_tx_desense`].
+const DESENSE_BASELINE_WINDOWS: usize = 20;
+/// Minimum quiet-window samples collected before the baseline is trusted —
+/// avoids flagging desense off a 1-2-sample fluke early in a session.
+const DESENSE_MIN_BASELINE_SAMPLES: usize = 5;
+/// Baseline mean below this is "the band's already quiet" — don't flag a
+/// drop-to-near-zero as desense when there was barely anything to hear.
+const DESENSE_MIN_BASELINE_MEAN: f64 = 3.0;
+/// A window counts as "TX-adjacent" for this long after the last PTT-on.
+/// Wider than one slot: 2026-07-04 on-air logs show the collapse persisting
+/// into the very next (listen-only) window too, not just the TX window
+/// itself.
+const DESENSE_TX_ADJACENT_MS: u64 = 20_000;
+/// Flag when the current window's decode count falls to this fraction (or
+/// less) of the quiet-window baseline.
+const DESENSE_DROP_RATIO: f64 = 0.25;
+
+/// TX-adjacent decode-count desense check.
+///
+/// Operator report (2026-07-04): DX Hunter/Band Activity thin out to almost
+/// nothing during an active QSO, and the station being called seems to
+/// "vanish." Correlating on-air logs across 4 separate sessions showed FT8
+/// sync-search quality (and therefore decoded-message counts) collapsing
+/// band-wide for the exact duration of repeated keep-call transmissions,
+/// recovering within one window after TX stopped — while audio RMS stayed
+/// flat throughout. The parity/scheduling/relay code was reviewed and is
+/// NOT the cause; this is most likely TX-induced desense or crosstalk in
+/// the audio path (e.g. a shared TX/RX USB audio interface). This check
+/// surfaces the pattern live instead of requiring a post-hoc log dig.
+///
+/// `decoded_count`/`now_ms` describe the just-finished window;
+/// `last_ptt_on_ms` is 0 until the first-ever TX. `quiet_window_decode_counts`
+/// and `desense_flagged` are caller-owned rolling state (one instance per
+/// decode-loop lifetime). Returns `Some(warning text)` on the FIRST window of
+/// a newly-detected episode only — edge-triggered so a multi-window collapse
+/// (or a long run of keep-calls) warns once, not every ~15s.
+fn maybe_flag_tx_desense(
+    decoded_count: usize,
+    now_ms: u64,
+    last_ptt_on_ms: u64,
+    quiet_window_decode_counts: &mut std::collections::VecDeque<usize>,
+    desense_flagged: &mut bool,
+) -> Option<String> {
+    let tx_adjacent =
+        last_ptt_on_ms != 0 && now_ms.saturating_sub(last_ptt_on_ms) < DESENSE_TX_ADJACENT_MS;
+
+    if !tx_adjacent {
+        // Only windows clear of our own TX contribute to the "healthy band"
+        // baseline — a window during/just-after our own TX must never
+        // pollute the very baseline it's being compared against.
+        quiet_window_decode_counts.push_back(decoded_count);
+        if quiet_window_decode_counts.len() > DESENSE_BASELINE_WINDOWS {
+            quiet_window_decode_counts.pop_front();
+        }
+        *desense_flagged = false;
+        return None;
+    }
+
+    if quiet_window_decode_counts.len() < DESENSE_MIN_BASELINE_SAMPLES {
+        return None;
+    }
+    let baseline_mean: f64 = quiet_window_decode_counts.iter().sum::<usize>() as f64
+        / quiet_window_decode_counts.len() as f64;
+    if baseline_mean < DESENSE_MIN_BASELINE_MEAN {
+        return None; // band's already quiet — nothing meaningful to compare against
+    }
+
+    let collapsed = (decoded_count as f64) <= baseline_mean * DESENSE_DROP_RATIO;
+    if !collapsed {
+        *desense_flagged = false;
+        return None;
+    }
+    if *desense_flagged {
+        return None; // already warned for this ongoing episode
+    }
+    *desense_flagged = true;
+    Some(format!(
+        "possible TX-induced desense: only {decoded_count} messages decoded this window vs. \
+         a {baseline_mean:.1}-message recent baseline, within {DESENSE_TX_ADJACENT_MS}ms of our \
+         last PTT — if this keeps happening, check TX/RX audio-path isolation (e.g. a shared \
+         USB audio interface)"
+    ))
+}
+
 /// hb-237 Session 3 — pure helper: translate the pancetta-qso
 /// [`pancetta_qso::A7SeedEntry`] cache entries into the decoder's ABI-
 /// stable [`pancetta_ft8::CrossSequenceSeed`] inputs.
@@ -171,6 +256,8 @@ impl super::ApplicationCoordinator {
         let shutdown = self.shutdown_signal.clone();
         let last_decode_timestamp = self.last_decode_timestamp.clone();
         let message_bus = self.message_bus.clone();
+        // TX-adjacent desense diagnostic input (see `maybe_flag_tx_desense`).
+        let last_ptt_on_ms = self.last_ptt_on_ms.clone();
         let gateway_enabled = self.gateway_enabled.clone();
         let self_waterfall_to_auto_tx = self.waterfall_to_auto_tx.clone();
 
@@ -269,6 +356,15 @@ impl super::ApplicationCoordinator {
                 );
             }
             let mut recent_pool: Vec<pancetta_ft8::RecentCallAp> = Vec::new();
+
+            // TX-adjacent desense diagnostic (see `maybe_flag_tx_desense`):
+            // a rolling history of recent per-window decode counts, sampled
+            // ONLY from windows well clear of our own transmit activity —
+            // the "healthy band" baseline this station is actually hearing
+            // right now, independent of time-of-day/propagation.
+            let mut quiet_window_decode_counts: std::collections::VecDeque<usize> =
+                std::collections::VecDeque::with_capacity(DESENSE_BASELINE_WINDOWS);
+            let mut desense_flagged = false;
 
             while !shutdown.load(Ordering::Acquire) {
                 match ft8_rx.recv_timeout(std::time::Duration::from_millis(100)) {
@@ -645,6 +741,32 @@ impl super::ApplicationCoordinator {
                             decoded_messages.len(),
                             decoded_messages.len()
                         );
+
+                        if let Some(warning_text) = maybe_flag_tx_desense(
+                            decoded_messages.len(),
+                            super::now_epoch_ms(),
+                            last_ptt_on_ms.load(Ordering::Relaxed),
+                            &mut quiet_window_decode_counts,
+                            &mut desense_flagged,
+                        ) {
+                            warn!(target: "ft8.desense", "{}", warning_text);
+                            let diag_msg = ComponentMessage::new(
+                                ComponentId::Ft8Decoder,
+                                ComponentId::Tui,
+                                MessageType::DiagnosticEvent {
+                                    target: "ft8.desense",
+                                    level: pancetta_core::DiagnosticLevel::Warn,
+                                    text: warning_text,
+                                    qso_id: None,
+                                    callsign: None,
+                                },
+                                Instant::now(),
+                            );
+                            let bus_desense = message_bus.clone();
+                            rt.spawn(async move {
+                                let _ = bus_desense.send_message(diag_msg).await;
+                            });
+                        }
 
                         // Window's audio came from the slot that started 13s before
                         // receipt; computing parity from the receipt timestamp keeps the
@@ -1103,6 +1225,146 @@ mod cross_sequence_invocation_tests {
                 .iter()
                 .map(|m| m.text.as_str())
                 .collect::<Vec<_>>()
+        );
+    }
+}
+
+// =============================================================================
+// TX-adjacent desense diagnostic (2026-07-04 operator report)
+// =============================================================================
+#[cfg(test)]
+mod desense_diagnostic_tests {
+    use super::maybe_flag_tx_desense;
+    use std::collections::VecDeque;
+
+    /// Fresh caller-owned state, mirroring what the decode loop holds.
+    fn state() -> (VecDeque<usize>, bool) {
+        (VecDeque::new(), false)
+    }
+
+    /// Fill the baseline with `n` quiet (non-TX-adjacent) windows of
+    /// `count` decodes each. `last_ptt_on_ms = 0` means "never transmitted".
+    fn fill_baseline(counts: &mut VecDeque<usize>, flagged: &mut bool, n: usize, count: usize) {
+        for _ in 0..n {
+            maybe_flag_tx_desense(count, 100_000, 0, counts, flagged);
+        }
+    }
+
+    #[test]
+    fn no_flag_with_insufficient_baseline_history() {
+        let (mut counts, mut flagged) = state();
+        // Only 2 quiet samples — below DESENSE_MIN_BASELINE_SAMPLES (5).
+        fill_baseline(&mut counts, &mut flagged, 2, 20);
+        let now = 200_000u64;
+        let last_ptt = now - 5_000; // well within the TX-adjacent window
+        let warning = maybe_flag_tx_desense(0, now, last_ptt, &mut counts, &mut flagged);
+        assert!(
+            warning.is_none(),
+            "must not flag before the baseline has enough samples"
+        );
+    }
+
+    #[test]
+    fn no_flag_when_band_is_already_quiet() {
+        let (mut counts, mut flagged) = state();
+        // Baseline itself is near-zero (a genuinely dead band) — dropping
+        // further to 0 is not "desense", there was nothing to lose.
+        fill_baseline(&mut counts, &mut flagged, 10, 1);
+        let now = 200_000u64;
+        let last_ptt = now - 5_000;
+        let warning = maybe_flag_tx_desense(0, now, last_ptt, &mut counts, &mut flagged);
+        assert!(
+            warning.is_none(),
+            "must not flag when the baseline itself is below the quiet-band floor"
+        );
+    }
+
+    #[test]
+    fn no_flag_when_not_tx_adjacent() {
+        let (mut counts, mut flagged) = state();
+        fill_baseline(&mut counts, &mut flagged, 10, 20);
+        let now = 200_000u64;
+        // last_ptt_on_ms far in the past — outside DESENSE_TX_ADJACENT_MS.
+        let last_ptt = now - 60_000;
+        let warning = maybe_flag_tx_desense(0, now, last_ptt, &mut counts, &mut flagged);
+        assert!(
+            warning.is_none(),
+            "a decode-count drop with no recent TX must not be flagged as desense"
+        );
+    }
+
+    #[test]
+    fn no_flag_when_never_transmitted() {
+        let (mut counts, mut flagged) = state();
+        fill_baseline(&mut counts, &mut flagged, 10, 20);
+        // last_ptt_on_ms == 0 is the "never transmitted" sentinel.
+        let warning = maybe_flag_tx_desense(0, 200_000, 0, &mut counts, &mut flagged);
+        assert!(warning.is_none());
+    }
+
+    #[test]
+    fn flags_collapse_during_tx_adjacent_window() {
+        let (mut counts, mut flagged) = state();
+        fill_baseline(&mut counts, &mut flagged, 10, 20);
+        let now = 200_000u64;
+        let last_ptt = now - 5_000; // TX-adjacent
+        let warning = maybe_flag_tx_desense(1, now, last_ptt, &mut counts, &mut flagged);
+        assert!(
+            warning.is_some(),
+            "a collapse to 1/20th of baseline during a TX-adjacent window must be flagged"
+        );
+        assert!(warning.unwrap().contains("desense"));
+    }
+
+    #[test]
+    fn does_not_flag_a_mild_dip() {
+        let (mut counts, mut flagged) = state();
+        fill_baseline(&mut counts, &mut flagged, 10, 20);
+        let now = 200_000u64;
+        let last_ptt = now - 5_000;
+        // 8/20 = 40%, above the 25% drop-ratio threshold.
+        let warning = maybe_flag_tx_desense(8, now, last_ptt, &mut counts, &mut flagged);
+        assert!(warning.is_none(), "a mild dip must not trigger the warning");
+    }
+
+    #[test]
+    fn edge_triggered_only_warns_once_per_episode_then_rearms_after_recovery() {
+        let (mut counts, mut flagged) = state();
+        fill_baseline(&mut counts, &mut flagged, 10, 20);
+        let now = 200_000u64;
+        let last_ptt = now - 5_000;
+
+        let first = maybe_flag_tx_desense(0, now, last_ptt, &mut counts, &mut flagged);
+        assert!(first.is_some(), "first collapsed window warns");
+
+        let second = maybe_flag_tx_desense(0, now + 15_000, last_ptt, &mut counts, &mut flagged);
+        assert!(
+            second.is_none(),
+            "a still-collapsed subsequent window must not re-warn"
+        );
+
+        // Recovery: a non-TX-adjacent, healthy window clears the flag AND
+        // re-seeds the baseline.
+        let recovered = maybe_flag_tx_desense(20, now + 30_000, 0, &mut counts, &mut flagged);
+        assert!(recovered.is_none());
+
+        // A second, later collapse must warn again (not permanently suppressed).
+        let last_ptt2 = now + 40_000;
+        let third = maybe_flag_tx_desense(0, now + 45_000, last_ptt2, &mut counts, &mut flagged);
+        assert!(
+            third.is_some(),
+            "a fresh episode after recovery must warn again"
+        );
+    }
+
+    #[test]
+    fn quiet_window_baseline_is_bounded() {
+        let (mut counts, mut flagged) = state();
+        // Push far more than DESENSE_BASELINE_WINDOWS (20) quiet samples.
+        fill_baseline(&mut counts, &mut flagged, 100, 20);
+        assert!(
+            counts.len() <= 20,
+            "quiet-window history must stay capped, not grow unbounded over a session"
         );
     }
 }

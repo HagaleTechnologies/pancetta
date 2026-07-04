@@ -575,6 +575,14 @@ pub struct ApplicationCoordinator {
     /// status bar to show the live reading only during TX.
     pub(crate) ptt_active: Arc<std::sync::atomic::AtomicBool>,
 
+    /// Epoch-ms timestamp of the most recent PTT-on (updated alongside
+    /// `ptt_active` going true). Unlike the boolean, this survives past
+    /// unkey, so the FT8 decode loop can flag a "TX-adjacent" window —
+    /// the one right after we stop transmitting, not just the window
+    /// during which PTT was actually keyed — when checking for
+    /// TX-correlated desense (`ft8.rs`'s `maybe_flag_tx_desense`).
+    pub(crate) last_ptt_on_ms: Arc<std::sync::atomic::AtomicU64>,
+
     /// C9 dedup anchor: the most recent dial frequency **pancetta itself
     /// commanded** (TUI `SetFrequency`, autonomous `ChangeBand`) and when.
     /// `None` until the first pancetta-initiated frequency change.
@@ -977,6 +985,7 @@ impl ApplicationCoordinator {
             fox_mode: Arc::new(AtomicBool::new(false)),
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_ptt_on_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             // C9 dedup anchor — no pancetta-initiated frequency command yet.
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "pancetta-hamlib")]

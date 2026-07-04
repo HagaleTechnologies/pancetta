@@ -167,8 +167,10 @@ impl PttGuard {
     fn new(
         message_bus: MessageBus,
         ptt_active: std::sync::Arc<std::sync::atomic::AtomicBool>,
+        last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         ptt_active.store(true, std::sync::atomic::Ordering::Release);
+        last_ptt_on_ms.store(super::now_epoch_ms(), std::sync::atomic::Ordering::Release);
         Self {
             message_bus,
             armed: true,
@@ -787,6 +789,9 @@ impl super::ApplicationCoordinator {
             let latest_tx_intent = self.latest_tx_intent.clone();
             // Keyed-state flag for the SWR poll / TUI (set by PttGuard).
             let ptt_active = self.ptt_active.clone();
+            // Timestamp of the most recent PTT-on, read by the FT8 decode
+            // loop's TX-adjacent-desense diagnostic (see `ft8.rs`).
+            let last_ptt_on_ms = self.last_ptt_on_ms.clone();
             // Active slot period (FT8 = 15e9 ns, FT4 = 7.5e9 ns), set once at
             // startup from `[rig].mode`. The TX scheduler keys against this so
             // FT4 lands on the 7.5s grid; FT8 (15e9) is byte-identical.
@@ -1318,8 +1323,11 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 5: Assert PTT ---
-                                    let mut ptt_guard =
-                                        PttGuard::new(message_bus.clone(), ptt_active.clone());
+                                    let mut ptt_guard = PttGuard::new(
+                                        message_bus.clone(),
+                                        ptt_active.clone(),
+                                        &last_ptt_on_ms,
+                                    );
                                     // TX badge on; guard drop clears it on every
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
@@ -1831,8 +1839,11 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 5: Assert PTT ---
-                                    let mut ptt_guard =
-                                        PttGuard::new(message_bus.clone(), ptt_active.clone());
+                                    let mut ptt_guard = PttGuard::new(
+                                        message_bus.clone(),
+                                        ptt_active.clone(),
+                                        &last_ptt_on_ms,
+                                    );
                                     // TX badge on; guard drop clears it on every
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
@@ -2020,8 +2031,11 @@ impl super::ApplicationCoordinator {
 
                                     // Engage PTT immediately. No slot
                                     // scheduling: tune happens NOW.
-                                    let mut ptt_guard =
-                                        PttGuard::new(message_bus.clone(), ptt_active.clone());
+                                    let mut ptt_guard = PttGuard::new(
+                                        message_bus.clone(),
+                                        ptt_active.clone(),
+                                        &last_ptt_on_ms,
+                                    );
                                     // TX badge on; guard drop clears it on every
                                     // exit path (complete / abort / shutdown).
                                     let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
