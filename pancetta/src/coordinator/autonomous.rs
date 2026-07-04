@@ -515,9 +515,13 @@ impl super::ApplicationCoordinator {
             );
         }
 
-        let (waterfall_to_auto_tx, waterfall_to_auto_rx) =
-            crossbeam_channel::bounded::<Vec<Vec<f32>>>(2);
-        self.waterfall_to_auto_tx = Some(waterfall_to_auto_tx);
+        // The channel is created in `new()` (before start_pipeline() spawns
+        // the FT8 thread that clones `waterfall_to_auto_tx`); this component
+        // just takes the receiver half.
+        let waterfall_to_auto_rx = self
+            .waterfall_to_auto_rx
+            .take()
+            .expect("waterfall_to_auto_rx set at coordinator construction");
 
         let evaluator: std::sync::Arc<dyn pancetta_qso::DxEvaluator> = std::sync::Arc::new(
             pancetta_qso::PriorityScorer::new(priority_weights, Box::new((*cached_lookup).clone())),

@@ -464,8 +464,15 @@ pub struct ApplicationCoordinator {
     /// cqdx.io integration bridge (None = degraded mode).
     cqdx_bridge: Option<std::sync::Arc<crate::cqdx_bridge::CqdxBridge>>,
 
-    /// Sender for waterfall data to the autonomous operator.
+    /// Sender for waterfall data to the autonomous operator. Created at
+    /// construction time (alongside `waterfall_to_auto_rx`) so it's already
+    /// `Some` by the time `start_pipeline()` spawns the FT8 thread that
+    /// clones it — see the comment at the call site in `new()`.
     waterfall_to_auto_tx: Option<crossbeam_channel::Sender<Vec<Vec<f32>>>>,
+
+    /// Receiver half, handed to `start_autonomous_component` (via `.take()`)
+    /// when the autonomous component actually starts.
+    waterfall_to_auto_rx: Option<crossbeam_channel::Receiver<Vec<Vec<f32>>>>,
 
     /// Shared active QSO AP state for FT8 AP3/AP4 decoding.
     /// Updated by the QSO component, read by the FT8 decoder thread.
@@ -883,6 +890,18 @@ impl ApplicationCoordinator {
         }));
         let scoped_fast_path = tier::initialize(ft8_config.clone()).await;
 
+        // Created here (not inside start_autonomous_component) so the FT8
+        // pipeline — started earlier in run() — captures a live Sender by
+        // value at start_ft8_pipeline time. Creating it later left the FT8
+        // thread's clone permanently None (start_pipeline() runs before
+        // start_autonomous_component()), so waterfall rows never reached the
+        // autonomous operator's spectral_snapshot, and placement_snapshot()
+        // (which requires it) always returned None — leaving the TX-placement
+        // instrument that replaced the waterfall in Operate/Hunt/Run views
+        // permanently blank.
+        let (waterfall_to_auto_tx, waterfall_to_auto_rx) =
+            crossbeam_channel::bounded::<Vec<Vec<f32>>>(2);
+
         let coordinator = Self {
             id,
             config,
@@ -925,7 +944,8 @@ impl ApplicationCoordinator {
                 crate::priority_evaluator::CachedStationLookup::new(),
             ),
             cqdx_bridge: None,
-            waterfall_to_auto_tx: None,
+            waterfall_to_auto_tx: Some(waterfall_to_auto_tx),
+            waterfall_to_auto_rx: Some(waterfall_to_auto_rx),
             active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
             active_qso_freq_hz: std::sync::Arc::new(std::sync::RwLock::new(None)),
             fp_filter: None,
@@ -1608,6 +1628,52 @@ mod tests {
         .await;
 
         assert!(coordinator.is_ok());
+    }
+
+    /// Regression test for the blank-TX-placement-instrument bug: the FT8
+    /// pipeline (started by `start_pipeline()`, before
+    /// `start_autonomous_component()` runs) clones `waterfall_to_auto_tx` by
+    /// value. If that field were still `None` at construction time (as it
+    /// was when the channel was created lazily inside
+    /// `start_autonomous_component`), the FT8 thread's clone would be
+    /// permanently `None` and waterfall rows would never reach the
+    /// autonomous operator's spectral snapshot — so `placement_snapshot()`
+    /// would always return `None` and the TX-placement instrument (which
+    /// replaced the waterfall in Operate/Hunt/Run views) would render blank
+    /// forever, regardless of how long the station ran. Asserts the channel
+    /// is already `Some` immediately after `new()`, before any component —
+    /// autonomous included — has started.
+    #[tokio::test]
+    async fn waterfall_to_auto_channel_is_wired_before_any_component_starts() {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let coordinator = ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed");
+
+        assert!(
+            coordinator.waterfall_to_auto_tx.is_some(),
+            "waterfall_to_auto_tx must be Some at construction time, before \
+             start_pipeline() spawns the FT8 thread that clones it"
+        );
+        assert!(
+            coordinator.waterfall_to_auto_rx.is_some(),
+            "waterfall_to_auto_rx must be Some at construction time, ready \
+             for start_autonomous_component to take()"
+        );
     }
 
     #[tokio::test]
