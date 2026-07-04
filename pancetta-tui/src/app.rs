@@ -570,32 +570,43 @@ pub enum ActivePanel {
 }
 
 impl ActivePanel {
-    // Tab cycle follows the on-screen layout top-to-bottom, left column then
-    // right column: BandActivity, QsoStatus (left) → DxHunter, Callers
-    // (right). The full-width-waterfall layout put Callers BELOW DX Hunter,
-    // so DxHunter precedes Callers here (the enum's declaration order is
-    // unrelated and left unchanged). TxPlacement (Task 11) is inserted right
-    // after BandActivity — it sits directly below the active-QSO banner and
-    // above the rest of the grid on-screen in Operate. `StationInfo` was
-    // removed from the cycle in Task 18 (demoted to a non-navigable station
-    // card + status-bar spans — it no longer has an `ActivePanel` variant).
-    pub fn next(&self) -> Self {
-        match self {
-            ActivePanel::BandActivity => ActivePanel::TxPlacement,
-            ActivePanel::TxPlacement => ActivePanel::QsoStatus,
-            ActivePanel::QsoStatus => ActivePanel::Callers,
-            ActivePanel::Callers => ActivePanel::DxHunter,
-            ActivePanel::DxHunter => ActivePanel::BandActivity,
-        }
-    }
-
-    pub fn previous(&self) -> Self {
-        match self {
-            ActivePanel::BandActivity => ActivePanel::DxHunter,
-            ActivePanel::DxHunter => ActivePanel::Callers,
-            ActivePanel::Callers => ActivePanel::QsoStatus,
-            ActivePanel::QsoStatus => ActivePanel::TxPlacement,
-            ActivePanel::TxPlacement => ActivePanel::BandActivity,
+    /// Panels reachable via Tab/Shift+Tab in a given activity view, in
+    /// on-screen visual order (top-to-bottom; left column before right
+    /// column where a view has two columns) — so Tab always moves focus to
+    /// the next panel actually drawn on screen, and never lands on a panel
+    /// the current view doesn't render (Hunt has no Callers row; Run has
+    /// neither Band Activity nor DX Hunter; Monitor has only Band Activity).
+    /// `StationInfo` has no variant here — it was demoted to a non-navigable
+    /// station card + status-bar spans in Task 18.
+    ///
+    /// Kept as one match per view (rather than sharing `ui::view_rects`'s
+    /// list) because that list's order is irrelevant to its own job — it
+    /// pairs each panel with its rect for rect-containment hit-testing — and
+    /// its Operate order doesn't reflect the screen: Operate's two-column
+    /// region puts DX Hunter above Callers on the right, but full-width
+    /// TxPlacement sits above the whole region, topmost of all.
+    pub fn tab_order(view: crate::view::ActiveView) -> &'static [ActivePanel] {
+        use crate::view::ActiveView;
+        match view {
+            ActiveView::Operate => &[
+                ActivePanel::TxPlacement,
+                ActivePanel::BandActivity,
+                ActivePanel::QsoStatus,
+                ActivePanel::DxHunter,
+                ActivePanel::Callers,
+            ],
+            ActiveView::Hunt => &[
+                ActivePanel::TxPlacement,
+                ActivePanel::DxHunter,
+                ActivePanel::BandActivity,
+                ActivePanel::QsoStatus,
+            ],
+            ActiveView::Run => &[
+                ActivePanel::TxPlacement,
+                ActivePanel::Callers,
+                ActivePanel::QsoStatus,
+            ],
+            ActiveView::Monitor => &[ActivePanel::BandActivity],
         }
     }
 }
@@ -2298,11 +2309,24 @@ impl App {
     }
 
     pub fn next_panel(&mut self) {
-        self.active_panel = self.active_panel.next();
+        let order = ActivePanel::tab_order(self.active_view);
+        // If the currently-focused panel isn't in this view (e.g. right
+        // after a view switch), land on the first — topmost — panel rather
+        // than skipping past it.
+        let next_idx = match order.iter().position(|p| *p == self.active_panel) {
+            Some(i) => (i + 1) % order.len(),
+            None => 0,
+        };
+        self.active_panel = order[next_idx];
     }
 
     pub fn previous_panel(&mut self) {
-        self.active_panel = self.active_panel.previous();
+        let order = ActivePanel::tab_order(self.active_view);
+        let prev_idx = match order.iter().position(|p| *p == self.active_panel) {
+            Some(i) => (i + order.len() - 1) % order.len(),
+            None => 0,
+        };
+        self.active_panel = order[prev_idx];
     }
 
     pub fn next_item(&mut self) {
@@ -3642,6 +3666,95 @@ mod tests {
             !shown.contains(&"K2BBB".to_string()),
             "third-party exchange filtered"
         );
+    }
+
+    /// Tab/Shift+Tab must never land on a panel the current view doesn't
+    /// render — each view's `tab_order()` should exactly match what
+    /// `ui::view_rects` draws for that view (as a set; order is asserted
+    /// separately below).
+    #[test]
+    fn tab_order_matches_rendered_panels_per_view() {
+        use crate::view::ActiveView;
+
+        let area = Rect::new(0, 0, 120, 40);
+        for view in [
+            ActiveView::Operate,
+            ActiveView::Hunt,
+            ActiveView::Run,
+            ActiveView::Monitor,
+        ] {
+            let rendered: Vec<ActivePanel> =
+                crate::ui::view_rects(view, false, ActivePanel::BandActivity, area)
+                    .into_iter()
+                    .map(|(p, _)| p)
+                    .collect();
+            let tab_order = ActivePanel::tab_order(view);
+            assert_eq!(
+                tab_order.len(),
+                rendered.len(),
+                "tab_order({view:?}) count must match view_rects"
+            );
+            for p in tab_order {
+                assert!(
+                    rendered.contains(p),
+                    "tab_order({view:?}) contains {p:?}, which view_rects doesn't draw"
+                );
+            }
+        }
+    }
+
+    /// Operate's Tab order is the on-screen top-to-bottom, left-then-right
+    /// order: the full-width TxPlacement strip first (it sits above the
+    /// two-column grid), then the left column (Band Activity, QSO Status),
+    /// then the right column (DX Hunter, Callers).
+    #[test]
+    fn operate_tab_order_is_visual_top_to_bottom() {
+        assert_eq!(
+            ActivePanel::tab_order(crate::view::ActiveView::Operate),
+            &[
+                ActivePanel::TxPlacement,
+                ActivePanel::BandActivity,
+                ActivePanel::QsoStatus,
+                ActivePanel::DxHunter,
+                ActivePanel::Callers,
+            ]
+        );
+    }
+
+    /// Tab/Shift+Tab cycle within the active view and wrap at both ends.
+    #[tokio::test]
+    async fn next_and_previous_panel_cycle_within_active_view() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.active_view = crate::view::ActiveView::Operate;
+        app.active_panel = ActivePanel::TxPlacement;
+
+        app.next_panel();
+        assert_eq!(app.active_panel, ActivePanel::BandActivity);
+        app.next_panel();
+        assert_eq!(app.active_panel, ActivePanel::QsoStatus);
+        app.next_panel();
+        assert_eq!(app.active_panel, ActivePanel::DxHunter);
+        app.next_panel();
+        assert_eq!(app.active_panel, ActivePanel::Callers);
+        app.next_panel();
+        assert_eq!(app.active_panel, ActivePanel::TxPlacement, "wraps forward");
+
+        app.previous_panel();
+        assert_eq!(app.active_panel, ActivePanel::Callers, "wraps backward");
+    }
+
+    /// Switching to a narrower view (e.g. Run, which has no Band Activity or
+    /// DX Hunter) while focused on a panel that view doesn't render must not
+    /// panic, and the next Tab press should land on that view's first panel
+    /// rather than getting stuck or skipping it.
+    #[tokio::test]
+    async fn next_panel_recovers_when_focus_not_in_current_view() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.active_panel = ActivePanel::BandActivity;
+        app.active_view = crate::view::ActiveView::Run;
+
+        app.next_panel();
+        assert_eq!(app.active_panel, ActivePanel::TxPlacement);
     }
 
     /// Regression: in Hunt view `displayed_messages()` is shorter than the
