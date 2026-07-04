@@ -1,5 +1,7 @@
+use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{
-    Resampler, SincFixedIn, SincInterpolationParameters, SincInterpolationType, WindowFunction,
+    Async, FixedAsync, Resampler, SincInterpolationParameters, SincInterpolationType,
+    WindowFunction,
 };
 use std::collections::VecDeque;
 use thiserror::Error;
@@ -22,8 +24,8 @@ pub type Result<T> = std::result::Result<T, ResamplerError>;
 /// High-quality audio resampler optimized for amateur radio applications
 /// Uses Rubato's high-quality SINC resampling with configurable parameters
 pub struct AudioResampler {
-    /// The underlying resampler engine (using SincFixedIn for simplicity)
-    resampler: SincFixedIn<f32>,
+    /// The underlying resampler engine (fixed-input-size sinc interpolation)
+    resampler: Async<f32>,
     /// Input sample rate
     input_rate: f32,
     /// Output sample rate
@@ -74,16 +76,17 @@ impl AudioResampler {
             window: WindowFunction::BlackmanHarris2, // Excellent stopband attenuation
         };
 
-        // Use SincFixedIn for all resampling scenarios
-        let resampler = SincFixedIn::<f32>::new(
+        // Use a fixed-input-size sinc resampler for all resampling scenarios
+        let resampler = Async::<f32>::new_sinc(
             output_rate as f64 / input_rate as f64,
             2.0, // Max relative deviation
-            params,
+            &params,
             chunk_size,
             1, // Mono channel
+            FixedAsync::Input,
         )
         .map_err(|e| ResamplerError::InitializationFailed {
-            message: format!("SincFixedIn creation failed: {}", e),
+            message: format!("Sinc resampler creation failed: {}", e),
         })?;
 
         let input_chunk_size = resampler.input_frames_next();
@@ -146,14 +149,19 @@ impl AudioResampler {
             }
 
             // Resample the chunk
-            let output_chunk = self.resampler.process(&input_chunk, None).map_err(|e| {
-                ResamplerError::ProcessingFailed {
+            let input_adapter = SequentialSliceOfVecs::new(&input_chunk, 1, self.input_chunk_size)
+                .map_err(|e| ResamplerError::ProcessingFailed {
+                    message: format!("Input buffer error: {}", e),
+                })?;
+            let output_chunk = self
+                .resampler
+                .process(&input_adapter, 0, None)
+                .map_err(|e| ResamplerError::ProcessingFailed {
                     message: format!("Resampling failed: {}", e),
-                }
-            })?;
+                })?;
 
             // Add output samples to buffer
-            self.output_buffer.extend(output_chunk[0].iter());
+            self.output_buffer.extend(output_chunk.take_data());
         }
 
         // Extract available output samples
@@ -218,13 +226,18 @@ impl AudioResampler {
                 }
             }
 
-            let output_chunk = self.resampler.process(&input_chunk, None).map_err(|e| {
-                ResamplerError::ProcessingFailed {
+            let input_adapter = SequentialSliceOfVecs::new(&input_chunk, 1, self.input_chunk_size)
+                .map_err(|e| ResamplerError::ProcessingFailed {
+                    message: format!("Input buffer error: {}", e),
+                })?;
+            let output_chunk = self
+                .resampler
+                .process(&input_adapter, 0, None)
+                .map_err(|e| ResamplerError::ProcessingFailed {
                     message: format!("Final resampling failed: {}", e),
-                }
-            })?;
+                })?;
 
-            self.output_buffer.extend(output_chunk[0].iter());
+            self.output_buffer.extend(output_chunk.take_data());
         }
 
         // Return all buffered output samples
