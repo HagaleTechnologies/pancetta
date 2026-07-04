@@ -29,6 +29,13 @@ use crate::relay::{
 /// Q-0011 pancetta refinement).
 const AUTH_DOMAIN_TAG: &str = "cqdx-relay-agent-auth-v1";
 
+/// Encode bytes as unpadded base64url (matches `keys::b64url_unpadded`'s
+/// convention; not shared across modules since each is `pub(crate)`-private).
+fn b64url_unpadded(bytes: &[u8]) -> String {
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
 /// Errors from driving the agent session leg.
 #[derive(Debug, thiserror::Error)]
 pub enum SessionError {
@@ -94,6 +101,12 @@ pub struct AgentSession<'a, W: WsConn> {
     handshake: Option<ResponderHandshake>,
     /// The established transport, present once the handshake completes.
     transport: Option<NoiseTransport>,
+    /// Unpadded base64url of the Noise handshake hash (`h`), captured the
+    /// instant the handshake completes (dispensa Q-0022) — the channel
+    /// binding a `txArmGrant.sessionId` is checked against. `None` until the
+    /// transport is established; naturally resets on reconnect since a fresh
+    /// `AgentSession` is built per connection.
+    session_id: Option<String>,
 }
 
 impl<'a, W: WsConn> AgentSession<'a, W> {
@@ -107,12 +120,23 @@ impl<'a, W: WsConn> AgentSession<'a, W> {
             phase: None,
             handshake: None,
             transport: None,
+            session_id: None,
         }
     }
 
     /// Whether the Noise transport is established (admitted + handshaked).
     pub fn is_transport_established(&self) -> bool {
         matches!(self.phase, Some(Phase::Transport))
+    }
+
+    /// The channel-binding session id (dispensa Q-0022): unpadded base64url
+    /// of the Noise handshake hash, present once the transport is
+    /// established. This is what a `txArmGrant.sessionId` must equal — since
+    /// it's derived from the completed handshake transcript, the relay
+    /// cannot forge or substitute it, and a grant signed for one session can
+    /// never verify against another.
+    pub fn session_id(&self) -> Option<&str> {
+        self.session_id.as_deref()
     }
 
     /// Whether the session has been admitted (received `ready`).
@@ -249,6 +273,10 @@ impl<'a, W: WsConn> AgentSession<'a, W> {
                     src: None,
                 };
                 self.ws.send_text(out.to_json()?)?;
+                // Capture the handshake hash BEFORE `into_transport` consumes
+                // `hs` — it's only available pre-transport (Q-0022 channel
+                // binding).
+                self.session_id = Some(b64url_unpadded(&hs.handshake_hash()));
                 self.transport = Some(hs.into_transport()?);
                 self.phase = Some(Phase::Transport);
                 Ok(None)
@@ -395,6 +423,9 @@ mod tests {
         fn into_transport(self) -> snow::TransportState {
             self.inner.into_transport_mode().unwrap()
         }
+        fn handshake_hash(&self) -> Vec<u8> {
+            self.inner.get_handshake_hash().to_vec()
+        }
     }
 
     fn client_key_id() -> String {
@@ -505,6 +536,17 @@ mod tests {
             _ => panic!("expected env msg2"),
         };
         initiator.read_msg2(&msg2);
+
+        // Q-0022: both sides derive the SAME session_id (unpadded base64url
+        // of the Noise handshake hash) from the completed handshake alone —
+        // no wire field, no coordination beyond the handshake itself.
+        let client_hash = initiator.handshake_hash();
+        assert_eq!(
+            sess.session_id(),
+            Some(b64url(&client_hash)).as_deref(),
+            "agent and client must derive an identical channel-binding session_id"
+        );
+
         let mut client_transport = initiator.into_transport();
 
         // Client → agent: encrypt a control frame, deliver as env, agent decrypts.

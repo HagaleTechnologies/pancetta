@@ -151,6 +151,11 @@ fn valid_grant() -> Value {
     sign_grant(base_grant(), &client_key())
 }
 
+/// The `sessionId` `base_grant()` bakes in — the "live session" every
+/// `full_verify` call (and most direct `verify_arm_grant` calls below) checks
+/// the grant's `sessionId` against.
+const SESSION_ID: &str = "sess-1";
+
 /// Verify a capability then a grant end-to-end with fresh replay state.
 fn full_verify(
     v: &CapabilityVerifier,
@@ -167,6 +172,7 @@ fn full_verify(
         client_vk,
         &allow_list(),
         &no_revocations(),
+        SESSION_ID,
         now_ms,
         &mut seen,
     )
@@ -365,6 +371,7 @@ fn grant_wrong_client_sig_rejected() {
         &client_key().verifying_key(),
         &allow_list(),
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     );
@@ -385,6 +392,7 @@ fn grant_mutated_field_after_signing_rejected() {
         &client_key().verifying_key(),
         &allow_list(),
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     );
@@ -405,6 +413,7 @@ fn grant_wrong_aud_rejected() {
         &client_key().verifying_key(),
         &allow_list(),
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     );
@@ -428,6 +437,7 @@ fn grant_client_key_id_mismatch_rejected() {
         &client_key().verifying_key(),
         &list,
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     );
@@ -448,6 +458,7 @@ fn grant_armed_until_in_past_rejected() {
         &client_key().verifying_key(),
         &allow_list(),
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     );
@@ -468,6 +479,7 @@ fn grant_armed_until_equal_now_rejected() {
         &client_key().verifying_key(),
         &allow_list(),
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     );
@@ -489,6 +501,7 @@ fn grant_armed_until_ten_years_rejected_as_too_long() {
         &client_key().verifying_key(),
         &allow_list(),
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     );
@@ -512,6 +525,7 @@ fn grant_armed_window_at_max_is_accepted_boundary() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen,
         )
@@ -529,6 +543,7 @@ fn grant_armed_window_at_max_is_accepted_boundary() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen2,
         ),
@@ -551,6 +566,7 @@ fn grant_heartbeat_zero_rejected() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen
         ),
@@ -573,6 +589,7 @@ fn grant_heartbeat_too_large_rejected() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen
         ),
@@ -597,6 +614,7 @@ fn grant_heartbeat_bounds_are_exact() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen,
         )
@@ -630,6 +648,7 @@ fn grant_armed_window_600000_boundary_exact() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen,
         )
@@ -663,6 +682,7 @@ fn grant_client_not_in_allow_list_rejected() {
             &client_key().verifying_key(),
             &other_list,
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen,
         ),
@@ -685,6 +705,7 @@ fn grant_empty_allow_list_rejects_all() {
             &client_key().verifying_key(),
             &empty,
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen,
         ),
@@ -706,6 +727,7 @@ fn grant_client_in_allow_list_passes_gate() {
         &client_key().verifying_key(),
         &allow_list(), // contains CLIENT_KEY_ID
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     );
@@ -731,6 +753,7 @@ fn grant_capability_jti_mismatch_rejected() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen,
         ),
@@ -756,6 +779,7 @@ fn grant_capability_without_tx_scope_rejected() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen
         ),
@@ -777,6 +801,7 @@ fn grant_same_jti_twice_second_is_replay() {
         &client_key().verifying_key(),
         &allow_list(),
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     )
@@ -789,6 +814,7 @@ fn grant_same_jti_twice_second_is_replay() {
         &client_key().verifying_key(),
         &allow_list(),
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     );
@@ -808,6 +834,7 @@ fn grant_missing_client_sig_rejected() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen
         ),
@@ -848,6 +875,7 @@ fn cap_without_tx_enabled_until_verifies_but_never_arms() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen,
         ),
@@ -884,6 +912,7 @@ fn cap_tx_enabled_until_in_past_never_arms() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             after,
             &mut seen,
         ),
@@ -1003,6 +1032,7 @@ fn grant_capability_jti_on_deny_list_rejected() {
             &client_key().verifying_key(),
             &allow_list(),
             &revoked,
+            SESSION_ID,
             NOW_MS,
             &mut seen,
         ),
@@ -1027,6 +1057,7 @@ fn grant_empty_or_unrelated_deny_list_is_inert() {
             &client_key().verifying_key(),
             &allow_list(),
             &HashSet::new(),
+            SESSION_ID,
             NOW_MS,
             &mut seen,
         )
@@ -1043,6 +1074,7 @@ fn grant_empty_or_unrelated_deny_list_is_inert() {
             &client_key().verifying_key(),
             &allow_list(),
             &unrelated,
+            SESSION_ID,
             NOW_MS,
             &mut seen2,
         )
@@ -1067,6 +1099,7 @@ enum Flip {
     GrantSigKey,
     GrantAud,
     GrantClient,
+    GrantSession,
     ArmedPast,
     ArmedTooLong,
     HeartbeatLow,
@@ -1085,6 +1118,7 @@ const ALL_FLIPS: &[Flip] = &[
     Flip::GrantSigKey,
     Flip::GrantAud,
     Flip::GrantClient,
+    Flip::GrantSession,
     Flip::ArmedPast,
     Flip::ArmedTooLong,
     Flip::HeartbeatLow,
@@ -1126,6 +1160,9 @@ fn run_flip(flip: Flip) -> Result<pancetta_agent::arm::VerifiedArmGrant, CapErro
         Flip::GrantClient => {
             g.insert("clientKeyId".to_string(), json!("otherClient00000"));
         }
+        Flip::GrantSession => {
+            g.insert("sessionId".to_string(), json!("some-other-session"));
+        }
         Flip::ArmedPast => {
             g.insert("armedUntil".to_string(), json!(NOW_MS - 10));
         }
@@ -1157,6 +1194,7 @@ fn run_flip(flip: Flip) -> Result<pancetta_agent::arm::VerifiedArmGrant, CapErro
         &client_key().verifying_key(),
         &list,
         &no_revocations(),
+        SESSION_ID,
         NOW_MS,
         &mut seen,
     )
@@ -1196,6 +1234,7 @@ fn property_each_flip_hits_its_gate() {
         (Flip::GrantSigKey, CapError::BadSignature),
         (Flip::GrantAud, CapError::AudMismatch),
         (Flip::GrantClient, CapError::ClientMismatch),
+        (Flip::GrantSession, CapError::SessionMismatch),
         (Flip::ArmedPast, CapError::Expired),
         (Flip::ArmedTooLong, CapError::ArmTooLong),
         (Flip::HeartbeatLow, CapError::BadHeartbeat),
@@ -1307,6 +1346,7 @@ fn token_without_callsign_accepts_grant_callsign() {
             &client_key().verifying_key(),
             &allow_list(),
             &no_revocations(),
+            SESSION_ID,
             NOW_MS,
             &mut seen,
         )

@@ -191,6 +191,7 @@ async fn dispatch_action(
     action: ControlAction,
     ctx: &mut ArmContext,
     bus: &MessageBus,
+    session_id: &str,
     now: i64,
 ) -> Dispatch {
     match action {
@@ -198,7 +199,7 @@ async fn dispatch_action(
             capability_token,
             grant,
         } => {
-            match verify_and_arm(&capability_token, &grant, ctx, now) {
+            match verify_and_arm(&capability_token, &grant, ctx, session_id, now) {
                 Ok(()) => {}
                 Err(reason) => {
                     // Fail-closed: audit the denial, do NOT arm.
@@ -401,13 +402,17 @@ fn dispatch_hello(capability_token: Option<String>, ctx: &mut ArmContext, now: i
 /// `capabilityJti`). The token is verified against the pinned IdP keys FIRST;
 /// then `verify_arm_grant` enforces the `txEnabledUntil` clock-2 gate, the
 /// arm-time best-effort deny-list (`ctx.revoked_jtis`, empty/inert in v1), the
-/// `clientSig`, the station-local TX-allow-list, and the window/heartbeat/scope
-/// bounds. The grant must carry a `clientKeyId` present in the allow-list AND for
+/// `clientSig`, the station-local TX-allow-list, the `sessionId` bind against
+/// `session_id` (dispensa Q-0022 — the caller's `AgentSession::session_id()`,
+/// the live Noise channel binding, so a captured grant can't be replayed into
+/// a different session), and the window/heartbeat/scope bounds. The grant
+/// must carry a `clientKeyId` present in the allow-list AND for
 /// which we hold a device verifying key.
 fn verify_and_arm(
     capability_token: &str,
     grant: &serde_json::Value,
     ctx: &mut ArmContext,
+    session_id: &str,
     now: i64,
 ) -> Result<(), String> {
     let obj = grant.as_object().ok_or("grant is not a JSON object")?;
@@ -444,6 +449,7 @@ fn verify_and_arm(
             &client_vk,
             &ctx.tx_allow_list,
             &ctx.revoked_jtis,
+            session_id,
             now,
             &mut ctx.seen_jtis,
         )
@@ -883,7 +889,16 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                         continue;
                     }
                 };
-                if dispatch_action(action, ctx, bus, now_ms()).await == Dispatch::Teardown {
+                if dispatch_action(
+                    action,
+                    ctx,
+                    bus,
+                    sess.session_id().unwrap_or_default(),
+                    now_ms(),
+                )
+                .await
+                    == Dispatch::Teardown
+                {
                     return;
                 }
                 last_phase = session_phase(&sess);
@@ -918,6 +933,9 @@ mod tests {
     const IDP_KID: &str = "idp-kid-1";
     const OPERATOR: &str = "K5ARH";
     const NOW: i64 = 1_700_000_000_000;
+    /// Matches `signed_grant`'s baked-in `sessionId` — the "live session"
+    /// `dispatch_action` calls in this module check the grant against.
+    const SESSION_ID: &str = "sess-1";
 
     fn b64url(bytes: &[u8]) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
@@ -1066,11 +1084,38 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        let d = dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        let d = dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
         assert_eq!(d, Dispatch::Continue);
         assert!(
             ctx.arm.lock().unwrap().tx_permitted(NOW),
             "a valid arm + consent must permit remote TX"
+        );
+    }
+
+    /// Dispensa Q-0022: an otherwise-perfectly-valid, correctly-signed Arm
+    /// grant whose `sessionId` doesn't match the LIVE session (e.g. a grant
+    /// captured on a prior connection, replayed into a new one) must never
+    /// arm — proven through the real coordinator dispatch path, not just
+    /// `pancetta-agent`'s unit-level `verify_arm_grant` coverage.
+    #[tokio::test]
+    async fn arm_with_mismatched_session_id_never_arms() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        // `arm_action`'s grant carries `sessionId: "sess-1"` (== SESSION_ID);
+        // dispatch it against a DIFFERENT live session id.
+        let d = dispatch_action(
+            arm_action("arm-jti-1"),
+            &mut ctx,
+            &bus,
+            "a-completely-different-session",
+            NOW,
+        )
+        .await;
+        assert_eq!(d, Dispatch::Continue);
+        assert!(
+            !ctx.arm.lock().unwrap().tx_permitted(NOW),
+            "a grant signed for a different session must never arm this one"
         );
     }
 
@@ -1090,6 +1135,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1113,6 +1159,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1124,6 +1171,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1152,6 +1200,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1162,6 +1211,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1187,6 +1237,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1197,6 +1248,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1221,6 +1273,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1231,6 +1284,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1261,6 +1315,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1277,7 +1332,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
         // No further heartbeats: at the dead-man deadline, tx_permitted is false.
         let dead = NOW + HEARTBEAT_TIMEOUT_MS;
@@ -1288,7 +1343,7 @@ mod tests {
         // A heartbeat *before* the deadline slides the window.
         let mut ctx2 = ctx_with(true, true);
         with_consent(&ctx2, true);
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx2, &bus, NOW).await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx2, &bus, SESSION_ID, NOW).await;
         dispatch_action(
             ControlAction::Heartbeat {
                 arm_jti: "arm-jti-1".into(),
@@ -1296,6 +1351,7 @@ mod tests {
             },
             &mut ctx2,
             &bus,
+            SESSION_ID,
             NOW + 20_000,
         )
         .await;
@@ -1315,7 +1371,7 @@ mod tests {
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
         // Arm at NOW; the grant's jti is "arm-jti-1" (signed_grant uses it).
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
 
         // Accept seq 5 at NOW+5000 (slides the window to there).
@@ -1327,6 +1383,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             accepted_at,
         )
         .await;
@@ -1340,6 +1397,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             deadline - 1,
         )
         .await;
@@ -1350,6 +1408,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             deadline - 1,
         )
         .await;
@@ -1368,7 +1427,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
         // A heartbeat naming a different arm must not slide the window.
         dispatch_action(
             ControlAction::Heartbeat {
@@ -1377,6 +1436,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW + 10_000,
         )
         .await;
@@ -1399,7 +1459,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         // remote_tx_enabled is OFF (default): do NOT set consent on.
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
         assert!(
             !ctx.arm.lock().unwrap().tx_permitted(NOW),
             "consent OFF must deny TX even after a valid arm"
@@ -1413,7 +1473,7 @@ mod tests {
         let mut ctx = ctx_with(false, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
         assert!(
             !ctx.arm.lock().unwrap().is_armed(),
             "a grant from a non-allow-listed client must NOT arm"
@@ -1427,7 +1487,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
         dispatch_action(
             ControlAction::Disarm {
@@ -1435,6 +1495,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1458,6 +1519,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1468,6 +1530,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1478,6 +1541,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1502,6 +1566,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1518,7 +1583,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
         // A txDisarm naming the live arm disarms it.
         dispatch_action(
@@ -1527,6 +1592,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1542,7 +1608,7 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, NOW).await;
+        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
         // A txDisarm naming a DIFFERENT arm still disarms (armJti is a sanity
         // match, not a gate — disarm-any is fail-safe TX-OFF).
@@ -1552,6 +1618,7 @@ mod tests {
             },
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1582,6 +1649,7 @@ mod tests {
             }),
             &mut ctx,
             &bus,
+            SESSION_ID,
             NOW,
         )
         .await;
@@ -1724,6 +1792,9 @@ mod tests {
         fn into_transport(self) -> snow::TransportState {
             self.inner.into_transport_mode().unwrap()
         }
+        fn handshake_hash(&self) -> Vec<u8> {
+            self.inner.get_handshake_hash().to_vec()
+        }
     }
 
     /// Mint a valid TX-enabled capabilityToken whose `aud` is `agent_key_id`.
@@ -1742,11 +1813,11 @@ mod tests {
     /// A full, frozen `txArm` INNER control frame whose `aud` is `agent_key_id`:
     /// `{type:"txArm", capabilityToken, grant}` — the token is a SIBLING of the
     /// client-signed grant (NOT inside it, per the frozen e2e-auth.v1 $defs).
-    fn tx_arm_frame_for_agent(agent_key_id: &str) -> Value {
+    fn tx_arm_frame_for_agent(agent_key_id: &str, session_id: &str) -> Value {
         let mut grant = json!({
             "aud": agent_key_id,
             "clientKeyId": CLIENT_KEY_ID,
-            "sessionId": "sess-1",
+            "sessionId": session_id,
             "capabilityJti": "cap-jti-1",
             "operatorCallsign": OPERATOR,
             "armedAt": NOW,
@@ -1825,11 +1896,22 @@ mod tests {
             _ => panic!("expected env(msg2)"),
         };
         initiator.read_msg2(&msg2);
+        // Q-0022: capture the client's channel-binding session_id BEFORE
+        // `into_transport` consumes the handshake — this is the same value
+        // the agent's `sess.session_id()` derives from its side of the SAME
+        // completed handshake, proving the real chain end-to-end (not two
+        // sides independently agreeing on a hardcoded test constant).
+        let client_session_id = b64url(&initiator.handshake_hash());
+        assert_eq!(
+            sess.session_id(),
+            Some(client_session_id.as_str()),
+            "agent and client must derive the identical channel-binding session_id"
+        );
         let mut client_transport = initiator.into_transport();
 
         // Encrypt the real txArm control frame (token+grant siblings) and hand
         // it to the session as an env.
-        let arm_frame = tx_arm_frame_for_agent(&agent_kid);
+        let arm_frame = tx_arm_frame_for_agent(&agent_kid, &client_session_id);
         let plaintext = serde_json::to_vec(&arm_frame).unwrap();
         let mut ct = vec![0u8; plaintext.len() + 16];
         let n = client_transport.write_message(&plaintext, &mut ct).unwrap();
@@ -1852,10 +1934,16 @@ mod tests {
         let action = map_client_frame(&decrypted).unwrap();
         assert!(matches!(action, ControlAction::Arm { .. }));
 
+        // Use the agent's OWN session_id() (not the hardcoded SESSION_ID test
+        // constant other tests use) — this is what makes this test an actual
+        // end-to-end proof of Q-0022's wiring, not just two hardcoded strings
+        // matching each other.
+        let agent_session_id = sess.session_id().expect("transport established");
+
         let mut ctx = ctx_with_agent(&agent_kid, true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        let d = dispatch_action(action, &mut ctx, &bus, NOW).await;
+        let d = dispatch_action(action, &mut ctx, &bus, agent_session_id, NOW).await;
         assert_eq!(d, Dispatch::Continue);
         assert!(
             ctx.arm.lock().unwrap().tx_permitted(NOW),
@@ -1866,7 +1954,7 @@ mod tests {
         let mut ctx_off = ctx_with_agent(&agent_kid, true, true);
         // (consent left OFF)
         let action2 = map_client_frame(&decrypted).unwrap();
-        dispatch_action(action2, &mut ctx_off, &bus, NOW).await;
+        dispatch_action(action2, &mut ctx_off, &bus, agent_session_id, NOW).await;
         // jti replay guard is per-ctx (fresh seen set), so this arms the state
         // machine but consent-off denies at the gate.
         assert!(

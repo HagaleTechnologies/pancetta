@@ -232,6 +232,11 @@ pub enum CapError {
     /// attribution integrity).
     #[error("grant operatorCallsign does not match the token's")]
     CallsignMismatch,
+    /// The grant's `sessionId` did not equal the live Noise session's channel
+    /// binding (dispensa Q-0022) — the replay-bind that ties one arm to one
+    /// live session failed, so a captured grant cannot be armed here.
+    #[error("grant sessionId does not match the live session")]
+    SessionMismatch,
 }
 
 /// Decode unpadded (or padded) base64url into bytes. Fails closed to
@@ -473,14 +478,17 @@ impl CapabilityVerifier {
     /// **best-effort** revocation deny-list keyed by the capability's `jti` — an
     /// **empty** set is INERT (never blocks; the station-local allow-list is the
     /// authoritative revoke); `seen_jtis` is the session-scoped single-use replay
-    /// set.
+    /// set; `expected_session_id` is the LIVE Noise session's channel binding
+    /// (dispensa Q-0022 — `AgentSession::session_id`, unpadded base64url of the
+    /// completed handshake hash) that `grant.sessionId` must equal, so a grant
+    /// captured on one session can never be replayed into another.
     ///
     /// Verification order (frozen e2e-auth.v1 `$defs.txArm`): the capability was
     /// already verified by the caller; here we gate, in order, **txEnabledUntil
     /// present AND still in-window**, then **jti not on the best-effort
     /// deny-list**, then clientSig, aud, allow-list, clientKeyId bind,
-    /// capabilityJti bind, window/heartbeat bounds, tx scope, single-use jti, and
-    /// finally mint.
+    /// capabilityJti bind, **sessionId bind**, window/heartbeat bounds, tx
+    /// scope, single-use jti, and finally mint.
     #[allow(clippy::too_many_arguments)]
     pub fn verify_arm_grant(
         &self,
@@ -489,6 +497,7 @@ impl CapabilityVerifier {
         client_verifying_key: &VerifyingKey,
         tx_allow_list: &HashSet<String>,
         revoked_jtis: &HashSet<String>,
+        expected_session_id: &str,
         now_ms: i64,
         seen_jtis: &mut HashSet<String>,
     ) -> Result<VerifiedArmGrant, CapError> {
@@ -573,6 +582,18 @@ impl CapabilityVerifier {
             .ok_or_else(|| CapError::MalformedClaim("capabilityJti".to_string()))?;
         if capability_jti != capability.jti {
             return Err(CapError::CapabilityMismatch);
+        }
+
+        // 3c. Bind the arm to THIS live Noise session (dispensa Q-0022): the
+        //     client signs `sessionId` into `clientSig`, so a captured grant
+        //     replayed against a different (or reconnected) session fails
+        //     here even if every other field still verifies.
+        let session_id = obj
+            .get("sessionId")
+            .and_then(Value::as_str)
+            .ok_or_else(|| CapError::MalformedClaim("sessionId".to_string()))?;
+        if session_id != expected_session_id {
+            return Err(CapError::SessionMismatch);
         }
 
         // 4. armedUntil window + heartbeat bounds.
