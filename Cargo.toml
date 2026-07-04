@@ -86,7 +86,7 @@ dirs = "5.0"
 num_cpus = "1.0"
 
 # Signal handling
-signal-hook = "0.3"
+signal-hook = "0.4"
 
 # Performance monitoring
 metrics = "0.24"
