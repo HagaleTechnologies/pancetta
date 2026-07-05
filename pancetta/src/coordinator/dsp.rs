@@ -85,6 +85,17 @@ fn band_flush_decision(band_ref_hz: u64, cur_dial_hz: u64) -> (u64, bool) {
     (band_ref_hz, false)
 }
 
+/// Decide whether the in-flight FT8 audio window must be flushed because the
+/// active operating mode changed (the operator cycled FT8/FT4/FT2 live).
+///
+/// `cached_mode`/`cur_mode` are `pancetta_config::OperatingMode::as_u8()`
+/// values. Unlike [`band_flush_decision`] there is no "unknown baseline"
+/// case — the DSP thread always starts with a real mode read from config at
+/// spawn time, so a simple inequality is the whole decision.
+fn mode_flush_decision(cached_mode: u8, cur_mode: u8) -> bool {
+    cached_mode != cur_mode
+}
+
 /// Manage WAV recording of 12kHz mono FT8 windows for decoder validation.
 ///
 /// Writes one WAV file per FT8 window (12.64 seconds @ 12kHz mono i16).
@@ -713,6 +724,23 @@ mod band_flush_tests {
         let (new_ref, flush) = band_flush_decision(M20, M20);
         assert!(!flush);
         assert_eq!(new_ref, M20);
+    }
+}
+
+#[cfg(test)]
+mod mode_flush_tests {
+    use super::mode_flush_decision;
+
+    #[test]
+    fn mode_flush_decision_same_mode_no_flush() {
+        assert!(!mode_flush_decision(0, 0));
+    }
+
+    #[test]
+    fn mode_flush_decision_changed_mode_flushes() {
+        assert!(mode_flush_decision(0, 1)); // FT8 -> FT4
+        assert!(mode_flush_decision(1, 2)); // FT4 -> FT2
+        assert!(mode_flush_decision(2, 0)); // FT2 -> FT8
     }
 }
 
