@@ -22,6 +22,41 @@ pub enum OperatingMode {
     Ft2,
 }
 
+impl OperatingMode {
+    /// Stable `u8` encoding for atomic storage. The mapping is fixed and
+    /// MUST NOT change (`0` = Ft8, `1` = Ft4, `2` = Ft2).
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            OperatingMode::Ft8 => 0,
+            OperatingMode::Ft4 => 1,
+            OperatingMode::Ft2 => 2,
+        }
+    }
+
+    /// Decode an [`OperatingMode`] from its stable `u8` encoding (see
+    /// [`OperatingMode::as_u8`]). Any unrecognized value decodes to the safe
+    /// default [`OperatingMode::Ft8`] — callers writing the atomic only ever
+    /// store values produced by `as_u8`, so this branch is defensive.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => OperatingMode::Ft8,
+            1 => OperatingMode::Ft4,
+            2 => OperatingMode::Ft2,
+            _ => OperatingMode::Ft8,
+        }
+    }
+
+    /// Cycle to the next mode in the Ft8 → Ft4 → Ft2 → Ft8 order. Drives the
+    /// operator's runtime mode-switch key (Shift+M).
+    pub fn cycle(&self) -> Self {
+        match self {
+            OperatingMode::Ft8 => OperatingMode::Ft4,
+            OperatingMode::Ft4 => OperatingMode::Ft2,
+            OperatingMode::Ft2 => OperatingMode::Ft8,
+        }
+    }
+}
+
 /// Default operating mode for [`RigConfig::mode`]: FT8.
 fn default_operating_mode() -> String {
     "FT8".to_string()
@@ -1211,5 +1246,27 @@ mod tests {
         config.mode = "FT9".to_string();
         assert!(config.operating_mode().is_err());
         assert!(config.validate_section().is_err());
+    }
+
+    #[test]
+    fn operating_mode_u8_roundtrip() {
+        assert_eq!(OperatingMode::from_u8(OperatingMode::Ft8.as_u8()), OperatingMode::Ft8);
+        assert_eq!(OperatingMode::from_u8(OperatingMode::Ft4.as_u8()), OperatingMode::Ft4);
+        assert_eq!(OperatingMode::from_u8(OperatingMode::Ft2.as_u8()), OperatingMode::Ft2);
+        assert_eq!(OperatingMode::Ft8.as_u8(), 0);
+        assert_eq!(OperatingMode::Ft4.as_u8(), 1);
+        assert_eq!(OperatingMode::Ft2.as_u8(), 2);
+    }
+
+    #[test]
+    fn operating_mode_from_u8_unrecognized_defaults_to_ft8() {
+        assert_eq!(OperatingMode::from_u8(99), OperatingMode::Ft8);
+    }
+
+    #[test]
+    fn operating_mode_cycle_order() {
+        assert_eq!(OperatingMode::Ft8.cycle(), OperatingMode::Ft4);
+        assert_eq!(OperatingMode::Ft4.cycle(), OperatingMode::Ft2);
+        assert_eq!(OperatingMode::Ft2.cycle(), OperatingMode::Ft8);
     }
 }
