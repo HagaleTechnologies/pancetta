@@ -683,6 +683,18 @@ impl QsoManager {
         &self.config
     }
 
+    /// Update the station-wide active mode string stamped into every
+    /// [`QsoMetadata::mode`] this manager creates from now on. Only affects
+    /// QSOs opened AFTER this call — anything already in progress keeps its
+    /// already-stamped mode. Called from the coordinator's QSO task when the
+    /// operator switches mode live (Shift+M); the caller (coordinator) is
+    /// responsible for having already confirmed no QSO is active before the
+    /// switch (see `try_switch_operating_mode`), so this setter itself does
+    /// no gating.
+    pub fn set_active_mode(&mut self, mode: String) {
+        self.config.active_mode = mode;
+    }
+
     /// Start the QSO manager
     pub async fn start(&self) -> Result<(), QsoManagerError> {
         info!("Starting QSO manager for {}", self.config.our_callsign);
@@ -4012,6 +4024,15 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(manager.get_qso(rx_id).await.unwrap().metadata.mode, "FT4");
+    }
+
+    /// `set_active_mode` updates the manager's configured mode, affecting
+    /// only QSOs opened after the call.
+    #[tokio::test]
+    async fn set_active_mode_affects_qsos_opened_afterward() {
+        let mut manager = QsoManager::new(test_config()); // starts at "FT8"
+        manager.set_active_mode("FT4".to_string());
+        assert_eq!(manager.config().active_mode, "FT4");
     }
 
     /// An FT4 `QsoMetadata` (built by a manager in FT4 mode) renders ADIF

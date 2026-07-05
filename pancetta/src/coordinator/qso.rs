@@ -2990,6 +2990,12 @@ impl super::ApplicationCoordinator {
                                                     .await;
                                             }
                                         }
+                                        crate::message_bus::QsoMessage::SetOperatingMode {
+                                            mode,
+                                        } => {
+                                            qso_manager.set_active_mode(mode.clone());
+                                            info!("QSO manager active mode set to {}", mode);
+                                        }
                                     }
                                 }
 

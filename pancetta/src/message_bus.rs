@@ -641,6 +641,16 @@ pub enum QsoMessage {
         /// `true` to engage Fox mode; `false` to disengage.
         on: bool,
     },
+    /// The operator switched the station-wide operating mode live
+    /// (Shift+M, gated by `try_switch_operating_mode` — the coordinator only
+    /// sends this after confirming no QSO is active). Updates
+    /// `QsoManager::active_mode` for QSOs opened from now on; anything
+    /// already logged keeps its already-stamped mode.
+    SetOperatingMode {
+        /// The new mode string (`"FT8"` / `"FT4"` / `"FT2"`), from
+        /// `super::mode_str`.
+        mode: String,
+    },
     /// Operator engaged Hound (DXpedition chaser) mode on a selected Fox.
     ///
     /// Opens a manual Hound QSO: calls the Fox low (300–900 Hz), QSYs up into
