@@ -807,6 +807,8 @@ impl ConfigSection for AudioConfig {
             self.output_channels = other.output_channels;
         }
 
+        self.bit_depth = other.bit_depth;
+
         // Merge complex structures
         self.processing.merge_with(other.processing);
         self.agc.merge_with(other.agc);

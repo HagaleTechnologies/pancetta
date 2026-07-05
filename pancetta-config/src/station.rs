@@ -255,6 +255,16 @@ impl ConfigSection for StationConfig {
             self.contest_category = other.contest_category;
         }
 
+        if other.tx_late_max_ms != 0 {
+            self.tx_late_max_ms = other.tx_late_max_ms;
+        }
+
+        self.tx_self_parity = other.tx_self_parity;
+
+        if other.ptt_lead_ms != 0 {
+            self.ptt_lead_ms = other.ptt_lead_ms;
+        }
+
         // Merge custom fields
         self.custom_fields.extend(other.custom_fields);
     }
@@ -460,6 +470,28 @@ mod tests {
         assert_eq!(config.grid_square, "AA00aa");
         assert_eq!(config.power_watts, 100);
         assert!(config.validate_section().is_ok());
+    }
+
+    /// Regression: same bug class as NetworkConfig's merge_with (see
+    /// network.rs's `merge_with_carries_over_every_opt_in_integration`) —
+    /// tx_late_max_ms/tx_self_parity/ptt_lead_ms drive the live TX-slot
+    /// scheduler (coordinator/tx.rs) and were silently dropped during
+    /// multi-source config merging, always reverting to compiled-in defaults
+    /// regardless of what the operator's file said.
+    #[test]
+    fn merge_with_carries_over_tx_timing_fields() {
+        let mut base = StationConfig::default();
+
+        let mut file_cfg = StationConfig::default();
+        file_cfg.tx_late_max_ms = 12_000;
+        file_cfg.tx_self_parity = TxSelfParity::Even;
+        file_cfg.ptt_lead_ms = 150;
+
+        base.merge_with(file_cfg);
+
+        assert_eq!(base.tx_late_max_ms, 12_000);
+        assert_eq!(base.tx_self_parity, TxSelfParity::Even);
+        assert_eq!(base.ptt_lead_ms, 150);
     }
 
     #[test]
