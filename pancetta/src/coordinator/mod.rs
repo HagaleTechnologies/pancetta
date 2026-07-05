@@ -264,6 +264,75 @@ pub(crate) fn mode_str(mode: pancetta_config::OperatingMode) -> &'static str {
     }
 }
 
+/// Error returned by [`try_switch_operating_mode`] when a runtime mode
+/// switch (operator Shift+M) cannot be applied. `pub` (not `pub(crate)`) so
+/// `pancetta/tests/coord_sim.rs` can assert on it directly — mirrors the
+/// existing precedent of `tx_qso_is_live`/`coalesce_transmit_requests` being
+/// `pub` specifically for coord_sim testability.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeSwitchError {
+    /// `N` QSO(s) are currently non-terminal; switching mid-exchange would
+    /// leave DSP/decode/TX disagreeing about the active protocol for an
+    /// in-flight QSO. The operator retries once clear.
+    QsosActive(usize),
+    /// The shared `Ft8Config` lock was unavailable (contended or poisoned).
+    /// Fails CLOSED — better to refuse the switch than leave DSP and decode
+    /// disagreeing about frame geometry.
+    ConfigLockBusy,
+}
+
+/// Attempt a runtime FT8/FT4/FT2 mode switch (operator Shift+M).
+///
+/// Gated on `active_tx_qsos` being empty: holds the **synchronous**
+/// `std::sync::RwLock` read guard for the ENTIRE critical section below (no
+/// `.await` anywhere in this function — it does not need to be `async`).
+/// Any concurrent QSO-open needs a WRITE lock on that same set to register,
+/// so it blocks until this function returns (or never starts if the initial
+/// check already sees a non-empty set). This mirrors the auto-repark
+/// feature's documented "zero `.await` between the live-QSO check and the
+/// write" invariant (`coordinator/autonomous.rs`).
+///
+/// Ordering: the fallible step (`ft8_config.try_write()`) happens BEFORE any
+/// atomic store, so a failure here leaves every consumer (DSP, decode, TX,
+/// QSO) seeing the OLD mode consistently — never a torn state where some
+/// consumers see new atomics but the decoder config is still old.
+pub fn try_switch_operating_mode(
+    new_mode: pancetta_config::OperatingMode,
+    active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    ft8_config: &std::sync::Arc<tokio::sync::RwLock<pancetta_ft8::Ft8Config>>,
+    active_protocol_mode: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    active_slot_ns: &std::sync::Arc<std::sync::atomic::AtomicI64>,
+    active_decode_phase_ns: &std::sync::Arc<std::sync::atomic::AtomicI64>,
+) -> Result<(), ModeSwitchError> {
+    use std::sync::atomic::Ordering;
+
+    let active_guard = active_tx_qsos
+        .read()
+        .map_err(|_| ModeSwitchError::QsosActive(usize::MAX))?;
+    if !active_guard.is_empty() {
+        return Err(ModeSwitchError::QsosActive(active_guard.len()));
+    }
+
+    let new_protocol = protocol_from_mode(new_mode);
+    let mut cfg_guard = ft8_config
+        .try_write()
+        .map_err(|_| ModeSwitchError::ConfigLockBusy)?;
+    cfg_guard.protocol = new_protocol;
+    drop(cfg_guard);
+
+    let timing = derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(new_protocol));
+    let decode_phase_ns = timing
+        .decode_phase
+        .num_nanoseconds()
+        .unwrap_or(13_000_000_000);
+    active_slot_ns.store(timing.slot_ns, Ordering::Relaxed);
+    active_decode_phase_ns.store(decode_phase_ns, Ordering::Relaxed);
+    active_protocol_mode.store(new_mode.as_u8(), Ordering::Relaxed);
+
+    drop(active_guard);
+    Ok(())
+}
+
 /// Per-protocol timing values the DSP windowing thread needs, derived once at
 /// startup from a [`pancetta_ft8::ProtocolParams`] via [`derive_dsp_timing`].
 ///
@@ -1319,6 +1388,13 @@ impl ApplicationCoordinator {
         self.active_slot_ns.clone()
     }
 
+    /// Active protocol's decode-phase atomic in nanoseconds (FT8 → 13e9,
+    /// FT4 → 6.5e9). Cloned into the decode loop's parity-stamping sites and
+    /// (from this task onward) written by `try_switch_operating_mode`.
+    pub(crate) fn active_decode_phase_ns(&self) -> Arc<std::sync::atomic::AtomicI64> {
+        self.active_decode_phase_ns.clone()
+    }
+
     /// Station-agent remote-TX arm gate (shared handle). Cloned into the TX
     /// worker, which checks `tx_permitted(now_ms)` before keying PTT for any
     /// `TxOrigin::Remote` request and drops it (fail-closed) if not permitted.
@@ -1787,5 +1863,67 @@ mod tests {
             "WAV playback should succeed: {:?}",
             result.err()
         );
+    }
+
+    // ------------------------------------------------------------------
+    // try_switch_operating_mode — gated on active_tx_qsos being empty.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn try_switch_operating_mode_refuses_with_active_qso() {
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::from([
+            "W1ABC-14074000".to_string(),
+        ])));
+        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config::default()));
+        let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::OperatingMode::Ft8.as_u8(),
+        ));
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
+        let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000));
+
+        let result = try_switch_operating_mode(
+            pancetta_config::OperatingMode::Ft4,
+            &active_tx_qsos,
+            &ft8_config,
+            &active_protocol_mode,
+            &active_slot_ns,
+            &active_decode_phase_ns,
+        );
+
+        assert!(matches!(result, Err(ModeSwitchError::QsosActive(1))));
+        // Nothing was touched.
+        assert_eq!(
+            active_protocol_mode.load(Ordering::Relaxed),
+            pancetta_config::OperatingMode::Ft8.as_u8()
+        );
+        assert_eq!(active_slot_ns.load(Ordering::Relaxed), 15_000_000_000);
+    }
+
+    #[tokio::test]
+    async fn try_switch_operating_mode_succeeds_when_idle() {
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config::default()));
+        let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::OperatingMode::Ft8.as_u8(),
+        ));
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
+        let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000));
+
+        let result = try_switch_operating_mode(
+            pancetta_config::OperatingMode::Ft4,
+            &active_tx_qsos,
+            &ft8_config,
+            &active_protocol_mode,
+            &active_slot_ns,
+            &active_decode_phase_ns,
+        );
+
+        assert!(result.is_ok());
+        assert_eq!(
+            active_protocol_mode.load(Ordering::Relaxed),
+            pancetta_config::OperatingMode::Ft4.as_u8()
+        );
+        assert_eq!(active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);
+        assert_eq!(ft8_config.read().await.protocol, pancetta_ft8::Protocol::Ft4);
     }
 }
