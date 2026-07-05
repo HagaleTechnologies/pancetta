@@ -1497,6 +1497,17 @@ impl ConfigSection for NetworkConfig {
         self.dx_cluster = other.dx_cluster;
         self.web_api = other.web_api;
         self.proxy = other.proxy;
+        self.tls = other.tls;
+        self.rate_limiting = other.rate_limiting;
+        self.reliability = other.reliability;
+        self.cqdx = other.cqdx;
+        self.clublog = other.clublog;
+        self.qrz_logbook = other.qrz_logbook;
+        self.lotw = other.lotw;
+        self.eqsl = other.eqsl;
+        self.qrz_xml = other.qrz_xml;
+        self.remote_gateway = other.remote_gateway;
+        self.station_agent = other.station_agent;
 
         // Merge custom services
         self.custom_services.extend(other.custom_services);
@@ -1775,6 +1786,59 @@ mod tests {
 
         config.qrz_logbook.api_key = "qrzkey123".to_string();
         assert!(config.validate_section().is_ok());
+    }
+
+    /// Regression for the real-world bug where an operator's `[network.qrz_logbook]`
+    /// (and clublog/lotw/eqsl/qrz_xml/cqdx/tls/rate_limiting/reliability/
+    /// remote_gateway/station_agent) settings, correctly present in their config
+    /// file, were silently discarded during multi-source merging: `merge_with`
+    /// only ever copied `psk_reporter`/`wspr`/`dx_cluster`/`web_api`/`proxy`
+    /// from `other`, so every later-added integration always reverted to its
+    /// compiled-in (disabled) default regardless of what the file said.
+    #[test]
+    fn merge_with_carries_over_every_opt_in_integration() {
+        let mut base = NetworkConfig::default();
+
+        let mut file_cfg = NetworkConfig::default();
+        file_cfg.qrz_logbook.enabled = true;
+        file_cfg.qrz_logbook.api_key = "qrzkey123".to_string();
+        file_cfg.clublog.enabled = true;
+        file_cfg.clublog.email = "op@example.com".to_string();
+        file_cfg.clublog.password = "secret".to_string();
+        file_cfg.clublog.api_key = "appkey123".to_string();
+        file_cfg.lotw.enabled = true;
+        file_cfg.lotw.tqsl_path = "/usr/bin/tqsl".to_string();
+        file_cfg.lotw.station_location = "Home".to_string();
+        file_cfg.eqsl.enabled = true;
+        file_cfg.eqsl.username = "opcall".to_string();
+        file_cfg.eqsl.password = "eqslpw".to_string();
+        file_cfg.qrz_xml.enabled = true;
+        file_cfg.qrz_xml.username = "opcall".to_string();
+        file_cfg.qrz_xml.password = "qrzxmlpw".to_string();
+        file_cfg.cqdx.enabled = true;
+        file_cfg.cqdx.token = Some("pat_abc".to_string());
+        file_cfg.remote_gateway.enabled = true;
+        file_cfg.station_agent.enabled = false; // exercised via bool identity below
+
+        base.merge_with(file_cfg);
+
+        assert!(
+            base.qrz_logbook.enabled,
+            "qrz_logbook.enabled must survive merge"
+        );
+        assert_eq!(base.qrz_logbook.api_key, "qrzkey123");
+        assert!(base.clublog.enabled, "clublog.enabled must survive merge");
+        assert_eq!(base.clublog.api_key, "appkey123");
+        assert!(base.lotw.enabled, "lotw.enabled must survive merge");
+        assert_eq!(base.lotw.station_location, "Home");
+        assert!(base.eqsl.enabled, "eqsl.enabled must survive merge");
+        assert!(base.qrz_xml.enabled, "qrz_xml.enabled must survive merge");
+        assert!(base.cqdx.enabled, "cqdx.enabled must survive merge");
+        assert_eq!(base.cqdx.token.as_deref(), Some("pat_abc"));
+        assert!(
+            base.remote_gateway.enabled,
+            "remote_gateway.enabled must survive merge"
+        );
     }
 
     #[test]
