@@ -279,6 +279,13 @@ pub enum ModeSwitchError {
     /// Fails CLOSED — better to refuse the switch than leave DSP and decode
     /// disagreeing about frame geometry.
     ConfigLockBusy,
+    /// The `active_tx_qsos` lock was poisoned (some other thread panicked
+    /// while holding it), so it could not even be read to determine whether
+    /// any QSO is active. Distinct from [`Self::QsosActive`], which means the
+    /// set WAS read successfully and found non-empty. Fails CLOSED — the
+    /// switch is refused either way, but this variant avoids reporting a
+    /// bogus `usize::MAX` QSO count to the operator.
+    QsoSetUnavailable,
 }
 
 /// Attempt a runtime FT8/FT4/FT2 mode switch (operator Shift+M).
@@ -308,7 +315,7 @@ pub fn try_switch_operating_mode(
 
     let active_guard = active_tx_qsos
         .read()
-        .map_err(|_| ModeSwitchError::QsosActive(usize::MAX))?;
+        .map_err(|_| ModeSwitchError::QsoSetUnavailable)?;
     if !active_guard.is_empty() {
         return Err(ModeSwitchError::QsosActive(active_guard.len()));
     }
@@ -1925,5 +1932,35 @@ mod tests {
         );
         assert_eq!(active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);
         assert_eq!(ft8_config.read().await.protocol, pancetta_ft8::Protocol::Ft4);
+    }
+
+    #[test]
+    fn try_switch_operating_mode_reports_unavailable_on_poisoned_lock() {
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(std::collections::HashSet::new()));
+        let ft8_config = Arc::new(tokio::sync::RwLock::new(Ft8Config::default()));
+        let active_protocol_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_config::OperatingMode::Ft8.as_u8(),
+        ));
+        let active_slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
+        let active_decode_phase_ns = Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000));
+
+        // Poison the lock by panicking while holding a write guard.
+        let poison_target = Arc::clone(&active_tx_qsos);
+        let _ = std::thread::spawn(move || {
+            let _guard = poison_target.write().unwrap();
+            panic!("intentional poison for test");
+        })
+        .join();
+
+        let result = try_switch_operating_mode(
+            pancetta_config::OperatingMode::Ft4,
+            &active_tx_qsos,
+            &ft8_config,
+            &active_protocol_mode,
+            &active_slot_ns,
+            &active_decode_phase_ns,
+        );
+
+        assert!(matches!(result, Err(ModeSwitchError::QsoSetUnavailable)));
     }
 }
