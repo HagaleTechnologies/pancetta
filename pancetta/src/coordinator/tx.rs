@@ -801,6 +801,11 @@ impl super::ApplicationCoordinator {
             // (byte-identical), `Ft4`/`Ft2` emit the correct on-air waveform
             // (FT4 → 4-GFSK, 105 symbols, GFSK BT=1.0). Without this the station
             // would DECODE FT4 but TRANSMIT an FT8 waveform onto the 7.5s grid.
+            // Live mode atomic — re-checked at the top of every request-
+            // processing cycle below so a runtime FT8/FT4/FT2 switch
+            // (Shift+M) takes effect on the very next TX, not just at
+            // coordinator startup.
+            let active_protocol_mode_atomic = self.active_protocol_mode();
             let active_protocol = self.active_protocol();
             // Station-agent remote-TX arm gate. Consulted ONLY for
             // `TxOrigin::Remote` requests before keying PTT; `TxOrigin::Local`
@@ -814,6 +819,10 @@ impl super::ApplicationCoordinator {
                     "FT8 transmitter component ready (protocol {})",
                     active_protocol
                 );
+
+                // Shadowed as mutable: rebuilt in-loop below when the live
+                // mode atomic diverges from this startup snapshot.
+                let mut active_protocol = active_protocol;
 
                 // For FT8 keep the exact legacy `Ft8Encoder::new()`; for FT4/FT2
                 // build the encoder with the mode's protocol params so
@@ -837,6 +846,32 @@ impl super::ApplicationCoordinator {
                     // try_recv cycle. Keeps a stale F8 from earlier (when no
                     // TX was in flight) from killing the next legitimate TX.
                     abort_current_tx.store(false, Ordering::Release);
+
+                    // Re-check the live mode atomic every cycle. Encoder
+                    // construction is cheap (no per-request TX happens more
+                    // than once every several seconds in FT8/FT4/FT2
+                    // operation) so rebuilding on a detected change, rather
+                    // than every single request, keeps the common case
+                    // (no change) a plain atomic load.
+                    let live_protocol = super::protocol_from_mode(
+                        pancetta_config::OperatingMode::from_u8(
+                            active_protocol_mode_atomic.load(Ordering::Relaxed),
+                        ),
+                    );
+                    if live_protocol != active_protocol {
+                        info!(
+                            "TX worker: protocol changed {} -> {} — rebuilding encoder",
+                            active_protocol, live_protocol
+                        );
+                        active_protocol = live_protocol;
+                        encoder = match active_protocol {
+                            pancetta_ft8::Protocol::Ft8 => Ft8Encoder::new(),
+                            _ => Ft8Encoder::with_protocol(
+                                pancetta_ft8::ProtocolParams::from_protocol(active_protocol),
+                            ),
+                        };
+                    }
+
                     match tx_rx.try_recv() {
                         Ok(mut message) => {
                             // qso-state-machine-analysis Symptom B fix: capture
