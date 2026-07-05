@@ -1830,17 +1830,44 @@ impl App {
 
         let band = &self.config.bands.bands[self.current_band_index];
         let band_name = band.name.clone();
-        // TODO(ft4): manual band-change dial is mode-unaware here — the TUI's
-        // band table (`config.bands`) carries FT8 dial frequencies in MHz and
-        // the active operating mode lives in the coordinator's [rig] config,
-        // not threaded into the TUI. In FT4 mode the operator currently lands
-        // on the FT8 dial via the manual `=`/`-` path. The autonomous band-hop
-        // path IS mode-aware (coordinator/autonomous.rs ChangeBand handler,
-        // via pancetta_core::Band::ft4_frequency / dial_for). Wiring the TUI
-        // path needs the active mode + a per-band FT4 column threaded in.
-        self.station_info.operating_frequency = band.ft8_frequency;
-        let dial = (band.ft8_frequency * 1_000_000.0) as u64;
-        let base_status = format!("Band: {} — {:.3} MHz", band_name, band.ft8_frequency);
+        // Mode-aware dial resolution (closes the manual-band-change gap
+        // documented for FT4 mode). FT8 → the TUI's own band table
+        // (unchanged). FT4 → `Band::dial_for(true)`, the same call the
+        // autonomous ChangeBand handler already uses; falls back to the FT8
+        // frequency (with a status note) on a band with no standard FT4
+        // sub-band. FT2 → no standard dial-frequency table exists yet (FT2
+        // remains blocked on the operator resolving two incompatible spec
+        // candidates); falls back to FT8 with a status note.
+        let core_band =
+            pancetta_core::Band::from_frequency((band.ft8_frequency * 1_000_000.0) as u64);
+        let (dial, fallback_note) = match self.station_info.mode.as_str() {
+            "FT4" => match core_band.and_then(|b| b.dial_for(true)) {
+                Some(hz) => (hz, None),
+                None => (
+                    (band.ft8_frequency * 1_000_000.0) as u64,
+                    Some(format!(
+                        "{} has no standard FT4 frequency — using FT8 dial",
+                        band_name
+                    )),
+                ),
+            },
+            "FT2" => (
+                (band.ft8_frequency * 1_000_000.0) as u64,
+                Some("FT2 dial frequencies not yet defined — using FT8 dial".to_string()),
+            ),
+            _ => ((band.ft8_frequency * 1_000_000.0) as u64, None),
+        };
+        self.station_info.operating_frequency = dial as f64 / 1_000_000.0;
+        let base_status = match fallback_note {
+            Some(note) => format!(
+                "Band: {} — {:.3} MHz ({})",
+                band_name, self.station_info.operating_frequency, note
+            ),
+            None => format!(
+                "Band: {} — {:.3} MHz",
+                band_name, self.station_info.operating_frequency
+            ),
+        };
 
         // 3. Clear every live list and reset cursors/pins.
         self.decoded_messages.clear();
@@ -5241,6 +5268,45 @@ mod tests {
         assert_eq!(app.band_activity_scroll, 0);
         assert_eq!(app.dx_hunter_scroll, 0);
         assert_eq!(app.callers_scroll, 0);
+    }
+
+    /// Manual band-change is mode-aware: in FT4 mode, `apply_band_selection`
+    /// resolves the dial via `pancetta_core::Band::dial_for(true)` (the same
+    /// call the autonomous ChangeBand handler already uses) rather than
+    /// always using the TUI's own FT8 band table.
+    #[tokio::test]
+    async fn apply_band_selection_uses_ft4_dial_when_mode_is_ft4() {
+        let mut app = fixture_app().await;
+        app.station_info.mode = "FT4".to_string();
+        // Land on 20M, which has a standard FT4 sub-band.
+        let idx = app
+            .config
+            .bands
+            .bands
+            .iter()
+            .position(|b| b.name == "20M")
+            .expect("20M band must exist in default config");
+        app.current_band_index = idx;
+        let dial_hz = app.apply_band_selection(None);
+        assert_eq!(dial_hz, 14_080_000); // pancetta_core::Band::Band20m.ft4_frequency()
+    }
+
+    /// Regression: the default (FT8) mode must be byte-identical to before —
+    /// the mode-aware dial resolution must not perturb the FT8 path.
+    #[tokio::test]
+    async fn apply_band_selection_ft8_unaffected_by_mode_field() {
+        let mut app = fixture_app().await;
+        assert_eq!(app.station_info.mode, "FT8");
+        let idx = app
+            .config
+            .bands
+            .bands
+            .iter()
+            .position(|b| b.name == "20M")
+            .unwrap();
+        app.current_band_index = idx;
+        let dial_hz = app.apply_band_selection(None);
+        assert_eq!(dial_hz, 14_074_000); // unchanged FT8 dial
     }
 
     /// Returning to a band within the 10-minute TTL restores its Callers (and
