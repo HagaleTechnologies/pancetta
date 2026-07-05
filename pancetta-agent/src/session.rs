@@ -432,6 +432,30 @@ mod tests {
         "CLIENT-KEY-ID".to_string()
     }
 
+    /// Cross-repo conformance check for dispensa Q-0022: pancetta's production
+    /// `b64url_unpadded` (the same function `session_id()` uses on the real
+    /// handshake hash) must reproduce `sessionIdB64` from
+    /// `contracts/auth/tx-arm-session-id.vectors.v1.json` byte-for-byte given
+    /// that vector's `handshakeHashHex`. This is the "not yet checked against
+    /// this specific vector file" gap the vector's own `conformance.pancetta`
+    /// note called out; panino already PASSed the same fixture.
+    #[test]
+    fn session_id_matches_dispensa_q0022_vector() {
+        let handshake_hash_hex = "48f3cb8bc9319da4ba1e9933991b1c4ed4034f1f126a76d3a1fbcfd7f94248d4";
+        let expected_session_id_b64 = "SPPLi8kxnaS6HpkzmRscTtQDTx8SanbTofvP1_lCSNQ";
+
+        let hash_bytes = hex_decode(handshake_hash_hex);
+        assert_eq!(hash_bytes.len(), 32, "handshake hash must be 32 bytes");
+        assert_eq!(b64url_unpadded(&hash_bytes), expected_session_id_b64);
+    }
+
+    fn hex_decode(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
     #[test]
     fn full_agent_leg_reaches_admitted_and_auth_sig_verifies() {
         let identity = AgentIdentity::generate();
