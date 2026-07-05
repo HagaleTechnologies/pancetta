@@ -548,6 +548,46 @@ fn test_ft4_round_trip_cq() {
     );
 }
 
+/// The C ft8_lib decoder, asked to decode as FT4 via
+/// `decode_window_ft8lib_protocol`, must round-trip a real FT4 message.
+/// Regression for the 2026-07-06 fix: the vendored C library already
+/// supported FT4 (`monitor_init` branches on `cfg.protocol`), but the Rust
+/// wrapper hardcoded `FTX_PROTOCOL_FT8`, so it was never actually exercised
+/// for FT4 audio in production.
+#[test]
+#[cfg(not(ft8lib_stub))]
+fn test_ft4_round_trip_via_ft8lib_c_decoder() {
+    use pancetta_ft8::Protocol;
+    let symbols = encode_ft4("CQ W1ABC FN42");
+    let audio = modulate_ft4(&symbols, 0.0);
+    let decoded = Ft8Decoder::decode_window_ft8lib_protocol(&audio, Protocol::Ft4);
+    assert!(
+        decoded.iter().any(|m| m.text == "CQ W1ABC FN42"),
+        "FT4 round-trip via ft8lib C decoder failed for 'CQ W1ABC FN42': decoded {:?}",
+        decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
+    );
+}
+
+/// FT8 via `decode_window_ft8lib_protocol(_, Protocol::Ft8)` must produce the
+/// exact same result as the existing FT8-only `decode_window_ft8lib` /
+/// `ft8lib_decode_audio` entry points — the new protocol parameter must not
+/// change FT8 behavior for any existing caller.
+#[test]
+#[cfg(not(ft8lib_stub))]
+fn test_ft8lib_protocol_ft8_matches_legacy_entry_point() {
+    use pancetta_ft8::Protocol;
+    let symbols = encode_message("CQ W1ABC FN42");
+    let audio = modulate_symbols(&symbols, 0.0);
+    let legacy = Ft8Decoder::decode_window_ft8lib(&audio);
+    let protocol_aware = Ft8Decoder::decode_window_ft8lib_protocol(&audio, Protocol::Ft8);
+    assert_eq!(legacy.len(), protocol_aware.len());
+    for (a, b) in legacy.iter().zip(protocol_aware.iter()) {
+        assert_eq!(a.text, b.text);
+        assert_eq!(a.frequency_offset, b.frequency_offset);
+        assert_eq!(a.time_offset, b.time_offset);
+    }
+}
+
 #[test]
 fn test_ft4_round_trip_all_message_types() {
     // FreeText ("HELLO WORLD") excluded — see Batch 32 `is_plausible`

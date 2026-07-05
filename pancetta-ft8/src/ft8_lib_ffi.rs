@@ -421,15 +421,36 @@ fn estimate_snr_from_waterfall(wf: &ftx_waterfall_t, cand: &ftx_candidate_t) -> 
 /// pancetta's native SNR definition (WSJT-X 2500 Hz reference). If the
 /// waterfall position is out of range the value falls back to `-24.0` dB (the
 /// same floor the native estimator uses).
+///
+/// FT8-only, byte-identical to every existing caller (tests, benchmark.rs).
+/// See [`ft8lib_decode_audio_protocol`] for the FT4-capable entry point.
 #[cfg(not(ft8lib_stub))]
 pub fn ft8lib_decode_audio(samples: &[f32]) -> Vec<(String, f32, f32, i32, f32)> {
+    ft8lib_decode_audio_protocol(samples, ftx_protocol_t::FTX_PROTOCOL_FT8)
+}
+
+/// Decode audio samples using ft8_lib's full pipeline for the given protocol.
+///
+/// The vendored C library's `monitor_init` (`common/monitor.c`) branches on
+/// `cfg.protocol` for slot time, symbol period, and block size — it already
+/// supports FT4 correctly; only this Rust wrapper previously hardcoded FT8.
+/// 2026-07-06: measured ~25x faster than the native Rust decoder on a real
+/// off-air recording (5.6ms vs 144.5ms per window, same message count) —
+/// added so the coordinator can use the C decoder for FT4, where decode
+/// wall-clock time was eating into the tight timing margin and truncating
+/// transmissions (see `docs/` FT4 TX-timing investigation).
+#[cfg(not(ft8lib_stub))]
+pub fn ft8lib_decode_audio_protocol(
+    samples: &[f32],
+    protocol: ftx_protocol_t,
+) -> Vec<(String, f32, f32, i32, f32)> {
     let cfg = monitor_config_t {
         f_min: 100.0,
         f_max: 3000.0,
         sample_rate: 12000,
         time_osr: 2,
         freq_osr: 2,
-        protocol: ftx_protocol_t::FTX_PROTOCOL_FT8,
+        protocol,
     };
 
     let mut mon: monitor_t = unsafe { std::mem::zeroed() };
@@ -558,6 +579,15 @@ pub fn ft8lib_decode_payload(_payload: &[u8; 10]) -> Option<String> {
 /// Stub: returns empty results when ft8_lib C library is not available.
 #[cfg(ft8lib_stub)]
 pub fn ft8lib_decode_audio(_samples: &[f32]) -> Vec<(String, f32, f32, i32, f32)> {
+    Vec::new()
+}
+
+/// Stub: returns empty results when ft8_lib C library is not available.
+#[cfg(ft8lib_stub)]
+pub fn ft8lib_decode_audio_protocol(
+    _samples: &[f32],
+    _protocol: ftx_protocol_t,
+) -> Vec<(String, f32, f32, i32, f32)> {
     Vec::new()
 }
 

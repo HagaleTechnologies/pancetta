@@ -1753,6 +1753,40 @@ impl Ft8Decoder {
             .collect()
     }
 
+    /// Decode using ft8_lib's C decoder via FFI, for the given protocol.
+    ///
+    /// The vendored C library (`common/monitor.c`) already supports FT4
+    /// natively — it branches on the protocol for slot time, symbol period,
+    /// and block size — so this is the same reference decoder as
+    /// [`Self::decode_window_ft8lib`], just no longer hardcoded to FT8.
+    /// Measured ~25x faster than the native Rust decoder on a real off-air
+    /// recording (5.6ms vs 144.5ms per window, same message count,
+    /// 2026-07-06) — added so FT4, whose 7.5s slot leaves far less decode
+    /// time margin than FT8's 15s slot, can use the fast C path instead of
+    /// (or in addition to) the slower native pass.
+    ///
+    /// FT2 has no `ftx_protocol_t` equivalent in ft8_lib; it falls back to
+    /// FT8 geometry, mirroring the same fallback used elsewhere when the
+    /// `ft2` feature is off (silently runs FT8 timing under the FT2 label).
+    pub fn decode_window_ft8lib_protocol(
+        samples: &[f32],
+        protocol: Protocol,
+    ) -> Vec<DecodedMessage> {
+        let ftx_protocol = match protocol {
+            Protocol::Ft4 => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT4,
+            _ => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT8,
+        };
+        let tuples = crate::ft8_lib_ffi::ft8lib_decode_audio_protocol(samples, ftx_protocol);
+        tuples
+            .into_iter()
+            .map(|(text, freq, time_sec, ldpc_errors, snr_db)| {
+                let mut m = DecodedMessage::from_ft8lib(&text, freq, snr_db, ldpc_errors);
+                m.time_offset = time_sec as f64;
+                m
+            })
+            .collect()
+    }
+
     /// Decode a 12.64-second window of audio samples with A Priori (AP) context.
     ///
     /// When `ap_context` contains known callsigns or an active QSO, candidates

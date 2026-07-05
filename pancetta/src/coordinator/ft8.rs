@@ -622,6 +622,16 @@ impl super::ApplicationCoordinator {
 
                         // Primary decoder: ft8_lib (reference C implementation)
                         // with full sliding-frame spectrogram — matches WSJT-X sensitivity.
+                        // Protocol-aware (2026-07-06): the vendored C library
+                        // already supports FT4 natively, it was just never
+                        // asked to — `decode_window_ft8lib_protocol` passes
+                        // `last_protocol` (kept in sync with the live config
+                        // above) instead of hardcoding FT8. Measured ~25x
+                        // faster than the native Rust decoder, which matters
+                        // most for FT4: its 7.5s slot leaves far less decode
+                        // margin than FT8's 15s, and decode wall-clock time
+                        // was found to be truncating FT4 transmissions (see
+                        // the coalesce-window scaling fix earlier this week).
                         //
                         // Wrapped in catch_unwind so a Rust-side panic on one
                         // pathological window is logged + skipped (empty result)
@@ -631,7 +641,10 @@ impl super::ApplicationCoordinator {
                         // supervisor (docs/RUNBOOK.md) is the backstop for that.
                         let ft8lib_messages = std::panic::catch_unwind(
                             std::panic::AssertUnwindSafe(|| {
-                                pancetta_ft8::Ft8Decoder::decode_window_ft8lib(&window)
+                                pancetta_ft8::Ft8Decoder::decode_window_ft8lib_protocol(
+                                    &window,
+                                    last_protocol,
+                                )
                             }),
                         )
                         .unwrap_or_else(|_| {
