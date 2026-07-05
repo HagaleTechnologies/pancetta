@@ -1168,21 +1168,23 @@ impl TuiRunner {
                         app.placement_cursor = (app.placement_cursor + 1).min(max_index);
                     }
                 } else {
-                    app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2500.0);
+                    app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2900.0);
                     app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
                 }
             }
 
             // TX frequency offset: [ = down 50 Hz, ] = up 50 Hz. Clamped to
-            // 200–2500 Hz to match the modulator/passband and find_clear_offset
+            // 200–2900 Hz to match the modulator/passband and find_clear_offset
             // — below 200 Hz multi-TX offsets go negative and single-TX
-            // silently encode-rejects.
+            // silently encode-rejects (2900 Hz matches the TX-offset-hold
+            // modal, qso_manager::TX_OFFSET_MAX_HZ headroom, and the
+            // modulator's MAX_FREQUENCY_DEVIATION as of the 2026-07-05 fix).
             KeyCode::Char('[') => {
                 app.tx_frequency_offset = (app.tx_frequency_offset - 50.0).max(200.0);
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
             KeyCode::Char(']') => {
-                app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2500.0);
+                app.tx_frequency_offset = (app.tx_frequency_offset + 50.0).min(2900.0);
                 app.status_message = format!("TX offset: {:.0} Hz", app.tx_frequency_offset);
             }
 
@@ -2965,8 +2967,8 @@ mod key_tests {
 
     // === UX audit Batch 3 ===========================================
 
-    /// The TX offset clamp matches the modulator/passband (200–2500 Hz):
-    /// hammering `[` never goes below 200, hammering `]` never exceeds 2500.
+    /// The TX offset clamp matches the modulator/passband (200–2900 Hz):
+    /// hammering `[` never goes below 200, hammering `]` never exceeds 2900.
     #[tokio::test]
     async fn tx_offset_clamps_to_modulator_passband() {
         let (mut r, _cmd_rx, app) = make_runner().await;
@@ -2985,8 +2987,8 @@ mod key_tests {
         }
         assert_eq!(
             app.read().await.tx_frequency_offset,
-            2500.0,
-            "TX offset must clamp at the 2500 Hz ceiling"
+            2900.0,
+            "TX offset must clamp at the 2900 Hz ceiling"
         );
     }
 
@@ -3596,7 +3598,7 @@ mod key_tests {
         );
         assert_eq!(
             a.tx_frequency_offset,
-            (before + 50.0).min(2500.0),
+            (before + 50.0).min(2900.0),
             "Right still nudges TX offset on Band Activity"
         );
         drop(a);

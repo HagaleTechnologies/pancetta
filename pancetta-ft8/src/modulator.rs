@@ -26,8 +26,15 @@ pub const TOTAL_TRANSMISSION_SAMPLES: usize = (MESSAGE_DURATION * SAMPLE_RATE as
 /// Default transmission power level (0.0 to 1.0)
 pub const DEFAULT_TX_POWER: f64 = 0.5;
 
-/// Maximum frequency deviation (Hz)
-pub const MAX_FREQUENCY_DEVIATION: f64 = 2500.0;
+/// Maximum frequency deviation (Hz).
+///
+/// Must stay above the app's declared valid TX-offset ceiling (2900 Hz — see
+/// the TX-offset-hold modal, `qso_manager::TX_OFFSET_MAX_HZ`, and
+/// `SmartFrequencyAllocator`'s default `freq_max_hz`) plus the widest tone
+/// spread in use (FT2: 7 * 25.0 Hz = 175 Hz), or a legitimately-selected TX
+/// offset silently fails to modulate (2026-07-05 on-air bug: OH2XO at 2500 Hz
+/// hung for 5 minutes with no PTT and no visible error).
+pub const MAX_FREQUENCY_DEVIATION: f64 = 3100.0;
 
 /// Default GFSK bandwidth-time product for FT8
 pub const DEFAULT_BT: f64 = 2.0;
@@ -856,6 +863,31 @@ mod tests {
         // Test excessive frequency offset
         let result = modulator.modulate_symbols(&symbols, 3000.0);
         assert!(result.is_err());
+    }
+
+    /// Regression for the 2026-07-05 on-air bug: a manual/autonomous QSO at an
+    /// absolute audio offset of 2456-2900 Hz (well within the app's own
+    /// declared valid TX range: qso_manager::TX_OFFSET_MAX_HZ=2700, the
+    /// TX-offset-hold modal's 2900 Hz cap, and SmartFrequencyAllocator's
+    /// 2800-3000 Hz default) silently failed to modulate/PTT and the QSO sat
+    /// until the manual-call watchdog killed it, because MAX_FREQUENCY_DEVIATION
+    /// was 2500 Hz and didn't leave headroom for the 8-tone spread (43.75 Hz),
+    /// so the real ceiling was ~2456.25 Hz.
+    #[test]
+    fn test_high_audio_offset_up_to_2900hz_is_transmittable() {
+        let mut modulator = Ft8Modulator::new_default().unwrap();
+        let symbols = [0u8; 79];
+
+        // The absolute-frequency convention used by the coordinator's TX
+        // worker: set_base_frequency(offset) then modulate with 0.0 delta.
+        for offset in [2456.25_f64, 2500.0, 2700.0, 2900.0] {
+            modulator.set_base_frequency(offset).unwrap();
+            let result = modulator.modulate_symbols(&symbols, 0.0);
+            assert!(
+                result.is_ok(),
+                "offset {offset} Hz should be transmittable (declared valid TX range goes up to 2900 Hz)"
+            );
+        }
     }
 
     #[test]
