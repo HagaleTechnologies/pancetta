@@ -708,6 +708,11 @@ impl TuiRunner {
             }
             TuiMessage::ModeUpdate { mode } => {
                 app.station_info.mode = mode;
+                // A mode switch changes the whole slot/symbol geometry —
+                // anything decoded under the old mode is meaningless now.
+                // Mirrors the same clear `apply_band_selection` does on a
+                // band change.
+                app.clear_live_decode_lists();
             }
             TuiMessage::SplitUpdate { tx_hz } => {
                 app.split_tx_hz = tx_hz;
@@ -3832,6 +3837,57 @@ mod key_tests {
         assert!(
             !app.read().await.fox_mode,
             "FoxModeUpdate{{on:false}} must clear fox_mode"
+        );
+    }
+
+    /// A successful `ModeUpdate` echo (Shift+M, e.g. FT8 -> FT4) must clear
+    /// Band Activity / DX Hunter, mirroring the clear a band change already
+    /// does — the old mode's decodes are meaningless frame geometry once the
+    /// new mode is active. Regression for an operator-reported bug (2026-07-05):
+    /// stale FT8 stations kept showing in the lists after switching to FT4.
+    #[tokio::test]
+    async fn mode_update_clears_live_decode_lists() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        let stale = DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14_074_000.0,
+            mode: "FT8".to_string(),
+            snr: -5,
+            delta_time: 0.0,
+            delta_freq: 1500.0,
+            call_sign: Some("AA1AA".to_string()),
+            grid_square: None,
+            message: "CQ AA1AA FN42".to_string(),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            priority_score: None,
+        };
+        app.write()
+            .await
+            .add_decoded_message(stale)
+            .await
+            .unwrap();
+        assert!(!app.read().await.decoded_messages.is_empty());
+        assert!(!app.read().await.dx_stations.is_empty());
+
+        r.handle_message(TuiMessage::ModeUpdate {
+            mode: "FT4".to_string(),
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            app.read().await.decoded_messages.is_empty(),
+            "stale FT8 decodes must be cleared on mode switch to FT4"
+        );
+        assert!(
+            app.read().await.dx_stations.is_empty(),
+            "stale FT8 DX Hunter entries must be cleared on mode switch to FT4"
         );
     }
 

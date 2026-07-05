@@ -1709,6 +1709,25 @@ impl App {
         info!("Cleared all decoded messages");
     }
 
+    /// Clear every live decode-derived list and reset associated scroll/pin
+    /// state. Used whenever the decode stream is invalidated by something
+    /// other than the operator asking for a plain clear — a band change or a
+    /// station-wide operating-mode switch (FT8/FT4/FT2) — since Band
+    /// Activity/Callers (both derived from `decoded_messages`) and DX Hunter
+    /// would otherwise keep showing entries decoded under a frame geometry
+    /// that's no longer active.
+    pub fn clear_live_decode_lists(&mut self) {
+        self.decoded_messages.clear();
+        self.dx_stations.clear();
+        self.band_activity_scroll = 0;
+        self.dx_hunter_scroll = 0;
+        self.dx_hunter_pinned_call = None;
+        self.callers_scroll = 0;
+        self.callers_pinned_call = None;
+        self.caller_reply_override = None;
+        self.caller_override_for = None;
+    }
+
     /// How long a first `x` press stays armed for a confirming second press
     /// (Task 20f).
     const CLEAR_CONFIRM_WINDOW: std::time::Duration = std::time::Duration::from_secs(3);
@@ -1886,15 +1905,7 @@ impl App {
         };
 
         // 3. Clear every live list and reset cursors/pins.
-        self.decoded_messages.clear();
-        self.dx_stations.clear();
-        self.band_activity_scroll = 0;
-        self.dx_hunter_scroll = 0;
-        self.dx_hunter_pinned_call = None;
-        self.callers_scroll = 0;
-        self.callers_pinned_call = None;
-        self.caller_reply_override = None;
-        self.caller_override_for = None;
+        self.clear_live_decode_lists();
 
         // 4. Restore a fresh snapshot for the band we're switching TO, if any.
         if let Some(snap) = self.band_cache.remove(&band_name) {
