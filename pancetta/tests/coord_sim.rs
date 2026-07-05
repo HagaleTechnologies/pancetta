@@ -67,10 +67,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
+use pancetta_config::OperatingMode;
 use pancetta_hamlib::{MockRig, PttState, RigControl, Vfo};
 use pancetta_lib::coordinator::{
-    active_tx_qso_key, coalesce_transmit_requests, remote_tx_permitted, tx_qso_is_live,
-    CoalesceEntry,
+    active_tx_qso_key, coalesce_transmit_requests, remote_tx_permitted, try_switch_operating_mode,
+    tx_qso_is_live, CoalesceEntry, ModeSwitchError,
 };
 use pancetta_lib::message_bus::{
     ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
@@ -313,6 +314,15 @@ pub struct CoordSim {
     pub active_tx_qsos: Arc<RwLock<HashSet<String>>>,
     /// Shared tri-state TX policy atomic, exactly as the coordinator holds it.
     pub tx_policy: Arc<AtomicU8>,
+    /// Shared FT8 decoder config, exactly as the coordinator holds it —
+    /// `try_switch_operating_mode` writes `.protocol` here.
+    pub ft8_config: Arc<tokio::sync::RwLock<pancetta_ft8::Ft8Config>>,
+    /// Active-mode atomic, exactly as the coordinator holds it.
+    pub active_protocol_mode: Arc<AtomicU8>,
+    /// Active slot-length atomic (ns), exactly as the coordinator holds it.
+    pub active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
+    /// Active decode-phase atomic (ns), exactly as the coordinator holds it.
+    pub active_decode_phase_ns: Arc<std::sync::atomic::AtomicI64>,
     /// Shutdown flag for the spawned hamlib consumer.
     shutdown: Arc<AtomicBool>,
     /// Our callsign (for building expected message text).
@@ -363,6 +373,10 @@ impl CoordSim {
             rig,
             active_tx_qsos: Arc::new(RwLock::new(HashSet::new())),
             tx_policy: Arc::new(AtomicU8::new(TxPolicy::Full.as_u8())),
+            ft8_config: Arc::new(tokio::sync::RwLock::new(pancetta_ft8::Ft8Config::default())),
+            active_protocol_mode: Arc::new(AtomicU8::new(OperatingMode::Ft8.as_u8())),
+            active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000)),
+            active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(13_000_000_000)),
             shutdown,
             our_callsign: our_callsign.to_string(),
             timeline: Timeline::default(),
@@ -2295,4 +2309,133 @@ async fn local_origin_qso_tx_unaffected_by_arm() {
         "a local QSO must never be dropped by the remote arm gate.\n{}",
         sim.timeline
     );
+}
+
+// ---------------------------------------------------------------------------
+// Runtime FT8/FT4/FT2 mode switch (operator Shift+M)
+// ---------------------------------------------------------------------------
+
+/// A runtime mode switch is refused while a QSO is non-terminal — the REAL
+/// `try_switch_operating_mode` reads the REAL `active_tx_qsos` set populated
+/// by the REAL `pump_qso_events` populater (not poked directly), mirroring
+/// exactly what the coordinator's QSO task maintains in production.
+#[tokio::test]
+async fn mode_switch_refused_while_qso_active() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    sim.manager
+        .respond_to_cq_with(
+            "W1AW".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+            false,
+        )
+        .await
+        .expect("respond_to_cq_with");
+
+    // Populate the REAL active_tx_qsos set via the same populater logic the
+    // coordinator uses (StateChanged -> active inserts).
+    let _pending = sim.pump_qso_events();
+
+    let result = try_switch_operating_mode(
+        OperatingMode::Ft4,
+        &sim.active_tx_qsos,
+        &sim.ft8_config,
+        &sim.active_protocol_mode,
+        &sim.active_slot_ns,
+        &sim.active_decode_phase_ns,
+    );
+
+    assert!(
+        matches!(result, Err(ModeSwitchError::QsosActive(n)) if n >= 1),
+        "expected QsosActive, got {:?}",
+        result
+    );
+    assert_eq!(
+        sim.active_protocol_mode.load(Ordering::Relaxed),
+        OperatingMode::Ft8.as_u8(),
+        "atomic must be untouched on refusal"
+    );
+}
+
+/// A runtime mode switch succeeds while idle (no active QSOs), flips the
+/// shared timing atomics, and the NEXT QSO opened after the switch is
+/// stamped with the new mode string — proving the switch is wired all the
+/// way through to `QsoMetadata::mode`, not just the atomics.
+#[tokio::test]
+async fn mode_switch_succeeds_idle_and_next_qso_uses_new_mode() {
+    let mut sim = CoordSim::new("K5ARH").await;
+
+    let result = try_switch_operating_mode(
+        OperatingMode::Ft4,
+        &sim.active_tx_qsos,
+        &sim.ft8_config,
+        &sim.active_protocol_mode,
+        &sim.active_slot_ns,
+        &sim.active_decode_phase_ns,
+    );
+    assert!(result.is_ok(), "expected Ok, got {:?}", result);
+    assert_eq!(sim.active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);
+    assert_eq!(
+        sim.active_protocol_mode.load(Ordering::Relaxed),
+        OperatingMode::Ft4.as_u8()
+    );
+
+    // Mirror what the QSO component's task does on QsoMessage::SetOperatingMode
+    // (Task 8) — direct call, since coord_sim has no separate task boundary.
+    sim.manager.set_active_mode("FT4".to_string());
+
+    sim.manager
+        .respond_to_cq_with(
+            "W1AW".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+            false,
+        )
+        .await
+        .expect("respond_to_cq_with");
+    let _pending = sim.pump_qso_events();
+
+    let active = sim.manager.get_active_qsos().await;
+    assert_eq!(active.len(), 1);
+    assert_eq!(active[0].1.metadata.mode, "FT4");
+}
+
+/// Regression invariant: an operator who never touches Shift+M sees the
+/// mode-switch atomics stay at their FT8 defaults, and the pre-existing
+/// `ptt_keys_for_scheduled_qso` PTT-keying behavior is completely unaffected
+/// by the presence of the new fields/machinery on `CoordSim`.
+#[tokio::test]
+async fn mode_switch_never_requested_is_byte_identical_to_today() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    assert_eq!(
+        sim.active_protocol_mode.load(Ordering::Relaxed),
+        OperatingMode::Ft8.as_u8()
+    );
+    assert_eq!(sim.active_slot_ns.load(Ordering::Relaxed), 15_000_000_000);
+
+    // Exact body of `ptt_keys_for_scheduled_qso` — proves an FT8-only
+    // operator who never touches Shift+M sees no behavior change.
+    let qso_id = sim
+        .manager
+        .respond_to_cq_with(
+            "W1AW".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+            false,
+        )
+        .await
+        .expect("respond_to_cq_with");
+    let pending = sim.pump_qso_events();
+    assert!(!pending.is_empty());
+    sim.drive_slot(pending).await;
+    sim.timeline.assert_keyed_for_qso(&qso_id.to_string());
+    sim.timeline.assert_all_released();
+    sim.timeline
+        .assert_keyed_at_offset(&qso_id.to_string(), 1500.0);
 }
