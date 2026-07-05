@@ -3867,11 +3867,7 @@ mod key_tests {
             atno: false,
             priority_score: None,
         };
-        app.write()
-            .await
-            .add_decoded_message(stale)
-            .await
-            .unwrap();
+        app.write().await.add_decoded_message(stale).await.unwrap();
         assert!(!app.read().await.decoded_messages.is_empty());
         assert!(!app.read().await.dx_stations.is_empty());
 

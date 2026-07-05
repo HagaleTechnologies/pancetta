@@ -2379,20 +2379,14 @@ mod schedule_tx_tests {
     #[test]
     fn coalesce_collect_window_scales_down_for_ft4() {
         // FT4 cycle = 7.5s, half of FT8's 15s → half the wait (400ms).
-        assert_eq!(
-            coalesce_collect_window_ms(pancetta_ft8::Protocol::Ft4),
-            400
-        );
+        assert_eq!(coalesce_collect_window_ms(pancetta_ft8::Protocol::Ft4), 400);
     }
 
     #[test]
     #[cfg(feature = "ft2")]
     fn coalesce_collect_window_scales_down_for_ft2() {
         // FT2 cycle = 3.2s → 800 * 3.2 / 15 = 170.67, rounds to 171ms.
-        assert_eq!(
-            coalesce_collect_window_ms(pancetta_ft8::Protocol::Ft2),
-            171
-        );
+        assert_eq!(coalesce_collect_window_ms(pancetta_ft8::Protocol::Ft2), 171);
     }
 
     #[test]
