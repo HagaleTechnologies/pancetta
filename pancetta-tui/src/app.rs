@@ -1840,24 +1840,40 @@ impl App {
         // candidates); falls back to FT8 with a status note.
         let core_band =
             pancetta_core::Band::from_frequency((band.ft8_frequency * 1_000_000.0) as u64);
-        let (dial, fallback_note) = match self.station_info.mode.as_str() {
+        let (dial, operating_frequency, fallback_note) = match self.station_info.mode.as_str() {
             "FT4" => match core_band.and_then(|b| b.dial_for(true)) {
-                Some(hz) => (hz, None),
-                None => (
-                    (band.ft8_frequency * 1_000_000.0) as u64,
-                    Some(format!(
-                        "{} has no standard FT4 frequency — using FT8 dial",
-                        band_name
-                    )),
-                ),
+                Some(hz) => (hz, hz as f64 / 1_000_000.0, None),
+                None => {
+                    let ft8_dial = (band.ft8_frequency * 1_000_000.0) as u64;
+                    (
+                        ft8_dial,
+                        ft8_dial as f64 / 1_000_000.0,
+                        Some(format!(
+                            "{} has no standard FT4 frequency — using FT8 dial",
+                            band_name
+                        )),
+                    )
+                }
             },
-            "FT2" => (
+            "FT2" => {
+                let ft8_dial = (band.ft8_frequency * 1_000_000.0) as u64;
+                (
+                    ft8_dial,
+                    ft8_dial as f64 / 1_000_000.0,
+                    Some("FT2 dial frequencies not yet defined — using FT8 dial".to_string()),
+                )
+            }
+            // FT8 (default): assign the band's own frequency directly — no
+            // u64-Hz round-trip — so this arm stays byte-identical to the
+            // pre-Task-11 code (`operating_frequency = band.ft8_frequency`)
+            // for any config, including a non-round-MHz custom band value.
+            _ => (
                 (band.ft8_frequency * 1_000_000.0) as u64,
-                Some("FT2 dial frequencies not yet defined — using FT8 dial".to_string()),
+                band.ft8_frequency,
+                None,
             ),
-            _ => ((band.ft8_frequency * 1_000_000.0) as u64, None),
         };
-        self.station_info.operating_frequency = dial as f64 / 1_000_000.0;
+        self.station_info.operating_frequency = operating_frequency;
         let base_status = match fallback_note {
             Some(note) => format!(
                 "Band: {} — {:.3} MHz ({})",
@@ -5305,8 +5321,16 @@ mod tests {
             .position(|b| b.name == "20M")
             .unwrap();
         app.current_band_index = idx;
+        let expected_ft8_frequency = app.config.bands.bands[idx].ft8_frequency;
         let dial_hz = app.apply_band_selection(None);
         assert_eq!(dial_hz, 14_074_000); // unchanged FT8 dial
+        // operating_frequency must be the band's own float, assigned
+        // directly (no u64-Hz round-trip) — exact equality, not just
+        // numerically-equal-by-coincidence for the default config's values.
+        assert_eq!(
+            app.station_info.operating_frequency, expected_ft8_frequency,
+            "FT8 operating_frequency must be assigned directly from band.ft8_frequency"
+        );
     }
 
     /// Returning to a band within the 10-minute TTL restores its Callers (and
