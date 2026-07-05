@@ -38,7 +38,33 @@ const DELAY_MS: u64 = 500;
 /// goes out at the boundary), so it adds no real latency in the common
 /// single-QSO case. Kept short so a request arriving in the final fraction
 /// before its slot is rarely pushed to the next slot.
+///
+/// This is the FT8 baseline — see [`coalesce_collect_window_ms`] for the
+/// protocol-scaled value actually used at the call site.
 const COALESCE_COLLECT_WINDOW_MS: u64 = 800;
+
+/// Scale the coalesce-collection wait to the active protocol's slot period.
+///
+/// 800ms was tuned against FT8's 15s slot, which has ~2s of decode-phase
+/// margin to spare before the next TX boundary. FT4 (7.5s slot, ~1s margin)
+/// and FT2 (3.2s slot) can't absorb the same fixed wait for free — it's a
+/// meaningful fraction of their whole slot, not "absorbed by the slot-wait"
+/// the way the FT8 comment above describes. Investigation 2026-07-05
+/// (operator-reported FT4 TX truncated to ~1-2s) found FT4 replies were
+/// consistently scheduled 3+ seconds late into their target slot, causing
+/// `schedule_tx`'s late-skip-ahead cursor to consume most of the 5.04s
+/// waveform. This 800ms wait is a fixed, purely artificial slice of that
+/// lateness we control directly — scaling it down proportionally claws back
+/// real margin with no decode-quality tradeoff (unlike widening the
+/// decode-phase margin itself, which trades against audio-capture
+/// completeness and needs its own design pass — see
+/// `docs/superpowers/specs/` for the follow-up). FT8 is byte-identical
+/// (`cycle_duration` = 15.0 → ratio 1.0 → 800ms, unchanged).
+fn coalesce_collect_window_ms(protocol: pancetta_ft8::Protocol) -> u64 {
+    const FT8_CYCLE_SECS: f64 = 15.0;
+    let cycle = pancetta_ft8::ProtocolParams::from_protocol(protocol).cycle_duration;
+    ((COALESCE_COLLECT_WINDOW_MS as f64) * (cycle / FT8_CYCLE_SECS)).round() as u64
+}
 
 /// Output of `schedule_tx`: where to TX, how much silence to pad in
 /// front, and how far into the modulated waveform to start emitting.
@@ -912,9 +938,10 @@ impl super::ApplicationCoordinator {
                                 // commits the slot alone and siblings trickle in
                                 // one-per-cycle (the "slow-start" bug). Absorbed by
                                 // the Step-6 slot-wait, so no real added latency.
-                                // See COALESCE_COLLECT_WINDOW_MS.
+                                // See COALESCE_COLLECT_WINDOW_MS /
+                                // coalesce_collect_window_ms (FT4/FT2-scaled).
                                 tokio::time::sleep(Duration::from_millis(
-                                    COALESCE_COLLECT_WINDOW_MS,
+                                    coalesce_collect_window_ms(active_protocol),
                                 ))
                                 .await;
                                 message.message_type = coalesce_backlog_into(
@@ -2339,6 +2366,33 @@ mod schedule_tx_tests {
         // next Odd = :07.5. Odd is closer → Auto picks Odd.
         let p = resolve_required_parity(None, TxSelfParity::Auto, at(5.0), FT4_SLOT_NS);
         assert_eq!(p, SlotParity::Odd);
+    }
+
+    #[test]
+    fn coalesce_collect_window_ft8_byte_identical() {
+        assert_eq!(
+            coalesce_collect_window_ms(pancetta_ft8::Protocol::Ft8),
+            COALESCE_COLLECT_WINDOW_MS
+        );
+    }
+
+    #[test]
+    fn coalesce_collect_window_scales_down_for_ft4() {
+        // FT4 cycle = 7.5s, half of FT8's 15s → half the wait (400ms).
+        assert_eq!(
+            coalesce_collect_window_ms(pancetta_ft8::Protocol::Ft4),
+            400
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "ft2")]
+    fn coalesce_collect_window_scales_down_for_ft2() {
+        // FT2 cycle = 3.2s → 800 * 3.2 / 15 = 170.67, rounds to 171ms.
+        assert_eq!(
+            coalesce_collect_window_ms(pancetta_ft8::Protocol::Ft2),
+            171
+        );
     }
 
     #[test]
