@@ -635,7 +635,9 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
         Span::raw(" | "),
         Span::styled(
             &app.station_info.mode,
-            Style::default().fg(app.theme.accent_color()),
+            Style::default()
+                .fg(app.theme.accent_color())
+                .add_modifier(Modifier::BOLD),
         ),
     ];
 
@@ -671,18 +673,6 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             .fg(app.theme.accent_color())
             .add_modifier(Modifier::BOLD),
     ));
-
-    // Active operating-mode chip: shown only when the station mode is NOT FT8
-    // (e.g. "FT4"). FT8 ⇒ no chip ⇒ title bar byte-identical to today.
-    if let Some(label) = mode_chip_label(&app.station_info.mode) {
-        left_spans.push(Span::raw(" "));
-        left_spans.push(Span::styled(
-            format!(" {} ", label),
-            Style::default()
-                .fg(app.theme.accent_color())
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
 
     // Active-view chip (Phase 2 TUI redesign): shown only when the operator
     // has switched away from Operate (the default) — `label()` returns
@@ -1400,41 +1390,6 @@ pub fn format_time_ago(timestamp: chrono::DateTime<chrono::Utc>) -> String {
         format!("{}h", duration.num_hours())
     } else {
         format!("{}d", duration.num_days())
-    }
-}
-
-/// Title-bar chip label for the station's active operating mode.
-///
-/// Returns `Some(uppercased mode)` for any non-FT8 mode (e.g. `"FT4"`,
-/// `"FT2"`) and `None` for FT8 — so the FT8 title bar stays chip-free and
-/// byte-identical to its pre-mode-chip look. Matching is case-insensitive on
-/// the configured `[rig].mode` string.
-pub fn mode_chip_label(mode: &str) -> Option<String> {
-    let m = mode.trim().to_uppercase();
-    if m.is_empty() || m == "FT8" {
-        None
-    } else {
-        Some(m)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn mode_chip_hidden_for_ft8() {
-        assert_eq!(mode_chip_label("FT8"), None);
-        assert_eq!(mode_chip_label("ft8"), None);
-        assert_eq!(mode_chip_label("  FT8 "), None);
-        assert_eq!(mode_chip_label(""), None);
-    }
-
-    #[test]
-    fn mode_chip_shown_for_non_ft8() {
-        assert_eq!(mode_chip_label("FT4"), Some("FT4".to_string()));
-        assert_eq!(mode_chip_label("ft4"), Some("FT4".to_string()));
-        assert_eq!(mode_chip_label("FT2"), Some("FT2".to_string()));
     }
 }
 

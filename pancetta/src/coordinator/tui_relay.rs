@@ -125,20 +125,11 @@ impl super::ApplicationCoordinator {
         // Clone the lookup for the scorer (Arc-fields share the live data).
         let relay_scorer_lookup = (*self.cached_lookup).clone();
 
-        // Station-wide active operating mode string ("FT8"/"FT4"/"FT2"),
-        // stamped onto every decode view forwarded to the TUI. FT8 is a
-        // station-global mode (not per-decode); read once at relay startup
-        // from `[rig].mode`. Defaults to "FT8" on parse error, so the legacy
-        // path is byte-identical.
-        let relay_active_mode = {
-            let cfg = self.config.read().await;
-            super::mode_str(
-                cfg.rig
-                    .operating_mode()
-                    .unwrap_or(pancetta_config::OperatingMode::Ft8),
-            )
-            .to_string()
-        };
+        // Station-wide active operating mode atomic — cloned here so the
+        // per-decode mode stamping below reads the LIVE mode (a runtime
+        // Shift+M switch takes effect on the very next decode), not a
+        // one-time snapshot taken at relay startup.
+        let relay_active_protocol_mode = self.active_protocol_mode();
 
         // Relay decoded messages from FT8 -> TUI on a dedicated thread
         // (tokio::spawn was causing starvation -- same pattern as DSP/FT8 fixes)
@@ -277,7 +268,10 @@ impl super::ApplicationCoordinator {
                             let tui_decoded = pancetta_tui::DecodedMessageView {
                                 timestamp: chrono::Utc::now(),
                                 frequency: dial_mhz,
-                                mode: relay_active_mode.clone(),
+                                mode: super::mode_str(pancetta_config::OperatingMode::from_u8(
+                                    relay_active_protocol_mode.load(Ordering::Relaxed),
+                                ))
+                                .to_string(),
                                 snr: decoded_msg.snr_db as i32,
                                 delta_time: decoded_msg.time_offset as f32,
                                 delta_freq: decoded_msg.frequency_offset as f32,
