@@ -1000,6 +1000,9 @@ impl super::ApplicationCoordinator {
         } else {
             Some(config.station.grid_square.clone())
         };
+        // Stamped into every rendered ADIF record's TX_PWR field (source-of-truth
+        // qsos.adi and every per-QSO logbook upload). 0 = unconfigured, omit TX_PWR.
+        let station_power_watts = config.station.power_watts;
         // Snapshot the opt-in QSO-upload settings. Only when at least one is
         // enabled do we build clients + spawn the upload subscriber.
         let clublog_cfg = config.network.clublog.clone();
@@ -1132,8 +1135,9 @@ impl super::ApplicationCoordinator {
                     .join("qsos.adi");
 
                 let _adif_writer = match pancetta_qso::AdifLogWriter::open(&adif_path).await {
-                    Ok(w) => {
+                    Ok(mut w) => {
                         info!("ADIF log open at {}", adif_path.display());
+                        w.set_station_power_watts(station_power_watts);
                         let w = std::sync::Arc::new(w);
                         start_adif_subscriber(w.clone(), qso_manager.subscribe(), shutdown.clone());
                         Some(w)
@@ -1199,6 +1203,7 @@ impl super::ApplicationCoordinator {
                         cqdx_cfg.clone(),
                         qrz_xml_cfg.clone(),
                         upload_our_callsign.clone(),
+                        station_power_watts,
                         qso_manager.subscribe(),
                         shutdown.clone(),
                     );
@@ -4409,6 +4414,7 @@ fn start_qso_upload_subscriber(
     cqdx_cfg: pancetta_config::network::CqdxConfig,
     qrz_xml_cfg: pancetta_config::network::QrzXmlConfig,
     our_callsign: String,
+    station_power_watts: u32,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
@@ -4540,7 +4546,8 @@ fn start_qso_upload_subscriber(
     }
 
     tokio::spawn(async move {
-        let processor = pancetta_qso::AdifProcessor::new();
+        let processor =
+            pancetta_qso::AdifProcessor::new().with_station_power_watts(station_power_watts);
 
         while !shutdown.load(std::sync::atomic::Ordering::Acquire) {
             match events.recv().await {

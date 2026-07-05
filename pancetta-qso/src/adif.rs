@@ -255,6 +255,9 @@ pub fn freq_hz_to_band(frequency_hz: f64) -> String {
 pub struct AdifProcessor {
     /// Known field definitions
     field_definitions: HashMap<String, AdifFieldDef>,
+    /// Station transmit power in watts, stamped into every `TX_PWR` field
+    /// this processor renders. `None` omits `TX_PWR` entirely (unconfigured).
+    station_power_watts: Option<f64>,
 }
 
 impl AdifProcessor {
@@ -262,10 +265,25 @@ impl AdifProcessor {
     pub fn new() -> Self {
         let mut processor = Self {
             field_definitions: HashMap::new(),
+            station_power_watts: None,
         };
 
         processor.initialize_standard_fields();
         processor
+    }
+
+    /// Set the station transmit power (watts) stamped into every `TX_PWR`
+    /// field this processor renders from here on. Pass the operator's
+    /// configured `[station] power_watts`; `0` (unset) is treated as "don't
+    /// stamp a power" rather than a literal `TX_PWR:0`.
+    pub fn set_station_power_watts(&mut self, watts: u32) {
+        self.station_power_watts = if watts == 0 { None } else { Some(watts as f64) };
+    }
+
+    /// Builder-style variant of [`set_station_power_watts`](Self::set_station_power_watts).
+    pub fn with_station_power_watts(mut self, watts: u32) -> Self {
+        self.set_station_power_watts(watts);
+        self
     }
 
     /// Parse ADIF data from a string
@@ -449,7 +467,7 @@ impl AdifProcessor {
                 .reports
                 .received
                 .map(|r| self.signal_report_to_rst(r)),
-            tx_pwr: None, // Not tracked in QSO metadata
+            tx_pwr: self.station_power_watts,
             station_callsign: metadata.our_callsign.clone(),
             operator: None, // Could be added to metadata
             my_gridsquare: metadata.grids.ours.clone(),
@@ -1278,6 +1296,34 @@ ADIF Export for Test Program
             !record_str.contains("APP_PANCETTA_HOUND"),
             "non-Hound rendered ADIF must not contain APP_PANCETTA_HOUND; got:\n{record_str}"
         );
+    }
+
+    /// TX_PWR is only stamped once the processor is configured with the
+    /// operator's station power; an unconfigured processor omits it entirely
+    /// rather than emitting `TX_PWR:0`.
+    #[test]
+    fn station_power_watts_stamps_tx_pwr_when_configured() {
+        let metadata = hound_adif_metadata(false, None);
+
+        let unconfigured = AdifProcessor::new();
+        let adif_qso = unconfigured.qso_to_adif(&metadata, None);
+        assert_eq!(
+            adif_qso.tx_pwr, None,
+            "unconfigured processor must omit TX_PWR"
+        );
+        let record_str = unconfigured.generate_record(&adif_qso).unwrap();
+        assert!(!record_str.contains("TX_PWR"), "got:\n{record_str}");
+
+        let configured = AdifProcessor::new().with_station_power_watts(100);
+        let adif_qso = configured.qso_to_adif(&metadata, None);
+        assert_eq!(adif_qso.tx_pwr, Some(100.0));
+        let record_str = configured.generate_record(&adif_qso).unwrap();
+        assert!(record_str.contains("TX_PWR"), "got:\n{record_str}");
+
+        // 0 means "unconfigured", not a literal zero-watt stamp.
+        let zero_watts = AdifProcessor::new().with_station_power_watts(0);
+        let adif_qso = zero_watts.qso_to_adif(&metadata, None);
+        assert_eq!(adif_qso.tx_pwr, None);
     }
 
     /// A non-Hound QSO with existing notes must pass them through unchanged.

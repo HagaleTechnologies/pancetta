@@ -149,6 +149,13 @@ impl AdifLogWriter {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Set the station transmit power (watts) stamped into every `TX_PWR`
+    /// field this writer renders from here on. Pass the operator's
+    /// configured `[station] power_watts`; `0` omits `TX_PWR` entirely.
+    pub fn set_station_power_watts(&mut self, watts: u32) {
+        self.processor.set_station_power_watts(watts);
+    }
 }
 
 #[cfg(test)]
