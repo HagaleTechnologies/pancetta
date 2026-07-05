@@ -682,7 +682,7 @@ impl super::ApplicationCoordinator {
                                 qso_filter_override_off,
                             );
                         if let Some(ref range) = narrow_filter_bins {
-                            debug!(
+                            info!(
                                 "hb-229: narrowing main decode to freq_bins {}..={} (partner {:.1} Hz)",
                                 range.start(),
                                 range.end(),
@@ -714,12 +714,15 @@ impl super::ApplicationCoordinator {
 
                         // Merge: start with ft8_lib results, add any native-only
                         // decodes (e.g. from AP injection) that ft8_lib missed
+                        let ft8lib_count = ft8lib_messages.len();
                         let mut seen_texts: std::collections::HashSet<String> =
                             ft8lib_messages.iter().map(|m| m.text.clone()).collect();
                         let mut decoded_messages = ft8lib_messages;
+                        let mut native_added_count = 0usize;
                         for msg in native_messages {
                             if seen_texts.insert(msg.text.clone()) {
                                 decoded_messages.push(msg);
+                                native_added_count += 1;
                             }
                         }
 
@@ -776,9 +779,11 @@ impl super::ApplicationCoordinator {
                             .fetch_add(decoded_messages.len() as u64, Ordering::Relaxed);
 
                         info!(
-                            "FT8 decoder: {} messages decoded ({} ft8lib + native merge)",
+                            "FT8 decoder: {} messages decoded ({} ft8lib + {} native + {} cross-seq)",
                             decoded_messages.len(),
-                            decoded_messages.len()
+                            ft8lib_count,
+                            native_added_count,
+                            cross_seq_recovered,
                         );
 
                         if let Some(warning_text) = maybe_flag_tx_desense(
