@@ -341,6 +341,7 @@ impl super::ApplicationCoordinator {
             // landing a Slow preset), rebuild before the next decode.
             let mut last_max_passes = initial_ft8_config.max_decode_passes;
             let mut last_osd_depth = initial_ft8_config.osd_depth;
+            let mut last_protocol = initial_ft8_config.protocol;
 
             // Create persistent AP state for enhanced decoding
             let my_call_ap = pancetta_ft8::MyCallAp::new(&station_callsign);
@@ -389,19 +390,24 @@ impl super::ApplicationCoordinator {
                         if let Ok(cfg_guard) = ft8_config_shared.try_read() {
                             let cur_max = cfg_guard.max_decode_passes;
                             let cur_osd = cfg_guard.osd_depth;
+                            let cur_protocol = cfg_guard.protocol;
                             cross_seq_enabled = cfg_guard.cross_sequence_a7_enabled;
-                            if cur_max != last_max_passes || cur_osd != last_osd_depth {
+                            if cur_max != last_max_passes
+                                || cur_osd != last_osd_depth
+                                || cur_protocol != last_protocol
+                            {
                                 let new_cfg = cfg_guard.clone();
                                 drop(cfg_guard);
                                 match Ft8Decoder::new(new_cfg) {
                                     Ok(d) => {
                                         info!(
-                                            "FT8 decoder rebuilt for tier preset: max_decode_passes={}, osd_depth={:?}",
-                                            cur_max, cur_osd
+                                            "FT8 decoder rebuilt: max_decode_passes={}, osd_depth={:?}, protocol={:?}",
+                                            cur_max, cur_osd, cur_protocol
                                         );
                                         decoder = d;
                                         last_max_passes = cur_max;
                                         last_osd_depth = cur_osd;
+                                        last_protocol = cur_protocol;
                                     }
                                     Err(e) => warn!(
                                         "FT8 decoder rebuild failed (keeping previous): {}",
