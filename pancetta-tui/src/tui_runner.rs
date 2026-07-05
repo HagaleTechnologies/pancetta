@@ -179,6 +179,13 @@ pub enum TuiMessage {
         /// New global TX policy.
         policy: pancetta_core::TxPolicy,
     },
+    /// Authoritative mode echo. Sent by the coordinator relay after a
+    /// successful `CycleOperatingMode` switch. Drives the title-bar mode
+    /// span (Task 10) and the manual band-change dial resolution.
+    ModeUpdate {
+        /// New mode string (`"FT8"` / `"FT4"` / `"FT2"`).
+        mode: String,
+    },
     /// Split-TX frequency echo. Sent by the coordinator relay after every
     /// write to the split atomic: modal set, manual band-change clear,
     /// and autonomous band-hop clear. `tx_hz == 0` means simplex (chip
@@ -352,6 +359,12 @@ pub enum TuiCommand {
     /// new initiations (CQ, hunting) while keeping in-progress QSOs and
     /// answering callers; Disabled is a hard RX-only mute.
     CycleTxPolicy,
+    /// Operator pressed Shift+M: cycle the station-wide operating mode
+    /// FT8 → FT4 → FT2 → FT8. Unlike `CycleTxPolicy` this can be REFUSED
+    /// (a QSO is active) — the coordinator relay does not optimistically
+    /// flip anything locally; it waits for either a `ModeUpdate` (success)
+    /// or a `StatusUpdate` (refusal) echo.
+    CycleOperatingMode,
     /// Operator pressed `f`: toggle the TX-frequency mode Hold ↔ Auto. The
     /// coordinator flips the shared `tx_freq_mode` atomic. Hold (default) keeps
     /// the operator's picked offset sticky; Auto lets pancetta choose/adjust it
@@ -692,6 +705,9 @@ impl TuiRunner {
             }
             TuiMessage::TxPolicyUpdate { policy } => {
                 app.tx_policy = policy;
+            }
+            TuiMessage::ModeUpdate { mode } => {
+                app.station_info.mode = mode;
             }
             TuiMessage::SplitUpdate { tx_hz } => {
                 app.split_tx_hz = tx_hz;
@@ -1463,6 +1479,14 @@ impl TuiRunner {
                 app.tx_policy = next;
                 app.status_message = format!("TX policy: {}", next.label());
                 self.message_tx.send(TuiCommand::CycleTxPolicy)?;
+            }
+
+            // Shift+M - cycle the station-wide operating mode. No optimistic
+            // local flip (unlike `g`): a mode switch can be refused while a
+            // QSO is active, and flip-then-rollback would flicker the
+            // title-bar mode span. Wait for the coordinator's echo.
+            KeyCode::Char('M') => {
+                self.message_tx.send(TuiCommand::CycleOperatingMode)?;
             }
 
             // === Activity views (Phase 2 TUI redesign) ===
@@ -2713,6 +2737,26 @@ mod key_tests {
             app.read().await.tx_policy,
             pancetta_core::TxPolicy::RespondOnly,
             "local banner advances optimistically"
+        );
+    }
+
+    /// Shift+M emits CycleOperatingMode with NO optimistic local flip — a
+    /// mode switch can be refused (QSO active) and flip-then-rollback would
+    /// flicker the title bar, so the TUI waits for the coordinator's
+    /// ModeUpdate/StatusUpdate echo.
+    #[tokio::test]
+    async fn key_shift_m_emits_cycle_operating_mode() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        let mode_before = app.read().await.station_info.mode.clone();
+        r.handle_key_event(key('M')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::CycleOperatingMode)),
+            "Shift+M must emit CycleOperatingMode"
+        );
+        assert_eq!(
+            app.read().await.station_info.mode,
+            mode_before,
+            "no optimistic local flip — wait for the coordinator's ModeUpdate/StatusUpdate echo"
         );
     }
 

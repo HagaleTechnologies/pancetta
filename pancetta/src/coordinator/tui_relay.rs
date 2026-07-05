@@ -735,6 +735,18 @@ impl super::ApplicationCoordinator {
         // relay arm; read by the manual-call handler at QSO open to place our
         // TX audio offset when the operator has set one.
         let cmd_tx_offset_hold_hz = self.tx_offset_hold_hz();
+        // Mode-switch machinery (Shift+M). Cloned here (not previously
+        // needed by this task) so the CycleOperatingMode handler can call
+        // `try_switch_operating_mode` directly, mirroring how `cmd_tx_policy`
+        // is used by CycleTxPolicy. `ft8_config`/`active_tx_qsos` are
+        // `pub(crate)` fields so they clone directly with no accessor;
+        // `active_protocol_mode`/`active_slot_ns`/`active_decode_phase_ns` go
+        // through their `pub(crate) fn` accessors.
+        let cmd_active_tx_qsos = self.active_tx_qsos.clone();
+        let cmd_ft8_config = self.ft8_config.clone();
+        let cmd_active_protocol_mode = self.active_protocol_mode();
+        let cmd_active_slot_ns = self.active_slot_ns();
+        let cmd_active_decode_phase_ns = self.active_decode_phase_ns();
         // Whether the autonomous component is running at all (config
         // gate). If it's config-disabled there is no decision loop to
         // re-enable — `a` should say so honestly instead of flipping a
@@ -1384,6 +1396,86 @@ impl super::ApplicationCoordinator {
                                     status: format!("TX policy: {}", next.label()),
                                 },
                             );
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::CycleOperatingMode => {
+                            // Operator pressed Shift+M: cycle the station-wide
+                            // operating mode FT8 → FT4 → FT2 → FT8. Unlike
+                            // CycleTxPolicy this can be REFUSED (a QSO is
+                            // active) — no optimistic local flip; the TUI
+                            // waits for either a ModeUpdate (success) or a
+                            // StatusUpdate (refusal) echo.
+                            let current = pancetta_config::OperatingMode::from_u8(
+                                cmd_active_protocol_mode.load(Ordering::Relaxed),
+                            );
+                            let next = current.cycle();
+                            match super::try_switch_operating_mode(
+                                next,
+                                &cmd_active_tx_qsos,
+                                &cmd_ft8_config,
+                                &cmd_active_protocol_mode,
+                                &cmd_active_slot_ns,
+                                &cmd_active_decode_phase_ns,
+                            ) {
+                                Ok(()) => {
+                                    let mode_str = super::mode_str(next).to_string();
+                                    warn!(
+                                        target: "operator.override",
+                                        "Operator switched operating mode: {} -> {}",
+                                        super::mode_str(current),
+                                        mode_str
+                                    );
+                                    let set_mode_msg = ComponentMessage::new(
+                                        ComponentId::Tui,
+                                        ComponentId::Qso,
+                                        MessageType::QsoMessage(
+                                            crate::message_bus::QsoMessage::SetOperatingMode {
+                                                mode: mode_str.clone(),
+                                            },
+                                        ),
+                                        Instant::now(),
+                                    );
+                                    if let Err(e) = cmd_message_bus.send_message(set_mode_msg).await
+                                    {
+                                        warn!(
+                                            "Failed to notify QSO component of mode switch: {}",
+                                            e
+                                        );
+                                    }
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::ModeUpdate {
+                                            mode: mode_str,
+                                        },
+                                    );
+                                }
+                                Err(super::ModeSwitchError::QsosActive(n)) => {
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "Mode".to_string(),
+                                            status: format!(
+                                                "can't switch mode: {} QSO(s) active",
+                                                n
+                                            ),
+                                        },
+                                    );
+                                }
+                                Err(super::ModeSwitchError::QsoSetUnavailable) => {
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "Mode".to_string(),
+                                            status: "can't switch mode: QSO state unavailable"
+                                                .to_string(),
+                                        },
+                                    );
+                                }
+                                Err(super::ModeSwitchError::ConfigLockBusy) => {
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "Mode".to_string(),
+                                            status: "mode switch busy, try again".to_string(),
+                                        },
+                                    );
+                                }
+                            }
                         }
                         pancetta_tui::tui_runner::TuiCommand::ToggleTxFreqMode => {
                             // Operator pressed `f`: toggle the TX-frequency mode
