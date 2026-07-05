@@ -1250,9 +1250,18 @@ mod tests {
 
     #[test]
     fn operating_mode_u8_roundtrip() {
-        assert_eq!(OperatingMode::from_u8(OperatingMode::Ft8.as_u8()), OperatingMode::Ft8);
-        assert_eq!(OperatingMode::from_u8(OperatingMode::Ft4.as_u8()), OperatingMode::Ft4);
-        assert_eq!(OperatingMode::from_u8(OperatingMode::Ft2.as_u8()), OperatingMode::Ft2);
+        assert_eq!(
+            OperatingMode::from_u8(OperatingMode::Ft8.as_u8()),
+            OperatingMode::Ft8
+        );
+        assert_eq!(
+            OperatingMode::from_u8(OperatingMode::Ft4.as_u8()),
+            OperatingMode::Ft4
+        );
+        assert_eq!(
+            OperatingMode::from_u8(OperatingMode::Ft2.as_u8()),
+            OperatingMode::Ft2
+        );
         assert_eq!(OperatingMode::Ft8.as_u8(), 0);
         assert_eq!(OperatingMode::Ft4.as_u8(), 1);
         assert_eq!(OperatingMode::Ft2.as_u8(), 2);

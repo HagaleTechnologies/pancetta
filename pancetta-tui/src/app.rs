@@ -5324,9 +5324,9 @@ mod tests {
         let expected_ft8_frequency = app.config.bands.bands[idx].ft8_frequency;
         let dial_hz = app.apply_band_selection(None);
         assert_eq!(dial_hz, 14_074_000); // unchanged FT8 dial
-        // operating_frequency must be the band's own float, assigned
-        // directly (no u64-Hz round-trip) — exact equality, not just
-        // numerically-equal-by-coincidence for the default config's values.
+                                         // operating_frequency must be the band's own float, assigned
+                                         // directly (no u64-Hz round-trip) — exact equality, not just
+                                         // numerically-equal-by-coincidence for the default config's values.
         assert_eq!(
             app.station_info.operating_frequency, expected_ft8_frequency,
             "FT8 operating_frequency must be assigned directly from band.ft8_frequency"

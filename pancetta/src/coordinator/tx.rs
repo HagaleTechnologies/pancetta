@@ -853,11 +853,10 @@ impl super::ApplicationCoordinator {
                     // operation) so rebuilding on a detected change, rather
                     // than every single request, keeps the common case
                     // (no change) a plain atomic load.
-                    let live_protocol = super::protocol_from_mode(
-                        pancetta_config::OperatingMode::from_u8(
+                    let live_protocol =
+                        super::protocol_from_mode(pancetta_config::OperatingMode::from_u8(
                             active_protocol_mode_atomic.load(Ordering::Relaxed),
-                        ),
-                    );
+                        ));
                     if live_protocol != active_protocol {
                         info!(
                             "TX worker: protocol changed {} -> {} — rebuilding encoder",

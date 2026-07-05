@@ -1937,7 +1937,10 @@ mod tests {
             pancetta_config::OperatingMode::Ft4.as_u8()
         );
         assert_eq!(active_slot_ns.load(Ordering::Relaxed), 7_500_000_000);
-        assert_eq!(ft8_config.read().await.protocol, pancetta_ft8::Protocol::Ft4);
+        assert_eq!(
+            ft8_config.read().await.protocol,
+            pancetta_ft8::Protocol::Ft4
+        );
     }
 
     #[test]
