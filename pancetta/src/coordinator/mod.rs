@@ -293,11 +293,17 @@ pub enum ModeSwitchError {
 /// Gated on `active_tx_qsos` being empty: holds the **synchronous**
 /// `std::sync::RwLock` read guard for the ENTIRE critical section below (no
 /// `.await` anywhere in this function — it does not need to be `async`).
-/// Any concurrent QSO-open needs a WRITE lock on that same set to register,
-/// so it blocks until this function returns (or never starts if the initial
-/// check already sees a non-empty set). This mirrors the auto-repark
-/// feature's documented "zero `.await` between the live-QSO check and the
-/// write" invariant (`coordinator/autonomous.rs`).
+/// Any concurrent registration of an already-created QSO needs a WRITE lock
+/// on that same set, so it blocks until this function returns (or never
+/// starts if the initial check already sees a non-empty set). This mirrors
+/// the auto-repark feature's documented "zero `.await` between the live-QSO
+/// check and the write" invariant (`coordinator/autonomous.rs`). It is
+/// **not** airtight end-to-end: registration happens asynchronously,
+/// slightly after a QSO is actually created (e.g. autonomous
+/// `respond_to_cq`, always-answer-callers), so a QSO still being *created*
+/// concurrently with a switch — and not yet inserted into this set — can
+/// slip through and run under the new mode's timing. Narrow, low-severity
+/// residual window; not a full closure of the race.
 ///
 /// Ordering: the fallible step (`ft8_config.try_write()`) happens BEFORE any
 /// atomic store, so a failure here leaves every consumer (DSP, decode, TX,

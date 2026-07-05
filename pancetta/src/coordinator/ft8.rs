@@ -35,6 +35,29 @@ static DECODE_PANIC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// full text well under 64); anything longer is malformed/hostile.
 const MAX_DECODED_FIELD_LEN: usize = 64;
 
+/// Compute the active protocol's slot parity for a decoded window.
+///
+/// `received_utc` is the window's receipt timestamp (captured immediately on
+/// recv, before any decode work — see the comment at the call site). The
+/// slot start is recovered by subtracting `decode_phase` (how far past the
+/// slot boundary the window arrives), then parity is derived over the given
+/// `slot_ns` period.
+///
+/// Pulled out of the decode loop as a small pure function so a live mode
+/// switch can be exercised in a unit test: this function has no memory of a
+/// prior call, so feeding it freshly-read `decode_phase`/`slot_ns` values
+/// every iteration (as the decode loop in `start_ft8_pipeline` does) can
+/// never "stick" to a stale mode's period the way caching them once at
+/// thread startup did.
+fn slot_parity_for_receipt(
+    received_utc: chrono::DateTime<chrono::Utc>,
+    decode_phase: chrono::Duration,
+    slot_ns: i64,
+) -> pancetta_core::slot::SlotParity {
+    let slot_start = received_utc - decode_phase;
+    pancetta_core::slot::SlotParity::of_with_period(slot_start, slot_ns)
+}
+
 /// I-16: sanitize a human-facing decoded string before it crosses the
 /// message-bus boundary into the TUI / QSO state machine / ADIF log.
 ///
@@ -316,23 +339,24 @@ impl super::ApplicationCoordinator {
         let cross_sequence_cache = self.cross_sequence_cache.clone();
         let cross_sequence_fp_filter = self.fp_filter.clone();
 
-        // Active protocol slot length (FT8 → 15e9, FT4 → 7.5e9), derived once
-        // at startup from `[rig].mode`. Read by the parity-stamping sites
-        // below via `SlotParity::of_with_period`. mode=FT8 is byte-identical
+        // Active protocol slot length (FT8 → 15e9, FT4 → 7.5e9). Re-read from
+        // this shared atomic once per decode-loop iteration (below, inside the
+        // `while` loop) so a live mode switch (Shift+M) is picked up promptly
+        // rather than only at thread startup. Read by the parity-stamping
+        // sites via `SlotParity::of_with_period`. mode=FT8 is byte-identical
         // to the prior `SlotParity::of` (which hardcodes 15e9).
         let active_slot_ns = self.active_slot_ns.clone();
 
         // Active protocol decode phase (FT8 → 13e9, FT4 → 6.5e9 ns): how far
         // past the slot boundary the window is received. Subtracted below to
-        // recover the slot start before parity-stamping. mode=FT8 is 13e9 ns,
-        // byte-identical to the prior hardcoded `Duration::seconds(13)`.
+        // recover the slot start before parity-stamping. Also re-read once per
+        // iteration alongside `active_slot_ns` for the same reason. mode=FT8
+        // is 13e9 ns, byte-identical to the prior hardcoded
+        // `Duration::seconds(13)`.
         let active_decode_phase_ns = self.active_decode_phase_ns.clone();
 
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
         let handle = tokio::task::spawn_blocking(move || {
-            let slot_ns = active_slot_ns.load(Ordering::Relaxed);
-            let decode_phase =
-                chrono::Duration::nanoseconds(active_decode_phase_ns.load(Ordering::Relaxed));
             let rt = tokio::runtime::Handle::current();
             info!("FT8 decoder thread started");
 
@@ -378,6 +402,21 @@ impl super::ApplicationCoordinator {
                         // operator to TX in the same slot as the DX.)
                         let window_received_utc = chrono::Utc::now();
 
+                        // Re-read the active protocol slot length/decode phase
+                        // once per iteration (not once at thread startup) so a
+                        // live mode switch (Shift+M -> try_switch_operating_mode
+                        // updating these atomics) is reflected in this window's
+                        // parity stamp. Stamping stale-period parity forever
+                        // after a switch would let the QSO state machine latch
+                        // the wrong tx_parity -> on-air collision, the exact
+                        // failure half-duplex parity scheduling exists to
+                        // prevent. mode=FT8 is byte-identical to before (same
+                        // constant value read every iteration instead of once).
+                        let slot_ns = active_slot_ns.load(Ordering::Relaxed);
+                        let decode_phase = chrono::Duration::nanoseconds(
+                            active_decode_phase_ns.load(Ordering::Relaxed),
+                        );
+
                         // hb-216 S2: re-check the shared Ft8Config. If the
                         // tier probe landed a Slow preset since the last
                         // window, rebuild the decoder. `try_read` keeps the
@@ -401,7 +440,7 @@ impl super::ApplicationCoordinator {
                                 match Ft8Decoder::new(new_cfg) {
                                     Ok(d) => {
                                         info!(
-                                            "FT8 decoder rebuilt: max_decode_passes={}, osd_depth={:?}, protocol={:?}",
+                                            "FT8 decoder rebuilt: max_decode_passes={}, osd_depth={:?}, protocol={}",
                                             cur_max, cur_osd, cur_protocol
                                         );
                                         decoder = d;
@@ -436,11 +475,8 @@ impl super::ApplicationCoordinator {
                             // current window as "slot N+1" for the
                             // look-up — seeds are from slot N which is the
                             // opposite parity).
-                            let now_slot_start = window_received_utc - decode_phase;
-                            let current_parity = pancetta_core::slot::SlotParity::of_with_period(
-                                now_slot_start,
-                                slot_ns,
-                            );
+                            let current_parity =
+                                slot_parity_for_receipt(window_received_utc, decode_phase, slot_ns);
                             let opposite_parity: u8 = match current_parity {
                                 pancetta_core::slot::SlotParity::Even => 1,
                                 pancetta_core::slot::SlotParity::Odd => 0,
@@ -547,11 +583,8 @@ impl super::ApplicationCoordinator {
                         // already-consumed messages by rejecting them at
                         // is_message_relevant (state has already advanced).
                         if !scoped_decodes.is_empty() {
-                            let scoped_slot_start = window_received_utc - decode_phase;
-                            let scoped_parity = pancetta_core::slot::SlotParity::of_with_period(
-                                scoped_slot_start,
-                                slot_ns,
-                            );
+                            let scoped_parity =
+                                slot_parity_for_receipt(window_received_utc, decode_phase, slot_ns);
                             for mut decoded_msg in scoped_decodes {
                                 decoded_msg.slot_parity = Some(scoped_parity);
                                 // I-16: sanitize at the bus boundary (scoped
@@ -779,9 +812,8 @@ impl super::ApplicationCoordinator {
                         // tag invariant under decode latency. (next_slot_start would
                         // give the wrong slot if decode pushes us into the next slot
                         // before we tag.)
-                        let slot_start = window_received_utc - decode_phase;
                         let window_parity =
-                            pancetta_core::slot::SlotParity::of_with_period(slot_start, slot_ns);
+                            slot_parity_for_receipt(window_received_utc, decode_phase, slot_ns);
 
                         for decoded_msg in decoded_messages.iter_mut() {
                             decoded_msg.slot_parity = Some(window_parity);
@@ -1452,5 +1484,64 @@ mod sanitize_decoded_field_tests {
                 .chars()
                 .all(|c| c != '\u{1b}' && c != '\u{7f}' && c >= '\u{20}'));
         }
+    }
+}
+
+#[cfg(test)]
+mod slot_parity_for_receipt_tests {
+    use super::slot_parity_for_receipt;
+    use chrono::{DateTime, Duration, Utc};
+    use pancetta_core::slot::SlotParity;
+
+    /// mode=FT8 regression: feeding the historical hardcoded values (13s
+    /// decode phase, 15s slot) reproduces the same parity `SlotParity::of`
+    /// (which hardcodes those exact constants) would give — the
+    /// live-mode-switch fix must not change FT8 behavior.
+    #[test]
+    fn ft8_params_match_legacy_hardcoded_formula() {
+        let received: DateTime<Utc> = DateTime::from_timestamp_nanos(20_000_000_000); // t=20s
+        let ft8_decode_phase = Duration::nanoseconds(13_000_000_000); // 13s
+        let ft8_slot_ns = 15_000_000_000i64; // 15s
+
+        let via_helper = slot_parity_for_receipt(received, ft8_decode_phase, ft8_slot_ns);
+        let via_legacy_formula = SlotParity::of(received - ft8_decode_phase);
+        assert_eq!(via_helper, via_legacy_formula);
+        // Concretely: slot_start = 20s - 13s = 7s, which falls in the [0,15)
+        // slot -> index 0 -> Even.
+        assert_eq!(via_helper, SlotParity::Even);
+    }
+
+    /// This is the regression test for the Critical whole-branch-review
+    /// finding: the decode loop used to read `active_slot_ns`/
+    /// `active_decode_phase_ns` ONCE at thread startup and never again, so a
+    /// live mode switch (Shift+M) never changed the parity stamped on
+    /// subsequently decoded frames. `slot_parity_for_receipt` is the pure
+    /// function the (now-fixed) loop calls with freshly-read atomics every
+    /// iteration; this test proves the SAME receipt instant produces a
+    /// DIFFERENT parity when fed FT4's period instead of FT8's — i.e. the
+    /// function has no memory of a prior call and always reflects whatever
+    /// (slot_ns, decode_phase) it's given "this iteration". If the loop
+    /// were still caching the pre-switch (FT8) values, every post-switch
+    /// window would keep landing on the FT8 answer.
+    #[test]
+    fn same_receipt_instant_differs_by_active_mode_period() {
+        let received: DateTime<Utc> = DateTime::from_timestamp_nanos(20_000_000_000); // t=20s
+
+        let ft8_decode_phase = Duration::nanoseconds(13_000_000_000); // 13s
+        let ft8_slot_ns = 15_000_000_000i64; // 15s
+        let ft8_parity = slot_parity_for_receipt(received, ft8_decode_phase, ft8_slot_ns);
+
+        let ft4_decode_phase = Duration::nanoseconds(6_500_000_000); // 6.5s
+        let ft4_slot_ns = 7_500_000_000i64; // 7.5s
+        let ft4_parity = slot_parity_for_receipt(received, ft4_decode_phase, ft4_slot_ns);
+
+        // FT8: slot_start = 20 - 13 = 7s -> index 7/15 = 0 -> Even.
+        assert_eq!(ft8_parity, SlotParity::Even);
+        // FT4: slot_start = 20 - 6.5 = 13.5s -> index 13.5/7.5 = 1 -> Odd.
+        assert_eq!(ft4_parity, SlotParity::Odd);
+        // The critical property: same instant, different mode period ->
+        // different (correct) parity. A stale-cache bug would keep
+        // returning `ft8_parity` for both.
+        assert_ne!(ft8_parity, ft4_parity);
     }
 }

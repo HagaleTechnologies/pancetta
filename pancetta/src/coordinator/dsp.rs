@@ -466,8 +466,12 @@ impl super::ApplicationCoordinator {
                                 target: "operator.override",
                                 "DSP: mode change {} -> {} — flushing {} in-flight \
                                  samples and resizing the decode window",
-                                cached_mode_u8,
-                                cur_mode_u8,
+                                super::mode_str(pancetta_config::OperatingMode::from_u8(
+                                    cached_mode_u8
+                                )),
+                                super::mode_str(pancetta_config::OperatingMode::from_u8(
+                                    cur_mode_u8
+                                )),
                                 ft8_buffer.len()
                             );
                             ft8_window_samples = new_timing.window_samples;

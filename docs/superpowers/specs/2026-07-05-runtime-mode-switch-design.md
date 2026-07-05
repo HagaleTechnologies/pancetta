@@ -77,10 +77,16 @@ drop-stale-TX gate, which deliberately fails open since it isn't safety-critical
 closer to the former: better to refuse than leave DSP and decode disagreeing about frame geometry.
 
 **Race safety.** Holding the `active_tx_qsos` read guard across the whole function means any concurrent
-QSO-open (which needs a write lock on that same set to register) blocks until the switch completes or
-never starts if the initial check saw a non-empty set. This closes the same class of check-then-act
-race the auto-repark feature's "zero `.await` between the live-QSO check and the write" invariant
-exists to prevent, without needing a new lock.
+registration of an already-created QSO (which needs a write lock on that same set to insert) blocks
+until the switch completes or never starts if the initial check saw a non-empty set. This closes the
+check-then-act race against a concurrent *write* to that set — the same class of race the auto-repark
+feature's "zero `.await` between the live-QSO check and the write" invariant exists to prevent, without
+needing a new lock. It is **not** airtight end-to-end, though: registration happens asynchronously,
+slightly after a QSO is actually created (e.g. autonomous `respond_to_cq`, always-answer-callers), so a
+QSO that is still being *created* concurrently with a switch — and hasn't reached its `active_tx_qsos`
+insert yet — can slip through and end up running under the new mode's timing. This is a narrow,
+low-severity residual window (the same class of bounded gap the codebase already accepts elsewhere,
+e.g. the auto-repark feature's own documented residuals), not a full closure of the race.
 
 ### DSP thread — buffer resize on mode change
 
