@@ -534,12 +534,15 @@ pub struct ApplicationCoordinator {
     /// once and not mutated at runtime (a live mode switch is a later task).
     active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
 
-    /// Active digital-mode protocol (FT8 / FT4 / FT2), derived once at startup
-    /// from `[rig].mode`. The TX worker branches its encode+modulate on this so
-    /// FT4 transmits a 4-GFSK / 105-symbol FT4 waveform (not the FT8 waveform);
-    /// `Protocol::Ft8` keeps the exact legacy calls (byte-identical). `Copy`, set
-    /// once, not mutated at runtime (a live mode switch is a later task).
-    active_protocol: pancetta_ft8::Protocol,
+    /// Active digital-mode protocol (FT8 / FT4 / FT2), encoded as
+    /// `pancetta_config::OperatingMode::as_u8()`. Seeded once at startup from
+    /// `[rig].mode`; from this task onward it is also written by
+    /// `try_switch_operating_mode` when the operator cycles mode live
+    /// (Shift+M). The TX worker, DSP thread, and decode loop all poll this
+    /// atomic each iteration (mirroring how they already poll the dial-freq
+    /// and tier-preset atomics) so a runtime switch reaches every consumer
+    /// without a restart.
+    active_protocol_mode: Arc<std::sync::atomic::AtomicU8>,
 
     /// Active protocol's decode phase in nanoseconds (FT8 → 13e9, FT4 → 6.5e9):
     /// how far past the slot boundary the decode window is received. The decode
@@ -858,13 +861,14 @@ impl ApplicationCoordinator {
         // rejected an unknown mode at load time; an Err here would only mean a
         // mode validated-then-mutated, so we fall back to FT8 timing rather
         // than failing coordinator init.
-        let active_protocol = match config.rig.operating_mode() {
-            Ok(mode) => protocol_from_mode(mode),
+        let active_operating_mode = match config.rig.operating_mode() {
+            Ok(mode) => mode,
             Err(e) => {
-                warn!("invalid [rig].mode ({e}); defaulting protocol timing to FT8");
-                pancetta_ft8::Protocol::Ft8
+                warn!("invalid [rig].mode ({e}); defaulting to FT8");
+                pancetta_config::OperatingMode::Ft8
             }
         };
+        let active_protocol = protocol_from_mode(active_operating_mode);
         let active_slot_ns_init = active_protocol.slot_ns();
         // Decode phase (ns) the parity-stamping sites subtract to recover the
         // slot start — same value the DSP thread derives (FT8 → 13e9).
@@ -974,9 +978,12 @@ impl ApplicationCoordinator {
             // Active protocol slot length, derived from [rig].mode above
             // (default 15e9 for FT8). Set once; read by the decode/DSP paths.
             active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(active_slot_ns_init)),
-            // Active digital-mode protocol from [rig].mode (default Ft8). The TX
-            // worker branches encode+modulate on this; Ft8 stays byte-identical.
-            active_protocol,
+            // Active digital-mode protocol from [rig].mode (default Ft8),
+            // encoded for atomic storage. Written by `try_switch_operating_mode`
+            // when the operator cycles mode live (Task 7).
+            active_protocol_mode: Arc::new(std::sync::atomic::AtomicU8::new(
+                active_operating_mode.as_u8(),
+            )),
             // Decode phase the parity-stamping sites subtract (FT8 → 13e9 ns).
             active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(
                 active_decode_phase_ns_init,
@@ -1321,12 +1328,21 @@ impl ApplicationCoordinator {
         self.remote_tx_arm.clone()
     }
 
-    /// Active digital-mode protocol (FT8 / FT4 / FT2), derived once at startup
-    /// from `[rig].mode`. Captured into the TX worker so its encode+modulate
-    /// emits the correct on-air waveform for the mode (`Ft8` = legacy path,
-    /// byte-identical). `Copy`.
+    /// Raw atomic handle for hot loops (DSP thread, decode loop, TX worker)
+    /// that need to poll the live mode every iteration without a function-call
+    /// indirection through `Protocol`.
+    pub(crate) fn active_protocol_mode(&self) -> Arc<std::sync::atomic::AtomicU8> {
+        self.active_protocol_mode.clone()
+    }
+
+    /// Active digital-mode protocol (FT8 / FT4 / FT2), read live from
+    /// `active_protocol_mode`. `Ft8` (the default) is byte-identical to the
+    /// old write-once field's value until the first runtime switch.
     pub(crate) fn active_protocol(&self) -> pancetta_ft8::Protocol {
-        self.active_protocol
+        protocol_from_mode(pancetta_config::OperatingMode::from_u8(
+            self.active_protocol_mode
+                .load(std::sync::atomic::Ordering::Relaxed),
+        ))
     }
 
     /// Fox-mode activation flag. `false` by default (normal Hound / station
@@ -1605,6 +1621,28 @@ mod tests {
         );
         assert_eq!(
             protocol_from_mode(pancetta_config::OperatingMode::Ft4),
+            pancetta_ft8::Protocol::Ft4
+        );
+    }
+
+    #[test]
+    fn active_protocol_reads_live_from_atomic() {
+        use std::sync::atomic::{AtomicU8, Ordering};
+        let atomic = Arc::new(AtomicU8::new(pancetta_config::OperatingMode::Ft8.as_u8()));
+        assert_eq!(
+            protocol_from_mode(pancetta_config::OperatingMode::from_u8(
+                atomic.load(Ordering::Relaxed)
+            )),
+            pancetta_ft8::Protocol::Ft8
+        );
+        atomic.store(
+            pancetta_config::OperatingMode::Ft4.as_u8(),
+            Ordering::Relaxed,
+        );
+        assert_eq!(
+            protocol_from_mode(pancetta_config::OperatingMode::from_u8(
+                atomic.load(Ordering::Relaxed)
+            )),
             pancetta_ft8::Protocol::Ft4
         );
     }
