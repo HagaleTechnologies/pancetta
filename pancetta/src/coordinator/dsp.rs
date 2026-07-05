@@ -259,6 +259,10 @@ impl super::ApplicationCoordinator {
         // Read per-window so recordings can be band-stamped. 0 = unknown
         // (no rig / not yet polled) → recording filename omits the band.
         let operating_frequency_hz = self.operating_frequency_hz.clone();
+        // Live mode atomic — polled once per audio batch alongside the dial
+        // frequency so a runtime FT8/FT4/FT2 switch (Shift+M) resizes the
+        // decode window without a restart.
+        let active_protocol_mode = self.active_protocol_mode();
 
         let config = self.config.read().await;
         let input_rate = config.audio.sample_rate;
@@ -266,12 +270,11 @@ impl super::ApplicationCoordinator {
         // Derive the active protocol's DSP timing once at startup. mode=FT8
         // yields exactly the historical 12.64s window / 13s decode phase /
         // 15×rate overlap (asserted by `derive_dsp_timing_ft8_byte_identical`).
-        let protocol = super::protocol_from_mode(
-            config
-                .rig
-                .operating_mode()
-                .unwrap_or(pancetta_config::OperatingMode::Ft8),
-        );
+        let active_operating_mode = config
+            .rig
+            .operating_mode()
+            .unwrap_or(pancetta_config::OperatingMode::Ft8);
+        let protocol = super::protocol_from_mode(active_operating_mode);
         drop(config);
         let timing =
             super::derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(protocol));
@@ -279,6 +282,10 @@ impl super::ApplicationCoordinator {
         let dsp_decode_phase = timing.decode_phase;
         let dsp_overlap_samples = timing.overlap_samples;
         let dsp_slot_ns = timing.slot_ns;
+        // Seed value for the closure's mutable `cached_mode_u8`, moved in
+        // alongside the timing locals so the initial cache matches the same
+        // config read that produced `protocol`/`timing` above.
+        let seed_mode_u8 = active_operating_mode.as_u8();
 
         let handle = tokio::task::spawn_blocking(move || {
             // FT8 timing: transmissions start at 0/15/30/45 second marks.
@@ -293,9 +300,23 @@ impl super::ApplicationCoordinator {
                 ));
             }
             const FT8_SAMPLE_RATE: usize = 12000;
+            // Protocol-derived timing, captured from `DspTiming` above.
+            // Mutable so a live mode switch (Shift+M) can resize the decode
+            // window / decode phase / overlap / slot period without
+            // restarting this thread — see the mode-change guard below.
+            // (`dsp_window_samples` itself is folded into `ft8_window_samples`
+            // below — that's the only one actually read past this point.)
+            let mut dsp_decode_phase = dsp_decode_phase;
+            let mut dsp_overlap_samples = dsp_overlap_samples;
+            let mut dsp_slot_ns = dsp_slot_ns;
             // Protocol-derived window length (FT8 → 151_680 = 12.64s×12kHz;
-            // FT4 → 60_480 = 5.04s×12kHz). Captured from `DspTiming` above.
-            let ft8_window_samples = dsp_window_samples;
+            // FT4 → 60_480 = 5.04s×12kHz).
+            let mut ft8_window_samples = dsp_window_samples;
+            // Cached mode (`OperatingMode::as_u8()`), seeded from the same
+            // config read that produced `protocol`/`timing` above. Compared
+            // each iteration against the live `active_protocol_mode` atomic
+            // to detect a runtime switch.
+            let mut cached_mode_u8: u8 = seed_mode_u8;
 
             let mut decimate_counter: usize = 0;
 
@@ -426,6 +447,43 @@ impl super::ApplicationCoordinator {
                             bin_history.clear();
                         }
                         band_ref_dial_hz = new_ref;
+
+                        // Mode-change guard: if the operator cycled the
+                        // station-wide mode (Shift+M) since the audio now
+                        // buffered was captured, the buffered samples are the
+                        // wrong frame geometry for the new mode's decoder —
+                        // flush and resize, mirroring the band-change guard
+                        // immediately above.
+                        let cur_mode_u8 = active_protocol_mode.load(Ordering::Relaxed);
+                        if mode_flush_decision(cached_mode_u8, cur_mode_u8) {
+                            let new_protocol = super::protocol_from_mode(
+                                pancetta_config::OperatingMode::from_u8(cur_mode_u8),
+                            );
+                            let new_timing = super::derive_dsp_timing(
+                                &pancetta_ft8::ProtocolParams::from_protocol(new_protocol),
+                            );
+                            info!(
+                                target: "operator.override",
+                                "DSP: mode change {} -> {} — flushing {} in-flight \
+                                 samples and resizing the decode window",
+                                cached_mode_u8,
+                                cur_mode_u8,
+                                ft8_buffer.len()
+                            );
+                            ft8_window_samples = new_timing.window_samples;
+                            dsp_decode_phase = new_timing.decode_phase;
+                            dsp_overlap_samples = new_timing.overlap_samples;
+                            dsp_slot_ns = new_timing.slot_ns;
+                            ft8_buffer.clear();
+                            last_live_wf_samples = 0;
+                            bin_history.clear();
+                            next_window_time = pancetta_core::slot::next_phase_with_period(
+                                chrono::Utc::now(),
+                                dsp_decode_phase,
+                                dsp_slot_ns,
+                            );
+                            cached_mode_u8 = cur_mode_u8;
+                        }
 
                         // Live waterfall: emit one spectrum row per second using rustfft.
                         // We keep a simple sample counter to trigger every ~1 second.
