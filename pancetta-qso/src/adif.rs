@@ -250,6 +250,46 @@ pub fn freq_hz_to_band(frequency_hz: f64) -> String {
     }
 }
 
+/// Attribution appended to every logged QSO's COMMENT field, crediting the
+/// software/service stack the station runs on. Two variants so long
+/// operator notes don't force a truncation: the full form (with URLs) is
+/// used when it fits; otherwise the short form; if even that doesn't fit,
+/// attribution is omitted rather than truncating the operator's own notes.
+const ATTRIBUTION_FULL: &str =
+    "Using cqdx.io & Pancetta -- https://cqdx.io https://github.com/HagaleTechnologies/pancetta";
+const ATTRIBUTION_SHORT: &str = "Using cqdx.io & Pancetta";
+
+/// Practical ceiling for the rendered COMMENT field. ADIF itself doesn't cap
+/// this field, but downstream consumers (ClubLog, QRZ Logbook, eQSL, LoTW)
+/// commonly bound it in their own storage; keep comfortably under a common
+/// 255-char column limit so attribution never risks truncating in transit.
+const COMMENT_SOFT_MAX_LEN: usize = 255;
+
+/// Append the software attribution to `base` (existing notes + any HOUND
+/// marker), preferring the full form (with URLs) if it fits within
+/// [`COMMENT_SOFT_MAX_LEN`], falling back to the short form, and omitting
+/// attribution entirely if `base` alone is already at or over the limit —
+/// operator notes are never truncated to make room.
+fn append_attribution(base: &str) -> String {
+    let with_full = if base.is_empty() {
+        ATTRIBUTION_FULL.to_string()
+    } else {
+        format!("{} {}", base, ATTRIBUTION_FULL)
+    };
+    if with_full.len() <= COMMENT_SOFT_MAX_LEN {
+        return with_full;
+    }
+    let with_short = if base.is_empty() {
+        ATTRIBUTION_SHORT.to_string()
+    } else {
+        format!("{} {}", base, ATTRIBUTION_SHORT)
+    };
+    if with_short.len() <= COMMENT_SOFT_MAX_LEN {
+        return with_short;
+    }
+    base.to_string()
+}
+
 /// ADIF parser and generator
 #[derive(Clone)]
 pub struct AdifProcessor {
@@ -432,17 +472,22 @@ impl AdifProcessor {
         let band = self.frequency_to_band(metadata.frequency);
         let freq_mhz = metadata.frequency / 1_000_000.0;
 
-        // Build the COMMENT field: start from existing notes, then append
-        // "HOUND" for Hound QSOs (the human-readable DXpedition marker).
-        // Appending rather than overwriting preserves any operator notes.
-        let comment = if metadata.hound {
-            match &metadata.notes {
-                Some(existing) if !existing.is_empty() => Some(format!("{} HOUND", existing)),
-                _ => Some("HOUND".to_string()),
-            }
-        } else {
-            metadata.notes.clone()
+        // Build the COMMENT field: start from existing notes, append "HOUND"
+        // for Hound QSOs (the human-readable DXpedition marker), then append
+        // the software attribution (full form with URLs if it fits, short
+        // form otherwise, omitted entirely rather than truncating operator
+        // notes). Appending never overwrites existing notes.
+        let existing_notes = match &metadata.notes {
+            Some(existing) if !existing.is_empty() => Some(existing.as_str()),
+            _ => None,
         };
+        let base = match (existing_notes, metadata.hound) {
+            (Some(existing), true) => format!("{} HOUND", existing),
+            (Some(existing), false) => existing.to_string(),
+            (None, true) => "HOUND".to_string(),
+            (None, false) => String::new(),
+        };
+        let comment = Some(append_attribution(&base));
 
         // Build additional_fields from metadata.tags; for Hound QSOs inject
         // the machine-readable APP_PANCETTA_HOUND marker.  Non-Hound QSOs are
@@ -1326,7 +1371,10 @@ ADIF Export for Test Program
         assert_eq!(adif_qso.tx_pwr, None);
     }
 
-    /// A non-Hound QSO with existing notes must pass them through unchanged.
+    /// A non-Hound QSO with existing notes must preserve them verbatim as a
+    /// prefix of COMMENT (2026-07-06: notes are no longer emitted alone —
+    /// software attribution is appended to every QSO — but the operator's
+    /// own text must never be altered or dropped).
     #[test]
     fn non_hound_qso_adif_notes_unchanged() {
         let processor = AdifProcessor::new();
@@ -1334,10 +1382,86 @@ ADIF Export for Test Program
 
         let adif_qso = processor.qso_to_adif(&metadata, None);
 
+        let comment = adif_qso.comment.as_deref().unwrap_or("");
+        assert!(
+            comment.starts_with("Good contact"),
+            "existing notes must be preserved verbatim as a prefix of COMMENT; got {:?}",
+            adif_qso.comment
+        );
+    }
+
+    /// Every QSO's COMMENT carries the cqdx.io/Pancetta attribution, full
+    /// form (with URLs) when there's room — the common case (no/short notes).
+    #[test]
+    fn every_qso_gets_full_attribution_by_default() {
+        let processor = AdifProcessor::new();
+        let metadata = hound_adif_metadata(false, None);
+
+        let adif_qso = processor.qso_to_adif(&metadata, None);
+
+        assert_eq!(adif_qso.comment.as_deref(), Some(ATTRIBUTION_FULL));
+    }
+
+    /// When existing notes are long enough that the full attribution
+    /// (with URLs) would blow past the soft max, fall back to the short
+    /// form rather than dropping attribution or truncating operator notes.
+    #[test]
+    fn long_notes_fall_back_to_short_attribution() {
+        let processor = AdifProcessor::new();
+        // Long enough that notes + ATTRIBUTION_FULL exceeds COMMENT_SOFT_MAX_LEN
+        // but notes + ATTRIBUTION_SHORT still fits.
+        let long_notes = "x".repeat(200);
+        let metadata = hound_adif_metadata(false, Some(&long_notes));
+
+        let adif_qso = processor.qso_to_adif(&metadata, None);
+        let comment = adif_qso.comment.as_deref().unwrap_or("");
+
+        assert!(
+            comment.starts_with(&long_notes),
+            "operator notes must be preserved verbatim"
+        );
+        assert!(
+            comment.contains(ATTRIBUTION_SHORT),
+            "expected short attribution; got {:?}",
+            adif_qso.comment
+        );
+        assert!(
+            !comment.contains("https://"),
+            "full attribution (with URLs) must not be used when it wouldn't fit; got {:?}",
+            adif_qso.comment
+        );
+    }
+
+    /// When even the short attribution wouldn't fit, operator notes are
+    /// preserved exactly and attribution is dropped entirely — notes are
+    /// never truncated to make room for it.
+    #[test]
+    fn very_long_notes_drop_attribution_entirely() {
+        let processor = AdifProcessor::new();
+        let very_long_notes = "x".repeat(COMMENT_SOFT_MAX_LEN);
+        let metadata = hound_adif_metadata(false, Some(&very_long_notes));
+
+        let adif_qso = processor.qso_to_adif(&metadata, None);
+
         assert_eq!(
             adif_qso.comment.as_deref(),
-            Some("Good contact"),
-            "non-Hound QSO notes must pass through to COMMENT unchanged"
+            Some(very_long_notes.as_str()),
+            "attribution must be dropped, not truncate operator notes"
         );
+    }
+
+    /// Attribution composes with the HOUND marker: notes, then HOUND, then
+    /// attribution, all in one COMMENT field.
+    #[test]
+    fn hound_qso_comment_includes_attribution_too() {
+        let processor = AdifProcessor::new();
+        let metadata = hound_adif_metadata(true, Some("Big pile-up!"));
+
+        let adif_qso = processor.qso_to_adif(&metadata, None);
+        let comment = adif_qso.comment.as_deref().unwrap_or("");
+
+        assert!(comment.contains("Big pile-up!"));
+        assert!(comment.contains("HOUND"));
+        assert!(comment.contains(ATTRIBUTION_FULL));
     }
 }
