@@ -54,15 +54,20 @@ fn ik_vector_byte_for_byte() {
     // re-parse for the responder.
     let mut initiator = snow::Builder::new(PARAMS.parse().expect("params parse"))
         .prologue(&prologue)
+        .expect("prologue")
         .local_private_key(&init_static)
+        .expect("local_private_key")
         .remote_public_key(&init_remote_static)
+        .expect("remote_public_key")
         .fixed_ephemeral_key_for_testing_only(&init_eph)
         .build_initiator()
         .expect("build initiator");
 
     let mut responder = snow::Builder::new(PARAMS.parse().expect("params parse"))
         .prologue(&prologue)
+        .expect("prologue")
         .local_private_key(&resp_static)
+        .expect("local_private_key")
         .fixed_ephemeral_key_for_testing_only(&resp_eph)
         .build_responder()
         .expect("build responder");

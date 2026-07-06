@@ -403,7 +403,9 @@ mod tests {
                 "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
             let inner = snow::Builder::new(params)
                 .local_private_key(local_priv)
+                .unwrap()
                 .remote_public_key(remote_pub)
+                .unwrap()
                 .build_initiator()
                 .unwrap();
             Self { inner }
