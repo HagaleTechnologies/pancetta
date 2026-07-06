@@ -234,6 +234,17 @@ cargo bench --package pancetta-ft8
 - **Signal Generation**: Synthetic FT8 signal creation for testing
 - **Error Conditions**: Comprehensive error handling validation
 
+## Profiling
+
+`cargo run --release -p pancetta-ft8 --example profile_decode -- [native|native-fresh|ft8lib] [iters]`
+
+Decodes `tests/fixtures/wav/wsjt/210703_133430.wav` repeatedly and prints per-window
+wall time. `RAYON_NUM_THREADS=1` gives clean single-thread numbers. For call-graph
+profiles build with `CARGO_PROFILE_RELEASE_DEBUG=true CARGO_PROFILE_RELEASE_STRIP=false`
+(the workspace release profile strips symbols) and use `sample`/Instruments (macOS).
+Ablation env vars: `ABL_LDPC_ITERS`, `ABL_SYNC_CANDS`, `ABL_MULTIPASS`,
+`ABL_CROSS_CYCLE` (0/1), `ABL_JOINT_PAIR` (0/1).
+
 ## Dependencies
 
 ### Core Dependencies

@@ -1724,6 +1724,13 @@ impl Ft8Decoder {
     // ========================================================================
 
     /// Decode a 12.64-second window of audio samples
+    ///
+    /// # Window size
+    ///
+    /// Callers must pass exactly `WINDOW_SAMPLES` samples (pad or truncate first).
+    /// The Costas t0 sweep scales with trailing time slack: feeding a full 15 s
+    /// (180 000-sample) buffer instead of the 151 680-sample window was measured
+    /// at 4–5x the decode cost (2026-07-06 profiling session).
     pub fn decode_window(&mut self, samples: &[f32]) -> Ft8Result<Vec<DecodedMessage>> {
         self.decode_window_with_ap(samples, &crate::ap::ApContext::default())
     }
