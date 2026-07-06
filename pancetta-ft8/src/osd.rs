@@ -519,29 +519,36 @@ impl OsdDecoder {
         }
         if let Some(probs) = neural_ordering {
             // Neural ordering: sort info bits by predicted error probability
-            // (highest probability first = least reliable), parity bits by |LLR|
+            // (highest probability first = least reliable), parity bits by |LLR|.
+            //
+            // A7b: precompute the per-index sort key once instead of
+            // recomputing `-probs[i]`/`-llrs[i].abs()` on every comparator
+            // call (~1,300 compares per sort) — same values, same order,
+            // same tie behavior, just cached.
+            let mut keys = [0.0f32; LDPC_CODEWORD_BITS];
+            for i in 0..LDPC_CODEWORD_BITS {
+                keys[i] = if i < LDPC_INFO_BITS {
+                    -probs[i] // negative so highest prob sorts first (= most unreliable)
+                } else {
+                    -llrs[i].abs() // parity bits: high |LLR| = reliable, sort last
+                };
+            }
+            // Sort ascending (most negative = highest prob = least reliable = first)
             sorted_indices.sort_by(|&a, &b| {
-                let key_a = if a < LDPC_INFO_BITS {
-                    -probs[a] // negative so highest prob sorts first (= most unreliable)
-                } else {
-                    -llrs[a].abs() // parity bits: high |LLR| = reliable, sort last
-                };
-                let key_b = if b < LDPC_INFO_BITS {
-                    -probs[b]
-                } else {
-                    -llrs[b].abs()
-                };
-                // Sort ascending (most negative = highest prob = least reliable = first)
-                key_b
-                    .partial_cmp(&key_a)
+                keys[b]
+                    .partial_cmp(&keys[a])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         } else {
-            // Original: sort by descending |LLR| (most reliable first)
+            // Original: sort by descending |LLR| (most reliable first).
+            // A7b: precompute |LLR| once instead of in the comparator.
+            let mut abs_llrs = [0.0f32; LDPC_CODEWORD_BITS];
+            for i in 0..LDPC_CODEWORD_BITS {
+                abs_llrs[i] = llrs[i].abs();
+            }
             sorted_indices.sort_by(|&a, &b| {
-                llrs[b]
-                    .abs()
-                    .partial_cmp(&llrs[a].abs())
+                abs_llrs[b]
+                    .partial_cmp(&abs_llrs[a])
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
         };

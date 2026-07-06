@@ -10145,15 +10145,21 @@ impl LdpcDecoder {
             // hb-067: optional mBP offset — reduce BP-LLR magnitudes
             // before OSD invocation so OSD considers more flip patterns
             // (per arXiv:2306.00443). bp_offset_subtract=0 → no change.
-            let llrs_for_osd: Vec<f32> = if self.bp_offset_subtract > 0.0 {
-                decoded_llrs[..174]
-                    .iter()
-                    .map(|&v| v.signum() * (v.abs() - self.bp_offset_subtract).max(0.0))
-                    .collect()
+            // F6: avoid the allocate-then-borrow round trip through a
+            // `Vec<f32>` — `decoded_llrs` is already `[f32; 174]` (Task 2),
+            // so the no-op (bp_offset_subtract == 0.0) case can borrow it
+            // directly, and the subtract case can compute straight into a
+            // stack array instead of a heap `Vec`.
+            let subtracted_arr: [f32; 174];
+            let llr_arr: &[f32; 174] = if self.bp_offset_subtract > 0.0 {
+                subtracted_arr = std::array::from_fn(|i| {
+                    let v = decoded_llrs[i];
+                    v.signum() * (v.abs() - self.bp_offset_subtract).max(0.0)
+                });
+                &subtracted_arr
             } else {
-                decoded_llrs[..174].to_vec()
+                &decoded_llrs
             };
-            let llr_arr: &[f32; 174] = llrs_for_osd[..174].try_into().unwrap();
             let parity_errors = self.count_parity_errors(llr_arr);
 
             // Parity gate for OSD: tunable via Ft8Config::max_parity_errors_for_osd.
