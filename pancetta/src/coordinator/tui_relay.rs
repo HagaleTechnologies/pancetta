@@ -741,6 +741,10 @@ impl super::ApplicationCoordinator {
         let cmd_active_protocol_mode = self.active_protocol_mode();
         let cmd_active_slot_ns = self.active_slot_ns();
         let cmd_active_decode_phase_ns = self.active_decode_phase_ns();
+        // Remote-gateway relay gate (dispensa Q-0027 mode event) — the
+        // CycleOperatingMode success arm relays the new mode to already-
+        // connected remote clients, same additive pattern as Frequency/Split.
+        let cmd_gateway_enabled = self.gateway_enabled.clone();
         // Whether the autonomous component is running at all (config
         // gate). If it's config-disabled there is no decision loop to
         // re-enable — `a` should say so honestly instead of flipping a
@@ -1435,6 +1439,19 @@ impl super::ApplicationCoordinator {
                                             e
                                         );
                                     }
+                                    // dispensa Q-0027: relay the new mode to already-
+                                    // connected remote-gateway clients, same additive
+                                    // pattern as Frequency/Split (no-op when the
+                                    // gateway is disabled).
+                                    super::remote_gateway::relay_to_gateway(
+                                        &cmd_message_bus,
+                                        &cmd_gateway_enabled,
+                                        ComponentId::Tui,
+                                        MessageType::ModeStatus {
+                                            mode: mode_str.clone(),
+                                        },
+                                    )
+                                    .await;
                                     let _ = cmd_tui_msg_tx.send(
                                         pancetta_tui::tui_runner::TuiMessage::ModeUpdate {
                                             mode: mode_str,

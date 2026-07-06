@@ -127,6 +127,7 @@ pub(crate) fn server_event_from_bus(msg: &MessageType) -> Option<ServerEvent> {
         }
         MessageType::SplitStatus { tx_hz } => Some(ServerEvent::Split { tx_hz: *tx_hz }),
         MessageType::TxStatus { active } => Some(ServerEvent::TxStatus { active: *active }),
+        MessageType::ModeStatus { mode } => Some(ServerEvent::Mode { mode: mode.clone() }),
         _ => None,
     }
 }
@@ -305,6 +306,17 @@ mod tests {
         match server_event_from_bus(&msg) {
             Some(ServerEvent::TxStatus { active }) => assert!(active),
             other => panic!("expected TxStatus, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn mode_status_maps_to_mode_event() {
+        let msg = MessageType::ModeStatus {
+            mode: "FT4".to_string(),
+        };
+        match server_event_from_bus(&msg) {
+            Some(ServerEvent::Mode { mode }) => assert_eq!(mode, "FT4"),
+            other => panic!("expected Mode, got {:?}", other),
         }
     }
 

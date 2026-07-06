@@ -37,6 +37,11 @@ pub enum ServerEvent {
         #[serde(rename = "txHz")]
         tx_hz: u64,
     },
+    /// Station-wide operating mode changed (operator Shift+M). Additive,
+    /// dispensa Q-0027 — see `StateSnapshot::mode`.
+    Mode {
+        mode: String,
+    },
     SignalStrength {
         #[serde(rename = "dbOverS9")]
         db_over_s9: i32,
@@ -145,6 +150,12 @@ mod tests {
                 },
             ),
             ("split", ServerEvent::Split { tx_hz: 0 }),
+            (
+                "mode",
+                ServerEvent::Mode {
+                    mode: "FT4".to_string(),
+                },
+            ),
             (
                 "signalStrength",
                 ServerEvent::SignalStrength { db_over_s9: 5 },

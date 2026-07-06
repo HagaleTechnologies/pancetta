@@ -201,6 +201,9 @@ async fn handle_bus_msg(
                         ServerEvent::Split { tx_hz } => {
                             s.split_tx_hz = *tx_hz;
                         }
+                        ServerEvent::Mode { mode } => {
+                            s.mode = mode.clone();
+                        }
                         _ => {}
                     }
                 }
@@ -271,6 +274,10 @@ impl super::ApplicationCoordinator {
             frequency_hz: self.operating_frequency_hz.load(Ordering::Relaxed),
             split_tx_hz: self.split_tx_frequency_hz.load(Ordering::Relaxed),
             tx_policy: TxPolicy::from_u8(self.tx_policy.load(Ordering::Acquire)),
+            mode: super::mode_str(pancetta_config::OperatingMode::from_u8(
+                self.active_protocol_mode().load(Ordering::Relaxed),
+            ))
+            .to_string(),
             dx_hunter: Vec::new(),
             active_qsos: Vec::new(),
             pending_calls: Vec::new(),
@@ -363,6 +370,7 @@ mod server_tests {
             frequency_hz: 14_074_000,
             split_tx_hz: 0,
             tx_policy: TxPolicy::Full,
+            mode: "FT8".to_string(),
             dx_hunter: vec![],
             active_qsos: vec![],
             pending_calls: vec![],

@@ -266,6 +266,16 @@ pub enum MessageType {
         tx_hz: u64,
     },
 
+    /// Station-wide operating-mode echo. Sent by the coordinator relay after
+    /// a successful `try_switch_operating_mode` (operator Shift+M). Relayed
+    /// additively to the remote gateway (`relay_to_gateway`) so already-
+    /// connected clients see a live mode change without needing a
+    /// reconnect — dispensa Q-0027 / rig-api v1.1. Observation only.
+    ModeStatus {
+        /// New active operating mode ("FT8"/"FT4"/"FT2").
+        mode: String,
+    },
+
     /// TX-offset-hold state echo for the TUI's TX-placement park line +
     /// title-bar chip. Every OTHER writer of `tx_offset_hold_hz` (the `o`
     /// modal, Enter-park on the TX-placement instrument) is TUI-initiated,

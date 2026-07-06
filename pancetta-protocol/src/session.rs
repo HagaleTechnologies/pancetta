@@ -40,10 +40,22 @@ pub struct StateSnapshot {
     pub split_tx_hz: u64,
     #[serde(with = "wire_serde::tx_policy")]
     pub tx_policy: TxPolicy,
+    /// Station-wide active operating mode ("FT8"/"FT4"/"FT2"). Added in the
+    /// rig-api v1.1 additive bump promised in dispensa Q-0009 once pancetta's
+    /// multi-mode (FT4/FT2) work landed (dispensa Q-0027). pancetta always
+    /// serializes a real value; `#[serde(default)]` on deserialize is purely
+    /// for back-compat with wire captures/fixtures that predate this field
+    /// (absent ⇒ "FT8", matching Q-0009's stated additive semantics).
+    #[serde(default = "default_mode_ft8")]
+    pub mode: String,
     pub dx_hunter: Vec<DxRow>,
     pub active_qsos: Vec<QsoProgress>,
     pub pending_calls: Vec<PendingCall>,
     pub recent_decodes: Vec<DecodedView>,
+}
+
+fn default_mode_ft8() -> String {
+    "FT8".to_string()
 }
 
 /// Top-level frame client→server.
@@ -107,11 +119,22 @@ mod tests {
             frequency_hz: 14_074_000,
             split_tx_hz: 0,
             tx_policy: TxPolicy::Full,
+            mode: "FT8".to_string(),
             dx_hunter: vec![],
             active_qsos: vec![],
             pending_calls: vec![],
             recent_decodes: vec![],
         }
+    }
+
+    /// A snapshot serialized before this field existed (no `mode` key) must
+    /// still deserialize, defaulting to "FT8" — the back-compat contract
+    /// dispensa Q-0009/Q-0027 promised.
+    #[test]
+    fn snapshot_without_mode_key_defaults_to_ft8() {
+        let j = r#"{"frequencyHz":14074000,"splitTxHz":0,"txPolicy":"full","dxHunter":[],"activeQsos":[],"pendingCalls":[],"recentDecodes":[]}"#;
+        let snap: StateSnapshot = serde_json::from_str(j).unwrap();
+        assert_eq!(snap.mode, "FT8");
     }
 
     #[test]
