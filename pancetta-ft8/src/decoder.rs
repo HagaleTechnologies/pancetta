@@ -10167,11 +10167,11 @@ impl LdpcDecoder {
                 // higher trial counts on weak signals.
                 #[cfg(feature = "neural_osd")]
                 let neural_ordering = trajectory
-                    .as_ref()
+                    .as_deref()
                     .map(crate::neural_osd::predict_error_bits);
                 #[cfg(not(feature = "neural_osd"))]
                 let neural_ordering: Option<[f32; 91]> = {
-                    let _ = trajectory.as_ref();
+                    let _ = trajectory.as_deref();
                     None
                 };
 
@@ -10196,7 +10196,7 @@ impl LdpcDecoder {
                         }
                         None => (false, None),
                     };
-                    let traj = trajectory.unwrap_or([[0.0; 174]; 25]);
+                    let traj = trajectory.as_deref().copied().unwrap_or([[0.0; 174]; 25]);
                     crate::bp_trajectory_capture::record(
                         crate::bp_trajectory_capture::CapturedTrajectory {
                             channel_llrs: captured_channel_llrs.unwrap_or([0.0; 174]),
@@ -10227,7 +10227,7 @@ impl LdpcDecoder {
                 // and `osd_codeword = None` so the dataset can also study
                 // whether the trajectory signature predicts the gate
                 // outcome (a useful auxiliary signal for the diagnostic).
-                let traj = trajectory.unwrap_or([[0.0; 174]; 25]);
+                let traj = trajectory.as_deref().copied().unwrap_or([[0.0; 174]; 25]);
                 crate::bp_trajectory_capture::record(
                     crate::bp_trajectory_capture::CapturedTrajectory {
                         channel_llrs: captured_channel_llrs.unwrap_or([0.0; 174]),
@@ -10282,7 +10282,7 @@ impl LdpcDecoder {
     /// Uses sparse message storage (only connected edges) and checks syndrome
     /// after every iteration for early termination. Most decodable messages
     /// converge in 10-30 iterations rather than running all 100.
-    fn belief_propagation(&self, channel_llrs: &[f32]) -> Ft8Result<Vec<f32>> {
+    fn belief_propagation(&self, channel_llrs: &[f32]) -> Ft8Result<[f32; 174]> {
         let num_checks = self.parity_check_matrix.num_checks;
         let num_vars = self.parity_check_matrix.num_variables;
 
@@ -10391,11 +10391,11 @@ impl LdpcDecoder {
             // Early termination: check syndrome every iteration (including iteration 0).
             // Most decodable messages converge in 10-30 iterations.
             if self.check_syndrome_fast(&output_llrs) {
-                return Ok(output_llrs.to_vec());
+                return Ok(output_llrs);
             }
         }
 
-        Ok(output_llrs.to_vec())
+        Ok(output_llrs)
     }
 
     /// Belief propagation with per-iteration LLR trajectory collection.
@@ -10407,7 +10407,7 @@ impl LdpcDecoder {
     fn belief_propagation_with_trajectory(
         &self,
         channel_llrs: &[f32],
-    ) -> Ft8Result<(Vec<f32>, Option<[[f32; 174]; 25]>)> {
+    ) -> Ft8Result<([f32; 174], Option<Box<[[f32; 174]; 25]>>)> {
         let (out, traj, _features) = self.belief_propagation_with_features(channel_llrs)?;
         Ok((out, traj))
     }
@@ -10426,7 +10426,7 @@ impl LdpcDecoder {
     fn belief_propagation_with_features(
         &self,
         channel_llrs: &[f32],
-    ) -> Ft8Result<(Vec<f32>, Option<[[f32; 174]; 25]>, (u8, f32))> {
+    ) -> Ft8Result<([f32; 174], Option<Box<[[f32; 174]; 25]>>, (u8, f32))> {
         let num_checks = self.parity_check_matrix.num_checks;
         let num_vars = self.parity_check_matrix.num_variables;
 
@@ -10434,7 +10434,12 @@ impl LdpcDecoder {
         let mut c2v = [[0.0f32; 7]; 83];
         let mut output_llrs = [0.0f32; 174];
         output_llrs[..num_vars].copy_from_slice(&channel_llrs[..num_vars]);
-        let mut trajectory = [[0.0f32; 174]; 25];
+        // Lazily allocated: the 17.4 KB (25×174 f32) trajectory is only
+        // ever read back on the BP-failure path (neural-OSD ordering /
+        // bp_trajectory_capture). On the convergent path — the common
+        // case — this stays `None` and the box is never allocated or
+        // written into.
+        let mut trajectory: Option<Box<[[f32; 174]; 25]>> = None;
 
         for check_idx in 0..num_checks {
             let connected_vars = self.parity_check_matrix.get_connected_variables(check_idx);
@@ -10534,26 +10539,33 @@ impl LdpcDecoder {
 
                 output_llrs = total;
 
-                if iteration < max_iters {
-                    trajectory[iteration] = output_llrs;
-                }
+                // Check convergence BEFORE recording the trajectory row:
+                // on the convergent path we return `None` for the
+                // trajectory anyway, so writing (and, before this, lazily
+                // allocating) the row for this iteration would be pure
+                // waste. Reordering is behavior-neutral — the syndrome
+                // check only reads `output_llrs`, which the trajectory
+                // store never mutates.
                 if self.check_syndrome_fast(&output_llrs) {
                     let iters_used = clamp_u8(iteration + 1);
                     let min_llr = min_abs_llr(&output_llrs);
-                    return Ok((output_llrs.to_vec(), None, (iters_used, min_llr)));
+                    return Ok((output_llrs, None, (iters_used, min_llr)));
+                }
+                if iteration < max_iters {
+                    trajectory.get_or_insert_with(|| Box::new([[0.0f32; 174]; 25]))[iteration] =
+                        output_llrs;
                 }
             }
 
+            let mut trajectory = trajectory
+                .take()
+                .unwrap_or_else(|| Box::new([output_llrs; 25]));
             for slot in trajectory.iter_mut().take(25).skip(max_iters) {
                 *slot = output_llrs;
             }
             let iters_used = clamp_u8(self.max_iterations);
             let min_llr = min_abs_llr(&output_llrs);
-            return Ok((
-                output_llrs.to_vec(),
-                Some(trajectory),
-                (iters_used, min_llr),
-            ));
+            return Ok((output_llrs, Some(trajectory), (iters_used, min_llr)));
         }
 
         for iteration in 0..self.max_iterations {
@@ -10637,31 +10649,35 @@ impl LdpcDecoder {
                 }
             }
 
-            // Record trajectory (only first 25 iterations fit)
-            if iteration < max_iters {
-                trajectory[iteration] = output_llrs;
-            }
-
-            // Early termination on convergence — discard trajectory
+            // Early termination on convergence — discard trajectory.
+            // Checked BEFORE recording the trajectory row (see the mirrored
+            // comment in the layered branch above): behavior-neutral
+            // reordering that skips the lazy allocation/write entirely on
+            // the convergent path.
             if self.check_syndrome_fast(&output_llrs) {
                 let iters_used = clamp_u8(iteration + 1);
                 let min_llr = min_abs_llr(&output_llrs);
-                return Ok((output_llrs.to_vec(), None, (iters_used, min_llr)));
+                return Ok((output_llrs, None, (iters_used, min_llr)));
+            }
+
+            // Record trajectory (only first 25 iterations fit)
+            if iteration < max_iters {
+                trajectory.get_or_insert_with(|| Box::new([[0.0f32; 174]; 25]))[iteration] =
+                    output_llrs;
             }
         }
 
         // BP did not converge — fill any remaining trajectory slots
+        let mut trajectory = trajectory
+            .take()
+            .unwrap_or_else(|| Box::new([output_llrs; 25]));
         for i in self.max_iterations.min(25)..25 {
             trajectory[i] = output_llrs;
         }
 
         let iters_used = clamp_u8(self.max_iterations);
         let min_llr = min_abs_llr(&output_llrs);
-        Ok((
-            output_llrs.to_vec(),
-            Some(trajectory),
-            (iters_used, min_llr),
-        ))
+        Ok((output_llrs, Some(trajectory), (iters_used, min_llr)))
     }
 
     /// Check if syndrome is zero (all parity checks satisfied).
@@ -11289,6 +11305,106 @@ mod tests {
         let (noisy_llrs, _) = layered.belief_propagation_with_trajectory(&noisy).unwrap();
         let correct = (0..174).filter(|&i| noisy_llrs[i] > 0.0).count();
         assert!(correct > 170, "layered only corrected {correct}/174 bits");
+    }
+
+    #[test]
+    fn bp_refactor_preserves_llrs_and_trajectory_contract() {
+        // Task 2 (F2) bit-exact pin: pins the exact numeric contract of
+        // `belief_propagation_with_features` (final LLRs, trajectory
+        // presence, iteration count, min |LLR|) BEFORE the lazy-trajectory
+        // + array-return refactor, so any accidental behavior change during
+        // the refactor is caught by an exact-value mismatch rather than a
+        // loose shape check.
+        //
+        // Non-converging case: pure noise LLRs — must fail to converge and
+        // therefore carry a `Some` trajectory.
+        let decoder = LdpcDecoder::new(100).unwrap();
+        let noise: Vec<f32> = (0..174)
+            .map(|i| ((i * 37 % 13) as f32 - 6.0) * 0.11)
+            .collect();
+        let (llrs, traj, (iters, min_llr)) =
+            decoder.belief_propagation_with_features(&noise).unwrap();
+        assert!(
+            traj.is_some(),
+            "non-converging input must yield a trajectory"
+        );
+        assert_eq!(llrs.len(), 174);
+        assert!(iters >= 1);
+        assert!(min_llr.is_finite());
+        // Converging case: a clean high-confidence all-zero codeword must
+        // converge quickly with no trajectory.
+        let clean = vec![5.0f32; 174];
+        let (clean_llrs, clean_traj, (clean_iters, clean_min_llr)) =
+            decoder.belief_propagation_with_features(&clean).unwrap();
+        assert!(
+            clean_traj.is_none(),
+            "clean codeword should converge with no trajectory"
+        );
+        assert!((1..100).contains(&clean_iters));
+        assert!(clean_min_llr > 0.0);
+        assert!(clean_llrs.iter().all(|&l| l > 0.0));
+
+        // Bit-exact pin, captured pre-refactor via `cargo test -p
+        // pancetta-ft8 --lib --features transmit
+        // bp_refactor_preserves_llrs_and_trajectory_contract -- --nocapture`
+        // (raw output recorded in task-2-report.md). Comparing raw f32 bit
+        // patterns (not just approximate equality) makes this a true
+        // bit-exact pin for the Task 2 lazy-trajectory + array-return
+        // refactor: any change to the refactor that alters even the last
+        // mantissa bit of a convergent-path or failure-path value fails
+        // this test.
+        let t = traj.as_ref().unwrap();
+        assert_eq!(iters, 100, "pinned BP iteration count regressed");
+        assert_eq!(
+            min_llr.to_bits(),
+            0x34bfffffu32,
+            "pinned min_llr bits regressed"
+        );
+        assert_eq!(
+            llrs[0].to_bits(),
+            0xbf297abeu32,
+            "pinned llrs[0] bits regressed"
+        );
+        assert_eq!(
+            llrs[1].to_bits(),
+            0x3f0cb743u32,
+            "pinned llrs[1] bits regressed"
+        );
+        assert_eq!(
+            llrs[173].to_bits(),
+            0xbde13238u32,
+            "pinned llrs[173] bits regressed"
+        );
+        assert_eq!(
+            t[0][0].to_bits(),
+            0xbf297a89u32,
+            "pinned trajectory[0][0] bits regressed"
+        );
+        assert_eq!(
+            t[24][173].to_bits(),
+            0xbde13238u32,
+            "pinned trajectory[24][173] bits regressed"
+        );
+
+        assert_eq!(
+            clean_iters, 1,
+            "pinned clean-case iteration count regressed"
+        );
+        assert_eq!(
+            clean_min_llr.to_bits(),
+            0x416a0587u32,
+            "pinned clean-case min_llr bits regressed"
+        );
+        assert_eq!(
+            clean_llrs[0].to_bits(),
+            0x416fd9beu32,
+            "pinned clean-case llrs[0] bits regressed"
+        );
+        assert_eq!(
+            clean_llrs[173].to_bits(),
+            0x4172c3d8u32,
+            "pinned clean-case llrs[173] bits regressed"
+        );
     }
 
     #[test]
