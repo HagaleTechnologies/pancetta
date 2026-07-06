@@ -1354,16 +1354,23 @@ impl Default for Ft8Config {
 // ============================================================================
 
 /// Time-frequency spectrogram with frequency oversampling support
+///
+/// Storage is a single flat `Vec` indexed via [`Spectrogram::idx`] —
+/// `(t * freq_osr + sub) * num_bins + bin` — rather than a jagged
+/// `Vec<Vec<Vec<_>>>`. This kills a triple-pointer-chase in the
+/// Costas-scoring hot loop (perf F3); reader/writer sites use
+/// [`Spectrogram::at`] / [`Spectrogram::row`] or direct `idx()` +
+/// slice-index for mutation.
 struct Spectrogram {
-    /// Power values [time_step][freq_sub][freq_bin]
+    /// Flattened [time_step][freq_sub][freq_bin] — index via `Self::idx`.
     /// With freq_osr=2: freq_sub 0 = even bins (0, 2, 4, ...), freq_sub 1 = odd bins (1, 3, 5, ...)
-    power: Vec<Vec<Vec<f64>>>,
-    /// Optional complex FFT bins, same shape as `power`. Populated
+    power: Vec<f64>,
+    /// Optional complex FFT bins, same flat indexing as `power`. Populated
     /// only when `Ft8Config::cross_cycle_coherent` is true; required for
     /// coherent cross-cycle averaging (phase recovery from Costas, then
     /// complex sum across cycles). When `None`, the cross-cycle pass falls
     /// back to the non-coherent (power-only) path.
-    complex: Option<Vec<Vec<Vec<Complex<f64>>>>>,
+    complex: Option<Vec<Complex<f64>>>,
     /// Number of time steps
     num_steps: usize,
     /// Number of frequency bins per sub-bin (in 6.25 Hz units)
@@ -1375,6 +1382,27 @@ struct Spectrogram {
     /// `candidate_offset_samples` (which subtracts this AND the
     /// `SLIDING_FRAME_LOOKBACK_STEPS` window-centring correction).
     time_padding: usize,
+}
+
+impl Spectrogram {
+    /// Flat index for `(time_step, freq_sub, freq_bin)`.
+    #[inline(always)]
+    fn idx(&self, t: usize, sub: usize, bin: usize) -> usize {
+        (t * self.freq_osr + sub) * self.num_bins + bin
+    }
+
+    /// Power (dB) at `(time_step, freq_sub, freq_bin)`.
+    #[inline(always)]
+    fn at(&self, t: usize, sub: usize, bin: usize) -> f64 {
+        self.power[self.idx(t, sub, bin)]
+    }
+
+    /// The full `num_bins`-wide power row at `(time_step, freq_sub)`.
+    #[inline(always)]
+    fn row(&self, t: usize, sub: usize) -> &[f64] {
+        let base = (t * self.freq_osr + sub) * self.num_bins;
+        &self.power[base..base + self.num_bins]
+    }
 }
 
 /// Costas sync search candidate
@@ -3445,12 +3473,18 @@ impl Ft8Decoder {
         let fft = &self.spectrogram_fft;
         let window = &self.spectrogram_window;
 
-        let mut power = Vec::with_capacity(num_steps);
+        // Flattened [time_step][freq_sub][freq_bin] storage — see
+        // `Spectrogram::idx`. Allocated once; written via the same
+        // `(t * freq_osr + fs) * num_bins + bin` formula.
+        let mut power = vec![0.0f64; num_steps * freq_osr * num_bins];
         // hb-074: retain complex bins only when the coherent cross-cycle
         // path will consume them (doubles the spectrogram's memory).
         let want_complex = self.config.cross_cycle_coherent;
-        let mut complex: Option<Vec<Vec<Vec<Complex<f64>>>>> = if want_complex {
-            Some(Vec::with_capacity(num_steps))
+        let mut complex: Option<Vec<Complex<f64>>> = if want_complex {
+            Some(vec![
+                Complex::new(0.0, 0.0);
+                num_steps * freq_osr * num_bins
+            ])
         } else {
             None
         };
@@ -3459,6 +3493,7 @@ impl Ft8Decoder {
         let mut last_frame = vec![0.0f64; nfft];
 
         let mut frame_pos = 0usize;
+        let mut t = 0usize;
 
         for _block in 0..num_blocks {
             for _time_sub in 0..time_osr {
@@ -3482,21 +3517,11 @@ impl Ft8Decoder {
                 fft.process(&mut fft_buffer);
 
                 // Organize into freq_osr sub-bins (matches monitor.c lines 164-188)
-                let mut sub_power = Vec::with_capacity(freq_osr);
-                let mut sub_complex: Option<Vec<Vec<Complex<f64>>>> = if want_complex {
-                    Some(Vec::with_capacity(freq_osr))
-                } else {
-                    None
-                };
                 for fs in 0..freq_osr {
-                    let mut row = Vec::with_capacity(num_bins);
-                    let mut crow: Option<Vec<Complex<f64>>> = if want_complex {
-                        Some(Vec::with_capacity(num_bins))
-                    } else {
-                        None
-                    };
+                    let row_base = (t * freq_osr + fs) * num_bins;
                     for bin in 0..num_bins {
                         let src_bin = bin * freq_osr + fs;
+                        let out_idx = row_base + bin;
                         if src_bin < nfft / 2 + 1 {
                             let cval = fft_buffer[src_bin];
                             // hb-228: per-bin magnitude compression. `Power`
@@ -3507,26 +3532,19 @@ impl Ft8Decoder {
                                 MagnitudeTransform::Sqrt => cval.norm().sqrt(),
                             };
                             let db = 10.0 * (1e-12f64 + m).log10();
-                            row.push(db);
-                            if let Some(c) = crow.as_mut() {
-                                c.push(cval);
+                            power[out_idx] = db;
+                            if let Some(c) = complex.as_mut() {
+                                c[out_idx] = cval;
                             }
                         } else {
-                            row.push(-120.0);
-                            if let Some(c) = crow.as_mut() {
-                                c.push(Complex::new(0.0, 0.0));
+                            power[out_idx] = -120.0;
+                            if let Some(c) = complex.as_mut() {
+                                c[out_idx] = Complex::new(0.0, 0.0);
                             }
                         }
                     }
-                    sub_power.push(row);
-                    if let (Some(sc), Some(cr)) = (sub_complex.as_mut(), crow) {
-                        sc.push(cr);
-                    }
                 }
-                power.push(sub_power);
-                if let (Some(c), Some(sc)) = (complex.as_mut(), sub_complex) {
-                    c.push(sc);
-                }
+                t += 1;
             }
         }
 
@@ -3564,11 +3582,9 @@ impl Ft8Decoder {
         // noise-floor proxy in the FT8/WSJT-X tradition. We follow that
         // convention here (matches the spectrogram's own dB storage).
         let denom = (spectrogram.num_steps as f64) * (spectrogram.freq_osr as f64);
-        for step in &spectrogram.power {
-            for fsub in step {
-                for (bin, &val) in fsub.iter().enumerate() {
-                    avg[bin] += val;
-                }
+        for row in spectrogram.power.chunks_exact(num_bins) {
+            for (bin, &val) in row.iter().enumerate() {
+                avg[bin] += val;
             }
         }
         for v in &mut avg {
@@ -3754,7 +3770,7 @@ impl Ft8Decoder {
                 if f >= spec.num_bins {
                     continue;
                 }
-                let power = spec.power[t][candidate.freq_sub][f];
+                let power = spec.at(t, candidate.freq_sub, f);
                 if power > best_power {
                     best_power = power;
                     best_tone = tone;
@@ -3771,7 +3787,7 @@ impl Ft8Decoder {
                 if f >= spec.num_bins {
                     continue;
                 }
-                noise_sum += spec.power[t][candidate.freq_sub][f];
+                noise_sum += spec.at(t, candidate.freq_sub, f);
                 noise_count += 1;
             }
         }
@@ -4267,7 +4283,7 @@ impl Ft8Decoder {
                     // the two outer `Vec` indirections once and reusing the row
                     // slice is bit-identical — same f64 values, same order — and
                     // removes two pointer-chases per access in the innermost loop.
-                    let row = &spec.power[time_idx][freq_sub];
+                    let row = spec.row(time_idx, freq_sub);
                     let signal_mag = row[freq_idx];
 
                     // Check frequency neighbor below
@@ -4288,7 +4304,7 @@ impl Ft8Decoder {
                     if k > 0 && time_idx >= steps_per_symbol {
                         let prev_time = time_idx - steps_per_symbol;
                         if prev_time < spec.num_steps {
-                            let neighbor = spec.power[prev_time][freq_sub][freq_idx];
+                            let neighbor = spec.at(prev_time, freq_sub, freq_idx);
                             score += signal_mag - neighbor;
                             num_average += 1;
                         }
@@ -4298,7 +4314,7 @@ impl Ft8Decoder {
                     if k + 1 < pp.costas_length {
                         let next_time = time_idx + steps_per_symbol;
                         if next_time < spec.num_steps {
-                            let neighbor = spec.power[next_time][freq_sub][freq_idx];
+                            let neighbor = spec.at(next_time, freq_sub, freq_idx);
                             score += signal_mag - neighbor;
                             num_average += 1;
                         }
@@ -8054,18 +8070,19 @@ fn subtract_decode_coherent(
                 continue;
             }
             // Scoped &mut to spectrogram.complex; ends before .power access.
+            let flat_idx = (t_idx * freq_osr + fs) * num_bins + f_idx;
             let residual = {
                 let complex = spectrogram.complex.as_mut().unwrap();
-                let bin = complex[t_idx][fs][f_idx];
+                let bin = complex[flat_idx];
                 let proj_real = (bin * rotor_conj).re;
                 // hb-081: scale the subtracted projection magnitude.
                 let signal_est = Complex::new(proj_real * scale, 0.0) * rotor;
                 let residual = bin - signal_est;
-                complex[t_idx][fs][f_idx] = residual;
+                complex[flat_idx] = residual;
                 residual
             };
             let mag2 = residual.norm_sqr();
-            spectrogram.power[t_idx][fs][f_idx] = 10.0 * (1e-12 + mag2).log10();
+            spectrogram.power[flat_idx] = 10.0 * (1e-12 + mag2).log10();
         }
     }
 }
@@ -8121,7 +8138,7 @@ fn known_coherence_score(
             prev_phase = None;
             continue;
         }
-        let bin = complex[t_idx][freq_sub][f_idx];
+        let bin = complex[spectrogram.idx(t_idx, freq_sub, f_idx)];
         let mag = bin.norm();
         if mag < 1e-30 {
             // Silent / clipped — skip this symbol's delta contribution
@@ -8298,7 +8315,7 @@ fn par_extract_complex_symbols_from_spectrogram(
             if freq_bin >= spectrogram.num_bins || fs >= spectrogram.freq_osr {
                 continue;
             }
-            row[tone] = complex[t_base][fs][freq_bin];
+            row[tone] = complex[spectrogram.idx(t_base, fs, freq_bin)];
         }
         out.push(row);
     }
@@ -8348,7 +8365,7 @@ fn estimate_candidate_phase_rotor(
 }
 
 /// Linear-interpolation lookup into a spectrogram with fractional time
-/// offset. dt=0 returns spectrogram.power[t_base][fs][freq_bin] exactly.
+/// offset. dt=0 returns `spectrogram.at(t_base, fs, freq_bin)` exactly.
 /// Out-of-range cells contribute -120.0 dB.
 ///
 /// When `linear_power` is true and `dt != 0`, the two endpoint
@@ -8369,7 +8386,7 @@ fn lookup_time_interp(
 ) -> f64 {
     if dt.abs() < f64::EPSILON {
         return if t_base < spec.num_steps {
-            spec.power[t_base][fs][freq_bin]
+            spec.at(t_base, fs, freq_bin)
         } else {
             -120.0
         };
@@ -8381,12 +8398,12 @@ fn lookup_time_interp(
     let lo_idx = t_lo_f as isize;
     let hi_idx = lo_idx + 1;
     let p_lo = if lo_idx >= 0 && (lo_idx as usize) < spec.num_steps {
-        spec.power[lo_idx as usize][fs][freq_bin]
+        spec.at(lo_idx as usize, fs, freq_bin)
     } else {
         -120.0
     };
     let p_hi = if hi_idx >= 0 && (hi_idx as usize) < spec.num_steps {
-        spec.power[hi_idx as usize][fs][freq_bin]
+        spec.at(hi_idx as usize, fs, freq_bin)
     } else {
         -120.0
     };
@@ -9628,19 +9645,15 @@ fn estimate_noise_floor(psd: &[f64]) -> f64 {
 /// after most signals had been subtracted; this metric goes to zero
 /// when subtraction zeroes the per-bin excess above the original
 /// floor.
-fn mean_excess_above_noise_db(power: &[Vec<Vec<f64>>], noise_floor_db: f64) -> f64 {
+fn mean_excess_above_noise_db(power: &[f64], noise_floor_db: f64) -> f64 {
     let mut sum = 0.0_f64;
     let mut count = 0_usize;
-    for ts in power {
-        for sub in ts {
-            for &db in sub {
-                let excess = db - noise_floor_db;
-                if excess > 0.0 {
-                    sum += excess;
-                }
-                count += 1;
-            }
+    for &db in power {
+        let excess = db - noise_floor_db;
+        if excess > 0.0 {
+            sum += excess;
         }
+        count += 1;
     }
     if count == 0 {
         return 0.0;
@@ -9654,20 +9667,8 @@ fn mean_excess_above_noise_db(power: &[Vec<Vec<f64>>], noise_floor_db: f64) -> f
 /// floor estimator. Computed once on the ORIGINAL spectrogram and
 /// reused as a stable reference across multipass rounds. O(N log N) one
 /// time; small relative to the rest of the decode budget.
-fn noise_floor_db_median(power: &[Vec<Vec<f64>>]) -> f64 {
-    let mut all: Vec<f64> = Vec::with_capacity(
-        power
-            .iter()
-            .map(|t| t.iter().map(|s| s.len()).sum::<usize>())
-            .sum::<usize>(),
-    );
-    for ts in power {
-        for sub in ts {
-            for &db in sub {
-                all.push(db);
-            }
-        }
-    }
+fn noise_floor_db_median(power: &[f64]) -> f64 {
+    let mut all: Vec<f64> = power.to_vec();
     if all.is_empty() {
         return -120.0;
     }
@@ -10894,18 +10895,19 @@ mod tests {
 
         assert!(spec.num_steps > 0);
         assert!(spec.num_bins > 0);
-        assert_eq!(spec.power.len(), spec.num_steps);
+        assert_eq!(
+            spec.power.len(),
+            spec.num_steps * spec.freq_osr * spec.num_bins
+        );
         assert_eq!(spec.freq_osr, FREQ_OSR);
-        assert_eq!(spec.power[0].len(), spec.freq_osr);
-        assert_eq!(spec.power[0][0].len(), spec.num_bins);
 
         // The 1500 Hz tone should produce a peak at bin 1500/6.25 = 240
         let tone_bin = (1500.0 / TONE_SPACING) as usize;
         let mid_step = spec.num_steps / 2;
 
         // Power (dB) at tone bin should be much larger than at a random bin (freq_sub=0)
-        let signal_db = spec.power[mid_step][0][tone_bin];
-        let noise_db = spec.power[mid_step][0][10]; // Low-frequency noise bin
+        let signal_db = spec.at(mid_step, 0, tone_bin);
+        let noise_db = spec.at(mid_step, 0, 10); // Low-frequency noise bin
         assert!(
             signal_db > noise_db + 20.0,
             "Signal dB {:.2} should be >> noise dB {:.2}",
@@ -10929,7 +10931,7 @@ mod tests {
         let signal_db = -10.0; // signal level in dB (30 dB above noise)
         let f0 = 240usize; // 1500 Hz
 
-        let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
+        let mut power = vec![noise_db; num_steps * freq_osr * num_bins];
 
         // Place Costas tones at the correct positions (freq_sub=0)
         // Fill all sub-steps of each symbol with the signal
@@ -10940,7 +10942,7 @@ mod tests {
                 for sub in 0..steps_per_symbol {
                     let time_idx = sym * steps_per_symbol + sub;
                     if time_idx < num_steps && f0 + tone < num_bins {
-                        power[time_idx][0][f0 + tone] = signal_db;
+                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] = signal_db;
                     }
                 }
             }
@@ -10999,14 +11001,14 @@ mod tests {
 
         // Place Costas tones aligned at the ODD half-offset: the true
         // sync position is t0 = 1 (time_idx = 1 + sym * TIME_OSR).
-        let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
+        let mut power = vec![noise_db; num_steps * freq_osr * num_bins];
         for &group_start in &[0usize, 36, 72] {
             for j in 0..7 {
                 let sym = group_start + j;
                 let tone = COSTAS[j] as usize;
                 let time_idx = 1 + sym * steps_per_symbol;
                 if time_idx < num_steps && f0 + tone < num_bins {
-                    power[time_idx][0][f0 + tone] = signal_db;
+                    power[(time_idx * freq_osr) * num_bins + (f0 + tone)] = signal_db;
                 }
             }
         }
@@ -11930,8 +11932,8 @@ mod tests {
 
         // The signal should appear in freq_sub=1 at bin 240 (since 1503.125 = 240*6.25 + 3.125)
         // Spectrogram values are in dB
-        let db_sub0 = spec.power[mid][0][bin];
-        let db_sub1 = spec.power[mid][1][bin];
+        let db_sub0 = spec.at(mid, 0, bin);
+        let db_sub1 = spec.at(mid, 1, bin);
 
         // freq_sub=1 should have stronger signal (higher dB) for a tone at bin+0.5
         assert!(
@@ -12152,7 +12154,7 @@ mod tests {
         let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
         let freq_osr = FREQ_OSR;
 
-        let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
+        let mut power = vec![noise_db; num_steps * freq_osr * num_bins];
 
         for &m in present_groups {
             let group_start = [0usize, 36, 72][m];
@@ -12162,7 +12164,7 @@ mod tests {
                 for sub in 0..steps_per_symbol {
                     let time_idx = sym * steps_per_symbol + sub;
                     if time_idx < num_steps && f0 + tone < num_bins {
-                        power[time_idx][0][f0 + tone] = signal_db;
+                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] = signal_db;
                     }
                 }
             }
@@ -12699,7 +12701,7 @@ mod hb230_relaxed_sync_tests {
         let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
         let freq_osr = FREQ_OSR;
 
-        let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
+        let mut power = vec![noise_db; num_steps * freq_osr * num_bins];
 
         for &m in present_groups {
             let group_start = [0usize, 36, 72][m];
@@ -12709,7 +12711,7 @@ mod hb230_relaxed_sync_tests {
                 for sub in 0..steps_per_symbol {
                     let time_idx = sym * steps_per_symbol + sub;
                     if time_idx < num_steps && f0 + tone < num_bins {
-                        power[time_idx][0][f0 + tone] = signal_db;
+                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] = signal_db;
                     }
                 }
             }
@@ -14272,9 +14274,8 @@ mod three_stage_sync_tests {
         let num_bins = seed_freq_bin + NUM_TONES + pad;
         let freq_osr = FREQ_OSR;
 
-        let mut power = vec![vec![vec![-120.0f64; num_bins]; freq_osr]; num_steps];
-        let mut complex =
-            vec![vec![vec![Complex::<f64>::new(0.0, 0.0); num_bins]; freq_osr]; num_steps];
+        let mut power = vec![-120.0f64; num_steps * freq_osr * num_bins];
+        let mut complex = vec![Complex::<f64>::new(0.0, 0.0); num_steps * freq_osr * num_bins];
 
         // Place a unit-magnitude same-phase sample at every (sym, expected
         // tone) position on the seed lattice point. Within each symbol
@@ -14300,8 +14301,9 @@ mod three_stage_sync_tests {
                 if t_idx >= num_steps {
                     continue;
                 }
-                complex[t_idx][seed_freq_sub][f_idx] = Complex::new(1.0, 0.0);
-                power[t_idx][seed_freq_sub][f_idx] = 10.0 * (1e-12_f64 + 1.0).log10();
+                let flat_idx = (t_idx * freq_osr + seed_freq_sub) * num_bins + f_idx;
+                complex[flat_idx] = Complex::new(1.0, 0.0);
+                power[flat_idx] = 10.0 * (1e-12_f64 + 1.0).log10();
             }
         }
 
@@ -14454,6 +14456,9 @@ mod three_stage_sync_tests {
         // worse score than fs=0. The pseudo-random phase generator uses
         // a deterministic recurrence so the test is reproducible.
         {
+            let num_bins = spec.num_bins;
+            let num_steps = spec.num_steps;
+            let freq_osr = spec.freq_osr;
             let complex = spec.complex.as_mut().unwrap();
             for sym_idx in 0..pp.num_symbols.min(tones.len()) {
                 let tone = tones[sym_idx] as usize;
@@ -14466,8 +14471,9 @@ mod three_stage_sync_tests {
                 let t_base = truth_time + sym_idx * steps_per_symbol;
                 for s in 0..steps_per_symbol {
                     let t_idx = t_base + s;
-                    if t_idx < complex.len() && f_idx < complex[t_idx][1].len() {
-                        complex[t_idx][1][f_idx] = sample;
+                    if t_idx < num_steps && f_idx < num_bins {
+                        let flat_idx = (t_idx * freq_osr + 1) * num_bins + f_idx;
+                        complex[flat_idx] = sample;
                     }
                 }
             }
@@ -14552,20 +14558,21 @@ mod three_stage_sync_tests {
         subtract_decode_coherent(&mut spec_off, &pp, &legacy_candidate, rotor, &tones, 1.0);
         subtract_decode_coherent(&mut spec_on, &pp, &refined_candidate, rotor, &tones, 1.0);
 
+        let num_bins = spec_off.num_bins;
+        let freq_osr = spec_off.freq_osr;
         let cmpx_off = spec_off.complex.as_ref().unwrap();
         let cmpx_on = spec_on.complex.as_ref().unwrap();
-        for (t, (row_off, row_on)) in cmpx_off.iter().zip(cmpx_on.iter()).enumerate() {
-            for (fs, (sub_off, sub_on)) in row_off.iter().zip(row_on.iter()).enumerate() {
-                for (b, (off_v, on_v)) in sub_off.iter().zip(sub_on.iter()).enumerate() {
-                    let delta = (off_v - on_v).norm();
-                    assert!(
-                        delta < 1e-12,
-                        "residual must be byte-identical when seed is \
-                         aligned; t={t}, fs={fs}, b={b}, off={off_v:?}, \
-                         on={on_v:?}, delta={delta}"
-                    );
-                }
-            }
+        for (i, (off_v, on_v)) in cmpx_off.iter().zip(cmpx_on.iter()).enumerate() {
+            let b = i % num_bins;
+            let fs = (i / num_bins) % freq_osr;
+            let t = i / (num_bins * freq_osr);
+            let delta = (off_v - on_v).norm();
+            assert!(
+                delta < 1e-12,
+                "residual must be byte-identical when seed is \
+                 aligned; t={t}, fs={fs}, b={b}, off={off_v:?}, \
+                 on={on_v:?}, delta={delta}"
+            );
         }
     }
 
@@ -15342,7 +15349,7 @@ mod auto_passband_tests {
         let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
         let freq_osr = FREQ_OSR;
 
-        let mut power = vec![vec![vec![noise_db; num_bins]; freq_osr]; num_steps];
+        let mut power = vec![noise_db; num_steps * freq_osr * num_bins];
 
         for &m in present_groups {
             let group_start = [0_usize, 36, 72][m];
@@ -15352,7 +15359,7 @@ mod auto_passband_tests {
                 for sub in 0..steps_per_symbol {
                     let time_idx = sym * steps_per_symbol + sub;
                     if time_idx < num_steps && f0 + tone < num_bins {
-                        power[time_idx][0][f0 + tone] = signal_db;
+                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] = signal_db;
                     }
                 }
             }
