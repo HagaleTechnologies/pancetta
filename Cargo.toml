@@ -46,7 +46,7 @@ publish = false
 # Real-time audio processing
 cpal = "0.15"
 # Lock-free data structures for real-time communication
-ringbuf = "0.4"
+ringbuf = "0.5"
 # High-precision timing
 instant = "0.1"
 # Atomic operations for real-time coordination
