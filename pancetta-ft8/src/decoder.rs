@@ -2104,6 +2104,37 @@ impl Ft8Decoder {
         result.map(|messages| (messages, report))
     }
 
+    /// Budgeted entry point that also supports frequency scoping, AP
+    /// context, and partner-frequency relaxed sync (Task 12 of the
+    /// decoder-speed-overhaul plan — coordinator deadline wiring). Mirrors
+    /// [`Self::decode_window_with_ap_scoped_partner`] but honors a real
+    /// [`DecodeBudget`] instead of always using [`DecodeBudget::unlimited`],
+    /// and returns the [`DecodeBudgetReport`] telemetry alongside the
+    /// decoded messages (mirroring [`Self::decode_window_budgeted`]). This
+    /// is the entry point the live coordinator calls at both of its decode
+    /// call sites (the hb-091 scoped fast-path and the primary native
+    /// decode), since both need the freq/AP/partner scoping the plain
+    /// `decode_window_budgeted` doesn't take.
+    pub fn decode_window_with_ap_scoped_partner_budgeted(
+        &mut self,
+        samples: &[f32],
+        ap_context: &crate::ap::ApContext,
+        freq_bin_range: Option<RangeInclusive<usize>>,
+        partner_freq_hz: Option<f64>,
+        budget: DecodeBudget,
+    ) -> Ft8Result<(Vec<DecodedMessage>, DecodeBudgetReport)> {
+        self.current_budget = budget;
+        let result = self.decode_window_with_ap_scoped_partner_impl(
+            samples,
+            ap_context,
+            freq_bin_range,
+            partner_freq_hz,
+        );
+        self.current_budget = DecodeBudget::unlimited();
+        let report = std::mem::take(&mut self.current_budget_report);
+        result.map(|messages| (messages, report))
+    }
+
     /// Core decode implementation shared by every public decode entry
     /// point. Callers must set `self.current_budget` before invoking
     /// this and reset it after (see `decode_window_budgeted` and

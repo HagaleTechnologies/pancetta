@@ -635,6 +635,30 @@ pub struct ApplicationCoordinator {
     /// byte-identical to the prior hardcoded `Duration::seconds(13)`.
     active_decode_phase_ns: Arc<std::sync::atomic::AtomicI64>,
 
+    /// Operator/preset-configured decode wall-time effort budget in
+    /// milliseconds (decoder-speed-overhaul Task 12). `0` is the unlimited
+    /// sentinel — the decode loop then falls back to the mode-aware
+    /// ceiling (`decode_budget_ceiling_ms`) alone. Read once per window at
+    /// both decode call sites in `ft8.rs`. Nothing in this task writes a
+    /// nonzero value (it stays `0` = unlimited, so production decode
+    /// behavior is unchanged until Task 14 maps effort presets/config/TUI
+    /// onto this atomic).
+    decode_effort_budget_ms: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Wall-clock time (ms) the most recently completed decode window spent
+    /// in the budgeted decode call(s) — decoder-speed-overhaul Task 12
+    /// metrics. `0` until the first window completes. Written by the FT8
+    /// decode loop, read by the TUI relay's periodic `PipelineHealth` push.
+    decode_last_elapsed_ms: Arc<std::sync::atomic::AtomicU64>,
+
+    /// Whether the most recently completed decode window ran out of its
+    /// [`pancetta_ft8::DecodeBudget`] before all optional work finished
+    /// (decoder-speed-overhaul Task 12 metrics). Always `false` while
+    /// `decode_effort_budget_ms == 0` (unlimited) — this task alone can
+    /// never flip it. Written by the FT8 decode loop, read by the TUI
+    /// relay's periodic `PipelineHealth` push.
+    decode_last_budget_exhausted: Arc<AtomicBool>,
+
     /// `true` when the read-only `remote_gateway` component is enabled
     /// (`[network.remote_gateway].enabled`). Cached from config at construction
     /// so the display-event emit sites (decode fan-out, QSO snapshot, freq,
@@ -1070,6 +1094,10 @@ impl ApplicationCoordinator {
             active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(
                 active_decode_phase_ns_init,
             )),
+            // 0 = unlimited; Task 14 maps effort presets/config/TUI onto this.
+            decode_effort_budget_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            decode_last_elapsed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            decode_last_budget_exhausted: Arc::new(AtomicBool::new(false)),
             gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
             fox_mode: Arc::new(AtomicBool::new(false)),
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
@@ -1406,6 +1434,14 @@ impl ApplicationCoordinator {
     /// (from this task onward) written by `try_switch_operating_mode`.
     pub(crate) fn active_decode_phase_ns(&self) -> Arc<std::sync::atomic::AtomicI64> {
         self.active_decode_phase_ns.clone()
+    }
+
+    /// Decode wall-time effort budget atomic in milliseconds (`0` =
+    /// unlimited). Decoder-speed-overhaul Task 12 plumbing: read every
+    /// window at both decode call sites in `ft8.rs`; Task 14 is the first
+    /// writer (config/TUI-driven effort presets).
+    pub(crate) fn decode_effort_budget_ms(&self) -> Arc<std::sync::atomic::AtomicU64> {
+        self.decode_effort_budget_ms.clone()
     }
 
     /// Station-agent remote-TX arm gate (shared handle). Cloned into the TX

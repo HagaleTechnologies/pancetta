@@ -201,6 +201,15 @@ pub struct PipelineHealth {
     pub ft8lib_available: bool,
     /// Total messages decoded this session
     pub total_decodes: u64,
+    /// Wall-clock time (ms) the most recently completed decode window spent
+    /// in the budgeted decode call(s) (decoder-speed-overhaul Task 12).
+    /// `0` until the first window completes.
+    pub last_decode_elapsed_ms: u64,
+    /// Whether the most recently completed decode window ran out of its
+    /// decode budget before all optional work finished (decoder-speed-
+    /// overhaul Task 12). Always `false` while the operator/preset effort
+    /// budget is unlimited (the only value set today).
+    pub last_decode_budget_exhausted: bool,
 }
 
 /// Per-QSO entry for the QSO-detail panel. Batch 94: populated live

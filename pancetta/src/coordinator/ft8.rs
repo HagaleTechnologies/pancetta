@@ -35,6 +35,23 @@ static DECODE_PANIC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::Ato
 /// full text well under 64); anything longer is malformed/hostile.
 const MAX_DECODED_FIELD_LEN: usize = 64;
 
+/// Ceiling on decode wall time so the DSP pipeline never backs up
+/// (decoder-speed-overhaul Task 12).
+///
+/// FT8: window every 15 s, decode-phase at 13 s -> ceiling 2000 ms.
+/// FT4: window every 7.5 s, decode-phase at 6.5 s -> ceiling 800 ms.
+///
+/// The boundary (`slot_ns == 7_500_000_000`, i.e. exactly FT4's period) is
+/// inclusive on the FT4 (800 ms) side — a slot period at or below FT4's is
+/// treated as the faster mode's tighter budget.
+fn decode_budget_ceiling_ms(slot_ns: u64) -> u64 {
+    if slot_ns <= 7_500_000_000 {
+        800
+    } else {
+        2000
+    }
+}
+
 /// Compute the active protocol's slot parity for a decoded window.
 ///
 /// `received_utc` is the window's receipt timestamp (captured immediately on
@@ -355,6 +372,19 @@ impl super::ApplicationCoordinator {
         // `Duration::seconds(13)`.
         let active_decode_phase_ns = self.active_decode_phase_ns.clone();
 
+        // decoder-speed-overhaul Task 12: mode-aware decode deadline wiring.
+        // `decode_effort_budget_ms` is the operator/preset-configured effort
+        // (0 = unlimited; Task 14 is the first writer). Re-read once per
+        // window alongside the slot/decode-phase atomics above so a live
+        // config/TUI change (once Task 14 lands) takes effect on the very
+        // next window. `decode_last_elapsed_ms`/`decode_last_budget_exhausted`
+        // are the metrics counterparts written after each window's budgeted
+        // decode calls and read by the TUI relay's periodic `PipelineHealth`
+        // push.
+        let decode_effort_budget_ms = self.decode_effort_budget_ms.clone();
+        let decode_last_elapsed_ms = self.decode_last_elapsed_ms.clone();
+        let decode_last_budget_exhausted = self.decode_last_budget_exhausted.clone();
+
         // Run FT8 decoder on a dedicated thread to avoid tokio starvation
         let handle = tokio::task::spawn_blocking(move || {
             let rt = tokio::runtime::Handle::current();
@@ -401,6 +431,19 @@ impl super::ApplicationCoordinator {
                         // and produce the wrong parity, causing the autonomous
                         // operator to TX in the same slot as the DX.)
                         let window_received_utc = chrono::Utc::now();
+                        // decoder-speed-overhaul Task 12: wall-clock anchor for
+                        // this window's decode deadline(s). Same receipt event
+                        // as `window_received_utc` above, just captured as a
+                        // monotonic `Instant` since `DecodeBudget` deadlines
+                        // are `Instant`-based (not calendar time).
+                        let window_ready_at = std::time::Instant::now();
+                        // decoder-speed-overhaul Task 12: accumulated across
+                        // whichever budgeted decode call(s) run this window
+                        // (the scoped fast-path only runs conditionally; the
+                        // primary native decode always runs) and reported once
+                        // at the end of the window.
+                        let mut window_decode_elapsed_ms: u64 = 0;
+                        let mut window_decode_budget_exhausted = false;
 
                         // Re-read the active protocol slot length/decode phase
                         // once per iteration (not once at thread startup) so a
@@ -416,6 +459,27 @@ impl super::ApplicationCoordinator {
                         let decode_phase = chrono::Duration::nanoseconds(
                             active_decode_phase_ns.load(Ordering::Relaxed),
                         );
+
+                        // decoder-speed-overhaul Task 12: mode-aware decode
+                        // deadline for this window. `decode_effort_budget_ms
+                        // == 0` (unlimited, the only value set anywhere
+                        // today — Task 14 is the first writer) falls back to
+                        // the ceiling alone; a nonzero operator/preset value
+                        // is clamped to never exceed the ceiling. Shared by
+                        // both decode call sites below so a single window
+                        // has one consistent deadline.
+                        let decode_budget = {
+                            let cfg_ms = decode_effort_budget_ms.load(Ordering::Relaxed);
+                            let ceiling_ms = decode_budget_ceiling_ms(slot_ns.max(0) as u64);
+                            let budget_ms = if cfg_ms == 0 {
+                                ceiling_ms
+                            } else {
+                                cfg_ms.min(ceiling_ms)
+                            };
+                            pancetta_ft8::DecodeBudget::until(
+                                window_ready_at + std::time::Duration::from_millis(budget_ms),
+                            )
+                        };
 
                         // hb-216 S2: re-check the shared Ft8Config. If the
                         // tier probe landed a Slow preset since the last
@@ -566,9 +630,27 @@ impl super::ApplicationCoordinator {
                                     let center = (freq_hz / 6.25).round() as usize;
                                     let lo = center.saturating_sub(SCOPED_HALF_WIDTH);
                                     let hi = center.saturating_add(SCOPED_HALF_WIDTH);
-                                    decoder
-                                        .decode_window_scoped(&window, lo..=hi)
-                                        .unwrap_or_default()
+                                    let scoped_call_start = Instant::now();
+                                    let (messages, report) = decoder
+                                        .decode_window_with_ap_scoped_partner_budgeted(
+                                            &window,
+                                            &pancetta_ft8::ApContext::default(),
+                                            Some(lo..=hi),
+                                            None,
+                                            decode_budget,
+                                        )
+                                        .unwrap_or_default();
+                                    let scoped_elapsed_ms =
+                                        scoped_call_start.elapsed().as_millis() as u64;
+                                    window_decode_elapsed_ms += scoped_elapsed_ms;
+                                    window_decode_budget_exhausted |= report.budget_exhausted;
+                                    debug!(
+                                        target: "decode.budget",
+                                        "scoped fast-path: elapsed={}ms exhausted={}",
+                                        scoped_elapsed_ms,
+                                        report.budget_exhausted,
+                                    );
+                                    messages
                                 } else {
                                     Vec::new()
                                 }
@@ -703,13 +785,19 @@ impl super::ApplicationCoordinator {
                             );
                         }
                         // Same catch_unwind resilience for the native AP decoder.
-                        let native_messages = std::panic::catch_unwind(
+                        // decoder-speed-overhaul Task 12: this is the primary
+                        // decode call site — always runs (unlike the
+                        // conditional scoped fast-path above), so it carries
+                        // the representative per-window budget telemetry.
+                        let native_call_start = Instant::now();
+                        let (native_messages, native_budget_report) = std::panic::catch_unwind(
                             std::panic::AssertUnwindSafe(|| {
-                                decoder.decode_window_with_ap_scoped_partner(
+                                decoder.decode_window_with_ap_scoped_partner_budgeted(
                                     &window,
                                     &ap_context,
                                     narrow_filter_bins,
                                     partner_freq_for_relaxed_sync,
+                                    decode_budget,
                                 )
                             }),
                         )
@@ -721,9 +809,19 @@ impl super::ApplicationCoordinator {
                                 target: "ft8.decode",
                                 "native AP decode panicked on a window (#{n}) — skipping it; station continues"
                             );
-                            Ok(Vec::new())
+                            Ok((Vec::new(), pancetta_ft8::DecodeBudgetReport::default()))
                         })
                         .unwrap_or_default();
+                        let native_elapsed_ms = native_call_start.elapsed().as_millis() as u64;
+                        window_decode_elapsed_ms += native_elapsed_ms;
+                        window_decode_budget_exhausted |= native_budget_report.budget_exhausted;
+                        debug!(
+                            target: "decode.budget",
+                            "primary decode: elapsed={}ms exhausted={} stages={:?}",
+                            native_elapsed_ms,
+                            native_budget_report.budget_exhausted,
+                            native_budget_report.stages,
+                        );
 
                         // Merge: start with ft8_lib results, add any native-only
                         // decodes (e.g. from AP injection) that ft8_lib missed
@@ -787,6 +885,22 @@ impl super::ApplicationCoordinator {
                         // more rt.block_on on the decoder thread per window).
                         last_decode_timestamp
                             .store(super::now_epoch_ms(), std::sync::atomic::Ordering::Relaxed);
+
+                        // decoder-speed-overhaul Task 12: per-window budget
+                        // summary (both decode call sites combined) — logged
+                        // and forwarded to the TUI's periodic PipelineHealth
+                        // metrics push (extends the existing decode-metrics
+                        // path minimally; see `PipelineHealth` in
+                        // pancetta-tui).
+                        decode_last_elapsed_ms.store(window_decode_elapsed_ms, Ordering::Relaxed);
+                        decode_last_budget_exhausted
+                            .store(window_decode_budget_exhausted, Ordering::Relaxed);
+                        debug!(
+                            target: "decode.budget",
+                            "window total: elapsed={}ms exhausted={}",
+                            window_decode_elapsed_ms,
+                            window_decode_budget_exhausted,
+                        );
 
                         health_total_decodes
                             .fetch_add(decoded_messages.len() as u64, Ordering::Relaxed);
@@ -1561,5 +1675,36 @@ mod slot_parity_for_receipt_tests {
         // different (correct) parity. A stale-cache bug would keep
         // returning `ft8_parity` for both.
         assert_ne!(ft8_parity, ft4_parity);
+    }
+}
+
+#[cfg(test)]
+mod decode_budget_ceiling_ms_tests {
+    use super::decode_budget_ceiling_ms;
+
+    #[test]
+    fn ft8_slot_period_gets_2000ms_ceiling() {
+        assert_eq!(decode_budget_ceiling_ms(15_000_000_000), 2000);
+    }
+
+    #[test]
+    fn ft4_slot_period_gets_800ms_ceiling() {
+        assert_eq!(decode_budget_ceiling_ms(7_500_000_000), 800);
+    }
+
+    #[test]
+    fn boundary_at_7_5s_is_inclusive_on_the_ft4_side() {
+        // Exactly FT4's period: must resolve to the tighter (800ms) ceiling.
+        assert_eq!(decode_budget_ceiling_ms(7_500_000_000), 800);
+        // One ns above the boundary: must resolve to the FT8 (2000ms) ceiling.
+        assert_eq!(decode_budget_ceiling_ms(7_500_000_001), 2000);
+        // One ns below the boundary: stays on the FT4 (800ms) side.
+        assert_eq!(decode_budget_ceiling_ms(7_499_999_999), 800);
+    }
+
+    #[test]
+    fn zero_slot_ns_is_treated_as_the_tighter_ceiling() {
+        // Degenerate input; falls on the <= branch, so 800ms — never panics.
+        assert_eq!(decode_budget_ceiling_ms(0), 800);
     }
 }

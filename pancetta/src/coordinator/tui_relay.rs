@@ -145,6 +145,10 @@ impl super::ApplicationCoordinator {
         let health_dsp_windows_relay = health_dsp_windows.clone();
         let health_last_rms_relay = health_last_rms.clone();
         let health_total_decodes_relay = health_total_decodes.clone();
+        // decoder-speed-overhaul Task 12: decode-budget metrics, read on the
+        // same 2s health tick and folded into `PipelineHealth` below.
+        let decode_last_elapsed_ms_relay = self.decode_last_elapsed_ms.clone();
+        let decode_last_budget_exhausted_relay = self.decode_last_budget_exhausted.clone();
         // Rig-connection + TX-output-misconfig badges (read on the 2s health
         // tick; pushed only on change so the TUI render stays cheap).
         let rig_conn_state_relay = self.rig_conn_state.clone();
@@ -596,6 +600,10 @@ impl super::ApplicationCoordinator {
                         last_rms: f32::from_bits(health_last_rms_relay.load(Ordering::Relaxed)),
                         ft8lib_available: pancetta_ft8::ft8lib_is_available(),
                         total_decodes: health_total_decodes_relay.load(Ordering::Relaxed),
+                        last_decode_elapsed_ms: decode_last_elapsed_ms_relay
+                            .load(Ordering::Relaxed),
+                        last_decode_budget_exhausted: decode_last_budget_exhausted_relay
+                            .load(Ordering::Relaxed),
                     };
                     let _ = tui_msg_tx_relay.send(
                         pancetta_tui::tui_runner::TuiMessage::PipelineHealth(health),
