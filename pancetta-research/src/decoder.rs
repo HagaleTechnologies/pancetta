@@ -373,6 +373,19 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W1.4 [A/B]: master switch for the
+    /// divisive LLR whitening step (per-tone/per-symbol noise-median
+    /// normalisation). Default ON in production
+    /// (`Ft8Config::llr_whitening_enabled`, graduated Batch 53); this
+    /// hook lets the research harness re-measure with it forced off
+    /// after the Task W1.4 dB/linear-magnitude unit-consistency fix,
+    /// since the original "+4 TP / -713 FP" graduation measurement may
+    /// not survive the fix. See `Ft8Config::llr_whitening_enabled`.
+    pub fn with_llr_whitening(mut self, on: bool) -> Self {
+        self.config.llr_whitening_enabled = on;
+        self
+    }
+
     /// Decoder-speed-overhaul Task 9/10: shallow BP iteration count for
     /// the S1/S2 primary decode. See `Ft8Config::floor_iters`.
     pub fn with_floor_iters(mut self, n: usize) -> Self {

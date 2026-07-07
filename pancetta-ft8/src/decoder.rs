@@ -774,10 +774,27 @@ pub struct Ft8Config {
     /// subsequent `normalize_llrs` pass then re-standardises the
     /// vector's variance to `llr_target_variance`.
     ///
-    /// Inspired by JS8Call-Improved LLR whitening.
+    /// Inspired by JS8Call-Improved LLR whitening. Operates on a
+    /// `ToneUnits`-tagged tone matrix (`whiten_llrs`/`maybe_whiten_llrs`)
+    /// so both the spectrogram path's dB log-power and the fine-FFT
+    /// path's linear `|y|` are converted to a common linear-magnitude
+    /// scale before the median/floor math above runs (Task W1.4,
+    /// decoder-TP-sensitivity plan — fixed a real dB-vs-linear unit
+    /// mismatch that had been silently degenerating a large fraction of
+    /// spectrogram-path whitening calls into a near-no-op).
+    ///
     /// Default `false` — the whitening pass is byte-identical to the
-    /// legacy path when off (no math executes). Flip on to A/B test;
-    /// expected lift on band-edge / non-uniform-noise signals.
+    /// legacy path when off (no math executes). Was briefly graduated
+    /// to `true` in Batch 53 on a (pre-unit-fix) "+4 TP / -713 FP"
+    /// measurement; Task W1.4 re-measured AFTER the unit fix and found
+    /// the corrected (properly gain-consistent) whitening is now a much
+    /// STRONGER effect that costs real recall: -56 TPs on hard-200
+    /// (bootstrap CI [-80,-34], excludes zero) with no compensating
+    /// benefit on the FP-on-noise tier (2 FPs on with fixed-whitening
+    /// vs 1 FP off) or synth-clean (~flat). Flipped back to `false` and
+    /// re-shelved; see `research/experiments/2026-07-07-w1.4-whiten-llrs-unit-fix.md`.
+    /// Flip on to A/B test with a different technique/knob; expected
+    /// lift claim needs fresh measurement given the above.
     pub llr_whitening_enabled: bool,
 
     /// When true, the time-domain subtract path
@@ -1356,13 +1373,18 @@ impl Default for Ft8Config {
             // tolerance only changes anything when both flags are set.
             soft_combiner_key_tolerance: 0,
             // JS8Call-Improved-inspired LLR whitening — graduated to
-            // default-ON in Batch 53 (2026-06-09). Hard_1000 measurement:
-            // +4 TPs (16365 → 16369) AND −713 FPs (precision 0.7317 →
-            // 0.7559, +3.3% relative). Precision lift survived 5× corpus
-            // scale-out from the original Batch 50 hard-200 finding
-            // (+2 TPs / +2.7% precision). Inspired by spec ref
-            // `spec-js8call-llr-whitening.md`.
-            llr_whitening_enabled: true,
+            // default-ON in Batch 53 (2026-06-09) on a hard_1000
+            // measurement (+4 TPs, -713 FPs) made against a BUGGY
+            // implementation that mixed dB log-power and linear
+            // magnitude inputs into the same magnitude-calibrated
+            // NOISE_FLOOR (Task W1.4, decoder-TP-sensitivity plan,
+            // 2026-07-07). Once fixed to operate on a consistent linear
+            // scale, whitening's real (properly-scaled) effect is much
+            // stronger and net NEGATIVE on hard-200: -56 TPs, bootstrap
+            // CI [-80,-34] (excludes zero), no compensating FP-on-noise
+            // win. Re-shelved to OFF; see
+            // `research/experiments/2026-07-07-w1.4-whiten-llrs-unit-fix.md`.
+            llr_whitening_enabled: false,
             // hb-226: Gaussian-ramp subtract default OFF. When OFF the
             // subtract path is byte-identical to the legacy
             // hard-edged subtraction. Inspired by spec ref
@@ -4972,6 +4994,7 @@ impl Ft8Decoder {
                 self.config.llr_whitening_enabled,
                 &mut base_llrs,
                 &tone_magnitudes,
+                ToneUnits::Db,
                 &self.protocol_params,
             );
             // hb-256: impulse-robust per-symbol weighting (no-op when None).
@@ -5370,7 +5393,13 @@ impl Ft8Decoder {
             // OR CRC fails OR message is implausible, the averaged
             // candidate yields nothing (additive, so harmless).
             let mut llrs = par_compute_soft_llrs_db(pp, &avg_mags);
-            maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &avg_mags, pp);
+            maybe_whiten_llrs(
+                self.config.llr_whitening_enabled,
+                &mut llrs,
+                &avg_mags,
+                ToneUnits::Db,
+                pp,
+            );
             // hb-256: impulse-robust per-symbol weighting (no-op when None).
             maybe_impulse_robust_llrs(
                 self.config.impulse_robust_llr,
@@ -5702,7 +5731,13 @@ impl Ft8Decoder {
                 }
             }
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
-            maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &tone_mags, pp);
+            maybe_whiten_llrs(
+                self.config.llr_whitening_enabled,
+                &mut llrs,
+                &tone_mags,
+                ToneUnits::Db,
+                pp,
+            );
             // hb-256: impulse-robust per-symbol weighting (no-op when None).
             maybe_impulse_robust_llrs(
                 self.config.impulse_robust_llr,
@@ -5847,7 +5882,13 @@ impl Ft8Decoder {
                 }
             }
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
-            maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &tone_mags, pp);
+            maybe_whiten_llrs(
+                self.config.llr_whitening_enabled,
+                &mut llrs,
+                &tone_mags,
+                ToneUnits::Db,
+                pp,
+            );
             // hb-256: impulse-robust per-symbol weighting (no-op when None).
             maybe_impulse_robust_llrs(
                 self.config.impulse_robust_llr,
@@ -6318,7 +6359,13 @@ impl Ft8Decoder {
         for cand in &new_candidates {
             let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
-            maybe_whiten_llrs(self.config.llr_whitening_enabled, &mut llrs, &tone_mags, pp);
+            maybe_whiten_llrs(
+                self.config.llr_whitening_enabled,
+                &mut llrs,
+                &tone_mags,
+                ToneUnits::Db,
+                pp,
+            );
             // hb-256: impulse-robust per-symbol weighting (no-op when None).
             maybe_impulse_robust_llrs(
                 self.config.impulse_robust_llr,
@@ -6492,6 +6539,7 @@ impl Ft8Decoder {
                 self.config.llr_whitening_enabled,
                 &mut llrs,
                 &tone_magnitudes,
+                ToneUnits::Db,
                 &self.protocol_params,
             );
             // hb-256: impulse-robust per-symbol weighting (no-op when None).
@@ -6647,10 +6695,12 @@ impl Ft8Decoder {
                 };
 
                 let mut llrs = self.compute_soft_llrs(&tone_magnitudes);
+                // Fine-FFT path stores linear magnitudes (Task W1.4).
                 maybe_whiten_llrs(
                     self.config.llr_whitening_enabled,
                     &mut llrs,
                     &tone_magnitudes,
+                    ToneUnits::LinearMag,
                     &self.protocol_params,
                 );
                 // hb-256: impulse-robust per-symbol weighting (no-op
@@ -7709,6 +7759,7 @@ fn par_decode_candidate(
             ctx.llr_whitening_enabled,
             &mut llrs,
             &tone_magnitudes,
+            ToneUnits::Db,
             ctx.protocol_params,
         );
         // hb-256: impulse-robust per-symbol weighting (no-op when None).
@@ -7947,10 +7998,12 @@ fn par_decode_candidate(
             } else {
                 par_compute_soft_llrs(ctx.protocol_params, &tone_magnitudes)
             };
+            // Fine-FFT path stores linear magnitudes (Task W1.4).
             maybe_whiten_llrs(
                 ctx.llr_whitening_enabled,
                 &mut llrs,
                 &tone_magnitudes,
+                ToneUnits::LinearMag,
                 ctx.protocol_params,
             );
             // hb-256: impulse-robust per-symbol weighting (no-op when
@@ -8053,6 +8106,7 @@ fn par_try_ap_decode(
             ctx.llr_whitening_enabled,
             &mut base_llrs,
             &tone_magnitudes,
+            ToneUnits::Db,
             ctx.protocol_params,
         );
         // hb-256: impulse-robust per-symbol weighting (no-op when None).
@@ -9243,6 +9297,25 @@ fn tone_powers_from_mag(tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<[f64; NUM_T
         .collect()
 }
 
+/// Linear tone MAGNITUDE from dB tone magnitudes (the spectrogram path
+/// stores `10·log10(mag²)` per bin). `10^(db/20) == sqrt(10^(db/10))
+/// == sqrt(power)`, i.e. this is exactly `tone_powers_from_db(..)`
+/// followed by an elementwise `sqrt` — kept as its own helper (rather
+/// than composed) so `whiten_llrs` (Task W1.4) never round-trips
+/// through a power intermediate it doesn't otherwise need.
+fn tone_magnitudes_linear_from_db(tone_magnitudes: &[[f64; NUM_TONES]]) -> Vec<[f64; NUM_TONES]> {
+    tone_magnitudes
+        .iter()
+        .map(|row| {
+            let mut out = [0.0f64; NUM_TONES];
+            for (o, &db) in out.iter_mut().zip(row.iter()) {
+                *o = 10f64.powf(db / 20.0);
+            }
+            out
+        })
+        .collect()
+}
+
 /// Simplest defensible block-constant (Es, N0) estimator from
 /// per-symbol linear tone powers at the candidate's bins.
 ///
@@ -9882,7 +9955,12 @@ fn normalize_llrs(llrs: &mut [f32], target_variance: f32) {
 ///   path (uniform-scale identity).
 /// - All-zero magnitudes leave LLRs unchanged (divisor stays at the
 ///   floor, but every LLR is already zero so the scaling is a no-op).
-fn whiten_llrs(llrs: &mut [f32], tone_magnitudes: &[[f64; NUM_TONES]], pp: &ProtocolParams) {
+fn whiten_llrs(
+    llrs: &mut [f32],
+    tone_magnitudes: &[[f64; NUM_TONES]],
+    units: ToneUnits,
+    pp: &ProtocolParams,
+) {
     const NOISE_FLOOR: f64 = 1e-6;
     let data_positions = pp.data_symbol_indices();
     let nd = data_positions.len();
@@ -9891,6 +9969,32 @@ fn whiten_llrs(llrs: &mut [f32], tone_magnitudes: &[[f64; NUM_TONES]], pp: &Prot
         return;
     }
     debug_assert_eq!(llrs.len(), nd * bps);
+
+    // Task W1.4 (decoder-TP-sensitivity plan, spec Section 7): normalise
+    // to a single LINEAR-MAGNITUDE representation before any median/floor
+    // math runs below. The median + `NOISE_FLOOR` logic in this function
+    // is calibrated for linear magnitude (the fine-FFT path's native
+    // `|y|` units, per `ToneUnits::LinearMag` — passed through unchanged,
+    // zero-alloc, byte-identical to the pre-fix behavior). The
+    // spectrogram path instead stores dB log-power (`10*log10(mag^2)`,
+    // see `ToneUnits::Db`), which is commonly NEGATIVE; fed directly into
+    // this function's `NOISE_FLOOR = 1e-6` floor (calibrated for a
+    // strictly-positive linear magnitude), a negative dB value ALWAYS
+    // clamps to the floor regardless of its actual value, which measurably
+    // degenerates a large fraction of dB-path whitening calls into a
+    // constant (non-differentiating) divisor — confirmed empirically
+    // during this task's investigation (~18% of dB-path invocations on a
+    // real off-air corpus were fully floored across all 8 tones). Convert
+    // dB to linear magnitude (`10^(db/20)`, i.e. `sqrt(power)`) so both
+    // domains share the same floor semantics on the same physical scale.
+    let owned_linear;
+    let tone_magnitudes: &[[f64; NUM_TONES]] = match units {
+        ToneUnits::Db => {
+            owned_linear = tone_magnitudes_linear_from_db(tone_magnitudes);
+            &owned_linear
+        }
+        ToneUnits::LinearMag => tone_magnitudes,
+    };
 
     // Determine the winning tone at each data symbol position. We use
     // the raw FFT-bin argmax (not the Gray-decoded label) because the
@@ -9987,10 +10091,11 @@ fn maybe_whiten_llrs(
     enabled: bool,
     llrs: &mut [f32],
     tone_magnitudes: &[[f64; NUM_TONES]],
+    units: ToneUnits,
     pp: &ProtocolParams,
 ) {
     if enabled {
-        whiten_llrs(llrs, tone_magnitudes, pp);
+        whiten_llrs(llrs, tone_magnitudes, units, pp);
     }
 }
 
@@ -15288,7 +15393,7 @@ mod llr_whitening_tests {
         let mut llrs = synthetic_llrs(174);
         let originals = llrs.clone();
 
-        whiten_llrs(&mut llrs, &mags, &pp);
+        whiten_llrs(&mut llrs, &mags, ToneUnits::LinearMag, &pp);
 
         // Pick two non-zero LLR indices and check ratios match.
         let ratio_before = originals[3] / originals[170];
@@ -15357,7 +15462,7 @@ mod llr_whitening_tests {
         // vector should produce LLRs with smaller divisor at tone-0-winner
         // positions than at tone-4-winner positions.
         let mut llrs = vec![10.0f32; 174];
-        whiten_llrs(&mut llrs, &mags, &pp);
+        whiten_llrs(&mut llrs, &mags, ToneUnits::LinearMag, &pp);
 
         let bps = pp.bits_per_symbol;
         let first_sym_llr_avg: f32 = llrs[..bps].iter().map(|l| l.abs()).sum::<f32>() / bps as f32;
@@ -15389,7 +15494,7 @@ mod llr_whitening_tests {
         let mags = winner_mags(&pp, &winners, 4.0, 1.0);
 
         let mut llrs = synthetic_llrs(174);
-        whiten_llrs(&mut llrs, &mags, &pp);
+        whiten_llrs(&mut llrs, &mags, ToneUnits::LinearMag, &pp);
         normalize_llrs(&mut llrs, LLR_TARGET_VARIANCE);
 
         let n = llrs.len() as f32;
@@ -15417,7 +15522,7 @@ mod llr_whitening_tests {
         let mags = uniform_mags(pp.num_symbols, 0.0);
         let mut llrs = synthetic_llrs(174);
 
-        whiten_llrs(&mut llrs, &mags, &pp);
+        whiten_llrs(&mut llrs, &mags, ToneUnits::LinearMag, &pp);
 
         for (i, &v) in llrs.iter().enumerate() {
             assert!(
@@ -15440,7 +15545,7 @@ mod llr_whitening_tests {
         llrs[100] = f32::INFINITY;
         llrs[101] = f32::NEG_INFINITY;
 
-        whiten_llrs(&mut llrs, &mags, &pp);
+        whiten_llrs(&mut llrs, &mags, ToneUnits::LinearMag, &pp);
 
         for (i, &v) in llrs.iter().enumerate() {
             assert!(
@@ -15476,7 +15581,7 @@ mod llr_whitening_tests {
         let mut llrs = synthetic_llrs(174);
         let original = llrs.clone();
 
-        maybe_whiten_llrs(false, &mut llrs, &mags, &pp);
+        maybe_whiten_llrs(false, &mut llrs, &mags, ToneUnits::LinearMag, &pp);
 
         assert_eq!(
             llrs, original,
@@ -15515,7 +15620,7 @@ mod llr_whitening_tests {
         let mut llrs = synthetic_llrs(174);
         let original = llrs.clone();
 
-        maybe_whiten_llrs(true, &mut llrs, &mags, &pp);
+        maybe_whiten_llrs(true, &mut llrs, &mags, ToneUnits::LinearMag, &pp);
 
         let max_delta = llrs
             .iter()
@@ -15530,18 +15635,24 @@ mod llr_whitening_tests {
     }
 
     #[test]
-    fn default_config_keeps_whitening_on() {
-        // LLR whitening graduated to default-ON in Batch 53 after a
-        // hard_1000 measurement showed +4 TPs and -713 FPs (precision
-        // 0.7317 → 0.7559, +3.3% relative). The flip is the active
-        // production stance; this test pins the default so a future
-        // refactor doesn't silently revert. To re-shelve, re-measure
-        // and flip back with a journal entry.
+    fn default_config_keeps_whitening_off() {
+        // LLR whitening was graduated to default-ON in Batch 53 on a
+        // measurement made against a BUGGY implementation (dB and
+        // linear-magnitude inputs sharing one magnitude-calibrated
+        // NOISE_FLOOR). Task W1.4 (decoder-TP-sensitivity plan,
+        // 2026-07-07) fixed the unit mismatch and re-measured: the
+        // corrected whitening is a much stronger effect and costs real
+        // recall (-56 TPs on hard-200, bootstrap CI excludes zero) with
+        // no compensating FP-on-noise win. Re-shelved to OFF; see
+        // `research/experiments/2026-07-07-w1.4-whiten-llrs-unit-fix.md`.
+        // This test pins the default so a future refactor doesn't
+        // silently re-enable it without a fresh measurement.
         let cfg = Ft8Config::default();
         assert!(
-            cfg.llr_whitening_enabled,
-            "Ft8Config::default().llr_whitening_enabled must be true; \
-             graduated in Batch 53 — re-shelve requires re-measurement"
+            !cfg.llr_whitening_enabled,
+            "Ft8Config::default().llr_whitening_enabled must be false; \
+             re-shelved in Task W1.4 (2026-07-07) — re-enabling requires \
+             re-measurement"
         );
     }
 
@@ -15558,8 +15669,75 @@ mod llr_whitening_tests {
         // early return is broken.
         let mags = uniform_mags(pp.num_symbols, 1.0);
         let mut llrs: Vec<f32> = Vec::new();
-        whiten_llrs(&mut llrs, &mags, &pp);
+        whiten_llrs(&mut llrs, &mags, ToneUnits::LinearMag, &pp);
         assert!(llrs.is_empty());
+    }
+
+    /// Task W1.4 (decoder-TP-sensitivity plan, spec Section 7): direct
+    /// unit-consistency proof, mirroring
+    /// `impulse_robust_llr_tests::db_and_linear_mag_units_agree`. The
+    /// same physical scene — one "hot" (winner-adjacent) data symbol at
+    /// much higher power than the rest, expressed BOTH as realistic
+    /// (commonly-negative) dB log-power AND as the equivalent linear
+    /// magnitude — must whiten identically once `whiten_llrs` is told
+    /// which domain it's receiving via `ToneUnits`.
+    ///
+    /// Before this task's fix, the dB-domain call would have applied
+    /// `NOISE_FLOOR` directly to raw (often-negative) dB values instead
+    /// of linear magnitude, so this test would NOT have compiled against
+    /// the old 3-argument `whiten_llrs` signature at all — the old
+    /// signature had no `ToneUnits` parameter, i.e. no way to declare
+    /// "these are dB values" and get correct handling. That is the
+    /// concrete manifestation of the bug this task fixes: dB and linear
+    /// inputs were never reconciled, they were just both fed to the same
+    /// magnitude-calibrated floor.
+    #[test]
+    fn whiten_llrs_db_and_linear_mag_units_agree() {
+        let pp = ProtocolParams::ft8();
+        let mut powers = uniform_mags(pp.num_symbols, 1.0);
+        let data_positions = pp.data_symbol_indices();
+        let hot = data_positions[9];
+        for t in 0..NUM_TONES {
+            powers[hot][t] = 25.0;
+        }
+        // Realistic spectrogram-path convention: dB log-power,
+        // `10*log10(power)`. With `power` mostly at 1.0, the non-hot
+        // symbols are exactly 0 dB (borderline) and the hot symbol is
+        // ~14 dB — nothing here is deep in negative territory, matching
+        // this task's empirical finding that the bug's practical impact
+        // is domain-mixing incoherence rather than a guaranteed flip.
+        let db: Vec<[f64; NUM_TONES]> = powers
+            .iter()
+            .map(|row| {
+                let mut out = [0.0f64; NUM_TONES];
+                for (o, &p) in out.iter_mut().zip(row.iter()) {
+                    *o = 10.0 * p.log10();
+                }
+                out
+            })
+            .collect();
+        // Fine-FFT-path convention: linear magnitude `|y|`, power = mag^2.
+        let mag: Vec<[f64; NUM_TONES]> = powers
+            .iter()
+            .map(|row| {
+                let mut out = [0.0f64; NUM_TONES];
+                for (o, &p) in out.iter_mut().zip(row.iter()) {
+                    *o = p.sqrt();
+                }
+                out
+            })
+            .collect();
+        let mut llrs_db = synthetic_llrs(174);
+        let mut llrs_mag = synthetic_llrs(174);
+        whiten_llrs(&mut llrs_db, &db, ToneUnits::Db, &pp);
+        whiten_llrs(&mut llrs_mag, &mag, ToneUnits::LinearMag, &pp);
+        for (i, (&a, &b)) in llrs_db.iter().zip(llrs_mag.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-3,
+                "dB and linear-mag unit paths must whiten identically at \
+                 index {i}: db-path={a}, mag-path={b}"
+            );
+        }
     }
 }
 

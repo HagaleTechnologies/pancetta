@@ -233,3 +233,129 @@ mod refinement {
         );
     }
 }
+
+// ============================================================================
+// Task W1.4 (decoder-TP-sensitivity plan, spec Section 7): `whiten_llrs`
+// dB-vs-linear-|y| gain-invariance property test.
+//
+// Unconditional (not gated behind `transmit`, unlike `mod refinement` above)
+// because it only needs a real off-air fixture WAV + `decode_window`, the
+// same minimal surface `wav_decode_tests.rs` uses without any feature gate.
+// ============================================================================
+
+mod gain_invariance {
+    use super::*;
+    use std::collections::BTreeSet;
+
+    fn fixture_path(subpath: &str) -> String {
+        format!(
+            "{}/tests/fixtures/wav/{}",
+            env!("CARGO_MANIFEST_DIR"),
+            subpath
+        )
+    }
+
+    fn read_wav_samples(path: &str) -> Vec<f32> {
+        let reader = hound::WavReader::open(path)
+            .unwrap_or_else(|e| panic!("Failed to open {}: {}", path, e));
+        let spec = reader.spec();
+        assert_eq!(spec.channels, 1, "fixture must be mono");
+        assert_eq!(
+            spec.sample_rate, SAMPLE_RATE,
+            "fixture must match SAMPLE_RATE"
+        );
+        reader
+            .into_samples::<i16>()
+            .map(|s| s.unwrap() as f32 / 32768.0)
+            .collect()
+    }
+
+    /// Decode `samples` after uniformly scaling every sample by `gain`,
+    /// returning the set of decoded message texts. A `BTreeSet` (rather
+    /// than the raw `Vec`) deliberately ignores decode ORDER — only the
+    /// set of messages recovered matters for a gain-invariance claim.
+    fn decode_set_at_gain(samples: &[f32], gain: f32) -> BTreeSet<String> {
+        let mut buffer: Vec<f32> = samples.iter().map(|&s| s * gain).collect();
+        if buffer.len() < WINDOW_SAMPLES {
+            buffer.resize(WINDOW_SAMPLES, 0.0);
+        }
+        let config = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(config).unwrap();
+        decoder
+            .decode_window(&buffer)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.text)
+            .collect()
+    }
+
+    /// `whiten_llrs` (`Ft8Config::llr_whitening_enabled`, default ON)
+    /// divides LLRs by per-tone/per-symbol MEDIAN tone magnitudes with a
+    /// `NOISE_FLOOR = 1e-6` floor. That floor is calibrated for the
+    /// LINEAR-magnitude domain (the fine-FFT path's native units, `|y|`),
+    /// but several spectrogram-path callers hand it dB LOG-POWER values
+    /// instead (`10*log10(power)`, commonly negative). Scaling the whole
+    /// recording by a gain factor shifts every dB value by a CONSTANT
+    /// (`20*log10(gain)` in magnitude terms), which changes how often the
+    /// `1e-6` floor clamps the per-tone/per-symbol medians — a real input
+    /// recording and a uniformly quieter recording of the IDENTICAL
+    /// signal should decode to the identical message set; if the floor
+    /// clamps differently at the two gains, the whitening divisor changes
+    /// shape between the two runs and the decode set can differ.
+    ///
+    /// This decodes a real off-air recording (`wsjt/210703_133430.wav`,
+    /// 9 messages at gain 1.0 per `wav_decode_tests.rs`) at gain 1.0 and
+    /// at gain 0.01 (pre-scaled samples — a ~-40 dB quieter recording of
+    /// the exact same signal) and asserts the decoded message sets match.
+    #[test]
+    fn test_whiten_llrs_gain_invariance() {
+        let samples = read_wav_samples(&fixture_path("wsjt/210703_133430.wav"));
+
+        let set_full = decode_set_at_gain(&samples, 1.0);
+        let set_quiet = decode_set_at_gain(&samples, 0.01);
+
+        assert!(
+            !set_full.is_empty(),
+            "sanity check: gain=1.0 baseline decode must find at least one \
+             message on this real off-air recording (documented at 9 \
+             messages in wav_decode_tests.rs)"
+        );
+
+        assert_eq!(
+            set_full, set_quiet,
+            "decode set must be gain-invariant — LDPC/CRC-verified messages \
+             don't depend on absolute recording level. gain=1.0 decoded \
+             {set_full:?}, gain=0.01 (~-40dB quieter, identical signal) \
+             decoded {set_quiet:?}"
+        );
+    }
+
+    /// Wider gain sweep than the primary two-point test above, spanning
+    /// -80 dB to +40 dB relative to the fixture's native level (six
+    /// orders of magnitude). Added during this task's investigation to
+    /// probe for a gain-dependent flip beyond the single 0.01 data
+    /// point; found none on this fixture (see the W1.4 experiment log
+    /// for the full investigation, including instrumented floor-hit
+    /// counts confirming the underlying dB/linear-magnitude unit
+    /// mismatch is real but happens not to cross the `NOISE_FLOOR`
+    /// threshold anywhere in this recording's dynamic range). Kept as a
+    /// standing regression guard broader than the primary test.
+    #[test]
+    fn test_whiten_llrs_gain_invariance_wide_sweep() {
+        let samples = read_wav_samples(&fixture_path("wsjt/210703_133430.wav"));
+        let baseline = decode_set_at_gain(&samples, 1.0);
+        assert!(
+            !baseline.is_empty(),
+            "sanity: gain=1.0 baseline must decode"
+        );
+
+        for gain in [0.0001f32, 0.001, 0.01, 0.1, 5.0, 20.0, 100.0] {
+            let set = decode_set_at_gain(&samples, gain);
+            assert_eq!(
+                set, baseline,
+                "decode set at gain={gain} must match the gain=1.0 baseline \
+                 {baseline:?}; got {set:?}"
+            );
+        }
+    }
+}

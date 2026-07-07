@@ -129,7 +129,21 @@ fn build_qso_context_signal(
 #[test]
 fn ap3_rescues_qso_context_signal_that_ap0_cannot_decode() {
     let text = "K1ABC W1AW RR73";
-    let audio = build_qso_context_signal(text, -28.0, -20.0);
+    // Callsign-field SNR recalibrated -20.0 -> -24.0 (Task W1.4,
+    // decoder-TP-sensitivity plan, 2026-07-07): that task flipped
+    // `Ft8Config::default().llr_whitening_enabled` true -> false after a
+    // unit-consistency fix showed the (now-correctly-applied) whitening
+    // costs real recall. With whitening off the decoder is measurably
+    // more sensitive, so the previous -20.0 dB callsign-field noise was
+    // no longer harsh enough to force a full AP3 (own+partner callsign)
+    // rescue — this exact signal started succeeding at AP1 (own call
+    // only) instead. -24.0 dB restores the intended discrimination
+    // (AP0 fails, AP1 alone is not enough, AP3 rescues) under the new
+    // default. Uses `Ft8Config::default()` deliberately (not a pinned
+    // config), so it's expected to need occasional recalibration as
+    // default-on decoder strength changes — that's a feature of testing
+    // against the real production config, not a design flaw.
+    let audio = build_qso_context_signal(text, -28.0, -24.0);
 
     // AP0 (no context at all) must fail on this signal.
     let mut plain_decoder = Ft8Decoder::new(Ft8Config::default()).expect("decoder");
