@@ -53,8 +53,9 @@
 
 use bitvec::prelude::*;
 use pancetta_ft8::ap::{inject_ap_llrs, ApContext, ApLevel, MyCallAp, QsoAp, QsoApProgress};
-use pancetta_ft8::ldpc::gray_to_binary;
+use pancetta_ft8::ldpc::{gray_to_binary, gray_to_binary_4fsk};
 use pancetta_ft8::message::PAYLOAD_BITS;
+use pancetta_ft8::protocol::{ProtocolParams, FT4_XOR_SEQUENCE};
 use pancetta_ft8::{Ft8Encoder, NUM_SYMBOLS};
 
 // ============================================================================
@@ -161,7 +162,7 @@ fn ap4_injected_i3_bits_match_encoder_rr73_ground_truth() {
     };
 
     let mut llrs = vec![0.0f32; 77];
-    inject_ap_llrs(&mut llrs, ApLevel::Ap4, &ctx);
+    inject_ap_llrs(&mut llrs, ApLevel::Ap4, &ctx, None);
 
     // inject_bit: true bit -> negative LLR, false bit -> positive LLR.
     let injected_i3 = [llrs[74] < 0.0, llrs[75] < 0.0, llrs[76] < 0.0];
@@ -188,10 +189,10 @@ fn ap4_only_changes_i3_bits_relative_to_ap3() {
     };
 
     let mut ap3_llrs = vec![0.0f32; 77];
-    inject_ap_llrs(&mut ap3_llrs, ApLevel::Ap3, &ctx);
+    inject_ap_llrs(&mut ap3_llrs, ApLevel::Ap3, &ctx, None);
 
     let mut ap4_llrs = vec![0.0f32; 77];
-    inject_ap_llrs(&mut ap4_llrs, ApLevel::Ap4, &ctx);
+    inject_ap_llrs(&mut ap4_llrs, ApLevel::Ap4, &ctx, None);
 
     assert_eq!(
         ap3_llrs[0..74],
@@ -206,5 +207,249 @@ fn ap4_only_changes_i3_bits_relative_to_ap3() {
         ap4_llrs[74..77],
         ap3_llrs[74..77],
         "AP4 must inject something at the i3 bits that AP3 does not"
+    );
+}
+
+// ============================================================================
+// Task W1.2: FT4 AP injection ignores XOR whitening
+// ============================================================================
+//
+// FT4 payloads are XOR-scrambled with `FT4_XOR_SEQUENCE` *before* LDPC
+// encoding (`encoder.rs::payload_to_symbols_protocol`) and un-scrambled the
+// same way after LDPC decode + CRC check (`decoder.rs::par_apply_xor`).
+// `inject_ap_llrs` sets LLR signs directly on the codeword fed into LDPC
+// decode — i.e. the SAME pre-un-XOR (whitened) domain `par_apply_xor`
+// reverses — so an AP-injected "real" callsign/i3 bit must itself be
+// whitened with the same sequence before its LLR sign is set. Before this
+// fix, AP injected the raw (un-whitened) bit unconditionally, which is
+// wrong at every payload bit position where `FT4_XOR_SEQUENCE` has a 1
+// (roughly half the 77 payload bits) — actively fighting the correct
+// decode instead of helping it.
+//
+// These tests establish the post-XOR ground truth via this project's own
+// FT4 encoder (never hand-computed), matching the "own encoder as ground
+// truth" pattern already used above for the i3 fix.
+
+/// Extract the first 77 bits of the 174-bit LDPC codeword from FT4
+/// symbols. This is the codeword's pre-un-XOR domain: for FT4 (whose
+/// `ProtocolParams::xor_sequence` is `Some`), this is NOT the raw 77-bit
+/// message payload — it's `payload XOR FT4_XOR_SEQUENCE` (see
+/// `encoder.rs::payload_to_symbols_protocol`, which scrambles the payload
+/// before it ever reaches LDPC encoding). This is exactly the domain
+/// `inject_ap_llrs`'s LLRs live in.
+fn extract_ft4_codeword_bits(symbols: &[u8]) -> BitVec {
+    const LDPC_CODEWORD_BITS: usize = 174;
+    // FT4 data symbol ranges (protocol.rs::FT4_DATA_RANGES): 5..34, 38..67,
+    // 71..100 (29 + 29 + 29 = 87 data symbols x 2 bits/symbol = 174 bits).
+    let data_ranges: [std::ops::Range<usize>; 3] = [5..34, 38..67, 71..100];
+
+    let mut codeword_bits = Vec::with_capacity(LDPC_CODEWORD_BITS);
+    for range in data_ranges {
+        for i in range {
+            let binary_value = gray_to_binary_4fsk(symbols[i]);
+            codeword_bits.push((binary_value & 2) != 0);
+            codeword_bits.push((binary_value & 1) != 0);
+        }
+    }
+    assert_eq!(codeword_bits.len(), LDPC_CODEWORD_BITS);
+
+    let mut payload = BitVec::with_capacity(PAYLOAD_BITS);
+    for &b in &codeword_bits[0..PAYLOAD_BITS] {
+        payload.push(b);
+    }
+    payload
+}
+
+/// Encode `message_text` as FT4 with this project's own encoder and
+/// return the first 77 POST-XOR codeword bits (ground truth).
+fn encode_ft4_to_codeword_bits(message_text: &str) -> BitVec {
+    let mut encoder = Ft8Encoder::with_protocol(ProtocolParams::ft4());
+    let symbols = encoder
+        .encode_message_protocol(message_text, None)
+        .unwrap_or_else(|e| panic!("failed to encode FT4 {message_text:?}: {e}"));
+    extract_ft4_codeword_bits(&symbols)
+}
+
+/// THE key regression test for this task: AP1's injected LLR signs (own
+/// callsign at bits 0-27) must match the FT4 encoder's real POST-XOR
+/// codeword bits, not the raw (un-whitened) callsign bits.
+///
+/// Before the fix, `inject_ap_llrs` injected `my_call.bits` directly
+/// regardless of protocol, which only agrees with the post-XOR ground
+/// truth at positions where `FT4_XOR_SEQUENCE` happens to have a 0 bit —
+/// roughly half the time it's wrong.
+#[test]
+fn ap1_ft4_injection_matches_post_xor_codeword_not_raw_callsign_bits() {
+    // "K1DEF W1ABC RR73": K1DEF is the addressee (to_callsign, bits 0-27),
+    // W1ABC is the sender (from_callsign, bits 29-56) — matching the
+    // module doc's convention that we are always to_callsign for
+    // anything we decode.
+    let ground_truth = encode_ft4_to_codeword_bits("K1DEF W1ABC RR73");
+
+    let my_call = MyCallAp::new("K1DEF").expect("K1DEF should encode");
+    // Sanity: MyCallAp's raw (un-whitened) bits must differ from the
+    // post-XOR ground truth at at least one position in 0..28 — otherwise
+    // this test can't distinguish "whitened correctly" from "bug present
+    // but coincidentally matches" for this call pair.
+    let raw_differs_from_whitened = (0..28).any(|i| my_call.bits[i] != ground_truth[i]);
+    assert!(
+        raw_differs_from_whitened,
+        "test call pair must exercise at least one FT4_XOR_SEQUENCE=1 bit \
+         in 0..28, otherwise the whitening bug is untestable here"
+    );
+
+    let ctx = ApContext {
+        my_call: Some(my_call),
+        recent_calls: vec![],
+        active_qso: None,
+    };
+
+    let mut llrs = vec![0.0f32; 77];
+    inject_ap_llrs(&mut llrs, ApLevel::Ap1, &ctx, Some(&FT4_XOR_SEQUENCE));
+
+    for i in 0..28 {
+        let injected_bit = llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "bit {i}: AP1's injected LLR sign (for FT4) must match the \
+             encoder's real post-XOR codeword bit, not the raw callsign bit"
+        );
+    }
+}
+
+/// Same as above, but for AP3 (both callsign fields: to_callsign at
+/// bits 0-27 AND from_callsign at bits 29-56) — the from_callsign field
+/// exercises whitening independently at a different byte/bit-position
+/// offset than to_callsign.
+#[test]
+fn ap3_ft4_injection_matches_post_xor_codeword_both_callsign_fields() {
+    let ground_truth = encode_ft4_to_codeword_bits("K1DEF W1ABC RR73");
+
+    let my_call = MyCallAp::new("K1DEF").expect("K1DEF should encode");
+    let qso =
+        QsoAp::new("W1ABC", QsoApProgress::WaitingForConfirmation).expect("W1ABC should encode");
+    assert!(
+        (29..57).any(|i| qso.their_bits[i - 29] != ground_truth[i]),
+        "test call pair must exercise at least one FT4_XOR_SEQUENCE=1 bit \
+         in 29..57, otherwise the whitening bug is untestable here"
+    );
+
+    let ctx = ApContext {
+        my_call: Some(my_call),
+        recent_calls: vec![],
+        active_qso: Some(qso),
+    };
+
+    let mut llrs = vec![0.0f32; 77];
+    inject_ap_llrs(&mut llrs, ApLevel::Ap3, &ctx, Some(&FT4_XOR_SEQUENCE));
+
+    for i in 0..28 {
+        let injected_bit = llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "bit {i} (to_callsign) mismatch"
+        );
+    }
+    for i in 29..57 {
+        let injected_bit = llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "bit {i} (from_callsign) mismatch"
+        );
+    }
+}
+
+/// AP4's i3 bits (74-76) are also inside the 77-bit payload the FT4 XOR
+/// scrambles, so they must be whitened too, matching a real RR73
+/// message's post-XOR i3 field.
+#[test]
+fn ap4_ft4_i3_bits_match_post_xor_codeword() {
+    let ground_truth = encode_ft4_to_codeword_bits("K1DEF W1ABC RR73");
+
+    let my_call = MyCallAp::new("K1DEF").expect("K1DEF should encode");
+    let qso =
+        QsoAp::new("W1ABC", QsoApProgress::WaitingForConfirmation).expect("W1ABC should encode");
+    let ctx = ApContext {
+        my_call: Some(my_call),
+        recent_calls: vec![],
+        active_qso: Some(qso),
+    };
+
+    let mut llrs = vec![0.0f32; 77];
+    inject_ap_llrs(&mut llrs, ApLevel::Ap4, &ctx, Some(&FT4_XOR_SEQUENCE));
+
+    for i in 74..77 {
+        let injected_bit = llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "bit {i} (i3 field): AP4's injected LLR sign must match the FT4 \
+             encoder's real post-XOR i3 bits"
+        );
+    }
+}
+
+/// FT8 regression: the SAME test structure, run against FT8 (no
+/// whitening — `ProtocolParams::ft8().xor_sequence` is `None`), must be
+/// completely unaffected by this fix. FT8's post-"XOR" ground truth is
+/// just the raw payload bits (there is no scrambling), so passing `None`
+/// for `xor_sequence` must inject exactly the raw callsign bits, as
+/// before this task.
+#[test]
+fn ap1_ap3_ft8_injection_unaffected_by_whitening_fix() {
+    let ground_truth = encode_to_payload("K1DEF W1ABC RR73");
+
+    let my_call = MyCallAp::new("K1DEF").expect("K1DEF should encode");
+    let qso =
+        QsoAp::new("W1ABC", QsoApProgress::WaitingForConfirmation).expect("W1ABC should encode");
+    let ctx = ApContext {
+        my_call: Some(my_call.clone()),
+        recent_calls: vec![],
+        active_qso: Some(qso.clone()),
+    };
+
+    // AP1: raw callsign bits, unchanged.
+    let mut ap1_llrs = vec![0.0f32; 77];
+    inject_ap_llrs(&mut ap1_llrs, ApLevel::Ap1, &ctx, None);
+    for i in 0..28 {
+        let injected_bit = ap1_llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit, my_call.bits[i],
+            "FT8 AP1 bit {i} must be the raw callsign bit"
+        );
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "FT8 AP1 bit {i} must also match the real (unscrambled) encoder payload bit"
+        );
+    }
+
+    // AP3: both fields, raw bits, unchanged.
+    let mut ap3_llrs = vec![0.0f32; 77];
+    inject_ap_llrs(&mut ap3_llrs, ApLevel::Ap3, &ctx, None);
+    for i in 0..28 {
+        assert_eq!(
+            ap3_llrs[i], ap1_llrs[i],
+            "FT8 AP3 to_callsign bits must match AP1"
+        );
+    }
+    for i in 29..57 {
+        let injected_bit = ap3_llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit,
+            qso.their_bits[i - 29],
+            "FT8 AP3 from_callsign bit {i} must be the raw callsign bit"
+        );
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "FT8 AP3 from_callsign bit {i} must also match the real encoder payload bit"
+        );
+    }
+
+    // AP4: i3 bits, raw (false, false, true), unchanged.
+    let mut ap4_llrs = vec![0.0f32; 77];
+    inject_ap_llrs(&mut ap4_llrs, ApLevel::Ap4, &ctx, None);
+    assert_eq!(
+        [ap4_llrs[74] < 0.0, ap4_llrs[75] < 0.0, ap4_llrs[76] < 0.0],
+        [false, false, true],
+        "FT8 AP4 i3 bits must remain the raw (false,false,true) pattern"
     );
 }

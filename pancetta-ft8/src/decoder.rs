@@ -5088,22 +5088,30 @@ impl Ft8Decoder {
         let mut llrs = base_llrs.to_vec();
         let xor_sequence = self.protocol_params.xor_sequence;
 
-        // Inject AP bits according to level
+        // Inject AP bits according to level. `xor_sequence` (Some for FT4,
+        // None for FT8/FT2) whitens the injected bits to match the
+        // pre-un-XOR codeword domain the LDPC decoder operates in — see
+        // `ap::xor_bit_at`.
         match ap_level {
             crate::ap::ApLevel::Ap0 => {} // no injection
             crate::ap::ApLevel::Ap1 => {
-                crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context);
+                crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
             }
             crate::ap::ApLevel::Ap2 => {
                 // First inject AP1 (our call as called station)
-                crate::ap::inject_ap_llrs(&mut llrs, crate::ap::ApLevel::Ap1, ap_context);
+                crate::ap::inject_ap_llrs(
+                    &mut llrs,
+                    crate::ap::ApLevel::Ap1,
+                    ap_context,
+                    xor_sequence,
+                );
                 // Then inject the specific caller at bits 0-27
                 if let Some(caller) = caller_override {
-                    crate::ap::inject_ap2_caller(&mut llrs, caller);
+                    crate::ap::inject_ap2_caller(&mut llrs, caller, xor_sequence);
                 }
             }
             crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
-                crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context);
+                crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
             }
         }
 
@@ -8176,20 +8184,21 @@ fn par_try_ldpc_with_ap(
     time_offset_s: f64,
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
+    let xor_sequence = ctx.xor_sequence;
 
     match ap_level {
         crate::ap::ApLevel::Ap0 => {}
         crate::ap::ApLevel::Ap1 => {
-            crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context);
+            crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
         }
         crate::ap::ApLevel::Ap2 => {
-            crate::ap::inject_ap_llrs(&mut llrs, crate::ap::ApLevel::Ap1, ap_context);
+            crate::ap::inject_ap_llrs(&mut llrs, crate::ap::ApLevel::Ap1, ap_context, xor_sequence);
             if let Some(caller) = caller_override {
-                crate::ap::inject_ap2_caller(&mut llrs, caller);
+                crate::ap::inject_ap2_caller(&mut llrs, caller, xor_sequence);
             }
         }
         crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
-            crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context);
+            crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
         }
     }
 
@@ -8302,8 +8311,12 @@ fn par_try_ldpc_with_recent_only(
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
     match pos {
-        RecentInjectPos::Caller => crate::ap::inject_ap2_caller(&mut llrs, recent),
-        RecentInjectPos::Called => crate::ap::inject_recent_call_at_called(&mut llrs, recent),
+        RecentInjectPos::Caller => {
+            crate::ap::inject_ap2_caller(&mut llrs, recent, ctx.xor_sequence)
+        }
+        RecentInjectPos::Called => {
+            crate::ap::inject_recent_call_at_called(&mut llrs, recent, ctx.xor_sequence)
+        }
     }
 
     normalize_llrs(&mut llrs, ctx.llr_target_variance);
