@@ -64,6 +64,18 @@ struct Args {
     /// F5 [A/B]: disable the redundant half-symbol inner loop in the
     /// Costas sync kernel. See `Ft8Config::costas_half_loop_disabled`.
     costas_half_loop_disabled: Option<bool>,
+    /// Decoder-speed-overhaul Task 10 [A/B]: master switch for the BP
+    /// escalation ladder. See `Ft8Config::escalation_enabled`.
+    escalation_enabled: Option<bool>,
+    /// Decoder-speed-overhaul Task 9/10: shallow BP iteration count.
+    /// See `Ft8Config::floor_iters`.
+    floor_iters: Option<usize>,
+    /// Decoder-speed-overhaul Task 10: deep BP iteration count. See
+    /// `Ft8Config::deep_iters`.
+    deep_iters: Option<usize>,
+    /// Decoder-speed-overhaul Task 10: max unsatisfied parity checks
+    /// tolerated before escalating. See `Ft8Config::escalation_parity_max`.
+    escalation_parity_max: Option<usize>,
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     cross_cycle_averaging: Option<bool>,
     /// hb-074: coherent (phase-aligned complex sum) variant of cross-cycle averaging.
@@ -192,6 +204,10 @@ impl Args {
         let mut layered_bp: Option<bool> = None;
         let mut pade_atanh: Option<bool> = None;
         let mut costas_half_loop_disabled: Option<bool> = None;
+        let mut escalation_enabled: Option<bool> = None;
+        let mut floor_iters: Option<usize> = None;
+        let mut deep_iters: Option<usize> = None;
+        let mut escalation_parity_max: Option<usize> = None;
         let mut cross_cycle_averaging: Option<bool> = None;
         let mut cross_cycle_coherent: Option<bool> = None;
         let mut cross_cycle_coherent_mrc: Option<bool> = None;
@@ -389,6 +405,26 @@ impl Args {
                 }
                 "--costas-half-loop-disabled" => {
                     costas_half_loop_disabled = Some(true);
+                }
+                "--escalation-enabled" => {
+                    escalation_enabled = Some(true);
+                }
+                "--floor-iters" => {
+                    floor_iters = Some(
+                        iter.next()
+                            .context("--floor-iters needs a value")?
+                            .parse()?,
+                    );
+                }
+                "--deep-iters" => {
+                    deep_iters = Some(iter.next().context("--deep-iters needs a value")?.parse()?);
+                }
+                "--escalation-parity-max" => {
+                    escalation_parity_max = Some(
+                        iter.next()
+                            .context("--escalation-parity-max needs a value")?
+                            .parse()?,
+                    );
                 }
                 "--cross-cycle-averaging" => {
                     cross_cycle_averaging = Some(true);
@@ -632,6 +668,10 @@ impl Args {
                     eprintln!("  --adaptive-ldpc-iters: enable hb-022 SNR-adaptive per-candidate LDPC iterations");
                     eprintln!("  --pade-atanh: F1 [A/B] — use the Padé rational approximant for atanh in the BP check-node update instead of the exact ln form (default off)");
                     eprintln!("  --costas-half-loop-disabled: F5 [A/B] — evaluate only half=0 in the Costas sync kernel's half-symbol inner loop instead of max(half=0, half=1) (default off)");
+                    eprintln!("  --escalation-enabled: decoder-speed-overhaul Task 10 [A/B] — BP escalation ladder master switch (default off). See Ft8Config::escalation_enabled.");
+                    eprintln!("  --floor-iters N: shallow BP iteration count for S1/S2 when --escalation-enabled (default 25).");
+                    eprintln!("  --deep-iters N: deep BP iteration count a near-miss floor failure is escalated to (default 100).");
+                    eprintln!("  --escalation-parity-max N: max unsatisfied parity checks at floor_iters tolerated before escalating (default 30).");
                     eprintln!("  --max-concurrent-tiers N: opt-in CPU-contention guard. Heavy tiers (hard-200/1000, chrono-replay, wild-*, hard-jt9-rich-200) acquire one of N file-lock slots in /tmp/pancetta-eval-tier-slots/ before running. Default unbounded (no guard).");
                     eprintln!("  --max-concurrent-tiers-pool-dir PATH: override the slot-pool directory (default /tmp/pancetta-eval-tier-slots).");
                     std::process::exit(0);
@@ -667,6 +707,10 @@ impl Args {
             layered_bp,
             pade_atanh,
             costas_half_loop_disabled,
+            escalation_enabled,
+            floor_iters,
+            deep_iters,
+            escalation_parity_max,
             cross_cycle_averaging,
             cross_cycle_coherent,
             cross_cycle_coherent_mrc,
@@ -1479,6 +1523,18 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(on) = args.costas_half_loop_disabled {
                 d = d.with_costas_half_loop_disabled(on);
+            }
+            if let Some(on) = args.escalation_enabled {
+                d = d.with_escalation_enabled(on);
+            }
+            if let Some(v) = args.floor_iters {
+                d = d.with_floor_iters(v);
+            }
+            if let Some(v) = args.deep_iters {
+                d = d.with_deep_iters(v);
+            }
+            if let Some(v) = args.escalation_parity_max {
+                d = d.with_escalation_parity_max(v);
             }
             if let Some(on) = args.cross_cycle_averaging {
                 d = d.with_cross_cycle_averaging(on);

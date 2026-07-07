@@ -354,6 +354,36 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-speed-overhaul Task 10 [A/B]: master switch for the BP
+    /// escalation ladder. See `Ft8Config::escalation_enabled`.
+    pub fn with_escalation_enabled(mut self, on: bool) -> Self {
+        self.config.escalation_enabled = on;
+        self
+    }
+
+    /// Decoder-speed-overhaul Task 9/10: shallow BP iteration count for
+    /// the S1/S2 primary decode. See `Ft8Config::floor_iters`.
+    pub fn with_floor_iters(mut self, n: usize) -> Self {
+        self.config.floor_iters = n;
+        self
+    }
+
+    /// Decoder-speed-overhaul Task 10: deep BP iteration count a
+    /// near-miss floor failure is escalated to. See
+    /// `Ft8Config::deep_iters`.
+    pub fn with_deep_iters(mut self, n: usize) -> Self {
+        self.config.deep_iters = n;
+        self
+    }
+
+    /// Decoder-speed-overhaul Task 10: maximum unsatisfied parity
+    /// checks tolerated at `floor_iters` before escalating. See
+    /// `Ft8Config::escalation_parity_max`.
+    pub fn with_escalation_parity_max(mut self, n: usize) -> Self {
+        self.config.escalation_parity_max = n;
+        self
+    }
+
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     pub fn with_cross_cycle_averaging(mut self, on: bool) -> Self {
         self.config.cross_cycle_averaging = on;
