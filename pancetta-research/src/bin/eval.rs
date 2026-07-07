@@ -43,7 +43,6 @@ struct Args {
     nms_score_delta_db: Option<f64>,
     min_sync_score: Option<f64>,
     adaptive_ldpc_iters: Option<bool>,
-    time_range: Option<f64>,
     max_parity_errors_for_osd: Option<usize>,
     /// hb-044: enable Costas time-axis parabolic refinement.
     sync_time_interpolation: Option<bool>,
@@ -205,7 +204,6 @@ impl Args {
         let mut nms_score_delta_db: Option<f64> = None;
         let mut min_sync_score: Option<f64> = None;
         let mut adaptive_ldpc_iters: Option<bool> = None;
-        let mut time_range: Option<f64> = None;
         let mut max_parity_errors_for_osd: Option<usize> = None;
         let mut sync_time_interpolation: Option<bool> = None;
         let mut sync_time_interp_score_gate: Option<f64> = None;
@@ -358,9 +356,6 @@ impl Args {
                 }
                 "--adaptive-ldpc-iters" => {
                     adaptive_ldpc_iters = Some(true);
-                }
-                "--time-range" => {
-                    time_range = Some(iter.next().context("--time-range needs a value")?.parse()?);
                 }
                 "--max-parity-errors-for-osd" => {
                     max_parity_errors_for_osd = Some(
@@ -726,7 +721,6 @@ impl Args {
             nms_score_delta_db,
             min_sync_score,
             adaptive_ldpc_iters,
-            time_range,
             max_parity_errors_for_osd,
             sync_time_interpolation,
             sync_time_interp_score_gate,
@@ -1708,9 +1702,6 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.adaptive_ldpc_iters {
         d = d.with_adaptive_ldpc_iters(on);
-    }
-    if let Some(v) = args.time_range {
-        d = d.with_time_range(v);
     }
     if let Some(n) = args.max_parity_errors_for_osd {
         d = d.with_max_parity_errors_for_osd(n);

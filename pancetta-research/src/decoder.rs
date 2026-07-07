@@ -274,12 +274,6 @@ impl Ft8Decoder {
         self
     }
 
-    /// Override `time_range` (seconds of ± slot-time search). hb-025 audit.
-    pub fn with_time_range(mut self, v: f64) -> Self {
-        self.config.time_range = v;
-        self
-    }
-
     /// Task W0.4 (2026-07-07): override the decoded protocol
     /// (`Ft8Config::protocol`). Default (from `Ft8Config::default()`) is
     /// `Protocol::Ft8`; the FT4 evaluation tier sets `Protocol::Ft4` so

@@ -182,9 +182,6 @@ pub struct Ft8Config {
     /// LDPC decoder iterations
     pub ldpc_iterations: usize,
 
-    /// Time search range (seconds)
-    pub time_range: f64,
-
     /// Maximum number of successive decoding passes. Default 1 (no
     /// subtract-and-redecode). The dB-domain `subtract_with_sidelobes`
     /// path masks adjacent weak signals more than it surfaces new
@@ -207,17 +204,19 @@ pub struct Ft8Config {
     pub osd_npre2_preprocessing_enabled: bool,
 
     /// Maximum candidates retained from Costas sync search before NMS.
-    /// Default matches the historical hard-coded MAX_SYNC_CANDIDATES (100).
+    /// Default matches the historical hard-coded MAX_SYNC_CANDIDATES (200).
     /// Raising this lets weaker sync candidates survive into NMS + LDPC
     /// at the cost of CPU per slot; lowering it cuts compute at the risk
     /// of dropping marginal real signals on busy bands.
     pub max_sync_candidates: usize,
 
     /// Target variance for LLR normalization before LDPC decoding.
-    /// Default 24.0 matches ft8_lib's ftx_normalize_logl(). LDPC
-    /// sum-product propagation is sensitive to LLR scale: over-scaled
-    /// LLRs cause BP to converge too aggressively to wrong codewords;
-    /// under-scaled LLRs slow convergence.
+    /// Default 32.0 — raised from ft8_lib's `ftx_normalize_logl()` value
+    /// of 24.0 for a small but consistent recall gain with no
+    /// regressions (see `LLR_TARGET_VARIANCE`). LDPC sum-product
+    /// propagation is sensitive to LLR scale: over-scaled LLRs cause BP
+    /// to converge too aggressively to wrong codewords; under-scaled
+    /// LLRs slow convergence.
     pub llr_target_variance: f32,
 
     /// Enable non-maximum suppression of nearby Costas sync candidates.
@@ -1138,7 +1137,6 @@ impl Default for Ft8Config {
             protocol: Protocol::Ft8,
             max_candidates: MAX_DECODE_CANDIDATES,
             ldpc_iterations: LDPC_MAX_ITERATIONS,
-            time_range: 2.0,
             max_decode_passes: 1,
             // Batch 73 (2026-06-11): dropped from Some(2) to Some(0).
             // OSD depth sweep on raw_530_full (2066 slots, ft8_lib truth)
