@@ -20,6 +20,7 @@ mod audio;
 mod autonomous;
 mod dsp;
 mod dx_cluster;
+mod effort;
 mod ft8;
 mod hamlib;
 mod health;
@@ -639,10 +640,14 @@ pub struct ApplicationCoordinator {
     /// milliseconds (decoder-speed-overhaul Task 12). `0` is the unlimited
     /// sentinel — the decode loop then falls back to the mode-aware
     /// ceiling (`decode_budget_ceiling_ms`) alone. Read once per window at
-    /// both decode call sites in `ft8.rs`. Nothing in this task writes a
-    /// nonzero value (it stays `0` = unlimited, so production decode
-    /// behavior is unchanged until Task 14 maps effort presets/config/TUI
-    /// onto this atomic).
+    /// both decode call sites in `ft8.rs`. Seeded from `[decoder]`
+    /// (`effort` mapped via `effort::preset_budget_ms`, or the explicit
+    /// `budget_ms` override when set) at coordinator startup (assuming
+    /// `HardwareTier::Fast` before the tier is known) and re-seeded by
+    /// `tier::initialize` once the real hardware tier resolves — see
+    /// `effort.rs` (Task 14). A live-reload/TUI-cycle call site landing
+    /// later should re-seed through `effort::seed_effort_budget` too (see
+    /// that module's doc comment).
     decode_effort_budget_ms: Arc<std::sync::atomic::AtomicU64>,
 
     /// Wall-clock time (ms) the most recently completed decode window spent
@@ -962,6 +967,13 @@ impl ApplicationCoordinator {
         // while Fox mode is engaged.
         let fox_max_streams_init = config.fox.max_streams;
 
+        // Snapshot [decoder] before config is moved into the Arc<RwLock>
+        // (decoder-speed-overhaul Task 14). `effort` + an optional explicit
+        // `budget_ms` override drive the `decode_effort_budget_ms` atomic
+        // seeded below; `budget_ms` always wins over the preset when set.
+        let decoder_effort_init = config.decoder.effort;
+        let decoder_budget_override_init = config.decoder.budget_ms;
+
         // Derive the active protocol's slot length from [rig].mode before
         // config is moved into the Arc<RwLock>. The config validator already
         // rejected an unknown mode at load time; an Err here would only mean a
@@ -1006,7 +1018,29 @@ impl ApplicationCoordinator {
             protocol: active_protocol,
             ..Ft8Config::default()
         }));
-        let scoped_fast_path = tier::initialize(ft8_config.clone()).await;
+
+        // decoder-speed-overhaul Task 14: seed `decode_effort_budget_ms` with
+        // an initial value before the hardware tier is known, assuming
+        // `HardwareTier::Fast` — the same "innocent until proven otherwise"
+        // convention `tier::initialize` already uses for `scoped_fast_path`
+        // (which also defaults to the fast-tier assumption until a cache hit
+        // or background probe resolves the real tier). `tier::initialize`
+        // re-seeds this atomic with the real tier on both the synchronous
+        // cache-hit path and the async probe-completion path.
+        let decode_effort_budget_ms = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        effort::seed_effort_budget(
+            decoder_effort_init,
+            decoder_budget_override_init,
+            pancetta_ft8::tier_probe::HardwareTier::Fast,
+            &decode_effort_budget_ms,
+        );
+        let scoped_fast_path = tier::initialize(
+            ft8_config.clone(),
+            decoder_effort_init,
+            decoder_budget_override_init,
+            decode_effort_budget_ms.clone(),
+        )
+        .await;
 
         // Created here (not inside start_autonomous_component) so the FT8
         // pipeline — started earlier in run() — captures a live Sender by
@@ -1094,8 +1128,10 @@ impl ApplicationCoordinator {
             active_decode_phase_ns: Arc::new(std::sync::atomic::AtomicI64::new(
                 active_decode_phase_ns_init,
             )),
-            // 0 = unlimited; Task 14 maps effort presets/config/TUI onto this.
-            decode_effort_budget_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            // Seeded above (Task 14) from `[decoder]` effort/budget_ms and the
+            // assumed-then-probed hardware tier; re-seeded on tier-probe
+            // completion by `tier::initialize`.
+            decode_effort_budget_ms,
             decode_last_elapsed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             decode_last_budget_exhausted: Arc::new(AtomicBool::new(false)),
             gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),

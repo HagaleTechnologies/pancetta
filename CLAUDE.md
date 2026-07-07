@@ -93,17 +93,27 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
   (or a cache hit from `~/.pancetta/tier_cache.json` keyed on
   `(cpu_model, core_count, pancetta_version)`). Moderate/Slow tiers
   flip the `scoped_fast_path: Arc<AtomicBool>` (replaces the old
-  env-var read in the FT8 hot loop). Tier-driven `Ft8Config` rewrites:
-  Fast and Moderate tiers run plain defaults (the Batch 36/41 Fast
-  preset `mp=2, ldpc=200` was retired in Batch 83 — under ft8_lib truth
-  it bought +24..+57 TPs for +142..+387 FPs at 2.6-3.9× decode time,
-  strictly dominated by the documented `ldpc_iterations=300` recall
-  lever); Slow tier rewrites to `max_decode_passes = 1` +
-  `max_sync_candidates = 150` (Batch 78; its pre-Batch-72
-  `osd_depth = Some(1)` rewrite was dropped — it would now *raise* OSD
-  depth above the `Some(0)` default). Operator override: `PANCETTA_SCOPED_FAST_PATH=1` forces
-  on, `=0` forces off, both skip the tier-driven preset. Spec:
-  `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`.
+  env-var read in the FT8 hot loop) — this mechanism is unchanged.
+  Operator override: `PANCETTA_SCOPED_FAST_PATH=1` forces on, `=0` forces
+  off, both skip the tier-driven `scoped_fast_path` decision. **Tier-driven
+  `Ft8Config` rewrites retired (decoder-speed-overhaul Task 14):** the old
+  ad-hoc per-tier `Ft8Config` field rewrites (Fast preset `mp=2, ldpc=200`
+  retired Batch 83; Slow preset `max_decode_passes=1` +
+  `max_sync_candidates=150` from Batch 78/72) are gone — `apply_tier` no
+  longer touches `Ft8Config` at all. Tuning decode thoroughness per tier is
+  now owned by the **`[decoder]` effort-preset system**
+  (`pancetta/src/coordinator/effort.rs`): `preset_budget_ms(effort, tier)`
+  maps a `DecodeEffort` (`Auto`/`Eco`/`Standard`/`Deep`/`Max`, config
+  `[decoder].effort`) — plus, for `Auto`, the probed `HardwareTier` — to a
+  per-window wall-time budget in ms, written into the
+  `decode_effort_budget_ms` atomic (Task 12) that the FT8 decode loop reads.
+  An explicit `[decoder].budget_ms` always overrides the preset. Seeded at
+  coordinator startup (assuming Fast until the tier is known) and re-seeded
+  once the tier resolves (cache hit or background-probe completion, mirroring
+  how `scoped_fast_path` itself gets re-applied). Spec:
+  `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md` (tier
+  probe) and `docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`
+  §6.1 (effort presets).
 - **QSO sender verification**: The QSO state machine (`pancetta-qso/src/qso_manager.rs::determine_state_transition` and `is_message_relevant`) verifies `from_station == expected DX callsign` on every state-advance. Mismatches are logged at `warn!` level (`target: "qso.security"`) and discarded. Frequency tolerance is 15 Hz. The autonomous responder (`autonomous.rs`) tracks per-callsign response timestamps in `recently_responded_to` and skips CQs from callsigns it responded to within the last 60s. Both defenses landed 2026-04-29 in response to Security Review C-1 and I-1; see `docs/security-review-2026-04-29.md`.
 - **Compound-callsign equivalence (catalog C18 / peer D4)** (`pancetta-qso/src/exchange.rs::{base_callsign,callsigns_match}`, applied in `qso_manager.rs::{is_us,is_partner}`): a station may sign a compound call (`EA8/G8BCG`, `G8BCG/P`, `K1ABC/R`, `VK9/W1XYZ/MM`) and later in the SAME QSO sign its bare base (`G8BCG`), or vice versa — same operator. WSJT-X/JTDX stall here because sender-verification compares the *displayed* call to the latched partner; pancetta does not. `callsigns_match` treats two calls as the same station iff they are byte-identical (uppercased) OR share a `base_callsign` — the longest `/`-separated component that is callsign-shaped (≥3 chars, has a digit AND a letter), which picks the home call over a country prefix or a portable suffix. It is conservative: genuinely different calls (`K5ARH`/`K5ARG`, `G8BCG`/`G8BCH`) extract distinct bases and never match, so the sender-mismatch security tests still reject impostors. Every `from == DX` (`is_partner`) and `to == us` (`is_us`) check in `determine_state_transition` + `is_message_relevant` routes through it, so a mid-QSO compound↔base change no longer stalls. `validate_callsign` was widened to accept compound forms (valid base + short prefix/suffix tokens) so compound frames parse instead of erroring out of the pipeline. The logged `their_callsign` is upgraded to the most-complete (longest matching) form seen — the compound carries DX/portable info. Tests: `pancetta-qso/tests/adversarial_compound_calls.rs`.
 - **Tri-state global TX policy** (`pancetta_core::TxPolicy` = `Full` | `RespondOnly` | `Disabled`, default `Full`): the operator's master TX switch, stored in the coordinator as `tx_policy: Arc<AtomicU8>` (orthogonal to `autonomous_enabled_runtime`). Operator cycles it with `g` in the TUI (Full → RespondOnly → Disabled → Full); Shift+Q emergency stop forces `Disabled`. Each state is echoed back as `MessageType::TxPolicyStatus` → `TuiMessage::TxPolicyUpdate` and rendered as a **bold, color-coded title-bar banner** (GREEN "TX: FULL", YELLOW "TX: RESPOND-ONLY", RED "TX: DISABLED — RX ONLY"). Gating map: **Disabled** = hard mute at the TX worker (`coordinator/tx.rs`, both `TransmitRequest` and `MultiTransmitRequest` arms) — never keys PTT / plays audio / modulates, consumes the request, reports a failed `TransmitComplete` + clears the TUI TX view. **RespondOnly** = suppress *initiations only*, gated at the sources: `StartCq` + `CallStation` refused in `tui_relay.rs` (with operator warning), repeating-CQ loop stopped, and autonomous initiation items (the `qso_id == None` `OperatorAction::Transmit`s, i.e. CQ-self + hunt/pounce) dropped in `coordinator/autonomous.rs` while QSO-in-progress items (`qso_id == Some`) and `RespondToCaller`/`QsoEvent::MessageToSend` flow through normally. **Full** = everything (legacy behavior). Autonomous initiation additionally requires the `autonomous_enabled_runtime` gate open. A **NOW-SENDING / QUEUED** TX strip (`pancetta-tui/src/ui/mod.rs::render_tx_strip`) shows the keyed message text + audio freq and items dequeued-but-not-yet-on-air, fed by `MessageType::TxQueueStatus { sending, queued }` from the TX worker (lightweight scope: reflects the request the worker is currently scheduling, not a deep channel-backlog scan).

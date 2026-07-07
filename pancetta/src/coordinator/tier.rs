@@ -12,19 +12,26 @@
 //!    tier directly or spawns a background probe.
 //! 2. The atomic is handed to the FT8 hot loop; reading it is a single
 //!    relaxed load per window iteration.
-//! 3. The [`Ft8Config`] handed in is wrapped in `Arc<RwLock<_>>`; the
-//!    probe worker rewrites it once with the Slow-tier preset if the
-//!    host classifies that way.
+//! 3. `initialize` and the background probe worker both also re-seed the
+//!    `decode_effort_budget_ms` atomic (decoder-speed-overhaul Task 14, see
+//!    `effort.rs`) once the tier is known — this **replaces** the old
+//!    Slow-tier `Ft8Config` numeric-field rewrite (`max_decode_passes=1` +
+//!    `max_sync_candidates=150`) that used to live in [`apply_tier`]: the
+//!    `[decoder]` effort-preset system now owns tuning decode thoroughness
+//!    for the Slow tier via the budget atomic instead of mutating
+//!    `Ft8Config` fields directly. `scoped_fast_path` handling is
+//!    unaffected by this change — it remains a separate, still-valid
+//!    mechanism.
 //!
 //! ## Override matrix
 //!
-//! | env var | probe result | atomic final | Ft8Config preset                       |
-//! |---------|--------------|--------------|----------------------------------------|
+//! | env var | probe result | atomic final | Ft8Config preset |
+//! |---------|--------------|--------------|------------------|
 //! | unset   | Fast         | false        | none (defaults; preset retired Batch 83) |
-//! | unset   | Moderate     | true         | none (defaults)                        |
-//! | unset   | Slow         | true         | Slow preset (mp=1, max_sync_candidates=150) |
-//! | `"1"`   | (any)        | true         | none (operator chose)                  |
-//! | `"0"`   | (any)        | false        | none (operator chose)                  |
+//! | unset   | Moderate     | true         | none (defaults)  |
+//! | unset   | Slow         | true         | none (defaults; Slow-tier preset retired Task 14 — see `effort.rs`) |
+//! | `"1"`   | (any)        | true         | none (operator chose) |
+//! | `"0"`   | (any)        | false        | none (operator chose) |
 //!
 //! The Fast preset trades wall-clock for sensitivity:
 //! - Batch 36 B1: `max_decode_passes=2` (+32 TPs / hard-200, 2.0× WC)
@@ -33,17 +40,21 @@
 //!
 //! Hosts with the compute budget pay it; Moderate/Slow stay at the default.
 //!
-//! See `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`.
+//! See `docs/superpowers/specs/2026-06-04-hb-216-s2-tier-wiring-design.md`
+//! and `docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
+use pancetta_config::DecodeEffort;
 use pancetta_ft8::tier_probe::{recommend_actions, HardwareTier};
 use pancetta_ft8::Ft8Config;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
+
+use super::effort::seed_effort_budget;
 
 const CACHE_SCHEMA_VERSION: u32 = 1;
 const ENV_OVERRIDE: &str = "PANCETTA_SCOPED_FAST_PATH";
@@ -246,16 +257,21 @@ fn detect_cpu_model() -> Option<String> {
 }
 
 /// Apply a tier classification to runtime state. Honors operator
-/// override: `ForceOn`/`ForceOff` short-circuit both the atomic and the
-/// config preset.
+/// override: `ForceOn`/`ForceOff` short-circuit the atomic.
 ///
 /// Returns a short human-readable description of what changed, suitable
 /// for logging.
+///
+/// Prior to decoder-speed-overhaul Task 14, this also rewrote
+/// `Ft8Config.max_decode_passes`/`max_sync_candidates` on the Slow tier.
+/// That rewrite is retired — the `[decoder]` effort-preset system
+/// (`effort.rs`) now owns tuning decode thoroughness per tier via the
+/// `decode_effort_budget_ms` atomic instead. This function no longer
+/// touches `Ft8Config` at all; `scoped_fast_path` handling is unchanged.
 pub(crate) async fn apply_tier(
     tier: HardwareTier,
     override_: Override,
     scoped_fast_path: &AtomicBool,
-    ft8_config: &RwLock<Ft8Config>,
 ) -> String {
     // Atomic flip.
     let (atomic_value, atomic_reason) = match override_ {
@@ -269,49 +285,17 @@ pub(crate) async fn apply_tier(
     };
     scoped_fast_path.store(atomic_value, Ordering::Release);
 
-    // Tier-driven Ft8Config preset. Skipped on any operator override
-    // — the operator's env var settings always win.
-    let config_change = if override_ == Override::None {
-        match tier {
-            // Batch 83: the old Fast preset (max_decode_passes=2,
-            // ldpc_iterations=200, from Batch 36 B1's pancetta-truth-era
-            // "+32 TPs") was re-measured under ft8_lib truth at the
-            // current defaults: +24..+57 TPs for +142..+387 FPs
-            // (5.9-10 FPs per TP) at 2.6-3.9x decode time on
-            // hard_1000 / raw_530_full — strictly dominated by the
-            // ldpc_iterations=300 recall lever (~2.3 FP/TP, Batch 82).
-            // Fast hardware now runs plain defaults; the recall levers
-            // are operator decisions (see hypothesis bank, hb-247 note).
-            HardwareTier::Fast => "",
-            HardwareTier::Moderate => "",
-            HardwareTier::Slow => {
-                let mut cfg = ft8_config.write().await;
-                cfg.max_decode_passes = 1;
-                // osd_depth deliberately left at the default (Some(0)
-                // since Batch 72). The old `Some(1)` here predated that
-                // ship: it was a *reduction* from the Some(2)-era
-                // default, but on top of Some(0) it would now ADD ~77
-                // FPs for +1 TP (Batch 72 hard_1000 OSD sweep).
-                // Batch 78: cap sync candidates at 150 on slow hardware
-                // (−0.06..−0.15% recall, −16% FPs, 2.3× decode speed on
-                // raw_530_full/hard_1000 with ft8_lib truth).
-                cfg.max_sync_candidates = 150;
-                " + Ft8Config slow preset (max_decode_passes=1, max_sync_candidates=150)"
-            }
-        }
-    } else {
-        ""
-    };
-
-    format!(
-        "scoped_fast_path={} ({}){}",
-        atomic_value, atomic_reason, config_change
-    )
+    format!("scoped_fast_path={} ({})", atomic_value, atomic_reason)
 }
 
 /// Spawn the background probe worker. Runs `probe_hardware_tier(10)`,
 /// persists the cache, and applies the tier to runtime state. All
 /// failures log and return — never panic.
+///
+/// Also re-seeds `decode_effort_budget_ms` (decoder-speed-overhaul Task 14)
+/// with the now-known tier via [`seed_effort_budget`], honoring
+/// `budget_override` when set.
+#[allow(clippy::too_many_arguments)]
 fn spawn_probe_worker(
     cpu_model: String,
     core_count: usize,
@@ -319,7 +303,9 @@ fn spawn_probe_worker(
     cache_path: Option<PathBuf>,
     override_: Override,
     scoped_fast_path: Arc<AtomicBool>,
-    ft8_config: Arc<RwLock<Ft8Config>>,
+    effort: DecodeEffort,
+    budget_override: Option<u64>,
+    decode_effort_budget_ms: Arc<AtomicU64>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = match pancetta_ft8::tier_probe::probe_hardware_tier(10) {
@@ -366,9 +352,19 @@ fn spawn_probe_worker(
             result.tier,
             override_,
             &scoped_fast_path,
-            &ft8_config,
         ));
         info!("tier probe: applied — {}", summary);
+
+        seed_effort_budget(
+            effort,
+            budget_override,
+            result.tier,
+            &decode_effort_budget_ms,
+        );
+        info!(
+            "tier probe: decode_effort_budget_ms re-seeded for {} tier",
+            result.tier.as_str()
+        );
     });
 }
 
@@ -378,10 +374,26 @@ fn spawn_probe_worker(
 /// applies the cached tier synchronously or schedules a background
 /// probe. Returns the `Arc<AtomicBool>` that the FT8 hot loop reads.
 ///
-/// `ft8_config` is the shared decoder config the FT8 thread reads on
-/// each window iteration; the probe worker may rewrite it (Slow-tier
-/// preset) before the FT8 thread sees the next window.
-pub(crate) async fn initialize(ft8_config: Arc<RwLock<Ft8Config>>) -> Arc<AtomicBool> {
+/// Also re-seeds `decode_effort_budget_ms` (decoder-speed-overhaul Task 14)
+/// once the tier is known — on the synchronous cache-hit path here, or
+/// asynchronously from the background probe worker (see
+/// [`spawn_probe_worker`]). The caller is expected to have already seeded
+/// `decode_effort_budget_ms` with an assumed tier before calling this (see
+/// `coordinator/mod.rs`), since a cache-miss means the real tier isn't
+/// known until the probe completes.
+///
+/// `ft8_config` no longer drives a tier-based preset rewrite here (Task 14
+/// retired the Slow-tier `Ft8Config` rewrite that used to live in
+/// [`apply_tier`]) — the parameter is kept purely so the call site in
+/// `coordinator/mod.rs` still reads naturally alongside the shared decoder
+/// config it constructs; the FT8 hot loop holds its own clone of the same
+/// `Arc` independently of this function.
+pub(crate) async fn initialize(
+    _ft8_config: Arc<RwLock<Ft8Config>>,
+    effort: DecodeEffort,
+    budget_override: Option<u64>,
+    decode_effort_budget_ms: Arc<AtomicU64>,
+) -> Arc<AtomicBool> {
     let scoped_fast_path = Arc::new(AtomicBool::new(false));
 
     let env_value = std::env::var(ENV_OVERRIDE).ok();
@@ -407,7 +419,7 @@ pub(crate) async fn initialize(ft8_config: Arc<RwLock<Ft8Config>>) -> Arc<Atomic
                 && c.pancetta_version == pancetta_version =>
         {
             if let Some(tier) = c.parse_tier() {
-                let summary = apply_tier(tier, override_, &scoped_fast_path, &ft8_config).await;
+                let summary = apply_tier(tier, override_, &scoped_fast_path).await;
                 info!(
                     "tier: cache hit (cpu='{}', cores={}, v{}) → {} — {}",
                     cpu_model,
@@ -416,6 +428,7 @@ pub(crate) async fn initialize(ft8_config: Arc<RwLock<Ft8Config>>) -> Arc<Atomic
                     tier.as_str(),
                     summary
                 );
+                seed_effort_budget(effort, budget_override, tier, &decode_effort_budget_ms);
                 false
             } else {
                 debug!("tier cache: unknown tier string '{}', re-probing", c.tier);
@@ -440,7 +453,9 @@ pub(crate) async fn initialize(ft8_config: Arc<RwLock<Ft8Config>>) -> Arc<Atomic
             cache_path,
             override_,
             scoped_fast_path.clone(),
-            ft8_config,
+            effort,
+            budget_override,
+            decode_effort_budget_ms,
         );
     }
 
@@ -527,79 +542,56 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn apply_tier_fast_no_override_leaves_config_at_defaults() {
+    async fn apply_tier_fast_no_override_clears_atomic() {
         // Batch 83: the Batch 36/41 Fast preset (mp=2, ldpc=200) was
         // retired — under ft8_lib truth it bought +24..+57 TPs for
         // +142..+387 FPs at 2.6-3.9x decode time, strictly dominated
         // by the ldpc=300 recall lever. Fast tier now runs defaults.
         let atomic = AtomicBool::new(true); // pre-set to verify it gets cleared
-        let cfg = RwLock::new(Ft8Config::default());
-        let before = cfg.read().await.clone();
-        apply_tier(HardwareTier::Fast, Override::None, &atomic, &cfg).await;
+        apply_tier(HardwareTier::Fast, Override::None, &atomic).await;
         assert!(!atomic.load(Ordering::Acquire));
-        let c = cfg.read().await;
-        assert_eq!(c.max_decode_passes, before.max_decode_passes);
-        assert_eq!(c.ldpc_iterations, before.ldpc_iterations);
-        assert_eq!(c.osd_depth, before.osd_depth);
-        assert_eq!(c.max_sync_candidates, before.max_sync_candidates);
     }
 
     #[tokio::test]
-    async fn apply_tier_fast_with_force_off_does_not_change_config() {
-        // Operator override always wins over tier-driven preset.
+    async fn apply_tier_fast_with_force_off_leaves_atomic_clear() {
+        // Operator override always wins over the tier-driven decision.
         let atomic = AtomicBool::new(false);
-        let cfg = RwLock::new(Ft8Config::default());
-        let before_mp = cfg.read().await.max_decode_passes;
-        apply_tier(HardwareTier::Fast, Override::ForceOff, &atomic, &cfg).await;
+        apply_tier(HardwareTier::Fast, Override::ForceOff, &atomic).await;
         assert!(!atomic.load(Ordering::Acquire));
-        assert_eq!(cfg.read().await.max_decode_passes, before_mp);
     }
 
     #[tokio::test]
-    async fn apply_tier_moderate_no_override_sets_atomic_only() {
+    async fn apply_tier_moderate_no_override_sets_atomic() {
         let atomic = AtomicBool::new(false);
-        let cfg = RwLock::new(Ft8Config::default());
-        let before = cfg.read().await.osd_depth;
-        apply_tier(HardwareTier::Moderate, Override::None, &atomic, &cfg).await;
+        apply_tier(HardwareTier::Moderate, Override::None, &atomic).await;
         assert!(atomic.load(Ordering::Acquire));
-        assert_eq!(cfg.read().await.osd_depth, before);
     }
 
     #[tokio::test]
-    async fn apply_tier_slow_no_override_writes_preset() {
+    async fn apply_tier_slow_no_override_sets_atomic() {
+        // decoder-speed-overhaul Task 14: the old Slow-tier `Ft8Config`
+        // rewrite (max_decode_passes=1, max_sync_candidates=150) is
+        // retired — `apply_tier` now only flips `scoped_fast_path` for the
+        // Slow tier; the `[decoder]` effort-preset system owns decode
+        // thoroughness via `decode_effort_budget_ms` instead (see
+        // `effort.rs`).
         let atomic = AtomicBool::new(false);
-        let cfg = RwLock::new(Ft8Config::default());
-        apply_tier(HardwareTier::Slow, Override::None, &atomic, &cfg).await;
+        apply_tier(HardwareTier::Slow, Override::None, &atomic).await;
         assert!(atomic.load(Ordering::Acquire));
-        let c = cfg.read().await;
-        assert_eq!(c.max_decode_passes, 1);
-        // Batch 78: Slow preset caps sync candidates and leaves
-        // osd_depth at the (Batch 72) default.
-        assert_eq!(c.max_sync_candidates, 150);
-        assert_eq!(c.osd_depth, Ft8Config::default().osd_depth);
     }
 
     #[tokio::test]
-    async fn apply_tier_slow_with_force_off_does_not_change_config() {
+    async fn apply_tier_slow_with_force_off_clears_atomic() {
         let atomic = AtomicBool::new(true); // pre-set to verify it gets cleared
-        let cfg = RwLock::new(Ft8Config::default());
-        let before_osd = cfg.read().await.osd_depth;
-        apply_tier(HardwareTier::Slow, Override::ForceOff, &atomic, &cfg).await;
+        apply_tier(HardwareTier::Slow, Override::ForceOff, &atomic).await;
         assert!(!atomic.load(Ordering::Acquire));
-        assert_eq!(cfg.read().await.osd_depth, before_osd);
     }
 
     #[tokio::test]
     async fn apply_tier_fast_with_force_on_sets_atomic() {
         let atomic = AtomicBool::new(false);
-        let cfg = RwLock::new(Ft8Config::default());
-        let before_osd = cfg.read().await.osd_depth;
-        let before_mp = cfg.read().await.max_decode_passes;
-        apply_tier(HardwareTier::Fast, Override::ForceOn, &atomic, &cfg).await;
+        apply_tier(HardwareTier::Fast, Override::ForceOn, &atomic).await;
         assert!(atomic.load(Ordering::Acquire));
-        // Operator override skips the Fast preset.
-        assert_eq!(cfg.read().await.max_decode_passes, before_mp);
-        assert_eq!(cfg.read().await.osd_depth, before_osd);
     }
 
     #[test]
