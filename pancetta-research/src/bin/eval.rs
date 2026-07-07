@@ -875,6 +875,49 @@ fn run_fixtures_tier(
     })
 }
 
+/// Task W0.2: SHA-256 of a file, used to key into the `baseline` binary's
+/// jt9-decode cache at `research/baselines/ft8/<sha>.json`. Mirrors the
+/// same tiny private helper already duplicated in `bin/baseline.rs`,
+/// `gen_noise.rs`, `bin/curate.rs`, `bin/curate_chrono_replay.rs` — an
+/// existing (if not ideal) convention in this crate, kept rather than
+/// introduced fresh.
+fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
+    use sha2::{Digest, Sha256};
+    let bytes = std::fs::read(path)?;
+    let mut hasher = Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Task W0.2: look up the jt9 oracle's cached decodes for `wav_path` (from
+/// `cargo run -p pancetta-research --bin baseline -- --tier synth
+/// --synth-manifest <manifest>`) and report whether any decode matches
+/// `encoded_message`. Returns `None` if no cache exists for this WAV (jt9
+/// oracle not yet run over this corpus) — the caller must distinguish
+/// "no jt9 data" from "jt9 attempted and missed".
+fn jt9_recovered(
+    workspace: &std::path::Path,
+    wav_path: &std::path::Path,
+    encoded_message: &str,
+) -> Option<bool> {
+    let sha = sha256_file(wav_path).ok()?;
+    let cache_path = workspace
+        .join("research/baselines/ft8")
+        .join(format!("{sha}.json"));
+    if !cache_path.exists() {
+        return None;
+    }
+    let s = std::fs::read_to_string(&cache_path).ok()?;
+    let cache: serde_json::Value = serde_json::from_str(&s).ok()?;
+    let decodes = cache.get("decodes")?.as_array()?;
+    Some(decodes.iter().any(|d| {
+        d.get("message")
+            .and_then(|m| m.as_str())
+            .map(|m| m.contains(encoded_message))
+            .unwrap_or(false)
+    }))
+}
+
 fn run_synth_tier(
     decoder: &dyn DecoderUnderTest,
     workspace: &std::path::Path,
@@ -884,6 +927,14 @@ fn run_synth_tier(
     let entries = load_synth_corpus(workspace, manifest_path)?;
     // Group by snr_db bin.
     let mut bins: BTreeMap<i64, (u32, u32)> = BTreeMap::new(); // key = snr*10 to avoid float keys
+                                                               // Task W0.2: parallel jt9-oracle bins, keyed identically, populated
+                                                               // only when a jt9 baseline cache exists for that WAV (see
+                                                               // `jt9_recovered`). If ANY entry in the tier is missing a cache, the
+                                                               // jt9 curve is reported empty rather than silently partial — a
+                                                               // partial curve with the SAME bin structure as the pancetta curve
+                                                               // could be misread as "jt9 covers the whole corpus" when it doesn't.
+    let mut jt9_bins: BTreeMap<i64, (u32, u32)> = BTreeMap::new();
+    let mut jt9_baseline_missing = false;
     let mut wavs_processed = 0u32;
     // hb-129: per-WAV TTFD collection for the synth-clean tier.
     let mut per_wav_ttfd_s: Vec<f64> = Vec::new();
@@ -916,6 +967,16 @@ fn run_synth_tier(
                 // Decode error — counts as failed attempt.
             }
         }
+
+        if !jt9_baseline_missing {
+            let jt9_bin = jt9_bins.entry(bin_key).or_insert((0, 0));
+            jt9_bin.0 += 1;
+            match jt9_recovered(workspace, &e.wav_path, &e.encoded_message) {
+                Some(true) => jt9_bin.1 += 1,
+                Some(false) => {}
+                None => jt9_baseline_missing = true,
+            }
+        }
     }
     let mut by_snr: Vec<SnrBin> = bins
         .iter()
@@ -927,16 +988,43 @@ fn run_synth_tier(
         })
         .collect();
     by_snr.sort_by(|a, b| a.snr_db.partial_cmp(&b.snr_db).unwrap());
-    // Find SNR @ 50% and 90% recovery (first bin where decoded/attempts >= threshold).
+    // Find SNR @ 50% and 90% recovery (linear interpolation between the
+    // straddling bins — Task W0.2, see `first_threshold_db`'s doc).
     let snr_at_50 = first_threshold_db(&by_snr, 0.50);
     let snr_at_90 = first_threshold_db(&by_snr, 0.90);
     let ttfd_distribution = TtfdDistribution::from_per_wav(per_wav_ttfd_s);
+
+    let (jt9_snr_curve, jt9_snr_at_50pct_recovery_db) = if jt9_baseline_missing {
+        eprintln!(
+            "synth tier: jt9 baseline cache missing for at least one WAV — jt9_snr_curve left \
+             empty. Run `cargo run --release -p pancetta-research --bin baseline -- --tier synth \
+             --synth-manifest {}` first to populate research/baselines/ft8/.",
+            manifest_path.display()
+        );
+        (Vec::new(), None)
+    } else {
+        let mut curve: Vec<SnrBin> = jt9_bins
+            .iter()
+            .map(|(k, (attempts, decoded))| SnrBin {
+                snr_db: (*k as f64) / 10.0,
+                attempts: *attempts,
+                decoded: *decoded,
+                fp: 0,
+            })
+            .collect();
+        curve.sort_by(|a, b| a.snr_db.partial_cmp(&b.snr_db).unwrap());
+        let at_50 = first_threshold_db(&curve, 0.50);
+        (curve, at_50)
+    };
+
     Ok(TierResult {
         wavs_processed,
         by_snr_db: by_snr,
         snr_at_50pct_recovery_db: snr_at_50,
         snr_at_90pct_recovery_db: snr_at_90,
         ttfd_distribution,
+        jt9_snr_curve,
+        jt9_snr_at_50pct_recovery_db,
         ..Default::default()
     })
 }
@@ -1446,11 +1534,39 @@ fn run_noise_tier(
     })
 }
 
-/// Lowest SNR (in dB) where recovery >= threshold. Bins must be sorted by SNR asc.
+/// SNR (in dB) where recovery crosses `threshold`, via **linear
+/// interpolation** between the two SNR bins straddling it (Task W0.2,
+/// 2026-07-06) — not "first bin >= threshold", which quantizes the
+/// reported number to the corpus's step size and can visibly move by a
+/// full step for a one-file recall change near a bin boundary.
+///
+/// Bins must be sorted by `snr_db` ascending (as `run_synth_tier` already
+/// sorts `by_snr`); bins with zero attempts are skipped entirely (neither
+/// bound an interpolation nor count as "reached").
+///
+/// - If the very first bin with attempts already meets `threshold`,
+///   there's no lower bin to interpolate from — returns that bin's
+///   `snr_db` as-is (can't report a value below the corpus's own range).
+/// - If no bin ever reaches `threshold`, returns `None`.
 fn first_threshold_db(bins: &[SnrBin], threshold: f64) -> Option<f64> {
-    for bin in bins {
-        if bin.attempts > 0 && (bin.decoded as f64) / (bin.attempts as f64) >= threshold {
-            return Some(bin.snr_db);
+    let valid: Vec<(f64, f64)> = bins
+        .iter()
+        .filter(|b| b.attempts > 0)
+        .map(|b| (b.snr_db, b.decoded as f64 / b.attempts as f64))
+        .collect();
+    let (first_snr, first_recall) = *valid.first()?;
+    if first_recall >= threshold {
+        return Some(first_snr);
+    }
+    for window in valid.windows(2) {
+        let (snr_lo, recall_lo) = window[0];
+        let (snr_hi, recall_hi) = window[1];
+        if recall_lo < threshold && recall_hi >= threshold {
+            if (recall_hi - recall_lo).abs() < f64::EPSILON {
+                return Some(snr_hi);
+            }
+            let frac = (threshold - recall_lo) / (recall_hi - recall_lo);
+            return Some(snr_lo + frac * (snr_hi - snr_lo));
         }
     }
     None
@@ -2052,4 +2168,74 @@ fn main() -> anyhow::Result<()> {
         card.harness.elapsed_seconds,
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod snr_interpolation_tests {
+    use super::*;
+
+    fn bin(snr_db: f64, attempts: u32, decoded: u32) -> SnrBin {
+        SnrBin {
+            snr_db,
+            attempts,
+            decoded,
+            fp: 0,
+        }
+    }
+
+    /// Task W0.2: SNR@50% must be genuine LINEAR INTERPOLATION between the
+    /// two bins straddling the threshold, not "first bin >= threshold".
+    /// -20dB: 2/10=0.20, -19dB: 6/10=0.60. Threshold=0.50 sits 75% of the
+    /// way from 0.20 to 0.60, so the interpolated crossing is
+    /// -20 + 0.75*(-19 - -20) = -19.25 dB — NOT -19 dB (what
+    /// "first bin >= threshold" would return).
+    #[test]
+    fn snr_at_50pct_interpolates_between_straddling_bins() {
+        let bins = vec![
+            bin(-22.0, 10, 0),
+            bin(-21.0, 10, 1),
+            bin(-20.0, 10, 2),
+            bin(-19.0, 10, 6),
+            bin(-18.0, 10, 9),
+        ];
+        let got = first_threshold_db(&bins, 0.50).expect("must cross 50%");
+        assert!(
+            (got - (-19.25)).abs() < 1e-9,
+            "expected -19.25 (linear interpolation), got {got}"
+        );
+    }
+
+    #[test]
+    fn snr_at_90pct_interpolates_between_straddling_bins() {
+        // -18dB: 9/10=0.90 exactly -> should return -18.0 with no
+        // interpolation needed (exact hit).
+        let bins = vec![bin(-19.0, 10, 6), bin(-18.0, 10, 9), bin(-17.0, 10, 10)];
+        let got = first_threshold_db(&bins, 0.90).expect("must cross 90%");
+        assert!(
+            (got - (-18.0)).abs() < 1e-9,
+            "expected exact -18.0, got {got}"
+        );
+    }
+
+    #[test]
+    fn returns_none_when_threshold_never_reached() {
+        let bins = vec![bin(-22.0, 10, 0), bin(-21.0, 10, 1)];
+        assert_eq!(first_threshold_db(&bins, 0.90), None);
+    }
+
+    #[test]
+    fn returns_edge_bin_when_first_bin_already_above_threshold() {
+        // No lower bin to interpolate from -- report the edge, don't
+        // fabricate a value below the corpus's actual range.
+        let bins = vec![bin(-22.0, 10, 10), bin(-21.0, 10, 10)];
+        assert_eq!(first_threshold_db(&bins, 0.50), Some(-22.0));
+    }
+
+    #[test]
+    fn skips_zero_attempt_bins() {
+        let bins = vec![bin(-22.0, 0, 0), bin(-21.0, 10, 2), bin(-20.0, 10, 8)];
+        let got = first_threshold_db(&bins, 0.50).expect("must cross 50%");
+        // interpolate between (-21, 0.2) and (-20, 0.8): frac=(0.5-0.2)/0.6=0.5
+        assert!((got - (-20.5)).abs() < 1e-9, "got {got}");
+    }
 }

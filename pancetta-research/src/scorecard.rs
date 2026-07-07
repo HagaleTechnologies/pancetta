@@ -128,6 +128,24 @@ pub struct TierResult {
     /// `research/ideation/2026-06-01-metric.md` M1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttfd_distribution: Option<TtfdDistribution>,
+    /// Task W0.2 (2026-07-06): the `jt9 -8 -d 3` reference recall curve
+    /// over the SAME synth corpus (same WAVs, same SNR bins) — populated
+    /// only for synth tiers when `research/baselines/ft8/<sha>.json`
+    /// caches exist for every entry (produced by
+    /// `cargo run -p pancetta-research --bin baseline -- --tier synth
+    /// --synth-manifest <manifest>`). Lets `snr_at_50pct_recovery_db` be
+    /// compared directly against jt9's own sensitivity, both measured
+    /// under the identical WSJT-X 2500 Hz SNR convention — the headline
+    /// metric for the rest of the decoder-tp-sensitivity plan is
+    /// `snr_at_50pct_recovery_db - jt9_snr_at_50pct_recovery_db` on this
+    /// tier. Empty for tiers/runs where the jt9 baseline wasn't generated.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub jt9_snr_curve: Vec<SnrBin>,
+    /// jt9's own SNR@50%-recovery on the same curve as `jt9_snr_curve`,
+    /// via the same linear-interpolation method as
+    /// `snr_at_50pct_recovery_db`. `None` when `jt9_snr_curve` is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jt9_snr_at_50pct_recovery_db: Option<f64>,
 }
 
 /// hb-129: aggregate Time-To-First-Decode distribution across WAVs in a tier.

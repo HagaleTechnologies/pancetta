@@ -59,12 +59,12 @@ Any decode on signal-free audio is a false positive. This tier is the guardrail 
 - Produces: `snr_at_50pct_recovery_db` computed by **linear interpolation** between the two bins straddling 50%, not "first bin ≥ 50%".
 
 **Steps:**
-- [ ] Failing test: generate a synth WAV at label −15 dB, measure signal power (windowed, over the 79-symbol span, tone-bin sum) and noise power density × 2500 Hz; assert ratio within ±0.3 dB of label. Then fix the generator.
-- [ ] Regenerate `clean` manifest: SNR −24 → −14 dB in **1 dB steps**, **n = 50 distinct messages per step** (seeded), randomized base freq 400–2600 Hz and dt ∈ [−0.3, +0.3] s per file (today: fixed 1500 Hz, fixed dt — decoders must not be allowed to overfit a single grid position).
-- [ ] Record the corpus refresh in `refresh_offsets.json` per the `metrics.rs:78-135` convention so composite history stays comparable.
-- [ ] Run the jt9 oracle (`pancetta-research/src/bin/baseline.rs`, `jt9 -8 -d 3`) over the new corpus to produce the **reference curve**; store per-bin jt9 recall in the scorecard (`jt9_snr_curve`).
-- [ ] Run pancetta; record both curves in an experiment log. This number — pancetta SNR@50% minus jt9 SNR@50%, same corpus, same convention — is the headline sensitivity metric for the rest of the plan.
-- [ ] Commit.
+- [x] Failing test: generate a synth WAV at label −15 dB, measure signal power (windowed, over the 79-symbol span, tone-bin sum) and noise power density × 2500 Hz; assert ratio within ±0.3 dB of label. Then fix the generator.
+- [x] Regenerate `clean` manifest: SNR −24 → −14 dB in **1 dB steps**, **n = 50 distinct messages per step** (seeded), randomized base freq 400–2600 Hz and dt ∈ [−0.3, +0.3] s per file (today: fixed 1500 Hz, fixed dt — decoders must not be allowed to overfit a single grid position).
+- [x] Record the corpus refresh in `refresh_offsets.json` per the `metrics.rs:78-135` convention so composite history stays comparable.
+- [x] Run the jt9 oracle (`pancetta-research/src/bin/baseline.rs`, `jt9 -8 -d 3`) over the new corpus to produce the **reference curve**; store per-bin jt9 recall in the scorecard (`jt9_snr_curve`).
+- [x] Run pancetta; record both curves in an experiment log. This number — pancetta SNR@50% minus jt9 SNR@50%, same corpus, same convention — is the headline sensitivity metric for the rest of the plan. **Result: pancetta SNR@50% = −19.214 dB, jt9 SNR@50% = −21.313 dB → headline gap = +2.10 dB (pancetta needs ~2.1 dB more SNR than jt9 for 50% recall). See `research/experiments/2026-07-07-snr-calibration.md`.**
+- [x] Commit.
 
 ### Task W0.3: Novel-decode accounting + real RegressionFlags [HARNESS]
 
