@@ -1060,10 +1060,10 @@ pub struct Ft8Config {
     /// 95% CI [-20,-5] — see `research/experiments/2026-07-06-pade-atanh.md`),
     /// so when enabled this actually applies the **piecewise** form
     /// (`fast_atanh_pade_piecewise`: Padé for |x| ≤ 0.95, exact ln form
-    /// above) which passed the re-run gate (Δrec not significant, ΔFP
-    /// favorable, elapsed improved). Default **false** — when off the
-    /// decoder is byte-identical to the pre-existing `fast_atanh` (ln-form)
-    /// behavior.
+    /// above), which passed the re-run gate (Δrec not significant, ΔFP
+    /// favorable, elapsed improved -16.0% on the hard-200 tier).
+    /// **GRADUATED 2026-07-06 — default `true`.** Set `false` to fall
+    /// back to the pre-existing `fast_atanh` (ln-form) behavior.
     pub pade_atanh: bool,
 }
 
@@ -1362,11 +1362,17 @@ impl Default for Ft8Config {
             // spectrogram rolloff shape. Inspired by spec ref
             // `spec-wsjtx-improved-auto-passband.md`.
             auto_passband_enabled: false,
-            // Padé fast_atanh (F1): DEFAULT OFF pending the hard-200 A/B
-            // gate (research/experiments/2026-07-06-pade-atanh.md). When
-            // off, BP's check-node update is byte-identical to the
-            // pre-existing `fast_atanh` (ln form).
-            pade_atanh: false,
+            // Padé fast_atanh (F1): GRADUATED 2026-07-06. hard-200 A/B
+            // gate (research/experiments/2026-07-06-pade-atanh.md) —
+            // piecewise variant (Padé for |x| <= 0.95, exact ln form
+            // above): Δrec=+0 (95% CI [-4,+4], not significant — recall
+            // within CI of baseline), Δnovel=-11 (95% CI [-22,-2],
+            // fewer FPs), elapsed 58.3s -> 49.0s (-16.0%) on the
+            // hard-200 tier. The raw (unconditional) Padé variant was
+            // measured FIRST and regressed recall (Δrec=-12, 95% CI
+            // [-20,-5]) — see the journal for both runs; only the
+            // piecewise form ships.
+            pade_atanh: true,
         }
     }
 }
