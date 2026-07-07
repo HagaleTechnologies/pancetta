@@ -13,6 +13,9 @@ publish.workspace = true
 pancetta-core = { path = "../pancetta-core" }
 # DSP and FFT operations
 rustfft = "6.4"
+# Real-input FFT (halves the work vs. a full complex FFT for real audio;
+# used for the spectrogram build — perf F4)
+realfft = "3.5"
 # Numeric operations with SIMD optimization
 num-complex = "0.4"
 num-traits = "0.2"

@@ -1391,7 +1391,7 @@ impl Default for Ft8Config {
 /// read boundary and downcast at the write boundary — only the
 /// `compute_spectrogram_with` FFT/log10 computation that produces these
 /// values natively operates at `SpecScalar` precision.
-type SpecScalar = f64;
+type SpecScalar = f32;
 
 /// Time-frequency spectrogram with frequency oversampling support
 ///
@@ -1587,11 +1587,17 @@ pub struct Ft8Decoder {
     /// Reusable FFT buffer for symbol extraction (avoids per-call allocation)
     symbol_fft_buffer: Vec<Complex<f64>>,
 
-    /// Pre-computed FFT plan for spectrogram (nfft = 2 * sps)
-    spectrogram_fft: std::sync::Arc<dyn rustfft::Fft<f64>>,
+    /// Pre-computed real-input FFT plan for the spectrogram (nfft = 2 *
+    /// sps). perf F4: audio is real, so a real-to-complex transform
+    /// (halves the work vs. a full complex FFT) replaces the previous
+    /// `rustfft::Fft<f64>` complex plan — the code already discarded the
+    /// upper (mirrored) half of the complex spectrum, so this changes
+    /// nothing about which bins are used, only how they're computed.
+    spectrogram_fft: std::sync::Arc<dyn realfft::RealToComplex<SpecScalar>>,
 
-    /// Pre-computed Hann window for spectrogram (nfft length)
-    spectrogram_window: Vec<f64>,
+    /// Pre-computed Hann window for spectrogram (nfft length), `SpecScalar`
+    /// precision (perf F4).
+    spectrogram_window: Vec<SpecScalar>,
 
     /// Message handler for callbacks
     message_handler: Box<dyn MessageHandler + Send>,
@@ -1688,16 +1694,19 @@ impl Ft8Decoder {
 
         let symbol_fft_buffer = vec![Complex::new(0.0, 0.0); sps];
 
-        // Pre-compute FFT plan and Hann window for spectrogram.
+        // Pre-compute the real-input FFT plan and Hann window for the
+        // spectrogram (perf F4: real-to-complex, half the work of a full
+        // complex FFT since the audio input is real).
         // Bake in 2.0/nfft normalization to match ft8_lib's monitor.c:
         //   window[i] = fft_norm * hann_i(i, nfft)
         // where fft_norm = 2.0/nfft and hann_i(i,N) = sin²(π*i/N).
         let spec_nfft = sps * FREQ_OSR; // 3840
-        let spectrogram_fft = planner.plan_fft_forward(spec_nfft);
-        let fft_norm = 2.0 / spec_nfft as f64;
-        let spectrogram_window: Vec<f64> = (0..spec_nfft)
+        let mut real_planner = realfft::RealFftPlanner::<SpecScalar>::new();
+        let spectrogram_fft = real_planner.plan_fft_forward(spec_nfft);
+        let fft_norm = 2.0 / spec_nfft as SpecScalar;
+        let spectrogram_window: Vec<SpecScalar> = (0..spec_nfft)
             .map(|i| {
-                let x = (std::f64::consts::PI * i as f64 / spec_nfft as f64).sin();
+                let x = (std::f32::consts::PI * i as SpecScalar / spec_nfft as SpecScalar).sin();
                 fft_norm * x * x
             })
             .collect();
@@ -3519,11 +3528,11 @@ impl Ft8Decoder {
         // Flattened [time_step][freq_sub][freq_bin] storage — see
         // `Spectrogram::idx`. Allocated once; written via the same
         // `(t * freq_osr + fs) * num_bins + bin` formula.
-        let mut power = vec![0.0f64; num_steps * freq_osr * num_bins];
+        let mut power: Vec<SpecScalar> = vec![0.0; num_steps * freq_osr * num_bins];
         // hb-074: retain complex bins only when the coherent cross-cycle
         // path will consume them (doubles the spectrogram's memory).
         let want_complex = self.config.cross_cycle_coherent;
-        let mut complex: Option<Vec<Complex<f64>>> = if want_complex {
+        let mut complex: Option<Vec<Complex<SpecScalar>>> = if want_complex {
             Some(vec![
                 Complex::new(0.0, 0.0);
                 num_steps * freq_osr * num_bins
@@ -3531,9 +3540,17 @@ impl Ft8Decoder {
         } else {
             None
         };
-        let mut fft_buffer = vec![Complex::new(0.0, 0.0); nfft];
+        // perf F4: real-input FFT — `real_input` holds the windowed
+        // (real-valued) samples; `spectrum` holds the nfft/2+1 unique
+        // complex bins a real signal's FFT produces (the previous
+        // complex-FFT path computed all `nfft` bins then discarded
+        // everything at-or-past `nfft/2+1` via the `src_bin < nfft/2+1`
+        // check below — the real-FFT never computes that redundant half
+        // in the first place, so which bins are used is unchanged).
+        let mut real_input = fft.make_input_vec();
+        let mut spectrum = fft.make_output_vec();
         // Persistent sliding frame buffer (matches ft8_lib's me->last_frame)
-        let mut last_frame = vec![0.0f64; nfft];
+        let mut last_frame: Vec<SpecScalar> = vec![0.0; nfft];
 
         let mut frame_pos = 0usize;
         let mut t = 0usize;
@@ -3546,7 +3563,7 @@ impl Ft8Decoder {
                 let new_start = nfft - subblock_size;
                 for pos in 0..subblock_size {
                     last_frame[new_start + pos] = if frame_pos < audio_ref.len() {
-                        audio_ref[frame_pos]
+                        audio_ref[frame_pos] as SpecScalar
                     } else {
                         0.0
                     };
@@ -3555,9 +3572,12 @@ impl Ft8Decoder {
 
                 // Apply window and FFT
                 for i in 0..nfft {
-                    fft_buffer[i] = Complex::new(window[i] * last_frame[i], 0.0);
+                    real_input[i] = window[i] * last_frame[i];
                 }
-                fft.process(&mut fft_buffer);
+                // realfft's `process` mutates `real_input` as scratch;
+                // both buffers are reused (not reallocated) every call.
+                fft.process(&mut real_input, &mut spectrum)
+                    .expect("spectrogram real-FFT: buffer lengths are fixed by construction");
 
                 // Organize into freq_osr sub-bins (matches monitor.c lines 164-188)
                 for fs in 0..freq_osr {
@@ -3565,8 +3585,8 @@ impl Ft8Decoder {
                     for bin in 0..num_bins {
                         let src_bin = bin * freq_osr + fs;
                         let out_idx = row_base + bin;
-                        if src_bin < nfft / 2 + 1 {
-                            let cval = fft_buffer[src_bin];
+                        if src_bin < spectrum.len() {
+                            let cval = spectrum[src_bin];
                             // hb-228: per-bin magnitude compression. `Power`
                             // (|X|^2) is the historical default.
                             let m = match transform {
@@ -3574,7 +3594,12 @@ impl Ft8Decoder {
                                 MagnitudeTransform::Linear => cval.norm(),
                                 MagnitudeTransform::Sqrt => cval.norm().sqrt(),
                             };
-                            let db = 10.0 * (1e-12f64 + m).log10();
+                            // perf F4: f32 log10 (was f64) — this is the
+                            // scalar's native precision, not a boundary
+                            // cast; dB values are compared at ~0.1 dB
+                            // granularity, well within f32's ~7 significant
+                            // digits.
+                            let db = 10.0 * (1e-12 + m).log10();
                             power[out_idx] = db;
                             if let Some(c) = complex.as_mut() {
                                 c[out_idx] = cval;
@@ -3627,7 +3652,7 @@ impl Ft8Decoder {
         let denom = (spectrogram.num_steps as f64) * (spectrogram.freq_osr as f64);
         for row in spectrogram.power.chunks_exact(num_bins) {
             for (bin, &val) in row.iter().enumerate() {
-                avg[bin] += val;
+                avg[bin] += val as f64;
             }
         }
         for v in &mut avg {
@@ -3813,7 +3838,7 @@ impl Ft8Decoder {
                 if f >= spec.num_bins {
                     continue;
                 }
-                let power = spec.at(t, candidate.freq_sub, f);
+                let power = spec.at(t, candidate.freq_sub, f) as f64;
                 if power > best_power {
                     best_power = power;
                     best_tone = tone;
@@ -3830,7 +3855,7 @@ impl Ft8Decoder {
                 if f >= spec.num_bins {
                     continue;
                 }
-                noise_sum += spec.at(t, candidate.freq_sub, f);
+                noise_sum += spec.at(t, candidate.freq_sub, f) as f64;
                 noise_count += 1;
             }
         }
@@ -4324,21 +4349,27 @@ impl Ft8Decoder {
                     // of this hot Costas-score loop. signal_mag and both frequency
                     // neighbors index the same (time, freq_sub) plane, so resolving
                     // the two outer `Vec` indirections once and reusing the row
-                    // slice is bit-identical — same f64 values, same order — and
-                    // removes two pointer-chases per access in the innermost loop.
+                    // slice is bit-identical — same order of reads — and removes
+                    // two pointer-chases per access in the innermost loop.
+                    //
+                    // perf F4: the row is `SpecScalar` (f32) storage; upcast to
+                    // f64 immediately at each read so the score accumulation
+                    // keeps its historical f64 arithmetic — only the storage
+                    // (and the half-size cache footprint that goes with it)
+                    // changed, not the scoring precision.
                     let row = spec.row(time_idx, freq_sub);
-                    let signal_mag = row[freq_idx];
+                    let signal_mag = row[freq_idx] as f64;
 
                     // Check frequency neighbor below
                     if sm > 0 && f0 + sm - 1 < spec.num_bins {
-                        let neighbor = row[f0 + sm - 1];
+                        let neighbor = row[f0 + sm - 1] as f64;
                         score += signal_mag - neighbor;
                         num_average += 1;
                     }
 
                     // Check frequency neighbor above
                     if sm + 1 < pp.num_tones && f0 + sm + 1 < spec.num_bins {
-                        let neighbor = row[f0 + sm + 1];
+                        let neighbor = row[f0 + sm + 1] as f64;
                         score += signal_mag - neighbor;
                         num_average += 1;
                     }
@@ -4347,7 +4378,7 @@ impl Ft8Decoder {
                     if k > 0 && time_idx >= steps_per_symbol {
                         let prev_time = time_idx - steps_per_symbol;
                         if prev_time < spec.num_steps {
-                            let neighbor = spec.at(prev_time, freq_sub, freq_idx);
+                            let neighbor = spec.at(prev_time, freq_sub, freq_idx) as f64;
                             score += signal_mag - neighbor;
                             num_average += 1;
                         }
@@ -4357,7 +4388,7 @@ impl Ft8Decoder {
                     if k + 1 < pp.costas_length {
                         let next_time = time_idx + steps_per_symbol;
                         if next_time < spec.num_steps {
-                            let neighbor = spec.at(next_time, freq_sub, freq_idx);
+                            let neighbor = spec.at(next_time, freq_sub, freq_idx) as f64;
                             score += signal_mag - neighbor;
                             num_average += 1;
                         }
@@ -8115,19 +8146,29 @@ fn subtract_decode_coherent(
                 continue;
             }
             // Scoped &mut to spectrogram.complex; ends before .power access.
+            //
+            // perf F4: `complex` storage is `SpecScalar` (f32) precision,
+            // but the ML-projection subtraction math itself stays f64 —
+            // upcast on read, downcast on write — since this path runs
+            // iteratively (coherent_subtract_and_repass) and is the
+            // precision-sensitive stage flagged in the F4 design: keeping
+            // the arithmetic (not just the storage) at f64 avoids
+            // compounding rounding error across rounds.
             let flat_idx = (t_idx * freq_osr + fs) * num_bins + f_idx;
             let residual = {
                 let complex = spectrogram.complex.as_mut().unwrap();
                 let bin = complex[flat_idx];
-                let proj_real = (bin * rotor_conj).re;
+                let bin64 = Complex::new(bin.re as f64, bin.im as f64);
+                let proj_real = (bin64 * rotor_conj).re;
                 // hb-081: scale the subtracted projection magnitude.
                 let signal_est = Complex::new(proj_real * scale, 0.0) * rotor;
-                let residual = bin - signal_est;
-                complex[flat_idx] = residual;
+                let residual = bin64 - signal_est;
+                complex[flat_idx] =
+                    Complex::new(residual.re as SpecScalar, residual.im as SpecScalar);
                 residual
             };
             let mag2 = residual.norm_sqr();
-            spectrogram.power[flat_idx] = 10.0 * (1e-12 + mag2).log10();
+            spectrogram.power[flat_idx] = (10.0 * (1e-12 + mag2).log10()) as SpecScalar;
         }
     }
 }
@@ -8183,7 +8224,10 @@ fn known_coherence_score(
             prev_phase = None;
             continue;
         }
-        let bin = complex[spectrogram.idx(t_idx, freq_sub, f_idx)];
+        // perf F4: upcast the f32-stored bin to f64 for the phase-jitter
+        // math (unchanged precision for this comparison metric).
+        let raw_bin = complex[spectrogram.idx(t_idx, freq_sub, f_idx)];
+        let bin = Complex::new(raw_bin.re as f64, raw_bin.im as f64);
         let mag = bin.norm();
         if mag < 1e-30 {
             // Silent / clipped — skip this symbol's delta contribution
@@ -8360,7 +8404,12 @@ fn par_extract_complex_symbols_from_spectrogram(
             if freq_bin >= spectrogram.num_bins || fs >= spectrogram.freq_osr {
                 continue;
             }
-            row[tone] = complex[spectrogram.idx(t_base, fs, freq_bin)];
+            // perf F4: upcast the f32-stored bin to f64 here so every
+            // downstream consumer (Costas accumulator, phase-rotor
+            // estimate, cross-cycle coherent sum) keeps its historical
+            // f64 arithmetic unchanged.
+            let raw = complex[spectrogram.idx(t_base, fs, freq_bin)];
+            row[tone] = Complex::new(raw.re as f64, raw.im as f64);
         }
         out.push(row);
     }
@@ -8431,7 +8480,7 @@ fn lookup_time_interp(
 ) -> f64 {
     if dt.abs() < f64::EPSILON {
         return if t_base < spec.num_steps {
-            spec.at(t_base, fs, freq_bin)
+            spec.at(t_base, fs, freq_bin) as f64
         } else {
             -120.0
         };
@@ -8443,12 +8492,12 @@ fn lookup_time_interp(
     let lo_idx = t_lo_f as isize;
     let hi_idx = lo_idx + 1;
     let p_lo = if lo_idx >= 0 && (lo_idx as usize) < spec.num_steps {
-        spec.at(lo_idx as usize, fs, freq_bin)
+        spec.at(lo_idx as usize, fs, freq_bin) as f64
     } else {
         -120.0
     };
     let p_hi = if hi_idx >= 0 && (hi_idx as usize) < spec.num_steps {
-        spec.at(hi_idx as usize, fs, freq_bin)
+        spec.at(hi_idx as usize, fs, freq_bin) as f64
     } else {
         -120.0
     };
@@ -9690,10 +9739,14 @@ fn estimate_noise_floor(psd: &[f64]) -> f64 {
 /// after most signals had been subtracted; this metric goes to zero
 /// when subtraction zeroes the per-bin excess above the original
 /// floor.
-fn mean_excess_above_noise_db(power: &[f64], noise_floor_db: f64) -> f64 {
+fn mean_excess_above_noise_db(power: &[SpecScalar], noise_floor_db: f64) -> f64 {
     let mut sum = 0.0_f64;
     let mut count = 0_usize;
     for &db in power {
+        // Boundary cast: this aggregate is called once per residual round
+        // (not per-candidate hot), so upcast to f64 for the sum/threshold
+        // comparison rather than accumulating in SpecScalar precision.
+        let db = db as f64;
         let excess = db - noise_floor_db;
         if excess > 0.0 {
             sum += excess;
@@ -9712,8 +9765,8 @@ fn mean_excess_above_noise_db(power: &[f64], noise_floor_db: f64) -> f64 {
 /// floor estimator. Computed once on the ORIGINAL spectrogram and
 /// reused as a stable reference across multipass rounds. O(N log N) one
 /// time; small relative to the rest of the decode budget.
-fn noise_floor_db_median(power: &[f64]) -> f64 {
-    let mut all: Vec<f64> = power.to_vec();
+fn noise_floor_db_median(power: &[SpecScalar]) -> f64 {
+    let mut all: Vec<f64> = power.iter().map(|&x| x as f64).collect();
     if all.is_empty() {
         return -120.0;
     }
@@ -12314,7 +12367,8 @@ mod tests {
         let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
         let freq_osr = FREQ_OSR;
 
-        let mut power = vec![noise_db; num_steps * freq_osr * num_bins];
+        let mut power: Vec<SpecScalar> =
+            vec![noise_db as SpecScalar; num_steps * freq_osr * num_bins];
 
         for &m in present_groups {
             let group_start = [0usize, 36, 72][m];
@@ -12324,7 +12378,8 @@ mod tests {
                 for sub in 0..steps_per_symbol {
                     let time_idx = sym * steps_per_symbol + sub;
                     if time_idx < num_steps && f0 + tone < num_bins {
-                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] = signal_db;
+                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] =
+                            signal_db as SpecScalar;
                     }
                 }
             }
@@ -12861,7 +12916,8 @@ mod hb230_relaxed_sync_tests {
         let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
         let freq_osr = FREQ_OSR;
 
-        let mut power = vec![noise_db; num_steps * freq_osr * num_bins];
+        let mut power: Vec<SpecScalar> =
+            vec![noise_db as SpecScalar; num_steps * freq_osr * num_bins];
 
         for &m in present_groups {
             let group_start = [0usize, 36, 72][m];
@@ -12871,7 +12927,8 @@ mod hb230_relaxed_sync_tests {
                 for sub in 0..steps_per_symbol {
                     let time_idx = sym * steps_per_symbol + sub;
                     if time_idx < num_steps && f0 + tone < num_bins {
-                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] = signal_db;
+                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] =
+                            signal_db as SpecScalar;
                     }
                 }
             }
@@ -14434,8 +14491,9 @@ mod three_stage_sync_tests {
         let num_bins = seed_freq_bin + NUM_TONES + pad;
         let freq_osr = FREQ_OSR;
 
-        let mut power = vec![-120.0f64; num_steps * freq_osr * num_bins];
-        let mut complex = vec![Complex::<f64>::new(0.0, 0.0); num_steps * freq_osr * num_bins];
+        let mut power: Vec<SpecScalar> = vec![-120.0; num_steps * freq_osr * num_bins];
+        let mut complex =
+            vec![Complex::<SpecScalar>::new(0.0, 0.0); num_steps * freq_osr * num_bins];
 
         // Place a unit-magnitude same-phase sample at every (sym, expected
         // tone) position on the seed lattice point. Within each symbol
@@ -14463,7 +14521,7 @@ mod three_stage_sync_tests {
                 }
                 let flat_idx = (t_idx * freq_osr + seed_freq_sub) * num_bins + f_idx;
                 complex[flat_idx] = Complex::new(1.0, 0.0);
-                power[flat_idx] = 10.0 * (1e-12_f64 + 1.0).log10();
+                power[flat_idx] = (10.0 * (1e-12_f64 + 1.0).log10()) as SpecScalar;
             }
         }
 
@@ -14627,7 +14685,7 @@ mod three_stage_sync_tests {
                 }
                 let f_idx = truth_freq_bin + tone;
                 let theta = ((sym_idx as f64) * 1.31).sin() * std::f64::consts::PI;
-                let sample = Complex::new(theta.cos(), theta.sin());
+                let sample = Complex::new(theta.cos() as SpecScalar, theta.sin() as SpecScalar);
                 let t_base = truth_time + sym_idx * steps_per_symbol;
                 for s in 0..steps_per_symbol {
                     let t_idx = t_base + s;
@@ -15509,7 +15567,8 @@ mod auto_passband_tests {
         let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
         let freq_osr = FREQ_OSR;
 
-        let mut power = vec![noise_db; num_steps * freq_osr * num_bins];
+        let mut power: Vec<SpecScalar> =
+            vec![noise_db as SpecScalar; num_steps * freq_osr * num_bins];
 
         for &m in present_groups {
             let group_start = [0_usize, 36, 72][m];
@@ -15519,7 +15578,8 @@ mod auto_passband_tests {
                 for sub in 0..steps_per_symbol {
                     let time_idx = sym * steps_per_symbol + sub;
                     if time_idx < num_steps && f0 + tone < num_bins {
-                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] = signal_db;
+                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] =
+                            signal_db as SpecScalar;
                     }
                 }
             }
