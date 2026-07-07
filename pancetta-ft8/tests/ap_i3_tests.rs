@@ -39,6 +39,13 @@
 //! verifies the i3 fix at the LLR-injection level, which is what the fix
 //! itself actually changes.
 //!
+//! **Fixed in Task W1.7** (`research/experiments/2026-07-07-w1.7-ap-injection-ordering-fix.md`):
+//! AP1-AP4's callsign fields (and `enumerate_a8_expected_texts`'s dx/my
+//! template ordering, which shared the same swap) now match the correct
+//! convention `ap_injection_survived` always required. The end-to-end
+//! "AP0 fails, AP3 rescues" audio-domain test flagged above as not
+//! achievable is now in `pancetta-ft8/tests/ap_injection_ordering_tests.rs`.
+//!
 //! W1.2 extends this same file with further i3/message-family AP tests.
 
 #![cfg(feature = "transmit")]

@@ -5,10 +5,25 @@
 //! to improve decode success at low SNR by injecting high-confidence
 //! LLR values at known bit positions in the 77-bit FT8 payload.
 //!
-//! FT8 77-bit payload layout:
-//! - Bits 0-27:  calling station callsign (28 bits)
-//! - Bits 28-55: called station callsign (28 bits)
-//! - Bits 56-76: report/grid/message content (21 bits)
+//! FT8 77-bit standard-message (i3=1/2) payload layout (per
+//! `message.rs::parse_type1_standard`, the ground truth): `n29a` occupies
+//! bits 0-28 = `to_callsign` (28-bit packed value at bits 0-27, `/P`-suffix
+//! flag at bit 28); `n29b` occupies bits 29-57 = `from_callsign` (28-bit
+//! packed value at bits 29-56, suffix flag at bit 57); bits 58-76 are
+//! ir/grid/report/i3.
+//!
+//! We are always the message's addressee for anything we decode (we never
+//! decode our own transmissions), so **our callsign is always
+//! `to_callsign` (bits 0-27)** and the other station is always
+//! `from_callsign` (bits 29-56) — there is a 1-bit gap at bit 28 (the
+//! `to_callsign` suffix flag) between the two 28-bit callsign fields, so
+//! they are NOT evenly spaced at offsets 0 and 28.
+//!
+//! - Bits 0-27:  to_callsign / called station (us) — 28 bits
+//! - Bit 28:     to_callsign suffix flag (`/P`/`/R`)
+//! - Bits 29-56: from_callsign / calling station (the other station) — 28 bits
+//! - Bit 57:     from_callsign suffix flag
+//! - Bits 58-76: ir + grid/report + i3 (19 bits)
 
 #![allow(dead_code)]
 // rationale: AP LLR-injection loops index the 77-bit payload positions; the
@@ -185,14 +200,18 @@ pub fn u32_to_bits_28(value: u32) -> [bool; 28] {
 pub enum ApLevel {
     /// No AP injection.
     Ap0,
-    /// Inject own callsign at bits 28-55 (called station).
+    /// Inject own callsign at bits 0-27 (called station / `to_callsign`
+    /// — we are always the addressee for any message we decode).
     Ap1,
-    /// Inject a recent caller's callsign at bits 0-27 (calling station).
-    /// The specific caller is selected externally via `inject_ap2_caller`.
+    /// Inject a recent caller's callsign at bits 29-56 (calling station /
+    /// `from_callsign`). The specific caller is selected externally via
+    /// `inject_ap2_caller`.
     Ap2,
-    /// Inject both: active QSO partner at bits 0-27, own call at bits 28-55.
+    /// Inject both: own call at bits 0-27 (`to_callsign`), active QSO
+    /// partner at bits 29-56 (`from_callsign`).
     Ap3,
-    /// AP3 + inject i3 type bits (74-76) as 0,0,0 (standard message / RR73).
+    /// AP3 + inject i3 type bits (74-76) as 0,0,1 (i3=1, the "standard
+    /// message" family RR73/RRR/73 actually use).
     Ap4,
 }
 
@@ -322,9 +341,13 @@ impl QsoAp {
 /// [`QsoAp::with_expected_texts`].
 ///
 /// Notes
-/// - All texts are uppercase, single-space separated, with the
-///   partner's call (`dx_call`) as the first token (the partner is
-///   addressing us).
+/// - All texts are uppercase, single-space separated, with **our own
+///   call** (`my_call`) as the first token and the partner's call
+///   (`dx_call`) second — matching `Ft8Message::Display`'s
+///   `to_callsign from_callsign ...` text order: any message the
+///   partner sends *to us* has us as the addressee (first token), per
+///   `message.rs::parse_type1_standard`'s bit layout (`to_callsign` at
+///   bits 0-27, `from_callsign` at bits 29-56).
 /// - The enumerations are intentionally small (≤6 entries per state);
 ///   they exist to *gate*, not to *seed* LDPC.
 pub fn enumerate_a8_expected_texts(
@@ -349,8 +372,8 @@ pub fn enumerate_a8_expected_texts(
             let mut out = Vec::with_capacity(24);
             let mut snr = -22i32;
             while snr <= 0 {
-                out.push(format!("{} {} R{:+03}", dx, my, snr));
-                out.push(format!("{} {} {:+03}", dx, my, snr));
+                out.push(format!("{} {} R{:+03}", my, dx, snr));
+                out.push(format!("{} {} {:+03}", my, dx, snr));
                 snr += 2;
             }
             out
@@ -360,9 +383,9 @@ pub fn enumerate_a8_expected_texts(
         // confirmation tokens.
         QsoApProgress::WaitingForConfirmation => {
             vec![
-                format!("{} {} RR73", dx, my),
-                format!("{} {} 73", dx, my),
-                format!("{} {} RRR", dx, my),
+                format!("{} {} RR73", my, dx),
+                format!("{} {} 73", my, dx),
+                format!("{} {} RRR", my, dx),
             ]
         }
     }
@@ -425,9 +448,10 @@ pub fn inject_ap_llrs(llrs: &mut [f32], level: ApLevel, context: &ApContext) {
         ApLevel::Ap0 => { /* no injection */ }
 
         ApLevel::Ap1 => {
-            // Inject own callsign at bits 28-55 (called station)
+            // Inject own callsign at bits 0-27 (to_callsign / called
+            // station — we are always the addressee).
             if let Some(ref my_call) = context.my_call {
-                inject_28_bits(llrs, 28, &my_call.bits);
+                inject_28_bits(llrs, 0, &my_call.bits);
             }
         }
 
@@ -438,23 +462,24 @@ pub fn inject_ap_llrs(llrs: &mut [f32], level: ApLevel, context: &ApContext) {
         }
 
         ApLevel::Ap3 => {
-            // Inject active QSO partner at bits 0-27
-            if let Some(ref qso) = context.active_qso {
-                inject_28_bits(llrs, 0, &qso.their_bits);
-            }
-            // Inject own callsign at bits 28-55
+            // Inject own callsign at bits 0-27 (to_callsign / called station)
             if let Some(ref my_call) = context.my_call {
-                inject_28_bits(llrs, 28, &my_call.bits);
+                inject_28_bits(llrs, 0, &my_call.bits);
+            }
+            // Inject active QSO partner at bits 29-56 (from_callsign /
+            // calling station)
+            if let Some(ref qso) = context.active_qso {
+                inject_28_bits(llrs, 29, &qso.their_bits);
             }
         }
 
         ApLevel::Ap4 => {
             // Same as AP3 …
-            if let Some(ref qso) = context.active_qso {
-                inject_28_bits(llrs, 0, &qso.their_bits);
-            }
             if let Some(ref my_call) = context.my_call {
-                inject_28_bits(llrs, 28, &my_call.bits);
+                inject_28_bits(llrs, 0, &my_call.bits);
+            }
+            if let Some(ref qso) = context.active_qso {
+                inject_28_bits(llrs, 29, &qso.their_bits);
             }
             // … plus i3 type bits at 74-76 = false, false, true (i3=1,
             // the "standard message" family RR73/RRR/73 actually use —
@@ -471,22 +496,24 @@ pub fn inject_ap_llrs(llrs: &mut [f32], level: ApLevel, context: &ApContext) {
     }
 }
 
-/// Inject a specific recent callsign at bits 0-27 (AP2 calling station).
+/// Inject a specific recent callsign at bits 29-56 (AP2 calling station /
+/// `from_callsign`).
 ///
 /// This is called externally for each candidate caller when attempting AP2
 /// decoding passes.
 pub fn inject_ap2_caller(llrs: &mut [f32], caller: &RecentCallAp) {
-    inject_28_bits(llrs, 0, &caller.bits);
+    inject_28_bits(llrs, 29, &caller.bits);
 }
 
-/// Inject a specific recent callsign at bits 28-55 (called station).
+/// Inject a specific recent callsign at bits 0-27 (called station /
+/// `to_callsign`).
 ///
 /// Companion to `inject_ap2_caller`. Used by hb-043 my_call-less AP
 /// injection — when the operator is scanning rather than transmitting,
 /// observed callsigns are still useful priors but might appear at EITHER
 /// position. This function handles the called-position injection.
 pub fn inject_recent_call_at_called(llrs: &mut [f32], call: &RecentCallAp) {
-    inject_28_bits(llrs, 28, &call.bits);
+    inject_28_bits(llrs, 0, &call.bits);
 }
 
 // ===========================================================================
@@ -547,14 +574,10 @@ mod tests {
         let mut llrs = vec![0.0f32; 77];
         inject_ap_llrs(&mut llrs, ApLevel::Ap1, &ctx);
 
-        // Bits 0-27 should be untouched (0.0)
+        // Bits 0-27 should be injected with own call (to_callsign / called
+        // station — we are always the addressee for any message we decode).
         for i in 0..28 {
-            assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
-        }
-
-        // Bits 28-55 should be injected with +-15.0
-        for i in 28..56 {
-            let expected_bit = my_call.bits[i - 28];
+            let expected_bit = my_call.bits[i];
             let expected_llr = if expected_bit {
                 -AP_LLR_MAGNITUDE
             } else {
@@ -563,8 +586,8 @@ mod tests {
             assert_eq!(llrs[i], expected_llr, "bit {} mismatch", i);
         }
 
-        // Bits 56-76 should be untouched
-        for i in 56..77 {
+        // Bits 28-76 should be untouched
+        for i in 28..77 {
             assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
         }
     }
@@ -582,20 +605,10 @@ mod tests {
         let mut llrs = vec![0.0f32; 77];
         inject_ap_llrs(&mut llrs, ApLevel::Ap3, &ctx);
 
-        // Bits 0-27: their callsign (W1AW)
+        // Bits 0-27: my callsign (K1ABC) — to_callsign / called station.
+        // We are always the addressee for any message we decode.
         for i in 0..28 {
-            let expected_bit = qso.their_bits[i];
-            let expected_llr = if expected_bit {
-                -AP_LLR_MAGNITUDE
-            } else {
-                AP_LLR_MAGNITUDE
-            };
-            assert_eq!(llrs[i], expected_llr, "bit {} (their call) mismatch", i);
-        }
-
-        // Bits 28-55: my callsign (K1ABC)
-        for i in 28..56 {
-            let expected_bit = my_call.bits[i - 28];
+            let expected_bit = my_call.bits[i];
             let expected_llr = if expected_bit {
                 -AP_LLR_MAGNITUDE
             } else {
@@ -604,8 +617,75 @@ mod tests {
             assert_eq!(llrs[i], expected_llr, "bit {} (my call) mismatch", i);
         }
 
-        // Bits 56-76 should be untouched
-        for i in 56..77 {
+        // Bit 28 (to_callsign suffix flag) untouched — not part of either
+        // 28-bit callsign field.
+        assert_eq!(
+            llrs[28], 0.0,
+            "bit 28 (suffix flag gap) should be untouched"
+        );
+
+        // Bits 29-56: their callsign (W1AW) — from_callsign / calling
+        // station.
+        for i in 29..57 {
+            let expected_bit = qso.their_bits[i - 29];
+            let expected_llr = if expected_bit {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(llrs[i], expected_llr, "bit {} (their call) mismatch", i);
+        }
+
+        // Bits 57-76 should be untouched
+        for i in 57..77 {
+            assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
+        }
+    }
+
+    #[test]
+    fn test_inject_ap2_caller_uses_from_callsign_offset() {
+        // AP2's candidate-caller injection targets bits 29-56
+        // (from_callsign / calling station) — the other station, since we
+        // are always the addressee.
+        let caller = RecentCallAp::new("W1AW", -10.0).expect("W1AW should encode");
+        let mut llrs = vec![0.0f32; 77];
+        inject_ap2_caller(&mut llrs, &caller);
+
+        for i in 0..29 {
+            assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
+        }
+        for i in 29..57 {
+            let expected_bit = caller.bits[i - 29];
+            let expected_llr = if expected_bit {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(llrs[i], expected_llr, "bit {} mismatch", i);
+        }
+        for i in 57..77 {
+            assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
+        }
+    }
+
+    #[test]
+    fn test_inject_recent_call_at_called_uses_to_callsign_offset() {
+        // The companion "called" injection targets bits 0-27
+        // (to_callsign) — as if the recent call were the addressee.
+        let recent = RecentCallAp::new("K1ABC", -5.0).expect("K1ABC should encode");
+        let mut llrs = vec![0.0f32; 77];
+        inject_recent_call_at_called(&mut llrs, &recent);
+
+        for i in 0..28 {
+            let expected_bit = recent.bits[i];
+            let expected_llr = if expected_bit {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(llrs[i], expected_llr, "bit {} mismatch", i);
+        }
+        for i in 28..77 {
             assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
         }
     }

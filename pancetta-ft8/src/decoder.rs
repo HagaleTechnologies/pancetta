@@ -2206,7 +2206,8 @@ impl Ft8Decoder {
         // Check whether AP is active (any known information available).
         // hb-043: a non-empty `recent_calls` alone activates AP — the
         // my_call-less injection path tries each recent callsign at
-        // both bits 0-27 (caller) and 28-55 (called).
+        // both bits 29-56 (caller / from_callsign) and 0-27 (called /
+        // to_callsign).
         let ap_active = ap_context.my_call.is_some()
             || ap_context.active_qso.is_some()
             || !ap_context.recent_calls.is_empty();
@@ -4958,7 +4959,7 @@ impl Ft8Decoder {
             let snr_db = self.estimate_snr_spectrogram(&tone_magnitudes);
             let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
-            // --- AP1: inject own callsign at bits 28-55 (called station) ---
+            // --- AP1: inject own callsign at bits 0-27 (called station / to_callsign) ---
             if ap_context.my_call.is_some() {
                 if let Some(msg) = self.try_ldpc_with_ap(
                     &base_llrs,
@@ -4974,7 +4975,7 @@ impl Ft8Decoder {
                 }
             }
 
-            // --- AP2: inject each recent caller at bits 0-27 + AP1 ---
+            // --- AP2: inject each recent caller at bits 29-56 (from_callsign) + AP1 ---
             if ap_context.my_call.is_some() {
                 for recent in &ap_context.recent_calls {
                     // Short-circuit: skip calls already decoded this window
@@ -8029,7 +8030,7 @@ fn par_try_ap_decode(
         let snr_db = par_estimate_snr_spectrogram(ctx.protocol_params, &tone_magnitudes);
         let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
-        // --- AP1: inject own callsign at bits 28-55 (called station) ---
+        // --- AP1: inject own callsign at bits 0-27 (called station / to_callsign) ---
         if ctx.ap_context.my_call.is_some() {
             if let Some(msg) = par_try_ldpc_with_ap(
                 ctx,
@@ -8047,7 +8048,7 @@ fn par_try_ap_decode(
             }
         }
 
-        // --- AP2: inject each recent caller at bits 0-27 + AP1 ---
+        // --- AP2: inject each recent caller at bits 29-56 (from_callsign) + AP1 ---
         if ctx.ap_context.my_call.is_some() {
             for recent in &ctx.ap_context.recent_calls {
                 if decoded_calls.contains(&recent.callsign) {
@@ -8071,8 +8072,9 @@ fn par_try_ap_decode(
         }
 
         // --- AP-recent-only (hb-043, my_call-less): when my_call is
-        // unset, try each recent callsign at BOTH bits 0-27 (caller
-        // position) and bits 28-55 (called position). Enables the
+        // unset, try each recent callsign at BOTH bits 29-56 (caller /
+        // from_callsign position) and bits 0-27 (called / to_callsign
+        // position). Enables the
         // hb-027 "rolling callsign window" use case where the operator
         // is scanning, not transmitting, so my_call is irrelevant but
         // observed callsigns are still useful priors.
@@ -8081,7 +8083,7 @@ fn par_try_ap_decode(
                 if decoded_calls.contains(&recent.callsign) {
                     continue;
                 }
-                // Try as caller (bits 0-27)
+                // Try as caller (bits 29-56, from_callsign)
                 if let Some(msg) = par_try_ldpc_with_recent_only(
                     ctx,
                     ldpc,
@@ -8095,7 +8097,7 @@ fn par_try_ap_decode(
                 ) {
                     return Some(msg);
                 }
-                // Try as called (bits 28-55)
+                // Try as called (bits 0-27, to_callsign)
                 if let Some(msg) = par_try_ldpc_with_recent_only(
                     ctx,
                     ldpc,
@@ -8275,9 +8277,9 @@ fn par_try_ldpc_with_ap(
 /// Position to inject a recent callsign in the LLR vector. my_call-less AP.
 #[derive(Debug, Clone, Copy)]
 enum RecentInjectPos {
-    /// Inject at bits 0-27 (caller / from-callsign position).
+    /// Inject at bits 29-56 (caller / from_callsign position).
     Caller,
-    /// Inject at bits 28-55 (called / to-callsign position).
+    /// Inject at bits 0-27 (called / to_callsign position).
     Called,
 }
 
@@ -8382,10 +8384,10 @@ pub(crate) fn ap_injection_survived(
         // No injection happened — nothing to verify.
         crate::ap::ApLevel::Ap0 => true,
 
-        // AP1 injects our callsign at bits 28-55 (the called-station slot).
-        // The parsed result must have our_call as to_callsign.
+        // AP1 injects our callsign at bits 0-27 (the to_callsign / called-
+        // station slot). The parsed result must have our_call as to_callsign.
         // AP2 also injects AP1 (our callsign as called) plus a recent caller
-        // at bits 0-27 (calling-station slot) — verify both.
+        // at bits 29-56 (from_callsign / calling-station slot) — verify both.
         crate::ap::ApLevel::Ap1 | crate::ap::ApLevel::Ap2 => {
             let Some(ref my) = ap_context.my_call else {
                 return true; // No my_call to verify against — accept.
@@ -8399,9 +8401,9 @@ pub(crate) fn ap_injection_survived(
             true
         }
 
-        // AP3/AP4 inject the active QSO partner at bits 0-27 (calling
-        // station) AND our callsign at bits 28-55 (called station). Both
-        // must survive in the parsed message.
+        // AP3/AP4 inject our callsign at bits 0-27 (to_callsign / called
+        // station) AND the active QSO partner at bits 29-56 (from_callsign /
+        // calling station). Both must survive in the parsed message.
         crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
             let Some(ref my) = ap_context.my_call else {
                 return true;
@@ -16223,12 +16225,15 @@ mod a8_qso_state_tests {
             "WaitingForConfirmation enumeration must include an RR73 template; got: {:?}",
             templates
         );
+        // Template order is "my_call dx_call ..." (we are always
+        // to_callsign, listed first, for any message directed at us —
+        // W1.7 fixed a dx/my swap here).
         assert!(
-            a8_text_matches(&ctx, "W1AW K1ABC RR73"),
+            a8_text_matches(&ctx, "K1ABC W1AW RR73"),
             "RR73 reply must match the a8 template list"
         );
         assert!(
-            a8_text_matches(&ctx, "W1AW K1ABC 73"),
+            a8_text_matches(&ctx, "K1ABC W1AW 73"),
             "73 reply must match the a8 template list"
         );
     }
@@ -16240,11 +16245,11 @@ mod a8_qso_state_tests {
         // range. A correctly-formatted partner report must match.
         let ctx = ctx_for("W1AW", "K1ABC", QsoApProgress::WaitingForReport, true);
         assert!(
-            a8_text_matches(&ctx, "W1AW K1ABC R-10"),
+            a8_text_matches(&ctx, "K1ABC W1AW R-10"),
             "R-NN reply must match a8 template list"
         );
         assert!(
-            a8_text_matches(&ctx, "W1AW K1ABC -06"),
+            a8_text_matches(&ctx, "K1ABC W1AW -06"),
             "bare -NN reply must match a8 template list"
         );
     }
@@ -16257,7 +16262,7 @@ mod a8_qso_state_tests {
         // the enumerated set.
         let ctx = ctx_for("W1AW", "K1ABC", QsoApProgress::WaitingForConfirmation, true);
         assert!(
-            !a8_text_matches(&ctx, "W1AW K1ABC -10"),
+            !a8_text_matches(&ctx, "K1ABC W1AW -10"),
             "report-shaped text must not match the RR73/73/RRR-only enumeration"
         );
         assert!(
@@ -16265,7 +16270,7 @@ mod a8_qso_state_tests {
             "CQ-shaped text must not match the partner-addressing enumeration"
         );
         assert!(
-            !a8_text_matches(&ctx, "W1AW N0CALL RR73"),
+            !a8_text_matches(&ctx, "N0CALL W1AW RR73"),
             "wrong called-station text must not match"
         );
     }
@@ -16278,9 +16283,9 @@ mod a8_qso_state_tests {
         // that the relaxation works across slightly different text
         // formatters (loopback tests, mock messages, etc.).
         let ctx = ctx_for("W1AW", "K1ABC", QsoApProgress::WaitingForConfirmation, true);
-        assert!(a8_text_matches(&ctx, "w1aw k1abc rr73"));
-        assert!(a8_text_matches(&ctx, "W1AW  K1ABC   RR73"));
-        assert!(a8_text_matches(&ctx, " W1AW K1ABC RR73 "));
+        assert!(a8_text_matches(&ctx, "k1abc w1aw rr73"));
+        assert!(a8_text_matches(&ctx, "K1ABC  W1AW   RR73"));
+        assert!(a8_text_matches(&ctx, " K1ABC W1AW RR73 "));
     }
 
     #[test]
@@ -16303,8 +16308,8 @@ mod a8_qso_state_tests {
                 t
             );
             assert!(
-                t.starts_with("W1AW K1ABC"),
-                "enumerated text must address us (DX MY ...); got {:?}",
+                t.starts_with("K1ABC W1AW"),
+                "enumerated text must address us (MY DX ...); got {:?}",
                 t
             );
         }
