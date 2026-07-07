@@ -822,8 +822,11 @@ mod merge_guard {
 
     /// The core assertion: merging a fully-non-default `source` into a default
     /// must reproduce `source` field-for-field.
-    fn assert_carries_all<T>(type_name: &str, overrides: &[(&str, Value)], merge: impl Fn(&mut T, T))
-    where
+    fn assert_carries_all<T>(
+        type_name: &str,
+        overrides: &[(&str, Value)],
+        merge: impl Fn(&mut T, T),
+    ) where
         T: Default + Clone + Serialize + DeserializeOwned,
     {
         let source = build_source::<T>(overrides);
