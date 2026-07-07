@@ -1678,9 +1678,12 @@ pub struct Ft8Decoder {
     /// floor/rest candidate-decode split during
     /// `decode_window_with_ap_scoped_partner_impl` and drained by
     /// [`Self::decode_window_budgeted`] into its returned
-    /// [`DecodeBudgetReport`]. Reset at the start of every window (so a
-    /// budgeted call never sees stale telemetry from a previous
-    /// window/instance reuse).
+    /// [`DecodeBudgetReport`]. Reset at the top of
+    /// `decode_window_with_ap_scoped_partner_impl` itself — the single
+    /// choke point every public entry point funnels through — so every
+    /// call (budgeted or not) starts a window with a clean report and
+    /// none of them can accumulate stale/unbounded telemetry across
+    /// windows on a long-lived, reused `Ft8Decoder` instance.
     current_budget_report: DecodeBudgetReport,
 }
 
@@ -2020,7 +2023,10 @@ impl Ft8Decoder {
         budget: DecodeBudget,
     ) -> Ft8Result<(Vec<DecodedMessage>, DecodeBudgetReport)> {
         self.current_budget = budget;
-        self.current_budget_report = DecodeBudgetReport::default();
+        // `current_budget_report` is reset inside
+        // `decode_window_with_ap_scoped_partner_impl` itself (the single
+        // choke point all entry points funnel through), so no reset is
+        // needed here.
         let result = self.decode_window_with_ap_scoped_partner_impl(
             samples,
             &crate::ap::ApContext::default(),
@@ -2051,6 +2057,18 @@ impl Ft8Decoder {
         self.residual_snr_records.clear();
         // hb-250: reset the candidate dump at the start of each window.
         self.candidate_dump.clear();
+        // Task 9 review fix: reset the budget-report telemetry here, at the
+        // single choke point every public entry point funnels through,
+        // rather than in each wrapper individually. Previously only
+        // `decode_window_budgeted` reset `current_budget_report`, so the
+        // other four entry points (`decode_window_with_ap`,
+        // `decode_window_scoped`, `decode_window_with_ap_scoped`,
+        // `decode_window_with_ap_scoped_partner`) each appended fresh stage
+        // tuples onto a report that was never cleared or read — an
+        // unbounded per-window `Vec` growth on a long-lived `Ft8Decoder`
+        // (exactly the production usage pattern in
+        // `pancetta/src/coordinator/ft8.rs`).
+        self.current_budget_report = DecodeBudgetReport::default();
 
         let min_samples = self.protocol_params.total_samples(SAMPLE_RATE);
         if samples.len() < min_samples {
@@ -12545,6 +12563,59 @@ mod tests {
             !decoded.iter().any(|m| m.text == "CQ K5ARH EM10"),
             "scoped decode at ~500 Hz must NOT recover the 2000 Hz transmission, got: {:?}",
             decoded.iter().map(|m| m.text.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    // Task 9 review fix: `current_budget_report` must be reset on every
+    // window, not just via `decode_window_budgeted`. Before the fix, the
+    // non-budgeted entry points (`decode_window_with_ap`,
+    // `decode_window_scoped`, `decode_window_with_ap_scoped`,
+    // `decode_window_with_ap_scoped_partner`) never cleared
+    // `current_budget_report`, so repeated calls on the same long-lived
+    // `Ft8Decoder` (the production usage pattern in
+    // `pancetta/src/coordinator/ft8.rs`) accumulated `stages` tuples
+    // forever — an unbounded memory leak. Reproduces via the private
+    // field directly (this test module is a child of `decoder` via
+    // `use super::*`, so it can see `current_budget_report`).
+    #[test]
+    fn current_budget_report_does_not_grow_across_repeated_scoped_calls() {
+        let config = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(config).unwrap();
+        let samples = vec![0.0f32; WINDOW_SAMPLES];
+
+        let _ = decoder
+            .decode_window_scoped(&samples, 0..=1)
+            .expect("decode 1");
+        let stages_after_first = decoder.current_budget_report.stages.len();
+        assert!(
+            stages_after_first > 0,
+            "expected the floor/rest split to record at least one stage per window"
+        );
+
+        // Repeat several more times through a mix of the non-budgeted
+        // entry points that funnel through the shared `_impl`. Before the
+        // fix, `stages` grew by `stages_after_first` (or more) on every
+        // call; after the fix it is reset at the top of every call, so the
+        // count after N calls equals the count after 1 call.
+        for _ in 0..5 {
+            let _ = decoder
+                .decode_window_scoped(&samples, 0..=1)
+                .expect("decode N");
+        }
+        assert_eq!(
+            decoder.current_budget_report.stages.len(),
+            stages_after_first,
+            "current_budget_report.stages must be reset every window, not accumulated \
+             (leak regression: Task 9 review finding)"
+        );
+
+        let _ = decoder
+            .decode_window_with_ap(&samples, &crate::ap::ApContext::default())
+            .expect("decode via decode_window_with_ap");
+        assert_eq!(
+            decoder.current_budget_report.stages.len(),
+            stages_after_first,
+            "decode_window_with_ap must also reset current_budget_report"
         );
     }
 
