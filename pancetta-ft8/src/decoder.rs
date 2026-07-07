@@ -1381,6 +1381,18 @@ impl Default for Ft8Config {
 // Internal data structures
 // ============================================================================
 
+/// Scalar type used for spectrogram storage (`power` + `complex` bins).
+///
+/// perf F4: was hardcoded `f64`; this alias isolates the storage-type
+/// diff surface so it can be flipped to `f32` (real-FFT + `f32`
+/// spectrogram) in one place. Consumers that need full `f64` precision
+/// downstream (Costas scoring accumulators, the coherent-subtract /
+/// cross-cycle-coherent complex-domain math) upcast immediately at the
+/// read boundary and downcast at the write boundary — only the
+/// `compute_spectrogram_with` FFT/log10 computation that produces these
+/// values natively operates at `SpecScalar` precision.
+type SpecScalar = f64;
+
 /// Time-frequency spectrogram with frequency oversampling support
 ///
 /// Storage is a single flat `Vec` indexed via [`Spectrogram::idx`] —
@@ -1392,13 +1404,13 @@ impl Default for Ft8Config {
 struct Spectrogram {
     /// Flattened [time_step][freq_sub][freq_bin] — index via `Self::idx`.
     /// With freq_osr=2: freq_sub 0 = even bins (0, 2, 4, ...), freq_sub 1 = odd bins (1, 3, 5, ...)
-    power: Vec<f64>,
+    power: Vec<SpecScalar>,
     /// Optional complex FFT bins, same flat indexing as `power`. Populated
     /// only when `Ft8Config::cross_cycle_coherent` is true; required for
     /// coherent cross-cycle averaging (phase recovery from Costas, then
     /// complex sum across cycles). When `None`, the cross-cycle pass falls
     /// back to the non-coherent (power-only) path.
-    complex: Option<Vec<Complex<f64>>>,
+    complex: Option<Vec<Complex<SpecScalar>>>,
     /// Number of time steps
     num_steps: usize,
     /// Number of frequency bins per sub-bin (in 6.25 Hz units)
@@ -1421,13 +1433,13 @@ impl Spectrogram {
 
     /// Power (dB) at `(time_step, freq_sub, freq_bin)`.
     #[inline(always)]
-    fn at(&self, t: usize, sub: usize, bin: usize) -> f64 {
+    fn at(&self, t: usize, sub: usize, bin: usize) -> SpecScalar {
         self.power[self.idx(t, sub, bin)]
     }
 
     /// The full `num_bins`-wide power row at `(time_step, freq_sub)`.
     #[inline(always)]
-    fn row(&self, t: usize, sub: usize) -> &[f64] {
+    fn row(&self, t: usize, sub: usize) -> &[SpecScalar] {
         let base = (t * self.freq_osr + sub) * self.num_bins;
         &self.power[base..base + self.num_bins]
     }
