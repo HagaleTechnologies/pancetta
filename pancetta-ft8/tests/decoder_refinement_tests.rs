@@ -274,12 +274,19 @@ mod gain_invariance {
     /// returning the set of decoded message texts. A `BTreeSet` (rather
     /// than the raw `Vec`) deliberately ignores decode ORDER — only the
     /// set of messages recovered matters for a gain-invariance claim.
+    ///
+    /// `llr_whitening_enabled` is forced ON here (it defaults to OFF as
+    /// of Task W1.4 — see the docstring below): this test exists
+    /// specifically to guard `whiten_llrs`/`maybe_whiten_llrs` against a
+    /// future gain-dependence regression, so it must exercise that code
+    /// path regardless of the crate's current default.
     fn decode_set_at_gain(samples: &[f32], gain: f32) -> BTreeSet<String> {
         let mut buffer: Vec<f32> = samples.iter().map(|&s| s * gain).collect();
         if buffer.len() < WINDOW_SAMPLES {
             buffer.resize(WINDOW_SAMPLES, 0.0);
         }
-        let config = Ft8Config::default();
+        let mut config = Ft8Config::default();
+        config.llr_whitening_enabled = true;
         let mut decoder = Ft8Decoder::new(config).unwrap();
         decoder
             .decode_window(&buffer)
@@ -289,8 +296,11 @@ mod gain_invariance {
             .collect()
     }
 
-    /// `whiten_llrs` (`Ft8Config::llr_whitening_enabled`, default ON)
-    /// divides LLRs by per-tone/per-symbol MEDIAN tone magnitudes with a
+    /// `whiten_llrs` (`Ft8Config::llr_whitening_enabled`, OFF by default
+    /// as of Task W1.4 — explicitly forced ON in `decode_set_at_gain`
+    /// above so this test still exercises the whitening path it's
+    /// meant to guard) divides LLRs by per-tone/per-symbol MEDIAN tone
+    /// magnitudes with a
     /// `NOISE_FLOOR = 1e-6` floor. That floor is calibrated for the
     /// LINEAR-magnitude domain (the fine-FFT path's native units, `|y|`),
     /// but several spectrogram-path callers hand it dB LOG-POWER values
