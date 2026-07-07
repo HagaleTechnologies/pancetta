@@ -639,16 +639,29 @@ fn all_wav_fixtures() -> Vec<String> {
     out
 }
 
-/// Critical invariant for the S4-S7 budget checkpoints added in this
-/// task: with `DecodeBudget::unlimited()`, every stage's
-/// `current_budget.has_time()` check always returns `true`, so
-/// `decode_window_budgeted` must decode a message set that is a
-/// superset of (or equal to) whatever the pre-existing, always-
-/// unlimited `decode_window` entry point produces. This proves the new
-/// checkpoints never accidentally skip cross-cycle averaging,
-/// multipass rounds, joint-pair retry, or the a7 pass when there is no
-/// real time pressure — the exact failure mode a careless checkpoint
-/// placement would introduce.
+/// Message-set-equivalence check for the S4-S7 budget checkpoints
+/// added in this task: `decode_window` is defined as
+/// `decode_window_budgeted(samples, DecodeBudget::unlimited())`
+/// discarding the report (see its doc comment), so this test proves
+/// `decode_window_budgeted` under an unlimited budget produces a
+/// message set that is a superset of (or equal to) whatever that
+/// pre-existing entry point produces — i.e. the two call sites agree.
+///
+/// **Evidentiary scope (corrected 2026-07-06 per review finding):**
+/// because both sides of this comparison invoke the *same*
+/// checkpointed code path with the *same* `DecodeBudget::unlimited()`
+/// value, this test CANNOT independently verify that the S4-S7
+/// `has_time()` checkpoints are correctly conditional. A checkpoint
+/// hardcoded to always skip (regardless of what `has_time()` actually
+/// returns) would degrade both "baseline" and "budgeted" identically,
+/// and this superset assertion would still pass — no fixture, however
+/// rich, changes that, since it's a structural property of the
+/// comparison, not a data-coverage gap. That conditional-skip
+/// verification is what
+/// `unlimited_budget_never_skips_s4_s7_stages_in_report` (below) is
+/// for: it calls `decode_window_budgeted` directly and inspects
+/// `DecodeBudgetReport::stages` for `skipped == 0`, which a hardcoded
+/// always-skip bug would fail.
 ///
 /// Runs over every WAV fixture under `tests/fixtures/wav/` (all four
 /// subdirectories), not just the one example fixture in the task
@@ -749,4 +762,109 @@ fn expired_budget_skips_s4_s7_stages_in_report() {
         find("S7-a7").is_none(),
         "a7_enabled defaults to false, so S7 should never enter its checkpoint"
     );
+}
+
+/// Review-gap closer (2026-07-06): `unlimited_budget_matches_baseline_decode_set_all_fixtures`
+/// (above) cannot detect a checkpoint hardcoded to always skip
+/// regardless of `has_time()`'s actual result, because its "baseline"
+/// and "budgeted" both call `decode_window_budgeted` with the same
+/// `DecodeBudget::unlimited()` value — an always-skip bug would
+/// degrade both sides identically and the superset assertion would
+/// still pass. `expired_budget_skips_s4_s7_stages_in_report` proves
+/// the skip branch is reachable, but not that it's correctly
+/// *conditional* (i.e. it doesn't distinguish "skips only when
+/// expired" from "always skips").
+///
+/// This test closes that gap directly: run `decode_window_budgeted`
+/// with `DecodeBudget::unlimited()` on fixtures known (from Task 11's
+/// own debug notes, see `task-11-report.md`) to actually exercise
+/// each checkpointed stage under current `Ft8Config` defaults
+/// (`cross_cycle_averaging=true`, `coherent_multipass_iterations=3`,
+/// `joint_pair_retry=true`, `a7_enabled=false`) —
+/// `basicft8/live_now.wav` drives S4-cross-cycle to a nonzero decode
+/// count, `jtdx/190227_155815.wav` drives S5-multipass to a nonzero
+/// decode count across its rounds — and asserts every S4/S5/S6 stage
+/// entry in the report shows `skipped == 0`. If any checkpoint were
+/// hardcoded to always skip (`if true` instead of
+/// `if !current_budget.has_time()`), the corresponding entry would
+/// show `skipped > 0` (and, for S4/S6, `decoded == 0`) and this test
+/// would fail — this is what the superset test structurally cannot
+/// prove. (Manually verified: temporarily hardcoding the S4 checkpoint
+/// to always skip makes this test fail while the superset test above
+/// keeps passing; reverted before commit.)
+#[test]
+fn unlimited_budget_never_skips_s4_s7_stages_in_report() {
+    assert!(
+        !Ft8Config::default().a7_enabled,
+        "this test's S7 absence assertion assumes a7_enabled defaults to false"
+    );
+
+    for fixture_path in ["basicft8/live_now.wav", "jtdx/190227_155815.wav"] {
+        let samples = read_fixture_window(fixture_path);
+        let mut d = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let (_msgs, report) = d
+            .decode_window_budgeted(&samples, DecodeBudget::unlimited())
+            .unwrap();
+
+        assert!(
+            !report.budget_exhausted,
+            "{fixture_path}: an unlimited budget must never report exhaustion"
+        );
+
+        // Every S4/S5/S6 entry (S5 may push multiple entries, one per
+        // round) must show zero skipped work under an unlimited
+        // budget. A hardcoded always-skip checkpoint would fail this.
+        for label in ["S4-cross-cycle", "S5-multipass", "S6-joint-pair"] {
+            let entries: Vec<_> = report
+                .stages
+                .iter()
+                .filter(|(l, _, _, _)| *l == label)
+                .collect();
+            assert!(
+                !entries.is_empty(),
+                "{fixture_path}: {label} must appear in the report"
+            );
+            for entry in &entries {
+                assert_eq!(
+                    entry.3, 0,
+                    "{fixture_path}: {label} must not skip any work under an unlimited budget \
+                     (entry: {entry:?})"
+                );
+            }
+        }
+
+        let s4_decoded: u32 = report
+            .stages
+            .iter()
+            .filter(|(l, _, _, _)| *l == "S4-cross-cycle")
+            .map(|(_, _, decoded, _)| *decoded)
+            .sum();
+        let s5_decoded: u32 = report
+            .stages
+            .iter()
+            .filter(|(l, _, _, _)| *l == "S5-multipass")
+            .map(|(_, _, decoded, _)| *decoded)
+            .sum();
+
+        match fixture_path {
+            "basicft8/live_now.wav" => assert!(
+                s4_decoded > 0,
+                "{fixture_path}: expected S4-cross-cycle to actually decode something \
+                 (this fixture is known to exercise it); got 0 — the test fixture may have \
+                 stopped exercising this stage"
+            ),
+            "jtdx/190227_155815.wav" => assert!(
+                s5_decoded > 0,
+                "{fixture_path}: expected S5-multipass to actually decode something \
+                 (this fixture is known to exercise it); got 0 — the test fixture may have \
+                 stopped exercising this stage"
+            ),
+            _ => unreachable!(),
+        }
+
+        assert!(
+            report.stages.iter().all(|(l, _, _, _)| *l != "S7-a7"),
+            "{fixture_path}: a7_enabled defaults to false, so S7 should never enter its checkpoint"
+        );
+    }
 }
