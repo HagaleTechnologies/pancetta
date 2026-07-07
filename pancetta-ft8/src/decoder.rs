@@ -25,6 +25,7 @@
 #![allow(clippy::doc_lazy_continuation)]
 
 use crate::{
+    budget::{DecodeBudget, DecodeBudgetReport},
     message::{calculate_crc14, DecodedMessage, MessageParser, CRC_BITS, PAYLOAD_BITS},
     osd::{OsdConfig, OsdDecoder},
     protocol::ProtocolParams,
@@ -1636,6 +1637,19 @@ pub struct Ft8Decoder {
     /// `candidate_dump_enabled` is true; drained by
     /// `take_candidate_dump`.
     candidate_dump: Vec<SyncCandidateRecord>,
+
+    /// Phase 2 "anytime decoder" plumbing (Task 8): the budget for the
+    /// decode window currently in progress. Set at the entry of
+    /// [`Self::decode_window_budgeted`] (and the other public entry
+    /// points, always with [`DecodeBudget::unlimited()`]) and reset to
+    /// `unlimited()` at exit, so a budgeted call never leaks its budget
+    /// into a later unlimited call on the same instance. Deep helpers can
+    /// read `self.current_budget` without a param threaded through every
+    /// private fn. Nothing consults it yet — that starts in Task 9,
+    /// which is also when this field's reads will make the
+    /// `dead_code` allow below unnecessary.
+    #[allow(dead_code)]
+    current_budget: DecodeBudget,
 }
 
 impl Ft8Decoder {
@@ -1747,6 +1761,7 @@ impl Ft8Decoder {
             soft_combiner,
             candidate_dump_enabled: false,
             candidate_dump: Vec::new(),
+            current_budget: DecodeBudget::unlimited(),
         })
     }
 
@@ -1810,7 +1825,8 @@ impl Ft8Decoder {
     /// (180 000-sample) buffer instead of the 151 680-sample window was measured
     /// at 4–5x the decode cost (2026-07-06 profiling session).
     pub fn decode_window(&mut self, samples: &[f32]) -> Ft8Result<Vec<DecodedMessage>> {
-        self.decode_window_with_ap(samples, &crate::ap::ApContext::default())
+        self.decode_window_budgeted(samples, DecodeBudget::unlimited())
+            .map(|(messages, _report)| messages)
     }
 
     /// Decode using ft8_lib's C decoder via FFI.
@@ -1928,6 +1944,61 @@ impl Ft8Decoder {
     /// `partner_freq_hz = None` (or the config radius `None`) makes this
     /// method byte-identical to `decode_window_with_ap_scoped`.
     pub fn decode_window_with_ap_scoped_partner(
+        &mut self,
+        samples: &[f32],
+        ap_context: &crate::ap::ApContext,
+        freq_bin_range: Option<RangeInclusive<usize>>,
+        partner_freq_hz: Option<f64>,
+    ) -> Ft8Result<Vec<DecodedMessage>> {
+        self.current_budget = DecodeBudget::unlimited();
+        let result = self.decode_window_with_ap_scoped_partner_impl(
+            samples,
+            ap_context,
+            freq_bin_range,
+            partner_freq_hz,
+        );
+        self.current_budget = DecodeBudget::unlimited();
+        result
+    }
+
+    /// Budgeted entry point (Task 8, decoder-speed-overhaul Phase 2
+    /// plumbing): decode with default AP context and no frequency
+    /// scoping, honoring a wall-clock [`DecodeBudget`]. Stores the
+    /// budget in `self.current_budget` for the duration of the call
+    /// (reset to `unlimited()` on exit, including on error) so deep
+    /// helpers can read it without a param threaded through every
+    /// private fn.
+    ///
+    /// Nothing in the pipeline consults the budget yet — that starts in
+    /// Task 9 — so `decode_window_budgeted(samples, DecodeBudget::unlimited())`
+    /// is byte-identical to [`Self::decode_window`]. Every existing
+    /// entry point (`decode_window`, `decode_window_with_ap*`,
+    /// `decode_window_scoped`) delegates to this budgeted core (directly
+    /// or via `decode_window_with_ap_scoped_partner`) with
+    /// `DecodeBudget::unlimited()`, discarding the [`DecodeBudgetReport`].
+    pub fn decode_window_budgeted(
+        &mut self,
+        samples: &[f32],
+        budget: DecodeBudget,
+    ) -> Ft8Result<(Vec<DecodedMessage>, DecodeBudgetReport)> {
+        self.current_budget = budget;
+        let result = self.decode_window_with_ap_scoped_partner_impl(
+            samples,
+            &crate::ap::ApContext::default(),
+            None,
+            None,
+        );
+        self.current_budget = DecodeBudget::unlimited();
+        result.map(|messages| (messages, DecodeBudgetReport::default()))
+    }
+
+    /// Core decode implementation shared by every public decode entry
+    /// point. Callers must set `self.current_budget` before invoking
+    /// this and reset it after (see `decode_window_budgeted` and
+    /// `decode_window_with_ap_scoped_partner` above) — this fn itself
+    /// does not touch `self.current_budget`, it only reads it (once
+    /// later tasks wire in budget checks).
+    fn decode_window_with_ap_scoped_partner_impl(
         &mut self,
         samples: &[f32],
         ap_context: &crate::ap::ApContext,

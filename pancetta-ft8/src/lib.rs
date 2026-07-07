@@ -96,6 +96,11 @@ pub use dt_history::{DtPrior, DtPriorLookup, InMemoryDtHistory};
 pub mod parallel;
 pub use parallel::{BudgetTracker, DecodeConfig, Parallelism};
 
+// Phase 2 "anytime decoder" plumbing: wall-clock decode budget (Task 8 of
+// the decoder-speed-overhaul plan). Inert today — nothing consults it yet.
+pub mod budget;
+pub use budget::{DecodeBudget, DecodeBudgetReport};
+
 // Core FT8 decoding modules
 pub mod bp_trajectory_capture;
 pub mod decoder;
