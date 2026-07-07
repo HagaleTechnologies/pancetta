@@ -568,9 +568,17 @@ fn ft8lib_decode_snr_is_nonconstant_and_in_range() {
 /// "rest" of the candidate list was skipped.
 ///
 /// Unlimited-budget decode of this fixture produces 9 messages (see
-/// `test_cross_validate_against_ft8lib`); the floor threshold below
-/// (>= 7) leaves margin while still proving the floor actually ran a
-/// real decode pass, not an early-out no-op.
+/// `test_cross_validate_against_ft8lib`). The threshold here was
+/// originally `>= 7`, back when only S1 (floor) / S2 (rest) were
+/// budget-aware: cross-cycle averaging, coherent multipass, and
+/// joint-pair-retry (S4/S5/S6, budget-checkpointed in decoder-speed-
+/// overhaul Task 11) ran unconditionally regardless of budget and
+/// padded the "floor-only" count above 7 even under an already-expired
+/// budget. Now that Task 11 correctly gates those stages too, an
+/// already-expired budget yields exactly the floor's own contribution
+/// after dedup — measured at 4 on this fixture — so the threshold is
+/// `>= 3` (small margin, still proving the floor ran a real decode
+/// pass rather than an early-out no-op).
 #[test]
 fn budget_floor_still_decodes_top_candidates() {
     let samples = read_fixture_window("wsjt/210703_133430.wav");
@@ -583,8 +591,162 @@ fn budget_floor_still_decodes_top_candidates() {
         "expected an already-expired budget to report exhaustion"
     );
     assert!(
-        msgs.len() >= 7,
+        msgs.len() >= 3,
         "floor (top-50 @ shallow BP) must still run, got {}",
         msgs.len()
+    );
+}
+
+// =============================================================
+// Decoder-speed-overhaul Task 11: budget checkpoints for S4-S7 +
+// superset invariant
+// =============================================================
+
+/// Recursively collect every `.wav` fixture under
+/// `tests/fixtures/wav/`, returned as paths relative to that root
+/// (e.g. `"wsjt/210703_133430.wav"`) suitable for
+/// `read_fixture_window`. The brief's literal example loops over
+/// `wsjt/` only; we cover every fixture subdirectory (`basicft8`,
+/// `generated`, `jtdx`, `wsjt`) to make the superset invariant as
+/// strong as possible, since it's cheap and the whole point is "never
+/// skip work under an unlimited budget" — that should hold everywhere,
+/// not just in one subdirectory.
+fn all_wav_fixtures() -> Vec<String> {
+    fn walk(dir: &std::path::Path, root: &std::path::Path, out: &mut Vec<String>) {
+        let entries = match std::fs::read_dir(dir) {
+            Ok(e) => e,
+            Err(_) => return,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, root, out);
+            } else if path.extension().and_then(|e| e.to_str()) == Some("wav") {
+                let rel = path
+                    .strip_prefix(root)
+                    .unwrap_or(&path)
+                    .to_string_lossy()
+                    .into_owned();
+                out.push(rel);
+            }
+        }
+    }
+    let root =
+        std::path::PathBuf::from(format!("{}/tests/fixtures/wav", env!("CARGO_MANIFEST_DIR")));
+    let mut out = Vec::new();
+    walk(&root, &root, &mut out);
+    out.sort();
+    out
+}
+
+/// Critical invariant for the S4-S7 budget checkpoints added in this
+/// task: with `DecodeBudget::unlimited()`, every stage's
+/// `current_budget.has_time()` check always returns `true`, so
+/// `decode_window_budgeted` must decode a message set that is a
+/// superset of (or equal to) whatever the pre-existing, always-
+/// unlimited `decode_window` entry point produces. This proves the new
+/// checkpoints never accidentally skip cross-cycle averaging,
+/// multipass rounds, joint-pair retry, or the a7 pass when there is no
+/// real time pressure — the exact failure mode a careless checkpoint
+/// placement would introduce.
+///
+/// Runs over every WAV fixture under `tests/fixtures/wav/` (all four
+/// subdirectories), not just the one example fixture in the task
+/// brief.
+#[test]
+fn unlimited_budget_matches_baseline_decode_set_all_fixtures() {
+    let fixtures = all_wav_fixtures();
+    assert!(
+        !fixtures.is_empty(),
+        "expected to find WAV fixtures under tests/fixtures/wav/"
+    );
+
+    for fixture_path in fixtures {
+        let samples = read_fixture_window(&fixture_path);
+
+        let baseline: std::collections::BTreeSet<String> = {
+            let mut d = Ft8Decoder::new(Ft8Config::default()).unwrap();
+            d.decode_window(&samples)
+                .unwrap()
+                .into_iter()
+                .map(|m| m.text)
+                .collect()
+        };
+        let budgeted: std::collections::BTreeSet<String> = {
+            let mut d = Ft8Decoder::new(Ft8Config::default()).unwrap();
+            d.decode_window_budgeted(&samples, DecodeBudget::unlimited())
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|m| m.text)
+                .collect()
+        };
+
+        assert!(
+            budgeted.is_superset(&baseline),
+            "{}: budgeted decode set is missing baseline messages: {:?}",
+            fixture_path,
+            baseline.difference(&budgeted).collect::<Vec<_>>()
+        );
+    }
+}
+
+/// With a budget that has already expired before decode starts, every
+/// S4-S7 stage checkpoint added in this task must record itself as
+/// skipped in the report (rather than either silently running anyway,
+/// or silently omitting itself from the report). `cross_cycle_averaging`
+/// and `joint_pair_retry` are on by default (so S4/S6 are exercised and
+/// must show `skipped == 1`); `coherent_multipass_iterations` defaults
+/// to 3 (so S5 must show a single skip record with `skipped == 3`,
+/// covering every remaining round in one entry since the round loop
+/// breaks on the first budget check). `a7_enabled` defaults to `false`,
+/// so S7 legitimately never enters its `if` at all — this is asserted
+/// explicitly rather than assumed.
+#[test]
+fn expired_budget_skips_s4_s7_stages_in_report() {
+    let samples = read_fixture_window("wsjt/210703_133430.wav");
+    assert!(
+        !Ft8Config::default().a7_enabled,
+        "this test's S7 assertion assumes a7_enabled defaults to false"
+    );
+    let mut d = Ft8Decoder::new(Ft8Config::default()).unwrap();
+    let (_msgs, report) = d
+        .decode_window_budgeted(&samples, DecodeBudget::until(std::time::Instant::now()))
+        .unwrap();
+
+    assert!(
+        report.budget_exhausted,
+        "expected an already-expired budget to report exhaustion"
+    );
+
+    let find = |label: &str| report.stages.iter().find(|(l, _, _, _)| *l == label);
+
+    let s4 = find("S4-cross-cycle").expect("S4-cross-cycle must appear in the report");
+    assert_eq!(
+        s4.2, 0,
+        "S4 must not have decoded anything under an expired budget"
+    );
+    assert_eq!(s4.3, 1, "S4 must record itself as fully skipped");
+
+    let s5 = find("S5-multipass").expect("S5-multipass must appear in the report");
+    assert_eq!(
+        s5.2, 0,
+        "S5 must not have decoded anything under an expired budget"
+    );
+    assert_eq!(
+        s5.3, 3,
+        "S5 must record all 3 default rounds as skipped in a single entry"
+    );
+
+    let s6 = find("S6-joint-pair").expect("S6-joint-pair must appear in the report");
+    assert_eq!(
+        s6.2, 0,
+        "S6 must not have decoded anything under an expired budget"
+    );
+    assert_eq!(s6.3, 1, "S6 must record itself as fully skipped");
+
+    assert!(
+        find("S7-a7").is_none(),
+        "a7_enabled defaults to false, so S7 should never enter its checkpoint"
     );
 }

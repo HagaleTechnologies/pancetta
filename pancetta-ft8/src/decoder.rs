@@ -2813,16 +2813,36 @@ impl Ft8Decoder {
             // outputs go through the same dedup, and a corrupted average
             // that fails CRC contributes nothing. Skipped when the flag
             // is off (default).
+            //
+            // Decoder-speed-overhaul Task 11: budget-checkpointed (S4).
+            // Under `DecodeBudget::unlimited()` `has_time()` is always
+            // `true`, so this is a byte-identical no-op — the stage
+            // always runs to completion, exactly as before this task.
             if self.config.cross_cycle_averaging {
-                let mut extra = self.cross_cycle_averaging_pass(&spectrogram, &sync_candidates);
-                let now_elapsed = start_time.elapsed();
-                for m in extra.iter_mut() {
-                    if m.decode_time_into_window.is_none() {
-                        m.decode_time_into_window = Some(now_elapsed);
+                if !current_budget.has_time() {
+                    self.current_budget_report.budget_exhausted = true;
+                    self.current_budget_report
+                        .stages
+                        .push(("S4-cross-cycle", 0, 0, 1));
+                } else {
+                    let stage_start = Instant::now();
+                    let mut extra = self.cross_cycle_averaging_pass(&spectrogram, &sync_candidates);
+                    let now_elapsed = start_time.elapsed();
+                    for m in extra.iter_mut() {
+                        if m.decode_time_into_window.is_none() {
+                            m.decode_time_into_window = Some(now_elapsed);
+                        }
+                        m.stamp_decode_origin(2);
                     }
-                    m.stamp_decode_origin(2);
+                    let done = extra.len() as u32;
+                    pass_decoded.extend(extra);
+                    self.current_budget_report.stages.push((
+                        "S4-cross-cycle",
+                        stage_start.elapsed().as_millis() as u32,
+                        done,
+                        0,
+                    ));
                 }
-                pass_decoded.extend(extra);
             }
 
             // hb-079: coherent iterative-subtract multi-pass. Subtracts
@@ -2859,7 +2879,24 @@ impl Ft8Decoder {
                 } else {
                     auto_passband_range.as_ref()
                 };
-                for _round in 0..self.config.coherent_multipass_iterations {
+                // Decoder-speed-overhaul Task 11: budget-checkpointed
+                // (S5), checked per round. Under
+                // `DecodeBudget::unlimited()` this never trips, so all
+                // `coherent_multipass_iterations` rounds still run
+                // exactly as before this task.
+                let total_rounds = self.config.coherent_multipass_iterations;
+                for round in 0..total_rounds {
+                    if !current_budget.has_time() {
+                        self.current_budget_report.budget_exhausted = true;
+                        self.current_budget_report.stages.push((
+                            "S5-multipass",
+                            0,
+                            0,
+                            (total_rounds - round) as u32,
+                        ));
+                        break;
+                    }
+                    let round_start = Instant::now();
                     let mut extra = self.coherent_subtract_and_repass(
                         &mut spectrogram,
                         to_subtract,
@@ -2868,6 +2905,12 @@ impl Ft8Decoder {
                         partner_freq_hz,
                     );
                     if extra.is_empty() {
+                        self.current_budget_report.stages.push((
+                            "S5-multipass",
+                            round_start.elapsed().as_millis() as u32,
+                            0,
+                            0,
+                        ));
                         break;
                     }
                     // hb-129: stamp multipass decodes — these arrive
@@ -2881,6 +2924,12 @@ impl Ft8Decoder {
                         m.stamp_decode_origin(3);
                     }
                     let added = extra.len();
+                    self.current_budget_report.stages.push((
+                        "S5-multipass",
+                        round_start.elapsed().as_millis() as u32,
+                        added as u32,
+                        0,
+                    ));
                     pass_decoded.extend(extra);
                     let round_start_offset = pass_decoded.len() - added;
                     to_subtract = &pass_decoded[round_start_offset..];
@@ -2895,18 +2944,36 @@ impl Ft8Decoder {
             // at the (now-cleaned) overlap bins are decodable. Diagnostic
             // confirmed 78% of missed truths on top-20 hard-200 WAVs are
             // within 50 Hz of a recovered decode.
+            // Decoder-speed-overhaul Task 11: budget-checkpointed (S6).
+            // Under `DecodeBudget::unlimited()` this never trips, so
+            // joint-pair-retry always runs exactly as before this task.
             if self.config.joint_pair_retry {
-                let mut extra =
-                    self.joint_pair_retry_pass(&spectrogram, &sync_candidates, &pass_decoded);
-                // hb-129: stamp joint-pair-retry decodes at pass completion.
-                let now_elapsed = start_time.elapsed();
-                for m in extra.iter_mut() {
-                    if m.decode_time_into_window.is_none() {
-                        m.decode_time_into_window = Some(now_elapsed);
+                if !current_budget.has_time() {
+                    self.current_budget_report.budget_exhausted = true;
+                    self.current_budget_report
+                        .stages
+                        .push(("S6-joint-pair", 0, 0, 1));
+                } else {
+                    let stage_start = Instant::now();
+                    let mut extra =
+                        self.joint_pair_retry_pass(&spectrogram, &sync_candidates, &pass_decoded);
+                    // hb-129: stamp joint-pair-retry decodes at pass completion.
+                    let now_elapsed = start_time.elapsed();
+                    for m in extra.iter_mut() {
+                        if m.decode_time_into_window.is_none() {
+                            m.decode_time_into_window = Some(now_elapsed);
+                        }
+                        m.stamp_decode_origin(4);
                     }
-                    m.stamp_decode_origin(4);
+                    let done = extra.len() as u32;
+                    pass_decoded.extend(extra);
+                    self.current_budget_report.stages.push((
+                        "S6-joint-pair",
+                        stage_start.elapsed().as_millis() as u32,
+                        done,
+                        0,
+                    ));
                 }
-                pass_decoded.extend(extra);
             }
 
             // hb-048 Session 3: a7 template cross-correlation pass. After
@@ -2933,36 +3000,52 @@ impl Ft8Decoder {
             // iteration also avoids inadvertently re-templating against
             // freshly-decoded 4th-pass output (which would be a fresh
             // false-positive surface).
+            // Decoder-speed-overhaul Task 11: budget-checkpointed (S7).
+            // Under `DecodeBudget::unlimited()` this never trips, so
+            // the a7 pass always runs exactly as before this task.
             if self.config.a7_enabled && !is_fourth_pass_after_a7 {
-                let mut extra = self.a7_cross_correlation_pass(
-                    &spectrogram,
-                    &sync_candidates,
-                    &pass_decoded,
-                    &ap_context_for_pass.recent_calls,
-                );
-                let now_elapsed = start_time.elapsed();
-                for m in extra.iter_mut() {
-                    if m.decode_time_into_window.is_none() {
-                        m.decode_time_into_window = Some(now_elapsed);
+                if !current_budget.has_time() {
+                    self.current_budget_report.budget_exhausted = true;
+                    self.current_budget_report.stages.push(("S7-a7", 0, 0, 1));
+                } else {
+                    let stage_start = Instant::now();
+                    let mut extra = self.a7_cross_correlation_pass(
+                        &spectrogram,
+                        &sync_candidates,
+                        &pass_decoded,
+                        &ap_context_for_pass.recent_calls,
+                    );
+                    let now_elapsed = start_time.elapsed();
+                    for m in extra.iter_mut() {
+                        if m.decode_time_into_window.is_none() {
+                            m.decode_time_into_window = Some(now_elapsed);
+                        }
+                        m.stamp_decode_origin(5);
                     }
-                    m.stamp_decode_origin(5);
-                }
-                // Track a7-attributed decodes for the 4th-pass-after-a7
-                // AP-extension. We capture (text, from_callsign, snr)
-                // before extending `pass_decoded` so we can correlate
-                // them against the final dedup result.
-                if fourth_pass_after_a7_enabled {
-                    for m in extra.iter() {
-                        if a7_emitted_texts.insert(m.text.clone()) {
-                            if let Some(ref from) = m.message.from_callsign {
-                                if !from.is_empty() {
-                                    a7_discovered_calls.push((from.clone(), m.snr_db));
+                    // Track a7-attributed decodes for the 4th-pass-after-a7
+                    // AP-extension. We capture (text, from_callsign, snr)
+                    // before extending `pass_decoded` so we can correlate
+                    // them against the final dedup result.
+                    if fourth_pass_after_a7_enabled {
+                        for m in extra.iter() {
+                            if a7_emitted_texts.insert(m.text.clone()) {
+                                if let Some(ref from) = m.message.from_callsign {
+                                    if !from.is_empty() {
+                                        a7_discovered_calls.push((from.clone(), m.snr_db));
+                                    }
                                 }
                             }
                         }
                     }
+                    let done = extra.len() as u32;
+                    pass_decoded.extend(extra);
+                    self.current_budget_report.stages.push((
+                        "S7-a7",
+                        stage_start.elapsed().as_millis() as u32,
+                        done,
+                        0,
+                    ));
                 }
-                pass_decoded.extend(extra);
             }
 
             // hb-086 V3 (SHELVED 2026-05-31): see
