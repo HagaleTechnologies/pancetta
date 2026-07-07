@@ -57,6 +57,7 @@ use tracing::{debug, info};
 // Re-export all configuration modules
 pub mod audio;
 pub mod autonomous;
+pub mod decoder;
 pub mod fox;
 pub mod hot_reload;
 pub mod hound;
@@ -69,6 +70,7 @@ pub mod ui;
 
 pub use audio::*;
 pub use autonomous::*;
+pub use decoder::*;
 pub use fox::*;
 pub use hound::*;
 pub use loader::*;
@@ -155,6 +157,10 @@ pub struct Config {
     #[serde(default)]
     pub tx_placement: tx_placement::TxPlacementConfig,
 
+    /// Decoder effort/budget configuration
+    #[serde(default)]
+    pub decoder: decoder::DecoderConfig,
+
     /// Metadata about the configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConfigMetadata>,
@@ -188,6 +194,7 @@ impl Default for Config {
             hound: hound::HoundConfig::default(),
             fox: fox::FoxConfig::default(),
             tx_placement: tx_placement::TxPlacementConfig::default(),
+            decoder: decoder::DecoderConfig::default(),
             metadata: Some(ConfigMetadata {
                 version: "1.0".to_string(),
                 last_modified: Some(chrono::Utc::now()),
@@ -238,6 +245,7 @@ impl Config {
         self.hound.validate_section()?;
         self.fox.validate_section()?;
         self.tx_placement.validate_section()?;
+        self.decoder.validate_section()?;
 
         info!("Configuration validation successful");
         Ok(())
@@ -256,6 +264,7 @@ impl Config {
         self.hound.merge_with(other.hound);
         self.fox.merge_with(other.fox);
         self.tx_placement.merge_with(other.tx_placement);
+        self.decoder.merge_with(other.decoder);
 
         // Update metadata
         if let Some(ref mut metadata) = self.metadata {
