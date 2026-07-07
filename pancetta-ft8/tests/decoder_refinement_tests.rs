@@ -13,6 +13,14 @@ mod refinement {
     /// Helper: generate a known FT8 signal at a specific frequency offset
     /// and verify the decoder finds it. Returns (decoded_count, frequency_error_hz).
     fn decode_at_offset(freq_offset: f64) -> (usize, f64) {
+        decode_at_offset_with_config(freq_offset, Ft8Config::default())
+    }
+
+    /// Same as `decode_at_offset` but with a caller-supplied `Ft8Config`,
+    /// so tests can exercise non-default flags (e.g.
+    /// `fine_fft_rect_window`, Task W1.3) end-to-end through
+    /// `decode_window`.
+    fn decode_at_offset_with_config(freq_offset: f64, config: Ft8Config) -> (usize, f64) {
         use pancetta_ft8::encoder::Ft8Encoder;
         use pancetta_ft8::modulator::Ft8Modulator;
 
@@ -30,7 +38,6 @@ mod refinement {
             }
         }
 
-        let config = Ft8Config::default();
         let mut decoder = Ft8Decoder::new(config).unwrap();
         let decoded = decoder.decode_window(&samples).unwrap();
 
@@ -192,6 +199,37 @@ mod refinement {
             "Multi-pass ({}) should decode at least as many as single-pass ({})",
             decoded3.len(),
             decoded1.len()
+        );
+    }
+
+    /// Task W1.3 (decoder-TP-sensitivity plan): `Ft8Config::default()`
+    /// must keep `fine_fft_rect_window` off until the hard-200 A/B gate
+    /// passes — a regression guard against an accidental default flip.
+    #[test]
+    fn test_fine_fft_rect_window_default_is_off() {
+        assert!(
+            !Ft8Config::default().fine_fft_rect_window,
+            "fine_fft_rect_window must default to false pending the A/B gate"
+        );
+    }
+
+    /// Task W1.3: sanity end-to-end check that enabling the rectangular
+    /// fine-FFT window doesn't break ordinary decoding of a clean,
+    /// bin-center signal (the flag only changes the Hann-vs-rect window
+    /// used on the `sync_score >= 3.5` fine-FFT fallback path; a strong
+    /// clean signal typically decodes on the coarse spectrogram path
+    /// before that fallback is even reached, so this is a coarse
+    /// regression guard, not a sensitivity claim — the sensitivity claim
+    /// is validated by the hard-200 A/B gate, see
+    /// `research/experiments/`).
+    #[test]
+    fn test_fine_fft_rect_window_flag_does_not_break_clean_decode() {
+        let mut config = Ft8Config::default();
+        config.fine_fft_rect_window = true;
+        let (count, _) = decode_at_offset_with_config(0.0, config);
+        assert!(
+            count >= 1,
+            "Should still decode a clean bin-center signal with fine_fft_rect_window enabled"
         );
     }
 }

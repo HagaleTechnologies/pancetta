@@ -365,6 +365,14 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W1.3 [A/B]: rectangular (no) window
+    /// on the fine-FFT fallback's symbol-length FFT instead of Hann.
+    /// See `Ft8Config::fine_fft_rect_window`.
+    pub fn with_fine_fft_rect_window(mut self, on: bool) -> Self {
+        self.config.fine_fft_rect_window = on;
+        self
+    }
+
     /// Decoder-speed-overhaul Task 9/10: shallow BP iteration count for
     /// the S1/S2 primary decode. See `Ft8Config::floor_iters`.
     pub fn with_floor_iters(mut self, n: usize) -> Self {

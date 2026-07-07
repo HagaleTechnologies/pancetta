@@ -1128,6 +1128,22 @@ pub struct Ft8Config {
     /// S1/S2 run BP at `ldpc_iterations` exactly as before, and
     /// `floor_iters`/`deep_iters`/`escalation_parity_max` are unused.
     pub escalation_enabled: bool,
+
+    /// Decoder-TP-sensitivity Task W1.3 [A/B]: use a rectangular
+    /// (i.e. no) window instead of a Hann window on the symbol-length
+    /// FFT in the fine-FFT fallback (`extract_symbols_complex` /
+    /// `par_extract_symbols_complex`, gated at `sync_score >= 3.5`).
+    /// A Hann window costs ~1.8 dB of coherent SNR and leaks ~-6 dB of
+    /// each tone's energy into its neighbors — destroying the 8-FSK
+    /// tone orthogonality that a rectangular one-symbol-period window
+    /// preserves — exactly on the path meant to rescue marginal
+    /// candidates the coarse spectrogram path couldn't decode. When
+    /// `false` (default until the hard-200 A/B gate passes), the
+    /// fine-FFT fallback is byte-identical to the historical Hann-
+    /// windowed path. See
+    /// `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`
+    /// §3.
+    pub fine_fft_rect_window: bool,
 }
 
 impl Default for Ft8Config {
@@ -1463,6 +1479,11 @@ impl Default for Ft8Config {
             // `research/experiments/`). When false, S1/S2 decode
             // behavior is byte-identical to pre-Task-10.
             escalation_enabled: false,
+            // [A/B] default OFF (Task W1.3) until the hard-200 gate
+            // passes (see `research/experiments/`). When false, the
+            // fine-FFT fallback is byte-identical to the historical
+            // Hann-windowed path.
+            fine_fft_rect_window: false,
         }
     }
 }
@@ -1796,14 +1817,26 @@ impl Ft8Decoder {
             config.ldpc_feedback_erase_threshold,
         );
 
-        // Pre-compute FFT plan and Hann window for symbol extraction
+        // Pre-compute FFT plan and window for symbol extraction (fine-FFT
+        // fallback only — see `extract_symbols_complex` /
+        // `par_extract_symbols_complex`). Hann by default; Task W1.3
+        // [A/B] (`fine_fft_rect_window`) swaps in a rectangular (i.e.
+        // no) window, which preserves 8-FSK tone orthogonality instead
+        // of costing ~1.8 dB coherent loss + inter-tone leakage. This
+        // field is consumed exclusively by that fallback path, so
+        // baking the choice in once here (rather than branching per
+        // sample in the hot loop) is behavior-preserving and free.
         let sps = protocol_params.samples_per_symbol(SAMPLE_RATE);
         let mut planner = FftPlanner::<f64>::new();
         let symbol_fft = planner.plan_fft_forward(sps);
         let pi2 = 2.0 * std::f64::consts::PI;
-        let symbol_window: Vec<f64> = (0..sps)
-            .map(|i| 0.5 * (1.0 - (pi2 * i as f64 / (sps - 1) as f64).cos()))
-            .collect();
+        let symbol_window: Vec<f64> = if config.fine_fft_rect_window {
+            vec![1.0; sps]
+        } else {
+            (0..sps)
+                .map(|i| 0.5 * (1.0 - (pi2 * i as f64 / (sps - 1) as f64).cos()))
+                .collect()
+        };
 
         let symbol_fft_buffer = vec![Complex::new(0.0, 0.0); sps];
 
@@ -12142,6 +12175,78 @@ mod tests {
                 m[target_tone as usize],
                 m[0]
             );
+        }
+    }
+
+    /// Task W1.3 (decoder-TP-sensitivity plan): proves the physics
+    /// motivating `Ft8Config::fine_fft_rect_window`. A pure FT8 tone at
+    /// exact bin center, run through the REAL production
+    /// `extract_symbols_complex` fine-FFT path: with the default Hann
+    /// window, energy leaks into the immediate neighbor tone bins
+    /// (~-6 dB, matching the ~1.8 dB coherent loss / -6 dB leakage
+    /// documented in `docs/superpowers/specs/
+    /// 2026-07-06-decoder-tp-sensitivity-design.md` §3); with the
+    /// rectangular (no) window, a bin-centered tone nulls every other
+    /// DFT bin (near machine precision), preserving 8-FSK tone
+    /// orthogonality. This is not a reimplementation — it calls the
+    /// actual decoder method with both config states.
+    #[test]
+    fn test_fine_fft_window_tone_leakage_physics() {
+        // Same synthetic single-tone construction as
+        // `test_complex_dft_tone_detection` above: tone index 3, exact
+        // bin center (1500 + 3*6.25 Hz).
+        let base_freq = 1500.0;
+        let target_tone = 3usize;
+        let neighbor_tones = [target_tone - 1, target_tone + 1];
+        let freq = base_freq + target_tone as f64 * TONE_SPACING;
+
+        let mut audio = vec![0.0f64; WINDOW_SAMPLES];
+        for (i, sample) in audio.iter_mut().enumerate() {
+            let t = i as f64 / SAMPLE_RATE as f64;
+            *sample = (2.0 * PI * freq * t).sin() * 0.5;
+        }
+
+        // Hann window (default, flag off): expect strong leakage into
+        // the immediate neighbor bins.
+        let hann_config = Ft8Config {
+            fine_fft_rect_window: false,
+            ..Ft8Config::default()
+        };
+        let mut hann_decoder = Ft8Decoder::new(hann_config).unwrap();
+        let (_, hann_mags) = hann_decoder
+            .extract_symbols_complex(&audio, 0, base_freq)
+            .unwrap();
+
+        // Rectangular window (flag on): expect near-zero leakage — a
+        // tone at exact bin center is orthogonal to every other DFT
+        // bin under a rectangular window.
+        let rect_config = Ft8Config {
+            fine_fft_rect_window: true,
+            ..Ft8Config::default()
+        };
+        let mut rect_decoder = Ft8Decoder::new(rect_config).unwrap();
+        let (_, rect_mags) = rect_decoder
+            .extract_symbols_complex(&audio, 0, base_freq)
+            .unwrap();
+
+        for &neighbor in &neighbor_tones {
+            for (i, (hm, rm)) in hann_mags.iter().zip(rect_mags.iter()).enumerate() {
+                let hann_ratio = hm[neighbor] / hm[target_tone];
+                let hann_db = 20.0 * hann_ratio.log10();
+                assert!(
+                    hann_db >= -8.0,
+                    "symbol {i}: Hann neighbor tone {neighbor} leakage {hann_db:.2} dB \
+                     should be >= -8 dB (documents the leakage the rect window removes)"
+                );
+
+                let rect_ratio = (rm[neighbor] / rm[target_tone]).max(1e-300);
+                let rect_db = 20.0 * rect_ratio.log10();
+                assert!(
+                    rect_db <= -40.0,
+                    "symbol {i}: rect neighbor tone {neighbor} leakage {rect_db:.2} dB \
+                     should be <= -40 dB (bin-centered tone orthogonality)"
+                );
+            }
         }
     }
 

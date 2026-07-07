@@ -67,6 +67,10 @@ struct Args {
     /// Decoder-speed-overhaul Task 10 [A/B]: master switch for the BP
     /// escalation ladder. See `Ft8Config::escalation_enabled`.
     escalation_enabled: Option<bool>,
+    /// Decoder-TP-sensitivity Task W1.3 [A/B]: rectangular (no) window
+    /// on the fine-FFT fallback's symbol FFT instead of Hann. See
+    /// `Ft8Config::fine_fft_rect_window`.
+    fine_fft_rect_window: Option<bool>,
     /// Decoder-speed-overhaul Task 9/10: shallow BP iteration count.
     /// See `Ft8Config::floor_iters`.
     floor_iters: Option<usize>,
@@ -215,6 +219,7 @@ impl Args {
         let mut pade_atanh: Option<bool> = None;
         let mut costas_half_loop_disabled: Option<bool> = None;
         let mut escalation_enabled: Option<bool> = None;
+        let mut fine_fft_rect_window: Option<bool> = None;
         let mut floor_iters: Option<usize> = None;
         let mut deep_iters: Option<usize> = None;
         let mut escalation_parity_max: Option<usize> = None;
@@ -417,6 +422,9 @@ impl Args {
                 }
                 "--escalation-enabled" => {
                     escalation_enabled = Some(true);
+                }
+                "--fine-fft-rect-window" => {
+                    fine_fft_rect_window = Some(true);
                 }
                 "--floor-iters" => {
                     floor_iters = Some(
@@ -692,6 +700,7 @@ impl Args {
                     eprintln!("  --pade-atanh: F1 [A/B] — use the Padé rational approximant for atanh in the BP check-node update instead of the exact ln form (default off)");
                     eprintln!("  --costas-half-loop-disabled: F5 [A/B] — evaluate only half=0 in the Costas sync kernel's half-symbol inner loop instead of max(half=0, half=1) (default off)");
                     eprintln!("  --escalation-enabled: decoder-speed-overhaul Task 10 [A/B] — BP escalation ladder master switch (default off). See Ft8Config::escalation_enabled.");
+                    eprintln!("  --fine-fft-rect-window: decoder-TP-sensitivity Task W1.3 [A/B] — rectangular (no) window on the fine-FFT fallback symbol FFT instead of Hann (default off). See Ft8Config::fine_fft_rect_window.");
                     eprintln!("  --floor-iters N: shallow BP iteration count for S1/S2 when --escalation-enabled (default 25).");
                     eprintln!("  --deep-iters N: deep BP iteration count a near-miss floor failure is escalated to (default 100).");
                     eprintln!("  --escalation-parity-max N: max unsatisfied parity checks at floor_iters tolerated before escalating (default 30).");
@@ -732,6 +741,7 @@ impl Args {
             pade_atanh,
             costas_half_loop_disabled,
             escalation_enabled,
+            fine_fft_rect_window,
             floor_iters,
             deep_iters,
             escalation_parity_max,
@@ -1735,6 +1745,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.escalation_enabled {
         d = d.with_escalation_enabled(on);
+    }
+    if let Some(on) = args.fine_fft_rect_window {
+        d = d.with_fine_fft_rect_window(on);
     }
     if let Some(v) = args.floor_iters {
         d = d.with_floor_iters(v);
