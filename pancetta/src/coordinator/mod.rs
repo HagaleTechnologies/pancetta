@@ -664,6 +664,25 @@ pub struct ApplicationCoordinator {
     /// relay's periodic `PipelineHealth` push.
     decode_last_budget_exhausted: Arc<AtomicBool>,
 
+    /// Operator-facing decode-effort preset (decoder-speed-overhaul
+    /// Task 15), encoded via `pancetta_config::DecodeEffort::as_u8`/
+    /// `from_u8`. Seeded from `[decoder].effort` at startup; from this task
+    /// onward it is also the state the TUI's `e` keybinding cycles
+    /// (Eco → Standard → Deep → Max → Auto → Eco) via
+    /// `effort::cycle_decode_effort`, which also re-derives and writes
+    /// `decode_effort_budget_ms` for the new preset.
+    current_decode_effort: Arc<std::sync::atomic::AtomicU8>,
+
+    /// Best-known hardware tier (decoder-speed-overhaul Task 15), encoded
+    /// via `pancetta_ft8::tier_probe::HardwareTier::as_u8`/`from_u8`.
+    /// Mirrors `scoped_fast_path`'s "innocent until proven otherwise"
+    /// convention: seeded `Fast` before the tier probe resolves, then
+    /// re-seeded by `tier::initialize` on both the synchronous cache-hit
+    /// path and the async probe-completion path. Read by the `e`
+    /// keybinding's `CycleDecodeEffort` handler so a live cycle onto `Auto`
+    /// resolves the correct tier-derived budget without re-probing.
+    resolved_hardware_tier: Arc<std::sync::atomic::AtomicU8>,
+
     /// `true` when the read-only `remote_gateway` component is enabled
     /// (`[network.remote_gateway].enabled`). Cached from config at construction
     /// so the display-event emit sites (decode fan-out, QSO snapshot, freq,
@@ -1034,11 +1053,25 @@ impl ApplicationCoordinator {
             pancetta_ft8::tier_probe::HardwareTier::Fast,
             &decode_effort_budget_ms,
         );
+        // decoder-speed-overhaul Task 15: the operator's current decode-effort
+        // preset, so the TUI's `e` cycle key has a starting point that
+        // matches `[decoder].effort` rather than always starting from Auto.
+        let current_decode_effort = Arc::new(std::sync::atomic::AtomicU8::new(
+            decoder_effort_init.as_u8(),
+        ));
+        // Assume Fast until the tier probe resolves (same convention as the
+        // `decode_effort_budget_ms` seed just above); `tier::initialize`
+        // re-seeds this with the real tier on both the cache-hit and
+        // background-probe-completion paths.
+        let resolved_hardware_tier = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
+        ));
         let scoped_fast_path = tier::initialize(
             ft8_config.clone(),
             decoder_effort_init,
             decoder_budget_override_init,
             decode_effort_budget_ms.clone(),
+            resolved_hardware_tier.clone(),
         )
         .await;
 
@@ -1134,6 +1167,8 @@ impl ApplicationCoordinator {
             decode_effort_budget_ms,
             decode_last_elapsed_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             decode_last_budget_exhausted: Arc::new(AtomicBool::new(false)),
+            current_decode_effort,
+            resolved_hardware_tier,
             gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
             fox_mode: Arc::new(AtomicBool::new(false)),
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
@@ -1478,6 +1513,18 @@ impl ApplicationCoordinator {
     /// writer (config/TUI-driven effort presets).
     pub(crate) fn decode_effort_budget_ms(&self) -> Arc<std::sync::atomic::AtomicU64> {
         self.decode_effort_budget_ms.clone()
+    }
+
+    /// Operator-facing decode-effort preset atomic (decoder-speed-overhaul
+    /// Task 15). See the field doc comment on `current_decode_effort`.
+    pub(crate) fn current_decode_effort(&self) -> Arc<std::sync::atomic::AtomicU8> {
+        self.current_decode_effort.clone()
+    }
+
+    /// Best-known hardware tier atomic (decoder-speed-overhaul Task 15).
+    /// See the field doc comment on `resolved_hardware_tier`.
+    pub(crate) fn resolved_hardware_tier(&self) -> Arc<std::sync::atomic::AtomicU8> {
+        self.resolved_hardware_tier.clone()
     }
 
     /// Station-agent remote-TX arm gate (shared handle). Cloned into the TX

@@ -36,7 +36,7 @@
 //!    design spec (2026-07-06, §6.2) — can call it directly instead of
 //!    re-deriving the mapping.
 
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicU8, Ordering};
 
 use pancetta_config::DecodeEffort;
 use pancetta_ft8::tier_probe::HardwareTier;
@@ -82,6 +82,35 @@ pub(crate) fn seed_effort_budget(
 ) {
     let budget = budget_override.unwrap_or_else(|| preset_budget_ms(effort, tier));
     decode_effort_budget_ms.store(budget, Ordering::Release);
+}
+
+/// Cycle the operator's live decode-effort preset (Eco → Standard → Deep →
+/// Max → Auto → Eco — decoder-speed-overhaul Task 15, TUI `e` keybinding)
+/// and immediately write the resulting budget into the shared atomic.
+///
+/// Unlike [`seed_effort_budget`], this deliberately ignores any config
+/// `budget_ms` override: an explicit operator keypress asking for a
+/// different preset should win over a static config value, not have the
+/// override silently re-clobber it back. `current_effort` is read/written
+/// with the SAME stable `u8` encoding as [`DecodeEffort::as_u8`]/`from_u8`,
+/// so it round-trips exactly through the atomic across repeated presses.
+///
+/// Returns `(new_preset, new_budget_ms)` — the caller (the TUI relay's
+/// command handler) uses this to build the `DecodeEffortUpdate` echo sent
+/// back to the operator; no active-QSO gate is needed here (a budget change
+/// never invalidates in-flight decode state — spec §6.2), so this always
+/// succeeds.
+pub(crate) fn cycle_decode_effort(
+    current_effort: &AtomicU8,
+    decode_effort_budget_ms: &AtomicU64,
+    tier: HardwareTier,
+) -> (DecodeEffort, u64) {
+    let current = DecodeEffort::from_u8(current_effort.load(Ordering::Acquire));
+    let next = current.cycle();
+    current_effort.store(next.as_u8(), Ordering::Release);
+    let budget = preset_budget_ms(next, tier);
+    decode_effort_budget_ms.store(budget, Ordering::Release);
+    (next, budget)
 }
 
 #[cfg(test)]
@@ -180,5 +209,49 @@ mod tests {
         let atomic = AtomicU64::new(0);
         seed_effort_budget(DecodeEffort::Auto, None, HardwareTier::Moderate, &atomic);
         assert_eq!(atomic.load(Ordering::Acquire), 250);
+    }
+
+    // ------------------------------------------------------------------
+    // decoder-speed-overhaul Task 15: TUI live effort cycling
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cycle_decode_effort_advances_preset_and_writes_budget() {
+        let current_effort = AtomicU8::new(DecodeEffort::Eco.as_u8());
+        let budget = AtomicU64::new(1);
+        let (next, budget_ms) = cycle_decode_effort(&current_effort, &budget, HardwareTier::Fast);
+        assert_eq!(next, DecodeEffort::Standard, "Eco -> Standard");
+        assert_eq!(budget_ms, 250);
+        assert_eq!(
+            current_effort.load(Ordering::Acquire),
+            DecodeEffort::Standard.as_u8(),
+            "current-effort atomic must reflect the new preset"
+        );
+        assert_eq!(
+            budget.load(Ordering::Acquire),
+            250,
+            "decode_effort_budget_ms atomic must be updated to the new preset's budget"
+        );
+    }
+
+    #[test]
+    fn cycle_decode_effort_wraps_from_max_to_auto_and_resolves_via_tier() {
+        let current_effort = AtomicU8::new(DecodeEffort::Max.as_u8());
+        let budget = AtomicU64::new(0);
+        let (next, budget_ms) = cycle_decode_effort(&current_effort, &budget, HardwareTier::Slow);
+        assert_eq!(next, DecodeEffort::Auto, "Max -> Auto");
+        // Auto on a Slow tier resolves to the 1ms floor-only budget.
+        assert_eq!(budget_ms, 1);
+        assert_eq!(budget.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn cycle_decode_effort_wraps_from_auto_to_eco() {
+        let current_effort = AtomicU8::new(DecodeEffort::Auto.as_u8());
+        let budget = AtomicU64::new(1000);
+        let (next, budget_ms) = cycle_decode_effort(&current_effort, &budget, HardwareTier::Fast);
+        assert_eq!(next, DecodeEffort::Eco, "Auto -> Eco");
+        assert_eq!(budget_ms, 1);
+        assert_eq!(budget.load(Ordering::Acquire), 1);
     }
 }

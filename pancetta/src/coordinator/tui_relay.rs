@@ -372,6 +372,17 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::TxPolicyUpdate { policy },
                             );
                         }
+                        MessageType::DecodeEffortStatus { effort, budget_ms } => {
+                            // Echo the live decode-effort preset to the
+                            // "DECODE: <PRESET> <ms>ms" title-bar chip
+                            // (decoder-speed-overhaul Task 15).
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::DecodeEffortUpdate {
+                                    effort,
+                                    budget_ms,
+                                },
+                            );
+                        }
                         MessageType::SplitStatus { tx_hz } => {
                             // Echo the authoritative split TX state to the
                             // title-bar chip. Sent from all three split-atomic
@@ -737,6 +748,14 @@ impl super::ApplicationCoordinator {
         // relay arm; read by the manual-call handler at QSO open to place our
         // TX audio offset when the operator has set one.
         let cmd_tx_offset_hold_hz = self.tx_offset_hold_hz();
+        // decoder-speed-overhaul Task 15: live decode-effort cycling (`e`).
+        // The handler cycles `cmd_current_decode_effort`, resolves `Auto`
+        // against `cmd_resolved_hardware_tier`, and writes the resulting
+        // budget into `cmd_decode_effort_budget_ms` — the same atomic
+        // `ft8.rs` reads at both budgeted decode call sites.
+        let cmd_current_decode_effort = self.current_decode_effort();
+        let cmd_resolved_hardware_tier = self.resolved_hardware_tier();
+        let cmd_decode_effort_budget_ms = self.decode_effort_budget_ms();
         // Mode-switch machinery (Shift+M). Cloned here (not previously
         // needed by this task) so the CycleOperatingMode handler can call
         // `try_switch_operating_mode` directly, mirroring how `cmd_tx_policy`
@@ -836,6 +855,28 @@ impl super::ApplicationCoordinator {
                 let on = cmd_fox_mode.load(Ordering::Acquire);
                 let _ =
                     cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::FoxModeUpdate { on });
+            }
+
+            // Seed the decode-effort chip so it is authoritative from frame 1
+            // (decoder-speed-overhaul Task 15) — mirrors the TxPolicyUpdate /
+            // FoxModeUpdate seeds above. Without this, a persisted
+            // `tui_state.json` guess (or the field's zero-value default)
+            // would show until the operator's first `e` press; pushing the
+            // REAL seeded preset + budget once at startup means the chip is
+            // never stale, even across a restart with a non-default
+            // `[decoder].effort`.
+            {
+                let effort = pancetta_config::DecodeEffort::from_u8(
+                    cmd_current_decode_effort.load(Ordering::Acquire),
+                )
+                .label()
+                .to_string();
+                let budget_ms = cmd_decode_effort_budget_ms.load(Ordering::Acquire);
+                let _ =
+                    cmd_tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::DecodeEffortUpdate {
+                        effort,
+                        budget_ms,
+                    });
             }
 
             // Surface any non-fatal config-load warnings to the operator as an
@@ -1514,6 +1555,38 @@ impl super::ApplicationCoordinator {
                                     );
                                 }
                             }
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::CycleDecodeEffort => {
+                            // Operator pressed `e`: cycle the live decode-effort
+                            // preset Eco → Standard → Deep → Max → Auto → Eco
+                            // (decoder-speed-overhaul Task 15). Unlike
+                            // CycleOperatingMode this can NEVER be refused — a
+                            // budget change never invalidates in-flight decode
+                            // state (spec §6.2) — so there is no active-QSO
+                            // gate and no optimistic local flip on the TUI side;
+                            // the TUI simply waits for this authoritative echo.
+                            let tier = pancetta_ft8::tier_probe::HardwareTier::from_u8(
+                                cmd_resolved_hardware_tier.load(Ordering::Acquire),
+                            );
+                            let (next, budget_ms) = super::effort::cycle_decode_effort(
+                                &cmd_current_decode_effort,
+                                &cmd_decode_effort_budget_ms,
+                                tier,
+                            );
+                            let label = next.label().to_string();
+                            info!(
+                                target: "decoder.effort",
+                                "Operator cycled decode effort -> {} (budget={}ms, tier={})",
+                                label,
+                                budget_ms,
+                                tier.as_str()
+                            );
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::DecodeEffortUpdate {
+                                    effort: label,
+                                    budget_ms,
+                                },
+                            );
                         }
                         pancetta_tui::tui_runner::TuiCommand::ToggleTxFreqMode => {
                             // Operator pressed `f`: toggle the TX-frequency mode

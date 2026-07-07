@@ -27,6 +27,60 @@ pub enum DecodeEffort {
     Max,
 }
 
+impl DecodeEffort {
+    /// Stable `u8` encoding for atomic storage (decoder-speed-overhaul
+    /// Task 15, TUI live effort cycling). The mapping is fixed and MUST NOT
+    /// change (`0` = Eco, `1` = Standard, `2` = Deep, `3` = Max, `4` = Auto).
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            DecodeEffort::Eco => 0,
+            DecodeEffort::Standard => 1,
+            DecodeEffort::Deep => 2,
+            DecodeEffort::Max => 3,
+            DecodeEffort::Auto => 4,
+        }
+    }
+
+    /// Decode a [`DecodeEffort`] from its stable `u8` encoding (see
+    /// [`DecodeEffort::as_u8`]). Any unrecognized value decodes to the safe
+    /// default [`DecodeEffort::Auto`] — callers writing the atomic only ever
+    /// store values produced by `as_u8`, so this branch is defensive.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => DecodeEffort::Eco,
+            1 => DecodeEffort::Standard,
+            2 => DecodeEffort::Deep,
+            3 => DecodeEffort::Max,
+            4 => DecodeEffort::Auto,
+            _ => DecodeEffort::Auto,
+        }
+    }
+
+    /// Cycle to the next preset in the Eco → Standard → Deep → Max → Auto →
+    /// Eco order. Drives the operator's live decode-effort keybinding (`e`
+    /// in the TUI).
+    pub fn cycle(&self) -> Self {
+        match self {
+            DecodeEffort::Eco => DecodeEffort::Standard,
+            DecodeEffort::Standard => DecodeEffort::Deep,
+            DecodeEffort::Deep => DecodeEffort::Max,
+            DecodeEffort::Max => DecodeEffort::Auto,
+            DecodeEffort::Auto => DecodeEffort::Eco,
+        }
+    }
+
+    /// Upper-case label for the TUI status chip (`DECODE: <PRESET> ...`).
+    pub fn label(&self) -> &'static str {
+        match self {
+            DecodeEffort::Eco => "ECO",
+            DecodeEffort::Standard => "STANDARD",
+            DecodeEffort::Deep => "DEEP",
+            DecodeEffort::Max => "MAX",
+            DecodeEffort::Auto => "AUTO",
+        }
+    }
+}
+
 /// Decoder effort/budget configuration.
 ///
 /// Corresponds to the `[decoder]` section in the TOML config file.
@@ -178,5 +232,45 @@ mod tests {
             Some(9_999),
             "budget_ms must survive merge_with"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // decoder-speed-overhaul Task 15: TUI live effort cycling
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn cycle_follows_eco_standard_deep_max_auto_eco_order() {
+        assert_eq!(DecodeEffort::Eco.cycle(), DecodeEffort::Standard);
+        assert_eq!(DecodeEffort::Standard.cycle(), DecodeEffort::Deep);
+        assert_eq!(DecodeEffort::Deep.cycle(), DecodeEffort::Max);
+        assert_eq!(DecodeEffort::Max.cycle(), DecodeEffort::Auto);
+        assert_eq!(DecodeEffort::Auto.cycle(), DecodeEffort::Eco);
+    }
+
+    #[test]
+    fn as_u8_from_u8_round_trip_for_every_variant() {
+        for effort in [
+            DecodeEffort::Eco,
+            DecodeEffort::Standard,
+            DecodeEffort::Deep,
+            DecodeEffort::Max,
+            DecodeEffort::Auto,
+        ] {
+            assert_eq!(DecodeEffort::from_u8(effort.as_u8()), effort);
+        }
+    }
+
+    #[test]
+    fn from_u8_unrecognized_value_defaults_to_auto() {
+        assert_eq!(DecodeEffort::from_u8(255), DecodeEffort::Auto);
+    }
+
+    #[test]
+    fn label_is_upper_case_preset_name() {
+        assert_eq!(DecodeEffort::Eco.label(), "ECO");
+        assert_eq!(DecodeEffort::Standard.label(), "STANDARD");
+        assert_eq!(DecodeEffort::Deep.label(), "DEEP");
+        assert_eq!(DecodeEffort::Max.label(), "MAX");
+        assert_eq!(DecodeEffort::Auto.label(), "AUTO");
     }
 }

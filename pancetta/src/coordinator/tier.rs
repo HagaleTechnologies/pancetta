@@ -44,7 +44,7 @@
 //! and `docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
 
 use pancetta_config::DecodeEffort;
@@ -294,7 +294,9 @@ pub(crate) async fn apply_tier(
 ///
 /// Also re-seeds `decode_effort_budget_ms` (decoder-speed-overhaul Task 14)
 /// with the now-known tier via [`seed_effort_budget`], honoring
-/// `budget_override` when set.
+/// `budget_override` when set, and stores the resolved tier into
+/// `resolved_hardware_tier` (decoder-speed-overhaul Task 15) so a later live
+/// `Auto` decode-effort cycle resolves the correct tier-derived budget.
 #[allow(clippy::too_many_arguments)]
 fn spawn_probe_worker(
     cpu_model: String,
@@ -306,6 +308,7 @@ fn spawn_probe_worker(
     effort: DecodeEffort,
     budget_override: Option<u64>,
     decode_effort_budget_ms: Arc<AtomicU64>,
+    resolved_hardware_tier: Arc<AtomicU8>,
 ) {
     tokio::task::spawn_blocking(move || {
         let result = match pancetta_ft8::tier_probe::probe_hardware_tier(10) {
@@ -361,6 +364,7 @@ fn spawn_probe_worker(
             result.tier,
             &decode_effort_budget_ms,
         );
+        resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
         info!(
             "tier probe: decode_effort_budget_ms re-seeded for {} tier",
             result.tier.as_str()
@@ -382,17 +386,24 @@ fn spawn_probe_worker(
 /// `coordinator/mod.rs`), since a cache-miss means the real tier isn't
 /// known until the probe completes.
 ///
+/// Also stores the resolved tier into `resolved_hardware_tier`
+/// (decoder-speed-overhaul Task 15), same seed-then-reconcile shape, so the
+/// TUI's live `e` decode-effort cycle can resolve `Auto` against the real
+/// tier without re-probing.
+///
 /// `ft8_config` no longer drives a tier-based preset rewrite here (Task 14
 /// retired the Slow-tier `Ft8Config` rewrite that used to live in
 /// [`apply_tier`]) — the parameter is kept purely so the call site in
 /// `coordinator/mod.rs` still reads naturally alongside the shared decoder
 /// config it constructs; the FT8 hot loop holds its own clone of the same
 /// `Arc` independently of this function.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn initialize(
     _ft8_config: Arc<RwLock<Ft8Config>>,
     effort: DecodeEffort,
     budget_override: Option<u64>,
     decode_effort_budget_ms: Arc<AtomicU64>,
+    resolved_hardware_tier: Arc<AtomicU8>,
 ) -> Arc<AtomicBool> {
     let scoped_fast_path = Arc::new(AtomicBool::new(false));
 
@@ -429,6 +440,7 @@ pub(crate) async fn initialize(
                     summary
                 );
                 seed_effort_budget(effort, budget_override, tier, &decode_effort_budget_ms);
+                resolved_hardware_tier.store(tier.as_u8(), Ordering::Release);
                 false
             } else {
                 debug!("tier cache: unknown tier string '{}', re-probing", c.tier);
@@ -456,6 +468,7 @@ pub(crate) async fn initialize(
             effort,
             budget_override,
             decode_effort_budget_ms,
+            resolved_hardware_tier,
         );
     }
 

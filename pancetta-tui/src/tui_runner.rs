@@ -186,6 +186,19 @@ pub enum TuiMessage {
         /// New mode string (`"FT8"` / `"FT4"` / `"FT2"`).
         mode: String,
     },
+    /// Authoritative decode-effort echo (decoder-speed-overhaul Task 15).
+    /// Sent by the coordinator relay both once at startup (so the chip is
+    /// correct from frame 1) and after every `CycleDecodeEffort` (operator
+    /// `e`). Drives the "DECODE: <PRESET> <ms>ms" title-bar chip; the
+    /// elapsed/exhausted half of that chip comes from `PipelineHealth`
+    /// separately.
+    DecodeEffortUpdate {
+        /// New decode-effort preset label ("ECO"/"STANDARD"/"DEEP"/"MAX"/
+        /// "AUTO").
+        effort: String,
+        /// The budget (ms) now active for this preset (`0` = unlimited).
+        budget_ms: u64,
+    },
     /// Split-TX frequency echo. Sent by the coordinator relay after every
     /// write to the split atomic: modal set, manual band-change clear,
     /// and autonomous band-hop clear. `tx_hz == 0` means simplex (chip
@@ -365,6 +378,15 @@ pub enum TuiCommand {
     /// flip anything locally; it waits for either a `ModeUpdate` (success)
     /// or a `StatusUpdate` (refusal) echo.
     CycleOperatingMode,
+    /// Operator pressed `e`: cycle the live decode-effort preset Eco →
+    /// Standard → Deep → Max → Auto → Eco (decoder-speed-overhaul Task 15).
+    /// Unlike `CycleOperatingMode` this can NEVER be refused — a budget
+    /// change never invalidates in-flight decode state (spec §6.2), so
+    /// there is no active-QSO gate. No optimistic local flip: the TUI
+    /// waits for the coordinator's authoritative `DecodeEffortUpdate` echo,
+    /// since only the coordinator knows the resolved hardware tier `Auto`
+    /// needs to pick the right budget.
+    CycleDecodeEffort,
     /// Operator pressed `f`: toggle the TX-frequency mode Hold ↔ Auto. The
     /// coordinator flips the shared `tx_freq_mode` atomic. Hold (default) keeps
     /// the operator's picked offset sticky; Auto lets pancetta choose/adjust it
@@ -713,6 +735,9 @@ impl TuiRunner {
                 // Mirrors the same clear `apply_band_selection` does on a
                 // band change.
                 app.clear_live_decode_lists();
+            }
+            TuiMessage::DecodeEffortUpdate { effort, budget_ms } => {
+                app.set_decode_effort(effort, budget_ms);
             }
             TuiMessage::SplitUpdate { tx_hz } => {
                 app.split_tx_hz = tx_hz;
@@ -1492,6 +1517,16 @@ impl TuiRunner {
             // title-bar mode span. Wait for the coordinator's echo.
             KeyCode::Char('M') => {
                 self.message_tx.send(TuiCommand::CycleOperatingMode)?;
+            }
+
+            // e - cycle the live decode-effort preset Eco → Standard → Deep
+            // → Max → Auto → Eco (decoder-speed-overhaul Task 15). No
+            // optimistic local flip (mirrors Shift+M): only the coordinator
+            // knows the resolved hardware tier `Auto` needs, so the TUI
+            // waits for the authoritative `DecodeEffortUpdate` echo. Unlike
+            // Shift+M this can never be refused (no active-QSO gate).
+            KeyCode::Char('e') => {
+                self.message_tx.send(TuiCommand::CycleDecodeEffort)?;
             }
 
             // === Activity views (Phase 2 TUI redesign) ===
@@ -2762,6 +2797,46 @@ mod key_tests {
             app.read().await.station_info.mode,
             mode_before,
             "no optimistic local flip — wait for the coordinator's ModeUpdate/StatusUpdate echo"
+        );
+    }
+
+    /// `e` emits CycleDecodeEffort with NO optimistic local flip (decoder-
+    /// speed-overhaul Task 15) — mirrors Shift+M: only the coordinator
+    /// knows the resolved hardware tier `Auto` needs, so the TUI waits for
+    /// the authoritative `DecodeEffortUpdate` echo. Unlike Shift+M this can
+    /// never be refused, but the plumbing shape is identical.
+    #[tokio::test]
+    async fn key_e_emits_cycle_decode_effort() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        let effort_before = app.read().await.decode_effort.clone();
+        r.handle_key_event(key('e')).await.unwrap();
+        assert!(
+            matches!(cmd_rx.try_recv(), Ok(TuiCommand::CycleDecodeEffort)),
+            "e must emit CycleDecodeEffort"
+        );
+        assert_eq!(
+            app.read().await.decode_effort,
+            effort_before,
+            "no optimistic local flip — wait for the coordinator's DecodeEffortUpdate echo"
+        );
+    }
+
+    /// `DecodeEffortUpdate` (coordinator echo) is the ONLY thing that ever
+    /// changes `app.decode_effort` — the authoritative preset + budget from
+    /// the coordinator's `cycle_decode_effort`/startup seed.
+    #[tokio::test]
+    async fn decode_effort_update_sets_app_state() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        r.handle_message(TuiMessage::DecodeEffortUpdate {
+            effort: "DEEP".to_string(),
+            budget_ms: 1000,
+        })
+        .await
+        .unwrap();
+        assert_eq!(
+            app.read().await.decode_effort,
+            "DEEP",
+            "DecodeEffortUpdate must set app.decode_effort to the echoed preset"
         );
     }
 

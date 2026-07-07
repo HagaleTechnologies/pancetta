@@ -882,6 +882,17 @@ pub struct App {
     /// for instant chip feedback; the coordinator flips the authoritative
     /// shared atomic. Hold (default) keeps the operator's picked offset sticky.
     pub tx_freq_mode: pancetta_core::TxFreqMode,
+    /// Live decode-effort preset label ("ECO"/"STANDARD"/"DEEP"/"MAX"/"AUTO",
+    /// decoder-speed-overhaul Task 15), mirrored from the coordinator's
+    /// `DecodeEffortUpdate` echo (`e` keybinding). No optimistic local flip —
+    /// only the coordinator knows the resolved hardware tier `Auto` needs to
+    /// pick the right budget. Loaded from `~/.pancetta/tui_state.json` at
+    /// startup and persisted alongside `active_view` on every change; the
+    /// coordinator's startup echo corrects a stale persisted guess within
+    /// the first health tick regardless. Drives the "DECODE: <PRESET>
+    /// <ms>ms" title-bar chip (the elapsed-ms/exhausted half comes from
+    /// `pipeline_health` separately).
+    pub decode_effort: String,
     /// The message currently being transmitted (NOW-SENDING), if any.
     /// Updated from the coordinator's `TxQueueUpdate`.
     pub tx_now_sending: Option<TxQueueItem>,
@@ -1062,6 +1073,7 @@ impl App {
             tx_frequency_offset: 1500.0,
             tx_policy: pancetta_core::TxPolicy::default(),
             tx_freq_mode: pancetta_core::TxFreqMode::default(),
+            decode_effort: Self::load_persisted_decode_effort(),
             tx_now_sending: None,
             tx_queued: Vec::new(),
             rig_connected: RigConnDisplay::default(),
@@ -1137,6 +1149,49 @@ impl App {
             .unwrap_or(crate::view::ActiveView::Operate)
     }
 
+    /// Load the operator's last-cycled decode-effort preset label from disk
+    /// (decoder-speed-overhaul Task 15). Best-effort, mirroring
+    /// [`Self::load_persisted_view`]: a missing file, unreadable file,
+    /// malformed JSON, or missing key all fall back to `"AUTO"` (matching
+    /// `pancetta_config::DecodeEffort::default()`'s label) — never fails App
+    /// construction. The coordinator's startup `DecodeEffortUpdate` echo
+    /// corrects a stale persisted guess within the first health tick
+    /// regardless, so this is purely cosmetic (avoids a blank/default chip
+    /// flash before that echo arrives).
+    pub fn load_persisted_decode_effort() -> String {
+        Self::tui_state_path()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+            .and_then(|v| {
+                v.get("decode_effort")
+                    .and_then(|x| x.as_str())
+                    .map(String::from)
+            })
+            .unwrap_or_else(|| "AUTO".to_string())
+    }
+
+    /// Write both persisted fields (`active_view` + `decode_effort`) to
+    /// `~/.pancetta/tui_state.json` in one shot, from the CURRENT in-memory
+    /// state — so whichever one just changed, the file always reflects both,
+    /// and a change to one can never clobber the other back to a stale
+    /// value. Best-effort: a write failure (e.g. no home dir, read-only
+    /// filesystem) is silently ignored and never panics or fails the TUI.
+    fn persist_tui_state(&self) {
+        if let Some(p) = Self::tui_state_path() {
+            if let Some(parent) = p.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::write(
+                &p,
+                format!(
+                    "{{\"active_view\":\"{}\",\"decode_effort\":\"{}\"}}",
+                    self.active_view.as_str(),
+                    self.decode_effort
+                ),
+            );
+        }
+    }
+
     /// Cycle the active view forward (`v`) or backward (`V`), persisting the
     /// new value best-effort — a write failure (e.g. no home dir, read-only
     /// filesystem) is silently ignored and never panics or fails the TUI.
@@ -1156,16 +1211,17 @@ impl App {
         // no-op, harmless call for the common case where the list didn't
         // shrink).
         self.clamp_band_activity_selection();
-        if let Some(p) = Self::tui_state_path() {
-            if let Some(parent) = p.parent() {
-                let _ = std::fs::create_dir_all(parent);
-            }
-            let _ = std::fs::write(
-                &p,
-                format!("{{\"active_view\":\"{}\"}}", self.active_view.as_str()),
-            );
-        }
+        self.persist_tui_state();
         self.status_message = format!("View: {:?}", self.active_view);
+    }
+
+    /// Apply the coordinator's authoritative `DecodeEffortUpdate` echo
+    /// (decoder-speed-overhaul Task 15, operator `e` keybinding) and persist
+    /// the chosen preset alongside the active view.
+    pub fn set_decode_effort(&mut self, effort: String, budget_ms: u64) {
+        self.status_message = format!("Decode effort: {} ({} ms budget)", effort, budget_ms);
+        self.decode_effort = effort;
+        self.persist_tui_state();
     }
 
     /// Returns the `TuiCommand` to send as a result of this event, if any.
@@ -3524,6 +3580,13 @@ pub fn tx_rf_out_of_us_band(tx_rf_hz: u64) -> bool {
 mod tests {
     use super::*;
 
+    /// Monotonic counter giving each test its own `tui_state_path()`
+    /// override, so concurrently-running tests never share (and race on)
+    /// the same file — mirrors `tui_runner.rs`'s `TEST_STATE_PATH_COUNTER`
+    /// (a separate module, so its own private static isn't visible here).
+    static TEST_STATE_PATH_COUNTER: std::sync::atomic::AtomicU64 =
+        std::sync::atomic::AtomicU64::new(0);
+
     #[test]
     fn freq_modal_default_is_hidden_rxdial() {
         let m = super::FreqModalState::default();
@@ -3544,6 +3607,48 @@ mod tests {
         TEST_TUI_STATE_PATH_OVERRIDE.with(|cell| *cell.borrow_mut() = None);
         let expected = dirs::home_dir().map(|h| h.join(".pancetta").join("tui_state.json"));
         assert_eq!(App::tui_state_path(), expected);
+    }
+
+    /// `set_decode_effort` (decoder-speed-overhaul Task 15) persists the
+    /// chosen preset to `tui_state.json` ALONGSIDE the active view — a
+    /// change to one must never clobber the other back to a stale value.
+    /// Regression for the single-key-write footgun `cycle_view`'s old
+    /// inline write had (it only ever wrote `active_view`).
+    #[tokio::test]
+    async fn set_decode_effort_persists_alongside_active_view() {
+        let n = TEST_STATE_PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state_path = std::env::temp_dir().join(format!("pancetta_apprs_test_state_{n}.json"));
+        App::set_test_tui_state_path(state_path);
+
+        let mut app = fixture_app().await;
+        app.active_view = crate::view::ActiveView::Hunt;
+        app.set_decode_effort("DEEP".to_string(), 1000);
+
+        assert_eq!(app.decode_effort, "DEEP");
+
+        // A fresh load (same thread, same override) must see BOTH fields —
+        // decode_effort from the just-completed write, active_view from the
+        // in-memory field the write also serialized.
+        assert_eq!(App::load_persisted_decode_effort(), "DEEP");
+        assert_eq!(App::load_persisted_view(), crate::view::ActiveView::Hunt);
+
+        // cycle_view flips only active_view — decode_effort must survive.
+        app.cycle_view(true);
+        assert_eq!(
+            App::load_persisted_decode_effort(),
+            "DEEP",
+            "cycle_view must not clobber the persisted decode_effort"
+        );
+    }
+
+    /// With no persisted file, `load_persisted_decode_effort` falls back to
+    /// `"AUTO"` — matching `pancetta_config::DecodeEffort::default()`'s label.
+    #[test]
+    fn load_persisted_decode_effort_defaults_to_auto_when_missing() {
+        let n = TEST_STATE_PATH_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let state_path = std::env::temp_dir().join(format!("pancetta_apprs_test_missing_{n}.json"));
+        App::set_test_tui_state_path(state_path);
+        assert_eq!(App::load_persisted_decode_effort(), "AUTO");
     }
 
     fn fixture_view(call: &str, snr: i32) -> DecodedMessageView {

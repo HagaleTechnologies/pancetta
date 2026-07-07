@@ -63,6 +63,32 @@ impl HardwareTier {
             HardwareTier::Slow => "slow",
         }
     }
+
+    /// Stable `u8` encoding for atomic storage (decoder-speed-overhaul
+    /// Task 15: the coordinator remembers the last-resolved tier in an
+    /// atomic so a live `Auto` decode-effort cycle can resolve the correct
+    /// preset budget without re-probing). The mapping is fixed and MUST NOT
+    /// change (`0` = Fast, `1` = Moderate, `2` = Slow).
+    pub fn as_u8(&self) -> u8 {
+        match self {
+            HardwareTier::Fast => 0,
+            HardwareTier::Moderate => 1,
+            HardwareTier::Slow => 2,
+        }
+    }
+
+    /// Decode a [`HardwareTier`] from its stable `u8` encoding (see
+    /// [`HardwareTier::as_u8`]). Any unrecognized value decodes to the safe
+    /// default [`HardwareTier::Fast`] — the same "innocent until proven
+    /// otherwise" convention `scoped_fast_path` uses elsewhere.
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            0 => HardwareTier::Fast,
+            1 => HardwareTier::Moderate,
+            2 => HardwareTier::Slow,
+            _ => HardwareTier::Fast,
+        }
+    }
 }
 
 const FAST_THRESHOLD_MS: u64 = 400;
@@ -221,6 +247,22 @@ mod tests {
     fn classify_tier_at_slow_boundary_is_slow() {
         assert_eq!(classify_tier(1200), HardwareTier::Slow);
         assert_eq!(classify_tier(5000), HardwareTier::Slow);
+    }
+
+    #[test]
+    fn tier_as_u8_from_u8_round_trip_for_every_variant() {
+        for tier in [
+            HardwareTier::Fast,
+            HardwareTier::Moderate,
+            HardwareTier::Slow,
+        ] {
+            assert_eq!(HardwareTier::from_u8(tier.as_u8()), tier);
+        }
+    }
+
+    #[test]
+    fn tier_from_u8_unrecognized_value_defaults_to_fast() {
+        assert_eq!(HardwareTier::from_u8(255), HardwareTier::Fast);
     }
 
     #[test]

@@ -674,6 +674,33 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     ));
 
+    // Decode-effort chip (decoder-speed-overhaul Task 15): the live preset
+    // + the most recently completed decode window's wall-time, with a
+    // trailing scissors mark when that window ran out of its budget before
+    // finishing optional work. `app.decode_effort` is authoritative-from-
+    // frame-1 (the coordinator seeds it at startup, not just on the
+    // operator's first `e` press); `pipeline_health` is `None` only for the
+    // first ~2s before the first health tick, in which case the elapsed
+    // reads as 0ms (never exhausted) rather than hiding the chip.
+    let (decode_elapsed_ms, decode_exhausted) = app
+        .pipeline_health
+        .as_ref()
+        .map(|h| (h.last_decode_elapsed_ms, h.last_decode_budget_exhausted))
+        .unwrap_or((0, false));
+    let decode_text = format!(
+        " DECODE: {} {}ms{} ",
+        app.decode_effort,
+        decode_elapsed_ms,
+        if decode_exhausted { " ✂" } else { "" }
+    );
+    left_spans.push(Span::raw(" "));
+    left_spans.push(Span::styled(
+        decode_text,
+        Style::default()
+            .fg(app.theme.accent_color())
+            .add_modifier(Modifier::BOLD),
+    ));
+
     // Active-view chip (Phase 2 TUI redesign): shown only when the operator
     // has switched away from Operate (the default) — `label()` returns
     // `None` for Operate, so the title bar is byte-identical to today until

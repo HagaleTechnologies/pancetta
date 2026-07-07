@@ -276,6 +276,24 @@ pub enum MessageType {
         mode: String,
     },
 
+    /// Decode-effort preset echo for the TUI's "DECODE: <PRESET> <ms>ms"
+    /// title-bar chip (decoder-speed-overhaul Task 15, operator `e`
+    /// keybinding). Sent by the coordinator's TUI-relay command handler
+    /// after `effort::cycle_decode_effort` advances the preset and writes
+    /// the resulting budget into `decode_effort_budget_ms`. Unlike
+    /// `ModeStatus` (which can be refused while a QSO is active) this
+    /// cycle never fails — a budget change never invalidates in-flight
+    /// decode state (spec §6.2) — so this is always the NEW preset, never
+    /// a refusal echo. Observation only — never drives TX.
+    DecodeEffortStatus {
+        /// New decode-effort preset label ("ECO"/"STANDARD"/"DEEP"/"MAX"/
+        /// "AUTO"), from `pancetta_config::DecodeEffort::label`.
+        effort: String,
+        /// The budget (ms) now written into `decode_effort_budget_ms` for
+        /// this preset (`0` = unlimited).
+        budget_ms: u64,
+    },
+
     /// TX-offset-hold state echo for the TUI's TX-placement park line +
     /// title-bar chip. Every OTHER writer of `tx_offset_hold_hz` (the `o`
     /// modal, Enter-park on the TX-placement instrument) is TUI-initiated,
