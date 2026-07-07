@@ -456,10 +456,17 @@ pub fn inject_ap_llrs(llrs: &mut [f32], level: ApLevel, context: &ApContext) {
             if let Some(ref my_call) = context.my_call {
                 inject_28_bits(llrs, 28, &my_call.bits);
             }
-            // … plus i3 type bits at 74-76 = false, false, false (type 0)
+            // … plus i3 type bits at 74-76 = false, false, true (i3=1,
+            // the "standard message" family RR73/RRR/73 actually use —
+            // verified empirically against this project's own encoder,
+            // see pancetta-ft8/tests/ap_i3_tests.rs. i3=0 selects the
+            // FreeText/Telemetry/contest family, which
+            // Ft8Message::is_plausible() unconditionally rejects, so the
+            // previous (0,0,0) injection made AP4 fight the very message
+            // class it exists to help decode.
             inject_bit(llrs, 74, false);
             inject_bit(llrs, 75, false);
-            inject_bit(llrs, 76, false);
+            inject_bit(llrs, 76, true);
         }
     }
 }
