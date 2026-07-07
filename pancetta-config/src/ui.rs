@@ -1999,7 +1999,11 @@ impl ConfigSection for UiConfig {
     }
 
     fn merge_with(&mut self, other: Self) {
-        // Always take the other value — only skip empty/zero
+        // Always take the other value — only skip empty strings so an unset
+        // higher-priority layer doesn't clobber a lower one. Every field must
+        // be carried here (these nested sections are inert today, but the
+        // `merge_with_carries_every_field` guardrail in lib.rs makes it safe to
+        // wire them up later without silently dropping them to defaults).
         if !other.theme.is_empty() {
             self.theme = other.theme;
         }
@@ -2008,12 +2012,19 @@ impl ConfigSection for UiConfig {
             self.layout = other.layout;
         }
 
-        if other.window.width != 0 {
-            self.window.width = other.window.width;
-        }
-        if other.window.height != 0 {
-            self.window.height = other.window.height;
-        }
+        // The nested display sections don't implement `ConfigSection`; take
+        // them wholesale so higher-priority layers fully override them.
+        self.window = other.window;
+        self.typography = other.typography;
+        self.colors = other.colors;
+        self.panels = other.panels;
+        self.accessibility = other.accessibility;
+        self.animations = other.animations;
+        self.toolbars = other.toolbars;
+        self.status_bar = other.status_bar;
+        self.keyboard = other.keyboard;
+        self.logging = other.logging;
+        self.spectrum = other.spectrum;
 
         // Merge custom widgets
         self.custom_widgets.extend(other.custom_widgets);
