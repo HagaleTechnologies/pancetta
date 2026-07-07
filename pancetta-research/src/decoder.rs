@@ -347,6 +347,13 @@ impl Ft8Decoder {
         self
     }
 
+    /// F5 [A/B]: disable the redundant half-symbol inner loop in the
+    /// Costas sync kernel (Batch 92). See `Ft8Config::costas_half_loop_disabled`.
+    pub fn with_costas_half_loop_disabled(mut self, on: bool) -> Self {
+        self.config.costas_half_loop_disabled = on;
+        self
+    }
+
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     pub fn with_cross_cycle_averaging(mut self, on: bool) -> Self {
         self.config.cross_cycle_averaging = on;

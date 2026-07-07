@@ -61,6 +61,9 @@ struct Args {
     /// F1 [A/B]: use the Padé atanh approximant in the BP check-node
     /// update instead of the exact ln form. See `Ft8Config::pade_atanh`.
     pade_atanh: Option<bool>,
+    /// F5 [A/B]: disable the redundant half-symbol inner loop in the
+    /// Costas sync kernel. See `Ft8Config::costas_half_loop_disabled`.
+    costas_half_loop_disabled: Option<bool>,
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     cross_cycle_averaging: Option<bool>,
     /// hb-074: coherent (phase-aligned complex sum) variant of cross-cycle averaging.
@@ -188,6 +191,7 @@ impl Args {
         let mut bp_offset_subtract: Option<f32> = None;
         let mut layered_bp: Option<bool> = None;
         let mut pade_atanh: Option<bool> = None;
+        let mut costas_half_loop_disabled: Option<bool> = None;
         let mut cross_cycle_averaging: Option<bool> = None;
         let mut cross_cycle_coherent: Option<bool> = None;
         let mut cross_cycle_coherent_mrc: Option<bool> = None;
@@ -382,6 +386,9 @@ impl Args {
                 }
                 "--pade-atanh" => {
                     pade_atanh = Some(true);
+                }
+                "--costas-half-loop-disabled" => {
+                    costas_half_loop_disabled = Some(true);
                 }
                 "--cross-cycle-averaging" => {
                     cross_cycle_averaging = Some(true);
@@ -624,6 +631,7 @@ impl Args {
                     );
                     eprintln!("  --adaptive-ldpc-iters: enable hb-022 SNR-adaptive per-candidate LDPC iterations");
                     eprintln!("  --pade-atanh: F1 [A/B] — use the Padé rational approximant for atanh in the BP check-node update instead of the exact ln form (default off)");
+                    eprintln!("  --costas-half-loop-disabled: F5 [A/B] — evaluate only half=0 in the Costas sync kernel's half-symbol inner loop instead of max(half=0, half=1) (default off)");
                     eprintln!("  --max-concurrent-tiers N: opt-in CPU-contention guard. Heavy tiers (hard-200/1000, chrono-replay, wild-*, hard-jt9-rich-200) acquire one of N file-lock slots in /tmp/pancetta-eval-tier-slots/ before running. Default unbounded (no guard).");
                     eprintln!("  --max-concurrent-tiers-pool-dir PATH: override the slot-pool directory (default /tmp/pancetta-eval-tier-slots).");
                     std::process::exit(0);
@@ -658,6 +666,7 @@ impl Args {
             bp_offset_subtract,
             layered_bp,
             pade_atanh,
+            costas_half_loop_disabled,
             cross_cycle_averaging,
             cross_cycle_coherent,
             cross_cycle_coherent_mrc,
@@ -1467,6 +1476,9 @@ fn main() -> anyhow::Result<()> {
             }
             if let Some(on) = args.pade_atanh {
                 d = d.with_pade_atanh(on);
+            }
+            if let Some(on) = args.costas_half_loop_disabled {
+                d = d.with_costas_half_loop_disabled(on);
             }
             if let Some(on) = args.cross_cycle_averaging {
                 d = d.with_cross_cycle_averaging(on);
