@@ -40,6 +40,7 @@ use rayon::prelude::*;
 use rustfft::FftPlanner;
 use std::collections::HashSet;
 use std::ops::RangeInclusive;
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Instant, SystemTime};
 use tracing::{debug, info};
 
@@ -1066,6 +1067,20 @@ pub struct Ft8Config {
     /// **GRADUATED 2026-07-06 — default `true`.** Set `false` to fall
     /// back to the pre-existing `fast_atanh` (ln-form) behavior.
     pub pade_atanh: bool,
+
+    /// Decoder-speed-overhaul Task 9: size of the "floor" slice of
+    /// ranked `sync_candidates` that is ALWAYS decoded, regardless of
+    /// [`DecodeBudget`](crate::budget::DecodeBudget) state. The floor
+    /// guarantees a best-effort result even when the budget expires
+    /// before the full candidate list is processed. Default 50.
+    pub floor_candidates: usize,
+
+    /// Decoder-speed-overhaul Task 9: LDPC iteration count reserved for
+    /// the floor slice's shallow belief-propagation pass. Not yet
+    /// consumed here — wired in Task 10, which will make the floor
+    /// decode cheaper per-candidate so more of it fits under a tight
+    /// budget. Default 25.
+    pub floor_iters: usize,
 }
 
 impl Default for Ft8Config {
@@ -1374,6 +1389,16 @@ impl Default for Ft8Config {
             // [-20,-5]) — see the journal for both runs; only the
             // piecewise form ships.
             pade_atanh: true,
+            // Decoder-speed-overhaul Task 9: floor/rest candidate split.
+            // 50 matches the historical `MAX_SYNC_CANDIDATES`-scale
+            // "always decode the strongest candidates" intuition — under
+            // an unlimited budget (every existing entry point) the floor
+            // is just the first stage of an order-preserving partition,
+            // so this default changes nothing observable until a caller
+            // actually supplies a tight `DecodeBudget`.
+            floor_candidates: 50,
+            // Consumed by Task 10 (not read yet in this task).
+            floor_iters: 25,
         }
     }
 }
@@ -1645,11 +1670,18 @@ pub struct Ft8Decoder {
     /// `unlimited()` at exit, so a budgeted call never leaks its budget
     /// into a later unlimited call on the same instance. Deep helpers can
     /// read `self.current_budget` without a param threaded through every
-    /// private fn. Nothing consults it yet — that starts in Task 9,
-    /// which is also when this field's reads will make the
-    /// `dead_code` allow below unnecessary.
-    #[allow(dead_code)]
+    /// private fn. Consulted starting Task 9 (floor/rest candidate
+    /// split) via `self.current_budget.has_time()`.
     current_budget: DecodeBudget,
+
+    /// Task 9: per-window budget telemetry, accumulated by the
+    /// floor/rest candidate-decode split during
+    /// `decode_window_with_ap_scoped_partner_impl` and drained by
+    /// [`Self::decode_window_budgeted`] into its returned
+    /// [`DecodeBudgetReport`]. Reset at the start of every window (so a
+    /// budgeted call never sees stale telemetry from a previous
+    /// window/instance reuse).
+    current_budget_report: DecodeBudgetReport,
 }
 
 impl Ft8Decoder {
@@ -1762,6 +1794,7 @@ impl Ft8Decoder {
             candidate_dump_enabled: false,
             candidate_dump: Vec::new(),
             current_budget: DecodeBudget::unlimited(),
+            current_budget_report: DecodeBudgetReport::default(),
         })
     }
 
@@ -1969,9 +2002,14 @@ impl Ft8Decoder {
     /// helpers can read it without a param threaded through every
     /// private fn.
     ///
-    /// Nothing in the pipeline consults the budget yet — that starts in
-    /// Task 9 — so `decode_window_budgeted(samples, DecodeBudget::unlimited())`
-    /// is byte-identical to [`Self::decode_window`]. Every existing
+    /// Task 9 wires the budget into the candidate-decode loop: ranked
+    /// sync candidates are split into an always-decoded "floor"
+    /// (`Ft8Config::floor_candidates`) and a budget-gated "rest", with
+    /// per-stage telemetry recorded into the returned
+    /// [`DecodeBudgetReport`]. Under `DecodeBudget::unlimited()` (every
+    /// other existing entry point) `rest` always runs in full, so
+    /// `decode_window_budgeted(samples, DecodeBudget::unlimited())`
+    /// remains byte-identical to [`Self::decode_window`]. Every existing
     /// entry point (`decode_window`, `decode_window_with_ap*`,
     /// `decode_window_scoped`) delegates to this budgeted core (directly
     /// or via `decode_window_with_ap_scoped_partner`) with
@@ -1982,6 +2020,7 @@ impl Ft8Decoder {
         budget: DecodeBudget,
     ) -> Ft8Result<(Vec<DecodedMessage>, DecodeBudgetReport)> {
         self.current_budget = budget;
+        self.current_budget_report = DecodeBudgetReport::default();
         let result = self.decode_window_with_ap_scoped_partner_impl(
             samples,
             &crate::ap::ApContext::default(),
@@ -1989,7 +2028,8 @@ impl Ft8Decoder {
             None,
         );
         self.current_budget = DecodeBudget::unlimited();
-        result.map(|messages| (messages, DecodeBudgetReport::default()))
+        let report = std::mem::take(&mut self.current_budget_report);
+        result.map(|messages| (messages, report))
     }
 
     /// Core decode implementation shared by every public decode entry
@@ -2500,15 +2540,107 @@ impl Ft8Decoder {
                 par_try_ap_decode(&ctx, candidate, ldpc, &decoded_calls, pass)
             };
 
+            // Decoder-speed-overhaul Task 9: floor/budgeted candidate
+            // split. `sync_candidates` is already ranked best-first (by
+            // Costas sync score, or by block score when
+            // `block_score_rerank` is on). Partition it into an
+            // always-decoded "floor" — the top `floor_candidates`
+            // (default 50) — and a budget-gated "rest".
+            //
+            // Under `DecodeBudget::unlimited()` (every entry point
+            // except `decode_window_budgeted` with a real deadline)
+            // `current_budget.has_time()` is always `true`, so `rest`
+            // always runs to completion and this split is a byte-
+            // identical no-op: `floor ++ rest` is `split_at` over the
+            // same ranked list processed in the same order as the
+            // pre-existing single `par_iter` pass, just as two
+            // back-to-back parallel passes instead of one.
+            let current_budget = self.current_budget;
+            let floor_len = sync_candidates.len().min(self.config.floor_candidates);
+            let (floor_slice, rest_slice) = sync_candidates.split_at(floor_len);
+
+            // S1-floor: decoded unconditionally, exactly as the legacy
+            // pipeline decoded every candidate.
+            let floor_start = Instant::now();
+            let floor_results: Vec<Option<DecodedMessage>> = floor_slice
+                .par_iter()
+                .map_init(&ldpc_init, &decode_candidate_op)
+                .collect();
+            let floor_done = floor_results.iter().filter(|m| m.is_some()).count() as u32;
+            self.current_budget_report.stages.push((
+                "S1-floor",
+                floor_start.elapsed().as_millis() as u32,
+                floor_done,
+                0,
+            ));
+
+            // S2-rest: only decoded if there's time left. Re-checked
+            // mid-stream (not just once up front) via a shared
+            // `AtomicBool` so a budget that expires partway through
+            // `rest` stops promptly instead of running the remainder to
+            // completion.
+            let rest_results: Vec<Option<DecodedMessage>> = if rest_slice.is_empty() {
+                Vec::new()
+            } else if !current_budget.has_time() {
+                self.current_budget_report.budget_exhausted = true;
+                self.current_budget_report
+                    .stages
+                    .push(("S2-rest", 0, 0, rest_slice.len() as u32));
+                std::iter::repeat_with(|| None)
+                    .take(rest_slice.len())
+                    .collect()
+            } else {
+                let rest_start = Instant::now();
+                let expired = AtomicBool::new(false);
+                let skipped = AtomicU32::new(0);
+                let results: Vec<Option<DecodedMessage>> = rest_slice
+                    .par_chunks(8)
+                    .map_init(&ldpc_init, |state, chunk| {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for candidate in chunk {
+                            if expired.load(Ordering::Relaxed) {
+                                skipped.fetch_add(1, Ordering::Relaxed);
+                                out.push(None);
+                                continue;
+                            }
+                            if !current_budget.has_time() {
+                                expired.store(true, Ordering::Relaxed);
+                                skipped.fetch_add(1, Ordering::Relaxed);
+                                out.push(None);
+                                continue;
+                            }
+                            out.push(decode_candidate_op(state, candidate));
+                        }
+                        out
+                    })
+                    .flatten()
+                    .collect();
+                let skipped_count = skipped.load(Ordering::Relaxed);
+                if skipped_count > 0 {
+                    self.current_budget_report.budget_exhausted = true;
+                }
+                let done_count = results.iter().filter(|m| m.is_some()).count() as u32;
+                self.current_budget_report.stages.push((
+                    "S2-rest",
+                    rest_start.elapsed().as_millis() as u32,
+                    done_count,
+                    skipped_count,
+                ));
+                results
+            };
+
+            // `per_candidate` preserves the original `sync_candidates`
+            // order: `floor_slice`/`rest_slice` are a `split_at`, so
+            // concatenating their results reconstructs the same
+            // best-first ranking the legacy single-pass loop consumed.
+            let per_candidate: Vec<Option<DecodedMessage>> =
+                floor_results.into_iter().chain(rest_results).collect();
+
             let mut pass_decoded: Vec<DecodedMessage> = if self.candidate_dump_enabled {
                 // hb-250 premise probe: buffer per-candidate results so
                 // each sync candidate can be tagged with its decode
                 // outcome, then flatten to the same Vec the legacy
                 // pipeline produces (rayon preserves order either way).
-                let per_candidate: Vec<Option<DecodedMessage>> = sync_candidates
-                    .par_iter()
-                    .map_init(ldpc_init, decode_candidate_op)
-                    .collect();
                 let dump_spec_step = sps / TIME_OSR;
                 let dump_tone_spacing = self.protocol_params.tone_spacing;
                 for (c, r) in sync_candidates.iter().zip(per_candidate.iter()) {
@@ -2529,11 +2661,7 @@ impl Ft8Decoder {
                 }
                 per_candidate.into_iter().flatten().collect()
             } else {
-                sync_candidates
-                    .par_iter()
-                    .map_init(ldpc_init, decode_candidate_op)
-                    .flatten()
-                    .collect()
+                per_candidate.into_iter().flatten().collect()
             };
 
             // hb-129: safety net — stamp any par_iter outputs that

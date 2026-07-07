@@ -6,8 +6,8 @@
 //!    our decoder or ft8_lib due to unknown signal characteristics)
 
 use pancetta_ft8::{
-    ft8_lib_ffi::ft8lib_decode_audio, DecodedMessage, Ft8Config, Ft8Decoder, SAMPLE_RATE,
-    WINDOW_SAMPLES,
+    ft8_lib_ffi::ft8lib_decode_audio, DecodeBudget, DecodedMessage, Ft8Config, Ft8Decoder,
+    SAMPLE_RATE, WINDOW_SAMPLES,
 };
 
 fn read_wav_file(path: &str) -> Vec<f32> {
@@ -20,6 +20,20 @@ fn read_wav_file(path: &str) -> Vec<f32> {
         .into_samples::<i16>()
         .map(|s| s.unwrap() as f32 / 32768.0)
         .collect()
+}
+
+/// Read a fixture WAV and pad/truncate to exactly one decode window —
+/// mirrors `decode_wav_file`'s buffer prep, but returns the raw samples
+/// so the caller can drive `decode_window_budgeted` directly.
+fn read_fixture_window(subpath: &str) -> Vec<f32> {
+    let samples = read_wav_file(&fixture(subpath));
+    if samples.len() >= WINDOW_SAMPLES {
+        samples
+    } else {
+        let mut padded = samples;
+        padded.resize(WINDOW_SAMPLES, 0.0);
+        padded
+    }
 }
 
 fn decode_wav_file(path: &str) -> Vec<DecodedMessage> {
@@ -541,4 +555,36 @@ fn ft8lib_decode_snr_is_nonconstant_and_in_range() {
             snrs
         );
     }
+}
+
+// =============================================================
+// Decoder-speed-overhaul Task 9: floor/budgeted candidate split
+// =============================================================
+
+/// With a budget that has already expired before decode starts, the
+/// decoder must still decode the "floor" slice of ranked sync
+/// candidates (the top `floor_candidates`, default 50) rather than
+/// returning nothing. `report.budget_exhausted` must reflect that the
+/// "rest" of the candidate list was skipped.
+///
+/// Unlimited-budget decode of this fixture produces 9 messages (see
+/// `test_cross_validate_against_ft8lib`); the floor threshold below
+/// (>= 7) leaves margin while still proving the floor actually ran a
+/// real decode pass, not an early-out no-op.
+#[test]
+fn budget_floor_still_decodes_top_candidates() {
+    let samples = read_fixture_window("wsjt/210703_133430.wav");
+    let mut d = Ft8Decoder::new(Ft8Config::default()).unwrap();
+    let (msgs, report) = d
+        .decode_window_budgeted(&samples, DecodeBudget::until(std::time::Instant::now()))
+        .unwrap();
+    assert!(
+        report.budget_exhausted,
+        "expected an already-expired budget to report exhaustion"
+    );
+    assert!(
+        msgs.len() >= 7,
+        "floor (top-50 @ shallow BP) must still run, got {}",
+        msgs.len()
+    );
 }
