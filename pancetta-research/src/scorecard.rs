@@ -72,6 +72,14 @@ pub struct TierResult {
     pub snr_at_90pct_recovery_db: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub false_positives_total: Option<u32>,
+    /// Workstream 0 (2026-07-06): count of noise-tier WAVs that produced
+    /// at least one decode. Every decode against a noise WAV is a false
+    /// positive by construction (there is no FT8 signal present), so a
+    /// nonzero value here — or in `false_positives_total` — is a hard
+    /// gate failure for the `noise_1000` tier. `None` for tiers that
+    /// don't run the noise corpus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_files_decoded: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixtures_total: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

@@ -48,6 +48,10 @@ name = "gen-synth-pair"
 path = "src/bin/gen_synth_pair.rs"
 
 [[bin]]
+name = "gen-noise"
+path = "src/bin/gen_noise.rs"
+
+[[bin]]
 name = "baseline"
 path = "src/bin/baseline.rs"
 

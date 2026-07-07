@@ -173,6 +173,11 @@ struct Args {
     /// Override the pool directory for `--max-concurrent-tiers`. Default
     /// is `pancetta_research::tier_slots::DEFAULT_POOL_DIR`.
     max_concurrent_tiers_pool_dir: Option<PathBuf>,
+    /// Workstream 0 (2026-07-06): override the default noise-tier manifest
+    /// path (`research/corpus/curated/noise/noise_1000.manifest.json`).
+    /// Lets tests (and ad-hoc diagnostic runs) point `noise_1000` at a
+    /// small generated manifest instead of the full 1000-file corpus.
+    noise_manifest: Option<PathBuf>,
 }
 
 impl Args {
@@ -239,6 +244,7 @@ impl Args {
         let mut chrono_replay_manifest: Option<PathBuf> = None;
         let mut max_concurrent_tiers: Option<usize> = None;
         let mut max_concurrent_tiers_pool_dir: Option<PathBuf> = None;
+        let mut noise_manifest: Option<PathBuf> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -642,11 +648,18 @@ impl Args {
                             .into(),
                     );
                 }
+                "--noise-manifest" => {
+                    noise_manifest = Some(
+                        iter.next()
+                            .context("--noise-manifest needs a path to a manifest JSON")?
+                            .into(),
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
                     );
-                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, synth-pair-200, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200, lid-of-band, chrono-replay");
+                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, synth-pair-200, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200, lid-of-band, chrono-replay, noise_1000");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
                     eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 200)");
                     eprintln!(
@@ -674,6 +687,7 @@ impl Args {
                     eprintln!("  --escalation-parity-max N: max unsatisfied parity checks at floor_iters tolerated before escalating (default 30).");
                     eprintln!("  --max-concurrent-tiers N: opt-in CPU-contention guard. Heavy tiers (hard-200/1000, chrono-replay, wild-*, hard-jt9-rich-200) acquire one of N file-lock slots in /tmp/pancetta-eval-tier-slots/ before running. Default unbounded (no guard).");
                     eprintln!("  --max-concurrent-tiers-pool-dir PATH: override the slot-pool directory (default /tmp/pancetta-eval-tier-slots).");
+                    eprintln!("  --noise-manifest PATH: override the noise_1000 tier's manifest (default research/corpus/curated/noise/noise_1000.manifest.json).");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -742,6 +756,7 @@ impl Args {
             chrono_replay_manifest,
             max_concurrent_tiers,
             max_concurrent_tiers_pool_dir,
+            noise_manifest,
         })
     }
 }
@@ -1388,6 +1403,49 @@ fn run_curated_tier(
     })
 }
 
+/// Workstream 0 (2026-07-06) — FP-on-noise tier. Every WAV in this corpus
+/// is seeded white Gaussian noise (+ optional birdie interference) with
+/// NO FT8 signal present. Any message the decoder under test returns is,
+/// by construction, a false positive — this tier is the harness's first
+/// guardrail against a hallucinating decoder scoring identically to a
+/// correct one (design spec §2, decision D0(a)).
+fn run_noise_tier(
+    decoder: &dyn DecoderUnderTest,
+    manifest_path: &std::path::Path,
+) -> anyhow::Result<TierResult> {
+    let entries = pancetta_research::gen_noise::load_noise_corpus(manifest_path)?;
+    let total = entries.len() as u32;
+    if total == 0 {
+        return Ok(TierResult {
+            wavs_processed: 0,
+            ..Default::default()
+        });
+    }
+    let mut false_positives_total: u32 = 0;
+    let mut noise_files_decoded: u32 = 0;
+    for entry in &entries {
+        let decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        if !decodes.is_empty() {
+            noise_files_decoded += 1;
+            false_positives_total += decodes.len() as u32;
+        }
+    }
+    if false_positives_total > 0 {
+        eprintln!(
+            "noise_1000: {false_positives_total} FALSE POSITIVE decode(s) across {noise_files_decoded}/{total} noise-only WAVs \
+             — the decoder is hallucinating on signal-free audio. This must be 0 for a healthy decoder."
+        );
+    } else {
+        eprintln!("noise_1000: 0 false positives across {total} noise-only WAVs.");
+    }
+    Ok(TierResult {
+        wavs_processed: total,
+        false_positives_total: Some(false_positives_total),
+        noise_files_decoded: Some(noise_files_decoded),
+        ..Default::default()
+    })
+}
+
 /// Lowest SNR (in dB) where recovery >= threshold. Bins must be sorted by SNR asc.
 fn first_threshold_db(bins: &[SnrBin], threshold: f64) -> Option<f64> {
     for bin in bins {
@@ -1897,6 +1955,26 @@ fn main() -> anyhow::Result<()> {
                     )?;
                     tiers.insert("chrono-replay".to_string(), result);
                 }
+            }
+            // Workstream 0 (2026-07-06) — FP-on-noise guardrail. Manifest
+            // defaults to the real 1000-file corpus but can be overridden
+            // (e.g. by tests) via --noise-manifest.
+            "noise_1000" => {
+                let manifest = args.noise_manifest.clone().unwrap_or_else(|| {
+                    workspace.join("research/corpus/curated/noise/noise_1000.manifest.json")
+                });
+                let manifest = if manifest.is_absolute() {
+                    manifest
+                } else {
+                    workspace.join(&manifest)
+                };
+                anyhow::ensure!(
+                    manifest.exists(),
+                    "noise tier manifest missing at {}. Run: cargo run --release -p pancetta-research --bin gen-noise -- --count 1000 --seed 20260706 --birdie-fraction 0.3 --output-dir ~/.pancetta/recordings/noise_1000 --manifest research/corpus/curated/noise/noise_1000.manifest.json",
+                    manifest.display()
+                );
+                let result = run_noise_tier(decoder.as_ref(), &manifest)?;
+                tiers.insert("noise_1000".to_string(), result);
             }
             other => anyhow::bail!("unknown tier '{other}'"),
         }

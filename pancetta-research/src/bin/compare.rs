@@ -276,6 +276,50 @@ fn any_tier_has_per_wav_records(card: &Scorecard) -> bool {
         .any(|t: &TierResult| !t.per_wav_records.is_empty())
 }
 
+/// Workstream 0 (2026-07-06) — the FP-on-noise hard gate. Unlike every
+/// other metric in this binary (advisory: printed as a WIN/REGRESSION but
+/// never fails the process), ANY increase in `false_positives_total` or
+/// `noise_files_decoded` on ANY shared tier is a hard failure: the harness
+/// exists specifically so a hallucinating decoder can no longer score
+/// identically to a correct one (design spec §2, decision D0). There is
+/// no threshold — a +1 is exactly as disqualifying as +7000.
+///
+/// Returns one report line per regressing tier; empty means the gate
+/// passed (A had no FP tier, or B's count never exceeded A's).
+fn fp_on_noise_hard_gate(a: &Scorecard, b: &Scorecard) -> Vec<String> {
+    let mut out = Vec::new();
+    let tier_keys: Vec<&String> = a
+        .tiers
+        .keys()
+        .chain(b.tiers.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for tier in tier_keys {
+        let (at, bt) = match (a.tiers.get(tier), b.tiers.get(tier)) {
+            (Some(at), Some(bt)) => (at, bt),
+            _ => continue,
+        };
+        let a_fp = at.false_positives_total.unwrap_or(0);
+        let b_fp = bt.false_positives_total.unwrap_or(0);
+        if b_fp > a_fp {
+            out.push(format!(
+                "  {tier:<20}  false_positives_total   {a_fp} → {b_fp}  (+{})",
+                b_fp - a_fp
+            ));
+        }
+        let a_ndec = at.noise_files_decoded.unwrap_or(0);
+        let b_ndec = bt.noise_files_decoded.unwrap_or(0);
+        if b_ndec > a_ndec {
+            out.push(format!(
+                "  {tier:<20}  noise_files_decoded     {a_ndec} → {b_ndec}  (+{})",
+                b_ndec - a_ndec
+            ));
+        }
+    }
+    out
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     let a = Scorecard::load(&args.a).with_context(|| format!("loading A: {}", args.a.display()))?;
@@ -419,6 +463,25 @@ fn main() -> anyhow::Result<()> {
         for (k, av, bv) in diffs {
             println!("  decoder.{k:<40} {av} → {bv}");
         }
+    }
+
+    // Workstream 0 (2026-07-06) — HARD GATE. Any FP-on-noise increase
+    // fails the comparison outright, regardless of every other metric
+    // above. Printed last (most prominent — the thing the operator's eye
+    // lands on) and enforced via a nonzero exit code so this gate is
+    // usable in scripts/CI-adjacent tooling, not just human review.
+    let fp_gate_failures = fp_on_noise_hard_gate(&a, &b);
+    if !fp_gate_failures.is_empty() {
+        println!();
+        println!("############################################################");
+        println!("# HARD GATE FAILURE — FALSE POSITIVES INCREASED ON NOISE TIER");
+        println!("# ANY increase disqualifies this change. See design spec §2 (D0).");
+        println!("############################################################");
+        for line in &fp_gate_failures {
+            println!("{line}");
+        }
+        println!();
+        std::process::exit(1);
     }
 
     Ok(())

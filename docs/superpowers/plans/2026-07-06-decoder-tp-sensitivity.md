@@ -41,12 +41,12 @@ Any decode on signal-free audio is a false positive. This tier is the guardrail 
 - Produces: eval tier `noise_1000` → scorecard fields `false_positives_total: u32`, `noise_files_decoded: u32` (any nonzero fails `compare`).
 
 **Steps:**
-- [ ] Write `gen_noise.rs` with a determinism unit test (same seed → byte-identical WAV) and a sanity test (RMS within 5% of target).
-- [ ] Add the eval tier: decode every noise WAV with production `Ft8Config::default()`; every returned message is an FP. Record per-file and total. Write failing integration test first (tier over 5 generated files, asserts fields populated), then implement.
-- [ ] Wire `false_positives_total` into `Scorecard` serialization and into the `compare` binary as a **hard gate** (any increase = FAIL, printed prominently).
-- [ ] Generate the real corpus: `count: 1000, seed: 20260706, birdie_fraction: 0.3` under `~/.pancetta/recordings/noise_1000/`, manifest with SHA-256s at `research/corpus/curated/noise/noise_1000.manifest.json` (same pattern as hard_200). Delete the empty `dead_band_425` / `sparse_419` leftovers or regenerate them for real.
-- [ ] Run the tier on current production config; record the baseline number in `research/experiments/2026-07-XX-noise-tier-baseline.md` and in the scorecard. (Expected near 0 today since OSD is off — that's the point: it must stay 0 as OSD returns.)
-- [ ] Commit.
+- [x] Write `gen_noise.rs` with a determinism unit test (same seed → byte-identical WAV) and a sanity test (RMS within 5% of target).
+- [x] Add the eval tier: decode every noise WAV with production `Ft8Config::default()`; every returned message is an FP. Record per-file and total. Write failing integration test first (tier over 5 generated files, asserts fields populated), then implement.
+- [x] Wire `false_positives_total` into `Scorecard` serialization and into the `compare` binary as a **hard gate** (any increase = FAIL, printed prominently).
+- [x] Generate the real corpus: `count: 1000, seed: 20260706, birdie_fraction: 0.3` under `~/.pancetta/recordings/noise_1000/`, manifest with SHA-256s at `research/corpus/curated/noise/noise_1000.manifest.json` (same pattern as hard_200). Delete the empty `dead_band_425` / `sparse_419` leftovers or regenerate them for real.
+- [x] Run the tier on current production config; record the baseline number in `research/experiments/2026-07-07-noise-tier-baseline.md` and in the scorecard. **Result: 3 FPs / 1000 WAVs — NOT 0. See log for honest root-cause discussion (plausibly CRC-14 chance-passes at the trial volume, not a harness bug); this is now the reference baseline the standing gate compares against.**
+- [x] Commit.
 
 ### Task W0.2: 2500 Hz SNR calibration + real sensitivity curve [HARNESS]
 
