@@ -652,3 +652,262 @@ mod tests {
         assert_eq!(audio["input_device"].as_str(), Some("Mic X"));
     }
 }
+
+/// Structural guardrail against the "field silently dropped by `merge_with`"
+/// bug class (see the 2026-07-05 CLAUDE.md entry and the
+/// `merge_with_carries_over_*` regression tests in network.rs / station.rs).
+///
+/// Every `ConfigSection::merge_with` is a hand-maintained list of
+/// `self.field = other.field` lines, so a field added to a config struct later
+/// is trivially forgotten — the parse and validation passes both succeed and
+/// only the *merge* silently reverts the field to its compiled-in default. The
+/// field-specific regression tests only guard the fields someone thought to
+/// list; this test is structural.
+///
+/// For each config type we build a *fully non-default* instance by serializing
+/// its `Default`, then perturbing every scalar leaf to a different, non-empty,
+/// non-zero value (and overriding the enum / `Option` leaves that can't be
+/// perturbed blindly). Merging that source into a fresh default must reproduce
+/// the source **exactly** (`serde_json::to_value(&merged) == to_value(&source)`).
+/// A field missing its merge line reverts to default in `merged` and the
+/// whole-value comparison fails — naming that class of bug at the type level
+/// instead of one field at a time.
+#[cfg(test)]
+mod merge_guard {
+    use super::*;
+    use serde::de::DeserializeOwned;
+    use serde::Serialize;
+    use serde_json::{json, Value};
+    use std::collections::HashSet;
+
+    #[derive(Clone)]
+    enum Seg {
+        Key(String),
+        Idx(usize),
+    }
+
+    /// Collect paths to every scalar (bool / number / string) leaf. `null` and
+    /// empty containers carry no type information, so they're skipped here and
+    /// handled via the per-type `overrides` instead.
+    fn collect_leaves(v: &Value, path: &mut Vec<Seg>, out: &mut Vec<Vec<Seg>>) {
+        match v {
+            Value::Object(m) => {
+                for (k, val) in m {
+                    path.push(Seg::Key(k.clone()));
+                    collect_leaves(val, path, out);
+                    path.pop();
+                }
+            }
+            Value::Array(a) => {
+                for (i, val) in a.iter().enumerate() {
+                    path.push(Seg::Idx(i));
+                    collect_leaves(val, path, out);
+                    path.pop();
+                }
+            }
+            Value::Bool(_) | Value::Number(_) | Value::String(_) => out.push(path.clone()),
+            Value::Null => {}
+        }
+    }
+
+    fn get_path<'a>(root: &'a Value, path: &[Seg]) -> Option<&'a Value> {
+        let mut cur = root;
+        for seg in path {
+            cur = match seg {
+                Seg::Key(k) => cur.as_object()?.get(k)?,
+                Seg::Idx(i) => cur.as_array()?.get(*i)?,
+            };
+        }
+        Some(cur)
+    }
+
+    fn set_path(root: &mut Value, path: &[Seg], nv: Value) {
+        let mut cur = root;
+        for (i, seg) in path.iter().enumerate() {
+            let last = i + 1 == path.len();
+            match seg {
+                Seg::Key(k) => {
+                    let obj = cur.as_object_mut().expect("object on path");
+                    if last {
+                        obj.insert(k.clone(), nv);
+                        return;
+                    }
+                    cur = obj.get_mut(k).expect("key on path");
+                }
+                Seg::Idx(idx) => {
+                    let arr = cur.as_array_mut().expect("array on path");
+                    if last {
+                        arr[*idx] = nv;
+                        return;
+                    }
+                    cur = arr.get_mut(*idx).expect("index on path");
+                }
+            }
+        }
+    }
+
+    /// A different, non-empty, non-zero value for a scalar leaf. Non-zero /
+    /// non-empty matters because several `merge_with` impls skip empty/zero
+    /// `other` values, so a zero would be legitimately ignored and mask a real
+    /// drop. Numbers stay within their original type's range.
+    fn perturb_scalar(v: &Value) -> Value {
+        match v {
+            Value::Bool(b) => Value::Bool(!b),
+            Value::Number(n) => {
+                if let Some(u) = n.as_u64() {
+                    Value::from(if u <= 1 { u + 2 } else { u - 1 })
+                } else if let Some(i) = n.as_i64() {
+                    Value::from(if i <= 1 { i + 2 } else { i - 1 })
+                } else if let Some(f) = n.as_f64() {
+                    Value::from(if f == 0.0 {
+                        2.0
+                    } else if f > 0.0 {
+                        f + 1.0
+                    } else {
+                        f - 1.0
+                    })
+                } else {
+                    v.clone()
+                }
+            }
+            Value::String(_) => Value::String("MERGE_GUARD_PROBE".to_string()),
+            other => other.clone(),
+        }
+    }
+
+    /// Build a fully-non-default `T`. Each scalar leaf is perturbed only if the
+    /// perturbation still deserializes (so enum-as-string leaves, which would
+    /// otherwise become an invalid variant, are left at their default and must
+    /// be handled via `overrides`). `overrides` sets top-level enum / `Option`
+    /// leaves to a valid, non-default value.
+    fn build_source<T>(overrides: &[(&str, Value)]) -> T
+    where
+        T: Default + Serialize + DeserializeOwned,
+    {
+        let mut working = serde_json::to_value(T::default()).expect("serialize default");
+        let override_keys: HashSet<&str> = overrides.iter().map(|(k, _)| *k).collect();
+        {
+            let obj = working
+                .as_object_mut()
+                .expect("config must serialize to a JSON object");
+            for (k, v) in overrides {
+                obj.insert((*k).to_string(), v.clone());
+            }
+        }
+
+        let mut paths = Vec::new();
+        collect_leaves(&working, &mut Vec::new(), &mut paths);
+
+        for path in &paths {
+            if let Some(Seg::Key(k)) = path.first() {
+                if override_keys.contains(k.as_str()) {
+                    continue;
+                }
+            }
+            let cur = get_path(&working, path).expect("path exists");
+            let candidate = perturb_scalar(cur);
+            if &candidate == cur {
+                continue;
+            }
+            let mut trial = working.clone();
+            set_path(&mut trial, path, candidate);
+            if serde_json::from_value::<T>(trial.clone()).is_ok() {
+                working = trial;
+            }
+            // else: enum-as-string / otherwise-constrained leaf — leave as-is.
+        }
+
+        serde_json::from_value::<T>(working).expect("perturbed config must deserialize")
+    }
+
+    /// The core assertion: merging a fully-non-default `source` into a default
+    /// must reproduce `source` field-for-field.
+    fn assert_carries_all<T>(
+        type_name: &str,
+        overrides: &[(&str, Value)],
+        merge: impl Fn(&mut T, T),
+    ) where
+        T: Default + Clone + Serialize + DeserializeOwned,
+    {
+        let source = build_source::<T>(overrides);
+        let source_json = serde_json::to_value(&source).unwrap();
+        let default_json = serde_json::to_value(T::default()).unwrap();
+        assert_ne!(
+            source_json, default_json,
+            "{type_name}: test setup bug — perturbed source is identical to default"
+        );
+
+        let mut merged = T::default();
+        merge(&mut merged, source.clone());
+        let merged_json = serde_json::to_value(&merged).unwrap();
+
+        assert_eq!(
+            merged_json, source_json,
+            "{type_name}::merge_with dropped a field. Merging a fully-non-default source \
+             into a default must reproduce the source exactly; a struct field without a \
+             matching `self.x = other.x` line reverts to its default here."
+        );
+    }
+
+    #[test]
+    fn merge_with_carries_every_field() {
+        assert_carries_all::<network::NetworkConfig>("NetworkConfig", &[], |a, b| a.merge_with(b));
+
+        assert_carries_all::<station::StationConfig>(
+            "StationConfig",
+            &[
+                (
+                    "coordinates",
+                    json!({"latitude": 12.5, "longitude": -34.5, "elevation_meters": 56.5}),
+                ),
+                ("operator_name", json!("Op Name")),
+                ("contest_category", json!("SINGLE-OP")),
+                ("tx_self_parity", json!("even")),
+            ],
+            |a, b| a.merge_with(b),
+        );
+
+        assert_carries_all::<audio::AudioConfig>(
+            "AudioConfig",
+            &[("bit_depth", json!("int16"))],
+            |a, b| a.merge_with(b),
+        );
+
+        assert_carries_all::<ui::UiConfig>("UiConfig", &[], |a, b| a.merge_with(b));
+
+        assert_carries_all::<rig::RigConfig>("RigConfig", &[], |a, b| a.merge_with(b));
+
+        // CatInterfaceConfig has an inherent `merge_with` (not a ConfigSection
+        // impl) and was one of the audited-inert gaps now closed.
+        assert_carries_all::<rig::CatInterfaceConfig>(
+            "CatInterfaceConfig",
+            &[
+                ("stop_bits", json!("two")),
+                ("parity", json!("even")),
+                ("flow_control", json!("hardware")),
+                ("protocol", json!("yaesu")),
+            ],
+            |a, b| a.merge_with(b),
+        );
+
+        assert_carries_all::<decoder::DecoderConfig>(
+            "DecoderConfig",
+            &[("effort", json!("eco")), ("budget_ms", json!(4321))],
+            |a, b| a.merge_with(b),
+        );
+
+        assert_carries_all::<autonomous::AutonomousConfig>(
+            "AutonomousConfig",
+            &[("slot_parity", json!("even"))],
+            |a, b| a.merge_with(b),
+        );
+
+        assert_carries_all::<fox::FoxConfig>("FoxConfig", &[], |a, b| a.merge_with(b));
+
+        assert_carries_all::<hound::HoundConfig>("HoundConfig", &[], |a, b| a.merge_with(b));
+
+        assert_carries_all::<tx_placement::TxPlacementConfig>("TxPlacementConfig", &[], |a, b| {
+            a.merge_with(b)
+        });
+    }
+}

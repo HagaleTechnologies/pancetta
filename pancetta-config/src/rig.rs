@@ -1077,15 +1077,39 @@ impl ConfigSection for RigConfig {
 
 // Implement merge methods for nested configurations
 impl CatInterfaceConfig {
-    fn merge_with(&mut self, other: Self) {
-        // Always take the other value — only skip empty/zero
+    // pub(crate) so the structural merge-guardrail test in lib.rs can invoke it
+    // (this is an inherent method, not a `ConfigSection` trait impl).
+    pub(crate) fn merge_with(&mut self, other: Self) {
+        // Always take the other value — only skip empty/zero so an unset
+        // higher-priority layer doesn't clobber a lower one. Every field must
+        // be carried here: the `merge_with_carries_every_field` guardrail
+        // (lib.rs) fails if a new field is added without a line below.
         if !other.port.is_empty() {
             self.port = other.port;
         }
         if other.baud_rate != 0 {
             self.baud_rate = other.baud_rate;
         }
+        if other.data_bits != 0 {
+            self.data_bits = other.data_bits;
+        }
+        self.stop_bits = other.stop_bits;
+        self.parity = other.parity;
+        self.flow_control = other.flow_control;
+        if other.timeout_ms != 0 {
+            self.timeout_ms = other.timeout_ms;
+        }
         self.enabled = other.enabled;
+        self.protocol = other.protocol;
+        if !other.termination.is_empty() {
+            self.termination = other.termination;
+        }
+        if other.response_timeout_ms != 0 {
+            self.response_timeout_ms = other.response_timeout_ms;
+        }
+        if other.retry_count != 0 {
+            self.retry_count = other.retry_count;
+        }
     }
 }
 
@@ -1132,8 +1156,12 @@ impl TimingConfig {
 }
 
 impl RigParametersConfig {
-    fn merge_with(&mut self, _other: Self) {
-        // Implementation for rig parameters config merging
+    fn merge_with(&mut self, other: Self) {
+        // Take the higher-priority layer wholesale (matches the sibling nested
+        // rig configs). Previously a no-op, which silently dropped every
+        // rig-parameter field (e.g. calibration.frequency_offset) back to its
+        // default — caught by the `merge_with_carries_every_field` guardrail.
+        *self = other;
     }
 }
 
