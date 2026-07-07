@@ -1435,6 +1435,18 @@ current_ratio: 0.051
     Future parameter tuning hits the precision wall — same as the OSD
     line. Path forward is structural (NMS-aware subtract, joint multi-
     slot via QSO context, cross-decoder ensemble), not parametric.
+  cross_ref: |
+    2026-07-06 (decoder-speed-overhaul Task 10, BP escalation ladder S3):
+    the flat "iters ∈ {50,75,100}" sweep here is superseded by a real
+    per-candidate escalation mechanism (floor pass, then continue-not-
+    restart to a deeper iteration count only for candidates that failed
+    at the floor). Its own A/B gate found the same wall this sweep
+    found: BP iteration count is a small slice of total decode cost, so
+    even a smarter (per-candidate, continuation-based) way to spend
+    more BP iterations doesn't move recall enough to justify the cost —
+    ships default OFF. Don't re-run flat global iteration-count sweeps
+    against this decoder without new evidence; see CLAUDE.md's "Decoder
+    speed overhaul" bullet.
 
 ### hb-033 — sync_cap saturation audit  [SHELVED 2026-05-24]
   mode: ft8
@@ -5200,6 +5212,18 @@ search to in-repo sources.
        because OSD is already catching what it can. Future "go deeper"
        work should target OSD (hb-014 parity gate, hb-034 OSD-3
        validation), not BP iters.
+  cross_ref: |
+    2026-07-06 (decoder-speed-overhaul Task 10, BP escalation ladder S3):
+    a real floor-then-continue-to-deep per-candidate BP escalation
+    mechanism was built and A/B-gated on hard-200. It independently
+    reconfirmed this hypothesis's core finding — BP iteration count is
+    a small fraction of total decode cost and 99.8% of floor-failures
+    already clear the recall-preserving threshold, so escalating BP
+    depth per-candidate isn't worth it — and also ships flag-gated OFF
+    (`escalation_enabled=false`). Do not resurrect per-candidate
+    adaptive-BP-iteration ideas without new evidence; this is now the
+    second independent negative result. See CLAUDE.md's "Decoder speed
+    overhaul" bullet and `research/experiments/2026-07-06-bp-escalation-ladder.md`.
   follow_up: |
     None. Result is decisive. The infrastructure
     (`adaptive_ldpc_iters` config flag + per-thread 3-decoder

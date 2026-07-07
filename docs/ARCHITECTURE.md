@@ -191,6 +191,65 @@ file before opening the new logging path.
 
 ---
 
+## Decode Pipeline Stages (Budget-Governed Anytime Decoder)
+
+As of the 2026-07-06 decoder-speed-overhaul (spec
+`docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`), a single
+decode window (`Ft8Decoder::decode_window*`) runs as an **anytime algorithm**:
+run to completion it produces the same result as before this work; stopped
+early under a wall-clock `DecodeBudget`, it still returns everything decoded
+so far, in a fixed priority order. Stages, in execution order:
+
+```
+sync candidates ranked by sync score
+        |
+        v
+  S1-floor   -- top-ranked candidates, decoded UNCONDITIONALLY
+        |       (always runs -- this alone matches the pre-overhaul
+        |        single-pass decoder's recall floor)
+        v
+  S2-rest    -- remaining candidates, gated by DecodeBudget.has_time()
+        |       (skipped once the budget is exhausted)
+        v
+  S3         -- BP escalation ladder: candidates that fail LDPC at a
+        |       floor iteration count get a continued (not restarted)
+        |       BP pass up to a deeper iteration count. Ships
+        |       DISABLED (escalation_enabled=false) -- its own A/B
+        |       data showed BP iterations are a small fraction of
+        |       total decode cost (Costas sync + FFT dominate), so
+        |       enabling it wasn't worth it. KNOWN LIMITATION: when
+        |       enabled, escalates in candidate sync-score-rank order,
+        |       not by a global most-promising-first ranking -- see
+        |       CLAUDE.md's decoder-speed-overhaul bullet.
+        v
+  S4-cross-cycle  -- cross-cycle joint decode, budget-gated
+        v
+  S5-multipass    -- multi-pass residual re-decode, budget-gated
+        v
+  S6-joint-pair   -- joint-pair (dual-miss) decode, budget-gated
+        v
+  S7-a7           -- AP/a7 injection pass, budget-gated
+        |
+        v
+  shared finalize tail (dedup, CRC, message parsing)
+```
+
+Each of S2-S7 is checkpointed at its entry: if `DecodeBudget::has_time()` is
+false, the stage is skipped (recorded in `DecodeBudgetReport.stages` for
+telemetry) rather than run. **Tests, CI, and the research harness always use
+`DecodeBudget::unlimited()`** — no stage is ever skipped on the eval path, so
+recall measurements stay deterministic and comparable across runs.
+
+In production, the coordinator seeds a real wall-clock budget into a shared
+`decode_effort_budget_ms` atomic from the operator's **decode-effort preset**
+(`[decoder]` config section, or the live `e` TUI key): `Eco` (1ms, floor-only),
+`Standard` (250ms), `Deep` (1000ms), `Max` (0/unlimited), or `Auto` (derived
+from the probed hardware tier — see `pancetta/src/coordinator/effort.rs`).
+This mapping **subsumes** the older per-hardware-tier `Ft8Config` field
+rewrites (`apply_tier` no longer touches `Ft8Config` directly).
+
+---
+
 ## Known Gaps
 
 - Grid "needed" set is never populated. cqdx.io has no

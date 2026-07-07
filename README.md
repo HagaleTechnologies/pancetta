@@ -152,6 +152,7 @@ cargo run --release
 | `p` | Toggle PTT manually |
 | `g` | Cycle TX policy: Full → Respond-only → Disabled |
 | `f` | TX-frequency mode: **Hold** (pin your offset) / **Auto** (Pancetta picks) |
+| `e` | Cycle decode-effort preset: Eco → Standard → Deep → Max → Auto |
 | `a` | Toggle autonomous mode |
 | `Shift+P` | Pause / resume autonomous |
 | `m` | Toggle audio monitoring |
@@ -163,6 +164,27 @@ cargo run --release
 
 The status bar at the bottom shows live pipeline state, your TX queue,
 and any errors emitted by the audio / QSO components.
+
+### Decode-effort control
+
+Pancetta's decoder is an *anytime* algorithm: it always produces the
+same decodes if given enough time, but can be capped to a per-window
+wall-clock budget and still return everything found so far. Press `e`
+in the TUI to cycle presets (a status chip shows the active one):
+
+| Preset | Behavior |
+|---|---|
+| `Auto` (default) | Budget derived from the auto-probed hardware tier — full effort on fast hosts, a tighter cap on slower ones. |
+| `Eco` | Minimal effort (floor pass only) — fastest, lowest recall. Useful on very slow hardware or when CPU is needed elsewhere. |
+| `Standard` | A moderate per-window budget. |
+| `Deep` | A generous per-window budget — more decode passes/candidates for better recall. |
+| `Max` | Unlimited — always runs every decode stage to completion. |
+
+You can also pin this at startup via `[decoder]` in `pancetta.toml`
+(see [`docs/CONFIG.md`](docs/CONFIG.md)); an explicit `budget_ms`
+there overrides the preset. Editing the config file's `[decoder]`
+section while Pancetta is running has no live effect (restart
+required) — the `e` key is the only *live* control.
 
 ---
 
