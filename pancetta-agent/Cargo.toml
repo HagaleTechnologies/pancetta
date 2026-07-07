@@ -6,7 +6,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
-snow = "0.9"
+snow = "0.10"
 thiserror = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }

@@ -72,6 +72,7 @@ impl ResponderHandshake {
     pub fn new(local_static_priv: &[u8]) -> Result<Self, NoiseError> {
         let inner = snow::Builder::new(params()?)
             .local_private_key(local_static_priv)
+            .map_err(|e| NoiseError::Build(e.to_string()))?
             .build_responder()
             .map_err(|e| NoiseError::Build(e.to_string()))?;
         Ok(Self { inner })
@@ -169,7 +170,9 @@ mod tests {
         fn new(local_static_priv: &[u8], remote_static_pub: &[u8]) -> Result<Self, NoiseError> {
             let inner = snow::Builder::new(params()?)
                 .local_private_key(local_static_priv)
+                .map_err(|e| NoiseError::Build(e.to_string()))?
                 .remote_public_key(remote_static_pub)
+                .map_err(|e| NoiseError::Build(e.to_string()))?
                 .build_initiator()
                 .map_err(|e| NoiseError::Build(e.to_string()))?;
             Ok(Self { inner })

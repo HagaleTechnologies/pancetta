@@ -93,14 +93,14 @@ rustfft = "6.4"
 
 [dev-dependencies]
 tempfile = "3.27"
-criterion = { version = "0.5", features = ["html_reports"] }
+criterion = { version = "0.8", features = ["html_reports"] }
 assert_cmd = "2.2"
 predicates = "3.1"
 tracing-test = "0.2"
 # Station-agent integration tests: hand-sign capabilityTokens + txArmGrants,
 # and drive the real AgentSession through a scripted Noise IK handshake.
 base64 = { workspace = true }
-snow = "0.9"
+snow = "0.10"
 
 [features]
 default = ["metrics", "pancetta-hamlib"]
