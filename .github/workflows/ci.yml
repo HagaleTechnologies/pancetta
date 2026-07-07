@@ -211,3 +211,20 @@ jobs:
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
           command: check bans licenses sources advisories
+
+  # Summary gate for branch protection. A single "CI" check covers the core
+  # lanes so branch-protection only needs to require one check name.
+  ci:
+    name: CI
+    needs: [clippy, fmt, ft8-tests, workspace-check, deny]
+    runs-on: ubuntu-latest
+    if: always()
+    steps:
+      - name: All CI checks passed
+        run: |
+          results='${{ toJSON(needs.*.result) }}'
+          if echo "$results" | grep -q '"failure"\|"cancelled"'; then
+            echo "One or more required CI jobs failed"
+            exit 1
+          fi
+          echo "All required CI jobs passed"
