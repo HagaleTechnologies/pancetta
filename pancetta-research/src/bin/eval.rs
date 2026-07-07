@@ -179,6 +179,12 @@ struct Args {
     /// Lets tests (and ad-hoc diagnostic runs) point `noise_1000` at a
     /// small generated manifest instead of the full 1000-file corpus.
     noise_manifest: Option<PathBuf>,
+    /// Task W0.4 (2026-07-07): override the default `synth-ft4` tier
+    /// manifest path (`research/corpus/synth/manifests/ft4_clean.manifest.json`).
+    /// Mirrors `--noise-manifest` — lets `tests/ft4_tier_tests.rs` point
+    /// the tier at a small generated FT4 manifest instead of the full
+    /// 550-file production corpus.
+    synth_ft4_manifest: Option<PathBuf>,
 }
 
 impl Args {
@@ -246,6 +252,7 @@ impl Args {
         let mut max_concurrent_tiers: Option<usize> = None;
         let mut max_concurrent_tiers_pool_dir: Option<PathBuf> = None;
         let mut noise_manifest: Option<PathBuf> = None;
+        let mut synth_ft4_manifest: Option<PathBuf> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -656,11 +663,18 @@ impl Args {
                             .into(),
                     );
                 }
+                "--synth-ft4-manifest" => {
+                    synth_ft4_manifest = Some(
+                        iter.next()
+                            .context("--synth-ft4-manifest needs a path to a manifest JSON")?
+                            .into(),
+                    );
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
                     );
-                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, synth-pair-200, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200, lid-of-band, chrono-replay, noise_1000");
+                    eprintln!("  tiers: fixtures, synth-clean, synth-doppler, synth-ft4 (requires --mode ft4), synth-pair-200, curated-hard-200, curated-hard-1000, wild-50, wild-100, wild-doppler-50, hard-jt9-rich-200, lid-of-band, chrono-replay, noise_1000");
                     eprintln!("  --max-passes: override Ft8Config::max_decode_passes (default 3)");
                     eprintln!("  --max-sync-candidates: override Ft8Config::max_sync_candidates (default 200)");
                     eprintln!(
@@ -689,6 +703,7 @@ impl Args {
                     eprintln!("  --max-concurrent-tiers N: opt-in CPU-contention guard. Heavy tiers (hard-200/1000, chrono-replay, wild-*, hard-jt9-rich-200) acquire one of N file-lock slots in /tmp/pancetta-eval-tier-slots/ before running. Default unbounded (no guard).");
                     eprintln!("  --max-concurrent-tiers-pool-dir PATH: override the slot-pool directory (default /tmp/pancetta-eval-tier-slots).");
                     eprintln!("  --noise-manifest PATH: override the noise_1000 tier's manifest (default research/corpus/curated/noise/noise_1000.manifest.json).");
+                    eprintln!("  --synth-ft4-manifest PATH: override the synth-ft4 tier's manifest (default research/corpus/synth/manifests/ft4_clean.manifest.json).");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -758,6 +773,7 @@ impl Args {
             max_concurrent_tiers,
             max_concurrent_tiers_pool_dir,
             noise_manifest,
+            synth_ft4_manifest,
         })
     }
 }
@@ -896,14 +912,21 @@ fn sha256_file(path: &std::path::Path) -> anyhow::Result<String> {
 /// `encoded_message`. Returns `None` if no cache exists for this WAV (jt9
 /// oracle not yet run over this corpus) — the caller must distinguish
 /// "no jt9 data" from "jt9 attempted and missed".
+///
+/// Task W0.4 (2026-07-07): takes `mode` to select the baseline cache
+/// subdirectory (`research/baselines/<mode>/`, matching how `bin/baseline.rs`
+/// keys its cache — see `cache_path`), so the new FT4 tier reads the FT4
+/// jt9 oracle cache instead of FT8's.
 fn jt9_recovered(
     workspace: &std::path::Path,
     wav_path: &std::path::Path,
     encoded_message: &str,
+    mode: Mode,
 ) -> Option<bool> {
     let sha = sha256_file(wav_path).ok()?;
     let cache_path = workspace
-        .join("research/baselines/ft8")
+        .join("research/baselines")
+        .join(mode.as_str())
         .join(format!("{sha}.json"));
     if !cache_path.exists() {
         return None;
@@ -924,6 +947,7 @@ fn run_synth_tier(
     workspace: &std::path::Path,
     manifest_path: &std::path::Path,
     fp_filter: Option<&pancetta_research::FpFilter>,
+    mode: Mode,
 ) -> anyhow::Result<TierResult> {
     let entries = load_synth_corpus(workspace, manifest_path)?;
     // Group by snr_db bin.
@@ -972,7 +996,7 @@ fn run_synth_tier(
         if !jt9_baseline_missing {
             let jt9_bin = jt9_bins.entry(bin_key).or_insert((0, 0));
             jt9_bin.0 += 1;
-            match jt9_recovered(workspace, &e.wav_path, &e.encoded_message) {
+            match jt9_recovered(workspace, &e.wav_path, &e.encoded_message, mode) {
                 Some(true) => jt9_bin.1 += 1,
                 Some(false) => {}
                 None => jt9_baseline_missing = true,
@@ -999,8 +1023,9 @@ fn run_synth_tier(
         eprintln!(
             "synth tier: jt9 baseline cache missing for at least one WAV — jt9_snr_curve left \
              empty. Run `cargo run --release -p pancetta-research --bin baseline -- --tier synth \
-             --synth-manifest {}` first to populate research/baselines/ft8/.",
-            manifest_path.display()
+             --mode {mode} --synth-manifest {}` first to populate research/baselines/{}/.",
+            manifest_path.display(),
+            mode.as_str(),
         );
         (Vec::new(), None)
     } else {
@@ -1640,6 +1665,205 @@ fn rustc_version() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// Task W0.4 (2026-07-07): build the `Ft8Decoder` wrapper from CLI args for
+/// a given protocol. Factored out of `main`'s old `match args.mode { Mode::Ft8
+/// => { .. } }` arm so adding `Mode::Ft4` (FT4 evaluation tier) didn't
+/// require duplicating this ~190-line CLI-knob wiring chain — every knob here
+/// is a generic `Ft8Config` field, not FT8-specific, so FT8 and FT4 share it
+/// verbatim; only the wrapped `Ft8Config::protocol` differs.
+fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8Decoder {
+    let mut d = Ft8Decoder::with_default_config().with_protocol(protocol);
+    if let Some(n) = args.max_passes {
+        d = d.with_max_passes(n);
+    }
+    if let Some(n) = args.max_sync_candidates {
+        d = d.with_max_sync_candidates(n);
+    }
+    if let Some(n) = args.max_candidates {
+        d = d.with_max_candidates(n);
+    }
+    if let Some(depth) = args.osd_depth {
+        d = d.with_osd_depth(depth);
+    }
+    if let Some(n) = args.ldpc_iterations {
+        d = d.with_ldpc_iterations(n);
+    }
+    if let Some(v) = args.llr_target_variance {
+        d = d.with_llr_target_variance(v);
+    }
+    if let Some(b) = args.nms_enabled {
+        d = d.with_nms_enabled(b);
+    }
+    if let Some(n) = args.nms_time_radius {
+        d = d.with_nms_time_radius(n);
+    }
+    if let Some(n) = args.nms_freq_radius {
+        d = d.with_nms_freq_radius(n);
+    }
+    if let Some(v) = args.nms_score_delta_db {
+        d = d.with_nms_score_delta_db(v);
+    }
+    if let Some(v) = args.min_sync_score {
+        d = d.with_min_sync_score(v);
+    }
+    if let Some(on) = args.adaptive_ldpc_iters {
+        d = d.with_adaptive_ldpc_iters(on);
+    }
+    if let Some(v) = args.time_range {
+        d = d.with_time_range(v);
+    }
+    if let Some(n) = args.max_parity_errors_for_osd {
+        d = d.with_max_parity_errors_for_osd(n);
+    }
+    if let Some(on) = args.sync_time_interpolation {
+        d = d.with_sync_time_interpolation(on);
+    }
+    if let Some(v) = args.sync_time_interp_score_gate {
+        d = d.with_sync_time_interp_score_gate(v);
+    }
+    if let Some(v) = args.sync_time_interp_delta_scale {
+        d = d.with_sync_time_interp_delta_scale(v);
+    }
+    if args.sync_time_interp_max_delta_abs.is_some() {
+        d = d.with_sync_time_interp_max_delta_abs(args.sync_time_interp_max_delta_abs);
+    }
+    if let Some(on) = args.sync_time_interp_linear_power {
+        d = d.with_sync_time_interp_linear_power(on);
+    }
+    if let Some(v) = args.bp_offset_subtract {
+        d = d.with_bp_offset_subtract(v);
+    }
+    if let Some(on) = args.layered_bp {
+        d = d.with_layered_bp(on);
+    }
+    if let Some(on) = args.pade_atanh {
+        d = d.with_pade_atanh(on);
+    }
+    if let Some(on) = args.costas_half_loop_disabled {
+        d = d.with_costas_half_loop_disabled(on);
+    }
+    if let Some(on) = args.escalation_enabled {
+        d = d.with_escalation_enabled(on);
+    }
+    if let Some(v) = args.floor_iters {
+        d = d.with_floor_iters(v);
+    }
+    if let Some(v) = args.deep_iters {
+        d = d.with_deep_iters(v);
+    }
+    if let Some(v) = args.escalation_parity_max {
+        d = d.with_escalation_parity_max(v);
+    }
+    if let Some(on) = args.cross_cycle_averaging {
+        d = d.with_cross_cycle_averaging(on);
+    }
+    if let Some(on) = args.cross_cycle_coherent {
+        d = d.with_cross_cycle_coherent(on);
+    }
+    if let Some(on) = args.cross_cycle_coherent_mrc {
+        d = d.with_cross_cycle_coherent_mrc(on);
+    }
+    if let Some(n) = args.coherent_multipass_iterations {
+        d = d.with_coherent_multipass_iterations(n);
+    }
+    if let Some(t) = args.coherent_subtract_mrc_threshold {
+        d = d.with_coherent_subtract_mrc_threshold(t);
+    }
+    if args.residual_min_sync_score.is_some() {
+        d = d.with_residual_min_sync_score(args.residual_min_sync_score);
+    }
+    if let Some(on) = args.joint_pair_retry {
+        d = d.with_joint_pair_retry(on);
+    }
+    if let Some(db) = args.joint_residual_sync_relax_db {
+        d = d.with_joint_residual_sync_relax_db(db);
+    }
+    if let Some(n) = args.joint_residual_sync_window_bins {
+        d = d.with_joint_residual_sync_window_bins(n);
+    }
+    if args.residual_energy_stop_db.is_some() {
+        d = d.with_residual_energy_stop_db(args.residual_energy_stop_db);
+    }
+    if args.residual_snr_gate_db.is_some() {
+        d = d.with_residual_snr_gate_db(args.residual_snr_gate_db);
+    }
+    if let Some(on) = args.a7_enabled {
+        d = d.with_a7_enabled(on);
+    }
+    if let Some(t) = args.a7_snr7_threshold {
+        d = d.with_a7_snr7_threshold(t);
+    }
+    if let Some(t) = args.a7_snr7b_threshold {
+        d = d.with_a7_snr7b_threshold(t);
+    }
+    if let Some(hz) = args.a7_freq_window_hz {
+        d = d.with_a7_freq_window_hz(hz);
+    }
+    if matches!(args.hb057_dt_history_enabled, Some(true)) {
+        let floor = args.hb057_dt_history_window_floor_s.unwrap_or(0.2);
+        let scale = args.hb057_dt_history_window_iqr_scale.unwrap_or(3.0);
+        d = d.with_dt_history(floor, scale);
+        if let Some(hz) = args.hb057_dt_history_freq_window_hz {
+            d = d.with_dt_history_freq_window_hz(hz);
+        }
+    }
+    if let Some(on) = args.two_stage {
+        d = d.with_two_stage(on);
+    }
+    // hb-004: build an ApContext from CLI flags if any AP knob set.
+    if args.ap_my_call.is_some() || args.ap_recent_calls.is_some() {
+        use pancetta_ft8::ap::{ApContext, MyCallAp, RecentCallAp};
+        let my_call = args.ap_my_call.as_ref().and_then(|c| {
+            let r = MyCallAp::new(c);
+            if r.is_none() {
+                eprintln!("warning: --ap-my-call {c:?} did not encode (returned None)");
+            }
+            r
+        });
+        let recent_calls = args
+            .ap_recent_calls
+            .as_ref()
+            .map(|calls| {
+                calls
+                    .iter()
+                    .filter_map(|c| {
+                        let r = RecentCallAp::new(c, 0.0);
+                        if r.is_none() {
+                            eprintln!("warning: --ap-recent-calls entry {c:?} did not encode");
+                        }
+                        r
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        let ctx = ApContext {
+            my_call,
+            recent_calls,
+            active_qso: None,
+        };
+        d = d.with_ap_context(ctx);
+    }
+    // hb-050: rolling-window mode overrides per-call ApContext.
+    if let Some(n) = args.ap_rolling_window {
+        d = d.with_rolling_window(n);
+    }
+    // Chronological-replay tier (2026-06-01): when the user
+    // requests the `chrono-replay` tier, stateful mode is
+    // mandatory (the tier's whole point). Auto-enable here so the
+    // operator doesn't have to remember a redundant flag — but
+    // also expose `--chrono-replay-enabled` for explicit
+    // hard-200/hard-1000 dispatch where the tier name doesn't
+    // imply statefulness (e.g. ad-hoc combinations).
+    let chrono_tier_requested = args.tiers.iter().any(|t| t == "chrono-replay");
+    if chrono_tier_requested || args.chrono_replay_enabled.unwrap_or(false) {
+        let cap = args.chrono_replay_capacity.unwrap_or(0);
+        let (d2, _state) = d.with_chrono_replay(cap);
+        d = d2;
+    }
+
+    d
+}
+
 fn main() -> anyhow::Result<()> {
     // Preflight gate. If --preflight refuses, the binary refuses too.
     let preflight = std::process::Command::new("./scripts/research-env.sh")
@@ -1661,201 +1885,14 @@ fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     let workspace = workspace_root()?;
     let started = Instant::now();
-    let decoder: Box<dyn DecoderUnderTest> = match args.mode {
-        Mode::Ft8 => {
-            let mut d = Ft8Decoder::with_default_config();
-            if let Some(n) = args.max_passes {
-                d = d.with_max_passes(n);
-            }
-            if let Some(n) = args.max_sync_candidates {
-                d = d.with_max_sync_candidates(n);
-            }
-            if let Some(n) = args.max_candidates {
-                d = d.with_max_candidates(n);
-            }
-            if let Some(depth) = args.osd_depth {
-                d = d.with_osd_depth(depth);
-            }
-            if let Some(n) = args.ldpc_iterations {
-                d = d.with_ldpc_iterations(n);
-            }
-            if let Some(v) = args.llr_target_variance {
-                d = d.with_llr_target_variance(v);
-            }
-            if let Some(b) = args.nms_enabled {
-                d = d.with_nms_enabled(b);
-            }
-            if let Some(n) = args.nms_time_radius {
-                d = d.with_nms_time_radius(n);
-            }
-            if let Some(n) = args.nms_freq_radius {
-                d = d.with_nms_freq_radius(n);
-            }
-            if let Some(v) = args.nms_score_delta_db {
-                d = d.with_nms_score_delta_db(v);
-            }
-            if let Some(v) = args.min_sync_score {
-                d = d.with_min_sync_score(v);
-            }
-            if let Some(on) = args.adaptive_ldpc_iters {
-                d = d.with_adaptive_ldpc_iters(on);
-            }
-            if let Some(v) = args.time_range {
-                d = d.with_time_range(v);
-            }
-            if let Some(n) = args.max_parity_errors_for_osd {
-                d = d.with_max_parity_errors_for_osd(n);
-            }
-            if let Some(on) = args.sync_time_interpolation {
-                d = d.with_sync_time_interpolation(on);
-            }
-            if let Some(v) = args.sync_time_interp_score_gate {
-                d = d.with_sync_time_interp_score_gate(v);
-            }
-            if let Some(v) = args.sync_time_interp_delta_scale {
-                d = d.with_sync_time_interp_delta_scale(v);
-            }
-            if args.sync_time_interp_max_delta_abs.is_some() {
-                d = d.with_sync_time_interp_max_delta_abs(args.sync_time_interp_max_delta_abs);
-            }
-            if let Some(on) = args.sync_time_interp_linear_power {
-                d = d.with_sync_time_interp_linear_power(on);
-            }
-            if let Some(v) = args.bp_offset_subtract {
-                d = d.with_bp_offset_subtract(v);
-            }
-            if let Some(on) = args.layered_bp {
-                d = d.with_layered_bp(on);
-            }
-            if let Some(on) = args.pade_atanh {
-                d = d.with_pade_atanh(on);
-            }
-            if let Some(on) = args.costas_half_loop_disabled {
-                d = d.with_costas_half_loop_disabled(on);
-            }
-            if let Some(on) = args.escalation_enabled {
-                d = d.with_escalation_enabled(on);
-            }
-            if let Some(v) = args.floor_iters {
-                d = d.with_floor_iters(v);
-            }
-            if let Some(v) = args.deep_iters {
-                d = d.with_deep_iters(v);
-            }
-            if let Some(v) = args.escalation_parity_max {
-                d = d.with_escalation_parity_max(v);
-            }
-            if let Some(on) = args.cross_cycle_averaging {
-                d = d.with_cross_cycle_averaging(on);
-            }
-            if let Some(on) = args.cross_cycle_coherent {
-                d = d.with_cross_cycle_coherent(on);
-            }
-            if let Some(on) = args.cross_cycle_coherent_mrc {
-                d = d.with_cross_cycle_coherent_mrc(on);
-            }
-            if let Some(n) = args.coherent_multipass_iterations {
-                d = d.with_coherent_multipass_iterations(n);
-            }
-            if let Some(t) = args.coherent_subtract_mrc_threshold {
-                d = d.with_coherent_subtract_mrc_threshold(t);
-            }
-            if args.residual_min_sync_score.is_some() {
-                d = d.with_residual_min_sync_score(args.residual_min_sync_score);
-            }
-            if let Some(on) = args.joint_pair_retry {
-                d = d.with_joint_pair_retry(on);
-            }
-            if let Some(db) = args.joint_residual_sync_relax_db {
-                d = d.with_joint_residual_sync_relax_db(db);
-            }
-            if let Some(n) = args.joint_residual_sync_window_bins {
-                d = d.with_joint_residual_sync_window_bins(n);
-            }
-            if args.residual_energy_stop_db.is_some() {
-                d = d.with_residual_energy_stop_db(args.residual_energy_stop_db);
-            }
-            if args.residual_snr_gate_db.is_some() {
-                d = d.with_residual_snr_gate_db(args.residual_snr_gate_db);
-            }
-            if let Some(on) = args.a7_enabled {
-                d = d.with_a7_enabled(on);
-            }
-            if let Some(t) = args.a7_snr7_threshold {
-                d = d.with_a7_snr7_threshold(t);
-            }
-            if let Some(t) = args.a7_snr7b_threshold {
-                d = d.with_a7_snr7b_threshold(t);
-            }
-            if let Some(hz) = args.a7_freq_window_hz {
-                d = d.with_a7_freq_window_hz(hz);
-            }
-            if matches!(args.hb057_dt_history_enabled, Some(true)) {
-                let floor = args.hb057_dt_history_window_floor_s.unwrap_or(0.2);
-                let scale = args.hb057_dt_history_window_iqr_scale.unwrap_or(3.0);
-                d = d.with_dt_history(floor, scale);
-                if let Some(hz) = args.hb057_dt_history_freq_window_hz {
-                    d = d.with_dt_history_freq_window_hz(hz);
-                }
-            }
-            if let Some(on) = args.two_stage {
-                d = d.with_two_stage(on);
-            }
-            // hb-004: build an ApContext from CLI flags if any AP knob set.
-            if args.ap_my_call.is_some() || args.ap_recent_calls.is_some() {
-                use pancetta_ft8::ap::{ApContext, MyCallAp, RecentCallAp};
-                let my_call = args.ap_my_call.as_ref().and_then(|c| {
-                    let r = MyCallAp::new(c);
-                    if r.is_none() {
-                        eprintln!("warning: --ap-my-call {c:?} did not encode (returned None)");
-                    }
-                    r
-                });
-                let recent_calls = args
-                    .ap_recent_calls
-                    .as_ref()
-                    .map(|calls| {
-                        calls
-                            .iter()
-                            .filter_map(|c| {
-                                let r = RecentCallAp::new(c, 0.0);
-                                if r.is_none() {
-                                    eprintln!(
-                                        "warning: --ap-recent-calls entry {c:?} did not encode"
-                                    );
-                                }
-                                r
-                            })
-                            .collect()
-                    })
-                    .unwrap_or_default();
-                let ctx = ApContext {
-                    my_call,
-                    recent_calls,
-                    active_qso: None,
-                };
-                d = d.with_ap_context(ctx);
-            }
-            // hb-050: rolling-window mode overrides per-call ApContext.
-            if let Some(n) = args.ap_rolling_window {
-                d = d.with_rolling_window(n);
-            }
-            // Chronological-replay tier (2026-06-01): when the user
-            // requests the `chrono-replay` tier, stateful mode is
-            // mandatory (the tier's whole point). Auto-enable here so the
-            // operator doesn't have to remember a redundant flag — but
-            // also expose `--chrono-replay-enabled` for explicit
-            // hard-200/hard-1000 dispatch where the tier name doesn't
-            // imply statefulness (e.g. ad-hoc combinations).
-            let chrono_tier_requested = args.tiers.iter().any(|t| t == "chrono-replay");
-            if chrono_tier_requested || args.chrono_replay_enabled.unwrap_or(false) {
-                let cap = args.chrono_replay_capacity.unwrap_or(0);
-                let (d2, _state) = d.with_chrono_replay(cap);
-                d = d2;
-            }
-            Box::new(d)
-        }
+    // Task W0.4 (2026-07-07): the decoder-construction knob chain lives in
+    // build_decoder_from_args (shared verbatim between FT8 and FT4 --
+    // only Ft8Config::protocol differs).
+    let protocol = match args.mode {
+        Mode::Ft8 => pancetta_ft8::Protocol::Ft8,
+        Mode::Ft4 => pancetta_ft8::Protocol::Ft4,
     };
+    let decoder: Box<dyn DecoderUnderTest> = Box::new(build_decoder_from_args(&args, protocol));
 
     // hb-052: build FP filter from configured sources, if any.
     let fp_filter: Option<pancetta_research::FpFilter> = if args.fp_filter_baselines.is_some()
@@ -2005,8 +2042,13 @@ fn main() -> anyhow::Result<()> {
                     "synth manifest missing at {}; run `cargo run -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/clean.config.json --output research/corpus/synth/manifests/clean.manifest.json`",
                     manifest.display()
                 );
-                let result =
-                    run_synth_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
+                let result = run_synth_tier(
+                    decoder.as_ref(),
+                    &workspace,
+                    &manifest,
+                    fp_filter_ref,
+                    Mode::Ft8,
+                )?;
                 tiers.insert("synth-clean".to_string(), result);
             }
             "synth-doppler" => {
@@ -2017,9 +2059,52 @@ fn main() -> anyhow::Result<()> {
                     "doppler synth manifest missing at {}; run `cargo run --release -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/doppler.config.json --output research/corpus/synth/manifests/doppler.manifest.json`",
                     manifest.display()
                 );
-                let result =
-                    run_synth_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
+                let result = run_synth_tier(
+                    decoder.as_ref(),
+                    &workspace,
+                    &manifest,
+                    fp_filter_ref,
+                    Mode::Ft8,
+                )?;
                 tiers.insert("synth-doppler".to_string(), result);
+            }
+            // Task W0.4 (2026-07-07): FT4 evaluation tier — the first-ever
+            // measured FT4 decode sensitivity. Same synth-clean shape
+            // (1 dB steps, n=50/step, 2500 Hz reference-bandwidth
+            // convention) as `synth-clean`, generated at FT4's 7.5s slot
+            // via `gen-synth --config ft4_clean.config.json` (the config's
+            // `"mode": "ft4"` selects FT4 protocol params + slot geometry).
+            // Requires `--mode ft4` so `build_decoder_from_args` wraps the
+            // decoder with `Protocol::Ft4`, and the jt9 oracle cache under
+            // `research/baselines/ft4/` (from `bin/baseline --mode ft4`).
+            "synth-ft4" => {
+                anyhow::ensure!(
+                    matches!(args.mode, Mode::Ft4),
+                    "synth-ft4 tier requires --mode ft4 (got {}) — the decoder must be \
+                     constructed with Protocol::Ft4 to decode FT4 audio",
+                    args.mode
+                );
+                let manifest = args.synth_ft4_manifest.clone().unwrap_or_else(|| {
+                    workspace.join("research/corpus/synth/manifests/ft4_clean.manifest.json")
+                });
+                let manifest = if manifest.is_absolute() {
+                    manifest
+                } else {
+                    workspace.join(&manifest)
+                };
+                anyhow::ensure!(
+                    manifest.exists(),
+                    "FT4 synth manifest missing at {}; run `cargo run --release -p pancetta-research --bin gen-synth -- --config research/corpus/synth/manifests/ft4_clean.config.json --output research/corpus/synth/manifests/ft4_clean.manifest.json`",
+                    manifest.display()
+                );
+                let result = run_synth_tier(
+                    decoder.as_ref(),
+                    &workspace,
+                    &manifest,
+                    fp_filter_ref,
+                    Mode::Ft4,
+                )?;
+                tiers.insert("synth-ft4".to_string(), result);
             }
             // hb-146 — synthetic adversarial mutual-masking pair tier.
             // Each WAV contains two FT8 signals at controlled (ΔSNR, Δf,

@@ -128,19 +128,33 @@ fn sha256_file(path: &Path) -> anyhow::Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-/// Parse one line of jt9 stdout. Typical format: `120000  5  0.4 1500 ~  CQ K1ABC FN42`.
+/// Task W0.4 (2026-07-07): the submode marker column (5th field) jt9
+/// emits differs per mode — confirmed empirically against the installed
+/// WSJT-X binary: FT8 decodes are marked `~`, FT4 decodes `+` (e.g.
+/// `000000 -14 -0.1 1552 +  CQ K1AAA FN42`). Not documented in `jt9
+/// --help`; verified by running `jt9 -8`/`jt9 -5` over real generated
+/// WAVs of each mode during this task.
+fn jt9_submode_marker(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Ft8 => "~",
+        Mode::Ft4 => "+",
+    }
+}
+
+/// Parse one line of jt9 stdout. Typical format: `120000  5  0.4 1500 ~  CQ K1ABC FN42`
+/// (FT8) or `000000 -14 -0.1 1552 +  CQ K1AAA FN42` (FT4 — Task W0.4).
 /// Returns None for non-decode lines.
-fn parse_jt9_line(line: &str) -> Option<BaselineDecode> {
-    // jt9's output starts with a 6-digit time (HHMMSS) followed by SNR, DT, freq, ~, then message.
+fn parse_jt9_line(line: &str, mode: Mode) -> Option<BaselineDecode> {
+    // jt9's output starts with a 6-digit time (HHMMSS) followed by SNR, DT, freq, marker, then message.
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 6 {
         return None;
     }
-    // Expect: time, snr, dt, freq, "~", message...
+    // Expect: time, snr, dt, freq, marker, message...
     let snr: f64 = parts[1].parse().ok()?;
     let dt: f64 = parts[2].parse().ok()?;
     let freq: f64 = parts[3].parse().ok()?;
-    if parts[4] != "~" {
+    if parts[4] != jt9_submode_marker(mode) {
         return None;
     }
     let message = parts[5..].join(" ");
@@ -152,10 +166,24 @@ fn parse_jt9_line(line: &str) -> Option<BaselineDecode> {
     })
 }
 
-fn run_jt9(jt9_path: &Path, wav_path: &Path) -> anyhow::Result<(Vec<BaselineDecode>, f64)> {
+/// Task W0.4 (2026-07-07): jt9 mode flag, confirmed against the installed
+/// WSJT-X binary's `jt9 --help` (`-8`/`--ft8` for FT8, `-5`/`--ft4` for
+/// FT4 — both accept the same `-d DEPTH` decoding-depth flag).
+fn jt9_mode_flag(mode: Mode) -> &'static str {
+    match mode {
+        Mode::Ft8 => "-8",
+        Mode::Ft4 => "-5",
+    }
+}
+
+fn run_jt9(
+    jt9_path: &Path,
+    wav_path: &Path,
+    mode: Mode,
+) -> anyhow::Result<(Vec<BaselineDecode>, f64)> {
     let started = std::time::Instant::now();
     let output = Command::new(jt9_path)
-        .args(["-8", "-d", "3"])
+        .args([jt9_mode_flag(mode), "-d", "3"])
         .arg(wav_path)
         .output()
         .with_context(|| format!("running {} on {}", jt9_path.display(), wav_path.display()))?;
@@ -168,7 +196,10 @@ fn run_jt9(jt9_path: &Path, wav_path: &Path) -> anyhow::Result<(Vec<BaselineDeco
         );
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let decodes = stdout.lines().filter_map(parse_jt9_line).collect();
+    let decodes = stdout
+        .lines()
+        .filter_map(|line| parse_jt9_line(line, mode))
+        .collect();
     Ok((decodes, elapsed))
 }
 
@@ -199,7 +230,7 @@ fn process_wav(
         );
         return Ok(());
     }
-    let (decodes, elapsed) = run_jt9(jt9_path, wav_path)?;
+    let (decodes, elapsed) = run_jt9(jt9_path, wav_path, mode)?;
     let cache = BaselineCache {
         schema_version: BaselineCache::CURRENT_SCHEMA_VERSION,
         wav_path: wav_path

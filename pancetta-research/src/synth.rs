@@ -39,6 +39,13 @@ pub struct SynthConfig {
     pub seed: u64,
     /// Output dir relative to workspace root. WAVs land here.
     pub output_dir: PathBuf,
+    /// Task W0.4 (2026-07-07): which digital mode to generate/modulate
+    /// this corpus as. `#[serde(default)]` → `Mode::Ft8`, so every
+    /// pre-W0.4 committed config (which has no `mode` key at all) still
+    /// deserializes as FT8 — the mode this whole corpus format was built
+    /// for before FT4 support landed.
+    #[serde(default)]
+    pub mode: crate::Mode,
 }
 
 /// One generated WAV entry — the unit of synth ground truth.
@@ -228,7 +235,9 @@ impl SynthPairManifest {
 // `gen-synth` binary is now a thin CLI wrapper around these functions.
 // ---------------------------------------------------------------------------
 
-use pancetta_ft8::{Ft8Encoder, Ft8Modulator, NUM_SYMBOLS, SAMPLE_RATE, WINDOW_SAMPLES};
+use pancetta_ft8::{
+    Ft8Encoder, Ft8Modulator, ProtocolParams, NUM_SYMBOLS, SAMPLE_RATE, WINDOW_SAMPLES,
+};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use rand_distr::{Distribution, Normal};
@@ -304,16 +313,42 @@ pub fn encode_message_symbols(text: &str) -> anyhow::Result<[u8; NUM_SYMBOLS]> {
 /// the actual output amplitude (see [`SYNTH_SIGNAL_SCALE`]'s doc), so an
 /// arbitrary in-range value is used and the real scaling is applied below.
 pub fn modulate_message_at(text: &str, base_freq_hz: f64) -> anyhow::Result<Vec<f32>> {
-    let mut encoder = Ft8Encoder::new();
-    let symbols = encoder
-        .encode_message(text, None)
-        .map_err(|e| anyhow::anyhow!("Ft8Encoder::encode_message failed for '{text}': {e}"))?;
+    modulate_message_at_protocol(text, base_freq_hz, &ProtocolParams::ft8())
+}
+
+/// Protocol-generic sibling of [`modulate_message_at`] (Task W0.4,
+/// 2026-07-07). Encode + modulate one message for ANY [`ProtocolParams`]
+/// (FT8, FT4, or FT2) via the protocol-aware `Ft8Encoder::with_protocol` /
+/// `encode_message_protocol` / `Ft8Modulator::modulate_symbols_protocol`
+/// API — the same pattern already exercised by
+/// `pancetta-ft8/tests/round_trip_tests.rs`'s FT4 round-trip tests.
+///
+/// `modulate_message_at` is now a thin wrapper calling this with
+/// `ProtocolParams::ft8()`, so the FT8 corpus path is unchanged (verified
+/// by the existing `modulate_message_at_respects_base_freq` /
+/// `snr_calibration_tests.rs` tests, which exercise `modulate_message_at`
+/// and continue to pass byte-identically): `encode_message_protocol` /
+/// `generate_symbols_protocol` compute the exact same symbol sequence as
+/// `encode_message` / `generate_symbols` for FT8 (no XOR scrambling,
+/// `bits_per_symbol == 3`, same Costas table) — only the fixed-array vs
+/// `Vec` return type differs.
+pub fn modulate_message_at_protocol(
+    text: &str,
+    base_freq_hz: f64,
+    params: &ProtocolParams,
+) -> anyhow::Result<Vec<f32>> {
+    let mut encoder = Ft8Encoder::with_protocol(params.clone());
+    let symbols = encoder.encode_message_protocol(text, None).map_err(|e| {
+        anyhow::anyhow!("Ft8Encoder::encode_message_protocol failed for '{text}': {e}")
+    })?;
 
     let mut modulator = Ft8Modulator::new(SAMPLE_RATE, base_freq_hz, 1.0)
         .map_err(|e| anyhow::anyhow!("Ft8Modulator::new failed: {e}"))?;
     let mut samples = modulator
-        .modulate_symbols(&symbols, 0.0)
-        .map_err(|e| anyhow::anyhow!("Ft8Modulator::modulate_symbols failed for '{text}': {e}"))?;
+        .modulate_symbols_protocol(&symbols, 0.0, params)
+        .map_err(|e| {
+            anyhow::anyhow!("Ft8Modulator::modulate_symbols_protocol failed for '{text}': {e}")
+        })?;
 
     for s in samples.iter_mut() {
         *s *= SYNTH_SIGNAL_SCALE as f32;
@@ -474,5 +509,45 @@ mod generation_tests {
         let symbols = encode_message_symbols("CQ K1ABC FN42").unwrap();
         assert_eq!(symbols.len(), NUM_SYMBOLS);
         assert!(symbols.iter().all(|&s| s < 8));
+    }
+
+    /// Task W0.4: `modulate_message_at` is now a thin wrapper over
+    /// `modulate_message_at_protocol(.., &ProtocolParams::ft8())`. This
+    /// guards the refactor: FT8 output must stay byte-identical to
+    /// calling the protocol-generic path directly, since every other
+    /// FT8 synth test (`modulate_message_at_respects_base_freq`,
+    /// `snr_calibration_tests.rs`) depends on `modulate_message_at`'s
+    /// exact output being unchanged.
+    #[test]
+    fn modulate_message_at_matches_protocol_path_for_ft8() {
+        let via_wrapper = modulate_message_at("CQ K1ABC FN42", 1500.0).unwrap();
+        let via_protocol =
+            modulate_message_at_protocol("CQ K1ABC FN42", 1500.0, &ProtocolParams::ft8()).unwrap();
+        assert_eq!(via_wrapper, via_protocol);
+    }
+
+    /// Task W0.4: FT4 modulation produces a well-formed, distinctly
+    /// shorter signal than FT8 for the same message (105 symbols @
+    /// 0.048s/symbol = 5.04s vs FT8's 79 @ 0.16s = 12.64s), and respects
+    /// base frequency like the FT8 path.
+    #[test]
+    fn modulate_message_at_protocol_ft4_produces_shorter_signal_than_ft8() {
+        let ft4_params = ProtocolParams::ft4();
+        let ft4 = modulate_message_at_protocol("CQ K1ABC FN42", 1500.0, &ft4_params).unwrap();
+        let ft8 = modulate_message_at("CQ K1ABC FN42", 1500.0).unwrap();
+
+        // FT4 total_samples: 105 symbols * (0.048s * 12000 Hz) = 60_480.
+        assert_eq!(ft4.len(), ft4_params.total_samples(SAMPLE_RATE));
+        assert!(
+            ft4.len() < ft8.len(),
+            "FT4 signal ({} samples) should be shorter than FT8 ({} samples)",
+            ft4.len(),
+            ft8.len()
+        );
+
+        let a = modulate_message_at_protocol("CQ K1ABC FN42", 800.0, &ft4_params).unwrap();
+        let b = modulate_message_at_protocol("CQ K1ABC FN42", 2200.0, &ft4_params).unwrap();
+        assert_eq!(a.len(), b.len());
+        assert_ne!(a, b);
     }
 }

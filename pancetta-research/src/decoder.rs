@@ -280,6 +280,16 @@ impl Ft8Decoder {
         self
     }
 
+    /// Task W0.4 (2026-07-07): override the decoded protocol
+    /// (`Ft8Config::protocol`). Default (from `Ft8Config::default()`) is
+    /// `Protocol::Ft8`; the FT4 evaluation tier sets `Protocol::Ft4` so
+    /// the wrapped `pancetta_ft8::Ft8Decoder` demodulates FT4 geometry
+    /// (105 symbols, 4-tone, 7.5s cycle) instead of FT8's.
+    pub fn with_protocol(mut self, protocol: pancetta_ft8::Protocol) -> Self {
+        self.config.protocol = protocol;
+        self
+    }
+
     /// Override the OSD parity gate. hb-014 sweep candidate.
     pub fn with_max_parity_errors_for_osd(mut self, n: usize) -> Self {
         self.config.max_parity_errors_for_osd = n;
@@ -561,7 +571,13 @@ impl Ft8Decoder {
 
 impl DecoderUnderTest for Ft8Decoder {
     fn mode(&self) -> Mode {
-        Mode::Ft8
+        // Task W0.4: report the wrapped protocol rather than hardcoding
+        // Ft8 — `with_protocol` (used by the FT4 evaluation tier) can
+        // change `self.config.protocol` after construction.
+        match self.config.protocol {
+            pancetta_ft8::Protocol::Ft4 => Mode::Ft4,
+            _ => Mode::Ft8,
+        }
     }
 
     fn identity(&self) -> String {
