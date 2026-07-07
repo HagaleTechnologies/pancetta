@@ -339,6 +339,14 @@ impl Ft8Decoder {
         self
     }
 
+    /// F1 [A/B]: use the Padé rational approximant for `atanh` in the
+    /// LDPC sum-product check-node update instead of the exact ln form.
+    /// See `Ft8Config::pade_atanh`.
+    pub fn with_pade_atanh(mut self, on: bool) -> Self {
+        self.config.pade_atanh = on;
+        self
+    }
+
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     pub fn with_cross_cycle_averaging(mut self, on: bool) -> Self {
         self.config.cross_cycle_averaging = on;

@@ -1048,6 +1048,23 @@ pub struct Ft8Config {
     /// always wins. Inspired by WSJT-X Improved v3.1.0 (DG2YCB).
     /// Pancetta's implementation is independent of upstream GPL source.
     pub auto_passband_enabled: bool,
+
+    /// Use a Padé rational approximant for `atanh` in the LDPC
+    /// sum-product check-node update (`2·atanh(∏ tanh(v/2))`) instead of
+    /// the exact `0.5·ln((1+x)/(1-x))` form everywhere. Matches ft8_lib's
+    /// approach (vendor/ft8_lib/ft8/ldpc.c, MIT) — division-and-multiply
+    /// only, no `ln`/transcendental call, on the hottest inner loop in BP.
+    /// The raw Padé saturates near |x|→1 (bounded ≈2.28 at the practical
+    /// BP clamp) instead of blowing up like the ln form (≈8.4); the
+    /// hard-200 A/B gate measured that this costs real recall (Δrec=-12,
+    /// 95% CI [-20,-5] — see `research/experiments/2026-07-06-pade-atanh.md`),
+    /// so when enabled this actually applies the **piecewise** form
+    /// (`fast_atanh_pade_piecewise`: Padé for |x| ≤ 0.95, exact ln form
+    /// above) which passed the re-run gate (Δrec not significant, ΔFP
+    /// favorable, elapsed improved). Default **false** — when off the
+    /// decoder is byte-identical to the pre-existing `fast_atanh` (ln-form)
+    /// behavior.
+    pub pade_atanh: bool,
 }
 
 impl Default for Ft8Config {
@@ -1345,6 +1362,11 @@ impl Default for Ft8Config {
             // spectrogram rolloff shape. Inspired by spec ref
             // `spec-wsjtx-improved-auto-passband.md`.
             auto_passband_enabled: false,
+            // Padé fast_atanh (F1): DEFAULT OFF pending the hard-200 A/B
+            // gate (research/experiments/2026-07-06-pade-atanh.md). When
+            // off, BP's check-node update is byte-identical to the
+            // pre-existing `fast_atanh` (ln form).
+            pade_atanh: false,
         }
     }
 }
@@ -1629,6 +1651,7 @@ impl Ft8Decoder {
         .with_max_parity_errors_for_osd(config.max_parity_errors_for_osd)
         .with_bp_offset_subtract(config.bp_offset_subtract)
         .with_layered(config.layered_bp)
+        .with_pade_atanh(config.pade_atanh)
         .with_feedback_refinement(
             config.ldpc_feedback_refinement_enabled,
             config.ldpc_feedback_boost_factor,
@@ -2229,6 +2252,7 @@ impl Ft8Decoder {
                 max_parity_errors_for_osd: self.config.max_parity_errors_for_osd,
                 bp_offset_subtract: self.config.bp_offset_subtract,
                 layered_bp: self.config.layered_bp,
+                pade_atanh: self.config.pade_atanh,
                 ldpc_feedback_refinement_enabled: self.config.ldpc_feedback_refinement_enabled,
                 ldpc_feedback_boost_factor: self.config.ldpc_feedback_boost_factor,
                 ldpc_feedback_attenuate_factor: self.config.ldpc_feedback_attenuate_factor,
@@ -2315,6 +2339,7 @@ impl Ft8Decoder {
                         .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
                         .with_bp_offset_subtract(ctx.bp_offset_subtract)
                         .with_layered(ctx.layered_bp)
+                        .with_pade_atanh(ctx.pade_atanh)
                         .with_feedback_refinement(
                             ctx.ldpc_feedback_refinement_enabled,
                             ctx.ldpc_feedback_boost_factor,
@@ -6666,6 +6691,8 @@ struct DecodeContext<'a> {
     bp_offset_subtract: f32,
     /// Layered (row-sequential) BP schedule.
     layered_bp: bool,
+    /// Padé `atanh` approximant in the BP check-node update (F1 [A/B]).
+    pade_atanh: bool,
     /// JS8Call-Improved-style LDPC feedback refinement: master switch.
     ldpc_feedback_refinement_enabled: bool,
     /// JS8Call-Improved-style LDPC feedback refinement: agree-boost factor.
@@ -9698,6 +9725,36 @@ fn fast_atanh(x: f32) -> f32 {
     0.5 * ((1.0 + x) / (1.0 - x)).ln()
 }
 
+/// Padé approximant for atanh, matching ft8_lib's approach
+/// (vendor/ft8_lib/ft8/ldpc.c, MIT). Saturates near |x|→1 (max ≈ 2.28 at
+/// the BP clamp) vs the ln form's ≈ 8.4 — hence the A/B gate
+/// (`Ft8Config::pade_atanh`).
+#[inline]
+fn fast_atanh_pade(x: f32) -> f32 {
+    let x2 = x * x;
+    let a = x * (945.0 + x2 * (-735.0 + x2 * 64.0));
+    let b = 945.0 + x2 * (-1050.0 + x2 * 225.0);
+    a / b
+}
+
+/// Piecewise fallback for `Ft8Config::pade_atanh`: the raw Padé
+/// (`fast_atanh_pade`) below the saturation boundary, the exact ln form
+/// (`fast_atanh`) above it. The hard-200 A/B gate
+/// (`research/experiments/2026-07-06-pade-atanh.md`) measured a
+/// significant recall regression (Δrec=-12, 95% CI [-20,-5]) with the raw
+/// Padé applied unconditionally — a minority of BP check-node products
+/// land close enough to ±1 that the Padé's bounded saturation (max ≈2.28)
+/// loses confidence the exact ln form (unbounded, clamped at ≈8.4) needs
+/// to converge. `0.95` matches the brief's fallback boundary.
+#[inline]
+fn fast_atanh_pade_piecewise(x: f32) -> f32 {
+    if x.abs() <= 0.95 {
+        fast_atanh_pade(x)
+    } else {
+        fast_atanh(x)
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 enum LdpcAlgorithm {
     MinSum { normalization_factor: f32 },
@@ -9768,6 +9825,11 @@ struct LdpcDecoder {
     /// When true, `belief_propagation_with_trajectory` uses a
     /// layered (row-sequential) schedule instead of flooding.
     layered: bool,
+    /// When true, the sum-product check-node update uses the piecewise
+    /// Padé/ln-form approximant (`fast_atanh_pade_piecewise`) instead of
+    /// the exact ln-form `fast_atanh` everywhere. See
+    /// `Ft8Config::pade_atanh`. Default `false`.
+    pade_atanh: bool,
     /// JS8Call-Improved-style feedback refinement config (clean-room port
     /// from a prose spec of the JS8Call-Improved LDPC feedback
     /// refinement). When `enabled` is
@@ -9947,6 +10009,7 @@ impl LdpcDecoder {
             max_parity_errors_for_osd: 4,
             bp_offset_subtract: 0.0,
             layered: false,
+            pade_atanh: false,
             feedback_refinement: FeedbackRefinementConfig::default(),
         })
     }
@@ -9969,6 +10032,13 @@ impl LdpcDecoder {
 
     fn with_layered(mut self, on: bool) -> Self {
         self.layered = on;
+        self
+    }
+
+    /// Enable / disable the Padé `atanh` approximant in the sum-product
+    /// check-node update. See `Ft8Config::pade_atanh`.
+    fn with_pade_atanh(mut self, on: bool) -> Self {
+        self.pade_atanh = on;
         self
     }
 
@@ -10292,6 +10362,14 @@ impl LdpcDecoder {
     fn belief_propagation(&self, channel_llrs: &[f32]) -> Ft8Result<[f32; 174]> {
         let num_checks = self.parity_check_matrix.num_checks;
         let num_vars = self.parity_check_matrix.num_variables;
+        // F1 [A/B]: select the atanh implementation once per call (constant
+        // across the whole decode), not per-edge, so the flag adds no
+        // per-iteration branching cost. See `Ft8Config::pade_atanh`.
+        let atanh_fn: fn(f32) -> f32 = if self.pade_atanh {
+            fast_atanh_pade_piecewise
+        } else {
+            fast_atanh
+        };
 
         // Sparse message storage: one f32 per edge in the Tanner graph.
         // For each check node, store messages indexed by position in its connection list.
@@ -10339,7 +10417,7 @@ impl LdpcDecoder {
                                     product *= th;
                                 }
                             }
-                            c2v[check_idx][target_pos] = 2.0 * fast_atanh(product);
+                            c2v[check_idx][target_pos] = 2.0 * atanh_fn(product);
                         }
                     }
                     LdpcAlgorithm::MinSum {
@@ -10436,6 +10514,14 @@ impl LdpcDecoder {
     ) -> Ft8Result<([f32; 174], Option<Box<[[f32; 174]; 25]>>, (u8, f32))> {
         let num_checks = self.parity_check_matrix.num_checks;
         let num_vars = self.parity_check_matrix.num_variables;
+        // F1 [A/B]: select once per call — see the mirrored comment in
+        // `belief_propagation` above. Shared by both the layered and
+        // flooding branches below.
+        let atanh_fn: fn(f32) -> f32 = if self.pade_atanh {
+            fast_atanh_pade_piecewise
+        } else {
+            fast_atanh
+        };
 
         let mut v2c = [[0.0f32; 7]; 83];
         let mut c2v = [[0.0f32; 7]; 83];
@@ -10502,7 +10588,7 @@ impl LdpcDecoder {
                                         product *= th;
                                     }
                                 }
-                                let new_msg = 2.0 * fast_atanh(product);
+                                let new_msg = 2.0 * atanh_fn(product);
                                 let var_idx = connected_vars[target_pos];
                                 total[var_idx] += new_msg - c2v[check_idx][target_pos];
                                 c2v[check_idx][target_pos] = new_msg;
@@ -10605,7 +10691,7 @@ impl LdpcDecoder {
                                     product *= th;
                                 }
                             }
-                            c2v[check_idx][target_pos] = 2.0 * fast_atanh(product);
+                            c2v[check_idx][target_pos] = 2.0 * atanh_fn(product);
                         }
                     }
                     LdpcAlgorithm::MinSum {
@@ -11313,6 +11399,62 @@ mod tests {
         let (noisy_llrs, _) = layered.belief_propagation_with_trajectory(&noisy).unwrap();
         let correct = (0..174).filter(|&i| noisy_llrs[i] > 0.0).count();
         assert!(correct > 170, "layered only corrected {correct}/174 bits");
+    }
+
+    #[test]
+    fn pade_atanh_matches_ln_form_in_bp_operating_range() {
+        // BP products of ≤6 tanh(|x|/2) values rarely approach ±1; the Padé
+        // (from MIT ft8_lib, vendor/ft8_lib/ft8/ldpc.c) matches the ln form
+        // to within 2e-3 across |x| ≤ 0.8 (measured max error ~1.4e-3 at
+        // the boundary) — the range that matters for typical BP products.
+        // Nearer the ±1 clamp the two forms diverge further (measured max
+        // error ~1.6e-2 at |x| = 0.9): the Padé saturates gracefully
+        // (bounded output, per the `fast_atanh_pade` doc comment) while the
+        // ln form blows up toward the LLR clamp, so a wider tolerance is
+        // used for 0.8 < |x| ≤ 0.9. This is what the A/B research-harness
+        // gate exists to validate on real decode data — a unit test can
+        // only pin the approximation's own numeric shape, not its net
+        // effect on recall/FP rate.
+        for i in 0..=1800 {
+            let x = (i as f32 / 1000.0) - 0.9;
+            let exact = 0.5 * ((1.0 + x) / (1.0 - x)).ln();
+            let pade = fast_atanh_pade(x);
+            let tol = if x.abs() <= 0.8 { 2e-3 } else { 2e-2 };
+            assert!(
+                (exact - pade).abs() < tol,
+                "x={x}: exact={exact} pade={pade} tol={tol}"
+            );
+        }
+    }
+
+    #[test]
+    fn pade_atanh_piecewise_matches_ln_form_beyond_the_saturation_boundary() {
+        // The hard-200 A/B gate (research/experiments/2026-07-06-pade-atanh.md)
+        // measured a significant recall regression (Δrec=-12, 95% CI
+        // [-20,-5]) with the raw Padé everywhere: the pure Padé saturates
+        // near |x|→1 (max ≈2.28) while BP occasionally needs the exact
+        // ln form's unbounded confidence to converge on strong-signal
+        // codewords. The piecewise fallback uses the Padé (cheap) below
+        // the boundary and falls back to the exact `fast_atanh` (ln form)
+        // above it, so it must be EXACTLY `fast_atanh(x)` — not merely
+        // close — for |x| > 0.95.
+        for i in 0..=999 {
+            let x = 0.951 + (i as f32 / 1000.0) * 0.0489999; // (0.951, 0.9999999]
+            let expected = fast_atanh(x);
+            let got = fast_atanh_pade_piecewise(x);
+            assert_eq!(
+                got, expected,
+                "x={x}: piecewise should equal ln form above 0.95"
+            );
+        }
+        // At and below the boundary, the piecewise form must be exactly
+        // the raw Padé (the cheap path — no behavior change vs the pure
+        // Padé for the range that matters for BP recall).
+        for i in 0..=950 {
+            let x = i as f32 / 1000.0;
+            assert_eq!(fast_atanh_pade_piecewise(x), fast_atanh_pade(x));
+            assert_eq!(fast_atanh_pade_piecewise(-x), fast_atanh_pade(-x));
+        }
     }
 
     #[test]
