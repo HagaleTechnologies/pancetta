@@ -49,9 +49,7 @@ use std::sync::Arc;
 
 use pancetta_config::DecodeEffort;
 use pancetta_ft8::tier_probe::{recommend_actions, HardwareTier};
-use pancetta_ft8::Ft8Config;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
 use tracing::{debug, info, warn};
 
 use super::effort::seed_effort_budget;
@@ -288,6 +286,20 @@ pub(crate) async fn apply_tier(
     format!("scoped_fast_path={} ({})", atomic_value, atomic_reason)
 }
 
+/// Whether a tier-probe completion should re-seed `decode_effort_budget_ms`
+/// given the operator's LIVE decode-effort preset (final-review Finding 1).
+///
+/// Pure decision function, factored out of [`spawn_probe_worker`] so the
+/// race-guard logic is unit-testable without spawning a real hardware
+/// probe: `Auto` is the only preset whose resolved budget depends on the
+/// tier (see `effort::preset_budget_ms`), so re-seeding is only correct —
+/// and only necessary — when the live preset is still `Auto`. A `false`
+/// here means the operator has explicitly cycled to a non-Auto preset
+/// since startup and that choice must not be clobbered.
+fn probe_completion_should_reseed_budget(live_effort: DecodeEffort) -> bool {
+    live_effort == DecodeEffort::Auto
+}
+
 /// Spawn the background probe worker. Runs `probe_hardware_tier(10)`,
 /// persists the cache, and applies the tier to runtime state. All
 /// failures log and return — never panic.
@@ -297,6 +309,17 @@ pub(crate) async fn apply_tier(
 /// `budget_override` when set, and stores the resolved tier into
 /// `resolved_hardware_tier` (decoder-speed-overhaul Task 15) so a later live
 /// `Auto` decode-effort cycle resolves the correct tier-derived budget.
+///
+/// **Race guard (final-review Finding 1):** this runs in the background,
+/// concurrently with the live TUI, so the operator may have already
+/// pressed `e` (cycling `current_decode_effort` away from `Auto`) before
+/// this completes. The budget re-seed reads the LIVE `current_decode_effort`
+/// atomic (not a value captured at coordinator startup) and only
+/// re-resolves/re-applies the tier-derived budget when that live value is
+/// still `Auto` — `Auto` is the only preset whose resolved budget actually
+/// depends on the tier (see `preset_budget_ms`), so this never clobbers an
+/// operator's explicit non-Auto choice, and is a no-op change of behavior
+/// for the untouched-`Auto` case.
 #[allow(clippy::too_many_arguments)]
 fn spawn_probe_worker(
     cpu_model: String,
@@ -305,9 +328,9 @@ fn spawn_probe_worker(
     cache_path: Option<PathBuf>,
     override_: Override,
     scoped_fast_path: Arc<AtomicBool>,
-    effort: DecodeEffort,
     budget_override: Option<u64>,
     decode_effort_budget_ms: Arc<AtomicU64>,
+    current_decode_effort: Arc<AtomicU8>,
     resolved_hardware_tier: Arc<AtomicU8>,
 ) {
     tokio::task::spawn_blocking(move || {
@@ -358,17 +381,31 @@ fn spawn_probe_worker(
         ));
         info!("tier probe: applied — {}", summary);
 
-        seed_effort_budget(
-            effort,
-            budget_override,
-            result.tier,
-            &decode_effort_budget_ms,
-        );
+        // Finding 1: only re-seed the budget atomic if the operator hasn't
+        // already cycled `e` away from `Auto` while this probe was running.
+        // Non-Auto presets resolve to the same budget regardless of tier
+        // (see `preset_budget_ms`), so skipping them here changes nothing
+        // for the untouched case and avoids clobbering an explicit choice.
+        let live_effort = DecodeEffort::from_u8(current_decode_effort.load(Ordering::Acquire));
+        if probe_completion_should_reseed_budget(live_effort) {
+            seed_effort_budget(
+                DecodeEffort::Auto,
+                budget_override,
+                result.tier,
+                &decode_effort_budget_ms,
+            );
+            info!(
+                "tier probe: decode_effort_budget_ms re-seeded for {} tier (Auto)",
+                result.tier.as_str()
+            );
+        } else {
+            debug!(
+                "tier probe: decode_effort_budget_ms NOT re-seeded — operator has already \
+                 cycled decode effort to {:?}; tier is still recorded for a future Auto cycle",
+                live_effort
+            );
+        }
         resolved_hardware_tier.store(result.tier.as_u8(), Ordering::Release);
-        info!(
-            "tier probe: decode_effort_budget_ms re-seeded for {} tier",
-            result.tier.as_str()
-        );
     });
 }
 
@@ -391,18 +428,19 @@ fn spawn_probe_worker(
 /// TUI's live `e` decode-effort cycle can resolve `Auto` against the real
 /// tier without re-probing.
 ///
-/// `ft8_config` no longer drives a tier-based preset rewrite here (Task 14
-/// retired the Slow-tier `Ft8Config` rewrite that used to live in
-/// [`apply_tier`]) — the parameter is kept purely so the call site in
-/// `coordinator/mod.rs` still reads naturally alongside the shared decoder
-/// config it constructs; the FT8 hot loop holds its own clone of the same
-/// `Arc` independently of this function.
+/// `current_decode_effort` is the live atomic the TUI's `e` keybinding
+/// cycles (`effort::cycle_decode_effort`); the background probe worker
+/// (see [`spawn_probe_worker`]) reads it at re-seed time so an operator
+/// choice made before the probe completes is never silently clobbered
+/// (final-review Finding 1). The synchronous cache-hit path below has no
+/// such race (it runs before the TUI can accept input), so it seeds from
+/// the startup `effort` value directly, same as before.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn initialize(
-    _ft8_config: Arc<RwLock<Ft8Config>>,
     effort: DecodeEffort,
     budget_override: Option<u64>,
     decode_effort_budget_ms: Arc<AtomicU64>,
+    current_decode_effort: Arc<AtomicU8>,
     resolved_hardware_tier: Arc<AtomicU8>,
 ) -> Arc<AtomicBool> {
     let scoped_fast_path = Arc::new(AtomicBool::new(false));
@@ -465,9 +503,9 @@ pub(crate) async fn initialize(
             cache_path,
             override_,
             scoped_fast_path.clone(),
-            effort,
             budget_override,
             decode_effort_budget_ms,
+            current_decode_effort,
             resolved_hardware_tier,
         );
     }
@@ -613,4 +651,52 @@ mod tests {
         assert!(!cpu.is_empty());
         assert!(cores >= 1);
     }
+
+    // ------------------------------------------------------------------
+    // final-review Finding 1: tier-probe completion must not clobber a
+    // live operator decode-effort choice.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn probe_completion_reseeds_when_live_effort_is_auto() {
+        // The default/untouched state: `Auto`, and the whole point of a
+        // tier-probe re-seed is to resolve `Auto` against the now-known
+        // tier. This must stay true, or the tier probe becomes inert.
+        assert!(probe_completion_should_reseed_budget(DecodeEffort::Auto));
+    }
+
+    #[test]
+    fn probe_completion_never_reseeds_when_operator_cycled_away_from_auto() {
+        // Simulates the operator pressing `e` during the brief
+        // cache-miss probe window: `current_decode_effort` now holds a
+        // non-Auto preset. The probe completing must NOT silently
+        // revert it — this is the exact bug described in Finding 1.
+        for cycled in [
+            DecodeEffort::Eco,
+            DecodeEffort::Standard,
+            DecodeEffort::Deep,
+            DecodeEffort::Max,
+        ] {
+            assert!(
+                !probe_completion_should_reseed_budget(cycled),
+                "probe completion must not re-seed the budget atomic when the \
+                 operator has cycled to {cycled:?} — doing so would silently \
+                 revert their live choice (final-review Finding 1)"
+            );
+        }
+    }
+
+    // Note: `tier::initialize`/`spawn_probe_worker` themselves are not
+    // exercised end-to-end here — `initialize` reads/writes the real
+    // `~/.pancetta/tier_cache.json` (via `default_cache_path`) and
+    // `spawn_probe_worker` runs the genuine `probe_hardware_tier` hardware
+    // timing probe on a `spawn_blocking` thread, so driving them from a
+    // unit test would have real side effects on the developer's machine
+    // and non-deterministic timing — the existing test suite already
+    // avoids calling `initialize` directly for the same reason. The
+    // plumbing was verified by code inspection instead: `initialize` now
+    // takes `current_decode_effort: Arc<AtomicU8>` and forwards it
+    // unchanged into `spawn_probe_worker` (see the `spawn_probe_worker(...)`
+    // call at the end of `initialize`), which reads it live at re-seed
+    // time via `probe_completion_should_reseed_budget`, tested above.
 }

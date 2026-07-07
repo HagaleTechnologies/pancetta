@@ -44,6 +44,11 @@ const MAX_DECODED_FIELD_LEN: usize = 64;
 /// The boundary (`slot_ns == 7_500_000_000`, i.e. exactly FT4's period) is
 /// inclusive on the FT4 (800 ms) side — a slot period at or below FT4's is
 /// treated as the faster mode's tighter budget.
+///
+/// Scope: this ceiling (and `decode_effort_budget_ms`) only governs the
+/// native `pancetta-ft8` AP-enhanced decode call. The separate
+/// `decode_window_ft8lib_protocol` ft8_lib C FFI decode path (below) runs
+/// unconditionally and is not bounded by either budget.
 fn decode_budget_ceiling_ms(slot_ns: u64) -> u64 {
     if slot_ns <= 7_500_000_000 {
         800

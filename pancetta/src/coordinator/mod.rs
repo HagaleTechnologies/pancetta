@@ -1067,10 +1067,10 @@ impl ApplicationCoordinator {
             pancetta_ft8::tier_probe::HardwareTier::Fast.as_u8(),
         ));
         let scoped_fast_path = tier::initialize(
-            ft8_config.clone(),
             decoder_effort_init,
             decoder_budget_override_init,
             decode_effort_budget_ms.clone(),
+            current_decode_effort.clone(),
             resolved_hardware_tier.clone(),
         )
         .await;
