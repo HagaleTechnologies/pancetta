@@ -52,7 +52,10 @@
 #![allow(clippy::needless_range_loop)] // protocol-bit-position loops; see ap.rs/encoder.rs
 
 use bitvec::prelude::*;
-use pancetta_ft8::ap::{inject_ap_llrs, ApContext, ApLevel, MyCallAp, QsoAp, QsoApProgress};
+use pancetta_ft8::ap::{
+    inject_ap2_caller, inject_ap_llrs, inject_recent_call_at_called, ApContext, ApLevel, MyCallAp,
+    QsoAp, QsoApProgress, RecentCallAp,
+};
 use pancetta_ft8::ldpc::{gray_to_binary, gray_to_binary_4fsk};
 use pancetta_ft8::message::PAYLOAD_BITS;
 use pancetta_ft8::protocol::{ProtocolParams, FT4_XOR_SEQUENCE};
@@ -452,4 +455,109 @@ fn ap1_ap3_ft8_injection_unaffected_by_whitening_fix() {
         [false, false, true],
         "FT8 AP4 i3 bits must remain the raw (false,false,true) pattern"
     );
+}
+
+// ============================================================================
+// Task W1.2 review follow-up: direct FT4-domain coverage for the two
+// `inject_ap_llrs` siblings that share the identical XOR-whitening bug
+// (`inject_ap2_caller` at offset 29, `inject_recent_call_at_called` at
+// offset 0) — both are live production decode paths (AP2 candidate-caller
+// injection and hb-043 my_call-less AP injection, respectively, per
+// `decoder.rs`'s call sites), but were previously only exercised in the
+// FT8/`None` no-op direction. These mirror
+// `ap1_ft4_injection_matches_post_xor_codeword_not_raw_callsign_bits`'s
+// exact methodology: real FT4 encoder round-trip as ground truth, plus a
+// sanity check that the chosen callsign actually exercises a
+// `FT4_XOR_SEQUENCE`=1 bit so the test can't false-pass on a coincidentally
+// XOR-neutral input.
+
+/// `inject_ap2_caller` injects a candidate caller's bits at offset 29
+/// (`from_callsign`). For FT4, its injected LLR signs must match the real
+/// post-XOR codeword bits at 29..57, not the raw (un-whitened) callsign
+/// bits — same bug class as AP1/AP3/AP4, same fix (`xor_bit_at` inside
+/// `inject_28_bits`), but previously unverified in the FT4 direction for
+/// this specific function.
+#[test]
+fn ap2_caller_ft4_injection_matches_post_xor_codeword_not_raw_callsign_bits() {
+    // "K1DEF W1ABC RR73": K1DEF is to_callsign (bits 0-27), W1ABC is
+    // from_callsign / the caller (bits 29-56) — matching the module doc's
+    // convention that we are always to_callsign for anything we decode.
+    let ground_truth = encode_ft4_to_codeword_bits("K1DEF W1ABC RR73");
+
+    let caller = RecentCallAp::new("W1ABC", 10.0).expect("W1ABC should encode");
+    // Sanity: the raw (un-whitened) caller bits must differ from the
+    // post-XOR ground truth at at least one position in 29..57, otherwise
+    // this test can't distinguish "whitened correctly" from "bug present
+    // but coincidentally matches" for this callsign.
+    let raw_differs_from_whitened = (29..57).any(|i| caller.bits[i - 29] != ground_truth[i]);
+    assert!(
+        raw_differs_from_whitened,
+        "test callsign must exercise at least one FT4_XOR_SEQUENCE=1 bit \
+         in 29..57, otherwise the whitening bug is untestable here"
+    );
+
+    let mut llrs = vec![0.0f32; 77];
+    inject_ap2_caller(&mut llrs, &caller, Some(&FT4_XOR_SEQUENCE));
+
+    for i in 29..57 {
+        let injected_bit = llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "bit {i}: inject_ap2_caller's injected LLR sign (for FT4) must \
+             match the encoder's real post-XOR codeword bit, not the raw \
+             caller callsign bit"
+        );
+    }
+
+    // Bits outside 29..57 must be untouched (still the 0.0 no-injection
+    // sentinel) — inject_ap2_caller only ever touches the caller field.
+    for i in (0..29).chain(57..77) {
+        assert_eq!(
+            llrs[i], 0.0,
+            "bit {i} outside the caller field must be untouched"
+        );
+    }
+}
+
+/// `inject_recent_call_at_called` injects a candidate callsign at offset 0
+/// (`to_callsign`). For FT4, its injected LLR signs must match the real
+/// post-XOR codeword bits at 0..28, not the raw callsign bits. This is the
+/// hb-043 my_call-less AP injection path: a live production decode path
+/// with the same whitening requirement as AP1's called-station injection,
+/// but previously unverified in the FT4 direction for this specific
+/// function.
+#[test]
+fn recent_call_at_called_ft4_injection_matches_post_xor_codeword_not_raw_callsign_bits() {
+    let ground_truth = encode_ft4_to_codeword_bits("K1DEF W1ABC RR73");
+
+    let call = RecentCallAp::new("K1DEF", 10.0).expect("K1DEF should encode");
+    // Sanity: the raw (un-whitened) callsign bits must differ from the
+    // post-XOR ground truth at at least one position in 0..28.
+    let raw_differs_from_whitened = (0..28).any(|i| call.bits[i] != ground_truth[i]);
+    assert!(
+        raw_differs_from_whitened,
+        "test callsign must exercise at least one FT4_XOR_SEQUENCE=1 bit \
+         in 0..28, otherwise the whitening bug is untestable here"
+    );
+
+    let mut llrs = vec![0.0f32; 77];
+    inject_recent_call_at_called(&mut llrs, &call, Some(&FT4_XOR_SEQUENCE));
+
+    for i in 0..28 {
+        let injected_bit = llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "bit {i}: inject_recent_call_at_called's injected LLR sign (for \
+             FT4) must match the encoder's real post-XOR codeword bit, not \
+             the raw callsign bit"
+        );
+    }
+
+    // Bits outside 0..28 must be untouched.
+    for i in 28..77 {
+        assert_eq!(
+            llrs[i], 0.0,
+            "bit {i} outside the called field must be untouched"
+        );
+    }
 }
