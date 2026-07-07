@@ -100,6 +100,27 @@ pub struct TierResult {
     pub decode_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub novel_decodes: Option<u32>,
+    /// Task W0.3 (2026-07-06): of the decodes counted in `novel_decodes`
+    /// (pancetta-only, not matched to jt9 truth on this tier), how many
+    /// classify as "verified" by the existing callsign-continuity filter
+    /// (`fp_filter::FpFilter::classify` — report-only, does NOT drop or
+    /// alter the decode set actually scored). A verified novel is one
+    /// whose extracted callsign(s) appear in the known-good reference set
+    /// (jt9 baselines across the whole corpus) — plausibly a real station
+    /// jt9 simply missed, not a hallucination. `None` on tiers that don't
+    /// run novel classification (fixtures, synth-*, noise_1000) or when
+    /// the classifier's reference corpus wasn't available for this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub novels_verified: Option<u32>,
+    /// Task W0.3: the complement of `novels_verified` — novel decodes
+    /// whose extracted callsign(s) do NOT appear in the known-good
+    /// reference set. The design spec's standing gate term
+    /// (`Δunverified-novels ≤ 2× ΔTP`, enforced in `bin/compare.rs`)
+    /// treats growth here, disproportionate to true-positive growth, as
+    /// evidence of a decoder hallucinating harder rather than genuinely
+    /// improving. `None` under the same conditions as `novels_verified`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub novels_unverified: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wsjtx_decoded: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]

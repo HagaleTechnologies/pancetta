@@ -9,7 +9,8 @@ use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus, load_synth
 use pancetta_research::curated::{load_curated_corpus, CuratedEntry};
 use pancetta_research::decoder::{DecoderUnderTest, Ft8Decoder};
 use pancetta_research::metrics::{
-    default_weights, populate_composite, saturation_aware_composite, RefreshOffsetRegistry,
+    compute_regression_flags, default_weights, populate_composite, saturation_aware_composite,
+    RefreshOffsetRegistry,
 };
 use pancetta_research::scorecard::{
     BuildInfo, ConfigInfo, GitInfo, HarnessInfo, PerWavFailure, PerWavRecord, RegressionFlags,
@@ -1155,6 +1156,7 @@ fn run_chrono_replay_tier(
     workspace: &std::path::Path,
     manifest_path: &std::path::Path,
     fp_filter: Option<&pancetta_research::FpFilter>,
+    novel_classifier: Option<&pancetta_research::FpFilter>,
 ) -> anyhow::Result<TierResult> {
     use pancetta_research::chrono_replay::load_chrono_replay_corpus;
     let entries = load_chrono_replay_corpus(manifest_path)?;
@@ -1168,6 +1170,10 @@ fn run_chrono_replay_tier(
     let mut truth_decodes_total = 0u32;
     let mut truth_recovered = 0u32;
     let mut novel_decodes = 0u32;
+    // Task W0.3: see the identical counters in `run_curated_tier` — same
+    // report-only semantics.
+    let mut novels_verified = 0u32;
+    let mut novels_unverified = 0u32;
     let mut wsjtx_total = 0u32;
     let mut per_wav_failures: Vec<PerWavFailure> = Vec::new();
     let mut per_wav_records: Vec<PerWavRecord> = Vec::new();
@@ -1239,6 +1245,14 @@ fn run_chrono_replay_tier(
             {
                 novel_decodes += 1;
                 novel_here += 1;
+                // Task W0.3: report-only classification, see run_curated_tier.
+                if let Some(classifier) = novel_classifier {
+                    if classifier.classify(&ours.message) {
+                        novels_verified += 1;
+                    } else {
+                        novels_unverified += 1;
+                    }
+                }
             }
         }
 
@@ -1332,6 +1346,8 @@ fn run_chrono_replay_tier(
         truth_decodes_recovered: Some(truth_recovered),
         decode_rate: Some(decode_rate),
         novel_decodes: Some(novel_decodes),
+        novels_verified: novel_classifier.map(|_| novels_verified),
+        novels_unverified: novel_classifier.map(|_| novels_unverified),
         wsjtx_decoded: Some(wsjtx_total),
         vs_wsjtx_pct: Some(vs_wsjtx_pct),
         per_wav_top_failures: per_wav_failures,
@@ -1346,6 +1362,7 @@ fn run_curated_tier(
     workspace: &std::path::Path,
     manifest_path: &std::path::Path,
     fp_filter: Option<&pancetta_research::FpFilter>,
+    novel_classifier: Option<&pancetta_research::FpFilter>,
 ) -> anyhow::Result<TierResult> {
     let entries: Vec<CuratedEntry> = load_curated_corpus(manifest_path)?;
     let total = entries.len() as u32;
@@ -1358,6 +1375,11 @@ fn run_curated_tier(
     let mut truth_decodes_total = 0u32;
     let mut truth_recovered = 0u32;
     let mut novel_decodes = 0u32;
+    // Task W0.3: report-only classification of novel decodes (does NOT
+    // filter/drop anything — see `novel_classifier` doc at the call site
+    // in `main`). `None` unless a classifier was built for this run.
+    let mut novels_verified = 0u32;
+    let mut novels_unverified = 0u32;
     let mut wsjtx_total = 0u32;
     let mut per_wav_failures: Vec<PerWavFailure> = Vec::new();
     // Phase B (2026-06-01): full per-WAV (truth, recovered, novel) records
@@ -1428,6 +1450,17 @@ fn run_curated_tier(
             {
                 novel_decodes += 1;
                 novel_here += 1;
+                // Task W0.3: classify (never filter) this novel via the
+                // existing callsign-continuity logic. Purely additive —
+                // `our_decodes`/`novel_decodes`/`recovered_here` etc. are
+                // untouched by this branch.
+                if let Some(classifier) = novel_classifier {
+                    if classifier.classify(&ours.message) {
+                        novels_verified += 1;
+                    } else {
+                        novels_unverified += 1;
+                    }
+                }
             }
         }
 
@@ -1482,6 +1515,8 @@ fn run_curated_tier(
         truth_decodes_recovered: Some(truth_recovered),
         decode_rate: Some(decode_rate),
         novel_decodes: Some(novel_decodes),
+        novels_verified: novel_classifier.map(|_| novels_verified),
+        novels_unverified: novel_classifier.map(|_| novels_unverified),
         wsjtx_decoded: Some(wsjtx_total),
         vs_wsjtx_pct: Some(vs_wsjtx_pct),
         per_wav_top_failures: per_wav_failures,
@@ -1868,6 +1903,57 @@ fn main() -> anyhow::Result<()> {
     };
     let fp_filter_ref = fp_filter.as_ref();
 
+    // Task W0.3 (2026-07-06): report-only novel-decode classifier. This is
+    // DELIBERATELY independent of `fp_filter` above (which is opt-in and
+    // actually drops decodes via `apply_fp_filter`) — it always builds
+    // when a jt9-truth tier is requested, from the SAME jt9-baseline
+    // corpus (`research/baselines/ft8`) already used to look up truth for
+    // every WAV in those tiers, and is used ONLY to classify (never
+    // filter) pancetta-only ("novel") decodes as verified/unverified for
+    // scorecard accounting (design spec §2, decision D0(c)). See
+    // `run_curated_tier` / `run_chrono_replay_tier` for where it's
+    // consulted, and `fp_filter.rs::FpFilter::classify` for the
+    // report-only entry point.
+    let novel_classifier_needed = args.tiers.iter().any(|t| {
+        matches!(
+            t.as_str(),
+            "curated-hard-200"
+                | "curated-hard-1000"
+                | "wild-50"
+                | "wild-100"
+                | "lid-of-band"
+                | "wild-doppler-50"
+                | "hard-jt9-rich-200"
+                | "chrono-replay"
+        )
+    });
+    let novel_classifier: Option<pancetta_research::FpFilter> = if novel_classifier_needed {
+        let dir = workspace.join("research/baselines/ft8");
+        if dir.exists() {
+            let mut f = pancetta_research::FpFilter::new();
+            let n = f.extend_from_baselines(&dir).with_context(|| {
+                format!("loading novel-classifier baselines from {}", dir.display())
+            })?;
+            eprintln!(
+                "novel-classifier: loaded {n} jt9 baseline files from {}, {} unique callsigns \
+                 (report-only — does not filter decodes)",
+                dir.display(),
+                f.reference_size()
+            );
+            Some(f)
+        } else {
+            eprintln!(
+                "novel-classifier: baselines dir {} missing — novels_verified/novels_unverified \
+                 will be omitted (None) for this run",
+                dir.display()
+            );
+            None
+        }
+    } else {
+        None
+    };
+    let novel_classifier_ref = novel_classifier.as_ref();
+
     // Batch 19 (2026-06-02): build a tier-slot pool when --max-concurrent-tiers
     // is set so heavy tier runs across N parallel `eval` invocations don't
     // co-saturate CPU. The pool is a no-op for light tiers (fixtures,
@@ -1975,8 +2061,13 @@ fn main() -> anyhow::Result<()> {
                     "curated manifest missing at {}. Run: cargo run --release -p pancetta-research --bin curate -- --source-dir ~/.pancetta/recordings --output-prefix research/corpus/curated/ft8",
                     manifest.display()
                 );
-                let result =
-                    run_curated_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
+                let result = run_curated_tier(
+                    decoder.as_ref(),
+                    &workspace,
+                    &manifest,
+                    fp_filter_ref,
+                    novel_classifier_ref,
+                )?;
                 tiers.insert(tier_name.to_string(), result);
             }
             // hb-073 — real-Doppler eval tier sourced from KiwiSDR auroral/TEP
@@ -2001,8 +2092,13 @@ fn main() -> anyhow::Result<()> {
                         },
                     );
                 } else {
-                    let result =
-                        run_curated_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
+                    let result = run_curated_tier(
+                        decoder.as_ref(),
+                        &workspace,
+                        &manifest,
+                        fp_filter_ref,
+                        novel_classifier_ref,
+                    )?;
                     tiers.insert("wild-doppler-50".to_string(), result);
                 }
             }
@@ -2029,8 +2125,13 @@ fn main() -> anyhow::Result<()> {
                         },
                     );
                 } else {
-                    let result =
-                        run_curated_tier(decoder.as_ref(), &workspace, &manifest, fp_filter_ref)?;
+                    let result = run_curated_tier(
+                        decoder.as_ref(),
+                        &workspace,
+                        &manifest,
+                        fp_filter_ref,
+                        novel_classifier_ref,
+                    )?;
                     tiers.insert("hard-jt9-rich-200".to_string(), result);
                 }
             }
@@ -2068,6 +2169,7 @@ fn main() -> anyhow::Result<()> {
                         &workspace,
                         &manifest,
                         fp_filter_ref,
+                        novel_classifier_ref,
                     )?;
                     tiers.insert("chrono-replay".to_string(), result);
                 }
@@ -2132,6 +2234,35 @@ fn main() -> anyhow::Result<()> {
     };
     populate_composite(&mut card, default_weights());
     card.harness.elapsed_seconds = started.elapsed().as_secs_f64();
+
+    // Task W0.3 (2026-07-06): compute real `RegressionFlags` by
+    // self-diffing this run against the checked-in
+    // `research/scorecards/main.json` baseline (best-effort — if it's
+    // missing, unreadable, or on a different schema version, this run's
+    // flags stay `RegressionFlags::default()`; a missing baseline is not
+    // itself a regression). This is deliberately read BEFORE `card` is
+    // written to `args.output` below, so the common `--output
+    // research/scorecards/main.json` refresh recipe compares against the
+    // PRIOR main.json, not the one it's about to overwrite.
+    let main_baseline_path = workspace.join("research/scorecards/main.json");
+    match Scorecard::load(&main_baseline_path) {
+        Ok(baseline) => {
+            card.regressions = compute_regression_flags(&baseline, &card);
+            eprintln!(
+                "regression-flags: computed vs {} (fixture_regression={}, false_positive_introduced={}, snr_curve_regression_db={:+.2})",
+                main_baseline_path.display(),
+                card.regressions.fixture_regression,
+                card.regressions.false_positive_introduced,
+                card.regressions.snr_curve_regression_db,
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "regression-flags: no usable baseline at {} ({e}); regressions left at default (false/false/0.0)",
+                main_baseline_path.display(),
+            );
+        }
+    }
 
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -2237,5 +2368,250 @@ mod snr_interpolation_tests {
         let got = first_threshold_db(&bins, 0.50).expect("must cross 50%");
         // interpolate between (-21, 0.2) and (-20, 0.8): frac=(0.5-0.2)/0.6=0.5
         assert!((got - (-20.5)).abs() < 1e-9, "got {got}");
+    }
+}
+
+/// Task W0.3 (2026-07-06) — novel-decode classification tests. These call
+/// `run_curated_tier` / `run_chrono_replay_tier` directly against a stub
+/// `DecoderUnderTest` and a temp workspace (no real audio, no subprocess),
+/// proving:
+///
+/// 1. the classification pass is genuinely report-only — every field that
+///    feeds recall/composite is byte-identical whether or not a classifier
+///    is supplied;
+/// 2. verified vs unverified counts come out right given a known reference
+///    set (built the same way `main` builds it, from
+///    `research/baselines/ft8`).
+#[cfg(test)]
+mod novel_classification_tests {
+    use super::*;
+    use pancetta_research::chrono_replay::{ChronoReplayEntry, ChronoReplayManifest};
+    use pancetta_research::curated::{CuratedEntry, CuratedManifest, ScoreBreakdown};
+    use pancetta_research::decoder::Decode;
+    use std::collections::HashMap;
+    use std::path::PathBuf;
+
+    /// A decoder stub that returns canned decodes keyed by the WAV's file
+    /// name, ignoring actual file content — no real audio needed.
+    struct StubDecoder {
+        responses: HashMap<String, Vec<Decode>>,
+    }
+
+    impl DecoderUnderTest for StubDecoder {
+        fn mode(&self) -> Mode {
+            Mode::Ft8
+        }
+        fn identity(&self) -> String {
+            "stub".to_string()
+        }
+        fn decode_wav(&self, path: &std::path::Path) -> anyhow::Result<Vec<Decode>> {
+            let key = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or_default();
+            Ok(self.responses.get(key).cloned().unwrap_or_default())
+        }
+        fn config_snapshot(&self) -> serde_json::Value {
+            serde_json::json!({})
+        }
+    }
+
+    fn decode(message: &str) -> Decode {
+        Decode {
+            message: message.to_string(),
+            freq_hz: 1500.0,
+            dt_s: 0.0,
+            snr_db: -10.0,
+            crc_valid: true,
+            decode_time_into_window_s: None,
+        }
+    }
+
+    /// Writes `wav_sha.json` (jt9's truth for the tier's one WAV) plus an
+    /// unrelated `extra_reference_wav` baseline file into
+    /// `workspace/research/baselines/ft8/` (seeding the novel-classifier's
+    /// reference set with extra callsigns, exactly like the real corpus
+    /// where the reference set spans every baseline file, not just the
+    /// WAVs in the current tier). Returns the curated-manifest path.
+    fn setup_curated(
+        workspace: &std::path::Path,
+        wav_sha: &str,
+        jt9_decodes: &[&str],
+        extra_reference_wav: Option<(&str, &[&str])>,
+    ) -> PathBuf {
+        let wav_dir = workspace.join("wavs");
+        std::fs::create_dir_all(&wav_dir).unwrap();
+        let wav_path = wav_dir.join(format!("{wav_sha}.wav"));
+        std::fs::write(&wav_path, b"not real audio").unwrap();
+
+        let baselines_dir = workspace.join("research/baselines/ft8");
+        std::fs::create_dir_all(&baselines_dir).unwrap();
+        write_baseline_cache(&baselines_dir, wav_sha, jt9_decodes);
+        if let Some((extra_sha, extra_decodes)) = extra_reference_wav {
+            write_baseline_cache(&baselines_dir, extra_sha, extra_decodes);
+        }
+
+        let manifest = CuratedManifest {
+            schema_version: CuratedManifest::CURRENT_SCHEMA_VERSION,
+            label: "test".to_string(),
+            generated_at: "2026-07-07T00:00:00Z".to_string(),
+            scoring_decoder: "stub".to_string(),
+            entries: vec![CuratedEntry {
+                wav_path,
+                wav_sha256: wav_sha.to_string(),
+                interest_score: 0.0,
+                score_breakdown: ScoreBreakdown::default(),
+            }],
+        };
+        let manifest_path = workspace.join("manifest.json");
+        manifest.save(&manifest_path).unwrap();
+        manifest_path
+    }
+
+    fn write_baseline_cache(baselines_dir: &std::path::Path, sha: &str, decodes: &[&str]) {
+        let cache = serde_json::json!({
+            "decodes": decodes
+                .iter()
+                .map(|m| serde_json::json!({"message": m}))
+                .collect::<Vec<_>>(),
+        });
+        std::fs::write(
+            baselines_dir.join(format!("{sha}.json")),
+            serde_json::to_string(&cache).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn build_classifier(workspace: &std::path::Path) -> pancetta_research::FpFilter {
+        let mut f = pancetta_research::FpFilter::new();
+        f.extend_from_baselines(&workspace.join("research/baselines/ft8"))
+            .unwrap();
+        f
+    }
+
+    #[test]
+    fn curated_tier_classification_is_report_only_and_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let sha = "aaaa1111";
+        // jt9 found K1ABC's CQ; pancetta finds it too PLUS two novels.
+        let manifest_path = setup_curated(
+            workspace,
+            sha,
+            &["CQ K1ABC FN42"],
+            Some(("bbbb2222", &["W1AW K5ARH FN20"])), // seeds K5ARH into the reference set
+        );
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("{sha}.wav"),
+            vec![
+                decode("CQ K1ABC FN42"),     // matches jt9 -> recovered, not novel
+                decode("K5ARH W9XYZ EM10"),  // novel; K5ARH IS in reference -> verified
+                decode("ZZ0ZZZ AA0AA AA00"), // novel; nothing in reference -> unverified
+            ],
+        );
+        let decoder = StubDecoder { responses };
+
+        let without = run_curated_tier(&decoder, workspace, &manifest_path, None, None).unwrap();
+        let classifier = build_classifier(workspace);
+        let with =
+            run_curated_tier(&decoder, workspace, &manifest_path, None, Some(&classifier)).unwrap();
+
+        // Report-only invariant: every recall/composite-relevant field is
+        // IDENTICAL whether or not the classifier ran.
+        assert_eq!(without.truth_decodes_total, with.truth_decodes_total);
+        assert_eq!(
+            without.truth_decodes_recovered,
+            with.truth_decodes_recovered
+        );
+        assert_eq!(without.decode_rate, with.decode_rate);
+        assert_eq!(without.novel_decodes, with.novel_decodes);
+        assert_eq!(without.wsjtx_decoded, with.wsjtx_decoded);
+        assert_eq!(without.vs_wsjtx_pct, with.vs_wsjtx_pct);
+        assert_eq!(without.per_wav_records.len(), with.per_wav_records.len());
+        for (a, b) in without
+            .per_wav_records
+            .iter()
+            .zip(with.per_wav_records.iter())
+        {
+            assert_eq!(a.truth, b.truth);
+            assert_eq!(a.recovered, b.recovered);
+            assert_eq!(a.novel, b.novel);
+        }
+
+        // Without a classifier: fields are None (not computed/omitted).
+        assert_eq!(without.novels_verified, None);
+        assert_eq!(without.novels_unverified, None);
+
+        // With a classifier: 1 verified (K5ARH known), 1 unverified (ZZ0ZZZ unknown).
+        assert_eq!(with.truth_decodes_recovered, Some(1));
+        assert_eq!(with.novel_decodes, Some(2));
+        assert_eq!(with.novels_verified, Some(1));
+        assert_eq!(with.novels_unverified, Some(1));
+    }
+
+    #[test]
+    fn chrono_replay_tier_classification_is_report_only_and_correct() {
+        let dir = tempfile::tempdir().unwrap();
+        let workspace = dir.path();
+        let sha = "cccc3333";
+
+        let wav_dir = workspace.join("wavs");
+        std::fs::create_dir_all(&wav_dir).unwrap();
+        let wav_path = wav_dir.join(format!("{sha}.wav"));
+        std::fs::write(&wav_path, b"not real audio").unwrap();
+
+        let baselines_dir = workspace.join("research/baselines/ft8");
+        std::fs::create_dir_all(&baselines_dir).unwrap();
+        write_baseline_cache(&baselines_dir, sha, &["CQ K1ABC FN42"]);
+        write_baseline_cache(&baselines_dir, "dddd4444", &["W1AW K5ARH FN20"]);
+
+        let manifest = ChronoReplayManifest {
+            schema_version: ChronoReplayManifest::CURRENT_SCHEMA_VERSION,
+            label: "test".to_string(),
+            generated_at: "2026-07-07T00:00:00Z".to_string(),
+            source_session_label: "test_*".to_string(),
+            first_wav_timestamp: "2026-07-07T00:00:00Z".to_string(),
+            last_wav_timestamp: "2026-07-07T00:00:00Z".to_string(),
+            span_seconds: 0.0,
+            entries: vec![ChronoReplayEntry {
+                wav_path,
+                wav_sha256: sha.to_string(),
+                slot_index: 0,
+                wav_timestamp: "2026-07-07T00:00:00Z".to_string(),
+            }],
+        };
+        let manifest_path = workspace.join("chrono.manifest.json");
+        manifest.save(&manifest_path).unwrap();
+
+        let mut responses = HashMap::new();
+        responses.insert(
+            format!("{sha}.wav"),
+            vec![
+                decode("CQ K1ABC FN42"),
+                decode("K5ARH W9XYZ EM10"),
+                decode("ZZ0ZZZ AA0AA AA00"),
+            ],
+        );
+        let decoder = StubDecoder { responses };
+
+        let without =
+            run_chrono_replay_tier(&decoder, workspace, &manifest_path, None, None).unwrap();
+        let classifier = build_classifier(workspace);
+        let with =
+            run_chrono_replay_tier(&decoder, workspace, &manifest_path, None, Some(&classifier))
+                .unwrap();
+
+        assert_eq!(without.novel_decodes, with.novel_decodes);
+        assert_eq!(
+            without.truth_decodes_recovered,
+            with.truth_decodes_recovered
+        );
+        assert_eq!(without.novels_verified, None);
+        assert_eq!(without.novels_unverified, None);
+        assert_eq!(with.novel_decodes, Some(2));
+        assert_eq!(with.novels_verified, Some(1));
+        assert_eq!(with.novels_unverified, Some(1));
     }
 }

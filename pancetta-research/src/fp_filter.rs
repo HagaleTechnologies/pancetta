@@ -215,6 +215,20 @@ impl FpFilter {
         self.reference.len()
     }
 
+    /// Task W0.3 (2026-07-06): report-only classification. Answers "would
+    /// this message's callsign(s) be accepted by the continuity filter?"
+    /// WITHOUT mutating any state (rolling window untouched) and WITHOUT
+    /// the caller dropping anything — a straight `accept(message, false)`
+    /// call. This is the entry point the eval harness uses to classify
+    /// pancetta-only ("novel") decodes as verified/unverified for
+    /// scorecard accounting; it must never be used to filter the actual
+    /// decode set (see `apply_fp_filter` in `bin/eval.rs` for the
+    /// separate, opt-in, actually-filtering path that also updates the
+    /// rolling window).
+    pub fn classify(&self, message: &str) -> bool {
+        self.accept(message, false)
+    }
+
     /// True if any of the message's extracted callsigns appear in the
     /// reference set OR the current rolling window. A message with no
     /// callsigns at all is rejected.
@@ -363,6 +377,29 @@ mod tests {
         // Empty reference + empty rolling → always reject.
         let f = FpFilter::new().with_rolling_window(2);
         assert!(!f.accept("CQ K1ABC FN42", true));
+    }
+
+    /// Task W0.3: `classify` is report-only — it must return the same
+    /// verdict as `accept(msg, false)` and must NEVER grow the rolling
+    /// window, even across repeated calls with novel callsigns. This is
+    /// the property the eval harness's report-only novel classification
+    /// depends on (it must not perturb decoder-under-test behavior).
+    #[test]
+    fn classify_matches_accept_false_and_never_mutates_rolling_window() {
+        let mut f = FpFilter::new().with_rolling_window(4);
+        f.extend_from_iter(["K1ABC"]);
+        assert!(f.classify("CQ K1ABC FN42"));
+        assert!(!f.classify("CQ ZZ0ZZZ AA00"));
+        // Call classify many times with callsigns that WOULD grow the
+        // rolling window under accept(..., true) — verify the window
+        // stays empty (reference-set-only membership still holds).
+        for _ in 0..10 {
+            f.classify("W9XYZ EM48 CQ");
+        }
+        // If classify had mutated the rolling window, W9XYZ would now be
+        // a rolling member and this unrelated call (which has no
+        // reference-set callsign) would flip to accepted.
+        assert!(!f.classify("W9XYZ AA0AA AA00"));
     }
 
     #[test]

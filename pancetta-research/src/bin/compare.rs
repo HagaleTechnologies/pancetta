@@ -320,6 +320,75 @@ fn fp_on_noise_hard_gate(a: &Scorecard, b: &Scorecard) -> Vec<String> {
     out
 }
 
+/// Task W0.3 (2026-07-06) — the unverified-novel standing-gate term
+/// (design spec §2, decision D0(c); plan Global Constraints / the
+/// standing TP gate: "unverified-novel count increase ≤ 2× verified-TP
+/// increase"). Unlike the zero-tolerance FP-on-noise gate above, this one
+/// is proportional: recall improvements structurally tend to pick up a
+/// few more borderline decodes alongside genuine gains, so SOME growth in
+/// unverified novels is expected. Growth disproportionate to the
+/// verified-TP gain (more than double) is the "hallucinating harder"
+/// failure mode this term exists to catch.
+///
+/// ΔTP is the aggregate `truth_decodes_recovered` delta and
+/// Δunverified-novels is the aggregate `novels_unverified` delta, summed
+/// across every shared tier where at least one side reports
+/// `novels_unverified` (tiers that never ran novel classification, e.g.
+/// fixtures/synth/noise, are excluded from the sum rather than silently
+/// contributing zero on both sides).
+///
+/// Returns `Vec::new()` when the gate passes (including when neither
+/// scorecard carries any `novels_unverified` data — nothing to gate on).
+fn unverified_novel_standing_gate(a: &Scorecard, b: &Scorecard) -> Vec<String> {
+    let tier_keys: Vec<&String> = a
+        .tiers
+        .keys()
+        .chain(b.tiers.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut delta_tp: i64 = 0;
+    let mut delta_unverified: i64 = 0;
+    let mut any_data = false;
+    let mut per_tier: Vec<(String, i64, i64)> = Vec::new();
+    for tier in tier_keys {
+        let (at, bt) = match (a.tiers.get(tier), b.tiers.get(tier)) {
+            (Some(at), Some(bt)) => (at, bt),
+            _ => continue,
+        };
+        if at.novels_unverified.is_none() && bt.novels_unverified.is_none() {
+            continue;
+        }
+        any_data = true;
+        let tier_delta_tp = bt.truth_decodes_recovered.unwrap_or(0) as i64
+            - at.truth_decodes_recovered.unwrap_or(0) as i64;
+        let tier_delta_unverified =
+            bt.novels_unverified.unwrap_or(0) as i64 - at.novels_unverified.unwrap_or(0) as i64;
+        delta_tp += tier_delta_tp;
+        delta_unverified += tier_delta_unverified;
+        per_tier.push((tier.clone(), tier_delta_tp, tier_delta_unverified));
+    }
+    if !any_data {
+        return Vec::new();
+    }
+    let allowance = 2 * delta_tp.max(0);
+    if delta_unverified <= allowance {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "  aggregate: unverified-novels Δ={delta_unverified:+} exceeds allowance {allowance:+} \
+         (2×ΔTP, ΔTP={delta_tp:+})"
+    )];
+    for (tier, tp, unverified) in per_tier {
+        if tp != 0 || unverified != 0 {
+            out.push(format!(
+                "  {tier:<20}  verified-TP Δ={tp:+}   unverified-novels Δ={unverified:+}"
+            ));
+        }
+    }
+    out
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     let a = Scorecard::load(&args.a).with_context(|| format!("loading A: {}", args.a.display()))?;
@@ -478,6 +547,25 @@ fn main() -> anyhow::Result<()> {
         println!("# ANY increase disqualifies this change. See design spec §2 (D0).");
         println!("############################################################");
         for line in &fp_gate_failures {
+            println!("{line}");
+        }
+        println!();
+        std::process::exit(1);
+    }
+
+    // Task W0.3 (2026-07-06) — the unverified-novel standing-gate term.
+    // Same enforcement style as the FP-on-noise gate above (prominent
+    // banner + nonzero exit), extending the standing A/B gate per the
+    // plan's Global Constraints: "unverified-novel count increase ≤ 2×
+    // verified-TP increase".
+    let novel_gate_failures = unverified_novel_standing_gate(&a, &b);
+    if !novel_gate_failures.is_empty() {
+        println!();
+        println!("############################################################");
+        println!("# HARD GATE FAILURE — UNVERIFIED-NOVEL GROWTH EXCEEDS 2×ΔTP");
+        println!("# See design spec §2 (D0) / plan Global Constraints (standing gate).");
+        println!("############################################################");
+        for line in &novel_gate_failures {
             println!("{line}");
         }
         println!();

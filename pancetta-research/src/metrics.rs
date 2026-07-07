@@ -1,4 +1,4 @@
-use crate::scorecard::{CompositeInfo, Scorecard, TierResult};
+use crate::scorecard::{CompositeInfo, RegressionFlags, Scorecard, TierResult};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -192,6 +192,77 @@ pub fn saturation_aware_composite(raw_composite: f64, registry: &RefreshOffsetRe
     raw_composite - registry.total_offset()
 }
 
+// ---------------------------------------------------------------------------
+// Task W0.3 (2026-07-06) — real `RegressionFlags` computation.
+// ---------------------------------------------------------------------------
+//
+// Previously written as `RegressionFlags::default()` at every scorecard-build
+// call site (`bin/eval.rs`) — always `false`/`false`/`0.0`, computed nowhere
+// (design spec §2). This is a pure function so it's independently testable
+// and so both `eval` (self-diffing the run it's about to write against the
+// checked-in `research/scorecards/main.json` baseline) and any other tool
+// can call it the same way.
+
+/// Compute `RegressionFlags` for `current` relative to `baseline` (typically
+/// the checked-in `research/scorecards/main.json`). Pure — no I/O, no
+/// mutation. Tiers present in only one side are treated as "nothing to
+/// compare" for that tier's contribution (never fabricates a regression from
+/// a tier that simply wasn't run on one side).
+///
+/// - `fixture_regression`: `true` iff both sides ran the `fixtures` tier and
+///   `current`'s `pass_rate` is strictly lower than `baseline`'s.
+/// - `false_positive_introduced`: `true` iff both sides ran the `noise_1000`
+///   tier (Task W0.1) and `current`'s `false_positives_total` is strictly
+///   higher than `baseline`'s. Any nonzero increase counts — there is no
+///   threshold, matching the noise-tier's zero-tolerance hard gate in
+///   `bin/compare.rs`.
+/// - `snr_curve_regression_db`: `current - baseline` on the `synth-clean`
+///   tier's `snr_at_50pct_recovery_db` (Task W0.2's 2500 Hz-calibrated
+///   curve). Positive means `current` needs MORE SNR to hit 50% recovery
+///   (worse sensitivity); negative means it improved. `0.0` when either
+///   side is missing the tier or the field.
+pub fn compute_regression_flags(baseline: &Scorecard, current: &Scorecard) -> RegressionFlags {
+    let fixture_regression = match (
+        baseline.tiers.get("fixtures"),
+        current.tiers.get("fixtures"),
+    ) {
+        (Some(b), Some(c)) => match (b.pass_rate, c.pass_rate) {
+            (Some(bv), Some(cv)) => cv < bv,
+            _ => false,
+        },
+        _ => false,
+    };
+
+    let false_positive_introduced = match (
+        baseline.tiers.get("noise_1000"),
+        current.tiers.get("noise_1000"),
+    ) {
+        (Some(b), Some(c)) => {
+            let bv = b.false_positives_total.unwrap_or(0);
+            let cv = c.false_positives_total.unwrap_or(0);
+            cv > bv
+        }
+        _ => false,
+    };
+
+    let snr_curve_regression_db = match (
+        baseline.tiers.get("synth-clean"),
+        current.tiers.get("synth-clean"),
+    ) {
+        (Some(b), Some(c)) => match (b.snr_at_50pct_recovery_db, c.snr_at_50pct_recovery_db) {
+            (Some(bv), Some(cv)) => cv - bv,
+            _ => 0.0,
+        },
+        _ => 0.0,
+    };
+
+    RegressionFlags {
+        fixture_regression,
+        false_positive_introduced,
+        snr_curve_regression_db,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -352,6 +423,224 @@ mod tests {
         let reg = RefreshOffsetRegistry::load_or_default(&path).unwrap();
         assert_eq!(reg.offsets.len(), 0);
         assert_eq!(reg.total_offset(), 0.0);
+    }
+
+    // -----------------------------------------------------------------
+    // Task W0.3 — real `RegressionFlags` computation (was
+    // `RegressionFlags::default()`, computed nowhere; design spec §2).
+    // -----------------------------------------------------------------
+
+    /// Minimal scorecard builder for the regression-flags tests — only
+    /// the `tiers` map matters for `compute_regression_flags`; every
+    /// other field is a fixed placeholder.
+    fn make_card(tiers: BTreeMap<String, TierResult>) -> Scorecard {
+        Scorecard {
+            schema_version: Scorecard::CURRENT_SCHEMA_VERSION,
+            generated_at: chrono::Utc::now(),
+            mode: crate::Mode::Ft8,
+            git: crate::scorecard::GitInfo {
+                branch: "test".into(),
+                head_sha: "0000000".into(),
+                main_merge_base: "0000000".into(),
+                dirty: false,
+            },
+            build: crate::scorecard::BuildInfo {
+                rustc_version: "1.85.0".into(),
+                release: true,
+                features: vec![],
+            },
+            harness: crate::scorecard::HarnessInfo {
+                harness_version: "test".into(),
+                host: "test/test".into(),
+                cores_used: 1,
+                elapsed_seconds: 0.0,
+            },
+            config: crate::scorecard::ConfigInfo {
+                decoder: serde_json::json!({}),
+                seed: 0,
+                tiers_run: vec![],
+                fp_filter_active: false,
+            },
+            tiers,
+            composite: CompositeInfo {
+                weights: BTreeMap::new(),
+                score: 0.0,
+                main_baseline_score: None,
+                delta_vs_main: None,
+            },
+            regressions: RegressionFlags::default(),
+            notes: String::new(),
+        }
+    }
+
+    #[test]
+    fn regression_flags_default_when_no_shared_tiers() {
+        let baseline = make_card(BTreeMap::new());
+        let current = make_card(BTreeMap::new());
+        let flags = compute_regression_flags(&baseline, &current);
+        assert!(!flags.fixture_regression);
+        assert!(!flags.false_positive_introduced);
+        assert_eq!(flags.snr_curve_regression_db, 0.0);
+    }
+
+    #[test]
+    fn regression_flags_detects_fixture_pass_rate_drop() {
+        let mut baseline_tiers = BTreeMap::new();
+        baseline_tiers.insert(
+            "fixtures".to_string(),
+            TierResult {
+                pass_rate: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let mut current_tiers = BTreeMap::new();
+        current_tiers.insert(
+            "fixtures".to_string(),
+            TierResult {
+                pass_rate: Some(0.9),
+                ..Default::default()
+            },
+        );
+        let baseline = make_card(baseline_tiers);
+        let current = make_card(current_tiers);
+        let flags = compute_regression_flags(&baseline, &current);
+        assert!(
+            flags.fixture_regression,
+            "pass_rate dropped 1.0 -> 0.9, must flag fixture_regression"
+        );
+    }
+
+    #[test]
+    fn regression_flags_no_fixture_regression_when_pass_rate_holds_or_improves() {
+        let mut baseline_tiers = BTreeMap::new();
+        baseline_tiers.insert(
+            "fixtures".to_string(),
+            TierResult {
+                pass_rate: Some(0.9),
+                ..Default::default()
+            },
+        );
+        let mut current_tiers = BTreeMap::new();
+        current_tiers.insert(
+            "fixtures".to_string(),
+            TierResult {
+                pass_rate: Some(1.0),
+                ..Default::default()
+            },
+        );
+        let baseline = make_card(baseline_tiers);
+        let current = make_card(current_tiers);
+        let flags = compute_regression_flags(&baseline, &current);
+        assert!(!flags.fixture_regression);
+    }
+
+    #[test]
+    fn regression_flags_detects_false_positive_introduced() {
+        let mut baseline_tiers = BTreeMap::new();
+        baseline_tiers.insert(
+            "noise_1000".to_string(),
+            TierResult {
+                false_positives_total: Some(0),
+                ..Default::default()
+            },
+        );
+        let mut current_tiers = BTreeMap::new();
+        current_tiers.insert(
+            "noise_1000".to_string(),
+            TierResult {
+                false_positives_total: Some(3),
+                ..Default::default()
+            },
+        );
+        let baseline = make_card(baseline_tiers);
+        let current = make_card(current_tiers);
+        let flags = compute_regression_flags(&baseline, &current);
+        assert!(
+            flags.false_positive_introduced,
+            "false_positives_total rose 0 -> 3, must flag false_positive_introduced"
+        );
+    }
+
+    #[test]
+    fn regression_flags_no_false_positive_when_noise_tier_unchanged() {
+        let mut baseline_tiers = BTreeMap::new();
+        baseline_tiers.insert(
+            "noise_1000".to_string(),
+            TierResult {
+                false_positives_total: Some(0),
+                ..Default::default()
+            },
+        );
+        let mut current_tiers = BTreeMap::new();
+        current_tiers.insert(
+            "noise_1000".to_string(),
+            TierResult {
+                false_positives_total: Some(0),
+                ..Default::default()
+            },
+        );
+        let baseline = make_card(baseline_tiers);
+        let current = make_card(current_tiers);
+        let flags = compute_regression_flags(&baseline, &current);
+        assert!(!flags.false_positive_introduced);
+    }
+
+    #[test]
+    fn regression_flags_computes_snr_curve_regression_db() {
+        let mut baseline_tiers = BTreeMap::new();
+        baseline_tiers.insert(
+            "synth-clean".to_string(),
+            TierResult {
+                snr_at_50pct_recovery_db: Some(-20.0),
+                ..Default::default()
+            },
+        );
+        let mut current_tiers = BTreeMap::new();
+        current_tiers.insert(
+            "synth-clean".to_string(),
+            TierResult {
+                // Worse sensitivity: needs 1.5 dB MORE SNR to hit 50%.
+                snr_at_50pct_recovery_db: Some(-18.5),
+                ..Default::default()
+            },
+        );
+        let baseline = make_card(baseline_tiers);
+        let current = make_card(current_tiers);
+        let flags = compute_regression_flags(&baseline, &current);
+        // current - baseline = -18.5 - (-20.0) = +1.5 (positive = worse).
+        assert!(
+            (flags.snr_curve_regression_db - 1.5).abs() < 1e-9,
+            "expected +1.5 dB regression, got {}",
+            flags.snr_curve_regression_db
+        );
+    }
+
+    #[test]
+    fn regression_flags_snr_curve_negative_when_sensitivity_improves() {
+        let mut baseline_tiers = BTreeMap::new();
+        baseline_tiers.insert(
+            "synth-clean".to_string(),
+            TierResult {
+                snr_at_50pct_recovery_db: Some(-20.0),
+                ..Default::default()
+            },
+        );
+        let mut current_tiers = BTreeMap::new();
+        current_tiers.insert(
+            "synth-clean".to_string(),
+            TierResult {
+                snr_at_50pct_recovery_db: Some(-21.0),
+                ..Default::default()
+            },
+        );
+        let baseline = make_card(baseline_tiers);
+        let current = make_card(current_tiers);
+        let flags = compute_regression_flags(&baseline, &current);
+        assert!(
+            (flags.snr_curve_regression_db - (-1.0)).abs() < 1e-9,
+            "expected -1.0 dB (improvement), got {}",
+            flags.snr_curve_regression_db
+        );
     }
 
     #[test]
