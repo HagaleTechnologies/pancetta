@@ -20,6 +20,7 @@ use std::collections::HashMap;
 
 use bitvec::prelude::*;
 
+use crate::acceptance::{self, AcceptanceScore};
 use crate::ldpc::{LDPC_CODEWORD_BITS, LDPC_GENERATOR, LDPC_INFO_BITS, LDPC_PARITY_BITS};
 use crate::message::{CRC_BITS, PAYLOAD_BITS};
 
@@ -72,6 +73,48 @@ pub struct OsdConfig {
     /// Default `false` — preserves byte-identical OSD behavior. Flip to
     /// `true` to enable; benefit kicks in only at `max_depth >= 3`.
     pub npre2_preprocessing_enabled: bool,
+
+    /// W2.2 acceptance gate (design spec §4 / `docs/superpowers/specs/
+    /// 2026-07-06-decoder-tp-sensitivity-design.md`): the maximum
+    /// [`AcceptanceScore::soft_distance`] a `max_depth >= 1` candidate may
+    /// have and still be accepted as the OSD result. Calibrated in task
+    /// W2.1 (`research/experiments/2026-07-07-acceptance-calibration.md`):
+    /// `0.0976` was the largest threshold keeping FDR <= 1% on a definitive
+    /// TP/FP subset (hard_200 jt9-verified decodes vs. noise_1000), giving
+    /// 100% in-sample TP retention and 98.6% noise-FP rejection. **Carry-
+    /// forward caveat**: that FDR is corpus-mix-dependent (a 1250:835
+    /// TP:FP ratio that is an artifact of the calibration corpus, not a
+    /// measured production base rate) — the THRESHOLD VALUE is the
+    /// transferable artifact, re-verify the actual FDR this buys on any
+    /// new corpus rather than assuming W2.1's number transfers unchanged.
+    /// Only consulted when `max_depth >= 1`; order-0's single hard-decision
+    /// candidate (which runs even at `max_depth == 0`, the production
+    /// default) is never gated by this field — see
+    /// `OsdDecoder::decode_with_features_scored` doc comment.
+    pub max_soft_distance: f32,
+
+    /// W2.2 acceptance gate: the maximum [`AcceptanceScore::hard_errors`]
+    /// a `max_depth >= 1` candidate may have and still be accepted,
+    /// applied together with `max_soft_distance` (both must pass). Default
+    /// `37` is the max `hard_errors` observed among W2.1's calibration
+    /// hard_200 jt9-verified (TP) population — a secondary, weaker
+    /// backstop; `soft_distance` is the load-bearing metric (W2.1 §
+    /// "soft_distance disagrees with naive hard-error ordering" — a raw
+    /// error count alone can rank cases in the wrong order).
+    pub max_hard_errors: u16,
+
+    /// W2.2 early-out bound: once a within-order candidate's
+    /// `soft_distance` is at or below this value, stop scanning the
+    /// remaining trials at that order and accept it immediately (bounds
+    /// OSD-2/OSD-3's worst-case trial count). `0.02` sits comfortably
+    /// below W2.1's observed noise-corpus minimum `soft_distance` (0.0242)
+    /// and close to the TP mean (0.0155): a candidate this clean is
+    /// overwhelmingly likely to be the true codeword, so it is safe to
+    /// stop searching for a (implausible) even-better match. This is a
+    /// pure cost optimization — it never changes which candidate wins
+    /// among those actually compared, since it only fires once a
+    /// candidate already passes the (stricter) `max_soft_distance` gate.
+    pub accept_immediately_below: f32,
 }
 
 impl Default for OsdConfig {
@@ -81,6 +124,9 @@ impl Default for OsdConfig {
         Self {
             max_depth: 1,
             npre2_preprocessing_enabled: false,
+            max_soft_distance: 0.0976,
+            max_hard_errors: 37,
+            accept_immediately_below: 0.02,
         }
     }
 }
@@ -577,17 +623,75 @@ impl OsdDecoder {
 
     /// FDR Session 3: like [`Self::decode`] but returns
     /// `Some((codeword, depth_used, nharderrs))`. `depth_used` is the
-    /// OSD depth at which `try_solution` first succeeded (0/1/2/3, where
-    /// 3 covers both the npre2 warm-start and the full triple loop).
-    /// `nharderrs` is the number of info bits flipped at the successful
-    /// trial (0 / 1 / 2 / 2 [npre2 pair] / 3 [triple]).
+    /// OSD depth at which the best-scoring candidate was accepted
+    /// (0/1/2/3, where 3 covers both the npre2 warm-start and the full
+    /// triple loop). `nharderrs` is the number of info bits flipped at
+    /// the accepted trial (0 / 1 / 2 / 2 [npre2 pair] / 3 [triple]).
     /// Inspired by spec ref `spec-wsjtx-improved-fdr.md` §"Inputs".
+    ///
+    /// Thin wrapper around [`Self::decode_with_features_scored`] using
+    /// `llrs` as both the search array AND the acceptance-scoring
+    /// "channel" array (the two coincide for every caller that doesn't
+    /// separately track pre-BP channel LLRs, e.g. this module's own unit
+    /// tests). Production decode (`decoder.rs`) uses
+    /// `decode_with_features_scored` directly so it can pass the true
+    /// pre-BP channel LLRs separately from the (possibly BP-offset-
+    /// adjusted) search array.
     #[allow(clippy::needless_range_loop)]
     pub fn decode_with_features(
         &self,
         llrs: &[f32; LDPC_CODEWORD_BITS],
         neural_ordering: Option<&[f32; LDPC_INFO_BITS]>,
     ) -> Option<(BitVec, u8, u8)> {
+        self.decode_with_features_scored(llrs, llrs, neural_ordering)
+            .map(|(bits, depth, nharderrs, _score)| (bits, depth, nharderrs))
+    }
+
+    /// W2.2 (`docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`
+    /// §4): like [`Self::decode_with_features`] but takes a SEPARATE
+    /// `channel_llrs` array — the pre-BP signal-domain LLRs — used ONLY
+    /// to score and RANK candidates at `max_depth >= 1` via
+    /// [`acceptance::score`]. `llrs` continues to drive reliability
+    /// ordering and candidate generation exactly as before (unchanged);
+    /// `channel_llrs` never influences WHICH candidates get tried, only
+    /// which one wins among those that pass CRC-14 at a given order.
+    /// Also returns the winning candidate's [`AcceptanceScore`].
+    ///
+    /// # The bug this fixes
+    /// Prior to W2.2, the order-1/2/3 loops below returned on the FIRST
+    /// CRC-14 pass encountered while enumerating flip patterns (up to
+    /// 121,485 for order-3). At CRC-14's 2⁻¹⁴ collision rate, a false
+    /// (CRC-valid but wrong) candidate turning up before the true one in
+    /// iteration order is a statistical certainty at that trial volume —
+    /// "first CRC pass" has no reason to correlate with "actually the
+    /// right codeword". This method instead collects every CRC-valid
+    /// candidate within an order, keeps the one with the MINIMUM
+    /// `soft_distance` (the true codeword should almost always agree far
+    /// better with the channel LLRs than a random CRC collision), and
+    /// requires that minimum to also pass an absolute acceptance gate
+    /// (`max_soft_distance` / `max_hard_errors`) before accepting it —
+    /// a low-confidence "best of a bad lot" is still rejected, escalating
+    /// to the next (deeper, costlier) order instead.
+    ///
+    /// # Why order-0 is untouched
+    /// Order-0 (the plain hard-decision candidate, zero flips) runs
+    /// UNCONDITIONALLY regardless of `max_depth` — including at
+    /// `max_depth == 0`, the PRODUCTION DEFAULT (`osd_depth: Some(0)`).
+    /// There is only ever ONE order-0 candidate, so there is no
+    /// first-vs-best SELECTION ambiguity there, and adding a gate would
+    /// change production behavior at the default config — which this
+    /// task must not do. The collect-and-rank + acceptance-gate fix below
+    /// applies ONLY to the order-1/2/3 (+ npre2) loops, all of which are
+    /// unreachable at `max_depth == 0` (each is behind its own `if
+    /// self.config.max_depth < N { return None; }` guard), so production
+    /// is byte-identical.
+    #[allow(clippy::needless_range_loop)]
+    pub fn decode_with_features_scored(
+        &self,
+        llrs: &[f32; LDPC_CODEWORD_BITS],
+        channel_llrs: &[f32; LDPC_CODEWORD_BITS],
+        neural_ordering: Option<&[f32; LDPC_INFO_BITS]>,
+    ) -> Option<(BitVec, u8, u8, AcceptanceScore)> {
         // 1. Sort indices by reliability (most reliable first, on a
         // commensurable scale across info AND parity bits — see
         // `reliability_sorted_indices`).
@@ -635,9 +739,12 @@ impl OsdDecoder {
             base_parity[p] = val;
         }
 
-        // Try OSD-0
+        // Try OSD-0 — single candidate, no selection ambiguity, no gate
+        // (see doc comment above: this path is live even at max_depth==0,
+        // today's production default, and must stay byte-identical).
         if let Some(result) = self.try_solution(&info_hard, &base_parity, &final_perm) {
-            return Some((result, 0, 0));
+            let score = acceptance::score(&result, channel_llrs);
+            return Some((result, 0, 0, score));
         }
 
         if self.config.max_depth < 1 {
@@ -652,6 +759,9 @@ impl OsdDecoder {
             }
         }
 
+        // W2.2: collect every CRC-valid single-flip candidate and keep the
+        // minimum-soft_distance one, instead of returning the first.
+        let mut best: Option<(BitVec, AcceptanceScore)> = None;
         for flip in 0..LDPC_INFO_BITS {
             let mut info = info_hard;
             info[flip] ^= 1;
@@ -661,17 +771,34 @@ impl OsdDecoder {
                     parity[p] ^= 1;
                 }
             }
-            if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
-                return Some((result, 1, 1));
+            if let Some(candidate) = self.try_solution(&info, &parity, &final_perm) {
+                let score = acceptance::score(&candidate, channel_llrs);
+                if self.is_better_candidate(&best, &score) {
+                    let accept_now = score.soft_distance <= self.config.accept_immediately_below;
+                    best = Some((candidate, score));
+                    if accept_now {
+                        break;
+                    }
+                }
             }
+        }
+        if let Some((codeword, score)) = best {
+            if self.passes_acceptance_gate(&score) {
+                return Some((codeword, 1, 1, score));
+            }
+            // Best order-1 candidate failed the acceptance gate (likely a
+            // CRC-14 collision, not a real decode) — fall through to a
+            // deeper (costlier but not-yet-exhausted) order rather than
+            // trusting it.
         }
 
         if self.config.max_depth < 2 {
             return None;
         }
 
-        // 7. OSD-2: flip pairs
-        for i in 0..LDPC_INFO_BITS {
+        // 7. OSD-2: flip pairs — same collect-and-rank pattern as OSD-1.
+        let mut best: Option<(BitVec, AcceptanceScore)> = None;
+        'osd2: for i in 0..LDPC_INFO_BITS {
             for j in (i + 1)..LDPC_INFO_BITS {
                 let mut info = info_hard;
                 info[i] ^= 1;
@@ -685,9 +812,22 @@ impl OsdDecoder {
                         parity[p] ^= 1;
                     }
                 }
-                if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
-                    return Some((result, 2, 2));
+                if let Some(candidate) = self.try_solution(&info, &parity, &final_perm) {
+                    let score = acceptance::score(&candidate, channel_llrs);
+                    if self.is_better_candidate(&best, &score) {
+                        let accept_now =
+                            score.soft_distance <= self.config.accept_immediately_below;
+                        best = Some((candidate, score));
+                        if accept_now {
+                            break 'osd2;
+                        }
+                    }
                 }
+            }
+        }
+        if let Some((codeword, score)) = best {
+            if self.passes_acceptance_gate(&score) {
+                return Some((codeword, 2, 2, score));
             }
         }
 
@@ -719,6 +859,7 @@ impl OsdDecoder {
                 let residual = npre2_residual_signature(&info_hard, &base_parity, &parity_cols);
                 let warm_pairs = npre2_collect_pairs(&marginals, &parity_cols, residual);
 
+                let mut best: Option<(BitVec, AcceptanceScore)> = None;
                 for (i1, i2) in warm_pairs {
                     let mut info = info_hard;
                     info[i1] ^= 1;
@@ -732,10 +873,23 @@ impl OsdDecoder {
                             parity[p] ^= 1;
                         }
                     }
-                    if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
+                    if let Some(candidate) = self.try_solution(&info, &parity, &final_perm) {
+                        let score = acceptance::score(&candidate, channel_llrs);
+                        if self.is_better_candidate(&best, &score) {
+                            let accept_now =
+                                score.soft_distance <= self.config.accept_immediately_below;
+                            best = Some((candidate, score));
+                            if accept_now {
+                                break;
+                            }
+                        }
+                    }
+                }
+                if let Some((codeword, score)) = best {
+                    if self.passes_acceptance_gate(&score) {
                         // npre2 warm-start always flips a marginal pair,
                         // even though it's enumerated within the depth-3 budget.
-                        return Some((result, 3, 2));
+                        return Some((codeword, 3, 2, score));
                     }
                 }
             }
@@ -744,9 +898,11 @@ impl OsdDecoder {
         // 8. OSD-3: flip all triples — C(91, 3) = 121,485 trials
         //    (= 91 · 90 · 89 / 6). Comment corrected 2026-06-02 (Phase C)
         //    per docs/engineering/2026-06-02-engineering-substance-audit.md
-        //    (claim 17); loop math was already correct.
+        //    (claim 17); loop math was already correct. Same
+        //    collect-and-rank pattern as OSD-1/OSD-2.
         // Each trial XORs 3 rows of the reduced generator matrix, then checks CRC-14.
-        for i in 0..LDPC_INFO_BITS {
+        let mut best: Option<(BitVec, AcceptanceScore)> = None;
+        'osd3: for i in 0..LDPC_INFO_BITS {
             for j in (i + 1)..LDPC_INFO_BITS {
                 // Pre-compute i+j parity update to avoid recomputing in innermost loop
                 let mut parity_ij = base_parity;
@@ -769,14 +925,55 @@ impl OsdDecoder {
                             parity[p] ^= 1;
                         }
                     }
-                    if let Some(result) = self.try_solution(&info, &parity, &final_perm) {
-                        return Some((result, 3, 3));
+                    if let Some(candidate) = self.try_solution(&info, &parity, &final_perm) {
+                        let score = acceptance::score(&candidate, channel_llrs);
+                        if self.is_better_candidate(&best, &score) {
+                            let accept_now =
+                                score.soft_distance <= self.config.accept_immediately_below;
+                            best = Some((candidate, score));
+                            if accept_now {
+                                break 'osd3;
+                            }
+                        }
                     }
                 }
             }
         }
+        if let Some((codeword, score)) = best {
+            if self.passes_acceptance_gate(&score) {
+                return Some((codeword, 3, 3, score));
+            }
+        }
 
         None
+    }
+
+    /// `true` iff `candidate_score` is a strictly better (lower
+    /// `soft_distance`) match than the current `best`, or `best` is
+    /// `None`. Shared by every order-1/2/3(+npre2) collect-and-rank loop
+    /// in [`Self::decode_with_features_scored`].
+    #[inline]
+    fn is_better_candidate(
+        &self,
+        best: &Option<(BitVec, AcceptanceScore)>,
+        candidate_score: &AcceptanceScore,
+    ) -> bool {
+        match best {
+            None => true,
+            Some((_, best_score)) => candidate_score.soft_distance < best_score.soft_distance,
+        }
+    }
+
+    /// W2.2 acceptance gate: `true` iff `score` is trustworthy enough to
+    /// accept as the final OSD result at `max_depth >= 1` — both the
+    /// weighted soft distance AND the raw hard-error count must be within
+    /// the configured bounds. See [`OsdConfig::max_soft_distance`] /
+    /// [`OsdConfig::max_hard_errors`] for the calibration provenance and
+    /// the carry-forward caveat about corpus-mix-dependent FDR.
+    #[inline]
+    fn passes_acceptance_gate(&self, score: &AcceptanceScore) -> bool {
+        score.soft_distance <= self.config.max_soft_distance
+            && score.hard_errors <= self.config.max_hard_errors
     }
 
     /// Un-permute info+parity bits into a codeword and check CRC-14.
@@ -1348,6 +1545,286 @@ mod tests {
                 "Could not find a bit triple where OSD-2 fails but OSD-3 succeeds"
             );
         }
+
+        /// W2.2 RED/GREEN test: a DETERMINISTIC (no probabilistic mining
+        /// loop) construction of "an early flip pattern yields a CRC-14
+        /// collision codeword at large soft distance and a later pattern
+        /// yields the true codeword at small distance" (task brief
+        /// language), exercising the order-1 -> order-3 escalation
+        /// boundary rather than two positions within one order's loop.
+        ///
+        /// # Why deterministic, and why order-1-vs-order-3
+        /// An earlier, purely-probabilistic version of this test (random
+        /// payloads + random corrupted-bit positions, hoping to stumble
+        /// on a genuine CRC-14 collision within OSD's small trial
+        /// neighborhood) was tried and abandoned: empirically, 500,000
+        /// random attempts targeting an order-1-collision/order-2-truth
+        /// scenario produced ZERO qualifying collisions (see this task's
+        /// experiment log) — far below the naive "2^-14 per trial"
+        /// expectation, because most single-info-bit flips don't even
+        /// touch the sparse ~1.3%-density parity columns that carry the
+        /// CRC-relevant bits, so most trials can't possibly flip CRC
+        /// pass/fail at all. A follow-up brute-force search (also in this
+        /// module, see the abandoned `diag_crc_kernel_search`/
+        /// `diag_mining_stats` probes) confirmed the minimum-weight
+        /// nonzero 77-bit payload delta with `crc14(delta) == 0` (a
+        /// "kernel element" — XORing it into any payload leaves the
+        /// CRC-14 unchanged) has weight **4**, one bit too many to fit
+        /// directly in OSD's max order-3 (91-choose-3) trial budget as a
+        /// single flip pattern.
+        ///
+        /// The construction that DOES work: split a weight-4 kernel
+        /// element's support `{p1,p2,p3,p4}` 3-and-1 between two
+        /// messages. Let `M` be the true message and `M' = M XOR
+        /// {p1,p2,p3,p4}` (also CRC-valid, since the delta is a kernel
+        /// element). Pick `baseline = M XOR {p1,p2,p3}`. Then:
+        /// - `baseline XOR {p1,p2,p3}` recovers `M` (an order-3 fix).
+        /// - `baseline XOR {p4}` recovers `M'` (an order-1 "fix" — really
+        ///   a spurious collision relative to the true intended signal).
+        ///
+        /// Order-1 is exhaustively tried BEFORE order-3 ever runs. Under
+        /// OLD first-CRC-accept semantics, order-1 finds `M'` (the
+        /// collision) at whichever info-role index corresponds to `p4`
+        /// and returns it immediately — order-3 (where `M`, the true
+        /// signal, lives) is never reached. This test fails against that
+        /// code. Post-W2.2, order-1's only CRC-valid candidate (`M'`) has
+        /// a large `soft_distance` (channel LLRs are set to confidently
+        /// match the TRUE codeword `C = encode(M)` everywhere, so `C'`
+        /// disagrees with many confident channel bits — verified, not
+        /// assumed, via an explicit assertion below), fails the
+        /// acceptance gate, and the decoder escalates to order-3, where
+        /// it finds and accepts `C`.
+        #[test]
+        fn test_osd_rejects_untrustworthy_order1_collision_and_finds_truth_at_order3() {
+            // All-zero payload: simplest possible base message. CRC-14
+            // linearity is verified explicitly below, not assumed.
+            let payload: BitVec = BitVec::repeat(false, PAYLOAD_BITS);
+            let crc = calculate_crc14(&payload);
+            let mut message: BitVec = payload.clone();
+            for i in 0..CRC_BITS {
+                message.push((crc >> (CRC_BITS - 1 - i)) & 1 == 1);
+            }
+            let encoder = LdpcEncoder::new();
+            let codeword = encoder.encode(&message).expect("LDPC encode failed");
+
+            // A weight-4 CRC-14 kernel element found by brute-force
+            // search over all 77-choose-4 payload-bit subsets (see the
+            // doc comment above): flipping these 4 payload bits leaves
+            // CRC-14 unchanged. Verified below, not assumed.
+            const DELTA: [usize; 4] = [0, 3, 37, 66];
+
+            // Verify DELTA is a genuine kernel element for THIS payload
+            // (all-zero): crc(payload) must equal crc(payload XOR DELTA).
+            let mut payload_prime = payload.clone();
+            for &p in &DELTA {
+                let bit = payload_prime[p];
+                payload_prime.set(p, !bit);
+            }
+            let crc_prime = calculate_crc14(&payload_prime);
+            assert_eq!(
+                crc, crc_prime,
+                "DELTA must be a genuine CRC-14 kernel element (crc(payload) == \
+                 crc(payload XOR DELTA)); got crc={:#06x} crc'={:#06x}",
+                crc, crc_prime
+            );
+
+            // M' = M XOR DELTA (same CRC bits, different payload) -> C'.
+            let mut message_prime = payload_prime.clone();
+            for i in 0..CRC_BITS {
+                message_prime.push((crc_prime >> (CRC_BITS - 1 - i)) & 1 == 1);
+            }
+            let codeword_prime = encoder
+                .encode(&message_prime)
+                .expect("LDPC encode failed for M'");
+            assert_ne!(
+                codeword, codeword_prime,
+                "M and M' must encode to DIFFERENT codewords (DELTA is nonzero)"
+            );
+
+            // Channel LLRs: confidently match the TRUE codeword `codeword`
+            // (M) at EVERY position, EXCEPT DELTA[0..3] (p1,p2,p3), which
+            // are given the WRONG sign (introducing the corruption that
+            // forces baseline = M XOR {p1,p2,p3}) at a lower-but-still-
+            // message-block-dominant magnitude. The parity block
+            // (positions 91..174) is confident but at the LOWEST
+            // magnitude of all three tiers, guaranteeing the message
+            // block (0..91) sorts entirely ahead of the parity block in
+            // reliability — the precondition for `final_perm` to map
+            // message-block positions onto OSD's "info" role as a set
+            // (verified dynamically below via `final_perm`, not assumed).
+            const MSG_CONFIDENT_MAG: f32 = 4.0;
+            const MSG_CORRUPTED_MAG: f32 = 2.0;
+            const PARITY_MAG: f32 = 1.8;
+            let mut llrs = [0.0f32; LDPC_CODEWORD_BITS];
+            for i in 0..LDPC_CODEWORD_BITS {
+                let mag = if i < LDPC_INFO_BITS {
+                    MSG_CONFIDENT_MAG
+                } else {
+                    PARITY_MAG
+                };
+                llrs[i] = if codeword[i] { -mag } else { mag };
+            }
+            for &p in &DELTA[..3] {
+                // Wrong sign, lower (but still message-block-dominant)
+                // magnitude: corrupted relative to the true codeword.
+                llrs[p] = if codeword[p] {
+                    MSG_CORRUPTED_MAG
+                } else {
+                    -MSG_CORRUPTED_MAG
+                };
+            }
+
+            // Replicate decode_with_features_scored's steps 1-4 to
+            // recover the EXACT permutation/info_hard/base_parity this
+            // LLR array is searched under, and to translate DELTA's
+            // original-bit-position support into OSD's info-role indices.
+            let decoder3 = OsdDecoder::new(OsdConfig {
+                max_depth: 3,
+                ..Default::default()
+            });
+            let sorted_indices = reliability_sorted_indices(&llrs, None);
+            let mut matrix = [[0u8; PACKED_BYTES]; LDPC_INFO_BITS];
+            for row in 0..LDPC_INFO_BITS {
+                for new_col in 0..LDPC_CODEWORD_BITS {
+                    let orig_col = sorted_indices[new_col];
+                    if get_bit(&decoder3.generator[row], orig_col) {
+                        set_bit(&mut matrix[row], new_col);
+                    }
+                }
+            }
+            let mut elim_perm = [0u16; LDPC_CODEWORD_BITS];
+            gaussian_eliminate(&mut matrix, &mut elim_perm)
+                .expect("Gaussian elimination must succeed on this reliability order");
+            let mut final_perm = [0usize; LDPC_CODEWORD_BITS];
+            for i in 0..LDPC_CODEWORD_BITS {
+                final_perm[i] = sorted_indices[elim_perm[i] as usize];
+            }
+
+            // Confirm the precondition: the message block (original
+            // positions 0..91) must occupy the info role (permuted
+            // positions 0..91) AS A SET — i.e. every DELTA position
+            // (which is < 77 < 91) has an info-role index.
+            let info_role_of = |orig_pos: usize| -> usize {
+                final_perm
+                    .iter()
+                    .position(|&p| p == orig_pos)
+                    .expect("original position must appear in final_perm")
+            };
+            let idx: Vec<usize> = DELTA.iter().map(|&p| info_role_of(p)).collect();
+            for &i in &idx {
+                assert!(
+                    i < LDPC_INFO_BITS,
+                    "DELTA position must map to the info role (index < {}), got {}",
+                    LDPC_INFO_BITS,
+                    i
+                );
+            }
+
+            let mut info_hard = [0u8; LDPC_INFO_BITS];
+            for i in 0..LDPC_INFO_BITS {
+                if llrs[final_perm[i]] < 0.0 {
+                    info_hard[i] = 1;
+                }
+            }
+            let mut base_parity = [0u8; LDPC_PARITY_BITS];
+            for p in 0..LDPC_PARITY_BITS {
+                let mut val = 0u8;
+                for i in 0..LDPC_INFO_BITS {
+                    if info_hard[i] == 1 && get_bit(&matrix[i], LDPC_INFO_BITS + p) {
+                        val ^= 1;
+                    }
+                }
+                base_parity[p] = val;
+            }
+
+            // Order-0 (no flips) must fail — the corruption at p1,p2,p3
+            // must actually break CRC validity of the raw hard-decision.
+            assert!(
+                decoder3
+                    .try_solution(&info_hard, &base_parity, &final_perm)
+                    .is_none(),
+                "order-0 (uncorrupted hard-decision) must fail CRC for this \
+                 construction to exercise order-1/order-3 at all"
+            );
+
+            // Scan order-1's full 91-trial space: find the first CRC-valid
+            // candidate (should be at idx[3], DELTA's 4th position, mapping
+            // to M') and confirm order-1 never reaches the true codeword.
+            let mut order1_true = false;
+            let mut first_collision: Option<(usize, BitVec)> = None;
+            for flip in 0..LDPC_INFO_BITS {
+                let mut info = info_hard;
+                info[flip] ^= 1;
+                let mut parity = base_parity;
+                for p in 0..LDPC_PARITY_BITS {
+                    if get_bit(&matrix[flip], LDPC_INFO_BITS + p) {
+                        parity[p] ^= 1;
+                    }
+                }
+                if let Some(cand) = decoder3.try_solution(&info, &parity, &final_perm) {
+                    if cand == codeword {
+                        order1_true = true;
+                    } else if first_collision.is_none() {
+                        first_collision = Some((flip, cand));
+                    }
+                }
+            }
+            assert!(
+                !order1_true,
+                "order-1 must NOT reach the true codeword directly — the \
+                 construction requires 3 flips (p1,p2,p3) to recover it"
+            );
+            let (collision_flip, collision_cw) = first_collision.expect(
+                "order-1 must find at least one CRC-valid candidate (M', via \
+                 the info-role index for DELTA[3])",
+            );
+            assert_eq!(
+                collision_flip, idx[3],
+                "the order-1 collision should be found at DELTA[3]'s info-role \
+                 index (no earlier accidental CRC collision) — if this fires, \
+                 an unplanned earlier collision exists; the test's assertions \
+                 below still hold generally, but the construction's narrative \
+                 assumption should be revisited"
+            );
+            assert_eq!(
+                collision_cw, codeword_prime,
+                "the order-1 collision must be exactly M' (C'), matching the \
+                 deterministic construction"
+            );
+
+            // Sanity: the collision must be a strictly WORSE (larger
+            // soft_distance) match against the channel than the truth —
+            // verified, not assumed.
+            let score_true = crate::acceptance::score(&codeword, &llrs);
+            let score_collision = crate::acceptance::score(&collision_cw, &llrs);
+            assert!(
+                score_collision.soft_distance > score_true.soft_distance,
+                "collision (soft_distance={}) must be a strictly WORSE match \
+                 than the true codeword (soft_distance={})",
+                score_collision.soft_distance,
+                score_true.soft_distance
+            );
+
+            // THE crux of W2.2: call the REAL decoder under test exactly
+            // once and check the outcome against BOTH possibilities.
+            let result = decoder3.decode(&llrs, None);
+            assert_ne!(
+                result.as_ref(),
+                Some(&collision_cw),
+                "decoder must NOT accept the untrustworthy order-1 CRC-14 \
+                 collision (soft_distance={}) merely because it was found \
+                 first — this is exactly what OLD first-CRC-accept code did",
+                score_collision.soft_distance
+            );
+            assert_eq!(
+                result.as_ref(),
+                Some(&codeword),
+                "decoder must instead find the TRUE codeword (soft_distance={}) \
+                 via order-3 escalation; got {:?}",
+                score_true.soft_distance,
+                result
+            );
+        }
     }
 }
 
@@ -1585,6 +2062,7 @@ mod npre2_tests {
         let decoder_off = OsdDecoder::new(OsdConfig {
             max_depth: 3,
             npre2_preprocessing_enabled: false,
+            ..Default::default()
         });
         let result_off = decoder_off.decode(&llrs, None);
         assert!(
@@ -1603,6 +2081,7 @@ mod npre2_tests {
         let decoder_on = OsdDecoder::new(OsdConfig {
             max_depth: 3,
             npre2_preprocessing_enabled: true,
+            ..Default::default()
         });
         let result_on = decoder_on.decode(&llrs, None);
         assert_eq!(

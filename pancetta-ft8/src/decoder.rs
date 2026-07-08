@@ -1826,6 +1826,7 @@ impl Ft8Decoder {
             config.osd_depth.map(|d| OsdConfig {
                 max_depth: d,
                 npre2_preprocessing_enabled: config.osd_npre2_preprocessing_enabled,
+                ..Default::default()
             }),
         )?
         .with_max_parity_errors_for_osd(config.max_parity_errors_for_osd)
@@ -2646,6 +2647,7 @@ impl Ft8Decoder {
                 let osd_cfg = ctx.osd_depth.map(|d| OsdConfig {
                     max_depth: d,
                     npre2_preprocessing_enabled: ctx.osd_npre2_preprocessing_enabled,
+                    ..Default::default()
                 });
                 let build = |iters: usize| {
                     LdpcDecoder::new_with_osd(iters, osd_cfg)
@@ -10774,6 +10776,18 @@ impl LdpcDecoder {
             };
             let parity_errors = self.count_parity_errors(llr_arr);
 
+            // W2.2: the acceptance gate inside OSD's order-1/2/3 loops
+            // must score candidates against the pre-BP CHANNEL LLRs (see
+            // `acceptance::score`'s doc comment), never against `llr_arr`
+            // above, which is BP's posterior output (optionally
+            // mBP-offset-adjusted) — a different array used only to drive
+            // OSD's reliability ordering and candidate generation. `llrs`
+            // (this function's own parameter) is the true channel array;
+            // copy it into a fixed-size array once, unconditionally (cheap
+            // — 174 floats) for `decode_with_features_scored`.
+            let mut channel_llrs_arr = [0.0f32; 174];
+            channel_llrs_arr.copy_from_slice(&llrs[..174]);
+
             // Parity gate for OSD: tunable via Ft8Config::max_parity_errors_for_osd.
             // Default 4: widening to 5 historically let too many noise candidates
             // through (CRC-14 collisions become FPs); tightening to 3 lost real
@@ -10812,10 +10826,16 @@ impl LdpcDecoder {
                     None
                 };
 
-                // FDR Session 3: use decode_with_features so the caller
-                // sees per-success (depth, nharderrs) telemetry.
-                let osd_result_with_features =
-                    osd.decode_with_features(llr_arr, neural_ordering.as_ref());
+                // FDR Session 3 + W2.2: use decode_with_features_scored so
+                // the caller sees per-success (depth, nharderrs) telemetry
+                // AND the acceptance-gated selection inside OSD's
+                // order-1/2/3 loops scores against the real channel LLRs
+                // rather than `llr_arr`.
+                let osd_result_with_features = osd.decode_with_features_scored(
+                    llr_arr,
+                    &channel_llrs_arr,
+                    neural_ordering.as_ref(),
+                );
 
                 // hb-064: record (trajectory, OSD outcome) for the
                 // research dataset. Only fires when capture is enabled
@@ -10824,7 +10844,7 @@ impl LdpcDecoder {
                 // see in production.
                 if capture_enabled {
                     let (osd_recovered, osd_codeword) = match &osd_result_with_features {
-                        Some((bv, _, _)) => {
+                        Some((bv, _, _, _)) => {
                             let mut arr = [0u8; 174];
                             for (i, slot) in arr.iter_mut().enumerate() {
                                 *slot = u8::from(bv.get(i).map(|b| *b).unwrap_or(false));
@@ -10846,7 +10866,9 @@ impl LdpcDecoder {
                     );
                 }
 
-                if let Some((codeword, depth_used, nharderrs)) = osd_result_with_features {
+                if let Some((codeword, depth_used, nharderrs, _acceptance)) =
+                    osd_result_with_features
+                {
                     // FDR Session 3: stamp the OSD-side features alongside
                     // the BP-side ones. depth_used ∈ {0,1,2,3}; nharderrs
                     // ∈ {0,1,2,3} (npre2 records depth=3, nharderrs=2).
