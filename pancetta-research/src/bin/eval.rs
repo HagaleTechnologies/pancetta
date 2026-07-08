@@ -2529,6 +2529,9 @@ mod novel_classification_tests {
             snr_db: -10.0,
             crc_valid: true,
             decode_time_into_window_s: None,
+            soft_distance: None,
+            hard_errors: None,
+            coherence: None,
         }
     }
 

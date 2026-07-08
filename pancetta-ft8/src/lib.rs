@@ -80,6 +80,12 @@ pub mod protocol;
 pub mod ap;
 pub use ap::{ApContext, ApLevel, MyCallAp, QsoAp, QsoApProgress, RecentCallAp};
 
+// Signal-domain acceptance metric for CRC-valid decodes (Workstream 2,
+// decoder-true-positive-sensitivity plan, task W2.1). Computed and attached
+// to `DecodedMessage::acceptance`; does not gate anything yet.
+pub mod acceptance;
+pub use acceptance::AcceptanceScore;
+
 /// hb-243 Phase 1: baseband complex-mixer + decimator (isolated DSP block; not
 /// yet wired into the decode path — correctness/cost validation only).
 pub mod baseband;

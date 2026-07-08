@@ -24,6 +24,19 @@ pub struct Decode {
     /// emit timing (jt9 subprocess, ft8_lib FFI). Used by the TTFD metric.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decode_time_into_window_s: Option<f64>,
+    /// W2.1 (decoder-tp-sensitivity plan): signal-domain acceptance
+    /// metric fields, flattened from `pancetta_ft8::DecodedMessage::acceptance`
+    /// (see `pancetta_ft8::acceptance`). `None` for decoders/paths that
+    /// didn't compute one — see that module's doc for exactly which paths
+    /// populate it. Used by the W2.1 calibration harness
+    /// (`bin/acceptance_calibration.rs`) to correlate acceptance evidence
+    /// against jt9-verified ground truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_distance: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_errors: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coherence: Option<f32>,
 }
 
 /// Generic interface for any decoder we want to evaluate. Implementors wrap
@@ -790,6 +803,11 @@ impl DecoderUnderTest for Ft8Decoder {
                     // hb-129: presentation-time elapsed from window start
                     // when this decode passed CRC. Used by TTFD metric.
                     decode_time_into_window_s: d.decode_time_into_window.map(|t| t.as_secs_f64()),
+                    // W2.1: flatten the acceptance metric (if computed) for
+                    // the calibration harness.
+                    soft_distance: d.acceptance.map(|a| a.soft_distance),
+                    hard_errors: d.acceptance.map(|a| a.hard_errors),
+                    coherence: d.acceptance.and_then(|a| a.coherence),
                 });
             }
         };
@@ -904,6 +922,10 @@ impl Jt9Decoder {
                 crc_valid: true,
                 // hb-129: jt9 doesn't expose per-decode timing.
                 decode_time_into_window_s: None,
+                // W2.1: jt9 is not the native decoder — no acceptance metric.
+                soft_distance: None,
+                hard_errors: None,
+                coherence: None,
             });
         }
         Ok(decodes)

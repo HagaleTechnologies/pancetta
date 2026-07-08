@@ -5281,6 +5281,15 @@ impl Ft8Decoder {
         // scoring, autonomous-TX gating) can read per-decode features.
         // osd_depth_used + nharderrs remain None until Session 3.
         decoded_message.confidence_features = Some(confidence_features);
+        // W2.1: signal-domain acceptance metric. Scored against
+        // `base_llrs` — the pre-AP-injection, pre-BP channel LLRs — NOT
+        // the post-injection `llrs` fed to BP/OSD above. AP injection is a
+        // decoder-internal bias (a prior baked in specifically to help
+        // this candidate's codeword pass), so scoring against the
+        // post-injection LLRs would be self-fulfilling at the injected bit
+        // positions. `base_llrs` is the true received-signal evidence.
+        decoded_message.acceptance =
+            crate::acceptance::score_from_slice(&corrected_bits, base_llrs);
 
         Ok(Some(decoded_message))
     }
@@ -5433,13 +5442,17 @@ impl Ft8Decoder {
                 candidate_offset_samples(anchor.time_step, spectrogram.time_padding, spec_step);
             let snr_db = par_estimate_snr_spectrogram(pp, &avg_mags);
             let confidence = (anchor.sync_score / 12.0).min(1.0) as f32;
-            decoded.push(DecodedMessage::new(
+            let mut new_msg = DecodedMessage::new(
                 ft8_message,
                 snr_db,
                 confidence,
                 base_frequency,
                 coarse_offset as f64 / SAMPLE_RATE as f64,
-            ));
+            );
+            // W2.1: `llrs` is the cross-cycle-averaged channel LLRs fed
+            // to `decode_soft` above (pre-BP).
+            new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+            decoded.push(new_msg);
         }
         decoded
     }
@@ -5795,6 +5808,9 @@ impl Ft8Decoder {
             // Preserve tone_symbols on the new decode so future multipass
             // iterations (if ever added) could subtract this signal too.
             new_msg.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
+            // W2.1: `llrs` is this residual candidate's own channel LLRs
+            // (post-subtraction spectrogram, pre-BP).
+            new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
             if diagnostic_on {
                 self.residual_snr_records
                     .push((cand.sync_score, pre_snr_db, true));
@@ -5944,6 +5960,9 @@ impl Ft8Decoder {
                 coarse_offset as f64 / SAMPLE_RATE as f64,
             );
             new_msg.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
+            // W2.1: `llrs` is this candidate's own channel LLRs (original
+            // sync position, pre-BP).
+            new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
             if diagnostic_on {
                 self.residual_snr_records
                     .push((cand.sync_score, pre_snr_db, true));
@@ -6403,6 +6422,9 @@ impl Ft8Decoder {
                 coarse_offset as f64 / SAMPLE_RATE as f64,
             );
             new_msg.tone_symbols = Some(Self::codeword_to_symbols(&corrected_bits));
+            // W2.1: `llrs` is this localized-sync candidate's own channel
+            // LLRs (pre-BP).
+            new_msg.acceptance = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
             decoded_new.push(new_msg);
         }
         decoded_new
@@ -7583,6 +7605,14 @@ fn par_decode_candidate(
             );
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
             decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
+            // W2.1: `llrs` is the channel LLRs actually fed to
+            // `ldpc.decode_soft`/the BICM-ID rescue above (post-whitening/
+            // combiner, pre-BP) — the right signal-domain reference for
+            // both the standard and rescue outcomes, since the rescue
+            // helper is called with `&llrs` (not `&mut`) and never
+            // mutates the caller's copy.
+            decoded_message.acceptance =
+                crate::acceptance::score_from_slice(&corrected_bits, &llrs);
             if let Some(unsat) = rescue_unsat {
                 // hb-252 (Batch 98): dedicated origin ordinal for the
                 // BICM-ID rescue. The shipped hb-103 v3 content gate
@@ -7737,6 +7767,11 @@ fn par_decode_candidate(
             );
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
             decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
+            // W2.1: `llrs` here is the fine-FFT path's own channel LLRs
+            // (post-whitening/impulse-robust, pre-BP) — the fine-FFT
+            // fallback's demodulation, not the coarse spectrogram one.
+            decoded_message.acceptance =
+                crate::acceptance::score_from_slice(&corrected_bits, &llrs);
 
             return Some(decoded_message);
         }
@@ -8046,6 +8081,10 @@ fn par_try_ldpc_with_ap(
     decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
     decoded_message.ap_level = ap_level_num;
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
+    // W2.1: score against pre-AP-injection channel LLRs — see the
+    // matching comment in `try_ldpc_with_ap` for why `base_llrs` (not the
+    // post-injection `llrs`) is the correct signal-domain reference.
+    decoded_message.acceptance = crate::acceptance::score_from_slice(&corrected_bits, base_llrs);
 
     Some(decoded_message)
 }
@@ -8138,6 +8177,9 @@ fn par_try_ldpc_with_recent_only(
     // introduce a distinct ap_level number for hb-043 if telemetry needs it.
     decoded_message.ap_level = 2;
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
+    // W2.1: see `par_try_ldpc_with_ap` — score against pre-injection
+    // channel LLRs, not the post-injection `llrs`.
+    decoded_message.acceptance = crate::acceptance::score_from_slice(&corrected_bits, base_llrs);
     Some(decoded_message)
 }
 
@@ -13136,6 +13178,7 @@ mod tests {
             decode_time_into_window: None,
             via_cross_sequence_a7: false,
             confidence_features: None,
+            acceptance: None,
         };
 
         decoder.subtract_signal(&mut audio, &msg);
