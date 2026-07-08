@@ -464,6 +464,71 @@ fn npre2_residual_signature(
     sig
 }
 
+/// Smallest/largest CNN error-probability accepted before mapping to a
+/// pseudo-LLR via `ln((1-p)/p)` — clamps away from the poles so a
+/// saturated sigmoid output (0.0 or 1.0) never produces +/-infinity.
+const NEURAL_PROB_EPS: f32 = 1e-6;
+
+/// Compute the reliability-descending column order OSD uses to seed its
+/// Gaussian elimination: `result[0]` is the single most-reliable codeword
+/// position (info or parity), `result[LDPC_CODEWORD_BITS - 1]` the least.
+/// The first `LDPC_INFO_BITS` columns of this order become candidates for
+/// the hard-decided/pivot ("info") role; the rest are solved for via the
+/// parity constraint. Getting "most reliable first" right — across BOTH
+/// info and parity bits, on ONE commensurable scale — is what lets
+/// Gaussian elimination preferentially keep genuinely-trustworthy bits
+/// fixed and push genuinely-unreliable ones to the parity-derived role.
+///
+/// Without neural ordering, reliability is just `|LLR|` for every
+/// position (channel/BP-posterior LLR magnitude), sorted descending.
+///
+/// With neural ordering (`neural_ordering: Some(probs)`), `probs[i]` is
+/// the CNN's predicted probability that info bit `i` is in error — a
+/// `[0, 1]` scale, NOT an LLR magnitude. Comparing it directly against
+/// unbounded `|LLR|` parity keys (as the pre-fix code did) is comparing
+/// incommensurable scales: nearly every info bit would out-rank nearly
+/// every parity bit with `|LLR| > 1`, regardless of true reliability.
+/// Instead, map `p` to a pseudo-LLR on the same log-odds scale via
+/// `ln((1-p)/p)`: `p -> 0` (CNN confident the bit is correct) yields a
+/// large POSITIVE key (reliable, sorts first, like a large `|LLR|`);
+/// `p -> 1` (CNN confident the bit is an error) yields a large NEGATIVE
+/// key (the worst possible candidate for the fixed/hard-decided role,
+/// sorts last); `p = 0.5` (maximum uncertainty) yields exactly `0`,
+/// matching the zero-reliability point of a real channel LLR. Parity
+/// bits keep `|LLR|` directly (no sign flip) so both classes share the
+/// same "larger key = more reliable, sorts first" convention.
+fn reliability_sorted_indices(
+    llrs: &[f32; LDPC_CODEWORD_BITS],
+    neural_ordering: Option<&[f32; LDPC_INFO_BITS]>,
+) -> [usize; LDPC_CODEWORD_BITS] {
+    let mut sorted_indices: [usize; LDPC_CODEWORD_BITS] = [0; LDPC_CODEWORD_BITS];
+    for i in 0..LDPC_CODEWORD_BITS {
+        sorted_indices[i] = i;
+    }
+    let mut keys = [0.0f32; LDPC_CODEWORD_BITS];
+    if let Some(probs) = neural_ordering {
+        for i in 0..LDPC_CODEWORD_BITS {
+            keys[i] = if i < LDPC_INFO_BITS {
+                let p = probs[i].clamp(NEURAL_PROB_EPS, 1.0 - NEURAL_PROB_EPS);
+                ((1.0 - p) / p).ln()
+            } else {
+                llrs[i].abs()
+            };
+        }
+    } else {
+        for i in 0..LDPC_CODEWORD_BITS {
+            keys[i] = llrs[i].abs();
+        }
+    }
+    // Sort descending by key: largest key (most reliable) first.
+    sorted_indices.sort_by(|&a, &b| {
+        keys[b]
+            .partial_cmp(&keys[a])
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    sorted_indices
+}
+
 /// OSD decoder that attempts to decode LLRs using ordered statistics decoding
 /// at depths 0, 1, 2, and 3 with CRC-14 validation.
 #[derive(Clone)]
@@ -479,6 +544,17 @@ impl OsdDecoder {
             config,
             generator: build_systematic_generator(),
         }
+    }
+
+    /// Configured maximum OSD order. Callers use this to decide whether
+    /// computing a neural ordering is worth its cost at all — at
+    /// `max_depth == 0` only the plain hard-decision candidate is ever
+    /// tried, so the CNN forward pass that would otherwise seed the
+    /// neural ordering is pure wasted work (see `decoder.rs`'s
+    /// `osd.max_depth() >= 1` gate before calling
+    /// `neural_osd::predict_error_bits`).
+    pub fn max_depth(&self) -> u8 {
+        self.config.max_depth
     }
 
     /// Attempt to decode 174 LLRs into a valid 174-bit codeword.
@@ -512,46 +588,10 @@ impl OsdDecoder {
         llrs: &[f32; LDPC_CODEWORD_BITS],
         neural_ordering: Option<&[f32; LDPC_INFO_BITS]>,
     ) -> Option<(BitVec, u8, u8)> {
-        // 1. Sort indices by reliability
-        let mut sorted_indices: [usize; LDPC_CODEWORD_BITS] = [0; LDPC_CODEWORD_BITS];
-        for i in 0..LDPC_CODEWORD_BITS {
-            sorted_indices[i] = i;
-        }
-        if let Some(probs) = neural_ordering {
-            // Neural ordering: sort info bits by predicted error probability
-            // (highest probability first = least reliable), parity bits by |LLR|.
-            //
-            // A7b: precompute the per-index sort key once instead of
-            // recomputing `-probs[i]`/`-llrs[i].abs()` on every comparator
-            // call (~1,300 compares per sort) — same values, same order,
-            // same tie behavior, just cached.
-            let mut keys = [0.0f32; LDPC_CODEWORD_BITS];
-            for i in 0..LDPC_CODEWORD_BITS {
-                keys[i] = if i < LDPC_INFO_BITS {
-                    -probs[i] // negative so highest prob sorts first (= most unreliable)
-                } else {
-                    -llrs[i].abs() // parity bits: high |LLR| = reliable, sort last
-                };
-            }
-            // Sort ascending (most negative = highest prob = least reliable = first)
-            sorted_indices.sort_by(|&a, &b| {
-                keys[b]
-                    .partial_cmp(&keys[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        } else {
-            // Original: sort by descending |LLR| (most reliable first).
-            // A7b: precompute |LLR| once instead of in the comparator.
-            let mut abs_llrs = [0.0f32; LDPC_CODEWORD_BITS];
-            for i in 0..LDPC_CODEWORD_BITS {
-                abs_llrs[i] = llrs[i].abs();
-            }
-            sorted_indices.sort_by(|&a, &b| {
-                abs_llrs[b]
-                    .partial_cmp(&abs_llrs[a])
-                    .unwrap_or(std::cmp::Ordering::Equal)
-            });
-        };
+        // 1. Sort indices by reliability (most reliable first, on a
+        // commensurable scale across info AND parity bits — see
+        // `reliability_sorted_indices`).
+        let sorted_indices = reliability_sorted_indices(llrs, neural_ordering);
 
         // 2. Permute generator columns per reliability ranking
         let mut matrix = [[0u8; PACKED_BYTES]; LDPC_INFO_BITS];
@@ -779,6 +819,107 @@ impl OsdDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// W1.5: the neural-ordering reliability sort must rank a
+    /// genuinely-most-reliable parity bit ahead of a genuinely-most-
+    /// reliable info bit's peers (cross-class comparability on one
+    /// commensurable scale), and must never rank a genuinely-unreliable
+    /// parity bit ahead of an ordinary/reliable parity bit (no sign
+    /// inversion within the parity class).
+    ///
+    /// Pre-fix, `reliability_sorted_indices` keyed parity bits by
+    /// `-|LLR|` under a descending sort — ranking parity bits by
+    /// ASCENDING reliability — and compared the CNN's `[0,1]`
+    /// probability scale directly against unbounded `|LLR|` magnitudes,
+    /// so essentially every info bit outranked essentially every parity
+    /// bit regardless of true reliability. Both assertions below fail
+    /// against that code and pass once parity uses `+|LLR|` and info
+    /// uses a commensurable `ln((1-p)/p)` pseudo-LLR.
+    #[test]
+    fn test_neural_ordering_parity_and_info_share_commensurable_reliability_scale() {
+        let mut llrs = [3.0f32; LDPC_CODEWORD_BITS];
+        let mut probs = [0.5f32; LDPC_INFO_BITS];
+
+        // A garden-variety ("bulk") parity bit — moderate reliability.
+        const BULK_PARITY_IDX: usize = LDPC_INFO_BITS + 5; // 96
+                                                           // The single most reliable bit in the whole codeword: a parity
+                                                           // bit with a huge |LLR|.
+        const BEST_PARITY_IDX: usize = LDPC_INFO_BITS + 40; // 131
+        llrs[BEST_PARITY_IDX] = 50.0;
+        // A parity bit that is genuinely far LESS reliable than the bulk.
+        const WORST_PARITY_IDX: usize = LDPC_INFO_BITS + 60; // 151
+        llrs[WORST_PARITY_IDX] = 0.001;
+
+        // A very reliable info bit per the CNN (near-zero error probability).
+        const BEST_INFO_IDX: usize = 10;
+        probs[BEST_INFO_IDX] = 0.001;
+        // A very unreliable info bit per the CNN (near-certain error).
+        const WORST_INFO_IDX: usize = 60;
+        probs[WORST_INFO_IDX] = 0.999;
+
+        let order = reliability_sorted_indices(&llrs, Some(&probs));
+        let rank_of = |idx: usize| order.iter().position(|&x| x == idx).unwrap();
+
+        // Cross-class comparability: the single best bit in the entire
+        // codeword is a parity bit, so it must rank ahead of the best
+        // INFO bit too, not just be arbitrarily shuffled among parity
+        // positions. Under the pre-fix code every info bit sorted ahead
+        // of every parity bit with |LLR| > 1 regardless of reliability
+        // (probs is in [-1, 0], -|llr| for |llr| > 1 is < -1), so this
+        // fails pre-fix (BEST_PARITY_IDX lands dead last, at rank 173).
+        assert!(
+            rank_of(BEST_PARITY_IDX) < rank_of(BEST_INFO_IDX),
+            "most-reliable parity bit (huge |LLR|) must outrank the \
+             most-reliable info bit; got rank(parity)={} rank(info)={}",
+            rank_of(BEST_PARITY_IDX),
+            rank_of(BEST_INFO_IDX)
+        );
+
+        // No sign inversion within the parity class: a bulk (moderate
+        // |LLR|=3.0) parity bit must rank ahead of a deliberately
+        // unreliable (|LLR|=0.001) parity bit. Pre-fix, `-|LLR|` under
+        // the descending sort put the LOW-|LLR| (unreliable) bit first
+        // (-0.001 > -3.0), so this fails pre-fix.
+        assert!(
+            rank_of(BULK_PARITY_IDX) < rank_of(WORST_PARITY_IDX),
+            "an ordinary parity bit (|LLR|=3.0) must outrank a genuinely \
+             unreliable one (|LLR|=0.001); got rank(bulk)={} rank(worst)={}",
+            rank_of(BULK_PARITY_IDX),
+            rank_of(WORST_PARITY_IDX)
+        );
+
+        // Sanity: the worst-of-all bit (info bit the CNN is nearly
+        // certain is wrong) must not be first, and the best-of-all bit
+        // (the huge-|LLR| parity bit) must be first overall.
+        assert_eq!(rank_of(BEST_PARITY_IDX), 0);
+        assert!(rank_of(WORST_INFO_IDX) > rank_of(BEST_PARITY_IDX));
+        assert!(rank_of(WORST_INFO_IDX) > rank_of(BULK_PARITY_IDX));
+    }
+
+    /// Without neural ordering, the sort must be unchanged: plain
+    /// descending `|LLR|` across all 174 positions (this is the
+    /// production `osd_depth: 0` path when the CNN doesn't run — a
+    /// regression guard that the refactor into
+    /// `reliability_sorted_indices` didn't perturb the non-neural case).
+    #[test]
+    fn test_no_neural_ordering_sorts_by_descending_abs_llr() {
+        let mut llrs = [0.0f32; LDPC_CODEWORD_BITS];
+        for (i, v) in llrs.iter_mut().enumerate() {
+            // Distinct magnitudes so the expected order is unambiguous.
+            *v = (i as f32 + 1.0) * if i % 2 == 0 { 1.0 } else { -1.0 };
+        }
+        let order = reliability_sorted_indices(&llrs, None);
+        for w in order.windows(2) {
+            assert!(
+                llrs[w[0]].abs() >= llrs[w[1]].abs(),
+                "expected descending |LLR|: |llrs[{}]|={} should be >= |llrs[{}]|={}",
+                w[0],
+                llrs[w[0]].abs(),
+                w[1],
+                llrs[w[1]].abs()
+            );
+        }
+    }
 
     #[test]
     fn test_bit_operations() {

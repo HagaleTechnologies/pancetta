@@ -11061,10 +11061,29 @@ impl LdpcDecoder {
                 // neural-OSD feature is compiled in. Without the feature,
                 // OSD falls back to |LLR|-based ordering at the cost of
                 // higher trial counts on weak signals.
+                //
+                // W1.5: skip the CNN forward pass entirely when
+                // `osd.max_depth() < 1` — at depth 0 only the plain
+                // hard-decision candidate is ever tried (no bit-flip
+                // trials), so the neural ordering exists only to reshape
+                // OSD-0's Gaussian-elimination pivot selection. Bypassing
+                // it here also keeps `osd_depth: 0` (today's production
+                // default) on the exact same plain-`|LLR|`-sort path it
+                // used before the neural-OSD ordering-key fix landed —
+                // that fix only changes behavior at `max_depth >= 1`,
+                // which is currently dead in production (see
+                // `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`
+                // §4). Pure cost elimination at depth 0: no trajectory
+                // dereference, no ~300M-op CNN forward pass per failed
+                // frame.
                 #[cfg(feature = "neural_osd")]
-                let neural_ordering = trajectory
-                    .as_deref()
-                    .map(crate::neural_osd::predict_error_bits);
+                let neural_ordering = if osd.max_depth() >= 1 {
+                    trajectory
+                        .as_deref()
+                        .map(crate::neural_osd::predict_error_bits)
+                } else {
+                    None
+                };
                 #[cfg(not(feature = "neural_osd"))]
                 let neural_ordering: Option<[f32; 91]> = {
                     let _ = trajectory.as_deref();
