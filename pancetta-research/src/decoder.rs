@@ -402,6 +402,14 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W3.3 [A/B]: master switch for the
+    /// per-candidate fine-sync + matched-demod stage that replaces the
+    /// legacy 21-trial fine-FFT fallback. See `Ft8Config::fine_sync_enabled`.
+    pub fn with_fine_sync_enabled(mut self, on: bool) -> Self {
+        self.config.fine_sync_enabled = on;
+        self
+    }
+
     /// Decoder-TP-sensitivity Task W1.4 [A/B]: master switch for the
     /// divisive LLR whitening step (per-tone/per-symbol noise-median
     /// normalisation). Default ON in production

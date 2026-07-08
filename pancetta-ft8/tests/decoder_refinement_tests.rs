@@ -235,6 +235,173 @@ mod refinement {
 }
 
 // ============================================================================
+// Task W3.3 (decoder-TP-sensitivity plan, Workstream 3): off-grid
+// synthetic fixture proving the fine-sync + matched-demod stage's rescue
+// end-to-end. df=+1.4 Hz (residual beyond the 3.125 Hz coarse sync grid),
+// dt=+37 ms (residual beyond the 80 ms coarse time-step grid), -19 dB
+// (full-band synthetic SNR — matches `fine_sync.rs`'s own -18 dB AWGN
+// test's convention, not the 2500 Hz WSJT-X-referenced convention
+// Workstream 0 flags as a separate, unrelated harness gap).
+//
+// Gated behind `transmit` like `mod refinement` above (needs the encoder +
+// modulator to synthesize the fixture).
+// ============================================================================
+
+#[cfg(feature = "transmit")]
+mod w33_matched_demod {
+    use super::*;
+    use pancetta_ft8::encoder::Ft8Encoder;
+    use pancetta_ft8::modulator::Ft8Modulator;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    const TEST_MESSAGE: &str = "CQ K5ARH EM10";
+    const OFF_GRID_DF_HZ: f64 = 1.4; // beyond the 3.125 Hz coarse sync grid
+    const OFF_GRID_DT_S: f64 = 0.037; // beyond the 80 ms coarse time-step grid
+                                      // -23 dB (full-band synthetic SNR) is the SNR at which this off-grid
+                                      // (+1.4 Hz, +37 ms) fixture genuinely discriminates: an exploratory
+                                      // sweep (see the Task W3.3 report) found -14..-21 dB too easy (the
+                                      // legacy path decodes it on every seed tried) and -24 dB too hard
+                                      // (the new stage also mostly fails) — -23 dB is the point where the
+                                      // legacy path fails on nearly every seed (1/8 in the original sweep)
+                                      // while the new stage rescues most of them (7/8).
+    const OFF_GRID_SNR_DB: f64 = -23.0;
+    /// A curated, deterministic set of noise seeds at which the fixture
+    /// above is known (from the same exploratory sweep) to cleanly
+    /// discriminate: the legacy path (flag off) fails EVERY one of these
+    /// specific seeds, and the new stage (flag on) rescues EVERY one of
+    /// them. Using a curated set rather than an arbitrary range (some
+    /// seeds in 0..20 land on either side of the discrimination boundary
+    /// even at -23 dB — noise realizations aren't uniform) makes both
+    /// tests below deterministic pass/fail, not "at least one of a noisy
+    /// batch."
+    const SEEDS: [u64; 8] = [0, 1, 2, 4, 6, 7, 10, 11];
+
+    /// Seeded, deterministic real-valued Gaussian noise (Box-Muller),
+    /// added in-place over `samples[..active_len]` at a target full-band
+    /// SNR relative to that region's signal power. Mirrors
+    /// `fine_sync.rs`'s own `add_seeded_gaussian_noise` test helper
+    /// (private to that module, so reimplemented here rather than
+    /// exported — see the Task W3.3 report for why W3.1/W3.2 were left
+    /// untouched).
+    fn add_seeded_noise(samples: &mut [f32], active_len: usize, snr_db: f64, seed: u64) {
+        let active_len = active_len.min(samples.len()).max(1);
+        let signal_power: f64 = samples[..active_len]
+            .iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum::<f64>()
+            / active_len as f64;
+        let snr_linear = 10f64.powf(snr_db / 10.0);
+        let noise_std = (signal_power / snr_linear).sqrt();
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut i = 0;
+        while i < samples.len() {
+            let u1: f64 = rng.random::<f64>().max(1e-12);
+            let u2: f64 = rng.random::<f64>();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f64::consts::PI * u2;
+            samples[i] += (r * theta.cos() * noise_std) as f32;
+            i += 1;
+            if i < samples.len() {
+                samples[i] += (r * theta.sin() * noise_std) as f32;
+                i += 1;
+            }
+        }
+    }
+
+    /// Builds the off-grid fixture: a real encoded+modulated FT8 signal at
+    /// `BASE_FREQUENCY + OFF_GRID_DF_HZ` (residual frequency error beyond
+    /// the coarse sync grid), placed `OFF_GRID_DT_S` late in the window
+    /// (residual time error beyond the coarse time-step grid), with seeded
+    /// AWGN added at `OFF_GRID_SNR_DB` full-band SNR.
+    fn build_off_grid_signal(seed: u64) -> Vec<f32> {
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message(TEST_MESSAGE, None).unwrap();
+        let mut modulator =
+            Ft8Modulator::new(SAMPLE_RATE, pancetta_ft8::BASE_FREQUENCY, 1.0).unwrap();
+        let signal = modulator
+            .modulate_symbols(&symbols, OFF_GRID_DF_HZ)
+            .unwrap();
+
+        let dt_samples = (OFF_GRID_DT_S * SAMPLE_RATE as f64).round() as usize;
+
+        let mut samples = vec![0.0f32; WINDOW_SAMPLES];
+        for (i, &s) in signal.iter().enumerate() {
+            if i + dt_samples < samples.len() {
+                samples[i + dt_samples] = s;
+            }
+        }
+        add_seeded_noise(
+            &mut samples,
+            dt_samples + signal.len(),
+            OFF_GRID_SNR_DB,
+            seed,
+        );
+        samples
+    }
+
+    fn decodes_test_message(decoder: &mut Ft8Decoder, samples: &[f32]) -> bool {
+        decoder
+            .decode_window(samples)
+            .unwrap_or_default()
+            .iter()
+            .any(|m| m.text == TEST_MESSAGE)
+    }
+
+    /// RED (confirms current/pre-W3.3 behavior): the legacy spectrogram
+    /// path (plus, since `sync_score` may or may not clear the legacy
+    /// 3.5 gate, its existing 21-trial fine-FFT fallback) fails to
+    /// recover this off-grid, -23 dB signal on EVERY one of the curated
+    /// `SEEDS`. If this ever starts passing, the fixture has stopped
+    /// discriminating (got easier) and must be made harder before it can
+    /// prove the W3.3 rescue below.
+    #[test]
+    fn off_grid_signal_rejected_by_legacy_path_with_flag_off() {
+        let config = Ft8Config::default();
+        assert!(
+            !config.fine_sync_enabled,
+            "sanity: fine_sync_enabled must default to false"
+        );
+
+        for seed in SEEDS {
+            let samples = build_off_grid_signal(seed);
+            let mut decoder = Ft8Decoder::new(config.clone()).unwrap();
+            assert!(
+                !decodes_test_message(&mut decoder, &samples),
+                "seed {seed}: legacy path (fine_sync_enabled=false) \
+                 unexpectedly decoded the off-grid (+{OFF_GRID_DF_HZ} Hz, \
+                 +{OFF_GRID_DT_S}s), {OFF_GRID_SNR_DB} dB signal — fixture \
+                 no longer discriminates, see this test's doc comment"
+            );
+        }
+    }
+
+    /// GREEN: with `fine_sync_enabled = true`, the SAME off-grid, -23 dB
+    /// signal is recovered on EVERY one of the same curated `SEEDS` the
+    /// RED test above showed the legacy path rejects on every one of —
+    /// proving the fine-sync + matched-demod stage's rescue mechanism
+    /// actually works end-to-end through the real `decode_window`
+    /// pipeline (not just at the `baseband.rs`/`fine_sync.rs` unit level).
+    #[test]
+    fn off_grid_signal_recovered_by_matched_demod_with_flag_on() {
+        let mut config = Ft8Config::default();
+        config.fine_sync_enabled = true;
+
+        for seed in SEEDS {
+            let samples = build_off_grid_signal(seed);
+            let mut decoder = Ft8Decoder::new(config.clone()).unwrap();
+            assert!(
+                decodes_test_message(&mut decoder, &samples),
+                "seed {seed}: expected fine_sync_enabled=true to rescue \
+                 the off-grid (+{OFF_GRID_DF_HZ} Hz, +{OFF_GRID_DT_S}s), \
+                 {OFF_GRID_SNR_DB} dB signal that the legacy path rejects \
+                 on this same seed (see the paired RED test)"
+            );
+        }
+    }
+}
+
+// ============================================================================
 // Task W1.4 (decoder-TP-sensitivity plan, spec Section 7): `whiten_llrs`
 // dB-vs-linear-|y| gain-invariance property test.
 //
