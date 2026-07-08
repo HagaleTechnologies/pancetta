@@ -375,6 +375,17 @@ impl Ft8Decoder {
         self
     }
 
+    /// Task W3.5 [A/B]: combine each symbol's two TIME_OSR sub-steps in
+    /// linear power instead of dB. Distinct from
+    /// `with_sync_time_interp_linear_power` above (that one governs the
+    /// SEPARATE fractional dt-shift lookup); this governs the
+    /// unconditional two-substep average that runs on every symbol of
+    /// every candidate.
+    pub fn with_linear_power_averaging(mut self, on: bool) -> Self {
+        self.config.linear_power_averaging = on;
+        self
+    }
+
     /// hb-067: mBP offset — subtract this magnitude from each LLR
     /// before invoking OSD. 0.0 = no offset.
     pub fn with_bp_offset_subtract(mut self, v: f32) -> Self {

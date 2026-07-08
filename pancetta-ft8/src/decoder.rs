@@ -373,6 +373,30 @@ pub struct Ft8Config {
     /// Default `false` until A/B confirms a net gain.
     pub sync_time_interp_linear_power: bool,
 
+    /// Task W3.5 [A/B] (decoder-tp-sensitivity plan): combine the two
+    /// TIME_OSR sub-steps within each symbol window (`db_a`, `db_b` in
+    /// `extract_symbols_from_spectrogram` / `par_extract_symbols_from_spectrogram`)
+    /// in linear power instead of dB. This is a DIFFERENT call site from
+    /// `sync_time_interp_linear_power` above: that flag only affects
+    /// `lookup_time_interp`'s fractional-time-shift lookup (active only
+    /// when `time_refinement != 0`, i.e. gated by `sync_time_interpolation`
+    /// AND the score gate). THIS flag governs the unconditional two-substep
+    /// average that runs for EVERY symbol of EVERY candidate on the
+    /// always-active coarse-sync path (`sync_time_interpolation` defaults
+    /// `true` already), independent of whether any fractional refinement
+    /// fired. Averaging two dB values arithmetically is a *geometric* mean
+    /// of the underlying linear powers; averaging in linear power (this
+    /// flag) is the *arithmetic* mean, the physically correct way to
+    /// combine two independent noisy power measurements of the same
+    /// symbol energy. Default `false` until A/B confirms a net gain — see
+    /// `sync_time_interp_linear_power`'s hb-069 precedent (2026-05-31,
+    /// SHELVED: linear-power interpolation on the *separate* dt-shift axis
+    /// regressed hard-200/-1000 recall). That result does not automatically
+    /// transfer to this axis (no fractional shift is involved here, just a
+    /// fixed 50/50 combine of two adjacent time bins), so this flag gets
+    /// its own independent A/B rather than assuming the same outcome.
+    pub linear_power_averaging: bool,
+
     /// mBP offset (arXiv:2306.00443) — subtract this magnitude
     /// from each LLR before invoking OSD. Reduces BP's confidence so
     /// OSD considers more flip patterns. Default 0.0 (no behavior change).
@@ -1443,6 +1467,9 @@ impl Default for Ft8Config {
             // sweep gates a possible flip to true if it rescues
             // hard-200 residual cost without regressing other tiers.
             sync_time_interp_linear_power: false,
+            // Task W3.5 [A/B]: substep-combine linear-power averaging
+            // default off; CLI sweep gates a possible flip to true.
+            linear_power_averaging: false,
             bp_offset_subtract: 0.0,
             // W2.3 [A/B]: default `BpPosterior` — byte-identical to
             // pre-W2.3 behavior. See `OsdInput` doc comment + the A/B
@@ -2839,6 +2866,7 @@ impl Ft8Decoder {
                 ldpc_feedback_attenuate_factor: self.config.ldpc_feedback_attenuate_factor,
                 ldpc_feedback_erase_threshold: self.config.ldpc_feedback_erase_threshold,
                 sync_time_interp_linear_power: self.config.sync_time_interp_linear_power,
+                linear_power_averaging: self.config.linear_power_averaging,
                 window_start: start_time,
                 // hb-244: thread the soft combiner through. `None` when
                 // disabled — the AP0 hot path collapses to a single
@@ -3631,6 +3659,7 @@ impl Ft8Decoder {
             let sps = pp.samples_per_symbol(SAMPLE_RATE);
             let spec_step = sps / TIME_OSR;
             let lin = self.config.sync_time_interp_linear_power;
+            let avg_lin = self.config.linear_power_averaging;
             let freq_window_hz = self.config.a7_freq_window_hz;
             let snr7_threshold = self.config.a7_snr7_threshold;
             let snr7b_threshold = self.config.a7_snr7b_threshold;
@@ -3681,7 +3710,7 @@ impl Ft8Decoder {
                     }
 
                     let tone_mags =
-                        par_extract_symbols_from_spectrogram(pp, &spectrogram, cand, lin);
+                        par_extract_symbols_from_spectrogram(pp, &spectrogram, cand, lin, avg_lin);
                     let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
                     normalize_llrs(&mut llrs, llr_target_variance);
 
@@ -5701,10 +5730,17 @@ impl Ft8Decoder {
                 coherent_sum_complex_to_db(&aligned, pp.num_symbols)
             } else {
                 let lin = self.config.sync_time_interp_linear_power;
+                let avg_lin = self.config.linear_power_averaging;
                 let members: Vec<Vec<[f64; NUM_TONES]>> = group
                     .iter()
                     .map(|&i| {
-                        par_extract_symbols_from_spectrogram(pp, spectrogram, &candidates[i], lin)
+                        par_extract_symbols_from_spectrogram(
+                            pp,
+                            spectrogram,
+                            &candidates[i],
+                            lin,
+                            avg_lin,
+                        )
                     })
                     .collect();
                 sum_tone_magnitudes_linear(&members, pp.num_symbols)
@@ -6072,6 +6108,7 @@ impl Ft8Decoder {
         let sps = pp.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
         let lin = self.config.sync_time_interp_linear_power;
+        let avg_lin = self.config.linear_power_averaging;
         // hb-093 step-4 extension: optional pre-decode residual SNR gate +
         // diagnostic capture. Mirrors `joint_pair_retry_pass` — the per-WAV
         // candidate count at this site (post-sync-search, bounded by
@@ -6081,7 +6118,8 @@ impl Ft8Decoder {
         let snr_gate_db = self.config.residual_snr_gate_db;
         let diagnostic_on = self.config.residual_snr_diagnostic;
         for cand in &new_candidates {
-            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
+            let tone_mags =
+                par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin, avg_lin);
             // hb-093 step-4: pre-decode residual SNR estimate. Cheap — just
             // iterates the already-extracted tone magnitudes.
             let pre_snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
@@ -6232,11 +6270,13 @@ impl Ft8Decoder {
         let sps = pp.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
         let lin = self.config.sync_time_interp_linear_power;
+        let avg_lin = self.config.linear_power_averaging;
         // hb-093: optional pre-decode residual SNR gate + diagnostic capture.
         let snr_gate_db = self.config.residual_snr_gate_db;
         let diagnostic_on = self.config.residual_snr_diagnostic;
         for cand in &pending {
-            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
+            let tone_mags =
+                par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin, avg_lin);
             // hb-093: pre-decode residual SNR estimate. Cheap — just
             // iterates the already-extracted tone magnitudes.
             let pre_snr_db = par_estimate_snr_spectrogram(pp, &tone_mags);
@@ -6412,6 +6452,7 @@ impl Ft8Decoder {
             let sps = pp.samples_per_symbol(SAMPLE_RATE);
             let spec_step = sps / TIME_OSR;
             let lin = self.config.sync_time_interp_linear_power;
+            let avg_lin = self.config.linear_power_averaging;
 
             // Build the set of (callsign, freq_hz, source) tuples for the
             // template generator. Sources:
@@ -6577,7 +6618,7 @@ impl Ft8Decoder {
                     // residual once `coherent_subtract_and_repass` has
                     // run.
                     let tone_mags =
-                        par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
+                        par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin, avg_lin);
                     let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
                     // NOTE: JS8Call-Improved-style LLR whitening
                     // intentionally NOT applied here. a7 uses LLRs for
@@ -6753,8 +6794,10 @@ impl Ft8Decoder {
         let sps = pp.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
         let lin = self.config.sync_time_interp_linear_power;
+        let avg_lin = self.config.linear_power_averaging;
         for cand in &new_candidates {
-            let tone_mags = par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin);
+            let tone_mags =
+                par_extract_symbols_from_spectrogram(pp, spectrogram, cand, lin, avg_lin);
             let mut llrs = par_compute_soft_llrs_db(pp, &tone_mags);
             maybe_whiten_llrs(
                 self.config.llr_whitening_enabled,
@@ -7050,6 +7093,8 @@ impl Ft8Decoder {
         let dt = candidate.time_refinement;
         // hb-069: linear-power interpolation gate.
         let lin = self.config.sync_time_interp_linear_power;
+        // Task W3.5 [A/B]: substep-combine linear-power averaging gate.
+        let avg_lin = self.config.linear_power_averaging;
 
         let mut tone_magnitudes = Vec::with_capacity(pp.num_symbols);
 
@@ -7075,7 +7120,7 @@ impl Ft8Decoder {
                 // linear interpolation; dt=0 reproduces original behavior.
                 let db_a = lookup_time_interp(spectrogram, t_base, dt, fs, freq_bin, lin);
                 let db_b = lookup_time_interp(spectrogram, t_base + 1, dt, fs, freq_bin, lin);
-                mags[tone] = (db_a + db_b) / 2.0;
+                mags[tone] = combine_substeps(db_a, db_b, avg_lin);
             }
 
             tone_magnitudes.push(mags);
@@ -7386,6 +7431,8 @@ struct DecodeContext<'a> {
     ldpc_feedback_erase_threshold: f32,
     /// Linear-power spectrogram interpolation gate.
     sync_time_interp_linear_power: bool,
+    /// Task W3.5 [A/B]: substep-combine linear-power averaging gate.
+    linear_power_averaging: bool,
     /// Window-start instant. Used to stamp each successful decode
     /// with its presentation-time-into-window for the TTFD metric.
     window_start: Instant,
@@ -7879,6 +7926,7 @@ fn par_decode_candidate(
             ctx.spectrogram,
             &trial_candidate,
             ctx.sync_time_interp_linear_power,
+            ctx.linear_power_averaging,
         );
         // hb-253 (Batch 99): demapper metric selection. DualMax keeps
         // the historical dB max-vs-max extraction byte-identical;
@@ -8768,6 +8816,7 @@ fn par_try_ap_decode(
             ctx.spectrogram,
             &trial_candidate,
             ctx.sync_time_interp_linear_power,
+            ctx.linear_power_averaging,
         );
         let mut base_llrs = par_compute_soft_llrs_db(ctx.protocol_params, &tone_magnitudes);
         // JS8Call-Improved-style LLR whitening (inspired by spec ref
@@ -9994,6 +10043,7 @@ fn par_extract_symbols_from_spectrogram(
     spectrogram: &Spectrogram,
     candidate: &CostasCandidate,
     linear_power: bool,
+    avg_linear_power: bool,
 ) -> Vec<[f64; NUM_TONES]> {
     let t0 = candidate.time_step;
     let f0 = candidate.freq_bin;
@@ -10016,7 +10066,7 @@ fn par_extract_symbols_from_spectrogram(
             }
             let db_a = lookup_time_interp(spectrogram, t_base, dt, fs, freq_bin, linear_power);
             let db_b = lookup_time_interp(spectrogram, t_base + 1, dt, fs, freq_bin, linear_power);
-            mags[tone] = (db_a + db_b) / 2.0;
+            mags[tone] = combine_substeps(db_a, db_b, avg_linear_power);
         }
 
         tone_magnitudes.push(mags);
@@ -10165,6 +10215,31 @@ fn lookup_time_interp(
         }
     } else {
         (1.0 - frac) * p_lo + frac * p_hi
+    }
+}
+
+/// Task W3.5 [A/B]: combine a symbol's two TIME_OSR sub-step dB readings
+/// (`db_a`, `db_b`) into one per-symbol magnitude. `linear_power=false`
+/// (default, legacy) is the straight dB average `(db_a+db_b)/2` — a
+/// geometric mean of the underlying linear powers. `linear_power=true`
+/// converts each endpoint to linear power, takes the arithmetic mean, and
+/// converts back to dB (mirroring `lookup_time_interp`'s own dB<->linear
+/// convention and -120 dB floor handling) — the physically correct way to
+/// average two independent noisy power measurements of the same symbol
+/// energy.
+#[inline]
+fn combine_substeps(db_a: f64, db_b: f64, linear_power: bool) -> f64 {
+    if linear_power {
+        let lin_a = 10f64.powf(db_a / 10.0);
+        let lin_b = 10f64.powf(db_b / 10.0);
+        let lin_avg = 0.5 * (lin_a + lin_b);
+        if lin_avg <= 1e-12 {
+            -120.0
+        } else {
+            10.0 * lin_avg.log10()
+        }
+    } else {
+        (db_a + db_b) / 2.0
     }
 }
 
@@ -11420,6 +11495,67 @@ mod parabolic_tests {
         assert!(base.is_finite());
         // round(0.40 * 5) = 2, idx = 1, sorted (NaN→0): [0, 1, 2, 3, 4]. → 1.0.
         assert!((base - 1.0).abs() < 1e-9, "base={base}");
+    }
+}
+
+#[cfg(test)]
+mod combine_substeps_tests {
+    use super::combine_substeps;
+
+    /// `linear_power=false` must be byte-identical to the legacy
+    /// `(db_a + db_b) / 2.0` expression — this is the flag-off
+    /// regression guard.
+    #[test]
+    fn db_domain_matches_legacy_average_exactly() {
+        for (a, b) in [
+            (-90.0, -85.0),
+            (-120.0, -120.0),
+            (-60.0, -110.0),
+            (0.0, -3.0),
+        ] {
+            let legacy = (a + b) / 2.0;
+            let got = combine_substeps(a, b, false);
+            assert_eq!(got, legacy, "a={a} b={b}");
+        }
+    }
+
+    /// Equal inputs: both domains must return that same value exactly
+    /// (averaging two identical readings is a no-op in either domain).
+    #[test]
+    fn equal_inputs_are_unchanged_in_either_domain() {
+        for v in [-120.0, -90.0, -40.0, -3.0] {
+            assert!((combine_substeps(v, v, false) - v).abs() < 1e-9);
+            assert!((combine_substeps(v, v, true) - v).abs() < 1e-6, "v={v}");
+        }
+    }
+
+    /// Linear-power averaging of two UNEQUAL dB values must be strictly
+    /// greater than the dB-domain (geometric-mean) average — AM >= GM,
+    /// strict when the two linear powers differ. This is the core
+    /// physical-correctness property the flag exists to deliver.
+    #[test]
+    fn linear_power_average_dominates_db_average_for_unequal_inputs() {
+        let (a, b) = (-90.0_f64, -60.0_f64);
+        let db_avg = combine_substeps(a, b, false);
+        let lin_avg = combine_substeps(a, b, true);
+        assert!(
+            lin_avg > db_avg,
+            "linear-power avg ({lin_avg}) should exceed dB avg ({db_avg}) for unequal inputs"
+        );
+        // Sanity: linear-power result must independently match the
+        // textbook AM formula (convert, average, convert back), not
+        // just "some value larger than db_avg".
+        let expected = 10.0 * (0.5 * (10f64.powf(a / 10.0) + 10f64.powf(b / 10.0))).log10();
+        assert!((lin_avg - expected).abs() < 1e-9);
+    }
+
+    /// The -120 dB floor sentinel round-trips through the linear-power
+    /// path without producing -inf or NaN.
+    #[test]
+    fn floor_sentinel_round_trips_without_nan_or_inf() {
+        let got = combine_substeps(-120.0, -120.0, true);
+        assert!(got.is_finite());
+        assert!((got - (-120.0)).abs() < 1e-6, "got={got}");
     }
 }
 
@@ -19488,6 +19624,7 @@ mod w2_5_acceptance_gating_tests {
             ldpc_feedback_attenuate_factor: decoder.config.ldpc_feedback_attenuate_factor,
             ldpc_feedback_erase_threshold: decoder.config.ldpc_feedback_erase_threshold,
             sync_time_interp_linear_power: decoder.config.sync_time_interp_linear_power,
+            linear_power_averaging: decoder.config.linear_power_averaging,
             window_start: Instant::now(),
             soft_combiner: decoder.soft_combiner.as_ref(),
             llr_whitening_enabled: decoder.config.llr_whitening_enabled,
@@ -19770,6 +19907,7 @@ mod w26_ap_coverage_tests {
             ldpc_feedback_attenuate_factor: decoder.config.ldpc_feedback_attenuate_factor,
             ldpc_feedback_erase_threshold: decoder.config.ldpc_feedback_erase_threshold,
             sync_time_interp_linear_power: decoder.config.sync_time_interp_linear_power,
+            linear_power_averaging: decoder.config.linear_power_averaging,
             window_start: Instant::now(),
             soft_combiner: decoder.soft_combiner.as_ref(),
             llr_whitening_enabled: decoder.config.llr_whitening_enabled,
@@ -19823,6 +19961,7 @@ mod w26_ap_coverage_tests {
             &decoder.protocol_params,
             &spectrogram,
             &candidate,
+            false,
             false,
         );
         let base_llrs = par_compute_soft_llrs_db(&decoder.protocol_params, &tone_magnitudes);

@@ -54,6 +54,9 @@ struct Args {
     sync_time_interp_max_delta_abs: Option<f64>,
     /// hb-069: interpolate spectrogram lookups in linear power instead of dB.
     sync_time_interp_linear_power: Option<bool>,
+    /// Task W3.5 [A/B]: combine each symbol's two TIME_OSR sub-steps in
+    /// linear power instead of dB (separate call site from the flag above).
+    linear_power_averaging: Option<bool>,
     /// hb-067: mBP offset value (subtract from |LLR| before OSD).
     bp_offset_subtract: Option<f32>,
     /// hb-063: enable layered (row-sequential) BP schedule.
@@ -249,6 +252,7 @@ impl Args {
         let mut sync_time_interp_delta_scale: Option<f64> = None;
         let mut sync_time_interp_max_delta_abs: Option<f64> = None;
         let mut sync_time_interp_linear_power: Option<bool> = None;
+        let mut linear_power_averaging: Option<bool> = None;
         let mut bp_offset_subtract: Option<f32> = None;
         let mut layered_bp: Option<bool> = None;
         let mut pade_atanh: Option<bool> = None;
@@ -446,6 +450,14 @@ impl Args {
                     // when the parabolic refinement isn't running).
                     sync_time_interp_linear_power = Some(true);
                     sync_time_interpolation.get_or_insert(true);
+                }
+                "--linear-power-averaging" => {
+                    // Task W3.5 [A/B]: turn on linear-power substep
+                    // averaging. Unlike --sync-time-interp-linear-power,
+                    // this does NOT imply sync_time_interpolation — the
+                    // substep combine runs unconditionally on the
+                    // always-active coarse-sync path.
+                    linear_power_averaging = Some(true);
                 }
                 "--bp-offset-subtract" => {
                     bp_offset_subtract = Some(
@@ -788,6 +800,7 @@ impl Args {
                     eprintln!("  --fine-fft-rect-window: decoder-TP-sensitivity Task W1.3 [A/B] — rectangular (no) window on the fine-FFT fallback symbol FFT instead of Hann (default off). See Ft8Config::fine_fft_rect_window.");
                     eprintln!("  --fine-sync-enabled: decoder-TP-sensitivity Task W3.3 [A/B] — per-candidate fine-sync + matched-demod stage replacing the legacy 21-trial fine-FFT fallback (default off). See Ft8Config::fine_sync_enabled.");
                     eprintln!("  --nsym-combining-enabled: decoder-TP-sensitivity Task W3.4 [A/B] — nsym=2/3 noncoherent combining LLR variants on top of the W3.3 stage; requires --fine-sync-enabled to have any effect (default off). See Ft8Config::nsym_combining_enabled.");
+                    eprintln!("  --linear-power-averaging: decoder-TP-sensitivity Task W3.5 [A/B] — combine each symbol's two TIME_OSR sub-steps in linear power instead of dB; runs unconditionally on the always-active coarse-sync path, independent of --sync-time-interp-linear-power (default off). See Ft8Config::linear_power_averaging.");
                     eprintln!("  --llr-whitening / --no-llr-whitening: decoder-TP-sensitivity Task W1.4 [A/B] — force the divisive LLR whitening step on/off (production default: off, flipped by the W1.4 A/B result). See Ft8Config::llr_whitening_enabled.");
                     eprintln!("  --acceptance-gating / --no-acceptance-gating: decoder-TP-sensitivity Task W2.5 [A/B] — replace the blunt post-CRC sync-score confidence floors with the W2.1 acceptance metric for decodes that cleanly pass it (production default: off). See Ft8Config::acceptance_gating_enabled.");
                     eprintln!("  --cq-ap / --no-cq-ap: decoder-TP-sensitivity Task W2.6 [A/B] — try ApLevel::Cq (assume a failed-AP0 candidate is a plain \"CQ\" call; no ApContext needed) on every candidate that reaches AP injection (production default: off). See Ft8Config::cq_ap_enabled.");
@@ -829,6 +842,7 @@ impl Args {
             sync_time_interp_delta_scale,
             sync_time_interp_max_delta_abs,
             sync_time_interp_linear_power,
+            linear_power_averaging,
             bp_offset_subtract,
             layered_bp,
             pade_atanh,
@@ -1870,6 +1884,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.sync_time_interp_linear_power {
         d = d.with_sync_time_interp_linear_power(on);
+    }
+    if let Some(on) = args.linear_power_averaging {
+        d = d.with_linear_power_averaging(on);
     }
     if let Some(v) = args.bp_offset_subtract {
         d = d.with_bp_offset_subtract(v);
