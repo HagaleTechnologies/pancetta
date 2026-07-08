@@ -191,6 +191,16 @@ pub fn u32_to_bits_28(value: u32) -> [bool; 28] {
     bits
 }
 
+/// Convert a 15-bit packed value to a bool array, MSB first. Used for the
+/// `igrid4` field (payload bits 59-73).
+pub fn u16_to_bits_15(value: u16) -> [bool; 15] {
+    let mut bits = [false; 15];
+    for i in 0..15 {
+        bits[i] = (value >> (14 - i)) & 1 == 1;
+    }
+    bits
+}
+
 // ---------------------------------------------------------------------------
 // AP types
 // ---------------------------------------------------------------------------
@@ -213,6 +223,60 @@ pub enum ApLevel {
     /// AP3 + inject i3 type bits (74-76) as 0,0,1 (i3=1, the "standard
     /// message" family RR73/RRR/73 actually use).
     Ap4,
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: assume this candidate is a
+    /// plain "CQ" call. Injects the `to_callsign` field (bits 0-27 + the
+    /// bit-28 suffix flag) with the packed "CQ" special token (`pack28`
+    /// value 2, matching this project's own encoder's `try_encode_standard`
+    /// / `parse_standard_message`) plus the i3 type bits (74-76) as
+    /// (0,0,1) — the same "standard message" family AP4 assumes. Unlike
+    /// AP1-AP4, this level needs **no context at all**: "CQ" is a fixed
+    /// protocol token, not a personal callsign, so it requires neither
+    /// `ApContext.my_call` nor `ApContext.active_qso` and can run
+    /// unconditionally on every candidate. Scope: plain "CQ" only (not
+    /// "CQ DX"/"CQ POTA"/etc modifiers, which pack a different token
+    /// value).
+    Cq,
+}
+
+/// Decoder-TP-sensitivity Task W2.6 [A/B]: which QSO-completion token to
+/// inject the full message-content mask for, on top of the existing AP4
+/// callsign + i3 injection. AP4 alone only pins the message-TYPE (i3=1);
+/// it never pinned the specific completion content (the `ir` bit and the
+/// 15-bit `igrid4` field that actually spells out RRR/RR73/73). Mirrors
+/// `encoder.rs::packgrid` / `message.rs::unpackgrid`'s special
+/// `MAXGRID4`-relative values (`MAXGRID4 = 32400`); ground truth verified
+/// against this project's own encoder in
+/// `pancetta-ft8/tests/ap_i3_tests.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmationToken {
+    /// "RRR" — igrid4 = MAXGRID4 + 2.
+    Rrr,
+    /// "RR73" — igrid4 = MAXGRID4 + 3.
+    RR73,
+    /// "73" — igrid4 = MAXGRID4 + 4.
+    Final73,
+}
+
+impl ConfirmationToken {
+    /// The three canonical confirmation tokens, RR73 first (by far the
+    /// most common single completion message in real operator use —
+    /// combines both the "roger" and "73" acknowledgements in one
+    /// transmission), then RRR, then bare 73.
+    pub const ALL: [ConfirmationToken; 3] = [
+        ConfirmationToken::RR73,
+        ConfirmationToken::Rrr,
+        ConfirmationToken::Final73,
+    ];
+
+    /// The 15-bit `igrid4` field value this token packs to.
+    fn igrid4_value(self) -> u16 {
+        const MAXGRID4: u16 = 32400;
+        match self {
+            ConfirmationToken::Rrr => MAXGRID4 + 2,
+            ConfirmationToken::RR73 => MAXGRID4 + 3,
+            ConfirmationToken::Final73 => MAXGRID4 + 4,
+        }
+    }
 }
 
 /// QSO progress within an active AP-tracked contact.
@@ -542,6 +606,48 @@ pub fn inject_ap_llrs(
             inject_bit(llrs, 75, false ^ xor_bit_at(xor_sequence, 75));
             inject_bit(llrs, 76, true ^ xor_bit_at(xor_sequence, 76));
         }
+
+        ApLevel::Cq => {
+            // Context-free: "CQ" is a fixed protocol token, not a personal
+            // callsign, so `context` is intentionally unused here.
+            if let Some((cq_packed, cq_ip)) = pack28("CQ") {
+                let cq_bits = u32_to_bits_28(cq_packed);
+                inject_28_bits(llrs, 0, &cq_bits, xor_sequence);
+                // Bit 28: to_callsign suffix flag. pack28("CQ") always
+                // returns ip=0 (no /P or /R on a bare "CQ" token).
+                inject_bit(llrs, 28, (cq_ip != 0) ^ xor_bit_at(xor_sequence, 28));
+            }
+            // i3=1 ("standard message" family) — same assumption AP4
+            // makes, and the only i3 value this project's own encoder
+            // ever emits for standard-message text (see
+            // `pancetta-ft8/tests/ap_i3_tests.rs`).
+            inject_bit(llrs, 74, false ^ xor_bit_at(xor_sequence, 74));
+            inject_bit(llrs, 75, false ^ xor_bit_at(xor_sequence, 75));
+            inject_bit(llrs, 76, true ^ xor_bit_at(xor_sequence, 76));
+        }
+    }
+}
+
+/// Inject the full message-content mask for a QSO-confirmation token
+/// (RRR/RR73/73), on top of the existing AP4 callsign + i3 injection
+/// (call [`inject_ap_llrs`] with `ApLevel::Ap4` first, then this): the
+/// `ir` bit (payload bit 58, always 0 for these three tokens — none of
+/// them carry an R-prefix) and the full 15-bit `igrid4` field (bits
+/// 59-73) for the assumed token. AP4 alone only constrains the message
+/// TYPE (i3=1); this additionally constrains the specific completion
+/// CONTENT.
+///
+/// `xor_sequence`: see [`inject_ap_llrs`].
+pub fn inject_confirmation_token_bits(
+    llrs: &mut [f32],
+    token: ConfirmationToken,
+    xor_sequence: Option<&[u8; 10]>,
+) {
+    inject_bit(llrs, 58, false ^ xor_bit_at(xor_sequence, 58));
+    let bits15 = u16_to_bits_15(token.igrid4_value());
+    for (i, &b) in bits15.iter().enumerate() {
+        let pos = 59 + i;
+        inject_bit(llrs, pos, b ^ xor_bit_at(xor_sequence, pos));
     }
 }
 
@@ -742,5 +848,103 @@ mod tests {
         for i in 28..77 {
             assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
         }
+    }
+
+    #[test]
+    fn test_inject_cq_uses_pack28_cq_token_at_called_position() {
+        // "CQ" special token per pack28 is packed value 2 (see the `match
+        // callsign { "CQ" => return Some((2, 0)), ... }` arm above).
+        let (cq_packed, cq_ip) = pack28("CQ").expect("CQ must encode");
+        assert_eq!(cq_packed, 2);
+        assert_eq!(cq_ip, 0);
+
+        let ctx = ApContext::default();
+        let mut llrs = vec![0.0f32; 77];
+        inject_ap_llrs(&mut llrs, ApLevel::Cq, &ctx, None);
+
+        let expected_bits = u32_to_bits_28(cq_packed);
+        for i in 0..28 {
+            let expected_llr = if expected_bits[i] {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(llrs[i], expected_llr, "bit {} (CQ token) mismatch", i);
+        }
+        // Bit 28 (suffix flag): CQ's ip=0 -> false -> positive LLR.
+        assert_eq!(llrs[28], AP_LLR_MAGNITUDE, "bit 28 (suffix flag) mismatch");
+        // i3 bits 74-76 = (0,0,1) — same "standard message" assumption AP4
+        // makes.
+        assert_eq!(llrs[74], AP_LLR_MAGNITUDE);
+        assert_eq!(llrs[75], AP_LLR_MAGNITUDE);
+        assert_eq!(llrs[76], -AP_LLR_MAGNITUDE);
+        // Bits 29-73 (from_callsign + ir + igrid4) untouched — CQ mask
+        // doesn't know or constrain who's calling or what grid they sent.
+        for i in 29..74 {
+            assert_eq!(llrs[i], 0.0, "bit {} should be untouched by CQ mask", i);
+        }
+    }
+
+    #[test]
+    fn test_inject_cq_requires_no_context() {
+        // The whole point of ApLevel::Cq: it must inject identically
+        // regardless of what's in the ApContext (my_call/active_qso
+        // present or absent) — "CQ" is a fixed protocol token, not a
+        // personal callsign.
+        let empty_ctx = ApContext::default();
+        let full_ctx = ApContext {
+            my_call: Some(MyCallAp::new("K1ABC").unwrap()),
+            recent_calls: vec![RecentCallAp::new("W1AW", -5.0).unwrap()],
+            active_qso: Some(QsoAp::new("W1AW", QsoApProgress::WaitingForReport).unwrap()),
+        };
+
+        let mut llrs_empty = vec![0.0f32; 77];
+        inject_ap_llrs(&mut llrs_empty, ApLevel::Cq, &empty_ctx, None);
+        let mut llrs_full = vec![0.0f32; 77];
+        inject_ap_llrs(&mut llrs_full, ApLevel::Cq, &full_ctx, None);
+
+        assert_eq!(
+            llrs_empty, llrs_full,
+            "ApLevel::Cq injection must be identical regardless of ApContext contents"
+        );
+    }
+
+    #[test]
+    fn test_inject_confirmation_token_bits_rr73() {
+        // MAXGRID4 = 32400; RR73 = +3 = 32403.
+        const MAXGRID4: u16 = 32400;
+        let mut llrs = vec![0.0f32; 77];
+        inject_confirmation_token_bits(&mut llrs, ConfirmationToken::RR73, None);
+
+        // ir bit (58) = 0 -> positive LLR.
+        assert_eq!(llrs[58], AP_LLR_MAGNITUDE, "ir bit must be 0 (no R-prefix)");
+
+        let expected_bits = u16_to_bits_15(MAXGRID4 + 3);
+        for i in 0..15 {
+            let expected_llr = if expected_bits[i] {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(
+                llrs[59 + i],
+                expected_llr,
+                "igrid4 bit {} (payload bit {}) mismatch",
+                i,
+                59 + i
+            );
+        }
+        // Everything else untouched.
+        for i in (0..58).chain(74..77) {
+            assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
+        }
+    }
+
+    #[test]
+    fn test_confirmation_token_igrid4_values_match_maxgrid4_offsets() {
+        const MAXGRID4: u16 = 32400;
+        assert_eq!(ConfirmationToken::Rrr.igrid4_value(), MAXGRID4 + 2);
+        assert_eq!(ConfirmationToken::RR73.igrid4_value(), MAXGRID4 + 3);
+        assert_eq!(ConfirmationToken::Final73.igrid4_value(), MAXGRID4 + 4);
     }
 }

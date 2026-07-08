@@ -53,8 +53,9 @@
 
 use bitvec::prelude::*;
 use pancetta_ft8::ap::{
-    inject_ap2_caller, inject_ap_llrs, inject_recent_call_at_called, ApContext, ApLevel, MyCallAp,
-    QsoAp, QsoApProgress, RecentCallAp,
+    inject_ap2_caller, inject_ap_llrs, inject_confirmation_token_bits,
+    inject_recent_call_at_called, ApContext, ApLevel, ConfirmationToken, MyCallAp, QsoAp,
+    QsoApProgress, RecentCallAp,
 };
 use pancetta_ft8::ldpc::{gray_to_binary, gray_to_binary_4fsk};
 use pancetta_ft8::message::PAYLOAD_BITS;
@@ -558,6 +559,201 @@ fn recent_call_at_called_ft4_injection_matches_post_xor_codeword_not_raw_callsig
         assert_eq!(
             llrs[i], 0.0,
             "bit {i} outside the called field must be untouched"
+        );
+    }
+}
+
+// ============================================================================
+// Task W2.6: ApLevel::Cq mask + RRR/RR73/73 full-message masks
+// ============================================================================
+//
+// Same "own encoder as ground truth" TDD methodology as the i3 fix above:
+// encode a real message with `Ft8Encoder`, extract its 77-bit payload, and
+// assert the new masks match at the injected positions — never a hand-typed
+// assumption about bit layout.
+
+/// Ground truth, independent of the CQ mask: a real "CQ K1DEF FN42" message
+/// encoded by this project's own encoder must have `to_callsign` (bits
+/// 0-27) equal to the packed "CQ" special token, suffix flag (bit 28)
+/// clear, and i3=1 (bits 74-76 = 0,0,1) — the same "standard message"
+/// family AP4 assumes.
+#[test]
+fn encoder_cq_message_packs_cq_token_at_to_callsign_position() {
+    use pancetta_ft8::ap::u32_to_bits_28;
+
+    let payload = encode_to_payload("CQ K1DEF FN42");
+
+    // pack28("CQ") = (2, 0) — verified directly against this project's own
+    // encoder's special-token table (see `wsjtx_compat_tests.rs::
+    // test_pack28_cq_matches_wsjtx` and `test_special_tokens_payload`).
+    let cq_bits = u32_to_bits_28(2);
+    for i in 0..28 {
+        assert_eq!(
+            payload[i], cq_bits[i],
+            "bit {i}: CQ K1DEF FN42's to_callsign field must be the packed \"CQ\" token"
+        );
+    }
+    assert!(
+        !payload[28],
+        "bit 28 (suffix flag) must be clear for plain CQ"
+    );
+    assert_eq!(
+        i3_bits(&payload),
+        [false, false, true],
+        "CQ messages must encode i3=1, same standard-message family as RR73/RRR/73"
+    );
+}
+
+/// THE key regression test: `ApLevel::Cq`'s injected LLR signs (bits
+/// 0-27+28 and 74-76) must match the encoder's real "CQ K1DEF FN42"
+/// ground truth established above.
+#[test]
+fn cq_mask_injection_matches_encoder_ground_truth() {
+    let ground_truth = encode_to_payload("CQ K1DEF FN42");
+
+    let ctx = ApContext::default();
+    let mut llrs = vec![0.0f32; 77];
+    inject_ap_llrs(&mut llrs, ApLevel::Cq, &ctx, None);
+
+    for i in 0..29 {
+        let injected_bit = llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "bit {i}: ApLevel::Cq's injected LLR sign must match the real \
+             encoder's CQ K1DEF FN42 payload bit"
+        );
+    }
+    for i in 74..77 {
+        let injected_bit = llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "bit {i} (i3 field): ApLevel::Cq must match the real encoder's i3=1 bits"
+        );
+    }
+}
+
+/// `ApLevel::Cq` must require no `ApContext` at all — needs neither
+/// `my_call` nor `active_qso`. Regression guard so a future change can't
+/// silently make it context-dependent.
+#[test]
+fn cq_mask_requires_no_context() {
+    let empty = ApContext::default();
+    let mut llrs_empty = vec![0.0f32; 77];
+    inject_ap_llrs(&mut llrs_empty, ApLevel::Cq, &empty, None);
+
+    let full = ApContext {
+        my_call: Some(MyCallAp::new("K1ABC").unwrap()),
+        recent_calls: vec![RecentCallAp::new("W1AW", -3.0).unwrap()],
+        active_qso: Some(QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).unwrap()),
+    };
+    let mut llrs_full = vec![0.0f32; 77];
+    inject_ap_llrs(&mut llrs_full, ApLevel::Cq, &full, None);
+
+    assert_eq!(
+        llrs_empty, llrs_full,
+        "ApLevel::Cq must inject identically regardless of ApContext contents"
+    );
+}
+
+/// Ground truth for the full-message masks: real "K1ABC W1AW RR73" /
+/// "... RRR" / "... 73" messages encoded by this project's own encoder
+/// must have distinct `ir`/`igrid4` fields (bits 58-73) per token — this
+/// is the content AP4 alone (i3-only) never pinned.
+#[test]
+fn encoder_confirmation_tokens_have_distinct_igrid4_fields() {
+    let rr73 = encode_to_payload("K1ABC W1AW RR73");
+    let rrr = encode_to_payload("K1ABC W1AW RRR");
+    let bare73 = encode_to_payload("K1ABC W1AW 73");
+
+    // ir bit (58) is 0 for all three (no R-prefix on any of them).
+    assert!(!rr73[58], "RR73 ir bit must be 0");
+    assert!(!rrr[58], "RRR ir bit must be 0");
+    assert!(!bare73[58], "73 ir bit must be 0");
+
+    // igrid4 fields (59-73) must all differ from each other.
+    let igrid4_of = |p: &BitSlice| -> Vec<bool> { p[59..74].iter().by_vals().collect() };
+    let rr73_igrid4 = igrid4_of(&rr73);
+    let rrr_igrid4 = igrid4_of(&rrr);
+    let bare73_igrid4 = igrid4_of(&bare73);
+    assert_ne!(
+        rr73_igrid4, rrr_igrid4,
+        "RR73 and RRR must pack different igrid4 values"
+    );
+    assert_ne!(
+        rr73_igrid4, bare73_igrid4,
+        "RR73 and 73 must pack different igrid4 values"
+    );
+    assert_ne!(
+        rrr_igrid4, bare73_igrid4,
+        "RRR and 73 must pack different igrid4 values"
+    );
+}
+
+/// THE key regression test for the full-message mask: for each of the
+/// three confirmation tokens, `inject_confirmation_token_bits`'s injected
+/// LLR signs (bits 58-73) must match the encoder's real ground truth for
+/// that exact message.
+#[test]
+fn confirmation_token_mask_matches_encoder_ground_truth_for_all_three() {
+    let cases = [
+        (ConfirmationToken::RR73, "K1ABC W1AW RR73"),
+        (ConfirmationToken::Rrr, "K1ABC W1AW RRR"),
+        (ConfirmationToken::Final73, "K1ABC W1AW 73"),
+    ];
+
+    for (token, text) in cases {
+        let ground_truth = encode_to_payload(text);
+        let mut llrs = vec![0.0f32; 77];
+        inject_confirmation_token_bits(&mut llrs, token, None);
+
+        for i in 58..74 {
+            let injected_bit = llrs[i] < 0.0;
+            assert_eq!(
+                injected_bit, ground_truth[i],
+                "{text:?}: bit {i} (ir/igrid4 field) mismatch for token {token:?}"
+            );
+        }
+        // Bits outside 58..74 untouched.
+        for i in (0..58).chain(74..77) {
+            assert_eq!(
+                llrs[i], 0.0,
+                "{text:?}: bit {i} outside ir/igrid4 must be untouched by \
+                 inject_confirmation_token_bits"
+            );
+        }
+    }
+}
+
+/// Combined AP4 + full mask, exactly as the decoder applies it
+/// (`inject_ap_llrs(Ap4)` then `inject_confirmation_token_bits`), must
+/// match the encoder's real full "K1ABC W1AW RR73" payload at every
+/// injected position: callsigns (0-27, 29-56), i3 (74-76), AND now
+/// ir/igrid4 (58-73) too.
+#[test]
+fn ap4_plus_full_mask_matches_full_encoder_payload_for_rr73() {
+    let ground_truth = encode_to_payload("K1ABC W1AW RR73");
+
+    let my_call = MyCallAp::new("K1ABC").expect("K1ABC should encode");
+    let qso =
+        QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).expect("W1AW should encode");
+    let ctx = ApContext {
+        my_call: Some(my_call),
+        recent_calls: vec![],
+        active_qso: Some(qso),
+    };
+
+    let mut llrs = vec![0.0f32; 77];
+    inject_ap_llrs(&mut llrs, ApLevel::Ap4, &ctx, None);
+    inject_confirmation_token_bits(&mut llrs, ConfirmationToken::RR73, None);
+
+    // Every payload bit this combined injection touches (0-27, 29-56,
+    // 58-76 — everything except the untouched bit-28 suffix-flag gap)
+    // must match the real encoder ground truth.
+    for i in (0..28).chain(29..57).chain(58..77) {
+        let injected_bit = llrs[i] < 0.0;
+        assert_eq!(
+            injected_bit, ground_truth[i],
+            "bit {i}: AP4 + full RR73 mask must match the real encoder payload"
         );
     }
 }
