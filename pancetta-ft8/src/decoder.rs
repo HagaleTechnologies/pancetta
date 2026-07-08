@@ -1210,6 +1210,29 @@ pub struct Ft8Config {
     /// `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`
     /// §3.
     pub fine_fft_rect_window: bool,
+
+    /// Decoder-TP-sensitivity Task W2.5 [A/B]: replace the blunt post-CRC
+    /// confidence floors (`MIN_DECODE_CONFIDENCE = 0.41` in the non-AP/AP0
+    /// path, `MIN_AP_CONFIDENCE = 0.55` in the AP1-4 / recent-only path)
+    /// with the W2.1 signal-domain acceptance metric for decodes that
+    /// cleanly pass it (`AcceptanceScore::soft_distance <= 0.0976` AND
+    /// `hard_errors <= 37` — W2.1's FDR<=1% calibration; see
+    /// `research/experiments/2026-07-07-acceptance-calibration.md`). A
+    /// CRC-valid decode whose acceptance score clears both bars is strong
+    /// evidence the codeword genuinely matches the received signal,
+    /// independent of sync score — so the non-AP path drops its
+    /// confidence floor (and suspicion scrutiny) entirely for such
+    /// decodes, while the AP1-4/recent-only paths relax their floor down
+    /// to `MIN_DECODE_CONFIDENCE` (not fully dropped — AP injection biases
+    /// the LDPC prior, so even a clean acceptance match keeps the baseline
+    /// floor as a backstop). Decodes that do NOT cleanly pass acceptance
+    /// are unaffected: the legacy floor + suspicion-scrutiny gate applies
+    /// exactly as before. Default **false** — every gate site's
+    /// `passes_acceptance` check is forced `false` unconditionally, so
+    /// decode behavior is byte-identical to pre-W2.5. See
+    /// `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`
+    /// §4.
+    pub acceptance_gating_enabled: bool,
 }
 
 impl Default for Ft8Config {
@@ -1559,6 +1582,12 @@ impl Default for Ft8Config {
             // fine-FFT fallback is byte-identical to the historical
             // Hann-windowed path.
             fine_fft_rect_window: false,
+            // [A/B] default OFF (Task W2.5) until the hard-200 +
+            // noise_1000 gate passes (see `research/experiments/`). When
+            // false, every post-CRC confidence gate is byte-identical to
+            // pre-W2.5 behavior (the blunt sync-score floor governs
+            // unconditionally).
+            acceptance_gating_enabled: false,
         }
     }
 }
@@ -2671,6 +2700,10 @@ impl Ft8Decoder {
                 escalation_parity_max: self.config.escalation_parity_max,
                 // Task W2.4: OSD escalation-ladder budget checkpointing.
                 budget: self.current_budget,
+                // Task W2.5 [A/B]: acceptance-metric-based post-CRC gate.
+                // Default OFF keeps every gate site byte-identical to
+                // pre-W2.5 behavior.
+                acceptance_gating_enabled: self.config.acceptance_gating_enabled,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -7101,6 +7134,11 @@ struct DecodeContext<'a> {
     /// per-thread `LdpcDecoder` via `with_budget` so OSD's escalation
     /// ladder checkpoints against it.
     budget: DecodeBudget,
+    /// Task W2.5 [A/B]: master switch for the acceptance-metric-based
+    /// post-CRC gate (see `Ft8Config::acceptance_gating_enabled`).
+    /// `false` (default) keeps every gate site's blunt confidence floor
+    /// byte-identical to pre-W2.5 behavior.
+    acceptance_gating_enabled: bool,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -7640,6 +7678,25 @@ fn par_decode_candidate(
             let snr_db = par_estimate_snr_spectrogram(ctx.protocol_params, &tone_magnitudes);
             let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
+            // W2.1: `llrs` is the channel LLRs actually fed to
+            // `ldpc.decode_soft`/the BICM-ID rescue above (post-whitening/
+            // combiner, pre-BP) — the right signal-domain reference for
+            // both the standard and rescue outcomes, since the rescue
+            // helper is called with `&llrs` (not `&mut`) and never
+            // mutates the caller's copy. Computed here (moved up from
+            // after the confidence gate, Task W2.5) so the gate below can
+            // consult it.
+            let acceptance_score = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+            // Task W2.5 [A/B]: a decode that cleanly passes the W2.1
+            // acceptance metric is strong signal-domain evidence the
+            // codeword genuinely matches the received signal, independent
+            // of sync score — bypass the blunt floor + suspicion scrutiny
+            // for it. `ctx.acceptance_gating_enabled == false` (default)
+            // forces this to `false` unconditionally, so the gate below is
+            // byte-identical to pre-W2.5 behavior.
+            let passes_acceptance =
+                passes_acceptance_gate(ctx.acceptance_gating_enabled, acceptance_score);
+
             // Progressive confidence gate: hard floor + suspicion check.
             // High confidence (≥0.65): accept if plausible.
             // Low confidence (<0.65): apply extra scrutiny via suspicion score.
@@ -7648,15 +7705,23 @@ fn par_decode_candidate(
             // recovery whose wrong-CRC failure mode is exactly the
             // CRC-collision shape suspicion_score targets, so high
             // sync confidence must not exempt it.
+            // Task W2.5: both checks below are skipped when
+            // `passes_acceptance` — a clean acceptance match is treated as
+            // stronger evidence than either sync score or suspicion
+            // scrutiny (mirroring OSD's `accept_immediately_below`
+            // precedent). A decode that does NOT cleanly pass acceptance
+            // (borderline or failing) falls through to the unchanged
+            // legacy gate.
             const MIN_DECODE_CONFIDENCE: f32 = 0.41;
             const SCRUTINY_THRESHOLD: f32 = 0.65;
-            if confidence < MIN_DECODE_CONFIDENCE {
+            if confidence < MIN_DECODE_CONFIDENCE && !passes_acceptance {
                 if let Some(unsat) = rescue_unsat {
                     bicm_id_instrument(&format!("reject {unsat}"));
                 }
                 continue;
             }
-            if (rescue_unsat.is_some() || confidence < SCRUTINY_THRESHOLD)
+            if !passes_acceptance
+                && (rescue_unsat.is_some() || confidence < SCRUTINY_THRESHOLD)
                 && ft8_message.suspicion_score() >= 2
             {
                 if let Some(unsat) = rescue_unsat {
@@ -7674,14 +7739,7 @@ fn par_decode_candidate(
             );
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
             decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
-            // W2.1: `llrs` is the channel LLRs actually fed to
-            // `ldpc.decode_soft`/the BICM-ID rescue above (post-whitening/
-            // combiner, pre-BP) — the right signal-domain reference for
-            // both the standard and rescue outcomes, since the rescue
-            // helper is called with `&llrs` (not `&mut`) and never
-            // mutates the caller's copy.
-            decoded_message.acceptance =
-                crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+            decoded_message.acceptance = acceptance_score;
             if let Some(unsat) = rescue_unsat {
                 // hb-252 (Batch 98): dedicated origin ordinal for the
                 // BICM-ID rescue. The shipped hb-103 v3 content gate
@@ -7818,12 +7876,28 @@ fn par_decode_candidate(
             let snr_db = par_estimate_snr_fft(ctx.protocol_params, &tone_magnitudes);
             let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
+            // W2.1: `llrs` here is the fine-FFT path's own channel LLRs
+            // (post-whitening/impulse-robust, pre-BP) — the fine-FFT
+            // fallback's demodulation, not the coarse spectrogram one.
+            // Computed here (moved up, Task W2.5) so the gate below can
+            // consult it.
+            let acceptance_score = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+            // Task W2.5 [A/B]: see the matching comment at the coarse-path
+            // gate above — a clean acceptance pass bypasses the floor and
+            // suspicion scrutiny; byte-identical to legacy when
+            // `acceptance_gating_enabled == false`.
+            let passes_acceptance =
+                passes_acceptance_gate(ctx.acceptance_gating_enabled, acceptance_score);
+
             const MIN_DECODE_CONFIDENCE: f32 = 0.41;
             const SCRUTINY_THRESHOLD: f32 = 0.65;
-            if confidence < MIN_DECODE_CONFIDENCE {
+            if confidence < MIN_DECODE_CONFIDENCE && !passes_acceptance {
                 continue;
             }
-            if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
+            if !passes_acceptance
+                && confidence < SCRUTINY_THRESHOLD
+                && ft8_message.suspicion_score() >= 2
+            {
                 continue;
             }
 
@@ -7836,11 +7910,7 @@ fn par_decode_candidate(
             );
             decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
             decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
-            // W2.1: `llrs` here is the fine-FFT path's own channel LLRs
-            // (post-whitening/impulse-robust, pre-BP) — the fine-FFT
-            // fallback's demodulation, not the coarse spectrogram one.
-            decoded_message.acceptance =
-                crate::acceptance::score_from_slice(&corrected_bits, &llrs);
+            decoded_message.acceptance = acceptance_score;
 
             return Some(decoded_message);
         }
@@ -8116,6 +8186,24 @@ fn par_try_ldpc_with_ap(
     const MIN_DECODE_CONFIDENCE: f32 = 0.41;
     const SCRUTINY_THRESHOLD: f32 = 0.65;
 
+    // W2.1: score against pre-AP-injection channel LLRs — see the
+    // matching comment in `try_ldpc_with_ap` for why `base_llrs` (not the
+    // post-injection `llrs`) is the correct signal-domain reference.
+    // Computed here (moved up from after the confidence gate, Task W2.5)
+    // so the gate below can consult it.
+    let acceptance_score = crate::acceptance::score_from_slice(&corrected_bits, base_llrs);
+    // Task W2.5 [A/B]: a clean acceptance pass is scored against
+    // `base_llrs` — the PRE-injection channel evidence — so it is
+    // independent of the AP bias itself; treat it the same as an a8
+    // template match (relax the floor, skip suspicion), but do NOT drop
+    // the floor entirely the way the non-AP path does: AP injection still
+    // biases the LDPC prior, so even a clean acceptance match keeps the
+    // baseline `MIN_DECODE_CONFIDENCE` as a backstop rather than
+    // accepting at any sync score. `ctx.acceptance_gating_enabled ==
+    // false` (default) forces this `false` unconditionally, so the gate
+    // below is byte-identical to pre-W2.5 behavior.
+    let passes_acceptance = passes_acceptance_gate(ctx.acceptance_gating_enabled, acceptance_score);
+
     // WSJT-X Improved-style a8: when enabled AND this is an AP3/AP4
     // decode whose parsed text matches one of the coordinator-supplied
     // expected next-message templates, relax the floor from
@@ -8128,7 +8216,7 @@ fn par_try_ldpc_with_ap(
         && matches!(ap_level, crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4)
         && a8_text_matches(ap_context, &ft8_message.to_string());
 
-    let min_conf = if ap_level_num > 0 && !a8_match {
+    let min_conf = if ap_level_num > 0 && !a8_match && !passes_acceptance {
         MIN_AP_CONFIDENCE
     } else {
         MIN_DECODE_CONFIDENCE
@@ -8136,7 +8224,11 @@ fn par_try_ldpc_with_ap(
     if confidence < min_conf {
         return None;
     }
-    if !a8_match && confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
+    if !a8_match
+        && !passes_acceptance
+        && confidence < SCRUTINY_THRESHOLD
+        && ft8_message.suspicion_score() >= 2
+    {
         return None;
     }
 
@@ -8150,10 +8242,7 @@ fn par_try_ldpc_with_ap(
     decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
     decoded_message.ap_level = ap_level_num;
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
-    // W2.1: score against pre-AP-injection channel LLRs — see the
-    // matching comment in `try_ldpc_with_ap` for why `base_llrs` (not the
-    // post-injection `llrs`) is the correct signal-domain reference.
-    decoded_message.acceptance = crate::acceptance::score_from_slice(&corrected_bits, base_llrs);
+    decoded_message.acceptance = acceptance_score;
 
     Some(decoded_message)
 }
@@ -8224,13 +8313,31 @@ fn par_try_ldpc_with_recent_only(
         return None;
     }
 
+    // W2.1: see `par_try_ldpc_with_ap` — score against pre-injection
+    // channel LLRs, not the post-injection `llrs`. Computed here (moved
+    // up, Task W2.5) so the gate below can consult it.
+    let acceptance_score = crate::acceptance::score_from_slice(&corrected_bits, base_llrs);
+    // Task W2.5 [A/B]: same treatment as `par_try_ldpc_with_ap` — a clean
+    // acceptance pass relaxes the floor to `MIN_DECODE_CONFIDENCE` (not a
+    // full drop; this path injects a bias just like AP2, so keep the
+    // baseline floor as a backstop) and skips suspicion scrutiny.
+    // `ctx.acceptance_gating_enabled == false` (default) forces this
+    // `false` unconditionally — byte-identical to pre-W2.5 behavior.
+    let passes_acceptance = passes_acceptance_gate(ctx.acceptance_gating_enabled, acceptance_score);
+
     // Same confidence gating as par_try_ldpc_with_ap for AP-level decodes.
     const MIN_AP_CONFIDENCE: f32 = 0.55;
+    const MIN_DECODE_CONFIDENCE: f32 = 0.41;
     const SCRUTINY_THRESHOLD: f32 = 0.65;
-    if confidence < MIN_AP_CONFIDENCE {
+    let min_conf = if passes_acceptance {
+        MIN_DECODE_CONFIDENCE
+    } else {
+        MIN_AP_CONFIDENCE
+    };
+    if confidence < min_conf {
         return None;
     }
-    if confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
+    if !passes_acceptance && confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
         return None;
     }
 
@@ -8246,9 +8353,7 @@ fn par_try_ldpc_with_recent_only(
     // introduce a distinct ap_level number for hb-043 if telemetry needs it.
     decoded_message.ap_level = 2;
     decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
-    // W2.1: see `par_try_ldpc_with_ap` — score against pre-injection
-    // channel LLRs, not the post-injection `llrs`.
-    decoded_message.acceptance = crate::acceptance::score_from_slice(&corrected_bits, base_llrs);
+    decoded_message.acceptance = acceptance_score;
     Some(decoded_message)
 }
 
@@ -8336,6 +8441,38 @@ pub(crate) fn a8_text_matches(ap_context: &crate::ap::ApContext, decoded_text: &
     qso.expected_next_message_texts
         .iter()
         .any(|t| crate::ap::normalize_for_a8_match(t) == candidate)
+}
+
+/// Task W2.5 [A/B] (decoder-tp-sensitivity plan): minimum acceptance-metric
+/// bar a CRC-valid decode must clear to bypass the blunt post-CRC
+/// confidence floors. Identical to `OsdConfig::default()`'s
+/// `max_soft_distance`/`max_hard_errors` — the same W2.1 calibration
+/// (`research/experiments/2026-07-07-acceptance-calibration.md`: largest
+/// `soft_distance` threshold keeping FDR <= 1% on the hard_200/noise_1000
+/// TP/FP subset) applied to a different gate (the BP/AP1-4 confidence
+/// floor, not OSD's own candidate selection).
+const ACCEPTANCE_GATE_MAX_SOFT_DISTANCE: f32 = 0.0976;
+/// See [`ACCEPTANCE_GATE_MAX_SOFT_DISTANCE`]. Secondary backstop —
+/// `soft_distance` is the load-bearing metric.
+const ACCEPTANCE_GATE_MAX_HARD_ERRORS: u16 = 37;
+
+/// Task W2.5 [A/B]: `true` iff `enabled` AND `score` clears both the
+/// soft-distance and hard-error acceptance bars
+/// ([`ACCEPTANCE_GATE_MAX_SOFT_DISTANCE`] /
+/// [`ACCEPTANCE_GATE_MAX_HARD_ERRORS`]). `enabled == false` (the default,
+/// `Ft8Config::acceptance_gating_enabled`) or `score == None` always
+/// returns `false`, so every call site gating on this helper's result is
+/// byte-identical to pre-W2.5 behavior unless the flag is on AND the
+/// decode's acceptance score cleanly passes.
+fn passes_acceptance_gate(
+    enabled: bool,
+    score: Option<crate::acceptance::AcceptanceScore>,
+) -> bool {
+    enabled
+        && score.is_some_and(|s| {
+            s.soft_distance <= ACCEPTANCE_GATE_MAX_SOFT_DISTANCE
+                && s.hard_errors <= ACCEPTANCE_GATE_MAX_HARD_ERRORS
+        })
 }
 
 // ---- Parallel-safe helpers (free functions operating on shared state) ----
@@ -17930,6 +18067,295 @@ mod impulse_robust_llr_tests {
         assert!(
             decoded.iter().any(|m| m.text == "CQ K5ARH EM10"),
             "impulse-robust weighting must decode a clean synthetic signal"
+        );
+    }
+}
+
+// ===========================================================================
+// Task W2.5 [A/B]: replace the blunt post-CRC confidence floors with the
+// W2.1 acceptance metric for decodes that cleanly pass it.
+// ===========================================================================
+#[cfg(test)]
+mod w2_5_acceptance_gating_tests {
+    use super::*;
+
+    /// Locates a REAL, clean (full-amplitude, noiseless) FT8 signal for
+    /// "CQ K5ARH EM10" via the actual Costas sync search, then returns its
+    /// true candidate with `sync_score` forcibly overridden to 4.0
+    /// (confidence 4.0/12.0 = 0.333) — squarely inside the design doc's
+    /// targeted sync-3.0-to-4.92 band (confidence 0.25-0.41) that today's
+    /// blunt `MIN_DECODE_CONFIDENCE = 0.41` floor rejects unconditionally.
+    ///
+    /// Only the `sync_score` FIELD is synthetic. `freq_bin`/`time_step`/
+    /// `freq_sub` are the REAL coordinates the sync search found, so
+    /// `par_decode_candidate` extracts the REAL tone magnitudes/LLRs at
+    /// that position and genuinely runs BP/CRC over the real signal. This
+    /// models a real signal whose Costas-preamble correlation happens to
+    /// be weak (e.g. a real-world fading/interference effect that hits
+    /// just the sync tones) while its data-bearing symbols stay clean —
+    /// exactly the scenario the acceptance-gating design targets, not a
+    /// toy construction.
+    #[cfg(feature = "transmit")]
+    fn build_low_sync_real_signal(
+        decoder: &Ft8Decoder,
+    ) -> (Vec<f64>, Spectrogram, CostasCandidate) {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let audio = decoder.preprocess_audio(&tx).expect("preprocess");
+        let spectrogram = decoder.compute_spectrogram(&audio).expect("spectrogram");
+        let candidates = decoder
+            .costas_sync_search_with_threshold(&spectrogram, 0.0, None)
+            .expect("sync search");
+        let real_candidate = candidates
+            .into_iter()
+            .max_by(|a, b| {
+                a.sync_score
+                    .partial_cmp(&b.sync_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("a clean full-amplitude signal must produce at least one sync candidate");
+
+        // Sanity: the real candidate's natural sync_score must be well
+        // above the target low-sync band — otherwise the override below
+        // wouldn't be a genuine downgrade of a real, strong signal.
+        assert!(
+            real_candidate.sync_score > 6.0,
+            "expected a strong natural sync_score on a clean full-amplitude \
+             signal, got {}",
+            real_candidate.sync_score
+        );
+
+        let low_sync_candidate = CostasCandidate {
+            sync_score: 4.0,
+            ..real_candidate
+        };
+
+        (audio, spectrogram, low_sync_candidate)
+    }
+
+    /// Builds a `DecodeContext` from a real `Ft8Decoder` instance's
+    /// internals, mirroring the production `decode_window`'s ctx literal
+    /// field-for-field (see the `let ctx = DecodeContext { ... }` site
+    /// earlier in this file).
+    #[cfg(feature = "transmit")]
+    fn build_ctx<'a>(
+        decoder: &'a Ft8Decoder,
+        spectrogram: &'a Spectrogram,
+        audio: &'a [f64],
+        ap_context: &'a crate::ap::ApContext,
+    ) -> DecodeContext<'a> {
+        DecodeContext {
+            protocol_params: &decoder.protocol_params,
+            message_parser: &decoder.message_parser,
+            spectrogram,
+            audio,
+            ap_context,
+            ap_active: false,
+            symbol_fft: &decoder.symbol_fft,
+            symbol_window: &decoder.symbol_window,
+            xor_sequence: decoder.protocol_params.xor_sequence,
+            ldpc_iterations: decoder.config.ldpc_iterations,
+            osd_depth: decoder.config.osd_depth,
+            osd_npre2_preprocessing_enabled: decoder.config.osd_npre2_preprocessing_enabled,
+            llr_target_variance: decoder.config.llr_target_variance,
+            adaptive_ldpc_iters: decoder.config.adaptive_ldpc_iters,
+            max_parity_errors_for_osd: decoder.config.max_parity_errors_for_osd,
+            bp_offset_subtract: decoder.config.bp_offset_subtract,
+            osd_input: decoder.config.osd_input,
+            layered_bp: decoder.config.layered_bp,
+            pade_atanh: decoder.config.pade_atanh,
+            ldpc_feedback_refinement_enabled: decoder.config.ldpc_feedback_refinement_enabled,
+            ldpc_feedback_boost_factor: decoder.config.ldpc_feedback_boost_factor,
+            ldpc_feedback_attenuate_factor: decoder.config.ldpc_feedback_attenuate_factor,
+            ldpc_feedback_erase_threshold: decoder.config.ldpc_feedback_erase_threshold,
+            sync_time_interp_linear_power: decoder.config.sync_time_interp_linear_power,
+            window_start: Instant::now(),
+            soft_combiner: decoder.soft_combiner.as_ref(),
+            llr_whitening_enabled: decoder.config.llr_whitening_enabled,
+            per_candidate_freq_tracker_enabled: decoder.config.per_candidate_freq_tracker_enabled,
+            per_candidate_freq_tracker_alpha: decoder.config.per_candidate_freq_tracker_alpha,
+            per_candidate_freq_tracker_max_step_hz: decoder
+                .config
+                .per_candidate_freq_tracker_max_step_hz,
+            per_candidate_freq_tracker_max_error_hz: decoder
+                .config
+                .per_candidate_freq_tracker_max_error_hz,
+            a8_qso_state_ap_enabled: decoder.config.a8_qso_state_ap_enabled,
+            bicm_id_iterations: decoder.config.bicm_id_iterations,
+            bicm_id_max_unsatisfied_checks: decoder.config.bicm_id_max_unsatisfied_checks,
+            llr_metric: decoder.config.llr_metric,
+            bicm_id_em_reestimation: decoder.config.bicm_id_em_reestimation,
+            impulse_robust_llr: decoder.config.impulse_robust_llr,
+            escalation_enabled: decoder.config.escalation_enabled,
+            floor_iters: decoder.config.floor_iters,
+            deep_iters: decoder.config.deep_iters,
+            escalation_parity_max: decoder.config.escalation_parity_max,
+            budget: DecodeBudget::unlimited(),
+            acceptance_gating_enabled: decoder.config.acceptance_gating_enabled,
+        }
+    }
+
+    #[cfg(feature = "transmit")]
+    fn decode_low_sync_candidate(acceptance_gating_enabled: bool) -> Option<DecodedMessage> {
+        let config = Ft8Config {
+            acceptance_gating_enabled,
+            ..Ft8Config::default()
+        };
+        let decoder = Ft8Decoder::new(config).expect("decoder");
+        let (audio, spectrogram, candidate) = build_low_sync_real_signal(&decoder);
+        let ap_context = crate::ap::ApContext::default();
+        let ctx = build_ctx(&decoder, &spectrogram, &audio, &ap_context);
+        let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        let mut fft_buffer = vec![Complex::new(0.0, 0.0); sps];
+        par_decode_candidate(
+            &ctx,
+            &candidate,
+            &decoder.ldpc_decoder,
+            None,
+            &mut fft_buffer,
+        )
+    }
+
+    /// RED (confirms current/pre-W2.5 behavior): a genuinely CRC-decodable
+    /// real signal whose sync_score lands in the 3.0-4.92 band (confidence
+    /// 0.25-0.41) is rejected outright by the blunt
+    /// `MIN_DECODE_CONFIDENCE = 0.41` floor — regardless of how clean its
+    /// actual codeword match is.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn low_sync_true_signal_rejected_with_gating_disabled() {
+        let result = decode_low_sync_candidate(false);
+        assert!(
+            result.is_none(),
+            "acceptance_gating_enabled=false must preserve the legacy \
+             blunt-floor rejection at sync_score=4.0 (confidence 0.333)"
+        );
+    }
+
+    /// GREEN: with the flag on, the SAME low-sync real signal is accepted
+    /// because it cleanly passes the W2.1 acceptance metric — a real,
+    /// clean signal's decoded codeword genuinely matches its own channel
+    /// LLRs, independent of the (artificially depressed) sync score.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn low_sync_true_signal_accepted_with_gating_enabled() {
+        let result = decode_low_sync_candidate(true);
+        let msg = result.expect(
+            "acceptance_gating_enabled=true must rescue a clean signal at \
+             sync_score=4.0 whose acceptance score cleanly passes",
+        );
+        assert_eq!(msg.text, "CQ K5ARH EM10");
+        let acc = msg
+            .acceptance
+            .expect("acceptance score must be populated on every native decode");
+        assert!(
+            acc.soft_distance <= ACCEPTANCE_GATE_MAX_SOFT_DISTANCE,
+            "expected a clean acceptance match (soft_distance <= {}), got {}",
+            ACCEPTANCE_GATE_MAX_SOFT_DISTANCE,
+            acc.soft_distance
+        );
+    }
+
+    /// Negative case: a CRC-valid codeword that does NOT match the
+    /// receiver's channel evidence (soft_distance far above threshold)
+    /// must NOT be rescued by the acceptance gate, even with the flag on.
+    ///
+    /// This reuses the exact weight-4 CRC-14 kernel element proven in
+    /// `osd.rs`'s
+    /// `test_osd_rejects_untrustworthy_order1_collision_and_finds_truth_at_order3`
+    /// (found there by brute-force search over all-zero-payload
+    /// 77-choose-4 subsets): flipping payload bits `[0, 3, 37, 66]` leaves
+    /// CRC-14 unchanged, so `codeword_true` and `codeword_wrong` are two
+    /// DIFFERENT, independently CRC-14-valid LDPC codewords sharing the
+    /// same CRC bits — a genuine CRC-14 coincidence pair, not hand-typed
+    /// garbage.
+    ///
+    /// Scope note: this is a metric+gate-level test, not a full
+    /// rayon-pipeline integration like the two tests above. Forcing BP
+    /// itself to *converge* to a specific wrong-but-CRC-valid codeword
+    /// through the full decode pipeline isn't practically constructible —
+    /// that would require either a genuine CRC-14 noise collision (BP
+    /// essentially never produces one on random data; convergence needs
+    /// real supporting evidence) or AP-bias steering, which is already
+    /// covered by the separate, existing `ap_injection_survived` check
+    /// this task does not touch. What's tested directly here is exactly
+    /// what every one of this task's 4 gate sites actually consults: the
+    /// `passes_acceptance_gate` predicate over a genuinely-computed bad
+    /// `AcceptanceScore`.
+    #[test]
+    fn low_sync_bad_acceptance_still_rejected() {
+        use crate::ldpc::LdpcEncoder;
+
+        const DELTA: [usize; 4] = [0, 3, 37, 66];
+
+        let payload: BitVec = BitVec::repeat(false, PAYLOAD_BITS);
+        let crc = calculate_crc14(&payload);
+        let mut message: BitVec = payload.clone();
+        for i in 0..CRC_BITS {
+            message.push((crc >> (CRC_BITS - 1 - i)) & 1 == 1);
+        }
+        let encoder = LdpcEncoder::new();
+        let codeword_true = encoder.encode(&message).expect("LDPC encode true message");
+
+        let mut payload_prime = payload.clone();
+        for &p in &DELTA {
+            let bit = payload_prime[p];
+            payload_prime.set(p, !bit);
+        }
+        let crc_prime = calculate_crc14(&payload_prime);
+        assert_eq!(
+            crc, crc_prime,
+            "DELTA must be a genuine CRC-14 kernel element for the \
+             all-zero payload (proven in osd.rs)"
+        );
+        let mut message_prime = payload_prime.clone();
+        for i in 0..CRC_BITS {
+            message_prime.push((crc_prime >> (CRC_BITS - 1 - i)) & 1 == 1);
+        }
+        let codeword_wrong = encoder
+            .encode(&message_prime)
+            .expect("LDPC encode alternate CRC-14-colliding message");
+        assert_ne!(
+            codeword_true, codeword_wrong,
+            "the two CRC-14-colliding messages must encode to DIFFERENT codewords"
+        );
+
+        // Channel LLRs confidently agree with `codeword_true` at every
+        // position — models a real receiver that actually heard
+        // `codeword_true`.
+        let mut llrs = [0.0f32; 174];
+        for (i, llr) in llrs.iter_mut().enumerate() {
+            let bit = codeword_true.get(i).map(|b| *b).unwrap_or(false);
+            *llr = if bit { -8.0 } else { 8.0 };
+        }
+
+        // `codeword_wrong` is a real, independently CRC-14-valid FT8
+        // codeword (not garbage) — exactly the shape of decode this
+        // workstream exists to catch: CRC passes, but it is NOT what was
+        // actually received.
+        let score = crate::acceptance::score(&codeword_wrong, &llrs);
+        assert!(
+            score.soft_distance > ACCEPTANCE_GATE_MAX_SOFT_DISTANCE,
+            "the wrong-but-CRC-valid codeword must score a BAD (high) \
+             soft_distance against channel evidence that actually matches a \
+             different codeword — got {}",
+            score.soft_distance
+        );
+
+        // Confirm the actual gate predicate every one of this task's 4
+        // call sites consults rejects it, even with the flag ON.
+        assert!(
+            !passes_acceptance_gate(true, Some(score)),
+            "passes_acceptance_gate must reject a CRC-valid-but-mismatched \
+             codeword regardless of the acceptance_gating_enabled flag"
         );
     }
 }

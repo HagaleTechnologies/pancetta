@@ -75,6 +75,10 @@ struct Args {
     /// divisive LLR whitening step, re-measured after the dB/linear
     /// unit-consistency fix. See `Ft8Config::llr_whitening_enabled`.
     llr_whitening: Option<bool>,
+    /// Decoder-TP-sensitivity Task W2.5 [A/B]: master switch for the
+    /// acceptance-metric-based post-CRC gate that replaces the blunt
+    /// sync-score confidence floors. See `Ft8Config::acceptance_gating_enabled`.
+    acceptance_gating: Option<bool>,
     /// Decoder-speed-overhaul Task 9/10: shallow BP iteration count.
     /// See `Ft8Config::floor_iters`.
     floor_iters: Option<usize>,
@@ -225,6 +229,7 @@ impl Args {
         let mut escalation_enabled: Option<bool> = None;
         let mut fine_fft_rect_window: Option<bool> = None;
         let mut llr_whitening: Option<bool> = None;
+        let mut acceptance_gating: Option<bool> = None;
         let mut floor_iters: Option<usize> = None;
         let mut deep_iters: Option<usize> = None;
         let mut escalation_parity_max: Option<usize> = None;
@@ -436,6 +441,12 @@ impl Args {
                 }
                 "--no-llr-whitening" => {
                     llr_whitening = Some(false);
+                }
+                "--acceptance-gating" => {
+                    acceptance_gating = Some(true);
+                }
+                "--no-acceptance-gating" => {
+                    acceptance_gating = Some(false);
                 }
                 "--floor-iters" => {
                     floor_iters = Some(
@@ -713,6 +724,7 @@ impl Args {
                     eprintln!("  --escalation-enabled: decoder-speed-overhaul Task 10 [A/B] — BP escalation ladder master switch (default off). See Ft8Config::escalation_enabled.");
                     eprintln!("  --fine-fft-rect-window: decoder-TP-sensitivity Task W1.3 [A/B] — rectangular (no) window on the fine-FFT fallback symbol FFT instead of Hann (default off). See Ft8Config::fine_fft_rect_window.");
                     eprintln!("  --llr-whitening / --no-llr-whitening: decoder-TP-sensitivity Task W1.4 [A/B] — force the divisive LLR whitening step on/off (production default: off, flipped by the W1.4 A/B result). See Ft8Config::llr_whitening_enabled.");
+                    eprintln!("  --acceptance-gating / --no-acceptance-gating: decoder-TP-sensitivity Task W2.5 [A/B] — replace the blunt post-CRC sync-score confidence floors with the W2.1 acceptance metric for decodes that cleanly pass it (production default: off). See Ft8Config::acceptance_gating_enabled.");
                     eprintln!("  --floor-iters N: shallow BP iteration count for S1/S2 when --escalation-enabled (default 25).");
                     eprintln!("  --deep-iters N: deep BP iteration count a near-miss floor failure is escalated to (default 100).");
                     eprintln!("  --escalation-parity-max N: max unsatisfied parity checks at floor_iters tolerated before escalating (default 30).");
@@ -755,6 +767,7 @@ impl Args {
             escalation_enabled,
             fine_fft_rect_window,
             llr_whitening,
+            acceptance_gating,
             floor_iters,
             deep_iters,
             escalation_parity_max,
@@ -1764,6 +1777,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.llr_whitening {
         d = d.with_llr_whitening(on);
+    }
+    if let Some(on) = args.acceptance_gating {
+        d = d.with_acceptance_gating_enabled(on);
     }
     if let Some(v) = args.floor_iters {
         d = d.with_floor_iters(v);

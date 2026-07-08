@@ -415,6 +415,15 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W2.5 [A/B]: master switch for the
+    /// acceptance-metric-based post-CRC gate that replaces the blunt
+    /// `MIN_DECODE_CONFIDENCE`/`MIN_AP_CONFIDENCE` sync-score floors. See
+    /// `Ft8Config::acceptance_gating_enabled`.
+    pub fn with_acceptance_gating_enabled(mut self, on: bool) -> Self {
+        self.config.acceptance_gating_enabled = on;
+        self
+    }
+
     /// Decoder-speed-overhaul Task 9/10: shallow BP iteration count for
     /// the S1/S2 primary decode. See `Ft8Config::floor_iters`.
     pub fn with_floor_iters(mut self, n: usize) -> Self {
