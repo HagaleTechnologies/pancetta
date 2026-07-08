@@ -1345,6 +1345,39 @@ pub struct Ft8Config {
     /// `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`
     /// section 3 (D3).
     pub fine_sync_enabled: bool,
+
+    /// Decoder-TP-sensitivity Task W3.4 [A/B]: nsym=2/3 noncoherent
+    /// (Gray-hypothesis) combining LLR variants, layered ON TOP of the
+    /// Task W3.3 matched-demod stage. **Only ever takes effect when
+    /// `fine_sync_enabled` is ALSO `true`** — this flag consumes the
+    /// per-symbol COMPLEX tone correlations that only exist inside
+    /// [`matched_demod_attempt`], so it is inert-by-construction whenever
+    /// `fine_sync_enabled = false` (the default).
+    ///
+    /// When both flags are `true`, a candidate whose ordinary 1-symbol
+    /// max-vs-max LLR metric fails to decode (BP/CRC/parse/plausibility)
+    /// gets up to two MORE BP attempts on the SAME candidate/position,
+    /// using 2-symbol and then 3-symbol noncoherent Gray-hypothesis
+    /// combining metrics (`nsym_combined_llrs`) formed by coherently
+    /// summing the complex per-tone correlations across adjacent data
+    /// symbols under every joint tone hypothesis, per
+    /// `research/specs/spec-wsjtx-mainline-ft8b.md`'s "Variant B (bmetb,
+    /// nsym=2)" / "Variant C (bmetc, nsym=3)" description. This trades a
+    /// wider (noisier) per-attempt hypothesis space for coherent-gain SNR
+    /// recovery — it only helps when the channel phase is genuinely
+    /// stable across the combined symbols (a real Doppler/multipath
+    /// channel would lose more than it gains); the synthetic test
+    /// fixture below uses a static AWGN channel to exercise exactly that
+    /// favorable case.
+    ///
+    /// Default **false**. Since `fine_sync_enabled` also defaults false,
+    /// this flag's own A/B result cannot independently ship a live
+    /// production change today (see the Task W3.3/W3.3b reports on why
+    /// `fine_sync_enabled` stays off — a real budget-starvation
+    /// regression at the realistic "Standard" decode-effort preset, not a
+    /// mechanism problem). See the Task W3.4 report for the isolated A/B
+    /// measurement (both legs run with `fine_sync_enabled = true`).
+    pub nsym_combining_enabled: bool,
 }
 
 impl Default for Ft8Config {
@@ -1725,6 +1758,11 @@ impl Default for Ft8Config {
             // fallback stays byte-identical to the legacy 21-trial
             // fine-FFT path.
             fine_sync_enabled: false,
+            // [A/B] default OFF (Task W3.4). Inert regardless of this
+            // flag's own value while `fine_sync_enabled = false` (see the
+            // field doc); kept default-false for defense-in-depth if
+            // `fine_sync_enabled` is ever flipped on independently.
+            nsym_combining_enabled: false,
         }
     }
 }
@@ -2865,6 +2903,9 @@ impl Ft8Decoder {
                 // Default OFF — byte-identical to the legacy 21-trial
                 // fine-FFT fallback.
                 fine_sync_enabled: self.config.fine_sync_enabled,
+                // Task W3.4 [A/B]: nsym combining. Default OFF —
+                // byte-identical (also gated behind fine_sync_enabled).
+                nsym_combining_enabled: self.config.nsym_combining_enabled,
                 baseband_taps: &self.baseband_taps,
             };
 
@@ -5758,6 +5799,7 @@ impl Ft8Decoder {
                     self.config.llr_target_variance,
                     self.config.acceptance_gating_enabled,
                     &self.baseband_taps,
+                    self.config.nsym_combining_enabled,
                 ) {
                     decoded.push(msg);
                 }
@@ -6298,6 +6340,7 @@ impl Ft8Decoder {
                     self.config.llr_target_variance,
                     self.config.acceptance_gating_enabled,
                     &self.baseband_taps,
+                    self.config.nsym_combining_enabled,
                 ) {
                     decoded_new.push(msg);
                 }
@@ -6792,6 +6835,7 @@ impl Ft8Decoder {
                     self.config.llr_target_variance,
                     self.config.acceptance_gating_enabled,
                     &self.baseband_taps,
+                    self.config.nsym_combining_enabled,
                 ) {
                     decoded_new.push(msg);
                 }
@@ -7425,6 +7469,10 @@ struct DecodeContext<'a> {
     /// Task W3.3 [A/B]: master switch for the per-candidate fine-sync +
     /// matched-demod stage. See `Ft8Config::fine_sync_enabled`.
     fine_sync_enabled: bool,
+    /// Task W3.4 [A/B]: master switch for nsym=2/3 noncoherent combining
+    /// LLR variants (only takes effect when `fine_sync_enabled` is ALSO
+    /// `true`). See `Ft8Config::nsym_combining_enabled`.
+    nsym_combining_enabled: bool,
     /// Task W3.3: pre-designed baseband decimation FIR taps (see
     /// `Ft8Decoder::baseband_taps`'s doc) — computed once per decoder
     /// instance, reused across every candidate in every window.
@@ -8265,6 +8313,7 @@ fn par_matched_demod_decode(
         ctx.llr_target_variance,
         ctx.acceptance_gating_enabled,
         ctx.baseband_taps,
+        ctx.nsym_combining_enabled,
     )?;
     msg.decode_time_into_window = Some(ctx.window_start.elapsed());
     Some(msg)
@@ -8294,6 +8343,7 @@ fn matched_demod_attempt(
     llr_target_variance: f32,
     acceptance_gating_enabled: bool,
     baseband_taps: &[f64],
+    nsym_combining_enabled: bool,
 ) -> Option<DecodedMessage> {
     let tone_spacing = pp.tone_spacing;
     let sub_bin_offset = candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
@@ -8325,7 +8375,19 @@ fn matched_demod_attempt(
     // top, exactly like `fine_sync::costas_power`'s own per-tone
     // correlation (this reproduces that math for all `pp.num_tones`
     // tones, not just the Costas subset).
+    //
+    // Task W3.4 [A/B]: when `nsym_combining_enabled`, ALSO retain the
+    // pre-`.norm()` complex correlation per symbol/tone — the raw
+    // material `nsym_combined_llrs` coherently sums across adjacent data
+    // symbols. Skipped entirely when the flag is off (an `Option` that
+    // stays `None`, no extra allocation) so the byte-identical-by-default
+    // contract holds.
     let mut tone_magnitudes: Vec<[f64; NUM_TONES]> = Vec::with_capacity(pp.num_symbols);
+    let mut tone_complex: Option<Vec<[Complex<f64>; NUM_TONES]>> = if nsym_combining_enabled {
+        Some(Vec::with_capacity(pp.num_symbols))
+    } else {
+        None
+    };
     for sym_idx in 0..pp.num_symbols {
         let frame_start = bb.nominal_start_index as isize + dt_offset + (sym_idx * sps_bb) as isize;
         if frame_start < 0 {
@@ -8338,12 +8400,18 @@ fn matched_demod_attempt(
         }
         let frame = &bb.samples[frame_start..frame_end];
         let mut mags = [0.0f64; NUM_TONES];
+        let mut cplx = [Complex::new(0.0, 0.0); NUM_TONES];
         for tone in 0..pp.num_tones {
-            mags[tone] =
-                matched_demod_tone_correlation(frame, tone, sps_bb, df_hz, bb.sample_rate_hz)
-                    .norm();
+            let c = matched_demod_tone_correlation(frame, tone, sps_bb, df_hz, bb.sample_rate_hz);
+            mags[tone] = c.norm();
+            if tone_complex.is_some() {
+                cplx[tone] = c;
+            }
         }
         tone_magnitudes.push(mags);
+        if let Some(tc) = tone_complex.as_mut() {
+            tc.push(cplx);
+        }
     }
 
     // hb-253-style demapper metric selection, matching the coarse and
@@ -8371,36 +8439,61 @@ fn matched_demod_attempt(
     );
     normalize_llrs(&mut llrs, llr_target_variance);
 
-    // Exactly ONE BP attempt — the whole point of this stage vs. the
-    // legacy 21-trial loop.
-    let corrected_bits = ldpc.decode_soft(&llrs).ok()?;
-    if !par_verify_crc(&corrected_bits) {
-        return None;
-    }
-
-    let payload_bits = par_apply_xor(xor_sequence, &corrected_bits);
-    let ft8_message = message_parser.parse_payload(&payload_bits).ok()?;
-    if !ft8_message.is_plausible() {
-        return None;
-    }
-
-    let snr_db = par_estimate_snr_fft(pp, &tone_magnitudes);
     let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
-    // Same post-CRC acceptance/confidence gate as every other per-
-    // candidate path (W2.1/W2.5) — this stage does not get a looser FP
-    // bar than the paths it replaces.
-    let acceptance_score = crate::acceptance::score_from_slice(&corrected_bits, &llrs);
-    let passes_acceptance = passes_acceptance_gate(acceptance_gating_enabled, acceptance_score);
+    // The ordinary 1-symbol BP attempt — the whole point of this stage
+    // vs. the legacy 21-trial loop. Task W3.4 [A/B]: if it fails AND
+    // `nsym_combining_enabled`, escalate to up to two MORE BP attempts on
+    // this SAME candidate/position using the 2-symbol then 3-symbol
+    // noncoherent-combining LLR variants (`nsym_combined_llrs`), each run
+    // through the identical whitening/impulse-robust/normalize/BP/CRC/
+    // parse/plausibility/acceptance-gate pipeline as the 1-symbol path so
+    // the escalation adds attempts without loosening the accept bar.
+    let (corrected_bits, ft8_message, acceptance_score) = matched_demod_try_bp(
+        &llrs,
+        ldpc,
+        xor_sequence,
+        message_parser,
+        acceptance_gating_enabled,
+        confidence,
+    )
+    .or_else(|| {
+        let tone_complex = tone_complex.as_ref()?;
+        for nsym in [2usize, 3usize] {
+            let Some(mut combined) = nsym_combined_llrs(pp, &tone_magnitudes, tone_complex, nsym)
+            else {
+                continue;
+            };
+            maybe_whiten_llrs(
+                llr_whitening_enabled,
+                &mut combined,
+                &tone_magnitudes,
+                ToneUnits::LinearMag,
+                pp,
+            );
+            maybe_impulse_robust_llrs(
+                impulse_robust_llr,
+                &mut combined,
+                &tone_magnitudes,
+                ToneUnits::LinearMag,
+                pp,
+            );
+            normalize_llrs(&mut combined, llr_target_variance);
+            if let Some(result) = matched_demod_try_bp(
+                &combined,
+                ldpc,
+                xor_sequence,
+                message_parser,
+                acceptance_gating_enabled,
+                confidence,
+            ) {
+                return Some(result);
+            }
+        }
+        None
+    })?;
 
-    const MIN_DECODE_CONFIDENCE: f32 = 0.41;
-    const SCRUTINY_THRESHOLD: f32 = 0.65;
-    if confidence < MIN_DECODE_CONFIDENCE && !passes_acceptance {
-        return None;
-    }
-    if !passes_acceptance && confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
-        return None;
-    }
+    let snr_db = par_estimate_snr_fft(pp, &tone_magnitudes);
 
     let base_frequency = candidate_freq_hz + df_hz;
     // Map the baseband-domain dt refinement back to an audio-domain time
@@ -8421,6 +8514,205 @@ fn matched_demod_attempt(
     decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
     decoded_message.acceptance = acceptance_score;
     Some(decoded_message)
+}
+
+/// Task W3.4: shared inner BP-attempt (decode_soft → CRC → parse →
+/// plausibility → confidence/acceptance gate) used by both the 1-symbol
+/// path and each nsym-combining escalation in [`matched_demod_attempt`].
+/// Factored out so the escalation ladder adds attempts without
+/// duplicating (and risking drift in) the accept/reject logic. Byte-
+/// identical to the inline sequence `matched_demod_attempt` ran before
+/// this task for the 1-symbol call.
+fn matched_demod_try_bp(
+    llrs: &[f32],
+    ldpc: &LdpcDecoder,
+    xor_sequence: Option<&'static [u8; 10]>,
+    message_parser: &MessageParser,
+    acceptance_gating_enabled: bool,
+    confidence: f32,
+) -> Option<(
+    BitVec,
+    crate::message::Ft8Message,
+    Option<crate::acceptance::AcceptanceScore>,
+)> {
+    let corrected_bits = ldpc.decode_soft(llrs).ok()?;
+    if !par_verify_crc(&corrected_bits) {
+        return None;
+    }
+
+    let payload_bits = par_apply_xor(xor_sequence, &corrected_bits);
+    let ft8_message = message_parser.parse_payload(&payload_bits).ok()?;
+    if !ft8_message.is_plausible() {
+        return None;
+    }
+
+    // Same post-CRC acceptance/confidence gate as every other per-
+    // candidate path (W2.1/W2.5) — this stage does not get a looser FP
+    // bar than the paths it replaces.
+    let acceptance_score = crate::acceptance::score_from_slice(&corrected_bits, llrs);
+    let passes_acceptance = passes_acceptance_gate(acceptance_gating_enabled, acceptance_score);
+
+    const MIN_DECODE_CONFIDENCE: f32 = 0.41;
+    const SCRUTINY_THRESHOLD: f32 = 0.65;
+    if confidence < MIN_DECODE_CONFIDENCE && !passes_acceptance {
+        return None;
+    }
+    if !passes_acceptance && confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
+        return None;
+    }
+
+    Some((corrected_bits, ft8_message, acceptance_score))
+}
+
+/// Task W3.4 [A/B]: noncoherent Gray-hypothesis energies for one group of
+/// `nsym` (2 or 3) adjacent data symbols, formed by coherently summing
+/// the COMPLEX per-tone correlations across the group under every joint
+/// tone hypothesis, then taking the magnitude of the sum. See
+/// `research/specs/spec-wsjtx-mainline-ft8b.md`, "Variant B (bmetb,
+/// nsym=2)" / "Variant C (bmetc, nsym=3)": `s2 = abs(cs(...) + cs(...))`
+/// generalizes directly to `nsym` terms.
+///
+/// Hypothesis indexing: for `nsym` symbols each carrying
+/// `bits_per_symbol = 3` Gray-coded bits, hypothesis `hyp` in
+/// `0..8^nsym` decomposes MSB-first into per-symbol 3-bit sub-indices
+/// `j_0` (most significant) `.. j_{nsym-1}` (least significant); symbol
+/// `k`'s hypothesized tone is `binary_to_gray(j_k)`. This ordering means
+/// bit `ib` of `hyp` (MSB-first, `ib` in `0..3*nsym`) is literally "bit
+/// `ib % 3` of symbol `ib / 3`'s 3-bit tuple" — exactly the existing
+/// single-symbol metric's `s2[j]` convention
+/// (`decoder.rs::par_compute_soft_llrs`) extended across symbols, so
+/// [`nsym_group_llrs`]'s max-vs-max extraction needs no separate
+/// remapping table.
+fn nsym_hypothesis_energies(group: &[[Complex<f64>; NUM_TONES]], nsym: usize) -> Vec<f64> {
+    debug_assert_eq!(group.len(), nsym);
+    let num_hyp = 8usize.pow(nsym as u32);
+    let mut energies = vec![0.0f64; num_hyp];
+    for (hyp, energy) in energies.iter_mut().enumerate() {
+        let mut acc = Complex::new(0.0, 0.0);
+        for (k, symbol) in group.iter().enumerate() {
+            let shift = 3 * (nsym - 1 - k);
+            let j = (hyp >> shift) & 0b111;
+            let tone = crate::ldpc::binary_to_gray(j as u8) as usize;
+            acc += symbol[tone];
+        }
+        *energy = acc.norm();
+    }
+    energies
+}
+
+/// Task W3.4 [A/B]: max-vs-max LLRs for one `nsym`-symbol group, built
+/// from [`nsym_hypothesis_energies`]. Produces exactly `3 * nsym` LLRs in
+/// the same MSB-first bit order `data_symbol_indices()` already uses
+/// (symbol 0's bit0, bit1, bit2, then symbol 1's, ...). The energies are
+/// log-power scaled (`10*log10(e^2)`) before the max-vs-max split,
+/// mirroring `par_compute_soft_llrs`'s 3-bit branch exactly — the same
+/// dB-domain convention applied to a coherently-combined "signal"
+/// instead of a single symbol's magnitude, so the nsym-combined LLRs sit
+/// at a comparable numeric scale before `normalize_llrs` re-normalizes
+/// regardless.
+fn nsym_group_llrs(group: &[[Complex<f64>; NUM_TONES]], nsym: usize) -> Vec<f32> {
+    let energies = nsym_hypothesis_energies(group, nsym);
+    let db: Vec<f64> = energies
+        .iter()
+        .map(|&e| (1e-12 + e * e).log10() * 10.0)
+        .collect();
+
+    let nbits = 3 * nsym;
+    let mut llrs = Vec::with_capacity(nbits);
+    for ib in 0..nbits {
+        let shift = nbits - 1 - ib;
+        let mut max_one = f64::NEG_INFINITY;
+        let mut max_zero = f64::NEG_INFINITY;
+        for (hyp, &v) in db.iter().enumerate() {
+            if (hyp >> shift) & 1 == 1 {
+                if v > max_one {
+                    max_one = v;
+                }
+            } else if v > max_zero {
+                max_zero = v;
+            }
+        }
+        llrs.push(-((max_one - max_zero) as f32));
+    }
+    llrs
+}
+
+/// The 1-symbol max-vs-max metric (FT8, `bits_per_symbol == 3` only),
+/// factored out of `par_compute_soft_llrs`'s inner loop (same formula,
+/// unchanged) so [`nsym_combined_llrs`]'s trailing-remainder fallback
+/// (58 data symbols isn't evenly divisible by `nsym=3`) shares the exact
+/// linear-magnitude-to-dB conversion rather than a hand-copy.
+fn single_symbol_max_llrs(mags: &[f64; NUM_TONES]) -> [f32; 3] {
+    let mut s2 = [0.0f64; 8];
+    for j in 0..8 {
+        let tone_idx = crate::ldpc::binary_to_gray(j as u8) as usize;
+        s2[j] = (1e-12 + mags[tone_idx] * mags[tone_idx]).log10() * 10.0;
+    }
+
+    fn max4(a: f64, b: f64, c: f64, d: f64) -> f64 {
+        a.max(b).max(c.max(d))
+    }
+
+    let llr0 = max4(s2[4], s2[5], s2[6], s2[7]) - max4(s2[0], s2[1], s2[2], s2[3]);
+    let llr1 = max4(s2[2], s2[3], s2[6], s2[7]) - max4(s2[0], s2[1], s2[4], s2[5]);
+    let llr2 = max4(s2[1], s2[3], s2[5], s2[7]) - max4(s2[0], s2[2], s2[4], s2[6]);
+
+    [-llr0 as f32, -llr1 as f32, -llr2 as f32]
+}
+
+/// Task W3.4 [A/B]: full 174-bit nsym-combined LLR vector for one
+/// candidate, grouping `data_symbol_indices()` into non-overlapping
+/// `nsym`-symbol blocks ([`nsym_group_llrs`]) and falling back to the
+/// ordinary 1-symbol max-vs-max metric ([`single_symbol_max_llrs`]) for
+/// any trailing remainder shorter than `nsym`.
+///
+/// 58 data symbols isn't evenly divisible by `nsym=3` (58 = 19*3 + 1),
+/// so the last group of 19 triples plus one trailing single-symbol
+/// fallback yields exactly `19*9 + 1*3 = 174` bits; `nsym=2` divides
+/// evenly (58 = 29*2, no remainder). This remainder handling — and the
+/// fact that the flattened `data_symbol_indices()` list crosses the
+/// mid-frame Costas sync block for exactly one boundary-spanning group
+/// per `nsym` (FT8's two 29-symbol data ranges are separated by 7 Costas
+/// symbols) — is pancetta's own design choice: the spec above describes
+/// the *hypothesis construction*, not how mainline `ft8b.f90` handles
+/// the non-integer group count, and clean-room policy forbids guessing
+/// at unread GPL source to match it exactly.
+///
+/// FT8-only (`bits_per_symbol == 3`); returns `None` otherwise (guards
+/// against a future FT4/FT2 caller — the flag is a no-op there today
+/// since nothing constructs `tone_complex` unless this returns `Some`
+/// anyway, but the explicit guard is defense-in-depth).
+fn nsym_combined_llrs(
+    pp: &ProtocolParams,
+    tone_magnitudes: &[[f64; NUM_TONES]],
+    tone_complex: &[[Complex<f64>; NUM_TONES]],
+    nsym: usize,
+) -> Option<Vec<f32>> {
+    if pp.bits_per_symbol != 3 || !(2..=3).contains(&nsym) {
+        return None;
+    }
+    let data_positions = pp.data_symbol_indices();
+    let n = data_positions.len();
+    let mut llrs = Vec::with_capacity(n * 3);
+
+    let mut i = 0;
+    while i < n {
+        if n - i >= nsym {
+            let group: Vec<[Complex<f64>; NUM_TONES]> = data_positions[i..i + nsym]
+                .iter()
+                .map(|&sym_idx| tone_complex[sym_idx])
+                .collect();
+            llrs.extend(nsym_group_llrs(&group, nsym));
+            i += nsym;
+        } else {
+            for &sym_idx in &data_positions[i..] {
+                llrs.extend(single_symbol_max_llrs(&tone_magnitudes[sym_idx]));
+            }
+            i = n;
+        }
+    }
+    debug_assert_eq!(llrs.len(), n * 3);
+    Some(llrs)
 }
 
 /// Matched-filter correlation of one `sps`-sample complex baseband frame
@@ -16611,6 +16903,198 @@ mod llr_whitening_tests {
         );
     }
 
+    // ========================================================================
+    // Task W3.4 [A/B]: nsym=2/3 noncoherent Gray-hypothesis combining metric
+    // construction — TDD unit tests (RED/GREEN cross-checked against a
+    // hand-derivation), independent of the full decode pipeline.
+    // ========================================================================
+    mod nsym_combining_metric {
+        use super::*;
+        use approx::assert_relative_eq;
+
+        /// A KNOWN 3-symbol group with distinguishable per-tone complex
+        /// amplitudes: symbol `k`, tone `t` gets `(k+1) * (t+1) *
+        /// exp(i * (k - t) * 0.3)` — arbitrary but fully deterministic and
+        /// distinct across every (symbol, tone) pair, so a specific
+        /// hypothesis's coherent sum can be hand-derived independently of
+        /// the implementation under test.
+        fn known_triplet() -> [[Complex<f64>; NUM_TONES]; 3] {
+            let mut group = [[Complex::new(0.0, 0.0); NUM_TONES]; 3];
+            for (k, symbol) in group.iter_mut().enumerate() {
+                for (t, slot) in symbol.iter_mut().enumerate() {
+                    let mag = (k as f64 + 1.0) * (t as f64 + 1.0);
+                    let phase = (k as f64 - t as f64) * 0.3;
+                    *slot = Complex::new(mag * phase.cos(), mag * phase.sin());
+                }
+            }
+            group
+        }
+
+        /// RED/GREEN: `nsym_hypothesis_energies` for `nsym=3` must equal a
+        /// straightforward hand-derivation (built independently, in the
+        /// test, by directly indexing the known triplet and Gray-mapping
+        /// each per-symbol tone index) for several specific hypotheses —
+        /// not just "runs without panicking".
+        #[test]
+        fn nsym_hypothesis_energies_matches_hand_derivation_for_known_triplet() {
+            let group = known_triplet();
+            let energies = nsym_hypothesis_energies(&group, 3);
+            assert_eq!(energies.len(), 8 * 8 * 8);
+
+            // Hand-derive a handful of specific hypotheses directly against
+            // `known_triplet`'s formula, decoding `hyp` MSB-first into
+            // (j0, j1, j2) exactly as the function's doc describes, and
+            // Gray-mapping each with the crate's own FT8 Gray table
+            // (`crate::ldpc::binary_to_gray`) — this is the same
+            // 3rd-party-verifiable table the single-symbol metric already
+            // uses, not a re-derivation of Gray-code theory.
+            let check = |j0: u8, j1: u8, j2: u8| {
+                let hyp = (j0 as usize) << 6 | (j1 as usize) << 3 | (j2 as usize);
+                let t0 = crate::ldpc::binary_to_gray(j0) as usize;
+                let t1 = crate::ldpc::binary_to_gray(j1) as usize;
+                let t2 = crate::ldpc::binary_to_gray(j2) as usize;
+                let expected = group[0][t0] + group[1][t1] + group[2][t2];
+                let expected_mag = expected.norm();
+                assert_relative_eq!(energies[hyp], expected_mag, epsilon = 1e-9);
+            };
+
+            // hyp = 0: all-zero tuple (j0=j1=j2=0) -> tone 0 on every symbol.
+            check(0, 0, 0);
+            // A hypothesis touching every symbol's highest tone index.
+            check(7, 7, 7);
+            // An asymmetric hypothesis (distinct j per symbol) exercising
+            // the MSB-first bit-shift decomposition non-trivially.
+            check(5, 2, 6);
+            check(3, 0, 7);
+        }
+
+        /// RED/GREEN: same cross-check for `nsym=2`, using the first two
+        /// symbols of the known triplet.
+        #[test]
+        fn nsym_hypothesis_energies_matches_hand_derivation_for_nsym_2() {
+            let full = known_triplet();
+            let group = [full[0], full[1]];
+            let energies = nsym_hypothesis_energies(&group, 2);
+            assert_eq!(energies.len(), 8 * 8);
+
+            let check = |j0: u8, j1: u8| {
+                let hyp = (j0 as usize) << 3 | (j1 as usize);
+                let t0 = crate::ldpc::binary_to_gray(j0) as usize;
+                let t1 = crate::ldpc::binary_to_gray(j1) as usize;
+                let expected = (group[0][t0] + group[1][t1]).norm();
+                assert_relative_eq!(energies[hyp], expected, epsilon = 1e-9);
+            };
+            check(0, 0);
+            check(7, 7);
+            check(4, 1);
+            check(2, 5);
+        }
+
+        /// Sanity: a hypothesis that happens to match the TRUE per-symbol
+        /// tones exactly (in-phase coherent addition) must have STRICTLY
+        /// greater energy than a mismatched hypothesis where the phases are
+        /// unrelated — the whole physical point of coherent combining. Uses
+        /// a purpose-built stable-phase (identical phase across symbols)
+        /// group so the "true" hypothesis really is a constructive (not
+        /// partially-cancelling) sum.
+        #[test]
+        fn matching_hypothesis_has_higher_energy_than_mismatch_under_stable_phase() {
+            let mut group = [[Complex::new(0.0, 0.0); NUM_TONES]; 3];
+            let true_tones = [2usize, 5usize, 1usize];
+            for (k, symbol) in group.iter_mut().enumerate() {
+                for (t, slot) in symbol.iter_mut().enumerate() {
+                    // Same phase (0) on every symbol/tone: a stable-phase
+                    // channel. The "true" tone gets a strong in-phase
+                    // amplitude; every other tone is near-zero noise.
+                    *slot = if t == true_tones[k] {
+                        Complex::new(5.0, 0.0)
+                    } else {
+                        Complex::new(0.05, 0.0)
+                    };
+                }
+            }
+
+            // Hypothesis encoding the true tones via the Gray-code inverse
+            // (gray_to_binary maps a physical tone back to its 3-bit
+            // Gray-domain index j).
+            let j_true: Vec<u8> = true_tones
+                .iter()
+                .map(|&t| crate::ldpc::gray_to_binary(t as u8))
+                .collect();
+            let hyp_true =
+                (j_true[0] as usize) << 6 | (j_true[1] as usize) << 3 | j_true[2] as usize;
+
+            let energies = nsym_hypothesis_energies(&group, 3);
+            let true_energy = energies[hyp_true];
+
+            // Every mismatched hypothesis (differs in at least one symbol's
+            // tone from the true one) must score strictly lower: 3 true
+            // in-phase 5.0 amplitudes sum to 15.0, while any substitution
+            // swaps at least one 5.0 term for a ~0.05 noise term.
+            for (hyp, &e) in energies.iter().enumerate() {
+                if hyp == hyp_true {
+                    continue;
+                }
+                assert!(
+                    e < true_energy,
+                    "hyp {hyp} (energy {e}) should score below the true \
+                     hypothesis {hyp_true} (energy {true_energy}) under a \
+                     stable-phase channel"
+                );
+            }
+        }
+
+        /// TDD for the full-group LLR extraction: `nsym_group_llrs` must
+        /// return exactly `3*nsym` entries and must NOT be all-zero on a
+        /// non-degenerate (non-uniform-energy) hypothesis grid.
+        #[test]
+        fn nsym_group_llrs_shape_and_non_degenerate() {
+            let group = known_triplet();
+            let llrs3 = nsym_group_llrs(&group, 3);
+            assert_eq!(llrs3.len(), 9);
+            assert!(llrs3.iter().any(|&v| v.abs() > 1e-6));
+
+            let full = group;
+            let group2 = [full[0], full[1]];
+            let llrs2 = nsym_group_llrs(&group2, 2);
+            assert_eq!(llrs2.len(), 6);
+            assert!(llrs2.iter().any(|&v| v.abs() > 1e-6));
+        }
+
+        /// `nsym_combined_llrs` must always produce exactly 174 bits (FT8),
+        /// for both `nsym=2` (58 divides evenly) and `nsym=3` (58 = 19*3+1,
+        /// exercising the trailing single-symbol remainder fallback).
+        #[test]
+        fn nsym_combined_llrs_always_produces_174_bits() {
+            let pp = ProtocolParams::ft8();
+            let tone_magnitudes = vec![[1.0f64; NUM_TONES]; pp.num_symbols];
+            let tone_complex = vec![[Complex::new(1.0, 0.0); NUM_TONES]; pp.num_symbols];
+
+            for nsym in [2usize, 3usize] {
+                let llrs = nsym_combined_llrs(&pp, &tone_magnitudes, &tone_complex, nsym)
+                    .expect("FT8 (bits_per_symbol=3) must produce a combined LLR vector");
+                assert_eq!(
+                    llrs.len(),
+                    174,
+                    "nsym={nsym} must always yield exactly 174 LLRs"
+                );
+            }
+        }
+
+        /// Guard: `nsym_combined_llrs` returns `None` for an unsupported
+        /// `nsym` (e.g. 1, or an out-of-range value) — this stage only ever
+        /// escalates to 2 and 3.
+        #[test]
+        fn nsym_combined_llrs_rejects_unsupported_nsym() {
+            let pp = ProtocolParams::ft8();
+            let tone_magnitudes = vec![[1.0f64; NUM_TONES]; pp.num_symbols];
+            let tone_complex = vec![[Complex::new(1.0, 0.0); NUM_TONES]; pp.num_symbols];
+
+            assert!(nsym_combined_llrs(&pp, &tone_magnitudes, &tone_complex, 1).is_none());
+            assert!(nsym_combined_llrs(&pp, &tone_magnitudes, &tone_complex, 4).is_none());
+        }
+    }
+
     #[test]
     fn default_config_keeps_whitening_off() {
         // LLR whitening was graduated to default-ON in Batch 53 on a
@@ -19031,6 +19515,7 @@ mod w2_5_acceptance_gating_tests {
             ap4_full_message_mask_enabled: decoder.config.ap4_full_message_mask_enabled,
             ap_injection_post_normalization: decoder.config.ap_injection_post_normalization,
             fine_sync_enabled: decoder.config.fine_sync_enabled,
+            nsym_combining_enabled: decoder.config.nsym_combining_enabled,
             baseband_taps: &decoder.baseband_taps,
         }
     }
@@ -19312,6 +19797,7 @@ mod w26_ap_coverage_tests {
             ap4_full_message_mask_enabled,
             ap_injection_post_normalization,
             fine_sync_enabled: decoder.config.fine_sync_enabled,
+            nsym_combining_enabled: decoder.config.nsym_combining_enabled,
             baseband_taps: &decoder.baseband_taps,
         }
     }

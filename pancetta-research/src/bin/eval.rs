@@ -76,6 +76,11 @@ struct Args {
     /// legacy 21-trial fine-FFT fallback. See
     /// `Ft8Config::fine_sync_enabled`.
     fine_sync_enabled: Option<bool>,
+    /// Decoder-TP-sensitivity Task W3.4 [A/B]: nsym=2/3 noncoherent
+    /// combining LLR variants layered on top of the W3.3 matched-demod
+    /// stage (only takes effect when `fine_sync_enabled` is ALSO
+    /// `true`). See `Ft8Config::nsym_combining_enabled`.
+    nsym_combining_enabled: Option<bool>,
     /// Decoder-TP-sensitivity Task W1.4 [A/B]: master switch for the
     /// divisive LLR whitening step, re-measured after the dB/linear
     /// unit-consistency fix. See `Ft8Config::llr_whitening_enabled`.
@@ -251,6 +256,7 @@ impl Args {
         let mut escalation_enabled: Option<bool> = None;
         let mut fine_fft_rect_window: Option<bool> = None;
         let mut fine_sync_enabled: Option<bool> = None;
+        let mut nsym_combining_enabled: Option<bool> = None;
         let mut llr_whitening: Option<bool> = None;
         let mut acceptance_gating: Option<bool> = None;
         let mut cq_ap: Option<bool> = None;
@@ -465,6 +471,9 @@ impl Args {
                 }
                 "--fine-sync-enabled" => {
                     fine_sync_enabled = Some(true);
+                }
+                "--nsym-combining-enabled" => {
+                    nsym_combining_enabled = Some(true);
                 }
                 "--llr-whitening" => {
                     llr_whitening = Some(true);
@@ -778,6 +787,7 @@ impl Args {
                     eprintln!("  --escalation-enabled: decoder-speed-overhaul Task 10 [A/B] — BP escalation ladder master switch (default off). See Ft8Config::escalation_enabled.");
                     eprintln!("  --fine-fft-rect-window: decoder-TP-sensitivity Task W1.3 [A/B] — rectangular (no) window on the fine-FFT fallback symbol FFT instead of Hann (default off). See Ft8Config::fine_fft_rect_window.");
                     eprintln!("  --fine-sync-enabled: decoder-TP-sensitivity Task W3.3 [A/B] — per-candidate fine-sync + matched-demod stage replacing the legacy 21-trial fine-FFT fallback (default off). See Ft8Config::fine_sync_enabled.");
+                    eprintln!("  --nsym-combining-enabled: decoder-TP-sensitivity Task W3.4 [A/B] — nsym=2/3 noncoherent combining LLR variants on top of the W3.3 stage; requires --fine-sync-enabled to have any effect (default off). See Ft8Config::nsym_combining_enabled.");
                     eprintln!("  --llr-whitening / --no-llr-whitening: decoder-TP-sensitivity Task W1.4 [A/B] — force the divisive LLR whitening step on/off (production default: off, flipped by the W1.4 A/B result). See Ft8Config::llr_whitening_enabled.");
                     eprintln!("  --acceptance-gating / --no-acceptance-gating: decoder-TP-sensitivity Task W2.5 [A/B] — replace the blunt post-CRC sync-score confidence floors with the W2.1 acceptance metric for decodes that cleanly pass it (production default: off). See Ft8Config::acceptance_gating_enabled.");
                     eprintln!("  --cq-ap / --no-cq-ap: decoder-TP-sensitivity Task W2.6 [A/B] — try ApLevel::Cq (assume a failed-AP0 candidate is a plain \"CQ\" call; no ApContext needed) on every candidate that reaches AP injection (production default: off). See Ft8Config::cq_ap_enabled.");
@@ -826,6 +836,7 @@ impl Args {
             escalation_enabled,
             fine_fft_rect_window,
             fine_sync_enabled,
+            nsym_combining_enabled,
             llr_whitening,
             acceptance_gating,
             cq_ap,
@@ -1880,6 +1891,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.fine_sync_enabled {
         d = d.with_fine_sync_enabled(on);
+    }
+    if let Some(on) = args.nsym_combining_enabled {
+        d = d.with_nsym_combining_enabled(on);
     }
     if let Some(on) = args.llr_whitening {
         d = d.with_llr_whitening(on);

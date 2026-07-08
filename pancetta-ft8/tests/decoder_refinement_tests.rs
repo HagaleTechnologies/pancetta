@@ -402,6 +402,157 @@ mod w33_matched_demod {
 }
 
 // ============================================================================
+// Task W3.4 (decoder-TP-sensitivity plan, Workstream 3): nsym=2/3
+// noncoherent-combining LLR variants, layered on top of W3.3's matched-demod
+// stage. Synthetic STABLE-PHASE (no off-grid dt/df offset — a static AWGN
+// channel, the favorable case coherent combining is designed for) fixture at
+// a seed-searched SNR where the 1-symbol matched-demod LLR path fails BP but
+// the nsym-combining escalation (2-symbol then 3-symbol) rescues it.
+//
+// `nsym_combining_enabled` only ever takes effect when `fine_sync_enabled` is
+// ALSO `true` (it consumes W3.3's per-symbol complex tone correlations) —
+// both flags are forced on in both tests below to isolate THIS flag's
+// effect, exactly like the paired RED/GREEN tests in `mod w33_matched_demod`
+// above isolate `fine_sync_enabled`'s effect against the true legacy
+// baseline.
+//
+// Gated behind `transmit` (needs the encoder + modulator to synthesize the
+// fixture), same as `mod w33_matched_demod` above.
+// ============================================================================
+
+#[cfg(feature = "transmit")]
+mod w34_nsym_combining {
+    use super::*;
+    use pancetta_ft8::encoder::Ft8Encoder;
+    use pancetta_ft8::modulator::Ft8Modulator;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    const TEST_MESSAGE: &str = "CQ K5ARH EM10";
+    // Seed-searched (see the Task W3.4 report for the full sweep): a plain
+    // on-grid (no injected dt/df error — genuinely "stable phase")
+    // synthetic signal at -21/-22 dB decodes on EVERY seed tried under
+    // BOTH configs (too easy — no discrimination); -23 dB is the point
+    // where the 1-symbol-only matched-demod path fails on a real subset
+    // of seeds (21/25 in the sweep) while nsym-combining recovers EVERY
+    // seed in the same sweep (25/25) — including every one the 1-symbol
+    // path missed.
+    const NSYM_SNR_DB: f64 = -23.0;
+    /// Curated, deterministic seeds (from the same search sweep, seeds
+    /// 0..25 at `NSYM_SNR_DB`) at which the 1-symbol path fails EVERY seed
+    /// and nsym-combining rescues EVERY seed — a curated set rather than
+    /// an arbitrary range keeps both tests below deterministic pass/fail
+    /// rather than "at least one of a noisy batch" (same rationale as
+    /// `w33_matched_demod::SEEDS`).
+    const SEEDS: [u64; 4] = [7, 17, 19, 22];
+
+    /// Seeded, deterministic real-valued Gaussian noise (Box-Muller), added
+    /// in-place at a target full-band SNR. Mirrors
+    /// `w33_matched_demod::add_seeded_noise` (private to that module, so
+    /// reimplemented here rather than exported, per the same rationale).
+    fn add_seeded_noise(samples: &mut [f32], active_len: usize, snr_db: f64, seed: u64) {
+        let active_len = active_len.min(samples.len()).max(1);
+        let signal_power: f64 = samples[..active_len]
+            .iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum::<f64>()
+            / active_len as f64;
+        let snr_linear = 10f64.powf(snr_db / 10.0);
+        let noise_std = (signal_power / snr_linear).sqrt();
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut i = 0;
+        while i < samples.len() {
+            let u1: f64 = rng.random::<f64>().max(1e-12);
+            let u2: f64 = rng.random::<f64>();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f64::consts::PI * u2;
+            samples[i] += (r * theta.cos() * noise_std) as f32;
+            i += 1;
+            if i < samples.len() {
+                samples[i] += (r * theta.sin() * noise_std) as f32;
+                i += 1;
+            }
+        }
+    }
+
+    /// Builds the stable-phase fixture: a plain on-grid (df=0, dt=0) real
+    /// encoded+modulated FT8 signal with seeded AWGN at `NSYM_SNR_DB`
+    /// full-band SNR — no channel drift, satisfying the coherent-combining
+    /// assumption nsym-combining relies on.
+    fn build_stable_phase_signal(seed: u64) -> Vec<f32> {
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message(TEST_MESSAGE, None).unwrap();
+        let mut modulator =
+            Ft8Modulator::new(SAMPLE_RATE, pancetta_ft8::BASE_FREQUENCY, 1.0).unwrap();
+        let signal = modulator.modulate_symbols(&symbols, 0.0).unwrap();
+
+        let mut samples = vec![0.0f32; WINDOW_SAMPLES];
+        for (i, &s) in signal.iter().enumerate() {
+            if i < samples.len() {
+                samples[i] = s;
+            }
+        }
+        add_seeded_noise(&mut samples, signal.len(), NSYM_SNR_DB, seed);
+        samples
+    }
+
+    fn decodes_test_message(decoder: &mut Ft8Decoder, samples: &[f32]) -> bool {
+        decoder
+            .decode_window(samples)
+            .unwrap_or_default()
+            .iter()
+            .any(|m| m.text == TEST_MESSAGE)
+    }
+
+    /// RED (confirms the 1-symbol-only matched-demod path's current
+    /// behavior): with `fine_sync_enabled = true` but
+    /// `nsym_combining_enabled = false`, this stable-phase, `NSYM_SNR_DB`
+    /// dB signal fails to decode on EVERY curated seed. If this ever starts
+    /// passing, the fixture has stopped discriminating and must be made
+    /// harder before it can prove the W3.4 rescue below.
+    #[test]
+    fn nsym_signal_rejected_by_1symbol_path() {
+        let mut config = Ft8Config::default();
+        config.fine_sync_enabled = true;
+        config.nsym_combining_enabled = false;
+
+        for seed in SEEDS {
+            let samples = build_stable_phase_signal(seed);
+            let mut decoder = Ft8Decoder::new(config.clone()).unwrap();
+            assert!(
+                !decodes_test_message(&mut decoder, &samples),
+                "seed {seed}: 1-symbol matched-demod path (nsym_combining_enabled=false) \
+                 unexpectedly decoded the stable-phase {NSYM_SNR_DB} dB signal — fixture \
+                 no longer discriminates, see this test's doc comment"
+            );
+        }
+    }
+
+    /// GREEN: with `fine_sync_enabled = true` AND `nsym_combining_enabled =
+    /// true` (isolating the nsym flag's own effect — the control above
+    /// already has `fine_sync_enabled = true`), the SAME stable-phase,
+    /// `NSYM_SNR_DB` dB signal is recovered on EVERY one of the same
+    /// curated SEEDS the RED test rejects on every one of.
+    #[test]
+    fn nsym_signal_recovered_by_combining_escalation() {
+        let mut config = Ft8Config::default();
+        config.fine_sync_enabled = true;
+        config.nsym_combining_enabled = true;
+
+        for seed in SEEDS {
+            let samples = build_stable_phase_signal(seed);
+            let mut decoder = Ft8Decoder::new(config.clone()).unwrap();
+            assert!(
+                decodes_test_message(&mut decoder, &samples),
+                "seed {seed}: expected nsym_combining_enabled=true to rescue the \
+                 stable-phase {NSYM_SNR_DB} dB signal that the 1-symbol path rejects \
+                 on this same seed (see the paired RED test)"
+            );
+        }
+    }
+}
+
+// ============================================================================
 // Task W1.4 (decoder-TP-sensitivity plan, spec Section 7): `whiten_llrs`
 // dB-vs-linear-|y| gain-invariance property test.
 //

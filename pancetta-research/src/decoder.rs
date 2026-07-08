@@ -427,6 +427,16 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W3.4 [A/B]: master switch for the
+    /// nsym=2/3 noncoherent combining LLR variants layered on top of the
+    /// Task W3.3 matched-demod stage. Only takes effect when
+    /// `fine_sync_enabled` is ALSO `true` — see
+    /// `Ft8Config::nsym_combining_enabled`.
+    pub fn with_nsym_combining_enabled(mut self, on: bool) -> Self {
+        self.config.nsym_combining_enabled = on;
+        self
+    }
+
     /// Task W3.3b [HARNESS]: set the per-window wall-clock decode budget
     /// (milliseconds). `None` (the default) reproduces
     /// `DecodeBudget::unlimited()` exactly, matching every prior eval
