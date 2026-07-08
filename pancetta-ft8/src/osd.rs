@@ -476,35 +476,44 @@ fn npre2_collect_pairs(
 /// Compute the residual parity-error signature over the first
 /// `NPRE2_NTAU` parity bits of an OSD codeword candidate. Used by
 /// `OsdDecoder::decode`'s npre2 warm-start path.
+///
+/// `base_parity` is the order-0 codeword's expected parity (`c0`'s
+/// parity portion, encoded from `info_hard` under the row-echelon
+/// generator — see `OsdDecoder::decode_with_features_scored_budgeted`'s
+/// "Compute base parity" step). `received_parity_hard` is the RECEIVED
+/// channel/BP-posterior LLR hard decision at each permuted parity-bit
+/// position (`llrs[final_perm[LDPC_INFO_BITS + p]] < 0.0`).
+///
+/// This is the WSJT-X mainline `e2sub` quantity (spec
+/// `research/specs/spec-wsjtx-mainline-osd174.md` § Step 6: `e2sub =
+/// (ce XOR hdec)[k+1..N]`) evaluated at the order-0 test pattern
+/// (`me = m0`, so `ce = c0` and `ce`'s parity portion is exactly
+/// `base_parity`): the residual is the parity-bit DISCREPANCY between
+/// what the order-0 codeword expects and what the channel actually
+/// received. A pair of marginal info bits whose combined parity-column
+/// XOR matches this signature, when flipped, cancels that discrepancy
+/// over the first `NPRE2_NTAU` bits — the "complementary pair" warm
+/// start the spec describes.
+///
+/// # Bug fixed here (Task W2.4)
+/// The prior implementation ignored `info_hard` and never had access to
+/// the received parity hard-decisions at all — it packed `base_parity`'s
+/// own bits directly as the "signature" (`let _ = info_hard;` disabling
+/// two of its three parameters). That quantity has no dependency on what
+/// was actually received, so it cannot express "cancel an error": it
+/// would be nonzero (and thus require a warm-start pair) even when
+/// `base_parity` already perfectly matched the received parity (zero
+/// true residual), and would never correctly signal a genuine
+/// discrepancy either. See
+/// `research/experiments/2026-07-07-w24-npre2-residual-signature-fix.md`
+/// for a worked numeric example and the derivation from the spec.
 fn npre2_residual_signature(
-    info_hard: &[u8; LDPC_INFO_BITS],
     base_parity: &[u8; LDPC_PARITY_BITS],
-    parity_cols_perm: &[[bool; LDPC_PARITY_BITS]; LDPC_INFO_BITS],
+    received_parity_hard: &[u8; LDPC_PARITY_BITS],
 ) -> u32 {
-    // For the order-0 reference, `base_parity` already encodes the
-    // expected parity from `info_hard` under the row-echelon generator.
-    // Since the order-0 codeword is by construction parity-consistent
-    // (info_hard + base_parity is a codeword), the residual is the
-    // distance between the received parity-hard-decisions and the
-    // order-0 parity. But we don't have received parity hard decisions
-    // separately here — they're folded into the LLR signs.
-    //
-    // The npre2 warm-start operates on "what does flipping bits change
-    // about the parity contribution?". For the integration in
-    // OsdDecoder::decode, the relevant signature is the *parity error
-    // pattern* that an order-iorder flip would induce relative to the
-    // order-0 baseline. We use the conservative interpretation:
-    // signature = first NPRE2_NTAU bits of base_parity (the order-0
-    // expected parity, against which warm-start pairs flip). A pair
-    // whose XOR'd parity columns match this signature, when applied,
-    // yields a codeword whose first-NPRE2_NTAU parity bits all flip to
-    // their complement — the WSJT-X "cancel the parity-error pattern"
-    // semantic from the spec.
-    let _ = info_hard;
-    let _ = parity_cols_perm;
     let mut sig: u32 = 0;
     for p in 0..NPRE2_NTAU {
-        if base_parity[p] == 1 {
+        if base_parity[p] != received_parity_hard[p] {
             sig |= 1 << p;
         }
     }
@@ -917,7 +926,17 @@ impl OsdDecoder {
             }
 
             if marginals.len() >= 2 {
-                let residual = npre2_residual_signature(&info_hard, &base_parity, &parity_cols);
+                // Task W2.4 fix: the residual must depend on what was
+                // actually RECEIVED, not just on `base_parity` in
+                // isolation (see `npre2_residual_signature`'s doc
+                // comment). Build the received parity-bit hard-decision
+                // array from `llrs` at the permuted parity positions.
+                let mut received_parity_hard = [0u8; LDPC_PARITY_BITS];
+                for (p, slot) in received_parity_hard.iter_mut().enumerate() {
+                    let orig_idx = final_perm[LDPC_INFO_BITS + p];
+                    *slot = u8::from(llrs[orig_idx] < 0.0);
+                }
+                let residual = npre2_residual_signature(&base_parity, &received_parity_hard);
                 let warm_pairs = npre2_collect_pairs(&marginals, &parity_cols, residual);
 
                 let mut best: Option<(BitVec, AcceptanceScore)> = None;
@@ -1997,6 +2016,48 @@ mod npre2_tests {
             *slot = i;
         }
         p
+    }
+
+    /// Task W2.4: `npre2_residual_signature` must compute `base_parity
+    /// XOR received_parity_hard`, per the spec's `e2sub = (ce XOR
+    /// hdec)[k+1..N]` at the order-0 test pattern (`research/specs/
+    /// spec-wsjtx-mainline-osd174.md` § Step 6) — NOT `base_parity`
+    /// alone (the bug: a signature with no dependency on what was
+    /// actually received).
+    #[test]
+    fn test_npre2_residual_signature_is_base_parity_xor_received() {
+        let mut base_parity = [0u8; LDPC_PARITY_BITS];
+        base_parity[0] = 1;
+        base_parity[2] = 1;
+        base_parity[5] = 1;
+
+        // Zero discrepancy case: received matches base_parity exactly
+        // over the first NPRE2_NTAU bits -> residual must be 0. The
+        // pre-fix implementation would have returned base_parity's own
+        // bits packed (0b100101), which is WRONG here: there is no
+        // error to cancel.
+        let received_matches = base_parity;
+        assert_eq!(
+            npre2_residual_signature(&base_parity, &received_matches),
+            0,
+            "when received parity exactly matches the order-0 codeword's \
+             expected parity, the residual signature must be zero — there \
+             is no discrepancy for a warm-start pair to cancel"
+        );
+
+        // Discrepancy at positions {1, 5}: base_parity has 0 at p=1
+        // (received 1, mismatch) and 1 at p=5 (received 0, mismatch);
+        // p=0 and p=2 still match (no mismatch).
+        let mut received_mismatch = base_parity;
+        received_mismatch[1] = 1; // base=0, received=1 -> mismatch
+        received_mismatch[5] = 0; // base=1, received=0 -> mismatch
+        let sig = npre2_residual_signature(&base_parity, &received_mismatch);
+        assert_eq!(
+            sig,
+            (1 << 1) | (1 << 5),
+            "residual signature must have exactly the bits set where \
+             base_parity and received_parity_hard disagree"
+        );
     }
 
     #[test]

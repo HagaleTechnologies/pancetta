@@ -241,6 +241,14 @@ impl Ft8Decoder {
         self
     }
 
+    /// Override `osd_npre2_preprocessing_enabled` on the wrapped config —
+    /// Task W2.4 [A/B]: WSJT-X mainline-style npre2 warm-start
+    /// preprocessing, active only at `osd_depth >= 3`.
+    pub fn with_npre2_enabled(mut self, enabled: bool) -> Self {
+        self.config.osd_npre2_preprocessing_enabled = enabled;
+        self
+    }
+
     /// Override `ldpc_iterations` on the wrapped config (BP iteration
     /// cap before OSD fallback). hb-005 sweep.
     pub fn with_ldpc_iterations(mut self, n: usize) -> Self {

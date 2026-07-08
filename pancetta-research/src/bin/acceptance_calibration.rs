@@ -46,6 +46,9 @@ struct Args {
     /// Task W2.3 [A/B]: which LLR array drives OSD's search. One of
     /// `bp-posterior` (default), `channel`, or `offset:<f32>`.
     osd_input: pancetta_ft8::OsdInput,
+    /// Task W2.4 [A/B]: WSJT-X mainline-style npre2 warm-start
+    /// preprocessing (active only at `osd_depth >= 3`).
+    npre2: bool,
     output_csv: PathBuf,
     target_fdr: f64,
 }
@@ -71,6 +74,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut noise_limit = None;
     let mut osd_depth = 2u8;
     let mut osd_input = pancetta_ft8::OsdInput::BpPosterior;
+    let mut npre2 = false;
     let mut output_csv = workspace.join("research/scorecards/acceptance_calibration.csv");
     let mut target_fdr = 0.01;
 
@@ -107,6 +111,7 @@ fn parse_args() -> anyhow::Result<Args> {
             "--osd-input" => {
                 osd_input = parse_osd_input(&it.next().context("--osd-input needs a value")?)?
             }
+            "--npre2" => npre2 = true,
             "--output" => output_csv = PathBuf::from(it.next().context("--output needs a value")?),
             "--target-fdr" => {
                 target_fdr = it
@@ -125,6 +130,7 @@ fn parse_args() -> anyhow::Result<Args> {
         noise_limit,
         osd_depth,
         osd_input,
+        npre2,
         output_csv,
         target_fdr,
     })
@@ -267,13 +273,14 @@ fn main() -> anyhow::Result<()> {
     let workspace = workspace_root()?;
 
     eprintln!(
-        "acceptance_calibration: osd_depth={} osd_input={:?} (RESEARCH-ONLY override; production default stays Some(0)/BpPosterior)",
-        args.osd_depth, args.osd_input
+        "acceptance_calibration: osd_depth={} osd_input={:?} npre2={} (RESEARCH-ONLY override; production default stays Some(0)/BpPosterior/npre2=false)",
+        args.osd_depth, args.osd_input, args.npre2
     );
 
     let decoder = Ft8Decoder::with_default_config()
         .with_osd_depth(Some(args.osd_depth))
-        .with_osd_input(args.osd_input);
+        .with_osd_input(args.osd_input)
+        .with_npre2_enabled(args.npre2);
 
     let mut all_rows: Vec<Row> = Vec::new();
 
