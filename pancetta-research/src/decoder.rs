@@ -233,6 +233,14 @@ impl Ft8Decoder {
         self
     }
 
+    /// Override `osd_input` on the wrapped config — Task W2.3 [A/B]:
+    /// which LLR array drives OSD's search (BP-posterior vs. channel vs.
+    /// offset-subtracted).
+    pub fn with_osd_input(mut self, input: pancetta_ft8::OsdInput) -> Self {
+        self.config.osd_input = input;
+        self
+    }
+
     /// Override `ldpc_iterations` on the wrapped config (BP iteration
     /// cap before OSD fallback). hb-005 sweep.
     pub fn with_ldpc_iterations(mut self, n: usize) -> Self {

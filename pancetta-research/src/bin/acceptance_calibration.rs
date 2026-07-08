@@ -43,8 +43,23 @@ struct Args {
     /// budget). `None` = full corpus.
     noise_limit: Option<usize>,
     osd_depth: u8,
+    /// Task W2.3 [A/B]: which LLR array drives OSD's search. One of
+    /// `bp-posterior` (default), `channel`, or `offset:<f32>`.
+    osd_input: pancetta_ft8::OsdInput,
     output_csv: PathBuf,
     target_fdr: f64,
+}
+
+fn parse_osd_input(s: &str) -> anyhow::Result<pancetta_ft8::OsdInput> {
+    if s == "bp-posterior" {
+        Ok(pancetta_ft8::OsdInput::BpPosterior)
+    } else if s == "channel" {
+        Ok(pancetta_ft8::OsdInput::Channel)
+    } else if let Some(v) = s.strip_prefix("offset:") {
+        Ok(pancetta_ft8::OsdInput::OffsetSubtracted(v.parse::<f32>()?))
+    } else {
+        anyhow::bail!("--osd-input must be one of bp-posterior|channel|offset:<f32>, got {s}")
+    }
 }
 
 fn parse_args() -> anyhow::Result<Args> {
@@ -55,6 +70,7 @@ fn parse_args() -> anyhow::Result<Args> {
     let mut hard200_limit = None;
     let mut noise_limit = None;
     let mut osd_depth = 2u8;
+    let mut osd_input = pancetta_ft8::OsdInput::BpPosterior;
     let mut output_csv = workspace.join("research/scorecards/acceptance_calibration.csv");
     let mut target_fdr = 0.01;
 
@@ -88,6 +104,9 @@ fn parse_args() -> anyhow::Result<Args> {
                     .context("--osd-depth needs a value")?
                     .parse::<u8>()?
             }
+            "--osd-input" => {
+                osd_input = parse_osd_input(&it.next().context("--osd-input needs a value")?)?
+            }
             "--output" => output_csv = PathBuf::from(it.next().context("--output needs a value")?),
             "--target-fdr" => {
                 target_fdr = it
@@ -105,6 +124,7 @@ fn parse_args() -> anyhow::Result<Args> {
         hard200_limit,
         noise_limit,
         osd_depth,
+        osd_input,
         output_csv,
         target_fdr,
     })
@@ -247,11 +267,13 @@ fn main() -> anyhow::Result<()> {
     let workspace = workspace_root()?;
 
     eprintln!(
-        "acceptance_calibration: osd_depth={} (RESEARCH-ONLY override; production default stays Some(0))",
-        args.osd_depth
+        "acceptance_calibration: osd_depth={} osd_input={:?} (RESEARCH-ONLY override; production default stays Some(0)/BpPosterior)",
+        args.osd_depth, args.osd_input
     );
 
-    let decoder = Ft8Decoder::with_default_config().with_osd_depth(Some(args.osd_depth));
+    let decoder = Ft8Decoder::with_default_config()
+        .with_osd_depth(Some(args.osd_depth))
+        .with_osd_input(args.osd_input);
 
     let mut all_rows: Vec<Row> = Vec::new();
 

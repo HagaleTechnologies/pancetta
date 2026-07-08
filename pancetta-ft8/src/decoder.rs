@@ -167,6 +167,45 @@ pub enum LlrMetric {
     Bessel,
 }
 
+/// Task W2.3 [A/B] (decoder-tp-sensitivity plan): selects which LLR array
+/// actually drives OSD's bit-flip search + candidate generation inside
+/// `post_bp_pipeline`. This is orthogonal to W2.1's acceptance-scoring
+/// array, which is ALWAYS the true pre-BP channel LLRs regardless of this
+/// setting (see `acceptance::score`'s doc comment and W2.2's report) —
+/// this enum only changes what OSD searches OVER, not what W2.2's
+/// order-1/2/3 candidate selection scores its winners against.
+///
+/// Motivation: after BP fails to converge (typically stuck in an LDPC
+/// trapping set), its posterior LLR output can be confidently WRONG in
+/// exactly the region that mattered — the bits it's most sure about may
+/// be the ones it got wrong. `Channel` sidesteps that by handing OSD the
+/// original, un-propagated channel LLRs instead; `OffsetSubtracted`
+/// partially discounts BP's overconfidence (mBP pre-conditioning per
+/// arXiv:2306.00443) without discarding it outright.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum OsdInput {
+    /// OSD searches over BP's posterior LLR output. This is the current/
+    /// production default — introducing this enum changes nothing at
+    /// this setting. Still composes with the legacy `bp_offset_subtract`
+    /// config field exactly as before (offset applied only if
+    /// `bp_offset_subtract > 0.0`).
+    #[default]
+    BpPosterior,
+    /// OSD searches over the pre-BP channel LLRs directly, ignoring BP's
+    /// posterior output entirely for the purpose of OSD's reliability
+    /// ordering + flip search. (BP's convergence check upstream is
+    /// unaffected — this only changes OSD's own input once BP has
+    /// already failed.)
+    Channel,
+    /// OSD searches over BP's posterior LLRs with `|LLR|` reduced by this
+    /// fixed magnitude before invoking OSD (mBP pre-conditioning),
+    /// independent of the legacy `bp_offset_subtract` field — lets this
+    /// experiment sweep an explicit offset without touching that knob's
+    /// own default/behavior.
+    OffsetSubtracted(f32),
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Ft8Config {
@@ -339,6 +378,16 @@ pub struct Ft8Config {
     /// OSD considers more flip patterns. Default 0.0 (no behavior change).
     /// Useful range: 0.5 to 4.0.
     pub bp_offset_subtract: f32,
+
+    /// Task W2.3 [A/B] (decoder-tp-sensitivity plan): which LLR array
+    /// drives OSD's actual bit-flip search + candidate generation (NOT
+    /// W2.1's acceptance-scoring array, which is always the true channel
+    /// LLRs regardless of this setting). Default `OsdInput::BpPosterior`
+    /// — byte-identical to pre-W2.3 behavior (this field's introduction
+    /// is a structural no-op at its default; it also composes with the
+    /// legacy `bp_offset_subtract` field above exactly as before). See
+    /// `OsdInput` doc comment for the three settings and the A/B result.
+    pub osd_input: OsdInput,
 
     /// JS8Call-Improved-style LDPC feedback refinement (clean-room port
     /// from a prose spec). When true, a failed first
@@ -1227,6 +1276,10 @@ impl Default for Ft8Config {
             // hard-200 residual cost without regressing other tiers.
             sync_time_interp_linear_power: false,
             bp_offset_subtract: 0.0,
+            // W2.3 [A/B]: default `BpPosterior` — byte-identical to
+            // pre-W2.3 behavior. See `OsdInput` doc comment + the A/B
+            // result in the experiment log for the other two settings.
+            osd_input: OsdInput::BpPosterior,
             // JS8Call-Improved-style LDPC feedback refinement: DEFAULT OFF
             // pending hard-200 measurement validation. When flipped on, a
             // failed BP pass triggers one extra meta-loop with refined LLRs
@@ -1831,6 +1884,7 @@ impl Ft8Decoder {
         )?
         .with_max_parity_errors_for_osd(config.max_parity_errors_for_osd)
         .with_bp_offset_subtract(config.bp_offset_subtract)
+        .with_osd_input(config.osd_input)
         .with_layered(config.layered_bp)
         .with_pade_atanh(config.pade_atanh)
         .with_feedback_refinement(
@@ -2559,6 +2613,7 @@ impl Ft8Decoder {
                 adaptive_ldpc_iters: self.config.adaptive_ldpc_iters,
                 max_parity_errors_for_osd: self.config.max_parity_errors_for_osd,
                 bp_offset_subtract: self.config.bp_offset_subtract,
+                osd_input: self.config.osd_input,
                 layered_bp: self.config.layered_bp,
                 pade_atanh: self.config.pade_atanh,
                 ldpc_feedback_refinement_enabled: self.config.ldpc_feedback_refinement_enabled,
@@ -2654,6 +2709,7 @@ impl Ft8Decoder {
                         .expect("LDPC decoder init failed")
                         .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
                         .with_bp_offset_subtract(ctx.bp_offset_subtract)
+                        .with_osd_input(ctx.osd_input)
                         .with_layered(ctx.layered_bp)
                         .with_pade_atanh(ctx.pade_atanh)
                         .with_feedback_refinement(
@@ -6957,6 +7013,8 @@ struct DecodeContext<'a> {
     max_parity_errors_for_osd: usize,
     /// mBP offset (subtract from |LLR| before OSD).
     bp_offset_subtract: f32,
+    /// Task W2.3 [A/B]: which LLR array drives OSD's search.
+    osd_input: OsdInput,
     /// Layered (row-sequential) BP schedule.
     layered_bp: bool,
     /// Padé `atanh` approximant in the BP check-node update (F1 [A/B]).
@@ -10272,6 +10330,10 @@ struct LdpcDecoder {
     /// Per arXiv:2306.00443 — claim is order-(m-1) OSD reaches order-m
     /// performance with small offset.
     bp_offset_subtract: f32,
+    /// Task W2.3 [A/B]: which LLR array drives OSD's search. Default
+    /// `OsdInput::BpPosterior` — composes with `bp_offset_subtract`
+    /// above exactly as before at that setting.
+    osd_input: OsdInput,
     /// When true, `belief_propagation_with_trajectory` uses a
     /// layered (row-sequential) schedule instead of flooding.
     layered: bool,
@@ -10530,6 +10592,7 @@ impl LdpcDecoder {
             osd: None,
             max_parity_errors_for_osd: 4,
             bp_offset_subtract: 0.0,
+            osd_input: OsdInput::BpPosterior,
             layered: false,
             pade_atanh: false,
             feedback_refinement: FeedbackRefinementConfig::default(),
@@ -10550,6 +10613,53 @@ impl LdpcDecoder {
     fn with_bp_offset_subtract(mut self, v: f32) -> Self {
         self.bp_offset_subtract = v.max(0.0);
         self
+    }
+
+    /// Task W2.3 [A/B]: override which LLR array drives OSD's search.
+    fn with_osd_input(mut self, v: OsdInput) -> Self {
+        self.osd_input = v;
+        self
+    }
+
+    /// Task W2.3 [A/B]: pure selection of which LLR array OSD's search
+    /// (reliability ordering + bit-flip candidate generation) actually
+    /// walks over, given BP's posterior output (`decoded_llrs`) and the
+    /// true pre-BP channel array (`channel_llrs`). `scratch` is a
+    /// caller-owned buffer used only by the two array-computing branches
+    /// — this keeps the common no-op case (`BpPosterior` with
+    /// `bp_offset_subtract == 0.0`, i.e. every pre-W2.3 caller) a zero-copy
+    /// borrow of `decoded_llrs`, matching this decoder's existing
+    /// hot-path discipline (this array-selection code runs on every
+    /// BP-non-converged candidate whenever OSD is configured at all,
+    /// independent of `osd_depth`).
+    fn osd_search_llrs<'a>(
+        &self,
+        decoded_llrs: &'a [f32; 174],
+        channel_llrs: &'a [f32; 174],
+        scratch: &'a mut [f32; 174],
+    ) -> &'a [f32; 174] {
+        match self.osd_input {
+            OsdInput::Channel => channel_llrs,
+            OsdInput::OffsetSubtracted(offset) => {
+                let offset = offset.max(0.0);
+                *scratch = std::array::from_fn(|i| {
+                    let v = decoded_llrs[i];
+                    v.signum() * (v.abs() - offset).max(0.0)
+                });
+                &*scratch
+            }
+            OsdInput::BpPosterior => {
+                if self.bp_offset_subtract > 0.0 {
+                    *scratch = std::array::from_fn(|i| {
+                        let v = decoded_llrs[i];
+                        v.signum() * (v.abs() - self.bp_offset_subtract).max(0.0)
+                    });
+                    &*scratch
+                } else {
+                    decoded_llrs
+                }
+            }
+        }
     }
 
     fn with_layered(mut self, on: bool) -> Self {
@@ -10756,37 +10866,33 @@ impl LdpcDecoder {
 
         // BP did not converge — try OSD fallback if available.
         if let Some(ref osd) = self.osd {
-            // hb-067: optional mBP offset — reduce BP-LLR magnitudes
-            // before OSD invocation so OSD considers more flip patterns
-            // (per arXiv:2306.00443). bp_offset_subtract=0 → no change.
-            // F6: avoid the allocate-then-borrow round trip through a
-            // `Vec<f32>` — `decoded_llrs` is already `[f32; 174]` (Task 2),
-            // so the no-op (bp_offset_subtract == 0.0) case can borrow it
-            // directly, and the subtract case can compute straight into a
-            // stack array instead of a heap `Vec`.
-            let subtracted_arr: [f32; 174];
-            let llr_arr: &[f32; 174] = if self.bp_offset_subtract > 0.0 {
-                subtracted_arr = std::array::from_fn(|i| {
-                    let v = decoded_llrs[i];
-                    v.signum() * (v.abs() - self.bp_offset_subtract).max(0.0)
-                });
-                &subtracted_arr
-            } else {
-                &decoded_llrs
-            };
-            let parity_errors = self.count_parity_errors(llr_arr);
-
             // W2.2: the acceptance gate inside OSD's order-1/2/3 loops
             // must score candidates against the pre-BP CHANNEL LLRs (see
             // `acceptance::score`'s doc comment), never against `llr_arr`
-            // above, which is BP's posterior output (optionally
-            // mBP-offset-adjusted) — a different array used only to drive
-            // OSD's reliability ordering and candidate generation. `llrs`
-            // (this function's own parameter) is the true channel array;
-            // copy it into a fixed-size array once, unconditionally (cheap
-            // — 174 floats) for `decode_with_features_scored`.
+            // below, which — depending on `osd_input` (W2.3) — may be
+            // BP's posterior output (optionally mBP-offset-adjusted) or
+            // the channel array itself; either way it's a separate array
+            // used only to drive OSD's reliability ordering and candidate
+            // generation. `llrs` (this function's own parameter) is the
+            // true channel array; copy it into a fixed-size array once,
+            // unconditionally (cheap — 174 floats), both for
+            // `decode_with_features_scored`'s scoring input AND (when
+            // `osd_input == Channel`) as OSD's actual search input.
             let mut channel_llrs_arr = [0.0f32; 174];
             channel_llrs_arr.copy_from_slice(&llrs[..174]);
+
+            // hb-067 / Task W2.3 [A/B]: select which LLR array OSD
+            // actually searches over. `BpPosterior` (default) preserves
+            // the pre-W2.3 behavior byte-for-byte, including composing
+            // with the legacy `bp_offset_subtract` field exactly as
+            // before. Factored into `osd_search_llrs` (pure, directly
+            // unit-tested) — `scratch` is caller-owned so the common
+            // no-op case still borrows `decoded_llrs` with zero copies,
+            // same hot-path discipline as before (see F6).
+            let mut scratch = [0.0f32; 174];
+            let llr_arr: &[f32; 174] =
+                self.osd_search_llrs(&decoded_llrs, &channel_llrs_arr, &mut scratch);
+            let parity_errors = self.count_parity_errors(llr_arr);
 
             // Parity gate for OSD: tunable via Ft8Config::max_parity_errors_for_osd.
             // Default 4: widening to 5 historically let too many noise candidates
@@ -13121,6 +13227,117 @@ mod tests {
         // Verify the no-OSD path still works
         let decoder_no_osd = LdpcDecoder::new(50).unwrap();
         assert!(decoder_no_osd.osd.is_none());
+    }
+
+    /// Task W2.3 [A/B]: `OsdInput::default()` must be `BpPosterior` — the
+    /// enum's introduction is a structural no-op unless something
+    /// explicitly opts into `Channel`/`OffsetSubtracted`.
+    #[test]
+    fn osd_input_default_is_bp_posterior() {
+        assert_eq!(OsdInput::default(), OsdInput::BpPosterior);
+        assert_eq!(Ft8Config::default().osd_input, OsdInput::BpPosterior);
+    }
+
+    /// `osd_search_llrs` at the default settings (`BpPosterior`,
+    /// `bp_offset_subtract == 0.0`) must return the BP-posterior array
+    /// completely unchanged (byte-identical to pre-W2.3 behavior) — this
+    /// is the load-bearing regression guarantee for this task.
+    #[test]
+    fn osd_search_llrs_bp_posterior_default_returns_decoded_llrs_unchanged() {
+        let decoder = LdpcDecoder::new(50).unwrap();
+        assert_eq!(decoder.osd_input, OsdInput::BpPosterior);
+        assert_eq!(decoder.bp_offset_subtract, 0.0);
+
+        let decoded_llrs: [f32; 174] = std::array::from_fn(|i| (i as f32) - 87.0);
+        let channel_llrs: [f32; 174] = std::array::from_fn(|i| (i as f32) * 2.0 - 174.0);
+        let mut scratch = [0.0f32; 174];
+        let selected = decoder.osd_search_llrs(&decoded_llrs, &channel_llrs, &mut scratch);
+        assert_eq!(
+            *selected, decoded_llrs,
+            "default must select BP-posterior LLRs verbatim"
+        );
+    }
+
+    /// `OsdInput::Channel` must select the channel array, ignoring both
+    /// BP's posterior output AND the legacy `bp_offset_subtract` field
+    /// entirely.
+    #[test]
+    fn osd_search_llrs_channel_selects_channel_array() {
+        let decoder = LdpcDecoder::new(50)
+            .unwrap()
+            .with_bp_offset_subtract(3.0) // must be ignored under Channel
+            .with_osd_input(OsdInput::Channel);
+
+        let decoded_llrs: [f32; 174] = std::array::from_fn(|i| (i as f32) - 87.0);
+        let channel_llrs: [f32; 174] = std::array::from_fn(|i| (i as f32) * 2.0 - 174.0);
+        let mut scratch = [0.0f32; 174];
+        let selected = decoder.osd_search_llrs(&decoded_llrs, &channel_llrs, &mut scratch);
+        assert_eq!(*selected, channel_llrs);
+        assert_ne!(
+            *selected, decoded_llrs,
+            "sanity: the two source arrays must actually differ in this test"
+        );
+    }
+
+    /// `OsdInput::OffsetSubtracted(v)` must reduce `|decoded_llrs|` by
+    /// exactly `v` (floor at 0, sign preserved), independent of the
+    /// legacy `bp_offset_subtract` field.
+    #[test]
+    fn osd_search_llrs_offset_subtracted_reduces_magnitude_and_preserves_sign() {
+        let decoder = LdpcDecoder::new(50)
+            .unwrap()
+            .with_bp_offset_subtract(99.0) // must be ignored — the enum variant's own value wins
+            .with_osd_input(OsdInput::OffsetSubtracted(2.0));
+
+        let decoded_llrs = [5.0f32, -5.0, 1.0, -1.0, 0.0];
+        let mut decoded_arr = [0.0f32; 174];
+        decoded_arr[..5].copy_from_slice(&decoded_llrs);
+        let channel_llrs = [0.0f32; 174];
+        let mut scratch = [0.0f32; 174];
+        let selected = decoder.osd_search_llrs(&decoded_arr, &channel_llrs, &mut scratch);
+
+        assert!(
+            (selected[0] - 3.0).abs() < 1e-6,
+            "5.0 - 2.0 = 3.0, got {}",
+            selected[0]
+        );
+        assert!(
+            (selected[1] + 3.0).abs() < 1e-6,
+            "-5.0 -> -3.0, got {}",
+            selected[1]
+        );
+        assert!(
+            (selected[2] - 0.0).abs() < 1e-6,
+            "|1.0| - 2.0 floors at 0, got {}",
+            selected[2]
+        );
+        assert!(
+            (selected[3] - 0.0).abs() < 1e-6,
+            "sign-preserving floor: -1.0 -> 0.0 (not -(-1.0)), got {}",
+            selected[3]
+        );
+        assert_eq!(selected[4], 0.0, "0.0 stays 0.0");
+    }
+
+    /// The legacy `bp_offset_subtract` field must still apply exactly as
+    /// before when `osd_input` is left at its default `BpPosterior` —
+    /// proves the two knobs compose correctly rather than the new enum
+    /// silently shadowing the old field.
+    #[test]
+    fn osd_search_llrs_bp_posterior_still_honors_legacy_bp_offset_subtract() {
+        let decoder = LdpcDecoder::new(50).unwrap().with_bp_offset_subtract(2.0);
+        assert_eq!(decoder.osd_input, OsdInput::BpPosterior);
+
+        let mut decoded_arr = [0.0f32; 174];
+        decoded_arr[0] = 5.0;
+        let channel_llrs = [0.0f32; 174];
+        let mut scratch = [0.0f32; 174];
+        let selected = decoder.osd_search_llrs(&decoded_arr, &channel_llrs, &mut scratch);
+        assert!(
+            (selected[0] - 3.0).abs() < 1e-6,
+            "legacy bp_offset_subtract=2.0 must still apply at BpPosterior default, got {}",
+            selected[0]
+        );
     }
 
     #[test]

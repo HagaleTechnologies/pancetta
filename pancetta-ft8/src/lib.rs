@@ -161,7 +161,8 @@ pub use protocol::{ModulationType, Protocol, ProtocolParams};
 
 // Core decoding exports
 pub use decoder::{
-    CrossSequenceSeed, Ft8Config, Ft8Decoder, LlrMetric, SyncCandidateRecord, WaterfallData,
+    CrossSequenceSeed, Ft8Config, Ft8Decoder, LlrMetric, OsdInput, SyncCandidateRecord,
+    WaterfallData,
 };
 pub use message::{ConfidenceFeatures, DecodedMessage, Ft8Message, MessageType};
 pub use signal_processing::{FftProcessor, WindowFunction};
