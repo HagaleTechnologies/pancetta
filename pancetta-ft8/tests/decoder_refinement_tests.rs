@@ -553,6 +553,94 @@ mod w34_nsym_combining {
 }
 
 // ============================================================================
+// Task W3.6 (decoder-TP-sensitivity plan, Workstream 3): re-test of the
+// per-candidate frequency tracker (`freq_tracker.rs`, built in Batch 50 for
+// the legacy 21-trial fine-FFT fallback, measured there at -2 TPs on
+// hard-200 — see `research/experiments/2026-06-09-batch-50.md`) as a NEW
+// consumer of the Task W3.3 matched-demod stage. `fine_sync_enabled` is
+// forced `true` in the tracker-enabled test below (the same isolation
+// technique W3.4 used) since the tracker only ever executes inside
+// `matched_demod_attempt`.
+//
+// These are regression/sanity tests, not a discriminating RED/GREEN pair
+// like `w33_matched_demod`/`w34_nsym_combining` above: an exploratory
+// (intra-slot linear drift x off-grid dt/df x SNR) sweep did not turn up a
+// synthetic fixture where the tracker's per-Costas-block correction flips a
+// failing decode to passing within this task's time budget (see the Task
+// W3.6 experiment log for the sweep). The decisive evidence for the
+// adopt/decline decision is the hard-200 + synth-clean corpus A/B, per this
+// task's brief and the plan's standing methodology — not a bespoke unit
+// fixture. What IS guarded here: the flag doesn't break ordinary decoding
+// when enabled (this test), and — already covered by every existing
+// `w33_matched_demod`/`w34_nsym_combining` test above, which leave this
+// flag at its default `false` and all still pass unmodified after this
+// task's changes — that `matched_demod_attempt`'s per-symbol loop is
+// byte-identical when the tracker is off.
+// ============================================================================
+
+#[cfg(feature = "transmit")]
+mod w36_freq_tracker {
+    use super::*;
+    use pancetta_ft8::encoder::Ft8Encoder;
+    use pancetta_ft8::modulator::Ft8Modulator;
+
+    const TEST_MESSAGE: &str = "CQ K5ARH EM10";
+
+    fn build_clean_signal() -> Vec<f32> {
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message(TEST_MESSAGE, None).unwrap();
+        let mut modulator =
+            Ft8Modulator::new(SAMPLE_RATE, pancetta_ft8::BASE_FREQUENCY, 1.0).unwrap();
+        let signal = modulator.modulate_symbols(&symbols, 0.0).unwrap();
+        let mut samples = vec![0.0f32; WINDOW_SAMPLES];
+        for (i, &s) in signal.iter().enumerate() {
+            if i < samples.len() {
+                samples[i] = s;
+            }
+        }
+        samples
+    }
+
+    fn decodes_test_message(decoder: &mut Ft8Decoder, samples: &[f32]) -> bool {
+        decoder
+            .decode_window(samples)
+            .unwrap_or_default()
+            .iter()
+            .any(|m| m.text == TEST_MESSAGE)
+    }
+
+    /// Regression guard: `per_candidate_freq_tracker_enabled` must default
+    /// to `false` — every OTHER test in this file (and in production)
+    /// relies on that default to stay on the legacy/matched-demod paths'
+    /// byte-identical behavior.
+    #[test]
+    fn per_candidate_freq_tracker_default_is_off() {
+        assert!(!Ft8Config::default().per_candidate_freq_tracker_enabled);
+    }
+
+    /// Sanity: enabling the tracker on top of `fine_sync_enabled` must not
+    /// break ordinary decoding of a clean, on-grid signal. A clean strong
+    /// signal typically decodes via the coarse spectrogram path before
+    /// `matched_demod_attempt` (and therefore the tracker) is ever reached,
+    /// so this is a coarse regression guard on the wiring, not a
+    /// sensitivity claim — mirrors
+    /// `test_fine_fft_rect_window_flag_does_not_break_clean_decode`'s
+    /// rationale earlier in this file.
+    #[test]
+    fn tracker_enabled_does_not_break_clean_decode() {
+        let mut config = Ft8Config::default();
+        config.fine_sync_enabled = true;
+        config.per_candidate_freq_tracker_enabled = true;
+        let mut decoder = Ft8Decoder::new(config).unwrap();
+        assert!(
+            decodes_test_message(&mut decoder, &build_clean_signal()),
+            "should still decode a clean bin-center signal with both \
+             fine_sync_enabled and per_candidate_freq_tracker_enabled on"
+        );
+    }
+}
+
+// ============================================================================
 // Task W1.4 (decoder-TP-sensitivity plan, spec Section 7): `whiten_llrs`
 // dB-vs-linear-|y| gain-invariance property test.
 //

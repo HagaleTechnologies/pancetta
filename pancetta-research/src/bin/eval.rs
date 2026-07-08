@@ -84,6 +84,11 @@ struct Args {
     /// stage (only takes effect when `fine_sync_enabled` is ALSO
     /// `true`). See `Ft8Config::nsym_combining_enabled`.
     nsym_combining_enabled: Option<bool>,
+    /// Decoder-TP-sensitivity Task W3.6 [A/B]: re-test of the
+    /// per-candidate frequency tracker as a consumer of the W3.3
+    /// matched-demod stage (only takes effect when `fine_sync_enabled`
+    /// is ALSO `true`). See `Ft8Config::per_candidate_freq_tracker_enabled`.
+    per_candidate_freq_tracker_enabled: Option<bool>,
     /// Decoder-TP-sensitivity Task W1.4 [A/B]: master switch for the
     /// divisive LLR whitening step, re-measured after the dB/linear
     /// unit-consistency fix. See `Ft8Config::llr_whitening_enabled`.
@@ -261,6 +266,7 @@ impl Args {
         let mut fine_fft_rect_window: Option<bool> = None;
         let mut fine_sync_enabled: Option<bool> = None;
         let mut nsym_combining_enabled: Option<bool> = None;
+        let mut per_candidate_freq_tracker_enabled: Option<bool> = None;
         let mut llr_whitening: Option<bool> = None;
         let mut acceptance_gating: Option<bool> = None;
         let mut cq_ap: Option<bool> = None;
@@ -486,6 +492,9 @@ impl Args {
                 }
                 "--nsym-combining-enabled" => {
                     nsym_combining_enabled = Some(true);
+                }
+                "--per-candidate-freq-tracker-enabled" => {
+                    per_candidate_freq_tracker_enabled = Some(true);
                 }
                 "--llr-whitening" => {
                     llr_whitening = Some(true);
@@ -800,6 +809,7 @@ impl Args {
                     eprintln!("  --fine-fft-rect-window: decoder-TP-sensitivity Task W1.3 [A/B] — rectangular (no) window on the fine-FFT fallback symbol FFT instead of Hann (default off). See Ft8Config::fine_fft_rect_window.");
                     eprintln!("  --fine-sync-enabled: decoder-TP-sensitivity Task W3.3 [A/B] — per-candidate fine-sync + matched-demod stage replacing the legacy 21-trial fine-FFT fallback (default off). See Ft8Config::fine_sync_enabled.");
                     eprintln!("  --nsym-combining-enabled: decoder-TP-sensitivity Task W3.4 [A/B] — nsym=2/3 noncoherent combining LLR variants on top of the W3.3 stage; requires --fine-sync-enabled to have any effect (default off). See Ft8Config::nsym_combining_enabled.");
+                    eprintln!("  --per-candidate-freq-tracker-enabled: decoder-TP-sensitivity Task W3.6 [A/B] — re-test of the per-candidate frequency tracker as a consumer of the W3.3 matched-demod stage; requires --fine-sync-enabled to have any effect (default off). See Ft8Config::per_candidate_freq_tracker_enabled.");
                     eprintln!("  --linear-power-averaging: decoder-TP-sensitivity Task W3.5 [A/B] — combine each symbol's two TIME_OSR sub-steps in linear power instead of dB; runs unconditionally on the always-active coarse-sync path, independent of --sync-time-interp-linear-power (default off). See Ft8Config::linear_power_averaging.");
                     eprintln!("  --llr-whitening / --no-llr-whitening: decoder-TP-sensitivity Task W1.4 [A/B] — force the divisive LLR whitening step on/off (production default: off, flipped by the W1.4 A/B result). See Ft8Config::llr_whitening_enabled.");
                     eprintln!("  --acceptance-gating / --no-acceptance-gating: decoder-TP-sensitivity Task W2.5 [A/B] — replace the blunt post-CRC sync-score confidence floors with the W2.1 acceptance metric for decodes that cleanly pass it (production default: off). See Ft8Config::acceptance_gating_enabled.");
@@ -851,6 +861,7 @@ impl Args {
             fine_fft_rect_window,
             fine_sync_enabled,
             nsym_combining_enabled,
+            per_candidate_freq_tracker_enabled,
             llr_whitening,
             acceptance_gating,
             cq_ap,
@@ -1911,6 +1922,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.nsym_combining_enabled {
         d = d.with_nsym_combining_enabled(on);
+    }
+    if let Some(on) = args.per_candidate_freq_tracker_enabled {
+        d = d.with_per_candidate_freq_tracker_enabled(on);
     }
     if let Some(on) = args.llr_whitening {
         d = d.with_llr_whitening(on);

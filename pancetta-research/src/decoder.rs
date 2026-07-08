@@ -448,6 +448,15 @@ impl Ft8Decoder {
         self
     }
 
+    /// Task W3.6 [A/B]: master switch for the per-candidate frequency
+    /// tracker's re-test as a consumer of the Task W3.3 matched-demod
+    /// stage (only takes effect when `fine_sync_enabled` is ALSO
+    /// `true`). See `Ft8Config::per_candidate_freq_tracker_enabled`.
+    pub fn with_per_candidate_freq_tracker_enabled(mut self, on: bool) -> Self {
+        self.config.per_candidate_freq_tracker_enabled = on;
+        self
+    }
+
     /// Task W3.3b [HARNESS]: set the per-window wall-clock decode budget
     /// (milliseconds). `None` (the default) reproduces
     /// `DecodeBudget::unlimited()` exactly, matching every prior eval

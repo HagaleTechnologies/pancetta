@@ -913,12 +913,29 @@ pub struct Ft8Config {
     /// especially for cheap radios, mobile / chirpy / solar-flare
     /// conditions.
     ///
-    /// Default **false**: the wiring is in place but disabled until a
-    /// drift-heavy corpus measurement confirms a net recall gain. When
-    /// off the hot path is byte-identical to the legacy fine-FFT path
-    /// (no tracker is constructed, no rotation is applied). Inspired by
-    /// JS8Call-Improved's per-candidate frequency tracker; peer source
-    /// GPL-3.0 was NOT consulted.
+    /// **Task W3.6 (decoder-TP-sensitivity plan, Workstream 3)**: this
+    /// flag is ALSO consumed by `matched_demod_attempt` (the Task W3.3
+    /// matched-demod stage, `Ft8Config::fine_sync_enabled`), which had no
+    /// per-symbol drift-tracking consumer before — `fine_sync::refine`
+    /// only ever fits ONE global (dt, df) for the whole 12.64s slot, so
+    /// intra-slot drift beyond that single estimate went uncorrected.
+    /// There, the tracker measures a residual at each of the 3 Costas
+    /// blocks (a cheap 3-point parabolic micro-search around the current
+    /// effective offset, reusing `matched_demod_tone_correlation`) and
+    /// the running offset is added to `fine_sync::refine`'s `df_hz` for
+    /// every symbol from that point in the slot onward. Only takes
+    /// effect when `fine_sync_enabled` is ALSO `true` — see the Task
+    /// W3.6 experiment log for the isolated A/B result.
+    ///
+    /// Default **false**: the wiring is in place but disabled — see the
+    /// Batch 50 measurement (legacy fine-FFT consumer, -2 TPs on
+    /// hard-200) and the Task W3.6 measurement (matched-demod consumer)
+    /// for why. When off the hot path is byte-identical to the legacy
+    /// fine-FFT path (no tracker is constructed, no rotation is applied)
+    /// and to the matched-demod path (no tracker is constructed, `df_hz`
+    /// alone is used for every symbol, exactly as before this task).
+    /// Inspired by JS8Call-Improved's per-candidate frequency tracker;
+    /// peer source GPL-3.0 was NOT consulted.
     pub per_candidate_freq_tracker_enabled: bool,
 
     /// Damping factor for the adaptive frequency tracker's running
@@ -5836,6 +5853,10 @@ impl Ft8Decoder {
                     self.config.acceptance_gating_enabled,
                     &self.baseband_taps,
                     self.config.nsym_combining_enabled,
+                    self.config.per_candidate_freq_tracker_enabled,
+                    self.config.per_candidate_freq_tracker_alpha,
+                    self.config.per_candidate_freq_tracker_max_step_hz,
+                    self.config.per_candidate_freq_tracker_max_error_hz,
                 ) {
                     decoded.push(msg);
                 }
@@ -6381,6 +6402,10 @@ impl Ft8Decoder {
                     self.config.acceptance_gating_enabled,
                     &self.baseband_taps,
                     self.config.nsym_combining_enabled,
+                    self.config.per_candidate_freq_tracker_enabled,
+                    self.config.per_candidate_freq_tracker_alpha,
+                    self.config.per_candidate_freq_tracker_max_step_hz,
+                    self.config.per_candidate_freq_tracker_max_error_hz,
                 ) {
                     decoded_new.push(msg);
                 }
@@ -6879,6 +6904,10 @@ impl Ft8Decoder {
                     self.config.acceptance_gating_enabled,
                     &self.baseband_taps,
                     self.config.nsym_combining_enabled,
+                    self.config.per_candidate_freq_tracker_enabled,
+                    self.config.per_candidate_freq_tracker_alpha,
+                    self.config.per_candidate_freq_tracker_max_step_hz,
+                    self.config.per_candidate_freq_tracker_max_error_hz,
                 ) {
                     decoded_new.push(msg);
                 }
@@ -7449,7 +7478,9 @@ struct DecodeContext<'a> {
     /// switch. When false, `par_extract_symbols_complex` skips the
     /// tracker entirely and produces byte-identical output to the
     /// legacy path. Inspired by JS8Call-Improved's per-candidate
-    /// frequency tracker.
+    /// frequency tracker. Task W3.6: also consumed by
+    /// `matched_demod_attempt` (via `par_matched_demod_decode`) — see
+    /// `Ft8Config::per_candidate_freq_tracker_enabled`'s doc.
     per_candidate_freq_tracker_enabled: bool,
     /// Tracker damping factor (`FreqTrackerConfig::alpha`).
     per_candidate_freq_tracker_alpha: f64,
@@ -8362,6 +8393,10 @@ fn par_matched_demod_decode(
         ctx.acceptance_gating_enabled,
         ctx.baseband_taps,
         ctx.nsym_combining_enabled,
+        ctx.per_candidate_freq_tracker_enabled,
+        ctx.per_candidate_freq_tracker_alpha,
+        ctx.per_candidate_freq_tracker_max_step_hz,
+        ctx.per_candidate_freq_tracker_max_error_hz,
     )?;
     msg.decode_time_into_window = Some(ctx.window_start.elapsed());
     Some(msg)
@@ -8376,6 +8411,16 @@ fn par_matched_demod_decode(
 /// `par_matched_demod_decode`'s doc for the mechanism description.
 /// `decode_time_into_window` is deliberately left unset — callers stamp it
 /// per their own convention.
+///
+/// Task W3.6 [A/B]: the last four parameters gate the per-candidate
+/// frequency tracker (`Ft8Config::per_candidate_freq_tracker_enabled`).
+/// `fine_sync::refine` fits ONE (dt, df) pair for the whole slot; when
+/// the tracker is enabled, its running offset is layered on top of that
+/// single `df_hz` and re-measured at each of the 3 Costas blocks, so
+/// intra-slot drift beyond the single global estimate can be corrected
+/// for later symbols in the same candidate. When disabled (default) no
+/// tracker is constructed and every symbol uses `df_hz` alone — byte-
+/// identical to pre-Task-W3.6 behavior.
 #[allow(clippy::too_many_arguments)] // mirrors DecodeContext's field count; a config struct would just move the sprawl
 fn matched_demod_attempt(
     pp: &ProtocolParams,
@@ -8392,6 +8437,10 @@ fn matched_demod_attempt(
     acceptance_gating_enabled: bool,
     baseband_taps: &[f64],
     nsym_combining_enabled: bool,
+    per_candidate_freq_tracker_enabled: bool,
+    per_candidate_freq_tracker_alpha: f64,
+    per_candidate_freq_tracker_max_step_hz: f64,
+    per_candidate_freq_tracker_max_error_hz: f64,
 ) -> Option<DecodedMessage> {
     let tone_spacing = pp.tone_spacing;
     let sub_bin_offset = candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
@@ -8436,6 +8485,35 @@ fn matched_demod_attempt(
     } else {
         None
     };
+    // Task W3.6 [A/B]: per-candidate frequency tracker, layered on top of
+    // `fine_sync::refine`'s single global `df_hz` estimate for the whole
+    // slot. `None` when the flag is off — `effective_df_hz` below then
+    // reduces to plain `df_hz` for every symbol, byte-identical to
+    // pre-Task-W3.6 behavior. See `Ft8Config::per_candidate_freq_tracker_enabled`.
+    let mut tracker_opt = if per_candidate_freq_tracker_enabled {
+        Some(crate::freq_tracker::FrequencyTracker::new(
+            candidate_freq_hz,
+            SAMPLE_RATE as f64,
+            crate::freq_tracker::FreqTrackerConfig {
+                alpha: per_candidate_freq_tracker_alpha,
+                max_step_hz: per_candidate_freq_tracker_max_step_hz,
+                max_error_hz: per_candidate_freq_tracker_max_error_hz,
+                ..crate::freq_tracker::FreqTrackerConfig::default()
+            },
+        ))
+    } else {
+        None
+    };
+    // Micro-search half-step (Hz) for the per-Costas-block residual
+    // measurement below. Matches `fine_sync::refine`'s own 0.5 Hz df grid
+    // step for consistency, not independently tuned.
+    const TRACKER_MICRO_STEP_HZ: f64 = 0.5;
+    // Accumulators for the current Costas block's 3-point (df-step, df,
+    // df+step) correlation-power sum. Reset after each block is measured.
+    let mut block_power_minus = 0.0f64;
+    let mut block_power_zero = 0.0f64;
+    let mut block_power_plus = 0.0f64;
+
     for sym_idx in 0..pp.num_symbols {
         let frame_start = bb.nominal_start_index as isize + dt_offset + (sym_idx * sps_bb) as isize;
         if frame_start < 0 {
@@ -8447,10 +8525,26 @@ fn matched_demod_attempt(
             return None;
         }
         let frame = &bb.samples[frame_start..frame_end];
+        // Task W3.6: apply whatever intra-slot drift the tracker has
+        // accumulated from Costas blocks already processed on top of the
+        // single global `df_hz`. When the tracker is absent this is
+        // exactly `df_hz` (no redundant floating-point op), preserving
+        // byte-identity with the pre-Task-W3.6 code.
+        let effective_df_hz = match tracker_opt.as_ref() {
+            Some(t) => df_hz + t.current_offset_hz(),
+            None => df_hz,
+        };
+
         let mut mags = [0.0f64; NUM_TONES];
         let mut cplx = [Complex::new(0.0, 0.0); NUM_TONES];
         for tone in 0..pp.num_tones {
-            let c = matched_demod_tone_correlation(frame, tone, sps_bb, df_hz, bb.sample_rate_hz);
+            let c = matched_demod_tone_correlation(
+                frame,
+                tone,
+                sps_bb,
+                effective_df_hz,
+                bb.sample_rate_hz,
+            );
             mags[tone] = c.norm();
             if tone_complex.is_some() {
                 cplx[tone] = c;
@@ -8459,6 +8553,61 @@ fn matched_demod_attempt(
         tone_magnitudes.push(mags);
         if let Some(tc) = tone_complex.as_mut() {
             tc.push(cplx);
+        }
+
+        // Task W3.6: at a Costas (pilot) symbol, accumulate a 3-point
+        // (effective_df_hz - step, effective_df_hz, effective_df_hz +
+        // step) correlation-power micro-search at the KNOWN correct
+        // tone for this position (`pp.costas_value`) — the center point
+        // is already `mags[tone]` computed above (as power, via
+        // `norm_sqr` = `norm()^2`), so only the +-step endpoints need
+        // extra correlations. At the LAST symbol of each Costas block,
+        // the accumulated 3-point sum is parabola-refined (the same
+        // `parabolic_peak_refinement` helper `fine_sync.rs` uses for its
+        // own axis refinements) into a sub-step residual and fed to the
+        // tracker — this is the "consume a residual measurement... at
+        // each pilot opportunity" step from `freq_tracker.rs`'s doc.
+        if let Some(costas_tone) = tracker_opt.as_ref().and(pp.costas_value(sym_idx)) {
+            let tone = costas_tone as usize;
+            let p_zero = mags[tone] * mags[tone];
+            let p_minus = matched_demod_tone_correlation(
+                frame,
+                tone,
+                sps_bb,
+                effective_df_hz - TRACKER_MICRO_STEP_HZ,
+                bb.sample_rate_hz,
+            )
+            .norm_sqr();
+            let p_plus = matched_demod_tone_correlation(
+                frame,
+                tone,
+                sps_bb,
+                effective_df_hz + TRACKER_MICRO_STEP_HZ,
+                bb.sample_rate_hz,
+            )
+            .norm_sqr();
+            block_power_minus += p_minus;
+            block_power_zero += p_zero;
+            block_power_plus += p_plus;
+
+            let is_last_symbol_of_block = pp
+                .costas_positions
+                .iter()
+                .any(|&pos| sym_idx == pos + pp.costas_length - 1);
+            if is_last_symbol_of_block {
+                let (_, delta_frac) = parabolic_peak_refinement(
+                    block_power_minus,
+                    block_power_zero,
+                    block_power_plus,
+                );
+                let residual_hz = delta_frac * TRACKER_MICRO_STEP_HZ;
+                if let Some(t) = tracker_opt.as_mut() {
+                    t.update(residual_hz);
+                }
+                block_power_minus = 0.0;
+                block_power_zero = 0.0;
+                block_power_plus = 0.0;
+            }
         }
     }
 
