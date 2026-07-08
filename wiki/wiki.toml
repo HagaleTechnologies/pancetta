@@ -1,0 +1,3 @@
+schema = "wiki-config/v1"
+repo = "pancetta"
+visibility = "public"

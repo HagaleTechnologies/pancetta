@@ -1,0 +1,271 @@
+{
+  "generated_at": "2026-07-07T22:17:12Z",
+  "head_commit": "eac7aab",
+  "pages": [
+    {
+      "hash": "sha256:14c86952170f43a65787c62beb38a3dc5bda45c633da95c7dcb5cb423f59a260",
+      "id": "additive-only-gateway",
+      "kind": "gotcha",
+      "links": [
+        "remote-operation"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/additive-only-gateway.md",
+      "sources": [
+        "pancetta/src/coordinator/mod.rs",
+        "pancetta/src/coordinator/remote_gateway/mod.rs",
+        "pancetta/src/coordinator/ft8.rs"
+      ],
+      "status": "current",
+      "title": "What will bite you about the additive-only remote gateway?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:f420c705cd3f2d6e5356fccbb9d50de338d77e67392ff06eceb7fc57111ff93b",
+      "id": "config-and-platform",
+      "kind": "decision-digest",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/config-and-platform.md",
+      "sources": [
+        "docs/DECISIONS/config-and-platform.md",
+        "pancetta-config/src/network.rs",
+        "pancetta/src/coordinator/effort.rs"
+      ],
+      "status": "current",
+      "title": "Why the config-merge guardrail, hardware tiers, and decoder budgets?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:36589138ccf311b984fba7c15f1a37e3c9a39a9cb4f24774a328002eff24aae9",
+      "id": "fail-closed-arm-gate",
+      "kind": "gotcha",
+      "links": [
+        "remote-operation"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/fail-closed-arm-gate.md",
+      "sources": [
+        "pancetta-agent/src/arm.rs",
+        "pancetta/src/coordinator/tx.rs"
+      ],
+      "status": "current",
+      "title": "What will bite you about the armed-TX gate?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:bdf63c9a8ddece86abff2544fcf677586882d092453d5afb93bb9c4413808e5e",
+      "id": "language-rust",
+      "kind": "decision-digest",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/language-rust.md",
+      "sources": [
+        "docs/DECISIONS/ADR-001-language.md"
+      ],
+      "status": "current",
+      "title": "Why is pancetta written in Rust?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:4820629310ce75409959bd88ce0b165a174606bc77d7db9e13f74b59ed79e3fa",
+      "id": "logging-uploads",
+      "kind": "decision-digest",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/logging-uploads.md",
+      "sources": [
+        "docs/DECISIONS/logging-uploads.md",
+        "pancetta/src/coordinator/qso.rs"
+      ],
+      "status": "current",
+      "title": "Why is QSO logging ADIF-first with opt-in per-QSO uploads?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:98fc5b5f505f39553886e1cff5282b4aad28dfbbb585dbcc96f4443136a75308",
+      "id": "modes",
+      "kind": "subsystem",
+      "links": [
+        "overview",
+        "tx-scheduling"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/modes.md",
+      "sources": [
+        "pancetta-ft8/src/protocol.rs",
+        "pancetta-core/src/slot.rs",
+        "pancetta/src/coordinator/dsp.rs",
+        "pancetta/src/coordinator/ft8.rs",
+        "docs/DECISIONS/modes.md"
+      ],
+      "status": "current",
+      "title": "How do operating modes (FT8/FT4/FT2, Hound) work?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:5c51a1bf9459c4237e6a90bd71d843ab6b92a33d8fe8f9317948f889dac02365",
+      "id": "overview",
+      "kind": "overview",
+      "links": [
+        "tx-scheduling",
+        "qso-engine",
+        "remote-operation",
+        "modes"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/overview.md",
+      "sources": [
+        "README.md",
+        "CLAUDE.md",
+        "Cargo.toml",
+        "docs/ARCHITECTURE.md"
+      ],
+      "status": "current",
+      "title": "pancetta \u2014 what is this and where do things live?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:7879bc95d2d0c269cdd9f873629af8c89c637168b238d91360fae9d4c217f577",
+      "id": "parity-rule",
+      "kind": "gotcha",
+      "links": [
+        "tx-scheduling"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/parity-rule.md",
+      "sources": [
+        "pancetta-qso/src/qso_manager.rs",
+        "pancetta/src/coordinator/tx.rs",
+        "pancetta/src/coordinator/qso.rs"
+      ],
+      "status": "current",
+      "title": "What will bite you about the half-duplex parity rule?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:42bab0fc204ca56010475e38810256bf965b4b7fc1549fc498cefd372b1fcafd",
+      "id": "qso-engine",
+      "kind": "subsystem",
+      "links": [
+        "overview",
+        "tx-scheduling"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/qso-engine.md",
+      "sources": [
+        "pancetta-qso/src/qso_manager.rs",
+        "pancetta-qso/src/autonomous.rs",
+        "pancetta-qso/src/exchange.rs",
+        "docs/DECISIONS/qso-engine.md"
+      ],
+      "status": "current",
+      "title": "How does the QSO engine work and why is it shaped this way?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:37824ee8dd0916f9407e98828ad1cf0b739bc6e9e1587f0e85e9e8b2729a761e",
+      "id": "remote-operation",
+      "kind": "subsystem",
+      "links": [
+        "overview",
+        "fail-closed-arm-gate",
+        "additive-only-gateway"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/remote-operation.md",
+      "sources": [
+        "pancetta/src/coordinator/remote_gateway/mod.rs",
+        "pancetta/src/coordinator/station_agent/mod.rs",
+        "pancetta-agent/src/arm.rs",
+        "pancetta-config/src/network.rs",
+        "docs/DECISIONS/remote-operation.md"
+      ],
+      "status": "current",
+      "title": "How does remote operation work and why is it shaped this way?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:9fa684f617c9511ca185bd3873e6da9ca94ca29a99a06dce2da90593a3778618",
+      "id": "tui",
+      "kind": "decision-digest",
+      "links": [
+        "overview"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/tui.md",
+      "sources": [
+        "docs/DECISIONS/tui.md",
+        "pancetta-tui/src/app.rs"
+      ],
+      "status": "current",
+      "title": "Why is the TUI shaped the way it is?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    },
+    {
+      "hash": "sha256:f99044196426b73d67e8ce35663f5a973c50326780ea0b666d92710d3265cd4e",
+      "id": "tx-scheduling",
+      "kind": "subsystem",
+      "links": [
+        "overview",
+        "parity-rule"
+      ],
+      "locked": false,
+      "maintainer": "agent",
+      "path": "pages/tx-scheduling.md",
+      "sources": [
+        "pancetta/src/coordinator/tx.rs",
+        "pancetta/src/coordinator/qso.rs",
+        "pancetta-qso/src/qso_manager.rs",
+        "docs/DECISIONS/tx-scheduling.md"
+      ],
+      "status": "current",
+      "title": "How does TX scheduling work and why is it shaped this way?",
+      "verified_commit": "eac7aab",
+      "verified_date": "2026-07-07",
+      "visibility": "public"
+    }
+  ],
+  "repo": "pancetta",
+  "schema": "wiki-manifest/v1",
+  "visibility": "public"
+}
