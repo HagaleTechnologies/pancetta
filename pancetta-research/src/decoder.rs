@@ -3,6 +3,7 @@ use anyhow::Context;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// One decoded message from a single WAV. Mode-agnostic.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -111,6 +112,21 @@ pub struct Ft8Decoder {
     /// THIS field with a `CrossTimeState` handle WITHOUT touching the
     /// rolling-window paths used by hb-050.
     chrono_replay_state: Option<ChronoReplayState>,
+    /// Task W3.3b: per-window wall-clock decode budget in milliseconds,
+    /// mirroring production's `decode_effort_budget_ms` atomic
+    /// (`pancetta/src/coordinator/effort.rs`). `None` (the default — no
+    /// flag, no builder call) means every existing behavior is preserved
+    /// byte-for-byte: `decode_budget()` maps `None` to
+    /// `pancetta_ft8::DecodeBudget::unlimited()`, exactly what
+    /// `decode_window`/`decode_window_with_ap` already used internally
+    /// before this task. `Some(0)` (the "unlimited" preset name) is
+    /// treated identically to `None` — both are the harness's "no
+    /// deadline" sentinel, matching production's `decode_effort_budget_ms
+    /// == 0` convention. `Some(ms)` with `ms > 0` builds a FRESH deadline
+    /// (`Instant::now() + ms`) on every `decode_wav` call, since a budget
+    /// is a per-window wall-clock deadline, not a fixed instant computed
+    /// once at CLI-parse time (see `decode_budget`).
+    budget_ms: Option<u64>,
     /// Used only so `config_snapshot` is stable across calls.
     _scratch: Mutex<()>,
 }
@@ -138,6 +154,7 @@ impl Ft8Decoder {
             two_stage_first_config: None,
             dt_history: None,
             chrono_replay_state: None,
+            budget_ms: None,
             _scratch: Mutex::new(()),
         }
     }
@@ -408,6 +425,38 @@ impl Ft8Decoder {
     pub fn with_fine_sync_enabled(mut self, on: bool) -> Self {
         self.config.fine_sync_enabled = on;
         self
+    }
+
+    /// Task W3.3b [HARNESS]: set the per-window wall-clock decode budget
+    /// (milliseconds). `None` (the default) reproduces
+    /// `DecodeBudget::unlimited()` exactly, matching every prior eval
+    /// invocation. `Some(0)` is also treated as unlimited (matches
+    /// production's `decode_effort_budget_ms == 0` sentinel). This lets
+    /// the eval harness re-measure an A/B under a REAL bounded
+    /// `DecodeBudget` (e.g. the `Standard`=250ms/`Eco`=1ms effort
+    /// presets) instead of always using an unlimited budget — see
+    /// `research/experiments/2026-07-08-w33-matched-demod-fine-sync.md`
+    /// ("DecodeBudget integration") for why this matters: the existing
+    /// S1-floor/S2-rest candidate split already gates per-candidate
+    /// dispatch on `current_budget.has_time()`, so a real bounded budget
+    /// should self-limit an expensive new stage's cost automatically —
+    /// this builder is what makes that measurable.
+    pub fn with_effort_budget_ms(mut self, ms: Option<u64>) -> Self {
+        self.budget_ms = ms;
+        self
+    }
+
+    /// Build the `DecodeBudget` to use for the next `decode_wav` call. A
+    /// budget is a wall-clock DEADLINE, so this must be called freshly
+    /// per WAV (not once at construction) — `Instant::now()` is read at
+    /// call time, right before decoding.
+    fn decode_budget(&self) -> pancetta_ft8::DecodeBudget {
+        match self.budget_ms {
+            None | Some(0) => pancetta_ft8::DecodeBudget::unlimited(),
+            Some(ms) => {
+                pancetta_ft8::DecodeBudget::until(Instant::now() + Duration::from_millis(ms))
+            }
+        }
     }
 
     /// Decoder-TP-sensitivity Task W1.4 [A/B]: master switch for the
@@ -736,12 +785,21 @@ impl DecoderUnderTest for Ft8Decoder {
                 recent_calls: recent,
                 active_qso: None,
             };
-            let r = decoder.decode_window_with_ap(&samples, &ctx).map_err(|e| {
-                anyhow::anyhow!(
-                    "decode_window_with_ap (chrono-replay) failed for {}: {e}",
-                    path.display()
+            let r = decoder
+                .decode_window_with_ap_scoped_partner_budgeted(
+                    &samples,
+                    &ctx,
+                    None,
+                    None,
+                    self.decode_budget(),
                 )
-            })?;
+                .map(|(messages, _report)| messages)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "decode_window_with_ap (chrono-replay) failed for {}: {e}",
+                        path.display()
+                    )
+                })?;
             // Push every from/to callsign into the persistent deque. We
             // dedup against current contents so the snapshot doesn't grow
             // with re-sightings (the SET semantics here are what a future
@@ -785,12 +843,21 @@ impl DecoderUnderTest for Ft8Decoder {
                 recent_calls: recent,
                 active_qso: None,
             };
-            let r = decoder.decode_window_with_ap(&samples, &ctx).map_err(|e| {
-                anyhow::anyhow!(
-                    "decode_window_with_ap (rolling) failed for {}: {e}",
-                    path.display()
+            let r = decoder
+                .decode_window_with_ap_scoped_partner_budgeted(
+                    &samples,
+                    &ctx,
+                    None,
+                    None,
+                    self.decode_budget(),
                 )
-            })?;
+                .map(|(messages, _report)| messages)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "decode_window_with_ap (rolling) failed for {}: {e}",
+                        path.display()
+                    )
+                })?;
             // Update the deque with callsigns from these decodes.
             if let Ok(mut deque) = self.rolling_calls.lock() {
                 for msg in &r {
@@ -817,12 +884,24 @@ impl DecoderUnderTest for Ft8Decoder {
             r
         } else {
             match &self.ap_context {
-                Some(ctx) => decoder.decode_window_with_ap(&samples, ctx).map_err(|e| {
-                    anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display())
-                })?,
-                None => decoder.decode_window(&samples).map_err(|e| {
-                    anyhow::anyhow!("decode_window failed for {}: {e}", path.display())
-                })?,
+                Some(ctx) => decoder
+                    .decode_window_with_ap_scoped_partner_budgeted(
+                        &samples,
+                        ctx,
+                        None,
+                        None,
+                        self.decode_budget(),
+                    )
+                    .map(|(messages, _report)| messages)
+                    .map_err(|e| {
+                        anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display())
+                    })?,
+                None => decoder
+                    .decode_window_budgeted(&samples, self.decode_budget())
+                    .map(|(messages, _report)| messages)
+                    .map_err(|e| {
+                        anyhow::anyhow!("decode_window failed for {}: {e}", path.display())
+                    })?,
             }
         };
         // hb-057 V2 (Session 3): record each decoded (callsign, DT, freq)

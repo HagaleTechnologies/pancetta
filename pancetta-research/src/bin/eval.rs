@@ -211,6 +211,13 @@ struct Args {
     /// the tier at a small generated FT4 manifest instead of the full
     /// 550-file production corpus.
     synth_ft4_manifest: Option<PathBuf>,
+    /// Task W3.3b [HARNESS]: per-window wall-clock decode budget in
+    /// milliseconds, derived from `--effort <eco|standard|deep|auto|unlimited>`
+    /// via `effort_preset_budget_ms` below (mirrors production's
+    /// `pancetta/src/coordinator/effort.rs::preset_budget_ms`). `None`
+    /// (flag omitted, the default) reproduces `DecodeBudget::unlimited()`
+    /// exactly — every existing eval invocation is unaffected.
+    effort_budget_ms: Option<u64>,
 }
 
 impl Args {
@@ -285,6 +292,7 @@ impl Args {
         let mut max_concurrent_tiers_pool_dir: Option<PathBuf> = None;
         let mut noise_manifest: Option<PathBuf> = None;
         let mut synth_ft4_manifest: Option<PathBuf> = None;
+        let mut effort_budget_ms: Option<u64> = None;
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
             match arg.as_str() {
@@ -735,6 +743,12 @@ impl Args {
                             .into(),
                     );
                 }
+                "--effort" => {
+                    let v = iter
+                        .next()
+                        .context("--effort needs a value (eco|standard|deep|auto|unlimited)")?;
+                    effort_budget_ms = effort_preset_budget_ms(&v)?;
+                }
                 "-h" | "--help" => {
                     eprintln!(
                         "usage: eval --tier <tiers,...> --mode <mode> --output <path> [--seed N] [--max-passes N] [--max-sync-candidates N] [--max-candidates N] [--osd-depth N|none] [--ldpc-iters N]"
@@ -776,6 +790,7 @@ impl Args {
                     eprintln!("  --max-concurrent-tiers-pool-dir PATH: override the slot-pool directory (default /tmp/pancetta-eval-tier-slots).");
                     eprintln!("  --noise-manifest PATH: override the noise_1000 tier's manifest (default research/corpus/curated/noise/noise_1000.manifest.json).");
                     eprintln!("  --synth-ft4-manifest PATH: override the synth-ft4 tier's manifest (default research/corpus/synth/manifests/ft4_clean.manifest.json).");
+                    eprintln!("  --effort <eco|standard|deep|auto|unlimited>: Task W3.3b [HARNESS] — construct the decoder's DecodeBudget from a real production effort preset (eco=1ms, standard=250ms, deep=1000ms, auto=1000ms [Fast-tier assumption; no live hardware probe here], unlimited=DecodeBudget::unlimited()) instead of always using an unlimited budget. Default (flag omitted): unlimited, byte-identical to every prior eval invocation. Mirrors pancetta/src/coordinator/effort.rs::preset_budget_ms.");
                     std::process::exit(0);
                 }
                 other => anyhow::bail!("unknown arg: {other}"),
@@ -852,8 +867,48 @@ impl Args {
             max_concurrent_tiers_pool_dir,
             noise_manifest,
             synth_ft4_manifest,
+            effort_budget_ms,
         })
     }
+}
+
+/// Task W3.3b [HARNESS]: effort-preset name → per-window wall-clock decode
+/// budget in milliseconds, mirroring the production mapping in
+/// `pancetta/src/coordinator/effort.rs::preset_budget_ms` (decoder-speed-
+/// overhaul Task 14: `Eco`=1, `Standard`=250, `Deep`=1000, `Max`=unlimited).
+///
+/// This is a deliberate, documented LOCAL RE-DERIVATION rather than a
+/// cross-crate call into that function: `preset_budget_ms` is `pub(crate)`
+/// inside the `pancetta` binary crate (not `pub`, and its `coordinator`
+/// submodule tree is private too), and reaching it would require adding
+/// `pancetta` — which pulls in axum, tokio-tungstenite, cpal, the hamlib
+/// FFI bindings, the TUI, etc. — as a dependency of `pancetta-research`
+/// just to reach one 4-arm match statement. That is a materially larger
+/// dependency-graph change than this harness-only CLI flag warrants (see
+/// task W3.3b's brief: "a well-justified local re-derivation of just the
+/// preset->ms numbers, cited from the production source, is an acceptable
+/// fallback"). **KEEP IN SYNC** with `preset_budget_ms` if the production
+/// constants ever change.
+///
+/// `auto` here assumes `HardwareTier::Fast` (mirrors the coordinator's own
+/// "innocent until proven otherwise" startup assumption in
+/// `coordinator/tier.rs`/`coordinator/mod.rs`'s pre-probe seeding) — the
+/// eval harness has no live hardware-tier probe, and probing would make
+/// scorecards host-dependent and non-reproducible. `unlimited` returns
+/// `None`, which `Ft8Decoder::decode_budget()` maps to
+/// `DecodeBudget::unlimited()` — the harness's pre-existing, and default,
+/// behavior.
+fn effort_preset_budget_ms(name: &str) -> anyhow::Result<Option<u64>> {
+    Ok(match name {
+        "unlimited" => None,
+        "eco" => Some(1),
+        "standard" => Some(250),
+        "deep" => Some(1000),
+        "auto" => Some(1000),
+        other => anyhow::bail!(
+            "--effort: unknown preset {other:?} (expected eco|standard|deep|auto|unlimited)"
+        ),
+    })
 }
 
 fn workspace_root() -> anyhow::Result<PathBuf> {
@@ -1955,6 +2010,14 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
         let cap = args.chrono_replay_capacity.unwrap_or(0);
         let (d2, _state) = d.with_chrono_replay(cap);
         d = d2;
+    }
+    // Task W3.3b [HARNESS]: only touched when --effort is passed; omitting
+    // the flag leaves `effort_budget_ms` at its parse-time default (None)
+    // and this branch never runs, so `with_effort_budget_ms` is never
+    // called and the decoder's `budget_ms` stays at its own default
+    // (`None`) — byte-identical to every pre-existing eval invocation.
+    if args.effort_budget_ms.is_some() {
+        d = d.with_effort_budget_ms(args.effort_budget_ms);
     }
 
     d
