@@ -14,7 +14,20 @@
 //!   2. low-pass FIR (Kaiser windowed-sinc, real taps on complex input)
 //!   3. integer decimate by `D = 60`  →  complex baseband at `fs_bb = 200 Hz`
 //!      (`sps_bb = 32` complex samples/symbol, exact).
+//!
+//! Task W3.1 (`docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`
+//! §3, D3) adds [`extract_candidate_baseband`] — a per-candidate front end that
+//! slices a search-margin window out of the raw window audio around a
+//! candidate's coarse `start_sample` and runs it through this same
+//! down-mix/FIR/decimate pipeline, returning a [`BasebandSlice`]. This is
+//! still **unwired**: `decoder.rs`'s `DecodeContext::audio: &[f64]` (the raw
+//! window audio, already plumbed to the candidate stage for the existing
+//! fine-FFT fallback at `par_extract_symbols_complex`) is exactly the buffer
+//! a future caller would pass in — no new plumbing was needed, so none was
+//! added. Task W3.2 (fine dt/df search) and W3.3 (matched demod) are the
+//! planned first callers.
 
+use crate::protocol::ProtocolParams;
 use num_complex::Complex;
 
 /// Input sample rate (FT8 fixed).
@@ -23,6 +36,21 @@ pub const FS: f64 = 12_000.0;
 pub const FS_BB: f64 = 200.0;
 /// Integer decimation factor (`FS / FS_BB`, exact).
 pub const DECIM: usize = 60;
+
+/// Search-margin size on each side of the nominal symbol window, in whole
+/// symbols.
+///
+/// Sized for Task W3.2's planned fine dt/df search, which scans
+/// `dt ∈ ±half symbol`: two full symbols of margin per side gives 4×
+/// headroom over that ±0.5-symbol requirement, which comfortably absorbs
+/// (a) the coarse candidate's own quantization error (the caller's
+/// `start_sample` is only accurate to the spectrogram time step, not to the
+/// sample), and (b) implementation slack for W3.3's matched-demod stage to
+/// look a little past the nominal symbol boundaries without a second
+/// extraction. Not a value from the design spec (none is given numerically
+/// there) — a deliberate, documented choice future tasks can widen if the
+/// fine-sync search ever needs more room.
+pub const MARGIN_SYMBOLS: f64 = 2.0;
 
 // Low-pass design targets (see spec §2.4): pass the 50 Hz signal (+ skirt),
 // kill everything by `FS_BB/2 = 100 Hz` so decimation images can't masquerade
@@ -149,6 +177,144 @@ pub fn baseband_extract_with(audio: &[f64], f_cand_hz: f64, taps: &[f64]) -> Vec
         c += DECIM;
     }
     out
+}
+
+/// A per-candidate baseband extraction: the nominal 79-symbol (or
+/// protocol-appropriate) transmission window, plus [`MARGIN_SYMBOLS`] of
+/// extra context on each side, down-mixed to 200 Hz complex baseband.
+///
+/// Coordinates are all in the *baseband* (200 Hz, post-decimation) domain
+/// unless a field name says otherwise. Symbol `s` (`0 <= s < num_symbols`) of
+/// the nominal window lives at
+/// `samples[nominal_start_index + s * samples_per_symbol .. + samples_per_symbol]`
+/// — but a caller doing a fine dt search should expect the true signal to sit
+/// a few samples either side of that (that's what the margin is for).
+#[derive(Debug, Clone)]
+pub struct BasebandSlice {
+    /// Complex baseband samples at `FS_BB` (200 Hz).
+    pub samples: Vec<Complex<f64>>,
+    /// Baseband sample rate (`FS_BB`, 200 Hz).
+    pub sample_rate_hz: f64,
+    /// Baseband samples per symbol (32 for FT8/FT4 at `FS_BB` = 200 Hz).
+    pub samples_per_symbol: usize,
+    /// Number of symbols in the nominal (non-margin) window, from `pp.num_symbols`.
+    pub num_symbols: usize,
+    /// Index into `samples` where the nominal window (symbol 0) begins.
+    /// Equal to `margin_samples` by construction (the margin is symmetric),
+    /// but callers should use this field rather than assuming that.
+    pub nominal_start_index: usize,
+    /// Baseband-domain margin available *before* `nominal_start_index`
+    /// (i.e. `nominal_start_index` itself). A dt search may range back this
+    /// far before running out of leading context; see [`MARGIN_SYMBOLS`]
+    /// for the nominal sizing. The trailing margin (after the last nominal
+    /// symbol) is `samples.len() - nominal_start_index - num_symbols *
+    /// samples_per_symbol` — normally within a sample or two of this value,
+    /// but not asserted equal: the FIR's own group delay consumes a small,
+    /// deterministic slice of the requested margin on the leading edge only
+    /// (see the function doc), so don't assume exact front/back symmetry.
+    pub margin_samples: usize,
+    /// The `start_sample` the caller passed in (audio-domain, `FS` = 12000 Hz
+    /// sample index into the original `audio` slice) — echoed back so a
+    /// consumer can map a baseband-domain dt refinement back to an
+    /// audio-domain sample offset (`dt_audio_samples ≈ dt_bb_samples * DECIM`).
+    pub start_sample: isize,
+    /// The candidate carrier frequency (Hz) used for the down-mix.
+    pub freq_hz: f64,
+}
+
+/// Extract a per-candidate baseband slice around a coarse candidate position.
+///
+/// Slices `[start_sample - margin, start_sample + window + margin)` out of
+/// `audio` (zero-padding whatever falls outside `audio`'s bounds, so a
+/// candidate near either edge of the recording still gets a full-size,
+/// well-formed slice rather than a truncated one), then runs it through the
+/// same down-mix → Kaiser-FIR → decimate-by-60 pipeline as
+/// [`baseband_extract`], producing 200 Hz complex baseband at 32
+/// samples/symbol.
+///
+/// `start_sample` is audio-domain (`FS` = 12000 Hz), matching the coarse
+/// candidate position a caller like `decoder.rs`'s `DecodeContext::audio`
+/// would provide; it may be negative or run past `audio.len()` after adding
+/// the window — both are zero-padded rather than panicking, since a coarse
+/// candidate near the edge of a decode window is an expected input, not a
+/// caller bug.
+///
+/// This function is standalone and unwired (Task W3.1): nothing in the live
+/// decode path calls it yet. It is the planned entry point for Task W3.2
+/// (fine dt/df search) and W3.3 (matched demod).
+pub fn extract_candidate_baseband(
+    audio: &[f64],
+    freq_hz: f64,
+    start_sample: isize,
+    pp: &ProtocolParams,
+) -> BasebandSlice {
+    let taps = design_decimation_lowpass();
+    extract_candidate_baseband_with(audio, freq_hz, start_sample, pp, &taps)
+}
+
+/// Like [`extract_candidate_baseband`] but with caller-supplied FIR taps
+/// (lets a hot loop design the filter once and reuse it across candidates).
+pub fn extract_candidate_baseband_with(
+    audio: &[f64],
+    freq_hz: f64,
+    start_sample: isize,
+    pp: &ProtocolParams,
+    taps: &[f64],
+) -> BasebandSlice {
+    let sps = pp.samples_per_symbol(FS as u32);
+    let window_samples = pp.num_symbols * sps;
+    let margin_samples_audio = (MARGIN_SYMBOLS * sps as f64).round() as isize;
+
+    let lo = start_sample - margin_samples_audio;
+    let hi = start_sample + window_samples as isize + margin_samples_audio;
+    let span = (hi - lo).max(0) as usize;
+
+    // Build the (possibly zero-padded) local slice `[lo, hi)` out of `audio`.
+    let mut local = vec![0.0f64; span];
+    let copy_lo = lo.max(0);
+    let copy_hi = hi.min(audio.len() as isize);
+    if copy_hi > copy_lo {
+        let src_start = copy_lo as usize;
+        let src_end = copy_hi as usize;
+        let dst_start = (copy_lo - lo) as usize;
+        let dst_end = dst_start + (src_end - src_start);
+        local[dst_start..dst_end].copy_from_slice(&audio[src_start..src_end]);
+    }
+
+    let samples = baseband_extract_with(&local, freq_hz, taps);
+
+    // Map the local-slice sample index `margin_samples_audio` (i.e. the
+    // caller's `start_sample`) to a baseband output index. `baseband_extract_with`
+    // emits output index `k` for local input index `c0 + k*DECIM`, where `c0`
+    // is the first multiple-of-DECIM-aligned valid center (see that
+    // function's doc). `margin_samples_audio` is constructed as a multiple
+    // of `DECIM` (a whole number of symbols, and `sps` is itself a multiple
+    // of `DECIM` for FT8/FT4), so it lands exactly on a decimation output
+    // when `c0` is also DECIM-aligned (which it is by construction) —
+    // dividing out any residual FIR group-delay alignment cleanly.
+    let ntaps = taps.len();
+    let m = (ntaps - 1) / 2;
+    let c0 = if m.is_multiple_of(DECIM) {
+        m
+    } else {
+        m.div_ceil(DECIM) * DECIM
+    };
+    let margin_bb = if margin_samples_audio >= 0 {
+        (margin_samples_audio as usize).saturating_sub(c0) / DECIM
+    } else {
+        0
+    };
+
+    BasebandSlice {
+        samples,
+        sample_rate_hz: FS_BB,
+        samples_per_symbol: sps / DECIM,
+        num_symbols: pp.num_symbols,
+        nominal_start_index: margin_bb,
+        margin_samples: margin_bb,
+        start_sample,
+        freq_hz,
+    }
 }
 
 #[cfg(test)]
@@ -313,6 +479,98 @@ mod hb243_baseband_tests {
             frac >= 0.9,
             "baseband per-symbol tone recovery {correct}/{counted} ({frac:.2}) < 0.90 \
              over {n_syms} symbols"
+        );
+    }
+
+    /// Task W3.1 TDD: `extract_candidate_baseband` at a nonzero dt offset.
+    ///
+    /// Synthesizes a real FT8 signal (via the real encoder/modulator, not a
+    /// hand-rolled tone) at 1503.1 Hz, then places it +0.12 s late relative
+    /// to the coarse candidate's assumed `start_sample = 0` — i.e. the
+    /// caller's coarse sync estimate is wrong by 0.12 s, exactly the
+    /// scenario the search margin exists to cover. Recovering the correct
+    /// per-symbol tones therefore requires the function to (a) extract a
+    /// window wide enough to still contain the true signal despite the
+    /// caller's `start_sample` missing it by 0.12 s, and (b) preserve
+    /// baseband-domain coordinates precisely enough that
+    /// `nominal_start_index + dt_bb` lands exactly on the true symbol-0
+    /// boundary. A bug in the start_sample/margin bookkeeping (as opposed
+    /// to a zero-offset bug that a dt=0 test would miss) would desync every
+    /// symbol frame and collapse the recovered-tone fraction.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn extract_candidate_baseband_recovers_symbols_at_nonzero_dt() {
+        use crate::{Ft8Encoder, Ft8Modulator};
+
+        let f_cand = 1503.1_f64;
+        let pp = ProtocolParams::ft8();
+        let symbols = Ft8Encoder::new()
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new(FS as u32, f_cand, 0.9).expect("modulator");
+        let audio_f32 = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        let tx: Vec<f64> = audio_f32.iter().map(|&s| s as f64).collect();
+
+        // dt = +0.12 s of silence prepended: the true signal starts 0.12 s
+        // *after* sample 0, which is what the (deliberately wrong) coarse
+        // `start_sample = 0` below assumes. Chosen as an exact multiple of
+        // `DECIM` (60) so the expected baseband-domain offset is an exact
+        // integer, keeping the assertion below free of rounding slop.
+        let dt_offset_s = 0.12_f64;
+        let dt_audio_samples = (dt_offset_s * FS).round() as usize;
+        assert_eq!(
+            dt_audio_samples % DECIM,
+            0,
+            "test fixture: dt offset must be an exact multiple of DECIM"
+        );
+        let dt_bb = dt_audio_samples / DECIM;
+
+        let mut audio = vec![0.0f64; dt_audio_samples];
+        audio.extend_from_slice(&tx);
+        // No trailing padding added deliberately: `hi` (start_sample +
+        // window + margin) runs past `audio.len()` here, so this also
+        // exercises the function's own past-the-end zero-padding path
+        // rather than relying on the test to provide a big enough buffer.
+
+        let start_sample: isize = 0; // the coarse (wrong-by-dt) candidate estimate
+        let bb = extract_candidate_baseband(&audio, f_cand, start_sample, &pp);
+
+        assert_eq!(bb.samples_per_symbol, 32, "baseband samples per symbol");
+        assert_eq!(bb.num_symbols, pp.num_symbols);
+        assert!(
+            bb.nominal_start_index >= dt_bb,
+            "margin ({}) must be able to absorb the dt offset ({dt_bb} bb samples)",
+            bb.nominal_start_index
+        );
+
+        let mut correct = 0;
+        let mut counted = 0;
+        for (s, &sym) in symbols.iter().enumerate() {
+            let start = bb.nominal_start_index + dt_bb + s * bb.samples_per_symbol;
+            if start + bb.samples_per_symbol > bb.samples.len() {
+                break;
+            }
+            let frame = &bb.samples[start..start + bb.samples_per_symbol];
+            let mut best_bin = 0usize;
+            let mut best_mag = -1.0;
+            for tone in 0..8usize {
+                let mag = goertzel_mag(frame, tone as f64 / bb.samples_per_symbol as f64);
+                if mag > best_mag {
+                    best_mag = mag;
+                    best_bin = tone;
+                }
+            }
+            counted += 1;
+            if best_bin == sym as usize {
+                correct += 1;
+            }
+        }
+        assert!(counted > 0);
+        let frac = correct as f64 / counted as f64;
+        assert!(
+            frac >= 0.9,
+            "baseband per-symbol tone recovery at dt=+0.12s: {correct}/{counted} \
+             ({frac:.2}) < 0.90"
         );
     }
 }
