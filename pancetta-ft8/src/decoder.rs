@@ -2669,6 +2669,8 @@ impl Ft8Decoder {
                 floor_iters: self.config.floor_iters,
                 deep_iters: self.config.deep_iters,
                 escalation_parity_max: self.config.escalation_parity_max,
+                // Task W2.4: OSD escalation-ladder budget checkpointing.
+                budget: self.current_budget,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -2718,6 +2720,9 @@ impl Ft8Decoder {
                             ctx.ldpc_feedback_attenuate_factor,
                             ctx.ldpc_feedback_erase_threshold,
                         )
+                        // Task W2.4: OSD escalation-ladder budget
+                        // checkpointing (see `DecodeContext::budget`).
+                        .with_budget(ctx.budget)
                 };
                 // Perf (decoder-analysis A3): when adaptive_ldpc_iters is off
                 // (the production default), iters_low == iters_mid ==
@@ -7092,6 +7097,10 @@ struct DecodeContext<'a> {
     /// tolerated before escalating to `deep_iters`. See
     /// `Ft8Config::escalation_parity_max`.
     escalation_parity_max: usize,
+    /// Task W2.4: per-window [`DecodeBudget`], threaded into each
+    /// per-thread `LdpcDecoder` via `with_budget` so OSD's escalation
+    /// ladder checkpoints against it.
+    budget: DecodeBudget,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -10349,6 +10358,15 @@ struct LdpcDecoder {
     /// behavior. When true, a failed first BP pass triggers one meta-loop
     /// with refined LLRs before falling through to OSD.
     feedback_refinement: FeedbackRefinementConfig,
+    /// Task W2.4: per-window wall-clock budget, forwarded to
+    /// [`OsdDecoder::decode_with_features_scored_budgeted`] so OSD's
+    /// escalation ladder (order-1/2/3) checkpoints against it exactly
+    /// like the decode-speed-overhaul plan's other S1-S7 stages.
+    /// Default [`DecodeBudget::unlimited()`] preserves byte-identical
+    /// behavior for every caller that doesn't opt in via
+    /// [`Self::with_budget`] (every test, and any production call site
+    /// that predates this field).
+    budget: DecodeBudget,
 }
 
 /// Internal layered-BP loop state at an iteration boundary: the running
@@ -10596,6 +10614,7 @@ impl LdpcDecoder {
             layered: false,
             pade_atanh: false,
             feedback_refinement: FeedbackRefinementConfig::default(),
+            budget: DecodeBudget::unlimited(),
         })
     }
 
@@ -10618,6 +10637,14 @@ impl LdpcDecoder {
     /// Task W2.3 [A/B]: override which LLR array drives OSD's search.
     fn with_osd_input(mut self, v: OsdInput) -> Self {
         self.osd_input = v;
+        self
+    }
+
+    /// Task W2.4: set the per-window [`DecodeBudget`] forwarded to OSD's
+    /// escalation-ladder checkpoints. Default (never called)
+    /// [`DecodeBudget::unlimited()`].
+    fn with_budget(mut self, v: DecodeBudget) -> Self {
+        self.budget = v;
         self
     }
 
@@ -10936,11 +10963,16 @@ impl LdpcDecoder {
                 // the caller sees per-success (depth, nharderrs) telemetry
                 // AND the acceptance-gated selection inside OSD's
                 // order-1/2/3 loops scores against the real channel LLRs
-                // rather than `llr_arr`.
-                let osd_result_with_features = osd.decode_with_features_scored(
+                // rather than `llr_arr`. Task W2.4: the `_budgeted` variant
+                // checkpoints the order-1/2/3 escalation ladder against
+                // `self.budget` — under `DecodeBudget::unlimited()` (every
+                // caller that never calls `with_budget`) this is
+                // byte-identical to the pre-W2.4 unconditional call.
+                let osd_result_with_features = osd.decode_with_features_scored_budgeted(
                     llr_arr,
                     &channel_llrs_arr,
                     neural_ordering.as_ref(),
+                    self.budget,
                 );
 
                 // hb-064: record (trajectory, OSD outcome) for the

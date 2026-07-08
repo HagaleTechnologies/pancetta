@@ -77,6 +77,9 @@ fn main() {
             if let Some(v) = env_usize("ABL_LDPC_ITERS") {
                 config.ldpc_iterations = v;
             }
+            if let Some(v) = env_usize("ABL_OSD_DEPTH") {
+                config.osd_depth = Some(v as u8);
+            }
             if let Some(v) = env_usize("ABL_SYNC_CANDS") {
                 config.max_sync_candidates = v;
             }

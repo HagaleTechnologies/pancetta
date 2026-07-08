@@ -21,6 +21,7 @@ use std::collections::HashMap;
 use bitvec::prelude::*;
 
 use crate::acceptance::{self, AcceptanceScore};
+use crate::budget::DecodeBudget;
 use crate::ldpc::{LDPC_CODEWORD_BITS, LDPC_GENERATOR, LDPC_INFO_BITS, LDPC_PARITY_BITS};
 use crate::message::{CRC_BITS, PAYLOAD_BITS};
 
@@ -685,12 +686,52 @@ impl OsdDecoder {
     /// unreachable at `max_depth == 0` (each is behind its own `if
     /// self.config.max_depth < N { return None; }` guard), so production
     /// is byte-identical.
+    ///
+    /// Thin wrapper around [`Self::decode_with_features_scored_budgeted`]
+    /// with [`DecodeBudget::unlimited()`] — preserves every existing
+    /// caller (including every unit test in this module and
+    /// [`Self::decode_with_features`]/[`Self::decode`]) byte-for-byte,
+    /// since `has_time()` on an unlimited budget always returns `true`.
     #[allow(clippy::needless_range_loop)]
     pub fn decode_with_features_scored(
         &self,
         llrs: &[f32; LDPC_CODEWORD_BITS],
         channel_llrs: &[f32; LDPC_CODEWORD_BITS],
         neural_ordering: Option<&[f32; LDPC_INFO_BITS]>,
+    ) -> Option<(BitVec, u8, u8, AcceptanceScore)> {
+        self.decode_with_features_scored_budgeted(
+            llrs,
+            channel_llrs,
+            neural_ordering,
+            DecodeBudget::unlimited(),
+        )
+    }
+
+    /// Task W2.4 (decoder-speed-overhaul budget integration): identical to
+    /// [`Self::decode_with_features_scored`], but checkpoints the
+    /// escalation ladder (order-1 -> order-2 -> order-3/npre2) against a
+    /// [`DecodeBudget`] the same way the decode-speed-overhaul plan's
+    /// S1-S7 stages check `DecodeBudget::has_time()` between work items.
+    /// OSD orders were not exercised in production before this task
+    /// (`osd_depth: Some(0)` never escalated past the always-cheap
+    /// order-0 hard-decision trial), so — now that deeper orders are
+    /// live — each order boundary is treated as its own checkpointed
+    /// work item: order-2 is ~45x costlier than order-1 (`C(91,2)` vs
+    /// `C(91,1)` trials) and order-3 a further ~30x costlier again
+    /// (`C(91,3)`), so re-checking between EACH order (not just once per
+    /// candidate) keeps a single slow candidate from silently consuming
+    /// an entire window's remaining budget on its own. Order-0 is
+    /// UNCHANGED (see the doc comment above) — it never consults
+    /// `budget` at all, so a budget that's already expired when this is
+    /// called still gets the same cheap order-0 attempt production
+    /// always ran.
+    #[allow(clippy::needless_range_loop)]
+    pub fn decode_with_features_scored_budgeted(
+        &self,
+        llrs: &[f32; LDPC_CODEWORD_BITS],
+        channel_llrs: &[f32; LDPC_CODEWORD_BITS],
+        neural_ordering: Option<&[f32; LDPC_INFO_BITS]>,
+        budget: DecodeBudget,
     ) -> Option<(BitVec, u8, u8, AcceptanceScore)> {
         // 1. Sort indices by reliability (most reliable first, on a
         // commensurable scale across info AND parity bits — see
@@ -750,6 +791,13 @@ impl OsdDecoder {
         if self.config.max_depth < 1 {
             return None;
         }
+        // Task W2.4: checkpoint before the first escalation work item
+        // (order-1, 91 trials) — cheap, but a window whose budget is
+        // already exhausted by earlier candidates should not pay even
+        // this cost on every remaining BP-failed candidate.
+        if !budget.has_time() {
+            return None;
+        }
 
         // 6. OSD-1: pre-compute parity columns
         let mut parity_cols = [[false; LDPC_PARITY_BITS]; LDPC_INFO_BITS];
@@ -795,6 +843,12 @@ impl OsdDecoder {
         if self.config.max_depth < 2 {
             return None;
         }
+        // Task W2.4: checkpoint before order-2 (`C(91,2)` = 4,095 trials,
+        // ~45x order-1's cost) — the first genuinely expensive escalation
+        // step.
+        if !budget.has_time() {
+            return None;
+        }
 
         // 7. OSD-2: flip pairs — same collect-and-rank pattern as OSD-1.
         let mut best: Option<(BitVec, AcceptanceScore)> = None;
@@ -832,6 +886,13 @@ impl OsdDecoder {
         }
 
         if self.config.max_depth < 3 {
+            return None;
+        }
+        // Task W2.4: checkpoint before order-3 + npre2 (`C(91,3)` =
+        // 121,485 trials, ~30x order-2's cost again) — by far the
+        // costliest escalation step; a single candidate reaching this
+        // point with an already-exhausted budget must not run it.
+        if !budget.has_time() {
             return None;
         }
 
@@ -1375,6 +1436,77 @@ mod tests {
             let (_bits, depth, nharderrs) = result.unwrap();
             assert_eq!(depth, 1, "single-flip path should report depth=1");
             assert_eq!(nharderrs, 1, "single-flip path should report nharderrs=1");
+        }
+
+        /// Task W2.4: an already-expired [`DecodeBudget`] must block OSD's
+        /// escalation ladder (order-1+) exactly like `max_depth == 0` would
+        /// — proving the budget checkpoint genuinely gates the expensive
+        /// orders, not just compiles. A clean codeword (order-0 succeeds)
+        /// must still decode under an expired budget (order-0 never
+        /// consults `budget`); a single corrupted bit (needs order-1) must
+        /// NOT decode under an expired budget, but MUST decode under
+        /// `DecodeBudget::unlimited()` with the identical config.
+        #[test]
+        fn expired_budget_blocks_escalation_past_order_zero() {
+            let (_message, codeword) = make_test_codeword();
+            let decoder = OsdDecoder::new(OsdConfig {
+                max_depth: 3,
+                ..Default::default()
+            });
+            let expired = DecodeBudget::until(
+                std::time::Instant::now() - std::time::Duration::from_millis(1),
+            );
+
+            // Clean codeword: order-0 alone recovers it, budget irrelevant.
+            let clean_llrs = codeword_to_llrs(&codeword, 4.0);
+            let clean_result = decoder.decode_with_features_scored_budgeted(
+                &clean_llrs,
+                &clean_llrs,
+                None,
+                expired,
+            );
+            assert!(
+                clean_result.is_some(),
+                "order-0 must still succeed on a clean codeword even under an \
+                 expired budget — order-0 never consults `budget`"
+            );
+            assert_eq!(
+                clean_result.unwrap().1,
+                0,
+                "clean codeword decodes at depth 0"
+            );
+
+            // One corrupted bit forces escalation past order-0.
+            let mut bad_llrs = clean_llrs;
+            bad_llrs[5] = if codeword[5] { 0.1 } else { -0.1 };
+
+            let blocked =
+                decoder.decode_with_features_scored_budgeted(&bad_llrs, &bad_llrs, None, expired);
+            assert!(
+                blocked.is_none(),
+                "an expired budget must block OSD-1+ escalation, exactly as \
+                 max_depth == 0 would — got {:?}",
+                blocked
+            );
+
+            // The identical config+input under an unlimited budget DOES
+            // recover it (proves the block above is the budget, not some
+            // other change).
+            let unblocked = decoder.decode_with_features_scored_budgeted(
+                &bad_llrs,
+                &bad_llrs,
+                None,
+                DecodeBudget::unlimited(),
+            );
+            assert!(
+                unblocked.is_some(),
+                "the same candidate must still decode under an unlimited budget"
+            );
+            assert_eq!(
+                unblocked.unwrap().1,
+                1,
+                "recovers at depth 1 when unblocked"
+            );
         }
 
         #[test]
