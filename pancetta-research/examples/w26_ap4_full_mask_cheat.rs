@@ -147,7 +147,21 @@ fn run_hard200(workspace: &std::path::Path) -> anyhow::Result<()> {
         .and_then(|e| e.as_array())
         .context("manifest missing entries")?;
 
-    let baseline_cfg = Ft8Config::default();
+    // NOTE (post-flip pin): `Ft8Config::default().ap4_full_message_mask_enabled`
+    // was flipped to `true` in commit e777fdf4 based on THIS harness's
+    // measurement. `baseline_cfg` must therefore explicitly pin the flag
+    // back to `false` rather than relying on `Ft8Config::default()` — the
+    // whole point of "baseline" here is "plain AP4, no full mask", and
+    // since the flip, plain `default()` no longer means that. The
+    // `post_norm` variant pins it too, so it isolates the post-norm
+    // ordering effect alone rather than silently also picking up the full
+    // mask via the (now-true) crate default. See the mirrored fix in
+    // `pancetta-ft8/tests/w26_ap_coverage_tests.rs::ap4_full_mask_rescues_signal_that_plain_ap4_cannot_decode`,
+    // which caught this exact class of problem for the unit test.
+    let baseline_cfg = Ft8Config {
+        ap4_full_message_mask_enabled: false,
+        ..Ft8Config::default()
+    };
     let variants: [(&str, Ft8Config); 2] = [
         (
             "full_mask",
@@ -159,6 +173,7 @@ fn run_hard200(workspace: &std::path::Path) -> anyhow::Result<()> {
         (
             "post_norm",
             Ft8Config {
+                ap4_full_message_mask_enabled: false,
                 ap_injection_post_normalization: true,
                 ..Ft8Config::default()
             },
@@ -262,7 +277,15 @@ fn run_noise(workspace: &std::path::Path) -> anyhow::Result<()> {
         .and_then(|e| e.as_array())
         .context("manifest missing entries")?;
 
-    let baseline_cfg = Ft8Config::default();
+    // NOTE (post-flip pin): see the matching comment in `run_hard200` —
+    // `Ft8Config::default()` now has `ap4_full_message_mask_enabled: true`
+    // post-e777fdf4, so `baseline_cfg` and the `post_norm` variant must
+    // explicitly pin it back to `false` to keep measuring what their names
+    // claim (plain AP4 / post-norm-ordering-only).
+    let baseline_cfg = Ft8Config {
+        ap4_full_message_mask_enabled: false,
+        ..Ft8Config::default()
+    };
     let variants: [(&str, Ft8Config); 2] = [
         (
             "full_mask",
@@ -274,6 +297,7 @@ fn run_noise(workspace: &std::path::Path) -> anyhow::Result<()> {
         (
             "post_norm",
             Ft8Config {
+                ap4_full_message_mask_enabled: false,
                 ap_injection_post_normalization: true,
                 ..Ft8Config::default()
             },

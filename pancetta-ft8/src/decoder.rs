@@ -1268,6 +1268,35 @@ pub struct Ft8Config {
     /// unchanged under a fixed mid-QSO context that already activates
     /// AP4. When `false`, AP4 behavior reverts to i3-only (pre-W2.6). See
     /// `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`.
+    ///
+    /// Re-confirmed 2026-07-08 after a harness self-consistency bug was
+    /// found and fixed in `w26_ap4_full_mask_cheat.rs` (its "baseline" leg
+    /// had silently become byte-identical to the full-mask variant once
+    /// this flag's own default flipped to `true` — the evidence-generator
+    /// no longer reproduced the number it was supposed to justify). The
+    /// baseline was re-pinned to explicitly force `false`, and the re-run
+    /// reproduced the exact same +8/0 (hard-200) and 1→1 (noise) numbers —
+    /// see the "Post-flip harness self-consistency re-check" section of
+    /// the experiment log above. The flip decision was NOT changed.
+    ///
+    /// **Residual risk, not yet on-air validated**: both measurements above
+    /// are a perfect-information ceiling — `active_qso` is set to the
+    /// exact truth (hard-200 leg) or a fixed always-active context (noise
+    /// leg). Neither `ap_injection_survived(Ap4, ...)` nor
+    /// `ap4_full_mask_survived` checks that `active_qso` is CURRENT, only
+    /// that the decode agrees with whatever hypothesis was injected. If a
+    /// REAL competing signal is decoded while production's `active_qso` is
+    /// stale or wrong (e.g. a QSO just completed, another station's frame
+    /// in flight), it is theoretically possible for a strong genuine LLR
+    /// set to be bent by the injected to/from/token bias into a
+    /// survival-passing decode whose content matches the (wrong) injected
+    /// context rather than the real over-the-air message. This was not
+    /// measured (constructing that scenario needs a real competing signal
+    /// under a deliberately stale `active_qso`, materially harder than a
+    /// noise-only FP check) and is flagged as a candidate for this
+    /// project's on-air soak validation (see
+    /// `docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`
+    /// §7.5) before this flip is declared fully validated.
     pub ap4_full_message_mask_enabled: bool,
 
     /// Decoder-TP-sensitivity Task W2.6 [A/B]: AP injection/normalization

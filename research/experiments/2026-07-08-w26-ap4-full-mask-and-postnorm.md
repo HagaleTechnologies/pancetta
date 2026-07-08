@@ -240,6 +240,83 @@ the full unmodified hard-200 corpus via the CQ-vehicle test. Per this plan's est
   pursued further given the already-clear signal (net zero at n=213, net zero at n=200 full-corpus
   vehicle test) and this plan's guidance to avoid re-attempting an already-declined change unchanged.
 
+## Post-flip harness self-consistency re-check (2026-07-08, review finding, re-confirmed)
+
+**Finding**: after the flip in commit `e777fdf4` set `Ft8Config::default().ap4_full_message_mask_enabled`
+to `true`, the harness's `baseline_cfg = Ft8Config::default()` (in both `run_hard200` and `run_noise`)
+silently stopped meaning "plain AP4, no full mask" — it became byte-identical to the `full_mask`
+variant's explicit `ap4_full_message_mask_enabled: true`. Re-running the harness at HEAD as committed
+would have reported `recovered: 0, regressed: 0` for `full_mask`, directly contradicting the `+8/0`
+this log used to justify the flip. The `post_norm` variant had a second, subtler instance of the same
+bug: it only set `ap_injection_post_normalization: true` and relied on `..Ft8Config::default()` for
+everything else, so after the flip it silently ALSO carried `ap4_full_message_mask_enabled: true` —
+no longer isolating the post-norm-ordering effect alone. This is the same class of problem the
+parallel unit test `ap4_full_mask_rescues_signal_that_plain_ap4_cannot_decode` (in
+`pancetta-ft8/tests/w26_ap_coverage_tests.rs`) already caught and fixed for its own "plain AP4"
+comparison leg, just missed here in the corpus harness.
+
+**Fix applied**: `pancetta-research/examples/w26_ap4_full_mask_cheat.rs` now explicitly pins
+`ap4_full_message_mask_enabled: false` on `baseline_cfg` AND on the `post_norm` variant (both
+`run_hard200` and `run_noise`), independent of whatever the crate default happens to be, with an
+inline comment explaining why. The `full_mask` variant's explicit `true` was already correct and is
+unchanged.
+
+**Re-run result (2026-07-08, post-fix, same build/commands as the original methodology section
+above)**:
+
+```
+RR73/RRR/73 confirmation truths found in hard-200: 213
+Matched by plain AP4 (i3-only, baseline):           158
+[full_mask] matched: 166  recovered: 8  regressed: 0
+[post_norm] matched: 158  recovered: 1  regressed: 1
+
+Noise WAVs processed:                         1000
+False positives, plain AP4 (baseline):        1  (1 WAV)
+[full_mask] false positives:                  1  (1 WAV)
+[post_norm] false positives:                  1  (1 WAV)
+```
+
+**These are IDENTICAL to the original numbers reported above** (+8/0 on hard-200 for the full mask;
+1/1 net-zero for post-norm; 1→1 unchanged false-positive rate on noise, same single WAV/message).
+With the baseline now correctly pinned to `false` independent of the crate default, the original
+`+8/0` result IS reproducible and the flip decision stands on honest, re-confirmed evidence — this
+was a harness self-consistency bug (the evidence-generator no longer matching its own claimed output
+if re-run unmodified), not an error in the original measurement or the underlying decision. **No
+change to the flip decision.**
+
+## Residual risk not covered by this measurement (flagged for on-air soak, not built here)
+
+Both the original and re-confirmed measurements above are a **perfect-information ceiling**: the
+cheat harness sets `my_call`/`active_qso` to the truth message's own `to_callsign`/`from_callsign`
+(hard-200 leg) or a fixed, always-active synthetic context (noise leg). Two things this does NOT
+exercise, both flagged here rather than built (constructing a faithful test for the first is
+genuinely hard — noted below — and was already flagged as appropriately out of scope by the original
+reviewer):
+
+1. **Real signal + stale/wrong `active_qso`.** In production, `active_qso` is maintained by the QSO
+   state machine and can be stale or momentarily wrong (e.g. a QSO just completed, or another
+   station's frame is in flight) at the exact moment a DIFFERENT real signal is being decoded. Both
+   `ap_injection_survived(Ap4, ...)` and `ap4_full_mask_survived` only check that the decode AGREES
+   with the injected hypothesis — neither checks that the hypothesis is CURRENT. It is theoretically
+   possible for a strong genuine LLR set from an unrelated real signal to be bent, by the injected
+   to/from/token bias, into a survival-passing decode whose content matches the (wrong) injected
+   context rather than the real over-the-air message — a wrong-content false decode, not caught by
+   either survival check. This scenario needs a real competing signal decoded under a deliberately
+   stale/mismatched `active_qso`, which is a materially harder harness to build honestly (it needs a
+   second real signal AND a plausible "just went stale" QSO-state snapshot) than the noise-only FP
+   check done here, and was not attempted.
+2. **Perfect-information ceiling.** Both the `+8` recovered count and the noise-leg 1→1 FP-parity
+   result assume `active_qso` is exactly correct at decode time. The real-world benefit (and the real-
+   world FP exposure) is bounded above/below by how accurately production's live QSO-state tracking
+   actually stays in sync with the true on-air state — not measured here.
+
+Both risks are documented in a code comment next to `Ft8Config::ap4_full_message_mask_enabled` in
+`pancetta-ft8/src/decoder.rs`. Per this plan's spec (`docs/superpowers/specs/2026-07-06-decoder-speed-overhaul-design.md`
+§7.5) and the pattern used for other production-behavior changes this session, this flip should be
+treated as **not fully validated until confirmed by an on-air soak** comparing real QSO sessions with
+the full mask enabled vs. disabled, specifically watching for wrong-content decodes during genuine
+mid-QSO operation (not just the noise-corpus FP rate checked here).
+
 ## Files
 
 - `research/scorecards/w26_postnorm_hard200_baseline.json`, `w26_postnorm_hard200_variant.json`
