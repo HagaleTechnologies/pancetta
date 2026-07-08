@@ -1233,6 +1233,47 @@ pub struct Ft8Config {
     /// `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`
     /// §4.
     pub acceptance_gating_enabled: bool,
+
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: master switch for
+    /// `ApLevel::Cq` — assume a candidate that fails standard (AP0)
+    /// decode is a plain "CQ" call and inject the packed "CQ" token at
+    /// the `to_callsign`/first-token position (bits 0-27+28) plus i3=1
+    /// message-type bits. Unlike AP1-AP4, this needs **no context**
+    /// (`ApContext.my_call`/`active_qso` are irrelevant — "CQ" is a fixed
+    /// protocol token) so it is tried unconditionally, sequenced before
+    /// AP1, on every candidate that reaches AP injection. Default
+    /// **false** — when off this decode attempt never runs, byte-
+    /// identical to pre-W2.6. See
+    /// `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`.
+    pub cq_ap_enabled: bool,
+
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: extend AP4 from a
+    /// message-TYPE-only prior (i3=1) to a full message-CONTENT mask.
+    /// When `true`, the AP4 candidate ALSO tries, once per
+    /// [`crate::ap::ConfirmationToken`] variant (RR73, RRR, then 73), the
+    /// full `ir` bit (58) + 15-bit `igrid4` field (59-73) injection via
+    /// [`crate::ap::inject_confirmation_token_bits`] — strictly additive,
+    /// falling through to the plain (i3-only) AP4 attempt if none of the
+    /// three survive. Default **false** — when off, AP4 behavior is
+    /// byte-identical to pre-W2.6 (i3-only). See
+    /// `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`.
+    pub ap4_full_message_mask_enabled: bool,
+
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: AP injection/normalization
+    /// ordering. Legacy (default `false`): inject the fixed-magnitude AP
+    /// bits into the raw channel LLRs, THEN call `normalize_llrs` — the
+    /// injected magnitude contributes to the variance `normalize_llrs`
+    /// computes over the WHOLE 174-element array, which can distort the
+    /// scale factor applied to the (majority) non-injected
+    /// channel-evidence bits. When `true`: `normalize_llrs` runs FIRST
+    /// (pure channel evidence, uncontaminated by the artificial injected
+    /// magnitude), and AP bits are injected AFTER, at a fixed
+    /// post-normalization magnitude. Applies to every live AP injection
+    /// site (`par_try_ldpc_with_ap`, `par_try_ldpc_with_recent_only`,
+    /// `par_try_ldpc_with_cq`, `par_try_ldpc_with_ap4_full`). Default
+    /// **false** — byte-identical to pre-W2.6 (inject-then-normalize).
+    /// See `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`.
+    pub ap_injection_post_normalization: bool,
 }
 
 impl Default for Ft8Config {
@@ -1588,6 +1629,19 @@ impl Default for Ft8Config {
             // pre-W2.5 behavior (the blunt sync-score floor governs
             // unconditionally).
             acceptance_gating_enabled: false,
+            // [A/B] default OFF (Task W2.6) until the hard-200 +
+            // noise_1000 gate passes. When false, the CQ mask never
+            // runs — byte-identical to pre-W2.6.
+            cq_ap_enabled: false,
+            // [A/B] default OFF (Task W2.6) until the hard-200 +
+            // noise_1000 gate passes. When false, AP4 stays i3-only
+            // (message-type prior), byte-identical to pre-W2.6.
+            ap4_full_message_mask_enabled: false,
+            // [A/B] default OFF (Task W2.6) until the hard-200 +
+            // noise_1000 gate passes. When false, every AP injection
+            // site injects BEFORE normalize_llrs, byte-identical to
+            // pre-W2.6.
+            ap_injection_post_normalization: false,
         }
     }
 }
@@ -2704,6 +2758,12 @@ impl Ft8Decoder {
                 // Default OFF keeps every gate site byte-identical to
                 // pre-W2.5 behavior.
                 acceptance_gating_enabled: self.config.acceptance_gating_enabled,
+                // Task W2.6 [A/B]: CQ mask / AP4 full-content mask /
+                // post-normalization injection ordering. All default OFF
+                // — byte-identical to pre-W2.6.
+                cq_ap_enabled: self.config.cq_ap_enabled,
+                ap4_full_message_mask_enabled: self.config.ap4_full_message_mask_enabled,
+                ap_injection_post_normalization: self.config.ap_injection_post_normalization,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -5224,7 +5284,9 @@ impl Ft8Decoder {
         const SCRUTINY_THRESHOLD: f32 = 0.65;
         let lowest_possible_floor = match ap_level {
             crate::ap::ApLevel::Ap0 => MIN_DECODE_CONFIDENCE,
-            crate::ap::ApLevel::Ap1 | crate::ap::ApLevel::Ap2 => MIN_AP_DECODE_CONFIDENCE,
+            crate::ap::ApLevel::Ap1 | crate::ap::ApLevel::Ap2 | crate::ap::ApLevel::Cq => {
+                MIN_AP_DECODE_CONFIDENCE
+            }
             crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
                 if self.config.a8_qso_state_ap_enabled {
                     MIN_DECODE_CONFIDENCE
@@ -5263,6 +5325,9 @@ impl Ft8Decoder {
                 }
             }
             crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
+                crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
+            }
+            crate::ap::ApLevel::Cq => {
                 crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
             }
         }
@@ -5327,6 +5392,7 @@ impl Ft8Decoder {
             crate::ap::ApLevel::Ap2 => 2,
             crate::ap::ApLevel::Ap3 => 3,
             crate::ap::ApLevel::Ap4 => 4,
+            crate::ap::ApLevel::Cq => 5,
         };
         // Minimum confidence floor. Two thresholds: AP0 decodes can land at
         // sync_score ≥ 4.92 (the LDPC has no priors, so a CRC-valid output
@@ -7139,6 +7205,15 @@ struct DecodeContext<'a> {
     /// `false` (default) keeps every gate site's blunt confidence floor
     /// byte-identical to pre-W2.5 behavior.
     acceptance_gating_enabled: bool,
+    /// Task W2.6 [A/B]: master switch for `ApLevel::Cq`. See
+    /// `Ft8Config::cq_ap_enabled`.
+    cq_ap_enabled: bool,
+    /// Task W2.6 [A/B]: master switch for the AP4 full message-content
+    /// mask. See `Ft8Config::ap4_full_message_mask_enabled`.
+    ap4_full_message_mask_enabled: bool,
+    /// Task W2.6 [A/B]: AP injection/normalization ordering. See
+    /// `Ft8Config::ap_injection_post_normalization`.
+    ap_injection_post_normalization: bool,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -7979,6 +8054,26 @@ fn par_try_ap_decode(
         let snr_db = par_estimate_snr_spectrogram(ctx.protocol_params, &tone_magnitudes);
         let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
 
+        // --- CQ (Task W2.6 [A/B]): assume this candidate is a plain "CQ"
+        // call. Sequenced before AP1 per the task brief — needs no
+        // context at all, so it's tried unconditionally on every
+        // candidate that reaches AP injection (gated only by the config
+        // flag; when off this block never runs, byte-identical to
+        // pre-W2.6). ---
+        if ctx.cq_ap_enabled {
+            if let Some(msg) = par_try_ldpc_with_cq(
+                ctx,
+                ldpc,
+                &base_llrs,
+                snr_db,
+                confidence,
+                base_frequency,
+                time_offset_s,
+            ) {
+                return Some(msg);
+            }
+        }
+
         // --- AP1: inject own callsign at bits 0-27 (called station / to_callsign) ---
         if ctx.ap_context.my_call.is_some() {
             if let Some(msg) = par_try_ldpc_with_ap(
@@ -8086,6 +8181,29 @@ fn par_try_ap_decode(
                     qso.progress,
                     crate::ap::QsoApProgress::WaitingForConfirmation
                 ) {
+                    // Task W2.6 [A/B]: try the full message-content mask
+                    // (one attempt per RRR/RR73/73 token) FIRST when
+                    // enabled — strictly additive, falls through to the
+                    // plain AP4 (i3-only) attempt below if none of the
+                    // three survive. When the flag is off, this loop
+                    // never runs — byte-identical to pre-W2.6.
+                    if ctx.ap4_full_message_mask_enabled {
+                        for token in crate::ap::ConfirmationToken::ALL {
+                            if let Some(msg) = par_try_ldpc_with_ap4_full(
+                                ctx,
+                                ldpc,
+                                &base_llrs,
+                                ctx.ap_context,
+                                token,
+                                snr_db,
+                                confidence,
+                                base_frequency,
+                                time_offset_s,
+                            ) {
+                                return Some(msg);
+                            }
+                        }
+                    }
                     if let Some(msg) = par_try_ldpc_with_ap(
                         ctx,
                         ldpc,
@@ -8127,23 +8245,38 @@ fn par_try_ldpc_with_ap(
     let mut llrs = base_llrs.to_vec();
     let xor_sequence = ctx.xor_sequence;
 
-    match ap_level {
+    let inject = |llrs: &mut Vec<f32>| match ap_level {
         crate::ap::ApLevel::Ap0 => {}
         crate::ap::ApLevel::Ap1 => {
-            crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
+            crate::ap::inject_ap_llrs(llrs, ap_level, ap_context, xor_sequence);
         }
         crate::ap::ApLevel::Ap2 => {
-            crate::ap::inject_ap_llrs(&mut llrs, crate::ap::ApLevel::Ap1, ap_context, xor_sequence);
+            crate::ap::inject_ap_llrs(llrs, crate::ap::ApLevel::Ap1, ap_context, xor_sequence);
             if let Some(caller) = caller_override {
-                crate::ap::inject_ap2_caller(&mut llrs, caller, xor_sequence);
+                crate::ap::inject_ap2_caller(llrs, caller, xor_sequence);
             }
         }
-        crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
-            crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
+        crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 | crate::ap::ApLevel::Cq => {
+            crate::ap::inject_ap_llrs(llrs, ap_level, ap_context, xor_sequence);
         }
-    }
+    };
 
-    normalize_llrs(&mut llrs, ctx.llr_target_variance);
+    // Task W2.6 [A/B]: injection/normalization ordering. Legacy (default
+    // `false`): inject the fixed-magnitude AP bits into the raw channel
+    // LLRs, THEN normalize — the injected magnitude contributes to the
+    // variance `normalize_llrs` computes from the WHOLE array, which can
+    // distort the scale factor applied to the (majority) non-injected
+    // channel-evidence bits. When `true`: normalize FIRST (pure channel
+    // evidence, uncontaminated by the artificial injected magnitude),
+    // THEN inject the fixed-magnitude AP bits on top of the now-clean
+    // scale. See `Ft8Config::ap_injection_post_normalization`.
+    if ctx.ap_injection_post_normalization {
+        normalize_llrs(&mut llrs, ctx.llr_target_variance);
+        inject(&mut llrs);
+    } else {
+        inject(&mut llrs);
+        normalize_llrs(&mut llrs, ctx.llr_target_variance);
+    }
 
     let corrected_bits = match ldpc.decode_soft(&llrs) {
         Ok(bits) => bits,
@@ -8178,6 +8311,7 @@ fn par_try_ldpc_with_ap(
         crate::ap::ApLevel::Ap2 => 2,
         crate::ap::ApLevel::Ap3 => 3,
         crate::ap::ApLevel::Ap4 => 4,
+        crate::ap::ApLevel::Cq => 5,
     };
     // AP decodes need higher confidence than standard decodes because
     // AP injection biases the LDPC solver toward our callsign, producing
@@ -8247,6 +8381,206 @@ fn par_try_ldpc_with_ap(
     Some(decoded_message)
 }
 
+/// Task W2.6 [A/B]: try LDPC decode assuming this candidate is a plain
+/// "CQ" call (`ApLevel::Cq`). No `ApContext` is consulted at all — "CQ" is
+/// a fixed protocol token, not a personal callsign — so, unlike every
+/// other AP level, this can run unconditionally on every candidate that
+/// reaches AP injection, gated only by `Ft8Config::cq_ap_enabled`.
+fn par_try_ldpc_with_cq(
+    ctx: &DecodeContext,
+    ldpc: &LdpcDecoder,
+    base_llrs: &[f32],
+    snr_db: f32,
+    confidence: f32,
+    base_frequency: f64,
+    time_offset_s: f64,
+) -> Option<DecodedMessage> {
+    let mut llrs = base_llrs.to_vec();
+    let xor_sequence = ctx.xor_sequence;
+    let empty_ctx = crate::ap::ApContext::default();
+
+    let inject = |llrs: &mut Vec<f32>| {
+        crate::ap::inject_ap_llrs(llrs, crate::ap::ApLevel::Cq, &empty_ctx, xor_sequence);
+    };
+
+    // Task W2.6 [A/B]: same injection/normalization ordering flag as
+    // `par_try_ldpc_with_ap` — see `Ft8Config::ap_injection_post_normalization`.
+    if ctx.ap_injection_post_normalization {
+        normalize_llrs(&mut llrs, ctx.llr_target_variance);
+        inject(&mut llrs);
+    } else {
+        inject(&mut llrs);
+        normalize_llrs(&mut llrs, ctx.llr_target_variance);
+    }
+
+    let corrected_bits = match ldpc.decode_soft(&llrs) {
+        Ok(bits) => bits,
+        Err(_) => return None,
+    };
+
+    if !par_verify_crc(&corrected_bits) {
+        return None;
+    }
+
+    let payload_bits = par_apply_xor(ctx.xor_sequence, &corrected_bits);
+    let ft8_message = match ctx.message_parser.parse_payload(&payload_bits) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+
+    if !ft8_message.is_plausible() {
+        return None;
+    }
+
+    // AP-injection survival check: the parsed message must actually be a
+    // CQ call, or the LDPC parity overruled the CQ-token bias.
+    if !ap_injection_survived(crate::ap::ApLevel::Cq, &empty_ctx, &ft8_message) {
+        return None;
+    }
+
+    const MIN_AP_CONFIDENCE: f32 = 0.55;
+    const MIN_DECODE_CONFIDENCE: f32 = 0.41;
+    const SCRUTINY_THRESHOLD: f32 = 0.65;
+
+    let acceptance_score = crate::acceptance::score_from_slice(&corrected_bits, base_llrs);
+    let passes_acceptance = passes_acceptance_gate(ctx.acceptance_gating_enabled, acceptance_score);
+
+    let min_conf = if passes_acceptance {
+        MIN_DECODE_CONFIDENCE
+    } else {
+        MIN_AP_CONFIDENCE
+    };
+    if confidence < min_conf {
+        return None;
+    }
+    if !passes_acceptance && confidence < SCRUTINY_THRESHOLD && ft8_message.suspicion_score() >= 2 {
+        return None;
+    }
+
+    let mut decoded_message = DecodedMessage::new(
+        ft8_message,
+        snr_db,
+        confidence,
+        base_frequency,
+        time_offset_s,
+    );
+    decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+    decoded_message.ap_level = 5; // Cq
+    decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
+    decoded_message.acceptance = acceptance_score;
+    Some(decoded_message)
+}
+
+/// Task W2.6 [A/B]: try LDPC decode with the AP4 callsign+i3 injection
+/// PLUS a full message-content mask for one specific QSO-confirmation
+/// token (RRR/RR73/73). AP4 alone (`par_try_ldpc_with_ap`) only pins the
+/// message TYPE (i3=1); this additionally pins the exact completion
+/// CONTENT via [`crate::ap::inject_confirmation_token_bits`]. Callers try
+/// this once per [`crate::ap::ConfirmationToken`] variant (gated by
+/// `Ft8Config::ap4_full_message_mask_enabled`), falling back to the plain
+/// AP4 attempt if none of the three survive.
+// rationale: parallel-safe decode fn threads many independent context values; a
+// params struct would add a layer without simplifying the rayon call sites.
+#[allow(clippy::too_many_arguments)]
+fn par_try_ldpc_with_ap4_full(
+    ctx: &DecodeContext,
+    ldpc: &LdpcDecoder,
+    base_llrs: &[f32],
+    ap_context: &crate::ap::ApContext,
+    token: crate::ap::ConfirmationToken,
+    snr_db: f32,
+    confidence: f32,
+    base_frequency: f64,
+    time_offset_s: f64,
+) -> Option<DecodedMessage> {
+    let mut llrs = base_llrs.to_vec();
+    let xor_sequence = ctx.xor_sequence;
+
+    let inject = |llrs: &mut Vec<f32>| {
+        crate::ap::inject_ap_llrs(llrs, crate::ap::ApLevel::Ap4, ap_context, xor_sequence);
+        crate::ap::inject_confirmation_token_bits(llrs, token, xor_sequence);
+    };
+
+    if ctx.ap_injection_post_normalization {
+        normalize_llrs(&mut llrs, ctx.llr_target_variance);
+        inject(&mut llrs);
+    } else {
+        inject(&mut llrs);
+        normalize_llrs(&mut llrs, ctx.llr_target_variance);
+    }
+
+    let corrected_bits = match ldpc.decode_soft(&llrs) {
+        Ok(bits) => bits,
+        Err(_) => return None,
+    };
+
+    if !par_verify_crc(&corrected_bits) {
+        return None;
+    }
+
+    let payload_bits = par_apply_xor(ctx.xor_sequence, &corrected_bits);
+    let ft8_message = match ctx.message_parser.parse_payload(&payload_bits) {
+        Ok(m) => m,
+        Err(_) => return None,
+    };
+
+    if !ft8_message.is_plausible() {
+        return None;
+    }
+
+    // Both the AP4 callsign survival check AND the new content-mask
+    // survival check must hold — either one failing means LDPC parity
+    // overruled part of the bias.
+    if !ap_injection_survived(crate::ap::ApLevel::Ap4, ap_context, &ft8_message) {
+        return None;
+    }
+    if !ap4_full_mask_survived(token, &ft8_message) {
+        return None;
+    }
+
+    const MIN_AP_CONFIDENCE: f32 = 0.55;
+    const MIN_DECODE_CONFIDENCE: f32 = 0.41;
+    const SCRUTINY_THRESHOLD: f32 = 0.65;
+
+    let acceptance_score = crate::acceptance::score_from_slice(&corrected_bits, base_llrs);
+    let passes_acceptance = passes_acceptance_gate(ctx.acceptance_gating_enabled, acceptance_score);
+
+    // Same a8 template-match relaxation the plain AP4 path gets — the
+    // content mask already constrains the message harder than a8's
+    // post-decode text check, but a8 may still be enabled independently.
+    let a8_match =
+        ctx.a8_qso_state_ap_enabled && a8_text_matches(ap_context, &ft8_message.to_string());
+
+    let min_conf = if !a8_match && !passes_acceptance {
+        MIN_AP_CONFIDENCE
+    } else {
+        MIN_DECODE_CONFIDENCE
+    };
+    if confidence < min_conf {
+        return None;
+    }
+    if !a8_match
+        && !passes_acceptance
+        && confidence < SCRUTINY_THRESHOLD
+        && ft8_message.suspicion_score() >= 2
+    {
+        return None;
+    }
+
+    let mut decoded_message = DecodedMessage::new(
+        ft8_message,
+        snr_db,
+        confidence,
+        base_frequency,
+        time_offset_s,
+    );
+    decoded_message.tone_symbols = Some(Ft8Decoder::codeword_to_symbols(&corrected_bits));
+    decoded_message.ap_level = 4; // still AP4-family for telemetry purposes
+    decoded_message.decode_time_into_window = Some(ctx.window_start.elapsed());
+    decoded_message.acceptance = acceptance_score;
+    Some(decoded_message)
+}
+
 /// Position to inject a recent callsign in the LLR vector. my_call-less AP.
 #[derive(Debug, Clone, Copy)]
 enum RecentInjectPos {
@@ -8274,16 +8608,24 @@ fn par_try_ldpc_with_recent_only(
     time_offset_s: f64,
 ) -> Option<DecodedMessage> {
     let mut llrs = base_llrs.to_vec();
-    match pos {
+    let inject = |llrs: &mut Vec<f32>| match pos {
         RecentInjectPos::Caller => {
-            crate::ap::inject_ap2_caller(&mut llrs, recent, ctx.xor_sequence)
+            crate::ap::inject_ap2_caller(llrs, recent, ctx.xor_sequence);
         }
         RecentInjectPos::Called => {
-            crate::ap::inject_recent_call_at_called(&mut llrs, recent, ctx.xor_sequence)
+            crate::ap::inject_recent_call_at_called(llrs, recent, ctx.xor_sequence);
         }
-    }
+    };
 
-    normalize_llrs(&mut llrs, ctx.llr_target_variance);
+    // Task W2.6 [A/B]: same injection/normalization ordering flag as
+    // `par_try_ldpc_with_ap` — see `Ft8Config::ap_injection_post_normalization`.
+    if ctx.ap_injection_post_normalization {
+        normalize_llrs(&mut llrs, ctx.llr_target_variance);
+        inject(&mut llrs);
+    } else {
+        inject(&mut llrs);
+        normalize_llrs(&mut llrs, ctx.llr_target_variance);
+    }
 
     let corrected_bits = match ldpc.decode_soft(&llrs) {
         Ok(bits) => bits,
@@ -8418,7 +8760,39 @@ pub(crate) fn ap_injection_survived(
             }
             true
         }
+
+        // Cq injects the "CQ" special token at the to_callsign/first-token
+        // position (bits 0-27+28) plus i3=1. The parsed result must
+        // actually be a CQ call — otherwise the LDPC parity overruled the
+        // CQ-token bias and produced a coincidental CRC-valid codeword
+        // that isn't a CQ at all.
+        crate::ap::ApLevel::Cq => {
+            matches!(
+                msg.standard_type,
+                Some(crate::message::StandardMessageType::Cq)
+            )
+        }
     }
+}
+
+/// Task W2.6 [A/B]: verify that the full message-content mask injected by
+/// [`crate::ap::inject_confirmation_token_bits`] survived the LDPC pass —
+/// the decoded message's `standard_type` must equal the specific token
+/// (RRR/RR73/73) that was injected, on top of the existing AP4
+/// callsign-survival check ([`ap_injection_survived`] with `ApLevel::Ap4`).
+/// Same false-positive-prevention rationale as `ap_injection_survived`:
+/// LDPC's parity constraints can overrule the content bias too, producing a
+/// CRC-valid codeword that doesn't carry the assumed completion token.
+pub(crate) fn ap4_full_mask_survived(
+    token: crate::ap::ConfirmationToken,
+    msg: &crate::message::Ft8Message,
+) -> bool {
+    let expected = match token {
+        crate::ap::ConfirmationToken::Rrr => crate::message::StandardMessageType::Rrr,
+        crate::ap::ConfirmationToken::RR73 => crate::message::StandardMessageType::RR73,
+        crate::ap::ConfirmationToken::Final73 => crate::message::StandardMessageType::Final73,
+    };
+    msg.standard_type == Some(expected)
 }
 
 /// WSJT-X Improved-style a8 helper: returns `true` when the decoded
@@ -18200,6 +18574,9 @@ mod w2_5_acceptance_gating_tests {
             escalation_parity_max: decoder.config.escalation_parity_max,
             budget: DecodeBudget::unlimited(),
             acceptance_gating_enabled: decoder.config.acceptance_gating_enabled,
+            cq_ap_enabled: decoder.config.cq_ap_enabled,
+            ap4_full_message_mask_enabled: decoder.config.ap4_full_message_mask_enabled,
+            ap_injection_post_normalization: decoder.config.ap_injection_post_normalization,
         }
     }
 
@@ -18356,6 +18733,331 @@ mod w2_5_acceptance_gating_tests {
             !passes_acceptance_gate(true, Some(score)),
             "passes_acceptance_gate must reject a CRC-valid-but-mismatched \
              codeword regardless of the acceptance_gating_enabled flag"
+        );
+    }
+}
+
+// ============================================================================
+// Task W2.6: AP coverage — CQ mask, post-normalization injection,
+// RR73/RRR/73 full masks
+// ============================================================================
+//
+// Audio-domain rescue tests (real WAV-scale scenarios) live in
+// `pancetta-ft8/tests/w26_ap_coverage_tests.rs`. This module covers the
+// mechanism-plumbing-correctness question — does `par_try_ldpc_with_cq` /
+// `par_try_ldpc_with_ap4_full` / the survival checks / the injection-order
+// flag actually wire up and behave as designed — using direct private-fn
+// calls, mirroring `w2_5_acceptance_gating_tests`'s style.
+#[cfg(test)]
+mod w26_ap_coverage_tests {
+    use super::*;
+
+    /// Real, clean (full-amplitude, noiseless) "CQ K1DEF FN42" signal via
+    /// the actual Costas sync search. Unlike
+    /// `w2_5_acceptance_gating_tests::build_low_sync_real_signal`, the
+    /// candidate's real (strong) `sync_score` is left untouched — this
+    /// test targets injection/decode PLUMBING correctness, not a
+    /// confidence-floor edge case.
+    #[cfg(feature = "transmit")]
+    fn build_clean_cq_signal(decoder: &Ft8Decoder) -> (Vec<f64>, Spectrogram, CostasCandidate) {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K1DEF FN42", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let audio = decoder.preprocess_audio(&tx).expect("preprocess");
+        let spectrogram = decoder.compute_spectrogram(&audio).expect("spectrogram");
+        let candidates = decoder
+            .costas_sync_search_with_threshold(&spectrogram, 0.0, None)
+            .expect("sync search");
+        let candidate = candidates
+            .into_iter()
+            .max_by(|a, b| {
+                a.sync_score
+                    .partial_cmp(&b.sync_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("a clean full-amplitude signal must produce at least one sync candidate");
+        assert!(
+            candidate.sync_score > 6.0,
+            "expected a strong natural sync_score on a clean signal, got {}",
+            candidate.sync_score
+        );
+
+        (audio, spectrogram, candidate)
+    }
+
+    /// Mirrors `w2_5_acceptance_gating_tests::build_ctx` field-for-field
+    /// (small intentional duplication across test modules, same pattern
+    /// used elsewhere in this file — see that function's doc comment).
+    #[cfg(feature = "transmit")]
+    fn build_ctx<'a>(
+        decoder: &'a Ft8Decoder,
+        spectrogram: &'a Spectrogram,
+        audio: &'a [f64],
+        ap_context: &'a crate::ap::ApContext,
+        cq_ap_enabled: bool,
+        ap4_full_message_mask_enabled: bool,
+        ap_injection_post_normalization: bool,
+    ) -> DecodeContext<'a> {
+        DecodeContext {
+            protocol_params: &decoder.protocol_params,
+            message_parser: &decoder.message_parser,
+            spectrogram,
+            audio,
+            ap_context,
+            ap_active: false,
+            symbol_fft: &decoder.symbol_fft,
+            symbol_window: &decoder.symbol_window,
+            xor_sequence: decoder.protocol_params.xor_sequence,
+            ldpc_iterations: decoder.config.ldpc_iterations,
+            osd_depth: decoder.config.osd_depth,
+            osd_npre2_preprocessing_enabled: decoder.config.osd_npre2_preprocessing_enabled,
+            llr_target_variance: decoder.config.llr_target_variance,
+            adaptive_ldpc_iters: decoder.config.adaptive_ldpc_iters,
+            max_parity_errors_for_osd: decoder.config.max_parity_errors_for_osd,
+            bp_offset_subtract: decoder.config.bp_offset_subtract,
+            osd_input: decoder.config.osd_input,
+            layered_bp: decoder.config.layered_bp,
+            pade_atanh: decoder.config.pade_atanh,
+            ldpc_feedback_refinement_enabled: decoder.config.ldpc_feedback_refinement_enabled,
+            ldpc_feedback_boost_factor: decoder.config.ldpc_feedback_boost_factor,
+            ldpc_feedback_attenuate_factor: decoder.config.ldpc_feedback_attenuate_factor,
+            ldpc_feedback_erase_threshold: decoder.config.ldpc_feedback_erase_threshold,
+            sync_time_interp_linear_power: decoder.config.sync_time_interp_linear_power,
+            window_start: Instant::now(),
+            soft_combiner: decoder.soft_combiner.as_ref(),
+            llr_whitening_enabled: decoder.config.llr_whitening_enabled,
+            per_candidate_freq_tracker_enabled: decoder.config.per_candidate_freq_tracker_enabled,
+            per_candidate_freq_tracker_alpha: decoder.config.per_candidate_freq_tracker_alpha,
+            per_candidate_freq_tracker_max_step_hz: decoder
+                .config
+                .per_candidate_freq_tracker_max_step_hz,
+            per_candidate_freq_tracker_max_error_hz: decoder
+                .config
+                .per_candidate_freq_tracker_max_error_hz,
+            a8_qso_state_ap_enabled: decoder.config.a8_qso_state_ap_enabled,
+            bicm_id_iterations: decoder.config.bicm_id_iterations,
+            bicm_id_max_unsatisfied_checks: decoder.config.bicm_id_max_unsatisfied_checks,
+            llr_metric: decoder.config.llr_metric,
+            bicm_id_em_reestimation: decoder.config.bicm_id_em_reestimation,
+            impulse_robust_llr: decoder.config.impulse_robust_llr,
+            escalation_enabled: decoder.config.escalation_enabled,
+            floor_iters: decoder.config.floor_iters,
+            deep_iters: decoder.config.deep_iters,
+            escalation_parity_max: decoder.config.escalation_parity_max,
+            budget: DecodeBudget::unlimited(),
+            acceptance_gating_enabled: decoder.config.acceptance_gating_enabled,
+            cq_ap_enabled,
+            ap4_full_message_mask_enabled,
+            ap_injection_post_normalization,
+        }
+    }
+
+    /// THE key plumbing-correctness test for the CQ mask: calling
+    /// `par_try_ldpc_with_cq` directly on a REAL clean "CQ K1DEF FN42"
+    /// signal's extracted LLRs must produce a valid decode tagged
+    /// `ap_level = 5`. This proves the mechanism (injection, survival
+    /// check) is wired correctly end-to-end — it does NOT by itself
+    /// claim a net-new recall benefit over AP0 (which trivially decodes a
+    /// clean signal too); the corpus-level A/B is the arbiter for that
+    /// question. An extensive audio-domain noise search (see
+    /// `pancetta-ft8/tests/w26_ap_coverage_tests.rs`'s documented note)
+    /// found no scenario where the CQ mask rescues a decode AP0 alone
+    /// could not.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn cq_mask_direct_call_decodes_clean_cq_signal() {
+        let decoder = Ft8Decoder::new(Ft8Config::default()).expect("decoder");
+        let (audio, spectrogram, candidate) = build_clean_cq_signal(&decoder);
+
+        let tone_magnitudes = par_extract_symbols_from_spectrogram(
+            &decoder.protocol_params,
+            &spectrogram,
+            &candidate,
+            false,
+        );
+        let base_llrs = par_compute_soft_llrs_db(&decoder.protocol_params, &tone_magnitudes);
+        let tone_spacing = decoder.protocol_params.tone_spacing;
+        let sub_bin_offset = candidate.freq_sub as f64 * (tone_spacing / FREQ_OSR as f64);
+        let base_frequency = candidate.freq_bin as f64 * tone_spacing + sub_bin_offset;
+        let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        let spec_step = sps / TIME_OSR;
+        let coarse_offset =
+            candidate_offset_samples(candidate.time_step, spectrogram.time_padding, spec_step);
+        let time_offset_s = coarse_offset as f64 / SAMPLE_RATE as f64;
+        let snr_db = par_estimate_snr_spectrogram(&decoder.protocol_params, &tone_magnitudes);
+        let confidence = (candidate.sync_score / 12.0).min(1.0) as f32;
+
+        let ap_context = crate::ap::ApContext::default();
+        let ctx = build_ctx(
+            &decoder,
+            &spectrogram,
+            &audio,
+            &ap_context,
+            true,
+            false,
+            false,
+        );
+
+        let msg = par_try_ldpc_with_cq(
+            &ctx,
+            &decoder.ldpc_decoder,
+            &base_llrs,
+            snr_db,
+            confidence,
+            base_frequency,
+            time_offset_s,
+        )
+        .expect("par_try_ldpc_with_cq must decode a real, clean CQ signal");
+
+        assert_eq!(msg.text, "CQ K1DEF FN42");
+        assert_eq!(msg.ap_level, 5, "must be tagged as the CQ mask level");
+    }
+
+    /// Direct unit test of the new `ApLevel::Cq` arm in
+    /// `ap_injection_survived`: a genuinely non-CQ message (a Reply/report
+    /// exchange) must NOT survive, even though `ApLevel::Cq` was
+    /// (hypothetically) the level tried — guards against the
+    /// "LDPC parity overruled the CQ-token bias and produced a
+    /// coincidental CRC-valid non-CQ message" false-positive pattern.
+    #[test]
+    fn ap_injection_survived_cq_rejects_non_cq_message() {
+        let mut msg = crate::message::Ft8Message::default();
+        msg.standard_type = Some(crate::message::StandardMessageType::Reply);
+        msg.to_callsign = Some("K1ABC".to_string());
+        msg.from_callsign = Some("W1AW".to_string());
+        let ctx = crate::ap::ApContext::default();
+        assert!(
+            !ap_injection_survived(crate::ap::ApLevel::Cq, &ctx, &msg),
+            "a non-CQ standard_type must not survive the Cq-level check"
+        );
+    }
+
+    /// Positive companion: a genuinely CQ message must survive.
+    #[test]
+    fn ap_injection_survived_cq_accepts_cq_message() {
+        let mut msg = crate::message::Ft8Message::default();
+        msg.standard_type = Some(crate::message::StandardMessageType::Cq);
+        msg.from_callsign = Some("K1DEF".to_string());
+        let ctx = crate::ap::ApContext::default();
+        assert!(ap_injection_survived(crate::ap::ApLevel::Cq, &ctx, &msg));
+    }
+
+    /// Direct unit tests of `ap4_full_mask_survived`: the decoded
+    /// message's `standard_type` must equal the specific token that was
+    /// injected — a message that decodes to a DIFFERENT standard type
+    /// (even a different one of the three confirmation tokens) must not
+    /// survive.
+    #[test]
+    fn ap4_full_mask_survived_matches_only_the_injected_token() {
+        let mk = |t: crate::message::StandardMessageType| {
+            let mut m = crate::message::Ft8Message::default();
+            m.standard_type = Some(t);
+            m
+        };
+
+        assert!(ap4_full_mask_survived(
+            crate::ap::ConfirmationToken::RR73,
+            &mk(crate::message::StandardMessageType::RR73)
+        ));
+        assert!(ap4_full_mask_survived(
+            crate::ap::ConfirmationToken::Rrr,
+            &mk(crate::message::StandardMessageType::Rrr)
+        ));
+        assert!(ap4_full_mask_survived(
+            crate::ap::ConfirmationToken::Final73,
+            &mk(crate::message::StandardMessageType::Final73)
+        ));
+
+        // Cross products must all fail.
+        assert!(!ap4_full_mask_survived(
+            crate::ap::ConfirmationToken::RR73,
+            &mk(crate::message::StandardMessageType::Rrr)
+        ));
+        assert!(!ap4_full_mask_survived(
+            crate::ap::ConfirmationToken::Rrr,
+            &mk(crate::message::StandardMessageType::Final73)
+        ));
+        assert!(!ap4_full_mask_survived(
+            crate::ap::ConfirmationToken::Final73,
+            &mk(crate::message::StandardMessageType::RR73)
+        ));
+        // An unrelated message type must also fail.
+        assert!(!ap4_full_mask_survived(
+            crate::ap::ConfirmationToken::RR73,
+            &mk(crate::message::StandardMessageType::Reply)
+        ));
+    }
+
+    /// Injection-ordering flag: with `ap_injection_post_normalization =
+    /// false` (default), the resulting LLR vector must be identical to
+    /// manually injecting-then-normalizing; with `true`, it must be
+    /// identical to manually normalizing-then-injecting. This is a pure
+    /// unit test of the ordering logic itself (not a full decode), fast
+    /// and deterministic.
+    #[test]
+    fn injection_post_normalization_flag_controls_order() {
+        // A synthetic base_llrs vector with clearly non-uniform, non-AP
+        // magnitude so the two orderings are numerically distinguishable.
+        let mut base_llrs = vec![0.0f32; 174];
+        for (i, llr) in base_llrs.iter_mut().enumerate() {
+            *llr = ((i % 7) as f32 - 3.0) * 2.0;
+        }
+        let target_variance = 24.0f32;
+
+        let my_call = crate::ap::MyCallAp::new("K1ABC").unwrap();
+        let ap_ctx = crate::ap::ApContext {
+            my_call: Some(my_call),
+            recent_calls: vec![],
+            active_qso: None,
+        };
+
+        // Legacy: inject then normalize.
+        let mut legacy = base_llrs.clone();
+        crate::ap::inject_ap_llrs(&mut legacy, crate::ap::ApLevel::Ap1, &ap_ctx, None);
+        normalize_llrs(&mut legacy, target_variance);
+
+        // Post-normalization: normalize then inject.
+        let mut post_norm = base_llrs.clone();
+        normalize_llrs(&mut post_norm, target_variance);
+        crate::ap::inject_ap_llrs(&mut post_norm, crate::ap::ApLevel::Ap1, &ap_ctx, None);
+
+        assert_ne!(
+            legacy, post_norm,
+            "the two orderings must produce numerically different LLR \
+             vectors for this non-trivial base_llrs input — otherwise this \
+             test can't discriminate the two code paths"
+        );
+
+        // Sanity: in the post-normalization ordering, the NON-injected
+        // bits (57..174, untouched by AP1) must be EXACTLY the
+        // normalized base_llrs (no distortion from the injected
+        // magnitude, since normalize ran BEFORE injection).
+        let mut pure_normalized = base_llrs.clone();
+        normalize_llrs(&mut pure_normalized, target_variance);
+        assert_eq!(
+            &post_norm[57..174],
+            &pure_normalized[57..174],
+            "post-normalization ordering: non-injected bits must be an \
+             exact match to normalizing the base LLRs alone"
+        );
+        // In the legacy ordering, the non-injected bits are NOT
+        // guaranteed to equal the same pure-normalized reference,
+        // because normalize_llrs's scale factor was computed AFTER the
+        // AP1 injection already perturbed the array's variance.
+        assert_ne!(
+            &legacy[57..174],
+            &pure_normalized[57..174],
+            "legacy ordering: injecting before normalizing must distort \
+             the scale applied to the non-injected bits relative to \
+             normalizing alone — otherwise this test's premise doesn't \
+             hold for this input"
         );
     }
 }
