@@ -424,6 +424,29 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: master switch for
+    /// `ApLevel::Cq` (assume a failed-AP0 candidate is a plain "CQ"
+    /// call). See `Ft8Config::cq_ap_enabled`.
+    pub fn with_cq_ap_enabled(mut self, on: bool) -> Self {
+        self.config.cq_ap_enabled = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: master switch for the AP4
+    /// full message-content mask (RR73/RRR/73). See
+    /// `Ft8Config::ap4_full_message_mask_enabled`.
+    pub fn with_ap4_full_message_mask_enabled(mut self, on: bool) -> Self {
+        self.config.ap4_full_message_mask_enabled = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: AP injection/normalization
+    /// ordering. See `Ft8Config::ap_injection_post_normalization`.
+    pub fn with_ap_injection_post_normalization(mut self, on: bool) -> Self {
+        self.config.ap_injection_post_normalization = on;
+        self
+    }
+
     /// Decoder-speed-overhaul Task 9/10: shallow BP iteration count for
     /// the S1/S2 primary decode. See `Ft8Config::floor_iters`.
     pub fn with_floor_iters(mut self, n: usize) -> Self {

@@ -79,6 +79,16 @@ struct Args {
     /// acceptance-metric-based post-CRC gate that replaces the blunt
     /// sync-score confidence floors. See `Ft8Config::acceptance_gating_enabled`.
     acceptance_gating: Option<bool>,
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: master switch for
+    /// `ApLevel::Cq`. See `Ft8Config::cq_ap_enabled`.
+    cq_ap: Option<bool>,
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: master switch for the AP4
+    /// full message-content mask (RR73/RRR/73). See
+    /// `Ft8Config::ap4_full_message_mask_enabled`.
+    ap4_full_mask: Option<bool>,
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: AP injection/normalization
+    /// ordering. See `Ft8Config::ap_injection_post_normalization`.
+    ap_post_normalize: Option<bool>,
     /// Decoder-speed-overhaul Task 9/10: shallow BP iteration count.
     /// See `Ft8Config::floor_iters`.
     floor_iters: Option<usize>,
@@ -230,6 +240,9 @@ impl Args {
         let mut fine_fft_rect_window: Option<bool> = None;
         let mut llr_whitening: Option<bool> = None;
         let mut acceptance_gating: Option<bool> = None;
+        let mut cq_ap: Option<bool> = None;
+        let mut ap4_full_mask: Option<bool> = None;
+        let mut ap_post_normalize: Option<bool> = None;
         let mut floor_iters: Option<usize> = None;
         let mut deep_iters: Option<usize> = None;
         let mut escalation_parity_max: Option<usize> = None;
@@ -447,6 +460,24 @@ impl Args {
                 }
                 "--no-acceptance-gating" => {
                     acceptance_gating = Some(false);
+                }
+                "--cq-ap" => {
+                    cq_ap = Some(true);
+                }
+                "--no-cq-ap" => {
+                    cq_ap = Some(false);
+                }
+                "--ap4-full-mask" => {
+                    ap4_full_mask = Some(true);
+                }
+                "--no-ap4-full-mask" => {
+                    ap4_full_mask = Some(false);
+                }
+                "--ap-post-normalize" => {
+                    ap_post_normalize = Some(true);
+                }
+                "--no-ap-post-normalize" => {
+                    ap_post_normalize = Some(false);
                 }
                 "--floor-iters" => {
                     floor_iters = Some(
@@ -725,6 +756,9 @@ impl Args {
                     eprintln!("  --fine-fft-rect-window: decoder-TP-sensitivity Task W1.3 [A/B] — rectangular (no) window on the fine-FFT fallback symbol FFT instead of Hann (default off). See Ft8Config::fine_fft_rect_window.");
                     eprintln!("  --llr-whitening / --no-llr-whitening: decoder-TP-sensitivity Task W1.4 [A/B] — force the divisive LLR whitening step on/off (production default: off, flipped by the W1.4 A/B result). See Ft8Config::llr_whitening_enabled.");
                     eprintln!("  --acceptance-gating / --no-acceptance-gating: decoder-TP-sensitivity Task W2.5 [A/B] — replace the blunt post-CRC sync-score confidence floors with the W2.1 acceptance metric for decodes that cleanly pass it (production default: off). See Ft8Config::acceptance_gating_enabled.");
+                    eprintln!("  --cq-ap / --no-cq-ap: decoder-TP-sensitivity Task W2.6 [A/B] — try ApLevel::Cq (assume a failed-AP0 candidate is a plain \"CQ\" call; no ApContext needed) on every candidate that reaches AP injection (production default: off). See Ft8Config::cq_ap_enabled.");
+                    eprintln!("  --ap4-full-mask / --no-ap4-full-mask: decoder-TP-sensitivity Task W2.6 [A/B] — extend AP4 from a message-TYPE-only prior (i3=1) to a full message-CONTENT mask, trying the RR73/RRR/73 ir+igrid4 fields (production default: off). See Ft8Config::ap4_full_message_mask_enabled.");
+                    eprintln!("  --ap-post-normalize / --no-ap-post-normalize: decoder-TP-sensitivity Task W2.6 [A/B] — normalize LLRs BEFORE injecting AP bits (not after) at every AP injection site, so the injected magnitude never distorts the channel-evidence scale (production default: off = inject-then-normalize). See Ft8Config::ap_injection_post_normalization.");
                     eprintln!("  --floor-iters N: shallow BP iteration count for S1/S2 when --escalation-enabled (default 25).");
                     eprintln!("  --deep-iters N: deep BP iteration count a near-miss floor failure is escalated to (default 100).");
                     eprintln!("  --escalation-parity-max N: max unsatisfied parity checks at floor_iters tolerated before escalating (default 30).");
@@ -768,6 +802,9 @@ impl Args {
             fine_fft_rect_window,
             llr_whitening,
             acceptance_gating,
+            cq_ap,
+            ap4_full_mask,
+            ap_post_normalize,
             floor_iters,
             deep_iters,
             escalation_parity_max,
@@ -1780,6 +1817,15 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.acceptance_gating {
         d = d.with_acceptance_gating_enabled(on);
+    }
+    if let Some(on) = args.cq_ap {
+        d = d.with_cq_ap_enabled(on);
+    }
+    if let Some(on) = args.ap4_full_mask {
+        d = d.with_ap4_full_message_mask_enabled(on);
+    }
+    if let Some(on) = args.ap_post_normalize {
+        d = d.with_ap_injection_post_normalization(on);
     }
     if let Some(v) = args.floor_iters {
         d = d.with_floor_iters(v);
