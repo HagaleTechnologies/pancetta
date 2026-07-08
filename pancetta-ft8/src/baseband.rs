@@ -200,8 +200,9 @@ pub struct BasebandSlice {
     /// Number of symbols in the nominal (non-margin) window, from `pp.num_symbols`.
     pub num_symbols: usize,
     /// Index into `samples` where the nominal window (symbol 0) begins.
-    /// Equal to `margin_samples` by construction (the margin is symmetric),
-    /// but callers should use this field rather than assuming that.
+    /// Equal to the *leading* `margin_samples` value by construction — not
+    /// to be confused with the (asymmetric) trailing margin; see that
+    /// field's doc. Callers should use this field rather than recomputing it.
     pub nominal_start_index: usize,
     /// Baseband-domain margin available *before* `nominal_start_index`
     /// (i.e. `nominal_start_index` itself). A dt search may range back this
