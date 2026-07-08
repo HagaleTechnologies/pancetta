@@ -1,0 +1,49 @@
+name: Dependabot Auto-Merge
+
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+      # dependabot/fetch-metadata outputs are safe (controlled by GitHub, not user input)
+      - name: Auto-approve minor/patch updates
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+        run: |
+          gh pr review "$PR_URL" --approve --body "Auto-approved: ${UPDATE_TYPE} update for ${DEP_NAMES}"
+
+      - name: Enable auto-merge for minor/patch updates
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge "$PR_URL" --auto --squash
+
+      - name: Label major updates for review
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
+          PREV_VER: ${{ steps.metadata.outputs.previous-version }}
+          NEW_VER: ${{ steps.metadata.outputs.new-version }}
+        run: |
+          gh pr edit "$PR_URL" --add-label "major-update,needs-review"
+          gh pr comment "$PR_URL" --body "Major version bump: ${DEP_NAMES} (${PREV_VER} -> ${NEW_VER}). Requires manual review before merge."
