@@ -42,21 +42,25 @@ fn build_signal(text: &str, global_snr_db: f32, field_snr_db: f32) -> Vec<f32> {
     audio
 }
 
-/// Config-level regression guard: `cq_ap_enabled`, `ap4_full_message_mask_enabled`,
-/// and `ap_injection_post_normalization` must all default to `false` — the
-/// byte-identical-when-off invariant every [A/B] task in this plan
-/// maintains.
+/// Config-level regression guard for the W2.6 A/B decisions: `cq_ap_enabled`
+/// (declined) and `ap_injection_post_normalization` (declined, net-zero) both
+/// default to `false`. `ap4_full_message_mask_enabled` (flipped ON — a clean
+/// A/B pass, see `research/experiments/2026-07-08-w26-ap4-full-mask-and-postnorm.md`)
+/// defaults to `true`.
 #[test]
-fn w26_flags_default_off() {
+fn w26_flags_default_matches_ab_decisions() {
     let cfg = Ft8Config::default();
-    assert!(!cfg.cq_ap_enabled, "cq_ap_enabled must default to false");
     assert!(
-        !cfg.ap4_full_message_mask_enabled,
-        "ap4_full_message_mask_enabled must default to false"
+        !cfg.cq_ap_enabled,
+        "cq_ap_enabled must default to false (declined — zero measured effect)"
+    );
+    assert!(
+        cfg.ap4_full_message_mask_enabled,
+        "ap4_full_message_mask_enabled must default to true (flipped — clean A/B pass)"
     );
     assert!(
         !cfg.ap_injection_post_normalization,
-        "ap_injection_post_normalization must default to false"
+        "ap_injection_post_normalization must default to false (declined — net-zero effect)"
     );
 }
 
@@ -130,10 +134,16 @@ fn ap4_full_mask_rescues_signal_that_plain_ap4_cannot_decode() {
         ap0_results.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
 
-    // Plain AP4 (i3-only, ap4_full_message_mask_enabled = false, the
-    // default) must ALSO fail — otherwise this test can't discriminate
-    // "the full mask adds value" from "AP4 alone was already enough."
-    let mut ap4_decoder = Ft8Decoder::new(Ft8Config::default()).expect("decoder");
+    // Plain AP4 (i3-only, ap4_full_message_mask_enabled explicitly forced
+    // false here — it now defaults to true post-flip, see
+    // Ft8Config::default()) must ALSO fail — otherwise this test can't
+    // discriminate "the full mask adds value" from "AP4 alone was
+    // already enough."
+    let plain_ap4_config = Ft8Config {
+        ap4_full_message_mask_enabled: false,
+        ..Ft8Config::default()
+    };
+    let mut ap4_decoder = Ft8Decoder::new(plain_ap4_config).expect("decoder");
     let ap4_results = ap4_decoder
         .decode_window_with_ap(&audio, &ctx)
         .unwrap_or_default();
@@ -144,7 +154,7 @@ fn ap4_full_mask_rescues_signal_that_plain_ap4_cannot_decode() {
         ap4_results.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
 
-    // Full mask enabled must rescue it.
+    // Full mask enabled (now also the default post-flip) must rescue it.
     let full_mask_config = Ft8Config {
         ap4_full_message_mask_enabled: true,
         ..Ft8Config::default()

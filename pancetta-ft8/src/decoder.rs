@@ -1254,8 +1254,19 @@ pub struct Ft8Config {
     /// full `ir` bit (58) + 15-bit `igrid4` field (59-73) injection via
     /// [`crate::ap::inject_confirmation_token_bits`] — strictly additive,
     /// falling through to the plain (i3-only) AP4 attempt if none of the
-    /// three survive. Default **false** — when off, AP4 behavior is
-    /// byte-identical to pre-W2.6 (i3-only). See
+    /// three survive.
+    ///
+    /// Default **true** — flipped after a clean A/B pass (see
+    /// `Ft8Config::default()`'s inline comment and
+    /// `research/experiments/2026-07-08-w26-ap4-full-mask-and-postnorm.md`):
+    /// a cheat-informed hard-200 measurement (perfect-information QSO
+    /// context; the stock `eval` CLI cannot construct `active_qso` at
+    /// all, so this AP3/AP4-family mechanism is only measurable this way,
+    /// mirroring `ap_recovery_ceiling.rs`'s established methodology)
+    /// found +8 recall recovered / 0 regressed out of 213 RR73/RRR/73
+    /// confirmation-message truths, with noise_1000's false-positive rate
+    /// unchanged under a fixed mid-QSO context that already activates
+    /// AP4. When `false`, AP4 behavior reverts to i3-only (pre-W2.6). See
     /// `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`.
     pub ap4_full_message_mask_enabled: bool,
 
@@ -1633,10 +1644,17 @@ impl Default for Ft8Config {
             // noise_1000 gate passes. When false, the CQ mask never
             // runs — byte-identical to pre-W2.6.
             cq_ap_enabled: false,
-            // [A/B] default OFF (Task W2.6) until the hard-200 +
-            // noise_1000 gate passes. When false, AP4 stays i3-only
-            // (message-type prior), byte-identical to pre-W2.6.
-            ap4_full_message_mask_enabled: false,
+            // [A/B] FLIPPED ON (Task W2.6): cheat-informed hard-200
+            // (perfect-information QSO context, the only way to
+            // corpus-measure this AP3/AP4-family mechanism — see
+            // research/experiments/2026-07-08-w26-ap4-full-mask-and-postnorm.md)
+            // shows +8 recall recovered / 0 regressed out of 213
+            // RR73/RRR/73 confirmation-message truths (sign-test
+            // p ≈ 0.0078, all 8 discordant pairs in favor); noise_1000
+            // false-positive rate unchanged (1 -> 1) under a fixed
+            // mid-QSO context that already activates AP4. A clean pass
+            // per this plan's standing discipline.
+            ap4_full_message_mask_enabled: true,
             // [A/B] default OFF (Task W2.6) until the hard-200 +
             // noise_1000 gate passes. When false, every AP injection
             // site injects BEFORE normalize_llrs, byte-identical to
