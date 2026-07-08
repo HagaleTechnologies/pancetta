@@ -10618,7 +10618,7 @@ fn percentile_baseline(peaks: &[(f64, usize)], pct: f64) -> f64 {
 /// check (`c[-1] - 2*c[0] + c[+1] > 0`, which is the
 /// same condition as `-2*a > 0` ⇔ `a < 0`). The clamp to [-0.5,
 /// +0.5] matches the reference edge-case handling.
-fn parabolic_peak_refinement(y_left: f64, y_center: f64, y_right: f64) -> (f64, f64) {
+pub(crate) fn parabolic_peak_refinement(y_left: f64, y_center: f64, y_right: f64) -> (f64, f64) {
     // Parabola: y(x) = a*x^2 + b*x + c
     //   y(-1) = a - b + c = y_left
     //   y( 0) =        c = y_center

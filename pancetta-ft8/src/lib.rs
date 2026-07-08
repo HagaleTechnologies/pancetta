@@ -90,6 +90,12 @@ pub use acceptance::AcceptanceScore;
 /// yet wired into the decode path — correctness/cost validation only).
 pub mod baseband;
 
+/// Task W3.2 (decoder-true-positive-sensitivity plan, Workstream 3): fine
+/// dt/df search on a per-candidate baseband slice (builds on [`baseband`]'s
+/// `extract_candidate_baseband`). Standalone and unwired — Task W3.3 is the
+/// planned first caller.
+pub mod fine_sync;
+
 // AP type 7 (a7) — template cross-correlation against decoded callsigns.
 // Session 2 of hb-048; no production hook in this session.
 pub mod a7;
