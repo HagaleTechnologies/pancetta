@@ -457,6 +457,32 @@ impl Ft8Decoder {
         self
     }
 
+    /// Task W4.2 [A/B]: master switch for the per-block time-varying
+    /// complex-amplitude GFSK subtraction path (replaces the legacy
+    /// whole-signal single-estimate fit in `subtract_signal`). Only has
+    /// any observable effect when `max_decode_passes >= 2` (the pass loop
+    /// only calls `subtract_signal` between passes) — see
+    /// `Ft8Config::time_varying_subtraction_enabled`. Added here in Task
+    /// W4.3 because W4.2 never wired a CLI/harness flag (it was a proven
+    /// dead path at the time); this task is the first that needs to
+    /// actually drive it through `eval`.
+    pub fn with_time_varying_subtraction_enabled(mut self, on: bool) -> Self {
+        self.config.time_varying_subtraction_enabled = on;
+        self
+    }
+
+    /// Task W4.2 [A/B]: independent sub-flag controlling whether the
+    /// time-varying path subtracts its fitted estimate at full scale
+    /// (1.0) vs. the legacy path's conservative 0.9 hold-back. Only takes
+    /// effect when `time_varying_subtraction_enabled` is ALSO `true`. See
+    /// `Ft8Config::full_scale_subtraction_enabled` and the W4.2 review's
+    /// carry-forward warning: this sub-flag is UNTESTED on weak signals
+    /// and should be A/B'd independently of the parent mechanism.
+    pub fn with_full_scale_subtraction_enabled(mut self, on: bool) -> Self {
+        self.config.full_scale_subtraction_enabled = on;
+        self
+    }
+
     /// Task W3.3b [HARNESS]: set the per-window wall-clock decode budget
     /// (milliseconds). `None` (the default) reproduces
     /// `DecodeBudget::unlimited()` exactly, matching every prior eval

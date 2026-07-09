@@ -2759,6 +2759,53 @@ impl Ft8Decoder {
                 break;
             }
 
+            // Task W4.3: gate additional multipass iterations (pass >= 1)
+            // on the REAL anytime `DecodeBudget` (`self.current_budget`,
+            // production-wired via `decode_effort_budget_ms`), not just
+            // the legacy `BudgetTracker` above (an osd_depth-derived
+            // wall-clock heuristic, unrelated to the operator's
+            // configured effort preset). Without this check, an
+            // additional pass — a full spectrogram recompute plus a
+            // fresh Costas sweep plus S1..S7 candidate decoding, roughly
+            // as expensive as pass 0 itself — would always be attempted
+            // once `pass_unique` is non-empty, regardless of how little
+            // of the configured budget remains. That is exactly the
+            // W3.3b starvation shape (one expensive unit of work
+            // consuming the whole remaining budget) but one level up:
+            // instead of one costly candidate starving the rest of a
+            // pass's candidates, one costly extra pass would starve
+            // every later stage of every later pass — and unlike
+            // per-candidate work, an outer pass has NO internal
+            // early-exit once started (S1-floor within it decodes
+            // unconditionally). Checking `has_time()` here, BEFORE the
+            // pass starts, is therefore the correct checkpoint
+            // granularity: it can actually prevent the expensive unit of
+            // work rather than merely observing it ran over budget
+            // afterward. Pass 0 is exempt (`pass > 0` guard) so a
+            // decoder is always guaranteed at least one full pass's
+            // worth of results, mirroring S1-floor's own "always runs"
+            // invariant at the per-candidate level. Under
+            // `DecodeBudget::unlimited()` (every existing entry point
+            // except the budgeted ones) `has_time()` is always `true`,
+            // so this is a byte-identical no-op — the same invariant
+            // every other `current_budget.has_time()` call site in this
+            // file relies on.
+            if pass > 0 && !self.current_budget.has_time() {
+                self.current_budget_report.budget_exhausted = true;
+                self.current_budget_report.stages.push((
+                    "multipass-outer",
+                    0,
+                    0,
+                    (loop_passes - pass) as u32,
+                ));
+                info!(
+                    pass,
+                    loop_passes,
+                    "DecodeBudget exhausted, stopping before additional multipass iteration"
+                );
+                break;
+            }
+
             // 4th-pass-after-a7 gating (spec ref
             // `spec-wsjtx-improved-4th-pass-after-a7.md` step 4): the
             // extra iteration (index >= max_passes) only runs if a7
@@ -3698,7 +3745,32 @@ impl Ft8Decoder {
             // over this cleaner residual recovers additional decodes
             // that were previously sitting under an a7-decoded signal's
             // ambiguity".
-            if pass + 1 < loop_passes {
+            //
+            // Task W4.3 budget fix: also gate this on
+            // `current_budget.has_time()`, not just `pass + 1 <
+            // loop_passes`. Found via A/B measurement, not by
+            // inspection: the top-of-loop `pass > 0` checkpoint added
+            // above only guards the NEXT pass's redecode work — it does
+            // NOT stop this unconditional subtraction step, which runs
+            // at the END of the CURRENT pass, one full iteration before
+            // that checkpoint is next evaluated. When
+            // `time_varying_subtraction_enabled` is on, subtraction
+            // itself is expensive (per-decoded-message GFSK synthesis +
+            // Hilbert transform + a sliding-window per-block 2x2 LS
+            // fit) — under a real bounded `DecodeBudget` this cost was
+            // being paid in full even on windows where the budget was
+            // then immediately exhausted at the very next loop-top
+            // check, so the next pass never ran anyway and the
+            // subtraction was pure waste. Skipping it when there is
+            // provably no time left for another pass closes that gap:
+            // the decision to pay for setup work (subtraction) is now
+            // conditioned on the same budget the decision to use that
+            // setup work (the next pass) is conditioned on. Under
+            // `DecodeBudget::unlimited()` `has_time()` is always
+            // `true`, so this is a byte-identical no-op for every
+            // existing entry point, matching every other
+            // `current_budget.has_time()` call site in this file.
+            if pass + 1 < loop_passes && self.current_budget.has_time() {
                 for msg in &pass_unique {
                     self.subtract_with_sidelobes(&mut residual_samples, msg);
                 }
