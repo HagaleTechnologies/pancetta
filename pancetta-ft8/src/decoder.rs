@@ -1419,6 +1419,81 @@ pub struct Ft8Config {
     /// mechanism problem). See the Task W3.4 report for the isolated A/B
     /// measurement (both legs run with `fine_sync_enabled = true`).
     pub nsym_combining_enabled: bool,
+
+    /// Decoder-TP-sensitivity Task W4.2 [A/B]: replaces `subtract_signal`'s
+    /// single WHOLE-SIGNAL complex (amplitude, phase) least-squares
+    /// estimate with a PER-BLOCK (sliding ~2-symbol window, 1-symbol hop)
+    /// estimate, low-pass smoothed across blocks (3-tap moving average)
+    /// and linearly interpolated to a per-sample time-varying complex
+    /// gain trajectory before subtracting. Real channel conditions
+    /// (fading, drift) mean the true amplitude/phase of a transmission
+    /// varies over its 12.64s duration; a single whole-signal fit leaves
+    /// systematic residue that a time-varying fit removes. Also switches
+    /// the subtraction REFERENCE itself from the hand-rolled CPFSK
+    /// approximation (`generate_cpfsk_iq`/`_ramped`) to Task W4.1's real,
+    /// Gaussian-pulse-shaped `generate_gfsk_reference` (synthesized via
+    /// the actual TX modulator) — its quadrature companion is derived via
+    /// an FFT-domain Hilbert transform (`hilbert_quadrature`; standard DSP
+    /// theory, not sourced from any peer decoder), since the real
+    /// modulator only emits one real-valued audio channel.
+    ///
+    /// The existing ±0.5 Hz-step/±40 ms-step fine alignment search that
+    /// finds `best_freq`/`best_time` is UNCHANGED — this flag only
+    /// affects what happens AFTER that search picks an alignment: the
+    /// legacy path fits one amplitude/phase pair over the whole aligned
+    /// signal and subtracts; this path fits a smoothed PER-BLOCK
+    /// trajectory over the same aligned signal (now referenced against
+    /// the true GFSK waveform) and subtracts that instead.
+    ///
+    /// Gated behind the `transmit` feature (same gate as
+    /// `generate_gfsk_reference`/`Ft8Modulator` themselves) — a
+    /// non-`transmit` build of `pancetta-ft8` alone always takes the
+    /// legacy path regardless of this flag's value (harmless: every
+    /// production/decode consumer in this workspace already builds with
+    /// `transmit` enabled).
+    ///
+    /// **Subtraction scale is `1.0` here, not the legacy path's `0.9`.**
+    /// The legacy `0.9` conservative factor exists to hedge against its
+    /// ONE-SHOT whole-signal fit being a poor match for a signal whose
+    /// true amplitude/phase varies over the transmission (over-
+    /// subtracting on a bad *global* fit flips the residual's sign and
+    /// makes things worse than under-subtracting). That fixed ~10%
+    /// held-back fraction is a percentage of the ORIGINAL signal's
+    /// amplitude, so for anything but a very weak signal it dwarfs a
+    /// realistic ambient noise floor regardless of fit quality — this
+    /// was measured empirically while building this task's TDD fixture
+    /// (see the Task W4.2 report): the legacy path's residual sat
+    /// ~46 dB above a matched-filter noise-only control on the fixture,
+    /// which the fixed `0.9` factor alone fully explains. The per-block
+    /// fit localizes the risk the legacy factor was hedging against to
+    /// each ~2-symbol window (a bad fit can only mis-subtract ~2
+    /// symbols' worth of samples, not the whole 12.64s), so this path
+    /// subtracts its own fitted estimate in full.
+    ///
+    /// **Presently a DEAD PATH in production**: `subtract_signal` (and
+    /// its sidelobe-cancelling wrapper `subtract_with_sidelobes`) is only
+    /// ever invoked from the standard multipass loop's
+    /// `if pass + 1 < loop_passes` guard, which never fires while
+    /// `max_decode_passes` stays at its production value of 1 (Task
+    /// W4.3, not yet landed, is what will re-enable real multipass).
+    /// Default **false** regardless: tests exercise this path directly by
+    /// constructing an `Ft8Config` with both this flag AND
+    /// `max_decode_passes >= 2` set locally (mirroring
+    /// `test_multipass_decodes_overlapping_signals`'s existing pattern),
+    /// which does not change the shipped default's behavior.
+    ///
+    /// Clean-room inspiration (prose specs only, no GPL source read):
+    /// `research/specs/spec-wsjtx-mainline-subtractft8.md` (WSJT-X
+    /// mainline's `subtractft8`/`gen_ft8wave` mix-with-conjugate-reference
+    /// + low-pass-filter-the-product technique for a slowly time-varying
+    /// complex amplitude — the general "time-varying gain, low-pass
+    /// smoothed" principle this flag implements a block-averaged variant
+    /// of, per this task's brief, rather than mainline's continuous
+    /// FFT-domain LPF), `spec-ft8mon-gaussian-ramp-subtract.md` (Gaussian
+    /// pulse-shaped reference for subtraction), and
+    /// `spec-sdrangel-subtract-edge-symbols.md` (edge-symbol subtraction
+    /// care).
+    pub time_varying_subtraction_enabled: bool,
 }
 
 impl Default for Ft8Config {
@@ -1807,6 +1882,12 @@ impl Default for Ft8Config {
             // field doc); kept default-false for defense-in-depth if
             // `fine_sync_enabled` is ever flipped on independently.
             nsym_combining_enabled: false,
+            // Task W4.2: default OFF. Dead path in production regardless
+            // (see the field doc — `subtract_signal` never runs while
+            // `max_decode_passes` stays at 1); default-false anyway for
+            // defense-in-depth and to keep every other test's legacy
+            // subtract behavior byte-identical.
+            time_varying_subtraction_enabled: false,
         }
     }
 }
@@ -4125,6 +4206,219 @@ impl Ft8Decoder {
         })
     }
 
+    /// Task W4.2: derive the analytic-signal quadrature companion of a
+    /// REAL reference waveform via an FFT-domain Hilbert transform —
+    /// zero the negative-frequency bins, double the positive-frequency
+    /// bins (DC and, for even length, Nyquist untouched), inverse
+    /// transform, and take the imaginary part. This is the standard
+    /// discrete Hilbert-transform-via-FFT construction (general DSP
+    /// theory; not sourced from any peer decoder).
+    ///
+    /// [`generate_gfsk_reference`] (Task W4.1) synthesizes a real,
+    /// Gaussian-pulse-shaped reference via the actual TX modulator, which
+    /// (like any real audio signal) only carries ONE channel — but the
+    /// complex 2x2 least-squares amplitude/phase solve this task's
+    /// per-block subtraction relies on needs TWO orthogonal real bases
+    /// (the same role `generate_cpfsk_iq`'s `(cos, sin)` pair already
+    /// plays for the legacy CPFSK reference). This function recovers
+    /// that missing orthogonal companion from the real reference alone,
+    /// so the modulator itself never needs to be touched.
+    #[cfg(feature = "transmit")]
+    fn hilbert_quadrature(real_signal: &[f64]) -> Vec<f64> {
+        let n = real_signal.len();
+        if n < 2 {
+            return vec![0.0; n];
+        }
+
+        let mut planner = FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(n);
+        let ifft = planner.plan_fft_inverse(n);
+
+        let mut buf: Vec<Complex<f64>> =
+            real_signal.iter().map(|&x| Complex::new(x, 0.0)).collect();
+        fft.process(&mut buf);
+
+        // h[0] = 1 (DC), h[n/2] = 1 (Nyquist, even n only), h[k] = 2 for
+        // 0 < k < n/2 (positive freqs, doubled to absorb the removed
+        // negative-frequency half), h[k] = 0 for k > n/2 (negative freqs).
+        let half = n / 2;
+        let last_doubled = if n.is_multiple_of(2) { half } else { half + 1 };
+        for c in buf.iter_mut().take(last_doubled).skip(1) {
+            *c *= 2.0;
+        }
+        for c in buf.iter_mut().skip(last_doubled) {
+            *c = Complex::new(0.0, 0.0);
+        }
+
+        ifft.process(&mut buf);
+        let scale = 1.0 / n as f64;
+        buf.into_iter().map(|c| c.im * scale).collect()
+    }
+
+    /// Task W4.2: build the GFSK reference's `(recon_i, recon_q)`
+    /// orthogonal pair at the given refined `(frequency, time)` estimate —
+    /// [`generate_gfsk_reference`]'s real samples as `recon_i`,
+    /// [`Self::hilbert_quadrature`]'s companion as `recon_q`. Returns
+    /// `None` if the modulator rejects the frequency (e.g. deviation
+    /// limits) — callers fall back to the legacy CPFSK subtraction path
+    /// on `None` rather than leaving the audio untouched.
+    #[cfg(feature = "transmit")]
+    fn build_gfsk_iq_pair(
+        symbols: &[u8],
+        pp: &ProtocolParams,
+        sample_rate: u32,
+        frequency_hz: f64,
+        time_offset_samples: f64,
+    ) -> Option<(Vec<f64>, Vec<f64>)> {
+        let gfsk_ref = Self::generate_gfsk_reference(
+            symbols,
+            pp,
+            sample_rate,
+            frequency_hz,
+            time_offset_samples,
+        )
+        .ok()?;
+        let recon_i: Vec<f64> = gfsk_ref.samples.iter().map(|&s| s as f64).collect();
+        let recon_q = Self::hilbert_quadrature(&recon_i);
+        Some((recon_i, recon_q))
+    }
+
+    /// Task W4.2: per-block (sliding ~2-symbol window, 1-symbol hop)
+    /// complex least-squares amplitude/phase estimate, low-pass smoothed
+    /// across blocks (3-tap moving average, reflected edges) and
+    /// linearly interpolated to a per-sample time-varying `(amp_i, amp_q)`
+    /// trajectory — replaces the legacy single whole-signal estimate.
+    ///
+    /// `recon_i`/`recon_q` must already be aligned so that index
+    /// `recon_offset` corresponds to `audio[recon_start]` (the same
+    /// convention `correlation_energy`/the legacy whole-signal fit use).
+    /// `signal_len` is the already-clipped overlap length. Each block's
+    /// raw fit is clamped to the same `MAX_AMP = 3.0` ceiling the legacy
+    /// whole-signal path uses, independently per block (so one noisy
+    /// block can't blow up the trajectory).
+    fn time_varying_complex_amplitude(
+        audio: &[f32],
+        recon_start: usize,
+        recon_i: &[f64],
+        recon_q: &[f64],
+        recon_offset: usize,
+        signal_len: usize,
+        sps: usize,
+    ) -> (Vec<f64>, Vec<f64>) {
+        const MAX_AMP: f64 = 3.0;
+
+        if signal_len == 0 {
+            return (Vec::new(), Vec::new());
+        }
+
+        let window_len = (2 * sps).max(1).min(signal_len);
+        let hop = sps.max(1);
+
+        // Slide the window across the signal, computing one complex
+        // amplitude/phase estimate per hop position.
+        let mut centers: Vec<usize> = Vec::new();
+        let mut estimates: Vec<(f64, f64)> = Vec::new();
+        let mut start = 0usize;
+        loop {
+            let win_len = window_len.min(signal_len - start);
+            if win_len == 0 {
+                break;
+            }
+
+            let mut dot_ai = 0.0f64;
+            let mut dot_aq = 0.0f64;
+            let mut dot_ii = 0.0f64;
+            let mut dot_qq = 0.0f64;
+            let mut dot_iq = 0.0f64;
+            for k in 0..win_len {
+                let idx = start + k;
+                let a = audio[recon_start + idx] as f64;
+                let ri = recon_i[recon_offset + idx];
+                let rq = recon_q[recon_offset + idx];
+                dot_ai += a * ri;
+                dot_aq += a * rq;
+                dot_ii += ri * ri;
+                dot_qq += rq * rq;
+                dot_iq += ri * rq;
+            }
+
+            let det = dot_ii * dot_qq - dot_iq * dot_iq;
+            let (mut ai, mut aq) = if det.abs() > 1e-12 {
+                (
+                    (dot_ai * dot_qq - dot_aq * dot_iq) / det,
+                    (dot_aq * dot_ii - dot_ai * dot_iq) / det,
+                )
+            } else {
+                (0.0, 0.0)
+            };
+            let total_amp = (ai * ai + aq * aq).sqrt();
+            if total_amp > MAX_AMP {
+                let s = MAX_AMP / total_amp;
+                ai *= s;
+                aq *= s;
+            }
+
+            centers.push(start + win_len / 2);
+            estimates.push((ai, aq));
+
+            if start + hop >= signal_len {
+                break;
+            }
+            start += hop;
+        }
+
+        if estimates.is_empty() {
+            return (vec![0.0; signal_len], vec![0.0; signal_len]);
+        }
+
+        // Low-pass smooth the block-estimate sequence (3-tap moving
+        // average, reflected/clamped edges) so adjacent blocks don't
+        // introduce an abrupt gain jump.
+        let smoothed: Vec<(f64, f64)> = (0..estimates.len())
+            .map(|i| {
+                let prev = estimates[i.saturating_sub(1)];
+                let next = estimates[(i + 1).min(estimates.len() - 1)];
+                let cur = estimates[i];
+                (
+                    0.25 * prev.0 + 0.5 * cur.0 + 0.25 * next.0,
+                    0.25 * prev.1 + 0.5 * cur.1 + 0.25 * next.1,
+                )
+            })
+            .collect();
+
+        // Interpolate the smoothed per-block estimates to a per-sample
+        // trajectory: linear between consecutive block centers, flat
+        // extrapolation before the first / after the last center.
+        let mut amp_i_t = vec![0.0f64; signal_len];
+        let mut amp_q_t = vec![0.0f64; signal_len];
+        let last = centers.len() - 1;
+        for n in 0..signal_len {
+            if n <= centers[0] {
+                amp_i_t[n] = smoothed[0].0;
+                amp_q_t[n] = smoothed[0].1;
+                continue;
+            }
+            if n >= centers[last] {
+                amp_i_t[n] = smoothed[last].0;
+                amp_q_t[n] = smoothed[last].1;
+                continue;
+            }
+            // centers[0] < n < centers[last]: find the bracketing pair.
+            let hi = centers.partition_point(|&c| c <= n).min(last);
+            let lo = hi.saturating_sub(1);
+            let (c0, c1) = (centers[lo], centers[hi]);
+            let frac = if c1 > c0 {
+                (n - c0) as f64 / (c1 - c0) as f64
+            } else {
+                0.0
+            };
+            amp_i_t[n] = smoothed[lo].0 + frac * (smoothed[hi].0 - smoothed[lo].0);
+            amp_q_t[n] = smoothed[lo].1 + frac * (smoothed[hi].1 - smoothed[lo].1);
+        }
+
+        (amp_i_t, amp_q_t)
+    }
+
     /// Compute the correlation energy (amplitude^2) of a CPFSK signal at given
     /// frequency against the audio. Used for fine frequency search.
     fn correlation_energy(
@@ -4241,6 +4535,79 @@ impl Ft8Decoder {
 
         if signal_len == 0 {
             return;
+        }
+
+        // Task W4.2 [A/B]: per-block time-varying complex amplitude,
+        // referenced against the true Gaussian-shaped GFSK waveform (Task
+        // W4.1) instead of the hand-rolled CPFSK approximation above
+        // (which stays as-is for the fine alignment search — only the
+        // FINAL subtraction reference/amplitude-fit changes here). See
+        // `Ft8Config::time_varying_subtraction_enabled`'s doc for the
+        // production-dead-path/default-off rationale. Gated behind
+        // `transmit` (same gate as `generate_gfsk_reference`/
+        // `Ft8Modulator` themselves).
+        #[cfg(feature = "transmit")]
+        if self.config.time_varying_subtraction_enabled {
+            if let Some((gfsk_i, gfsk_q)) = Self::build_gfsk_iq_pair(
+                symbols,
+                &self.protocol_params,
+                SAMPLE_RATE,
+                best_freq,
+                best_time as f64,
+            ) {
+                if gfsk_i.len() >= recon_offset + signal_len {
+                    let (amp_i_t, amp_q_t) = Self::time_varying_complex_amplitude(
+                        audio,
+                        recon_start,
+                        &gfsk_i,
+                        &gfsk_q,
+                        recon_offset,
+                        signal_len,
+                        sps,
+                    );
+                    // The legacy path's `0.9` conservative factor hedges
+                    // against its ONE-SHOT whole-signal fit being a poor
+                    // match for a signal whose true amplitude/phase
+                    // varies over the transmission (over-subtracting on
+                    // a bad global fit flips the residual's sign and
+                    // makes things worse than under-subtracting). That
+                    // systematic ~10% (`1 - 0.9`) held-back fraction is a
+                    // FIXED percentage of the original (often fairly
+                    // strong) signal — for anything but a very weak
+                    // signal it dwarfs a realistic ambient noise floor
+                    // regardless of fit quality, old or new (measured
+                    // empirically while building this task's TDD fixture
+                    // — see the Task W4.2 report). The per-block fit
+                    // localizes the risk the legacy factor was hedging
+                    // against to each ~2-symbol window (a bad fit can
+                    // only mis-subtract ~2 symbols' worth of samples, not
+                    // the whole 12.64s), so this path uses the full,
+                    // un-hedged estimate (`scale = 1.0`): each block's
+                    // own least-squares fit IS the conservative measure
+                    // now, not an additional blanket held-back fraction
+                    // on top of it.
+                    let scale = 1.0;
+                    for i in 0..signal_len {
+                        let subtracted = amp_i_t[i] * gfsk_i[recon_offset + i]
+                            + amp_q_t[i] * gfsk_q[recon_offset + i];
+                        audio[recon_start + i] -= (subtracted * scale) as f32;
+                    }
+
+                    #[cfg(feature = "debug-decode")]
+                    eprintln!(
+                        "  [subtract-tv] '{}' at {:.2} Hz (nom {:.1}), t={:.4}s (nom {:.3})",
+                        msg.text,
+                        best_freq,
+                        nominal_freq,
+                        best_time as f64 / SAMPLE_RATE as f64,
+                        msg.time_offset
+                    );
+                    return;
+                }
+            }
+            // Falls through to the legacy CPFSK path below if GFSK
+            // reference synthesis failed (e.g. frequency near the
+            // deviation limit) — never silently drop the subtraction.
         }
 
         // Full 2x2 least-squares for amplitude and phase
@@ -16678,6 +17045,324 @@ mod hb226_gaussian_ramp_tests {
             );
             last_v = *v;
         }
+    }
+}
+
+// ============================================================================
+// Task W4.2 (decoder-true-positive-sensitivity plan, Workstream 4):
+// per-block time-varying complex amplitude subtraction against the true
+// GFSK reference (Task W4.1), replacing the legacy whole-signal estimate.
+//
+// This is the "residual power in A's tone bins <= noise floor + 3dB" half
+// of the task brief's two-signal TDD fixture. It lives HERE (a unit test
+// inside this module) rather than in `tests/decoder_refinement_tests.rs`
+// because it needs direct access to the private `subtract_signal` method
+// to inspect the mutated residual buffer — the same reason
+// `hb226_gaussian_ramp_tests` above (and its
+// `hb226_subtract_default_off_byte_identical` /
+// `hb226_subtract_ramped_changes_buffer_at_boundaries` tests) hand-
+// construct a `DecodedMessage` with the encoder's real tone symbols and
+// call `subtract_signal` directly: an external integration test can only
+// see this crate's `pub` API, and `subtract_signal` isn't `pub`. The
+// complementary "B decodes on pass 2" half of the fixture lives in
+// `tests/decoder_refinement_tests.rs` (`mod w42_time_varying_subtraction`),
+// driven entirely through the public `decode_window` API with
+// `max_decode_passes = 2` set LOCALLY in that test (this does not change
+// the shipped config default of 1 — see
+// `Ft8Config::time_varying_subtraction_enabled`'s doc).
+// ============================================================================
+#[cfg(test)]
+#[cfg(feature = "transmit")]
+mod w42_time_varying_subtraction_tests {
+    use super::*;
+    use crate::WINDOW_SAMPLES;
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    const FREQ_A: f64 = 1200.0;
+    const FREQ_B: f64 = FREQ_A + 30.0; // 30 Hz apart, per the task brief
+    const AMP_A_DB: f64 = -5.0;
+    const AMP_B_DB: f64 = -17.0;
+    const NOISE_FLOOR_DB_BELOW_A: f64 = -20.0;
+
+    fn db_to_amplitude(db: f64) -> f64 {
+        10f64.powf(db / 20.0)
+    }
+
+    /// Deterministic real-valued Gaussian noise (Box-Muller), added
+    /// in-place. Mirrors the identical helper already used in
+    /// `tests/decoder_refinement_tests.rs`'s `w33_matched_demod`/
+    /// `w34_nsym_combining` fixtures (private to those modules, so
+    /// reimplemented here rather than exported, per the same rationale
+    /// documented there).
+    fn add_seeded_noise(samples: &mut [f32], noise_amplitude: f64, seed: u64) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut i = 0;
+        while i < samples.len() {
+            let u1: f64 = rng.random::<f64>().max(1e-12);
+            let u2: f64 = rng.random::<f64>();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f64::consts::PI * u2;
+            samples[i] += (r * theta.cos() * noise_amplitude) as f32;
+            i += 1;
+            if i < samples.len() {
+                samples[i] += (r * theta.sin() * noise_amplitude) as f32;
+                i += 1;
+            }
+        }
+    }
+
+    /// Build the overlapping two-signal fixture: message A's real
+    /// encoded+modulated symbols at `FREQ_A`/`AMP_A_DB`, overlapped with
+    /// message B's at `FREQ_B`/`AMP_B_DB` (30 Hz apart, per the task
+    /// brief), plus a small deterministic noise floor. Returns
+    /// `(audio, symbols_a, symbols_b)`.
+    fn build_overlapping_fixture(seed: u64) -> (Vec<f32>, Vec<u8>, Vec<u8>) {
+        use crate::encoder::Ft8Encoder;
+        use crate::modulator::{Ft8Modulator, PulseShape};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols_a = encoder.encode_message("CQ K5ARH EM10", None).unwrap();
+        let symbols_b = encoder.encode_message("CQ W1ABC FN42", None).unwrap();
+
+        // Real FT8 signals are Gaussian-shaped (GFSK, BT=2.0), not the
+        // decoder's legacy rectangular-CPFSK reference approximation —
+        // build the fixture with the SAME real pulse shape a genuine
+        // off-air signal has (this is exactly the shape mismatch Task
+        // W4.1/W4.2 exist to close; using `Ft8Modulator::new`'s
+        // rectangular default here would silently test the old
+        // assumption instead of the real one).
+        let mut modulator_a = Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE,
+            FREQ_A,
+            1.0,
+            PulseShape::Gaussian { bt: 2.0 },
+        )
+        .unwrap();
+        let sig_a = modulator_a.modulate_symbols(&symbols_a, 0.0).unwrap();
+        let mut modulator_b = Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE,
+            FREQ_B,
+            1.0,
+            PulseShape::Gaussian { bt: 2.0 },
+        )
+        .unwrap();
+        let sig_b = modulator_b.modulate_symbols(&symbols_b, 0.0).unwrap();
+
+        let amp_a = db_to_amplitude(AMP_A_DB);
+        let amp_b = db_to_amplitude(AMP_B_DB);
+
+        let mut audio = vec![0.0f32; WINDOW_SAMPLES];
+        for (i, &s) in sig_a.iter().enumerate() {
+            if i < audio.len() {
+                audio[i] += s * amp_a as f32;
+            }
+        }
+        for (i, &s) in sig_b.iter().enumerate() {
+            if i < audio.len() {
+                audio[i] += s * amp_b as f32;
+            }
+        }
+
+        let noise_amplitude = amp_a * db_to_amplitude(NOISE_FLOOR_DB_BELOW_A);
+        add_seeded_noise(&mut audio, noise_amplitude, seed);
+
+        (audio, symbols_a.to_vec(), symbols_b.to_vec())
+    }
+
+    /// Coherent matched-filter "how much A-like energy remains" metric:
+    /// the same complex 2x2 least-squares projection `subtract_signal`
+    /// itself uses, applied ONCE over the whole aligned region (not
+    /// per-block) and returning `ai^2 + aq^2` — the best-fit amplitude^2
+    /// of `audio` against the `(recon_i, recon_q)` reference. This is a
+    /// cleaner "residual power in A's tone bins" measure than a raw FFT
+    /// bin-power average: an FFT of a fixed-length buffer containing a
+    /// strong nearby tone leaks that tone's energy into neighboring bins
+    /// via window sidelobes regardless of how well it was subtracted,
+    /// which would make a spectral "residual vs. distant noise floor"
+    /// comparison measure window leakage rather than genuine subtraction
+    /// residue (found empirically while calibrating this fixture — see
+    /// the Task W4.2 report). A matched-filter projection against A's
+    /// OWN reference is immune to that: it only responds to energy that
+    /// actually correlates with A's waveform.
+    fn project_energy(
+        audio: &[f32],
+        start: usize,
+        recon_i: &[f64],
+        recon_q: &[f64],
+        len: usize,
+    ) -> f64 {
+        let mut dot_ai = 0.0f64;
+        let mut dot_aq = 0.0f64;
+        let mut dot_ii = 0.0f64;
+        let mut dot_qq = 0.0f64;
+        let mut dot_iq = 0.0f64;
+        for i in 0..len {
+            let a = audio[start + i] as f64;
+            let ri = recon_i[i];
+            let rq = recon_q[i];
+            dot_ai += a * ri;
+            dot_aq += a * rq;
+            dot_ii += ri * ri;
+            dot_qq += rq * rq;
+            dot_iq += ri * rq;
+        }
+        let det = dot_ii * dot_qq - dot_iq * dot_iq;
+        if det.abs() > 1e-12 {
+            let ai = (dot_ai * dot_qq - dot_aq * dot_iq) / det;
+            let aq = (dot_aq * dot_ii - dot_ai * dot_iq) / det;
+            ai * ai + aq * aq
+        } else {
+            0.0
+        }
+    }
+
+    /// TDD fixture (a): after subtracting A (via the new time-varying,
+    /// GFSK-referenced path) from the A+B overlap, the coherent
+    /// matched-filter energy A's own reference still finds in the
+    /// residual must fall within 3 dB of the energy the SAME matched
+    /// filter finds in a pure-ambient-noise-only control buffer (same
+    /// noise seed/level, no A or B at all) — i.e. the residual is
+    /// statistically indistinguishable from "just the noise floor" as
+    /// far as A's own reference waveform is concerned.
+    #[test]
+    fn time_varying_subtraction_leaves_low_residual_in_a_tone_bins() {
+        // Multiple independent noise seeds — a single lucky seed
+        // wouldn't be convincing evidence for a claim this specific.
+        for seed in [1u64, 7, 13, 42, 99] {
+            let (mut audio, symbols_a, _symbols_b) = build_overlapping_fixture(seed);
+
+            let mut msg_a =
+                DecodedMessage::new(crate::message::Ft8Message::default(), 0.0, 1.0, FREQ_A, 0.0);
+            msg_a.tone_symbols = Some(symbols_a.clone());
+
+            let mut config = Ft8Config::default();
+            config.time_varying_subtraction_enabled = true;
+            let decoder = Ft8Decoder::new(config.clone()).unwrap();
+
+            decoder.subtract_signal(&mut audio, &msg_a);
+
+            let (gfsk_i, gfsk_q) = Ft8Decoder::build_gfsk_iq_pair(
+                &symbols_a,
+                &decoder.protocol_params,
+                SAMPLE_RATE,
+                FREQ_A,
+                0.0,
+            )
+            .expect("GFSK reference synthesis should succeed at a valid in-band frequency");
+            let residual_a_energy = project_energy(&audio, 0, &gfsk_i, &gfsk_q, gfsk_i.len());
+
+            // Noise-only control: same ambient noise seed/level, no A or
+            // B — the "false positive" energy A's own matched filter
+            // would show from pure noise alone.
+            let mut noise_only = vec![0.0f32; WINDOW_SAMPLES];
+            let noise_amplitude =
+                db_to_amplitude(AMP_A_DB) * db_to_amplitude(NOISE_FLOOR_DB_BELOW_A);
+            add_seeded_noise(&mut noise_only, noise_amplitude, seed);
+            let noise_floor_energy = project_energy(&noise_only, 0, &gfsk_i, &gfsk_q, gfsk_i.len());
+
+            let limit = noise_floor_energy * 10f64.powf(3.0 / 10.0); // +3 dB in linear power
+            assert!(
+                residual_a_energy <= limit,
+                "seed {seed}: matched-filter residual energy for A ({:.3e}) should be \
+                 within 3 dB of the noise-only control's matched-filter energy \
+                 ({:.3e}, +3dB limit {:.3e})",
+                residual_a_energy,
+                noise_floor_energy,
+                limit
+            );
+        }
+    }
+
+    /// RED companion to the GREEN test above: the LEGACY path (flag off
+    /// — whole-signal CPFSK reference + fixed `0.9` conservative scale)
+    /// leaves a matched-filter-detectable residual well ABOVE the
+    /// noise-only control's +3dB limit on the SAME fixture — proving the
+    /// GREEN result isn't something the pre-existing code already
+    /// achieved for free. The legacy path's `0.9` factor deliberately
+    /// holds back ~10% of the fitted amplitude regardless of fit
+    /// quality; over a whole-signal matched-filter integration that
+    /// fixed percentage of a `-5 dB` signal is unavoidably far louder
+    /// than a realistic `-25 dB` ambient floor.
+    #[test]
+    fn legacy_path_fails_the_same_residual_bound() {
+        let (mut audio, symbols_a, _symbols_b) = build_overlapping_fixture(7);
+
+        let mut msg_a =
+            DecodedMessage::new(crate::message::Ft8Message::default(), 0.0, 1.0, FREQ_A, 0.0);
+        msg_a.tone_symbols = Some(symbols_a.clone());
+
+        let config = Ft8Config::default();
+        assert!(!config.time_varying_subtraction_enabled);
+        let decoder = Ft8Decoder::new(config.clone()).unwrap();
+
+        decoder.subtract_signal(&mut audio, &msg_a);
+
+        let (gfsk_i, gfsk_q) = Ft8Decoder::build_gfsk_iq_pair(
+            &symbols_a,
+            &decoder.protocol_params,
+            SAMPLE_RATE,
+            FREQ_A,
+            0.0,
+        )
+        .expect("GFSK reference synthesis should succeed at a valid in-band frequency");
+        // Note: measuring the LEGACY (CPFSK-subtracted) residual against
+        // the NEW GFSK reference's matched filter — appropriate, since
+        // the claim under test is "is genuine A-like energy still
+        // present", not "does the legacy reference agree with itself".
+        let residual_a_energy = project_energy(&audio, 0, &gfsk_i, &gfsk_q, gfsk_i.len());
+
+        let mut noise_only = vec![0.0f32; WINDOW_SAMPLES];
+        let noise_amplitude = db_to_amplitude(AMP_A_DB) * db_to_amplitude(NOISE_FLOOR_DB_BELOW_A);
+        add_seeded_noise(&mut noise_only, noise_amplitude, 7);
+        let noise_floor_energy = project_energy(&noise_only, 0, &gfsk_i, &gfsk_q, gfsk_i.len());
+
+        let limit = noise_floor_energy * 10f64.powf(3.0 / 10.0);
+        assert!(
+            residual_a_energy > limit,
+            "legacy path unexpectedly satisfied the +3dB residual bound on its own \
+             ({:.3e} <= limit {:.3e}) — the GREEN test's result would no longer be \
+             evidence of an improvement",
+            residual_a_energy,
+            limit
+        );
+    }
+
+    /// Regression guard: the flag must default OFF, so every other
+    /// `subtract_signal` test in this file (and production, which never
+    /// even reaches `subtract_signal` while `max_decode_passes` stays at
+    /// 1 — see the field's doc) stays on the legacy byte-identical path.
+    #[test]
+    fn time_varying_subtraction_default_is_off() {
+        assert!(!Ft8Config::default().time_varying_subtraction_enabled);
+    }
+
+    /// Sanity: with the flag OFF (default), `subtract_signal` on the
+    /// overlapping fixture must produce the exact same output as two
+    /// independent runs with the flag OFF — i.e. this task's changes
+    /// didn't perturb the legacy path's determinism.
+    #[test]
+    fn legacy_path_unaffected_when_flag_off() {
+        let (audio, symbols_a, _symbols_b) = build_overlapping_fixture(7);
+
+        let mut msg_a =
+            DecodedMessage::new(crate::message::Ft8Message::default(), 0.0, 1.0, FREQ_A, 0.0);
+        msg_a.tone_symbols = Some(symbols_a);
+
+        let config = Ft8Config::default();
+        assert!(!config.time_varying_subtraction_enabled);
+
+        let decoder1 = Ft8Decoder::new(config.clone()).unwrap();
+        let mut audio1 = audio.clone();
+        decoder1.subtract_signal(&mut audio1, &msg_a);
+
+        let decoder2 = Ft8Decoder::new(config).unwrap();
+        let mut audio2 = audio.clone();
+        decoder2.subtract_signal(&mut audio2, &msg_a);
+
+        assert_eq!(
+            audio1, audio2,
+            "default-OFF subtract must remain deterministic / byte-identical"
+        );
     }
 }
 

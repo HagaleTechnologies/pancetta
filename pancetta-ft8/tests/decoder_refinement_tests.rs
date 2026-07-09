@@ -641,6 +641,190 @@ mod w36_freq_tracker {
 }
 
 // ============================================================================
+// Task W4.2 (decoder-true-positive-sensitivity plan, Workstream 4):
+// per-block time-varying complex amplitude subtraction against the true
+// GFSK reference (Task W4.1). This is the "B decodes on pass 2" half of
+// the task brief's two-signal TDD fixture — driven entirely through the
+// public `decode_window` API with `max_decode_passes = 2` set LOCALLY in
+// this test (mirrors `test_multipass_decodes_overlapping_signals` above;
+// does NOT change the shipped config default of 1 — see
+// `Ft8Config::time_varying_subtraction_enabled`'s doc). The complementary
+// "residual power in A's tone bins" half of the fixture is a unit test
+// inside `decoder.rs` itself (`mod w42_time_varying_subtraction_tests`),
+// since it needs direct access to the private `subtract_signal` method —
+// see that module's doc comment for why.
+// ============================================================================
+#[cfg(feature = "transmit")]
+mod w42_time_varying_subtraction {
+    use super::*;
+    use pancetta_ft8::encoder::Ft8Encoder;
+    use pancetta_ft8::modulator::{Ft8Modulator, PulseShape};
+    use rand::{rngs::StdRng, Rng, SeedableRng};
+
+    const MSG_A: &str = "CQ K5ARH EM10";
+    const MSG_B: &str = "CQ W1ABC FN42";
+    const FREQ_A: f64 = 1200.0;
+    const FREQ_B: f64 = FREQ_A + 30.0; // 30 Hz apart, per the task brief
+    const AMP_A_DB: f64 = -5.0;
+    const AMP_B_DB: f64 = -17.0;
+    // -20 dB relative to A (i.e. -25 dB absolute) — comfortably below B
+    // (-17 dB absolute, an 8 dB gap) so B stays cleanly decodable; also
+    // matches the noise level the paired residual-power unit test in
+    // `decoder.rs` uses (`NOISE_FLOOR_DB_BELOW_A`).
+    const NOISE_FLOOR_DB_BELOW_A: f64 = -20.0;
+
+    fn db_to_amplitude(db: f64) -> f64 {
+        10f64.powf(db / 20.0)
+    }
+
+    /// Deterministic real-valued Gaussian noise (Box-Muller), added
+    /// in-place. Mirrors the identical helper already used by
+    /// `w33_matched_demod`/`w34_nsym_combining` above (private to those
+    /// modules, so reimplemented here rather than exported, per the same
+    /// rationale documented there).
+    fn add_seeded_noise(samples: &mut [f32], noise_amplitude: f64, seed: u64) {
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut i = 0;
+        while i < samples.len() {
+            let u1: f64 = rng.random::<f64>().max(1e-12);
+            let u2: f64 = rng.random::<f64>();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f64::consts::PI * u2;
+            samples[i] += (r * theta.cos() * noise_amplitude) as f32;
+            i += 1;
+            if i < samples.len() {
+                samples[i] += (r * theta.sin() * noise_amplitude) as f32;
+                i += 1;
+            }
+        }
+    }
+
+    /// Build the overlapping two-signal fixture: message A's real
+    /// encoded+modulated (Gaussian/GFSK-shaped, matching a genuine
+    /// off-air FT8 signal) symbols at `FREQ_A`/`AMP_A_DB`, overlapped
+    /// with message B's at `FREQ_B`/`AMP_B_DB` (30 Hz apart, per the task
+    /// brief), plus a deterministic ambient noise floor.
+    fn build_overlapping_fixture(seed: u64) -> Vec<f32> {
+        let mut encoder = Ft8Encoder::new();
+        let symbols_a = encoder.encode_message(MSG_A, None).unwrap();
+        let symbols_b = encoder.encode_message(MSG_B, None).unwrap();
+
+        let mut modulator_a = Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE,
+            FREQ_A,
+            1.0,
+            PulseShape::Gaussian { bt: 2.0 },
+        )
+        .unwrap();
+        let sig_a = modulator_a.modulate_symbols(&symbols_a, 0.0).unwrap();
+        let mut modulator_b = Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE,
+            FREQ_B,
+            1.0,
+            PulseShape::Gaussian { bt: 2.0 },
+        )
+        .unwrap();
+        let sig_b = modulator_b.modulate_symbols(&symbols_b, 0.0).unwrap();
+
+        let amp_a = db_to_amplitude(AMP_A_DB);
+        let amp_b = db_to_amplitude(AMP_B_DB);
+
+        let mut audio = vec![0.0f32; WINDOW_SAMPLES];
+        for (i, &s) in sig_a.iter().enumerate() {
+            if i < audio.len() {
+                audio[i] += s * amp_a as f32;
+            }
+        }
+        for (i, &s) in sig_b.iter().enumerate() {
+            if i < audio.len() {
+                audio[i] += s * amp_b as f32;
+            }
+        }
+
+        let noise_amplitude = amp_a * db_to_amplitude(NOISE_FLOOR_DB_BELOW_A);
+        add_seeded_noise(&mut audio, noise_amplitude, seed);
+
+        audio
+    }
+
+    fn decoded_texts(config: Ft8Config, audio: &[f32]) -> Vec<String> {
+        let mut decoder = Ft8Decoder::new(config).unwrap();
+        decoder
+            .decode_window(audio)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| m.text)
+            .collect()
+    }
+
+    /// GREEN: with the new time-varying, GFSK-referenced subtraction
+    /// enabled (and `max_decode_passes` raised to 2 LOCALLY in this test
+    /// — production stays at 1, see the module doc above), pass 1
+    /// decodes the stronger A and subtracts it from the residual; pass 2
+    /// then decodes B out of that cleaned residual.
+    #[test]
+    fn time_varying_subtraction_recovers_b_on_pass_2() {
+        let audio = build_overlapping_fixture(7);
+
+        let mut config = Ft8Config::default();
+        config.max_decode_passes = 2;
+        config.time_varying_subtraction_enabled = true;
+
+        let texts = decoded_texts(config, &audio);
+        assert!(
+            texts.iter().any(|t| t == MSG_A),
+            "sanity: A ({MSG_A}) should decode on pass 1; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == MSG_B),
+            "expected B ({MSG_B}) to decode on pass 2 after A is subtracted \
+             via the new time-varying subtraction path; got {texts:?}"
+        );
+    }
+
+    /// Sanity check (NOT a discriminating RED test — see below): the SAME
+    /// fixture with the legacy subtraction path (flag off) ALSO recovers
+    /// B at `max_decode_passes = 2` on this particular fixture. Measured
+    /// while building this test: this scenario (a static channel, no
+    /// injected fading/drift) doesn't discriminate old-vs-new at the
+    /// pass/fail decode-outcome level, because 30 Hz separation / -12 dB
+    /// relative power is easy enough that even the legacy whole-signal
+    /// fit's larger residual still falls below what pass 2 needs to find
+    /// B. The finer-grained, quantitative residual-power comparison DOES
+    /// discriminate the two mechanisms — see
+    /// `decoder.rs`'s `w42_time_varying_subtraction_tests::
+    /// legacy_path_fails_the_same_residual_bound` (GREEN) vs
+    /// `time_varying_subtraction_leaves_low_residual_in_a_tone_bins`
+    /// (matched-filter energy: legacy ~46 dB above the noise floor,
+    /// new within 3 dB of it). This test is therefore a byte-identical-
+    /// legacy-path regression guard, not a claim that the new mechanism
+    /// is required to decode B on this specific easy fixture.
+    #[test]
+    fn legacy_subtraction_also_recovers_b_on_this_fixture() {
+        let audio = build_overlapping_fixture(7);
+
+        let mut config = Ft8Config::default();
+        config.max_decode_passes = 2;
+        assert!(!config.time_varying_subtraction_enabled);
+
+        let texts = decoded_texts(config, &audio);
+        assert!(
+            texts.iter().any(|t| t == MSG_A),
+            "sanity: A ({MSG_A}) should still decode on pass 1; got {texts:?}"
+        );
+        assert!(
+            texts.iter().any(|t| t == MSG_B),
+            "expected legacy subtraction to also recover B ({MSG_B}) on this \
+             easy (non-fading) fixture — if this ever starts failing, this \
+             fixture HAS become a genuine RED/GREEN discriminator for the \
+             decode outcome and this test should be inverted into one \
+             (asserting B is NOT recovered) alongside the GREEN test above; \
+             got {texts:?}"
+        );
+    }
+}
+
+// ============================================================================
 // Task W1.4 (decoder-TP-sensitivity plan, spec Section 7): `whiten_llrs`
 // dB-vs-linear-|y| gain-invariance property test.
 //
