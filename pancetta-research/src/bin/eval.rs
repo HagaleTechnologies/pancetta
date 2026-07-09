@@ -131,6 +131,10 @@ struct Args {
     /// primary sweep with a per-`freq_bin` top-K cut). See
     /// `Ft8Config::per_bin_candidate_selection`.
     per_bin_candidate_selection: Option<bool>,
+    /// Task W5.2 [A/B]: master switch for the percentile-normalized
+    /// wide-lag two-baseline sync mechanism. See
+    /// `Ft8Config::costas_two_baseline_enabled`.
+    costas_two_baseline_enabled: Option<bool>,
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     cross_cycle_averaging: Option<bool>,
     /// hb-074: coherent (phase-aligned complex sum) variant of cross-cycle averaging.
@@ -296,6 +300,7 @@ impl Args {
         let mut deep_iters: Option<usize> = None;
         let mut escalation_parity_max: Option<usize> = None;
         let mut per_bin_candidate_selection: Option<bool> = None;
+        let mut costas_two_baseline_enabled: Option<bool> = None;
         let mut cross_cycle_averaging: Option<bool> = None;
         let mut cross_cycle_coherent: Option<bool> = None;
         let mut cross_cycle_coherent_mrc: Option<bool> = None;
@@ -576,6 +581,12 @@ impl Args {
                 }
                 "--no-per-bin-candidate-selection" => {
                     per_bin_candidate_selection = Some(false);
+                }
+                "--costas-two-baseline-enabled" => {
+                    costas_two_baseline_enabled = Some(true);
+                }
+                "--no-costas-two-baseline-enabled" => {
+                    costas_two_baseline_enabled = Some(false);
                 }
                 "--cross-cycle-averaging" => {
                     cross_cycle_averaging = Some(true);
@@ -865,6 +876,8 @@ impl Args {
                     eprintln!("  --cq-ap / --no-cq-ap: decoder-TP-sensitivity Task W2.6 [A/B] — try ApLevel::Cq (assume a failed-AP0 candidate is a plain \"CQ\" call; no ApContext needed) on every candidate that reaches AP injection (production default: off). See Ft8Config::cq_ap_enabled.");
                     eprintln!("  --ap4-full-mask / --no-ap4-full-mask: decoder-TP-sensitivity Task W2.6 [A/B] — extend AP4 from a message-TYPE-only prior (i3=1) to a full message-CONTENT mask, trying the RR73/RRR/73 ir+igrid4 fields (production default: off). See Ft8Config::ap4_full_message_mask_enabled.");
                     eprintln!("  --ap-post-normalize / --no-ap-post-normalize: decoder-TP-sensitivity Task W2.6 [A/B] — normalize LLRs BEFORE injecting AP bits (not after) at every AP injection site, so the injected magnitude never distorts the channel-evidence scale (production default: off = inject-then-normalize). See Ft8Config::ap_injection_post_normalization.");
+                    eprintln!("  --per-bin-candidate-selection / --no-per-bin-candidate-selection: decoder-TP-sensitivity Task W5.1 [A/B] — per-bin (freq_bin) top-K candidate thinning on the main Costas sweep, replacing the flat top-max_sync_candidates cap (production default: off, DECLINED — real regression on hard-200). See Ft8Config::per_bin_candidate_selection.");
+                    eprintln!("  --costas-two-baseline-enabled / --no-costas-two-baseline-enabled: decoder-TP-sensitivity Task W5.2 [A/B] — percentile-normalized wide-lag two-baseline (tight+wide) sync candidate emission (production default: off). See Ft8Config::costas_two_baseline_enabled.");
                     eprintln!("  --floor-iters N: shallow BP iteration count for S1/S2 when --escalation-enabled (default 25).");
                     eprintln!("  --deep-iters N: deep BP iteration count a near-miss floor failure is escalated to (default 100).");
                     eprintln!("  --escalation-parity-max N: max unsatisfied parity checks at floor_iters tolerated before escalating (default 30).");
@@ -922,6 +935,7 @@ impl Args {
             deep_iters,
             escalation_parity_max,
             per_bin_candidate_selection,
+            costas_two_baseline_enabled,
             cross_cycle_averaging,
             cross_cycle_coherent,
             cross_cycle_coherent_mrc,
@@ -2011,6 +2025,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.per_bin_candidate_selection {
         d = d.with_per_bin_candidate_selection(on);
+    }
+    if let Some(on) = args.costas_two_baseline_enabled {
+        d = d.with_costas_two_baseline_enabled(on);
     }
     if let Some(on) = args.cross_cycle_averaging {
         d = d.with_cross_cycle_averaging(on);

@@ -737,8 +737,22 @@ pub struct Ft8Config {
     /// Inspired by WSJT-X mainline `sync8.f90` — the wide-lag baseline
     /// (`red2`) is the mechanism that catches slot-edge negative-dt
     /// signals at the candidate-generation stage, distinct from the
-    /// per-candidate `sync_bc` partial-Costas metric. Default **false**
-    /// until corpus measurement confirms the FP profile.
+    /// per-candidate `sync_bc` partial-Costas metric.
+    ///
+    /// Decoder-TP-sensitivity Task W5.2 [A/B, RETESTED — DECLINED]:
+    /// re-measured against the true production default
+    /// (`per_bin_candidate_selection = false`) on hard-200: recall
+    /// Δ=-49 (95% CI [-69,-30], significant), novel Δ=-200 (95% CI
+    /// [-253,-152], significant) — a clean, decisive regression, not a
+    /// tradeoff. Also re-measured with W5.1's per-bin candidate
+    /// selection forced on (the historical shelving theory: this
+    /// mechanism's flat-cap interaction was the root cause) — the
+    /// regression shrinks (rec Δ=-19, novel Δ=-101, both still
+    /// significant) but does not clear, and W5.1 itself was declined as
+    /// a default (see `per_bin_candidate_selection`'s doc), so that
+    /// configuration can never ship standalone either way. Default
+    /// stays **false**. See
+    /// `research/experiments/2026-07-09-w52-costas-two-baseline-retest-declined.md`.
     pub costas_two_baseline_enabled: bool,
 
     /// Wide-lag baseline: half-width (in spectrogram time-steps)

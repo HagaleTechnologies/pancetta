@@ -591,6 +591,14 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W5.2 [A/B]: master switch for the
+    /// percentile-normalized wide-lag two-baseline sync mechanism. See
+    /// `Ft8Config::costas_two_baseline_enabled`.
+    pub fn with_costas_two_baseline_enabled(mut self, on: bool) -> Self {
+        self.config.costas_two_baseline_enabled = on;
+        self
+    }
+
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     pub fn with_cross_cycle_averaging(mut self, on: bool) -> Self {
         self.config.cross_cycle_averaging = on;
