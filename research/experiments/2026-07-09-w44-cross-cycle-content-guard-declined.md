@@ -44,10 +44,33 @@ discipline as the W4.3 narrative correction earlier this workstream):
   steps later" within one file's own buffer.
 - `hard_200`/`hard_1000` (the corpus the ORIGINAL hb-056/hb-074/hb-075 cross-cycle
   measurements actually used, and where spec §7's own cited "+8 novel/+14
-  recovered" number comes from) are **90-second multi-slot recordings** (verified
-  the same way — 1,080,064 frames @ 12kHz = 90.0s ≈ 6 FT8 slots per file). This is
-  the only corpus in the harness that can structurally exercise
-  `group_for_cross_cycle` at all.
+  recovered" number comes from) **do contain some 90-second multi-slot
+  recordings that can structurally exercise `group_for_cross_cycle`** — but,
+  checked file-by-file against the manifest (not assumed from the corpus
+  name), only **3 of `hard_200`'s 200 entries** are actually ~90s
+  (1,080,064 frames @ 12kHz); the other 197 are 13.5-15.0s single-slot
+  files — structurally IDENTICAL to `chrono_replay` in their inability to
+  ever produce a `group_for_cross_cycle` grouping (same limitation as
+  chrono_replay, just not carried through with equal rigor to this
+  corpus in the original pass over this task). `hard_1000` contains the
+  SAME 3 ~90s files (embedded in a larger batch of otherwise-inert
+  single-slot files), not 1000 independent ~90s recordings.
+  **Those 3 files are not independent recordings either**: per
+  `research/experiments/2026-05-25-batch-5-plumbing.md:95-99`
+  (`raw_decimated_12khz.wav`, `raw_subsampled_12khz.wav`,
+  `python_fir_decimated.wav`, decoding 73/73/72 respectively), they are the
+  SAME underlying off-air recording run through three different
+  resampling/decimation pipelines for an unrelated DSP-fidelity
+  comparison — i.e. one distinct audio scene, not three independent
+  samples. **Consequently, the entire threshold-sweep effect below (both
+  `hard_200` and `hard_1000` tables) is driven by what happens inside that
+  SINGLE scene, not a 200- or 1000-file sample** — the true effective
+  sample size behind these numbers is essentially N≈1 audio scene (times
+  however many cross-cycle candidate pairs happen to occur within it), not
+  200 or 1000 files. This makes the "decline, no clean threshold found"
+  conclusion below MORE conservative and better-justified, not less: a
+  confident "win" claim would be even harder to support at this much
+  smaller true N than it would be at N≈200/1000.
 - Empirical proof: ran `chrono-replay` (mini33, 33 real WAVs) with
   `--no-cross-cycle-averaging` vs. the default (`cross_cycle_averaging=true`,
   i.e. the mechanism this task modifies fully engaged) — **every recall/novel
@@ -176,7 +199,20 @@ without a proportional recall cost. At the strict end (0.95) the guard clearly
 functions (proves it isn't silently vacuous): it costs 8 real recovered
 decodes to cut only 11 unverified novels — a bad trade.
 
-### Confirmation at 5x scale: `curated-hard-1000`
+### `curated-hard-1000` re-measurement — NOT independent confirmation at 5x scale
+
+This was originally framed as "confirmation at 5x scale." **That framing is
+wrong and is corrected here.** `hard_1000`'s manifest contains the SAME 3
+~90s files identified above (`raw_decimated_12khz.wav`,
+`raw_subsampled_12khz.wav`, `python_fir_decimated.wav` — one underlying
+off-air recording through three resampling pipelines) embedded in a batch of
+997 additional files that are single-slot and cannot structurally exercise
+`group_for_cross_cycle` at all (the exact same limitation this task
+correctly diagnosed for `chrono_replay`). Running the sweep against
+`hard_1000` therefore re-measures the identical scene already measured
+against `hard_200`, just diluted into a larger denominator of inert files —
+it is not a larger or independent sample, and the numbers below should not
+be read as corroboration at greater statistical power.
 
 ```
 ./target/release/eval --tier curated-hard-1000 --mode ft8 --output ctrl.json
@@ -192,10 +228,12 @@ decodes to cut only 11 unverified novels — a bad trade.
 | 0.5       |      1250 | 26769 |    18337 |       8432 |
 | 0.8       |      1247 | 26684 |    18282 |       8402 |
 
-At 0.3 the sign even flips (novel +1 vs. hard-200's -1) — confirms it's pure
-noise at that operating point, not a real, reproducible effect. At 0.5/0.8 the
-same pattern as hard-200 repeats: recall falls alongside novel counts, never a
-clean unverified-only win.
+At 0.3 the sign even flips (novel +1 vs. hard-200's -1) — this is consistent
+with both re-measurements sampling the same single scene (where a
+noise-level, non-reproducible effect at this threshold is unsurprising), not
+evidence of a larger, independently-confirmed effect. At 0.5/0.8 the same
+pattern as hard-200 repeats (expected, since it's the same underlying data):
+recall falls alongside novel counts, never a clean unverified-only win.
 
 ### Diagnostic: does the guard work as designed in the regime the original bug
 was measured in? (non-coherent-only, `--no-cross-cycle-coherent`, i.e. the
@@ -210,9 +248,11 @@ plain hb-056 config, NOT what ships today)
 bug's own regime. (The TDD tests above independently prove the mechanism DOES
 correctly reject engineered maximally-different content; the real corpus
 apparently just doesn't contain enough total groups, or the mismatched ones
-that do occur, at a correlation clearly below 0.3, to move the needle — the
-whole "+8 novel" cost spans only a handful of WAVs out of 200/1000, so this is
-a small-numbers regime regardless of coherent/non-coherent path.)
+that do occur, at a correlation clearly below 0.3, to move the needle — and
+per the corpus correction above, this isn't merely "a handful of WAVs out of
+200/1000," it's the entirety of the effect coming from the single ~90s
+audio scene shared by the 3 multi-slot files present in both manifests, so
+this is a small-numbers regime by construction, not just in degree.)
 
 ## Decision
 
@@ -221,8 +261,19 @@ a small-numbers regime regardless of coherent/non-coherent path.)
 
 1. **Corpus correction**: chrono_replay (the brief's named calibration corpus)
    cannot exercise this mechanism at all — verified empirically, not assumed.
-   Hard-200/hard-1000 (the mechanism's actual birth corpus) is the only valid
-   substitute, and that's what this A/B used.
+   Hard-200/hard-1000 (the mechanism's actual birth corpus) is the closest
+   available substitute, and that's what this A/B used — **but only 3 of
+   hard_200's 200 entries (the same 3 embedded in hard_1000's 1000) are
+   actually multi-slot and able to exercise the mechanism at all; those 3
+   are themselves the same underlying off-air recording through 3
+   resampling pipelines, not independent samples** (see the corpus-size
+   correction above). The true effective sample size behind every number in
+   the sweep tables is essentially N≈1 audio scene, not 200 or 1000 files,
+   and the `hard_1000` table is a re-measurement of that same scene, not an
+   independent confirmation at larger scale. This makes the decline below
+   MORE conservative and better-justified than it would be at the
+   originally-assumed N — a confident "win" claim would be even harder to
+   support at N≈1 than at N≈200/1000.
 2. **The bug's cost was measured against a component that isn't what ships.**
    Spec §7's "+8 novel/+14 recovered" is the hb-056 plain non-coherent number.
    Production ships `cross_cycle_coherent=true` + `cross_cycle_coherent_mrc=true`
@@ -280,6 +331,24 @@ tests landed, before this log was written.
   ("chrono_replay", "the cross-cycle corpus") doesn't guarantee the mechanism
   under test can structurally fire there. A 30-second `wave.open(...)` check on
   the first manifest entry would have caught this before any eval run.
+- **The same durability check must be applied to a SUBSTITUTE corpus, not just
+  the originally-named one, and to every entry, not just the first.** This
+  task correctly checked `chrono_replay`'s first manifest entry and correctly
+  concluded it's a structural no-op corpus — but then substituted
+  `hard_200`/`hard_1000` without checking what fraction of THEIR entries are
+  actually multi-slot. A subsequent review found only 3 of `hard_200`'s 200
+  entries (same 3 in `hard_1000`'s 1000) are ~90s multi-slot files, and those
+  3 are the same underlying recording through 3 resampling pipelines (per
+  `research/experiments/2026-05-25-batch-5-plumbing.md`), not independent
+  samples — so the true effective N behind the whole threshold sweep is ≈1
+  audio scene, not 200 or 1000 files, and the "hard_1000 confirms at 5x scale"
+  framing was wrong (it re-measures the same scene, not a larger one).
+  Corrected in this log and in `.superpowers/sdd/task-W4.4-report.md`; the
+  underlying decline decision is unaffected (if anything more conservative at
+  the true N). Lesson: a full per-entry census of frame counts (not a
+  first-entry spot check) is the actual bar for "does this corpus exercise
+  the mechanism," and provenance (are these independent recordings or the
+  same one reprocessed?) matters as much as raw entry count.
 - **A default flip's cost/benefit must be measured against the CURRENT
   compounding of prior defaults, not the mechanism's own historical
   introduction-time measurement.** Spec §7 cited a number from before
@@ -287,8 +356,12 @@ tests landed, before this log was written.
   have caught the "almost solved already" finding without needing the full
   threshold sweep — worth remembering for any future spec-cited number in this
   plan that predates later-landed work in the same file.
-- If a future change reopens a real precision gap in cross-cycle grouping (e.g.
-  a change to the coherent MRC weighting, or a corpus with denser genuine
-  repeats than hard-200/1000's ~7% incidence), `cross_cycle_content_guard` is
-  fully wired and ready for a fresh calibration pass — no further plumbing
-  needed, just re-run this same sweep methodology.
+- If a future change reopens a real precision gap in cross-cycle grouping,
+  `cross_cycle_content_guard` is fully wired and ready for a fresh calibration
+  pass — but note it should be recalibrated against a corpus with GENUINELY
+  more multi-slot entries than the ≈1-scene sample used here (hard-200/1000's
+  "~7% incidence" figure from an earlier draft of this log was itself an
+  overstatement built on the same uncorrected assumption; the real per-file
+  incidence in this specific harness is closer to 1-2% of entries, all from
+  one scene) — no further code plumbing needed, just a better corpus and a
+  re-run of this same sweep methodology.
