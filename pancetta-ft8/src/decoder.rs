@@ -481,6 +481,28 @@ pub struct Ft8Config {
     /// members inflated sum variance. Default false.
     pub cross_cycle_coherent_mrc: bool,
 
+    /// Task W4.4 [A/B] (decoder-tp-sensitivity plan, spec §7): content
+    /// guard for `group_for_cross_cycle`. That function groups candidates
+    /// **geometrically only** (same `freq_sub`/`freq_bin`±1 grid position,
+    /// `t0` a multiple of one FT8 slot apart ±2 steps, `sync_score` within
+    /// band) — it never checks whether two candidates at the same grid
+    /// position are actually carrying the SAME message before summing
+    /// their tone energies. Measured cost on hard-200: +8 spurious novel
+    /// decodes alongside +14 genuinely recovered ones (the geometric
+    /// grouping occasionally sums two DIFFERENT stations that happen to
+    /// land at the same grid position across cycles).
+    ///
+    /// When `Some(threshold)`, before accepting a candidate into a group,
+    /// each member independently demodulates its own per-bit LLRs (via
+    /// [`par_extract_symbols_from_spectrogram`] + [`par_compute_soft_llrs_db`]
+    /// on ITS OWN grid position, never touching the other member's) and the
+    /// candidate is only accepted if the **sign correlation** between its
+    /// LLR vector and the group seed's (`+1.0` = every bit sign agrees,
+    /// `-1.0` = every bit sign disagrees) is `>= threshold`. `None`
+    /// (the default) preserves the original geometric-only behavior
+    /// exactly — byte-identical to pre-W4.4.
+    pub cross_cycle_content_guard: Option<f32>,
+
     /// After the multipass loop, force-retry every original
     /// sync candidate (not at an already-subtracted position) against the
     /// residual spectrogram. Catches pairs where pass-1 LDPC failed at B's
@@ -1636,6 +1658,10 @@ impl Default for Ft8Config {
             // memory when these flags are on; acceptable cost.
             cross_cycle_coherent: true,
             cross_cycle_coherent_mrc: true,
+            // Task W4.4 [A/B]: content guard default OFF (`None`) pending
+            // the chrono_replay A/B — see the experiment log for the
+            // calibration + decision.
+            cross_cycle_content_guard: None,
             // hb-081: MRC subtract scaling off by default until the
             // A/B confirms.
             coherent_subtract_mrc_threshold: 0.0,
@@ -6302,7 +6328,13 @@ impl Ft8Decoder {
         let tone_spacing = pp.tone_spacing;
         let sps = pp.samples_per_symbol(SAMPLE_RATE);
         let spec_step = sps / TIME_OSR;
-        let groups = group_for_cross_cycle(candidates);
+        // Task W4.4 [A/B]: `None` (default) is byte-identical to pre-W4.4
+        // geometric-only grouping.
+        let content_guard = self
+            .config
+            .cross_cycle_content_guard
+            .map(|threshold| (threshold, pp, spectrogram));
+        let groups = group_for_cross_cycle(candidates, content_guard);
 
         // hb-074: when the coherent flag is on AND the spectrogram retains
         // complex bins (only when cross_cycle_coherent was set at decode
@@ -10421,6 +10453,38 @@ const CROSS_CYCLE_T_TOL: usize = 2;
 const CROSS_CYCLE_F_TOL: usize = 1;
 const CROSS_CYCLE_SCORE_BAND: f64 = 3.0;
 
+/// Task W4.4 [A/B]: independently demodulate `a` and `b`'s own per-bit
+/// channel LLRs (each from ITS OWN grid position in `spectrogram`, no
+/// cross-contamination) and return the sign correlation between the two
+/// vectors: `+1.0` = every bit's sign agrees (strong evidence they carry
+/// the same codeword), `-1.0` = every bit's sign disagrees, `0.0` =
+/// uncorrelated (chance). Returns `None` if either candidate's grid
+/// position yields no usable magnitudes (never happens in practice since
+/// `par_extract_symbols_from_spectrogram` always returns a full-length
+/// vector, floored at -120 dB out of bounds, but kept `Option` so a future
+/// degenerate case fails closed at call sites rather than panicking).
+fn llr_sign_correlation(
+    pp: &ProtocolParams,
+    spectrogram: &Spectrogram,
+    a: &CostasCandidate,
+    b: &CostasCandidate,
+) -> Option<f32> {
+    let mags_a = par_extract_symbols_from_spectrogram(pp, spectrogram, a, false, false);
+    let mags_b = par_extract_symbols_from_spectrogram(pp, spectrogram, b, false, false);
+    let llr_a = par_compute_soft_llrs_db(pp, &mags_a);
+    let llr_b = par_compute_soft_llrs_db(pp, &mags_b);
+    if llr_a.is_empty() || llr_a.len() != llr_b.len() {
+        return None;
+    }
+    let n = llr_a.len() as f32;
+    let agree: f32 = llr_a
+        .iter()
+        .zip(llr_b.iter())
+        .map(|(&x, &y)| if (x >= 0.0) == (y >= 0.0) { 1.0 } else { -1.0 })
+        .sum();
+    Some(agree / n)
+}
+
 /// Group candidates that look like the same repeating station in
 /// different slots. Two candidates match when they share `freq_sub`, their
 /// `freq_bin`s are within `F_TOL`, their `t0`s differ by a non-zero
@@ -10428,7 +10492,17 @@ const CROSS_CYCLE_SCORE_BAND: f64 = 3.0;
 /// `sync_score`s are within `SCORE_BAND`. Greedy first-fit: each candidate
 /// joins the first compatible group or starts a new one; only returns
 /// groups of size ≥ 2.
-fn group_for_cross_cycle(candidates: &[CostasCandidate]) -> Vec<Vec<usize>> {
+///
+/// Task W4.4 [A/B]: `content_guard`, when `Some((threshold, pp,
+/// spectrogram))`, adds one more requirement before a geometrically
+/// compatible candidate is accepted — [`llr_sign_correlation`] between it
+/// and the group's seed (`a`, the first/anchor member of the group being
+/// built) must be `>= threshold`. `None` preserves the original
+/// geometric-only behavior exactly (byte-identical to pre-W4.4).
+fn group_for_cross_cycle(
+    candidates: &[CostasCandidate],
+    content_guard: Option<(f32, &ProtocolParams, &Spectrogram)>,
+) -> Vec<Vec<usize>> {
     let n = candidates.len();
     let mut groups: Vec<Vec<usize>> = Vec::new();
     let mut grouped = vec![false; n];
@@ -10462,6 +10536,12 @@ fn group_for_cross_cycle(candidates: &[CostasCandidate]) -> Vec<Vec<usize>> {
             }
             if (a.sync_score - b.sync_score).abs() > CROSS_CYCLE_SCORE_BAND {
                 continue;
+            }
+            if let Some((threshold, pp, spectrogram)) = content_guard {
+                match llr_sign_correlation(pp, spectrogram, a, b) {
+                    Some(corr) if corr >= threshold => {}
+                    _ => continue,
+                }
             }
             group.push(j);
             grouped[j] = true;
@@ -14883,7 +14963,7 @@ mod tests {
             mk(80 + 2 * SLOT_TIME_STEPS_FT8, 200, 0, 1.0), // 3  group 2 reject (Δscore 4 > band)
             mk(60, 300, 0, 6.0),                           // 4  singleton
         ];
-        let groups = group_for_cross_cycle(&candidates);
+        let groups = group_for_cross_cycle(&candidates, None);
         assert_eq!(groups.len(), 1, "exactly one valid group expected");
         let g = &groups[0];
         assert_eq!(g.len(), 2);
@@ -14902,6 +14982,189 @@ mod tests {
             "expected {expected_db}, got {}",
             summed[0][0]
         );
+    }
+
+    /// Task W4.4 [A/B]: build two candidates at a geometrically
+    /// compatible cross-cycle grid position (same freq_bin/freq_sub, t0
+    /// exactly one FT8 slot apart, matching sync scores) whose SYNTHETIC
+    /// per-symbol content is engineered to be maximally different: for
+    /// every data symbol, candidate A's dominant tone is the gray index
+    /// `j`, candidate B's is the bit-complement `7 - j` — flipping all 3
+    /// codeword bits' sign for every data symbol. Confirms (1) the
+    /// pre-existing geometric-only grouping accepts this pair (the actual
+    /// bug spec §7 measured: +8 spurious novels), (2) the two candidates'
+    /// independently demodulated LLRs are indeed strongly anti-correlated,
+    /// and (3) the new content guard rejects the pairing.
+    #[test]
+    fn test_cross_cycle_content_guard_rejects_different_messages() {
+        use crate::protocol::ProtocolParams;
+        let pp = ProtocolParams::ft8();
+        let steps_per_symbol = TIME_OSR;
+        let freq_bin = 100usize;
+        let freq_sub = 0usize;
+        let t0_a = 50usize;
+        let t0_b = t0_a + SLOT_TIME_STEPS_FT8;
+        let num_steps = t0_b + pp.num_symbols * steps_per_symbol + 4;
+        let num_bins = freq_bin + NUM_TONES + 8;
+        let noise_db: SpecScalar = -40.0;
+        let signal_db: SpecScalar = -3.0;
+
+        let mut power = vec![noise_db; num_steps * FREQ_OSR * num_bins];
+        let set = |power: &mut Vec<SpecScalar>, t_step: usize, tone: usize, db: SpecScalar| {
+            let idx = (t_step * FREQ_OSR + freq_sub) * num_bins + freq_bin + tone;
+            power[idx] = db;
+        };
+
+        for &sym_idx in pp.data_symbol_indices() {
+            let j_a = (sym_idx % 8) as u8;
+            let j_b = 7 - j_a; // bit-complement in 3 bits: every LLR sign flips
+            let tone_a = crate::ldpc::binary_to_gray(j_a) as usize;
+            let tone_b = crate::ldpc::binary_to_gray(j_b) as usize;
+
+            let t_base_a = t0_a + sym_idx * steps_per_symbol;
+            set(&mut power, t_base_a, tone_a, signal_db);
+            set(&mut power, t_base_a + 1, tone_a, signal_db);
+
+            let t_base_b = t0_b + sym_idx * steps_per_symbol;
+            set(&mut power, t_base_b, tone_b, signal_db);
+            set(&mut power, t_base_b + 1, tone_b, signal_db);
+        }
+
+        let spec = Spectrogram {
+            power,
+            complex: None,
+            num_steps,
+            num_bins,
+            freq_osr: FREQ_OSR,
+            time_padding: 0,
+        };
+
+        let a = CostasCandidate {
+            time_step: t0_a,
+            freq_bin,
+            freq_sub,
+            sync_score: 7.0,
+            time_refinement: 0.0,
+        };
+        let b = CostasCandidate {
+            time_step: t0_b,
+            freq_bin,
+            freq_sub,
+            sync_score: 7.0,
+            time_refinement: 0.0,
+        };
+        let candidates = vec![a, b];
+
+        // RED (pre-fix behavior): geometric-only grouping accepts this
+        // pair even though the content is engineered to be maximally
+        // different — this IS the bug spec §7 measured (+8 spurious
+        // novels alongside +14 recovered on hard-200).
+        let groups_no_guard = group_for_cross_cycle(&candidates, None);
+        assert_eq!(
+            groups_no_guard.len(),
+            1,
+            "geometric-only grouping should still group these two \
+             different-message candidates (demonstrates the pre-W4.4 bug)"
+        );
+
+        // Sanity: the two candidates' independently demodulated LLR
+        // vectors are indeed strongly anti-correlated.
+        let corr = llr_sign_correlation(&pp, &spec, &a, &b).expect("correlation should compute");
+        assert!(
+            corr < -0.9,
+            "expected near-total LLR sign disagreement for engineered \
+             different-message candidates, got {corr}"
+        );
+
+        // GREEN (post-fix behavior): the content guard at the calibrated
+        // threshold rejects the pairing, so no group forms.
+        let guarded = group_for_cross_cycle(&candidates, Some((0.3, &pp, &spec)));
+        assert!(
+            guarded.is_empty(),
+            "content guard should reject a geometrically-compatible pair \
+             carrying different message content, got {guarded:?}"
+        );
+    }
+
+    /// Task W4.4 [A/B]: the mirror-image case — two candidates at the
+    /// same geometrically compatible grid position carrying IDENTICAL
+    /// synthetic content (the legitimate cross-cycle case: the same
+    /// repeating station heard again a slot later) must still be grouped
+    /// under the content guard. Proves the guard doesn't break the
+    /// mechanism it's meant to protect.
+    #[test]
+    fn test_cross_cycle_content_guard_allows_same_message() {
+        use crate::protocol::ProtocolParams;
+        let pp = ProtocolParams::ft8();
+        let steps_per_symbol = TIME_OSR;
+        let freq_bin = 100usize;
+        let freq_sub = 0usize;
+        let t0_a = 50usize;
+        let t0_b = t0_a + SLOT_TIME_STEPS_FT8;
+        let num_steps = t0_b + pp.num_symbols * steps_per_symbol + 4;
+        let num_bins = freq_bin + NUM_TONES + 8;
+        let noise_db: SpecScalar = -40.0;
+        let signal_db: SpecScalar = -3.0;
+
+        let mut power = vec![noise_db; num_steps * FREQ_OSR * num_bins];
+        let set = |power: &mut Vec<SpecScalar>, t_step: usize, tone: usize, db: SpecScalar| {
+            let idx = (t_step * FREQ_OSR + freq_sub) * num_bins + freq_bin + tone;
+            power[idx] = db;
+        };
+
+        for &sym_idx in pp.data_symbol_indices() {
+            let j = (sym_idx % 8) as u8;
+            let tone = crate::ldpc::binary_to_gray(j) as usize;
+
+            let t_base_a = t0_a + sym_idx * steps_per_symbol;
+            set(&mut power, t_base_a, tone, signal_db);
+            set(&mut power, t_base_a + 1, tone, signal_db);
+
+            // Same message, same dominant tone, at the repeat's grid position.
+            let t_base_b = t0_b + sym_idx * steps_per_symbol;
+            set(&mut power, t_base_b, tone, signal_db);
+            set(&mut power, t_base_b + 1, tone, signal_db);
+        }
+
+        let spec = Spectrogram {
+            power,
+            complex: None,
+            num_steps,
+            num_bins,
+            freq_osr: FREQ_OSR,
+            time_padding: 0,
+        };
+
+        let a = CostasCandidate {
+            time_step: t0_a,
+            freq_bin,
+            freq_sub,
+            sync_score: 7.0,
+            time_refinement: 0.0,
+        };
+        let b = CostasCandidate {
+            time_step: t0_b,
+            freq_bin,
+            freq_sub,
+            sync_score: 7.0,
+            time_refinement: 0.0,
+        };
+        let candidates = vec![a, b];
+
+        let corr = llr_sign_correlation(&pp, &spec, &a, &b).expect("correlation should compute");
+        assert!(
+            corr > 0.9,
+            "expected near-total LLR sign agreement for identical-message \
+             candidates, got {corr}"
+        );
+
+        let guarded = group_for_cross_cycle(&candidates, Some((0.3, &pp, &spec)));
+        assert_eq!(
+            guarded.len(),
+            1,
+            "content guard must not reject a genuinely repeating same-message pair"
+        );
+        assert!(guarded[0].contains(&0) && guarded[0].contains(&1));
     }
 
     #[test]

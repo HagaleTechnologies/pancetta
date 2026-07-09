@@ -132,6 +132,9 @@ struct Args {
     cross_cycle_coherent: Option<bool>,
     /// hb-075: MRC-weighted variant of coherent cross-cycle averaging.
     cross_cycle_coherent_mrc: Option<bool>,
+    /// Task W4.4 [A/B]: LLR-sign correlation threshold content guard for
+    /// cross-cycle grouping (`None` = geometric-only, pre-W4.4 behavior).
+    cross_cycle_content_guard: Option<f32>,
     /// hb-079 + hb-080: number of coherent subtract+repass rounds.
     coherent_multipass_iterations: Option<u8>,
     /// hb-081: MRC subtract scaling threshold (0 disables).
@@ -290,6 +293,7 @@ impl Args {
         let mut cross_cycle_averaging: Option<bool> = None;
         let mut cross_cycle_coherent: Option<bool> = None;
         let mut cross_cycle_coherent_mrc: Option<bool> = None;
+        let mut cross_cycle_content_guard: Option<f32> = None;
         let mut coherent_multipass_iterations: Option<u8> = None;
         let mut coherent_subtract_mrc_threshold: Option<f64> = None;
         let mut residual_min_sync_score: Option<f64> = None;
@@ -570,9 +574,22 @@ impl Args {
                 "--cross-cycle-coherent" => {
                     cross_cycle_coherent = Some(true);
                 }
+                "--no-cross-cycle-coherent" => {
+                    cross_cycle_coherent = Some(false);
+                }
                 "--cross-cycle-coherent-mrc" => {
                     cross_cycle_coherent = Some(true);
                     cross_cycle_coherent_mrc = Some(true);
+                }
+                "--cross-cycle-content-guard" => {
+                    cross_cycle_content_guard = Some(
+                        iter.next()
+                            .context(
+                                "--cross-cycle-content-guard needs a value \
+                                 (LLR-sign correlation threshold in [-1,1])",
+                            )?
+                            .parse()?,
+                    );
                 }
                 "--coherent-multipass" => {
                     coherent_multipass_iterations = Some(1);
@@ -895,6 +912,7 @@ impl Args {
             cross_cycle_averaging,
             cross_cycle_coherent,
             cross_cycle_coherent_mrc,
+            cross_cycle_content_guard,
             coherent_multipass_iterations,
             coherent_subtract_mrc_threshold,
             residual_min_sync_score,
@@ -1986,6 +2004,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.cross_cycle_coherent_mrc {
         d = d.with_cross_cycle_coherent_mrc(on);
+    }
+    if args.cross_cycle_content_guard.is_some() {
+        d = d.with_cross_cycle_content_guard(args.cross_cycle_content_guard);
     }
     if let Some(n) = args.coherent_multipass_iterations {
         d = d.with_coherent_multipass_iterations(n);

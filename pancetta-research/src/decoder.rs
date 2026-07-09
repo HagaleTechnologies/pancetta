@@ -604,6 +604,16 @@ impl Ft8Decoder {
         self
     }
 
+    /// Task W4.4 [A/B] (decoder-tp-sensitivity plan): content guard for
+    /// `group_for_cross_cycle` — require LLR-sign correlation between a
+    /// candidate and its group's seed to be `>= threshold` before
+    /// accepting it into the group. `None` (default) preserves the
+    /// original geometric-only grouping.
+    pub fn with_cross_cycle_content_guard(mut self, threshold: Option<f32>) -> Self {
+        self.config.cross_cycle_content_guard = threshold;
+        self
+    }
+
     /// hb-079 + hb-080: set the number of coherent subtract+repass rounds.
     /// 0 disables; 1 = original hb-079 (one round). hb-080 sweeps {2..5}.
     pub fn with_coherent_multipass_iterations(mut self, n: u8) -> Self {
