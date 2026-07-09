@@ -1452,23 +1452,16 @@ pub struct Ft8Config {
     /// production/decode consumer in this workspace already builds with
     /// `transmit` enabled).
     ///
-    /// **Subtraction scale is `1.0` here, not the legacy path's `0.9`.**
-    /// The legacy `0.9` conservative factor exists to hedge against its
-    /// ONE-SHOT whole-signal fit being a poor match for a signal whose
-    /// true amplitude/phase varies over the transmission (over-
-    /// subtracting on a bad *global* fit flips the residual's sign and
-    /// makes things worse than under-subtracting). That fixed ~10%
-    /// held-back fraction is a percentage of the ORIGINAL signal's
-    /// amplitude, so for anything but a very weak signal it dwarfs a
-    /// realistic ambient noise floor regardless of fit quality — this
-    /// was measured empirically while building this task's TDD fixture
-    /// (see the Task W4.2 report): the legacy path's residual sat
-    /// ~46 dB above a matched-filter noise-only control on the fixture,
-    /// which the fixed `0.9` factor alone fully explains. The per-block
-    /// fit localizes the risk the legacy factor was hedging against to
-    /// each ~2-symbol window (a bad fit can only mis-subtract ~2
-    /// symbols' worth of samples, not the whole 12.64s), so this path
-    /// subtracts its own fitted estimate in full.
+    /// **This flag ONLY controls per-block vs. whole-signal fitting.**
+    /// The subtraction *scale* (whether the fitted estimate is subtracted
+    /// in full or held back by the legacy path's fixed `0.9` conservative
+    /// factor) is a SEPARATE, independently-controllable knob —
+    /// [`Self::full_scale_subtraction_enabled`] — split out from this
+    /// flag in review (see that field's doc for the scale tradeoff
+    /// itself). The two were originally bundled together in this task's
+    /// first cut; a future consumer (e.g. Task W4.3) can now A/B
+    /// "per-block fitting" and "full-scale subtraction" independently
+    /// rather than being forced to accept or reject both together.
     ///
     /// **Presently a DEAD PATH in production**: `subtract_signal` (and
     /// its sidelobe-cancelling wrapper `subtract_with_sidelobes`) is only
@@ -1494,6 +1487,54 @@ pub struct Ft8Config {
     /// `spec-sdrangel-subtract-edge-symbols.md` (edge-symbol subtraction
     /// care).
     pub time_varying_subtraction_enabled: bool,
+
+    /// Decoder-TP-sensitivity Task W4.2 review fix (Finding #1): the
+    /// per-block subtraction path's use of a full, un-hedged `1.0`
+    /// subtraction scale (vs. the legacy whole-signal path's fixed `0.9`
+    /// "conservative" factor) was originally bundled into
+    /// [`Self::time_varying_subtraction_enabled`] itself. Split out into
+    /// its own knob so the per-block MECHANISM and the scale change can
+    /// be A/B'd independently.
+    ///
+    /// Only has any effect when `time_varying_subtraction_enabled` is
+    /// ALSO `true` — this flag doesn't touch the legacy whole-signal
+    /// path, which always uses its own hardcoded `0.9`.
+    ///
+    /// - `false` (default): the per-block path applies the SAME `0.9`
+    ///   conservative scale the legacy path uses.
+    /// - `true`: the per-block path subtracts its full fitted estimate
+    ///   (`scale = 1.0`), holding nothing back.
+    ///
+    /// **This is a genuine, unresolved tradeoff — not a free win.**
+    /// Shrinking the fit window from the whole signal (~151,680 samples,
+    /// ~12.64s) down to a ~2-symbol per-block window (~3,840 samples,
+    /// ~0.32s) increases the per-block estimate's variance to AMBIENT
+    /// NOISE by roughly `10*log10(151680/3840) ≈ 16 dB` (far fewer
+    /// samples averaged into each estimate). On a WEAK/noisy signal, a
+    /// per-block complex-amplitude estimate can therefore be
+    /// meaningfully NOISIER than the whole-signal estimate would have
+    /// been — which is exactly the kind of estimation error the legacy
+    /// `0.9` factor ALSO historically hedges against (not only global-fit
+    /// staleness from real fading/drift, which is
+    /// `time_varying_subtraction_enabled`'s own stated purpose).
+    /// Subtracting that noisier per-block estimate at full scale risks
+    /// over-subtracting and injecting MORE residual than it removes, on
+    /// exactly the low-SNR signals this decoder cares most about.
+    /// Balanced against that: on a strong/clean signal the legacy `0.9`
+    /// factor's fixed ~10% held-back fraction is a real, measured cost
+    /// (see `time_varying_subtraction_enabled`'s doc — ~46 dB above a
+    /// matched-filter noise floor on this task's TDD fixture, which is a
+    /// STRONG, -5dB signal). Neither side of this tradeoff has been
+    /// verified on a genuinely weak-signal fixture; treat this flag as
+    /// needing its OWN independent A/B on a low-SNR corpus before ever
+    /// flipping default-on, separate from whatever verdict
+    /// `time_varying_subtraction_enabled` itself gets.
+    ///
+    /// Dead path in production for the same reason as
+    /// `time_varying_subtraction_enabled` (`subtract_signal` is
+    /// unreachable while `max_decode_passes` stays at 1). Default
+    /// `false`.
+    pub full_scale_subtraction_enabled: bool,
 }
 
 impl Default for Ft8Config {
@@ -1888,6 +1929,10 @@ impl Default for Ft8Config {
             // defense-in-depth and to keep every other test's legacy
             // subtract behavior byte-identical.
             time_varying_subtraction_enabled: false,
+            // Review fix Finding #1: independent of the mechanism flag
+            // above, default OFF — see the field doc for the noise-
+            // sensitivity tradeoff this needs its own A/B for.
+            full_scale_subtraction_enabled: false,
         }
     }
 }
@@ -4246,7 +4291,23 @@ impl Ft8Decoder {
         for c in buf.iter_mut().take(last_doubled).skip(1) {
             *c *= 2.0;
         }
-        for c in buf.iter_mut().skip(last_doubled) {
+        // Review fix (Minor #1): for even `n`, `last_doubled == half`
+        // (the Nyquist bin index) — the doubling loop above already
+        // stops one short of it (`take(last_doubled)` covers indices
+        // `0..last_doubled`, and `.skip(1)` only excludes index 0), so
+        // the Nyquist bin itself was never doubled, but this zero loop
+        // used to start AT `last_doubled`, zeroing it out anyway
+        // (contradicting the comment above: `h[n/2] = 1`, i.e.
+        // untouched). Zero from `last_doubled + 1` for even `n` so the
+        // Nyquist bin is left multiplied by 1, matching the doc. Odd `n`
+        // has no distinct Nyquist bin — `last_doubled` is already the
+        // correct start-of-zeroing boundary there, unchanged.
+        let zero_start = if n.is_multiple_of(2) {
+            last_doubled + 1
+        } else {
+            last_doubled
+        };
+        for c in buf.iter_mut().skip(zero_start) {
             *c = Complex::new(0.0, 0.0);
         }
 
@@ -4262,6 +4323,18 @@ impl Ft8Decoder {
     /// `None` if the modulator rejects the frequency (e.g. deviation
     /// limits) — callers fall back to the legacy CPFSK subtraction path
     /// on `None` rather than leaving the audio untouched.
+    ///
+    /// **Review note (Minor #2):** `time_offset_samples` is forwarded to
+    /// [`generate_gfsk_reference`] but this function only ever reads the
+    /// returned [`GfskReference::samples`] — [`GfskReference::start_sample`]
+    /// (the only field `time_offset_samples` affects) is discarded here.
+    /// The parameter therefore has ZERO effect on this function's return
+    /// value; time/frequency alignment between the reference and the
+    /// audio is handled entirely by the caller's own
+    /// `recon_start`/`recon_offset` bookkeeping (correct — see
+    /// `subtract_signal`). Callers should pass `0.0` rather than
+    /// threading a real offset through here, to avoid implying it does
+    /// something it doesn't.
     #[cfg(feature = "transmit")]
     fn build_gfsk_iq_pair(
         symbols: &[u8],
@@ -4548,12 +4621,22 @@ impl Ft8Decoder {
         // `Ft8Modulator` themselves).
         #[cfg(feature = "transmit")]
         if self.config.time_varying_subtraction_enabled {
+            // `time_offset_samples = 0.0`: `build_gfsk_iq_pair` only ever
+            // reads `GfskReference::samples` (never `::start_sample`), so
+            // whatever value is threaded through here has zero effect on
+            // the returned `(recon_i, recon_q)` pair — alignment is
+            // handled entirely externally via `recon_start`/
+            // `recon_offset` below (the same convention
+            // `correlation_energy`/the legacy whole-signal fit use).
+            // Passing the real `best_time` here (as an earlier revision
+            // did) was misleading dead-weight plumbing; `0.0` makes the
+            // no-effect explicit. See `build_gfsk_iq_pair`'s doc.
             if let Some((gfsk_i, gfsk_q)) = Self::build_gfsk_iq_pair(
                 symbols,
                 &self.protocol_params,
                 SAMPLE_RATE,
                 best_freq,
-                best_time as f64,
+                0.0,
             ) {
                 if gfsk_i.len() >= recon_offset + signal_len {
                     let (amp_i_t, amp_q_t) = Self::time_varying_complex_amplitude(
@@ -4565,28 +4648,17 @@ impl Ft8Decoder {
                         signal_len,
                         sps,
                     );
-                    // The legacy path's `0.9` conservative factor hedges
-                    // against its ONE-SHOT whole-signal fit being a poor
-                    // match for a signal whose true amplitude/phase
-                    // varies over the transmission (over-subtracting on
-                    // a bad global fit flips the residual's sign and
-                    // makes things worse than under-subtracting). That
-                    // systematic ~10% (`1 - 0.9`) held-back fraction is a
-                    // FIXED percentage of the original (often fairly
-                    // strong) signal — for anything but a very weak
-                    // signal it dwarfs a realistic ambient noise floor
-                    // regardless of fit quality, old or new (measured
-                    // empirically while building this task's TDD fixture
-                    // — see the Task W4.2 report). The per-block fit
-                    // localizes the risk the legacy factor was hedging
-                    // against to each ~2-symbol window (a bad fit can
-                    // only mis-subtract ~2 symbols' worth of samples, not
-                    // the whole 12.64s), so this path uses the full,
-                    // un-hedged estimate (`scale = 1.0`): each block's
-                    // own least-squares fit IS the conservative measure
-                    // now, not an additional blanket held-back fraction
-                    // on top of it.
-                    let scale = 1.0;
+                    // Review fix Finding #1: the subtraction scale is now
+                    // an independent knob
+                    // (`Ft8Config::full_scale_subtraction_enabled`, see
+                    // its doc for the noise-sensitivity tradeoff) rather
+                    // than being hardcoded to `1.0` alongside the
+                    // per-block mechanism itself.
+                    let scale = if self.config.full_scale_subtraction_enabled {
+                        1.0
+                    } else {
+                        0.9
+                    };
                     for i in 0..signal_len {
                         let subtracted = amp_i_t[i] * gfsk_i[recon_offset + i]
                             + amp_q_t[i] * gfsk_q[recon_offset + i];
@@ -17237,6 +17309,13 @@ mod w42_time_varying_subtraction_tests {
 
             let mut config = Ft8Config::default();
             config.time_varying_subtraction_enabled = true;
+            // Review fix Finding #1: the scale change is now a separate
+            // knob from the per-block mechanism — this test's claim
+            // (residual within 3dB of the noise floor) was originally
+            // demonstrated with BOTH the per-block mechanism AND the
+            // full (1.0) subtraction scale, so both must be set
+            // explicitly to preserve that claim.
+            config.full_scale_subtraction_enabled = true;
             let decoder = Ft8Decoder::new(config.clone()).unwrap();
 
             decoder.subtract_signal(&mut audio, &msg_a);
@@ -17362,6 +17441,322 @@ mod w42_time_varying_subtraction_tests {
         assert_eq!(
             audio1, audio2,
             "default-OFF subtract must remain deterministic / byte-identical"
+        );
+    }
+
+    /// Review fix Finding #1 regression guard: the new scale knob must
+    /// default OFF, independent of `time_varying_subtraction_enabled`.
+    #[test]
+    fn full_scale_subtraction_default_is_off() {
+        assert!(!Ft8Config::default().full_scale_subtraction_enabled);
+    }
+
+    /// Review fix Finding #1: the scale knob must have a REAL,
+    /// independent effect on the per-block path's output — proving the
+    /// split isn't cosmetic. Same per-block mechanism (`
+    /// time_varying_subtraction_enabled = true` in both runs), only
+    /// `full_scale_subtraction_enabled` differs; the two runs must leave
+    /// measurably different residuals (0.9-scale holds back more than
+    /// 1.0-scale, so it must leave MORE residual energy).
+    #[test]
+    fn full_scale_subtraction_flag_independently_controls_scale() {
+        let (audio, symbols_a, _symbols_b) = build_overlapping_fixture(7);
+
+        let mut msg_a =
+            DecodedMessage::new(crate::message::Ft8Message::default(), 0.0, 1.0, FREQ_A, 0.0);
+        msg_a.tone_symbols = Some(symbols_a.clone());
+
+        let mut config_09 = Ft8Config::default();
+        config_09.time_varying_subtraction_enabled = true;
+        assert!(!config_09.full_scale_subtraction_enabled);
+        let decoder_09 = Ft8Decoder::new(config_09).unwrap();
+        let mut audio_09 = audio.clone();
+        decoder_09.subtract_signal(&mut audio_09, &msg_a);
+
+        let mut config_10 = Ft8Config::default();
+        config_10.time_varying_subtraction_enabled = true;
+        config_10.full_scale_subtraction_enabled = true;
+        let decoder_10 = Ft8Decoder::new(config_10).unwrap();
+        let mut audio_10 = audio.clone();
+        decoder_10.subtract_signal(&mut audio_10, &msg_a);
+
+        let (gfsk_i, gfsk_q) = Ft8Decoder::build_gfsk_iq_pair(
+            &symbols_a,
+            &decoder_09.protocol_params,
+            SAMPLE_RATE,
+            FREQ_A,
+            0.0,
+        )
+        .expect("GFSK reference synthesis should succeed at a valid in-band frequency");
+
+        let energy_09 = project_energy(&audio_09, 0, &gfsk_i, &gfsk_q, gfsk_i.len());
+        let energy_10 = project_energy(&audio_10, 0, &gfsk_i, &gfsk_q, gfsk_i.len());
+
+        assert!(
+            energy_09 > energy_10,
+            "per-block subtraction at the held-back 0.9 scale ({energy_09:.3e}) should leave \
+             MORE residual A-energy than the full 1.0 scale ({energy_10:.3e}) — otherwise the \
+             two knobs aren't actually independent/effective"
+        );
+        assert_ne!(
+            audio_09, audio_10,
+            "the two scale settings must produce different subtracted audio"
+        );
+    }
+
+    /// Review fix (Minor #1): for an EVEN-length input, the Nyquist bin
+    /// (index `n/2`) must be left untouched (multiplier `h[n/2] = 1`,
+    /// per this function's own doc/comment) — neither doubled nor
+    /// zeroed. Uses a pure alternating +1/-1 signal, which places ALL of
+    /// its energy exactly at the Nyquist bin, so a bug that zeroes that
+    /// bin collapses the whole transform to (near) zero.
+    #[test]
+    fn hilbert_quadrature_nyquist_bin_untouched_for_even_length() {
+        // NOTE on why this test doesn't call `hilbert_quadrature` itself:
+        // for a pure Nyquist-tone (alternating +/-1) real input, bin
+        // N/2's IFFT basis function `e^{-i*pi*n}` is purely real at
+        // EVERY integer sample `n` (`sin(pi*n) == 0` for all integers),
+        // so that bin's contribution to the returned IMAGINARY part is
+        // always exactly zero whether the bin is left at its real
+        // coefficient or zeroed out — the buggy and fixed versions are
+        // provably indistinguishable via `hilbert_quadrature`'s return
+        // value alone (verified: both give `quadrature == [0.0; n]` for
+        // this input). The bug (and its fix) is real relative to this
+        // function's own doc/invariant (`h[n/2] = 1`, untouched) but is
+        // unobservable through the narrow `.im`-only contract this
+        // function exposes.
+        //
+        // This test instead re-derives the REAL part of the same
+        // analytic-signal construction the fix restores (minimal
+        // duplication of the bin-doubling/zeroing logic, intentionally
+        // NOT calling the private helper, since that helper structurally
+        // cannot expose this) and checks the defining property of a
+        // correct analytic signal: `Re{x + jH(x)} == x` exactly. This
+        // would FAIL (systematic reconstruction error at the Nyquist
+        // component) under the pre-fix zero-the-Nyquist-bin behavior.
+        let n = 64;
+        let signal: Vec<f64> = (0..n)
+            .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+            .collect();
+
+        let mut planner = FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(n);
+        let ifft = planner.plan_fft_inverse(n);
+
+        let mut buf: Vec<Complex<f64>> = signal.iter().map(|&x| Complex::new(x, 0.0)).collect();
+        fft.process(&mut buf);
+
+        let half = n / 2;
+        for c in buf.iter_mut().take(half).skip(1) {
+            *c *= 2.0;
+        }
+        // Fixed behavior: leave bin `half` (Nyquist) untouched, zero only
+        // the true negative frequencies (`half + 1 ..`).
+        for c in buf.iter_mut().skip(half + 1) {
+            *c = Complex::new(0.0, 0.0);
+        }
+
+        ifft.process(&mut buf);
+        let scale = 1.0 / n as f64;
+
+        for (i, (&orig, c)) in signal.iter().zip(buf.iter()).enumerate() {
+            let recon_re = c.re * scale;
+            assert!(
+                (orig - recon_re).abs() < 1e-9,
+                "index {i}: analytic-signal real part ({recon_re}) should exactly reconstruct \
+                 the original Nyquist-tone sample ({orig}) when the Nyquist bin is left \
+                 untouched (h[n/2] = 1) rather than zeroed"
+            );
+        }
+    }
+
+    // ========================================================================
+    // Review fix Finding #2: genuine ablation of the per-block MECHANISM
+    // itself, independent of the scale change and independent of the
+    // GFSK-vs-CPFSK reference change.
+    //
+    // The GREEN/RED tests above use a STATIC channel (no injected
+    // fading/drift across the 12.64s transmission — only AWGN varies
+    // across seeds), so a whole-signal fit and a per-block fit converge
+    // to nearly the same estimate on that fixture; the demonstrated GREEN
+    // result there is explainable almost entirely by the scale change
+    // (1.0 vs 0.9), NOT by "per-block replacing whole-signal" — the
+    // mechanism's actual stated purpose (tracking real fading/drift over
+    // a transmission's duration, per `time_varying_subtraction_enabled`'s
+    // doc).
+    //
+    // This fixture injects a genuine slow sinusoidal AMPLITUDE fade
+    // (realistic ionospheric QSB) over the signal's duration, and
+    // compares [`Ft8Decoder::time_varying_complex_amplitude`] used TWICE
+    // — once with its real ~2-symbol/1-symbol-hop window (the actual
+    // per-block mechanism), once with the window widened to span the
+    // WHOLE signal (`sps` argument set to `signal_len`, which forces the
+    // sliding-window loop to compute exactly one global block via the
+    // IDENTICAL dot-product/clamp code path) — so the reference waveform,
+    // the scale (both arms use the raw fitted estimate, scale = 1.0
+    // implicitly, no `Ft8Config` scale knob involved at all), and the
+    // estimator code itself are held perfectly fixed. The ONLY variable
+    // that differs between the two arms is per-block vs. whole-signal
+    // windowing — isolating the mechanism's contribution alone.
+    // ========================================================================
+
+    const FADE_DEPTH: f64 = 0.6; // +/-60% amplitude swing around the mean
+    const FADE_PERIOD_S: f64 = 3.0; // ~4 fade cycles across the 12.64s transmission
+
+    /// Build a single genuinely-fading signal (message A only, no
+    /// overlapping B): A's real GFSK-modulated waveform, amplitude-
+    /// modulated by a slow sinusoidal envelope over its 12.64s duration,
+    /// plus a small deterministic ambient noise floor.
+    fn build_fading_fixture(seed: u64) -> (Vec<f32>, Vec<u8>) {
+        use crate::encoder::Ft8Encoder;
+        use crate::modulator::{Ft8Modulator, PulseShape};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols_a = encoder.encode_message("CQ K5ARH EM10", None).unwrap();
+
+        let mut modulator_a = Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE,
+            FREQ_A,
+            1.0,
+            PulseShape::Gaussian { bt: 2.0 },
+        )
+        .unwrap();
+        let sig_a = modulator_a.modulate_symbols(&symbols_a, 0.0).unwrap();
+
+        let amp_a = db_to_amplitude(AMP_A_DB);
+
+        let mut audio = vec![0.0f32; WINDOW_SAMPLES];
+        for (i, &s) in sig_a.iter().enumerate() {
+            if i < audio.len() {
+                let t = i as f64 / SAMPLE_RATE as f64;
+                let envelope =
+                    1.0 + FADE_DEPTH * (2.0 * std::f64::consts::PI * t / FADE_PERIOD_S).sin();
+                audio[i] += s * (amp_a * envelope) as f32;
+            }
+        }
+
+        let noise_amplitude = amp_a * db_to_amplitude(NOISE_FLOOR_DB_BELOW_A);
+        add_seeded_noise(&mut audio, noise_amplitude, seed);
+
+        (audio, symbols_a.to_vec())
+    }
+
+    /// Raw residual signal POWER (sum of squared samples) — deliberately
+    /// NOT `project_energy`'s matched-filter re-projection. `project_energy`
+    /// finds the best-fit (ai, aq) of the given buffer against the SAME
+    /// reference used to build the estimate being tested; by the
+    /// orthogonality principle of least squares, re-projecting a
+    /// whole-signal-fit-and-subtracted residual through the identical
+    /// whole-window fit is ALWAYS ~0, tautologically, regardless of how
+    /// much the fit actually helped — a residual is always orthogonal to
+    /// the exact basis it was just optimally projected out of. That
+    /// self-cancellation was discovered empirically while building this
+    /// ablation (the first attempt, using `project_energy` on both arms,
+    /// showed the whole-signal arm at ~0 residual by construction, not by
+    /// merit). Raw power sidesteps this: it measures how much signal
+    /// energy is actually left in the buffer, independent of which
+    /// reference/window was used to remove it.
+    fn residual_power(residual: &[f32]) -> f64 {
+        residual.iter().map(|&x| (x as f64) * (x as f64)).sum()
+    }
+
+    /// The real per-block mechanism must leave LESS residual A-power
+    /// than a whole-signal fit on a genuinely fading signal — the
+    /// positive case the static-channel fixture above cannot demonstrate.
+    #[test]
+    fn per_block_mechanism_tracks_fading_better_than_whole_signal_fit() {
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+        let pp = ProtocolParams::ft8();
+
+        for seed in [1u64, 7, 13, 42, 99] {
+            let (audio, symbols_a) = build_fading_fixture(seed);
+
+            let (gfsk_i, gfsk_q) =
+                Ft8Decoder::build_gfsk_iq_pair(&symbols_a, &pp, SAMPLE_RATE, FREQ_A, 0.0)
+                    .expect("GFSK reference synthesis should succeed at a valid in-band frequency");
+            let signal_len = gfsk_i.len().min(audio.len());
+
+            // Real per-block estimate: ~2-symbol window, 1-symbol hop.
+            let (amp_i_block, amp_q_block) = Ft8Decoder::time_varying_complex_amplitude(
+                &audio, 0, &gfsk_i, &gfsk_q, 0, signal_len, sps,
+            );
+            let mut residual_block: Vec<f32> = audio[..signal_len].to_vec();
+            for i in 0..signal_len {
+                residual_block[i] -=
+                    (amp_i_block[i] * gfsk_i[i] + amp_q_block[i] * gfsk_q[i]) as f32;
+            }
+
+            // Whole-signal estimate: identical estimator function, with
+            // the window widened (via `sps = signal_len`) to force
+            // exactly one global block spanning the entire signal.
+            let (amp_i_whole, amp_q_whole) = Ft8Decoder::time_varying_complex_amplitude(
+                &audio, 0, &gfsk_i, &gfsk_q, 0, signal_len, signal_len,
+            );
+            let mut residual_whole: Vec<f32> = audio[..signal_len].to_vec();
+            for i in 0..signal_len {
+                residual_whole[i] -=
+                    (amp_i_whole[i] * gfsk_i[i] + amp_q_whole[i] * gfsk_q[i]) as f32;
+            }
+
+            let power_block = residual_power(&residual_block);
+            let power_whole = residual_power(&residual_whole);
+
+            assert!(
+                power_block < power_whole,
+                "seed {seed}: on a genuinely fading signal, the real per-block estimate's \
+                 residual power ({power_block:.3e}) should be lower than the whole-signal \
+                 estimate's ({power_whole:.3e}) — same reference, same scale, same estimator \
+                 function, differing only in window size"
+            );
+        }
+    }
+
+    /// Sanity companion: on the SAME static (non-fading) fixture the
+    /// GREEN/RED tests above use, the real per-block estimate and the
+    /// whole-signal estimate (same estimator function, same reference,
+    /// window size the only difference) should leave near-IDENTICAL
+    /// residual power — documenting concretely why that fixture alone
+    /// cannot discriminate the per-block mechanism from the scale
+    /// change (Finding #2's diagnosis).
+    #[test]
+    fn static_channel_does_not_discriminate_per_block_from_whole_signal() {
+        let sps = (SYMBOL_DURATION * SAMPLE_RATE as f64) as usize;
+        let pp = ProtocolParams::ft8();
+        let (audio, symbols_a, _symbols_b) = build_overlapping_fixture(7);
+
+        let (gfsk_i, gfsk_q) =
+            Ft8Decoder::build_gfsk_iq_pair(&symbols_a, &pp, SAMPLE_RATE, FREQ_A, 0.0)
+                .expect("GFSK reference synthesis should succeed at a valid in-band frequency");
+        let signal_len = gfsk_i.len().min(audio.len());
+
+        let (amp_i_block, amp_q_block) = Ft8Decoder::time_varying_complex_amplitude(
+            &audio, 0, &gfsk_i, &gfsk_q, 0, signal_len, sps,
+        );
+        let mut residual_block: Vec<f32> = audio[..signal_len].to_vec();
+        for i in 0..signal_len {
+            residual_block[i] -= (amp_i_block[i] * gfsk_i[i] + amp_q_block[i] * gfsk_q[i]) as f32;
+        }
+
+        let (amp_i_whole, amp_q_whole) = Ft8Decoder::time_varying_complex_amplitude(
+            &audio, 0, &gfsk_i, &gfsk_q, 0, signal_len, signal_len,
+        );
+        let mut residual_whole: Vec<f32> = audio[..signal_len].to_vec();
+        for i in 0..signal_len {
+            residual_whole[i] -= (amp_i_whole[i] * gfsk_i[i] + amp_q_whole[i] * gfsk_q[i]) as f32;
+        }
+
+        let power_block = residual_power(&residual_block);
+        let power_whole = residual_power(&residual_whole);
+
+        // "Near-identical" = within 3dB, the same tolerance the GREEN/RED
+        // tests above use for their own noise-floor comparison.
+        let ratio_db = 10.0 * (power_whole.max(1e-30) / power_block.max(1e-30)).log10();
+        assert!(
+            ratio_db.abs() <= 3.0,
+            "on the static (non-fading) fixture, per-block ({power_block:.3e}) and \
+             whole-signal ({power_whole:.3e}) estimates should be within 3dB of each other \
+             ({ratio_db:.2} dB apart) — if this ever fails, the static fixture HAS started \
+             discriminating the mechanism and the diagnosis in Finding #2 should be revisited"
         );
     }
 }
