@@ -1897,6 +1897,27 @@ struct CostasCandidate {
     time_refinement: f64,
 }
 
+/// Result of [`Ft8Decoder::generate_gfsk_reference`] (Task W4.1): a real,
+/// Gaussian-pulse-shaped (GFSK) audio-domain subtraction reference
+/// synthesized via the crate's real TX modulator, at a caller-supplied
+/// refined (unquantized) frequency/time estimate.
+///
+/// [BIT-EXACT]: new, presently-unused type — see the function doc.
+#[cfg(feature = "transmit")]
+#[derive(Clone, Debug)]
+struct GfskReference {
+    /// Synthesized real-valued reference audio samples
+    /// (length = `pp.total_samples(sample_rate)`), GFSK pulse-shaped via
+    /// the real `crate::modulator::Ft8Modulator` — not the linear-ramp
+    /// approximation `Ft8Decoder::generate_cpfsk_iq_ramped` uses.
+    samples: Vec<f32>,
+    /// Whole-sample index (may be negative) at which `samples[0]` aligns
+    /// against an audio buffer under subtraction: the caller's refined
+    /// `time_offset_samples`, rounded to the nearest whole sample
+    /// (sub-sample rendering is not modeled — see the function doc).
+    start_sample: isize,
+}
+
 /// Per-bin magnitude compression used when building the sync
 /// spectrogram. The JTDX "3-method spectral sweep" runs the Costas sync search
 /// over three compressions of the SAME FFT and unions the candidates — each
@@ -4017,6 +4038,91 @@ impl Ft8Decoder {
     fn ramp_samples_from_fraction(sps: usize, fraction: f64) -> usize {
         let r = (sps as f64 * fraction).round() as i64;
         r.max(1) as usize
+    }
+
+    /// Task W4.1 (decoder-true-positive-sensitivity plan, Workstream 4):
+    /// synthesize a Gaussian-pulse-shaped (true GFSK) subtraction reference
+    /// via the real TX modulator (`crate::modulator::Ft8Modulator` with
+    /// `PulseShape::Gaussian { bt }`), at a caller-supplied **refined**
+    /// absolute frequency/time estimate — e.g. a coarse candidate's nominal
+    /// `(frequency_offset, time_offset)` already summed with a
+    /// `fine_sync::FineSync`'s `(df_hz, dt_samples)` (W3.2/W3.3's per-
+    /// candidate fine dt/df search) — rather than the grid-quantized
+    /// `(freq_bin, freq_sub, time_step)` lattice `reverse_derive_candidate`
+    /// re-derives for the existing coherent-spectrogram subtraction path.
+    ///
+    /// Every existing reference generator in this file
+    /// (`generate_cpfsk_iq`, `generate_cpfsk_iq_ramped`) synthesizes a
+    /// RECTANGULAR-pulse (hard tone-transition) or a linear-angular-
+    /// velocity-ramp approximation of CPFSK by hand. Real FT8/FT4 use true
+    /// Gaussian-filtered GFSK (`ProtocolParams::modulation`,
+    /// `ModulationType::Gfsk { bt }` — BT=2.0 for FT8, BT=1.0 for FT4), so a
+    /// rectangular reference leaves spectral sidelobe residue at symbol
+    /// boundaries after subtraction. This function reuses the crate's own
+    /// real modulator (the same code that shapes actual over-the-air TX
+    /// audio) to synthesize the matched reference instead of re-deriving an
+    /// approximation.
+    ///
+    /// `frequency_hz` and `time_offset_samples` are taken as the caller's
+    /// final, continuous-valued REFINED estimates — this function performs
+    /// **no** grid quantization of either. `time_offset_samples` is,
+    /// however, rounded to the nearest whole audio sample for
+    /// [`GfskReference::start_sample`]: sub-sample sample-domain rendering
+    /// (resampling/interpolating the synthesized waveform to a fractional
+    /// alignment) is not modeled here — a known, documented simplification,
+    /// consistent with the existing `subtract_signal` path which also only
+    /// searches/aligns at whole-sample resolution.
+    ///
+    /// [BIT-EXACT]: new, presently-**unused** function — not called from any
+    /// decode path. W4.2 (audio-domain subtraction) and W4.3 (real
+    /// multipass) are the intended future callers.
+    ///
+    /// Gated behind the `transmit` feature (same gate as
+    /// `crate::modulator::Ft8Modulator` itself): every production/decode
+    /// consumer of `pancetta-ft8` in this workspace (the `pancetta` binary,
+    /// `pancetta-qso`'s `sim-hifi` feature, `pancetta-research`) already
+    /// builds this crate with `transmit` enabled, so this does not reduce
+    /// subtraction capability anywhere it currently matters. A default
+    /// (non-`transmit`) build of `pancetta-ft8` alone simply does not
+    /// compile this function in — harmless, since nothing calls it yet.
+    #[cfg(feature = "transmit")]
+    fn generate_gfsk_reference(
+        tone_symbols: &[u8],
+        pp: &ProtocolParams,
+        sample_rate: u32,
+        frequency_hz: f64,
+        time_offset_samples: f64,
+    ) -> Ft8Result<GfskReference> {
+        use crate::modulator::{Ft8Modulator, PulseShape, DEFAULT_TX_POWER};
+        use crate::protocol::ModulationType;
+
+        let bt = match pp.modulation {
+            ModulationType::Gfsk { bt } => bt,
+            // No current production protocol uses `Cpfsk` (see
+            // `ModulationType::Cpfsk`'s doc — retained for completeness
+            // only); fall back to the modulator's own FT8-standard default
+            // rather than panicking on a value this function can't use.
+            ModulationType::Cpfsk => crate::modulator::DEFAULT_BT,
+        };
+
+        let mut modulator = Ft8Modulator::with_pulse_shape(
+            sample_rate,
+            frequency_hz,
+            DEFAULT_TX_POWER,
+            PulseShape::Gaussian { bt },
+        )?;
+
+        // `frequency_offset = 0.0`: the full refined absolute carrier is
+        // already folded into the modulator's `base_frequency` above, so no
+        // additional per-call offset is needed.
+        let samples = modulator.modulate_symbols_protocol(tone_symbols, 0.0, pp)?;
+
+        let start_sample = time_offset_samples.round() as isize;
+
+        Ok(GfskReference {
+            samples,
+            start_sample,
+        })
     }
 
     /// Compute the correlation energy (amplitude^2) of a CPFSK signal at given
@@ -20289,6 +20395,205 @@ mod w26_ap_coverage_tests {
              the scale applied to the non-injected bits relative to \
              normalizing alone — otherwise this test's premise doesn't \
              hold for this input"
+        );
+    }
+}
+
+// ============================================================================
+// Task W4.1 (decoder-true-positive-sensitivity plan, Workstream 4): TDD for
+// `Ft8Decoder::generate_gfsk_reference` — the new, still-unused real-GFSK
+// subtraction reference generator. Requires `transmit` (the function itself
+// is gated on it; see its doc for the feature-gating rationale).
+// ============================================================================
+#[cfg(all(test, feature = "transmit"))]
+mod w4_1_gfsk_reference_tests {
+    use super::*;
+
+    /// Build a worst-case-splatter symbol sequence: alternating tone 0 and
+    /// tone 7 (the two extremes of the 8-tone alphabet, `7 * TONE_SPACING`
+    /// = 43.75 Hz apart) on every symbol boundary — the maximum possible
+    /// instantaneous frequency jump, applied at every single transition.
+    /// This is deliberately NOT a realistic Costas+data FT8 frame; it's a
+    /// synthetic stress pattern chosen so that a "sidelobe" band exactly
+    /// `TONE_SPACING` (6.25 Hz) away from either extreme tone is otherwise
+    /// silent (no other tone in this alphabet subset lands there), so any
+    /// energy measured there is genuinely symbol-boundary splatter, not
+    /// intentional signal content from some other active tone.
+    fn worst_case_alternating_symbols() -> Vec<u8> {
+        (0..NUM_SYMBOLS)
+            .map(|i| if i % 2 == 0 { 0u8 } else { 7u8 })
+            .collect()
+    }
+
+    #[test]
+    fn gfsk_reference_matches_expected_length_and_start_sample() {
+        let pp = ProtocolParams::ft8();
+        let symbols = worst_case_alternating_symbols();
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let expected_len = pp.total_samples(SAMPLE_RATE);
+        assert_eq!(expected_len, NUM_SYMBOLS * sps);
+
+        let refined_time = 1234.6_f64; // arbitrary fractional refined offset
+        let gfsk =
+            Ft8Decoder::generate_gfsk_reference(&symbols, &pp, SAMPLE_RATE, 1500.0, refined_time)
+                .expect("gfsk reference synthesis should succeed for a valid candidate");
+
+        assert_eq!(
+            gfsk.samples.len(),
+            expected_len,
+            "reference length must match the protocol's full transmission length"
+        );
+        assert_eq!(
+            gfsk.start_sample, 1235,
+            "start_sample must be the refined time offset rounded to the nearest whole sample"
+        );
+    }
+
+    /// Power in the "just-beyond-the-tone-raster" flank band: strictly
+    /// outside `[lo_tone - guard_hz, hi_tone + guard_hz]` (the occupied
+    /// tone cluster plus a `guard_hz` margin), but not further than
+    /// `guard_hz + flank_width_hz` beyond either edge — i.e. two narrow
+    /// windows just past the outermost tones on each side, as a fraction
+    /// of total signal power. Bounding the flank width (rather than
+    /// integrating all the way to Nyquist) keeps the measurement local to
+    /// "splatter spilling just past the legitimate tone raster" rather than
+    /// diluting it with the broadband numerical/dither floor far away.
+    fn flank_power_fraction(
+        real_signal: &[f64],
+        sample_rate: u32,
+        lo_tone: f64,
+        hi_tone: f64,
+        guard_hz: f64,
+        flank_width_hz: f64,
+    ) -> f64 {
+        let n = real_signal.len();
+        let mut buf: Vec<Complex<f64>> =
+            real_signal.iter().map(|&s| Complex::new(s, 0.0)).collect();
+        let mut planner = FftPlanner::<f64>::new();
+        let fft = planner.plan_fft_forward(n);
+        fft.process(&mut buf);
+        let bin_hz = sample_rate as f64 / n as f64;
+        let total_power: f64 = buf.iter().map(|c| c.norm_sqr()).sum();
+
+        let lo_flank = (lo_tone - guard_hz - flank_width_hz, lo_tone - guard_hz);
+        let hi_flank = (hi_tone + guard_hz, hi_tone + guard_hz + flank_width_hz);
+
+        let mut flank_power = 0.0f64;
+        for (k, c) in buf.iter().enumerate() {
+            let freq = k as f64 * bin_hz;
+            if freq > sample_rate as f64 / 2.0 {
+                break;
+            }
+            if (freq >= lo_flank.0 && freq <= lo_flank.1)
+                || (freq >= hi_flank.0 && freq <= hi_flank.1)
+            {
+                flank_power += c.norm_sqr();
+            }
+        }
+        flank_power / total_power
+    }
+
+    #[test]
+    fn gfsk_reference_suppresses_symbol_boundary_sidelobes_vs_rectangular() {
+        // Worst-case alternating tone-0/tone-7 pattern (every symbol
+        // boundary is a maximal 43.75 Hz instantaneous frequency jump
+        // under the rectangular reference) — the whole 0..7 tone raster is
+        // "occupied" (tone 0 is the lowest tone in the FT8 alphabet, tone 7
+        // the highest), so the flank bands just beyond tone 0 and tone 7
+        // are exactly the territory a legitimate FT8 signal on this
+        // alphabet never occupies: real "splatter into the neighboring
+        // channel" territory.
+        let pp = ProtocolParams::ft8();
+        let symbols = worst_case_alternating_symbols();
+        let sps = pp.samples_per_symbol(SAMPLE_RATE);
+        let base_freq = 1500.0;
+
+        // Existing rectangular reference (`generate_cpfsk_iq`): use the
+        // real (cosine) quadrature component as the "transmitted" signal —
+        // same magnitude-spectrum shape as the actual `sin(phase)` audio
+        // the legacy subtract path fits against.
+        let (rect_i, _rect_q) = Ft8Decoder::generate_cpfsk_iq(&symbols, base_freq, sps);
+
+        // New GFSK reference via the real TX modulator, same symbols/freq,
+        // zero refinement (df=0, dt=0) so both references describe the
+        // identical nominal candidate — isolating the pulse-shape as the
+        // only difference under test.
+        let gfsk = Ft8Decoder::generate_gfsk_reference(&symbols, &pp, SAMPLE_RATE, base_freq, 0.0)
+            .expect("gfsk reference synthesis should succeed");
+
+        assert_eq!(
+            rect_i.len(),
+            gfsk.samples.len(),
+            "both references must be the same length for a fair spectral comparison"
+        );
+
+        // Flank bands: starting one TONE_SPACING (6.25 Hz) beyond the
+        // lowest (tone 0) and highest (tone 7) occupied frequencies, out to
+        // a further 50 Hz — the territory just past the legitimate 8-tone
+        // FT8 raster where symbol-boundary splatter shows up as adjacent-
+        // channel interference.
+        let tone0_freq = base_freq;
+        let tone7_freq = base_freq + 7.0 * TONE_SPACING;
+        let guard_hz = TONE_SPACING;
+        let flank_width_hz = 50.0;
+
+        let rect_flank = flank_power_fraction(
+            &rect_i,
+            SAMPLE_RATE,
+            tone0_freq,
+            tone7_freq,
+            guard_hz,
+            flank_width_hz,
+        );
+        let gfsk_samples_f64: Vec<f64> = gfsk.samples.iter().map(|&s| s as f64).collect();
+        let gfsk_flank = flank_power_fraction(
+            &gfsk_samples_f64,
+            SAMPLE_RATE,
+            tone0_freq,
+            tone7_freq,
+            guard_hz,
+            flank_width_hz,
+        );
+
+        assert!(
+            gfsk_flank < rect_flank * 0.5,
+            "GFSK reference must show measurably suppressed flank splatter \
+             (beyond {}Hz past the outermost tones) vs. the rectangular \
+             reference: rect={:.3e}, gfsk={:.3e} (want gfsk < 0.5 * rect)",
+            guard_hz,
+            rect_flank,
+            gfsk_flank
+        );
+    }
+
+    #[test]
+    fn gfsk_reference_uses_protocol_bt_ft8_vs_ft4() {
+        // Sanity: FT8 (BT=2.0) and FT4 (BT=1.0) must produce DIFFERENT
+        // synthesized references for the same nominal symbols/frequency —
+        // confirms `pp.modulation`'s BT is actually threaded through to the
+        // modulator rather than a hardcoded constant.
+        let pp_ft8 = ProtocolParams::ft8();
+        let pp_ft4 = ProtocolParams::ft4();
+
+        let ft8_symbols = worst_case_alternating_symbols();
+        let ft4_symbols: Vec<u8> = (0..pp_ft4.num_symbols)
+            .map(|i| if i % 2 == 0 { 0u8 } else { 3u8 })
+            .collect();
+
+        let ft8_ref =
+            Ft8Decoder::generate_gfsk_reference(&ft8_symbols, &pp_ft8, SAMPLE_RATE, 1500.0, 0.0)
+                .expect("FT8 gfsk reference synthesis should succeed");
+        let ft4_ref =
+            Ft8Decoder::generate_gfsk_reference(&ft4_symbols, &pp_ft4, SAMPLE_RATE, 1500.0, 0.0)
+                .expect("FT4 gfsk reference synthesis should succeed");
+
+        // Different protocols -> different total lengths (FT4 has fewer,
+        // shorter symbols) — a cheap, unambiguous confirmation that the
+        // protocol params (not just a hardcoded FT8 shape) drove synthesis.
+        assert_ne!(
+            ft8_ref.samples.len(),
+            ft4_ref.samples.len(),
+            "FT8 and FT4 references must differ in length (different protocol timing)"
         );
     }
 }
