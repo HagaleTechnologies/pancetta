@@ -355,7 +355,7 @@ impl DxClusterClient {
             while let Some(command) = cmd_rx.recv().await {
                 debug!("Sending WebSocket command: {}", command);
 
-                if let Err(e) = write.send(Message::Text(command)).await {
+                if let Err(e) = write.send(Message::Text(command.into())).await {
                     error!("Failed to send WebSocket message: {}", e);
                     *writer_status.lock().await = ConnectionStatus::Error(e.to_string());
                     break;

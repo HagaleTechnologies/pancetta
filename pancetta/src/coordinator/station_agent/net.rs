@@ -58,7 +58,7 @@ impl RealWsConn {
                     // Outbound: forward text frames to the socket.
                     maybe = out_rx.recv() => match maybe {
                         Some(text) => {
-                            if sink.send(Message::Text(text)).await.is_err() {
+                            if sink.send(Message::Text(text.into())).await.is_err() {
                                 let _ = in_tx.send(None).await;
                                 break;
                             }
@@ -72,7 +72,7 @@ impl RealWsConn {
                     // Inbound: forward text frames (and closes) to the adapter.
                     inbound = source.next() => match inbound {
                         Some(Ok(Message::Text(t))) => {
-                            if in_tx.send(Some(t)).await.is_err() {
+                            if in_tx.send(Some(t.to_string())).await.is_err() {
                                 break;
                             }
                         }

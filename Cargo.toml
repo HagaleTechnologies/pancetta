@@ -116,7 +116,7 @@ base64 = "0.22"
 
 # TLS and WebSocket support
 native-tls = "0.2"
-tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
+tokio-tungstenite = { version = "0.29", features = ["native-tls"] }
 
 # HTTP server and WebSocket upgrade (remote_gateway)
 axum = { version = "0.8", features = ["ws"] }

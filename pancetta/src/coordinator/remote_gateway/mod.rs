@@ -409,7 +409,7 @@ mod server_tests {
             client_version: "0".into(),
         });
         ws.send(tokio_tungstenite::tungstenite::Message::Text(
-            serde_json::to_string(&hello).unwrap(),
+            serde_json::to_string(&hello).unwrap().into(),
         ))
         .await
         .unwrap();
