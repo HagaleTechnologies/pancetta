@@ -126,6 +126,11 @@ struct Args {
     /// Decoder-speed-overhaul Task 10: max unsatisfied parity checks
     /// tolerated before escalating. See `Ft8Config::escalation_parity_max`.
     escalation_parity_max: Option<usize>,
+    /// Task W5.1 [A/B]: master switch for per-bin peak candidate
+    /// selection (replaces the flat top-`max_sync_candidates` cap on the
+    /// primary sweep with a per-`freq_bin` top-K cut). See
+    /// `Ft8Config::per_bin_candidate_selection`.
+    per_bin_candidate_selection: Option<bool>,
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     cross_cycle_averaging: Option<bool>,
     /// hb-074: coherent (phase-aligned complex sum) variant of cross-cycle averaging.
@@ -290,6 +295,7 @@ impl Args {
         let mut floor_iters: Option<usize> = None;
         let mut deep_iters: Option<usize> = None;
         let mut escalation_parity_max: Option<usize> = None;
+        let mut per_bin_candidate_selection: Option<bool> = None;
         let mut cross_cycle_averaging: Option<bool> = None;
         let mut cross_cycle_coherent: Option<bool> = None;
         let mut cross_cycle_coherent_mrc: Option<bool> = None;
@@ -564,6 +570,12 @@ impl Args {
                             .context("--escalation-parity-max needs a value")?
                             .parse()?,
                     );
+                }
+                "--per-bin-candidate-selection" => {
+                    per_bin_candidate_selection = Some(true);
+                }
+                "--no-per-bin-candidate-selection" => {
+                    per_bin_candidate_selection = Some(false);
                 }
                 "--cross-cycle-averaging" => {
                     cross_cycle_averaging = Some(true);
@@ -909,6 +921,7 @@ impl Args {
             floor_iters,
             deep_iters,
             escalation_parity_max,
+            per_bin_candidate_selection,
             cross_cycle_averaging,
             cross_cycle_coherent,
             cross_cycle_coherent_mrc,
@@ -1995,6 +2008,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(v) = args.escalation_parity_max {
         d = d.with_escalation_parity_max(v);
+    }
+    if let Some(on) = args.per_bin_candidate_selection {
+        d = d.with_per_bin_candidate_selection(on);
     }
     if let Some(on) = args.cross_cycle_averaging {
         d = d.with_cross_cycle_averaging(on);

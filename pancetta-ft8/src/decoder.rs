@@ -125,6 +125,14 @@ const MIN_SYNC_SCORE: f64 = 3.0;
 /// coordinator/tier.rs).
 const MAX_SYNC_CANDIDATES: usize = 200;
 
+/// Task W5.1: per-bin candidate cap when `Ft8Config::per_bin_candidate_selection`
+/// is enabled. Keep the top K candidates (by `sync_score`) per `freq_bin`
+/// from the main sweep before the (unchanged) global `max_sync_candidates`
+/// truncation runs. K=2 mirrors the brief's spec: enough headroom for a
+/// bin to carry both a genuine signal and one spurious near-threshold
+/// sidelobe without the bin dominating the whole candidate budget.
+const PER_BIN_CANDIDATE_TOP_K: usize = 2;
+
 /// Minimum frequency bin for FT8 search (0 = full passband coverage)
 const MIN_FREQ_BIN: usize = 0;
 
@@ -753,6 +761,31 @@ pub struct Ft8Config {
     /// mainline `syncmin` constant. Only consulted when
     /// `costas_two_baseline_enabled = true`.
     pub costas_two_baseline_norm_threshold: f64,
+
+    /// Decoder-TP-sensitivity Task W5.1 [A/B]: per-bin peak selection
+    /// replaces the flat top-`max_sync_candidates` cap on the primary
+    /// candidate-collection sweep. When `true`, the above-threshold cells
+    /// gathered by the main Costas sweep are first grouped by `freq_bin`
+    /// and thinned to the top `PER_BIN_CANDIDATE_TOP_K` (currently 2, by
+    /// `sync_score`) *within each bin*, before the existing global
+    /// `max_sync_candidates` truncation runs. A crowded frequency
+    /// neighborhood packed with strong candidates can otherwise starve out
+    /// a weak, genuine, isolated signal in a quiet bin purely by winning
+    /// the flat global sort — the weak signal would trivially clear a
+    /// per-bin cut but never reaches the flat top-N. This mirrors WSJT-X
+    /// mainline `sync8`'s per-bin peak-picking philosophy (one candidate
+    /// per bin per lag-window pathway;
+    /// `research/specs/spec-wsjtx-mainline-sync8.md` Phase 3/4), extended
+    /// here to pancetta's main sweep rather than only the tight/wide
+    /// auxiliary pathway. The auxiliary `costas_two_baseline_enabled`
+    /// pathway already performs its own top-1-per-bin-per-pathway
+    /// selection (tight + wide) and is unaffected by this flag — its
+    /// output is appended after this selection runs, so the two
+    /// mechanisms compose additively. The existing exact-duplicate guards
+    /// in the auxiliary-pathway emission block and downstream NMS are
+    /// untouched. Default **false** pending hard-200 / lid-of-band
+    /// measurement.
+    pub per_bin_candidate_selection: bool,
 
     /// Disable the half-symbol inner loop in
     /// `compute_costas_score_groups`. The kernel historically
@@ -1747,6 +1780,9 @@ impl Default for Ft8Config {
             costas_two_baseline_tight_steps: 20,
             costas_two_baseline_percentile: 0.40,
             costas_two_baseline_norm_threshold: 1.2,
+            // Task W5.1: per-bin peak selection default OFF pending
+            // hard-200 / lid-of-band measurement.
+            per_bin_candidate_selection: false,
             // Batch 92: Costas half-loop removal default OFF pending
             // A/B measurement (probe-baseline discipline). When false
             // the sync kernel is byte-identical to the historical
@@ -2047,6 +2083,61 @@ struct CostasCandidate {
     /// of `compute_costas_score` at t0-1 / t0 / t0+1. In [-0.5, +0.5].
     /// 0.0 = integer-bin alignment (unrefined).
     time_refinement: f64,
+}
+
+/// Task W5.1 [A/B]: pure per-bin candidate selection. Groups
+/// above-threshold Costas sync cells by `freq_bin` and keeps only the
+/// `k_per_bin` highest-`sync_score` cells within each bin, discarding the
+/// rest. A plain `list in -> list out` transform with no decoder state or
+/// side effects, so it is unit-testable in complete isolation from the
+/// spectrogram/decode pipeline.
+///
+/// This is the mechanism behind `Ft8Config::per_bin_candidate_selection`:
+/// it replaces the legacy flat top-`max_sync_candidates` truncation for
+/// the primary candidate-collection sweep in
+/// `costas_sync_search_with_threshold_and_partner`. Under flat top-N, a
+/// crowded frequency neighborhood packed with many strong candidate cells
+/// can starve out a weak, genuine, isolated candidate in a quiet bin —
+/// the weak candidate never reaches the flat global top-N even though it
+/// would trivially clear a per-bin cut. Grouping by bin first guarantees
+/// every bin gets its fair share of the budget regardless of how crowded
+/// its neighbors are.
+///
+/// The returned list is unordered *across* bins (each bin's own kept
+/// subset is highest-score-first, but bins are not globally re-sorted
+/// here); callers that need a final ranking re-sort afterward, exactly as
+/// `costas_sync_search_with_threshold_and_partner` already does before
+/// applying the global `max_sync_candidates` cap.
+///
+/// `k_per_bin = 0` returns an empty list (keep nothing per bin, hence
+/// nothing overall) rather than passing candidates through unchanged —
+/// there is no meaningful "keep zero" no-op interpretation here, so the
+/// literal semantics are honored.
+fn select_top_k_per_bin(
+    candidates: Vec<CostasCandidate>,
+    k_per_bin: usize,
+) -> Vec<CostasCandidate> {
+    if k_per_bin == 0 || candidates.is_empty() {
+        return Vec::new();
+    }
+
+    let mut by_bin: std::collections::HashMap<usize, Vec<CostasCandidate>> =
+        std::collections::HashMap::new();
+    for c in candidates {
+        by_bin.entry(c.freq_bin).or_default().push(c);
+    }
+
+    let mut out = Vec::with_capacity(by_bin.len() * k_per_bin);
+    for (_freq_bin, mut group) in by_bin {
+        group.sort_by(|a, b| {
+            b.sync_score
+                .partial_cmp(&a.sync_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        group.truncate(k_per_bin);
+        out.extend(group);
+    }
+    out
 }
 
 /// Result of [`Ft8Decoder::generate_gfsk_reference`] (Task W4.1): a real,
@@ -5632,6 +5723,24 @@ impl Ft8Decoder {
                     }
                 }
             }
+        }
+
+        // Task W5.1 [A/B]: per-bin peak selection. Replaces the flat
+        // top-`max_sync_candidates` cap (applied further below) for THIS
+        // primary sweep's above-threshold cells with a per-`freq_bin` top-K
+        // cut, so a crowded frequency neighborhood can't starve out a
+        // weak, isolated candidate in a quiet bin before the global cap
+        // even runs. Applied BEFORE the two-baseline auxiliary pathway
+        // below appends its own candidates — that pathway already keeps
+        // at most one candidate per bin per (tight/wide) pathway by
+        // construction, so the two mechanisms compose additively rather
+        // than one undoing the other. The existing exact-duplicate guards
+        // in that block (`tight_pass && tight_score <= min_score`, etc.)
+        // are untouched: they gate on the absolute/normalized score, not
+        // on list membership, so they behave identically regardless of
+        // whether this per-bin thinning ran first.
+        if self.config.per_bin_candidate_selection {
+            candidates = select_top_k_per_bin(candidates, PER_BIN_CANDIDATE_TOP_K);
         }
 
         // hb-242 wide-lag baseline (red2): emit additional candidates
@@ -15349,6 +15458,297 @@ mod tests {
         assert!(waterfall.min_power < waterfall.max_power);
         assert!(waterfall.frequency_bins[0] >= 0.0);
         assert!(waterfall.frequency_bins.last().unwrap() <= &3000.0);
+    }
+
+    /// Task W5.1 TDD: reproduce the flat-top-N crowded-band bug, then show
+    /// per-bin selection fixes it.
+    ///
+    /// Scenario: a 30-cell crowded cluster all sharing ONE `freq_bin`
+    /// (many strong, slightly-jittered candidates — e.g. many nearby time
+    /// steps all clearing threshold near a strong real signal or a busy
+    /// part of the band), plus a single weak, genuinely isolated candidate
+    /// in a distant, otherwise-quiet `freq_bin`. Every crowded-cluster
+    /// score comfortably outranks the weak isolated cell.
+    ///
+    /// RED (demonstrates the bug): flat top-N at N=20 sorts globally by
+    /// score and truncates — all 20 kept slots go to the crowded cluster,
+    /// and the weak isolated cell (which would trivially have survived in
+    /// its own quiet bin) is dropped entirely.
+    ///
+    /// GREEN (demonstrates the fix): per-bin selection with K=2 keeps at
+    /// most 2 candidates per bin regardless of how many other bins are
+    /// crowded, so the weak isolated cell (the only candidate in its bin)
+    /// survives.
+    #[test]
+    fn test_per_bin_selection_saves_weak_isolated_cell_from_crowded_band() {
+        let mut candidates: Vec<CostasCandidate> = Vec::new();
+
+        // 30-cell crowded cluster, all in freq_bin=100, at 30 distinct
+        // time steps, scores 25.00..25.29 (all clearly stronger than the
+        // weak isolated cell below).
+        for t in 0..30usize {
+            candidates.push(CostasCandidate {
+                time_step: t,
+                freq_bin: 100,
+                freq_sub: 0,
+                sync_score: 25.0 + (t as f64) * 0.01,
+                time_refinement: 0.0,
+            });
+        }
+
+        // One weak, isolated candidate in a distant, otherwise-empty bin.
+        candidates.push(CostasCandidate {
+            time_step: 5,
+            freq_bin: 900,
+            freq_sub: 0,
+            sync_score: 10.0,
+            time_refinement: 0.0,
+        });
+
+        assert_eq!(candidates.len(), 31);
+
+        // --- RED: legacy flat top-N behavior (sort best-first, truncate). ---
+        let mut flat = candidates.clone();
+        flat.sort_by(|a, b| {
+            b.sync_score
+                .partial_cmp(&a.sync_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        flat.truncate(20);
+
+        assert_eq!(flat.len(), 20, "flat top-20 should keep exactly 20 cells");
+        assert!(
+            !flat.iter().any(|c| c.freq_bin == 900),
+            "bug reproduction failed: flat top-N should have starved out the \
+             weak isolated cell in freq_bin=900, but it survived"
+        );
+        assert!(
+            flat.iter().all(|c| c.freq_bin == 100),
+            "expected the entire flat top-20 to be consumed by the crowded \
+             cluster in freq_bin=100"
+        );
+
+        // --- GREEN: per-bin selection (the fix), K=2. ---
+        let per_bin = select_top_k_per_bin(candidates, 2);
+
+        let weak_survivor = per_bin
+            .iter()
+            .find(|c| c.freq_bin == 900)
+            .expect("per-bin selection must keep the weak isolated cell");
+        assert_eq!(weak_survivor.sync_score, 10.0);
+
+        // The crowded bin is thinned to its own top 2 (highest two of the
+        // 30-cell cluster: t=29 -> 25.29, t=28 -> 25.28).
+        let crowded: Vec<&CostasCandidate> = per_bin.iter().filter(|c| c.freq_bin == 100).collect();
+        assert_eq!(
+            crowded.len(),
+            2,
+            "crowded bin must be thinned to top-K=2, not all 30 cells"
+        );
+        let mut crowded_scores: Vec<f64> = crowded.iter().map(|c| c.sync_score).collect();
+        crowded_scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert!((crowded_scores[0] - 25.29).abs() < 1e-9);
+        assert!((crowded_scores[1] - 25.28).abs() < 1e-9);
+
+        // Total output: 2 (crowded bin) + 1 (weak isolated bin) = 3.
+        assert_eq!(per_bin.len(), 3);
+    }
+
+    /// General correctness: a bin with fewer than K candidates keeps all
+    /// of them; a bin with more than K candidates keeps exactly its top K.
+    #[test]
+    fn test_select_top_k_per_bin_general_grouping() {
+        let candidates = vec![
+            // bin 10: 1 candidate (< K) -> kept entirely.
+            CostasCandidate {
+                time_step: 0,
+                freq_bin: 10,
+                freq_sub: 0,
+                sync_score: 5.0,
+                time_refinement: 0.0,
+            },
+            // bin 20: exactly K=2 candidates -> both kept.
+            CostasCandidate {
+                time_step: 0,
+                freq_bin: 20,
+                freq_sub: 0,
+                sync_score: 8.0,
+                time_refinement: 0.0,
+            },
+            CostasCandidate {
+                time_step: 1,
+                freq_bin: 20,
+                freq_sub: 0,
+                sync_score: 9.0,
+                time_refinement: 0.0,
+            },
+            // bin 30: 3 candidates (> K) -> only the top 2 kept.
+            CostasCandidate {
+                time_step: 0,
+                freq_bin: 30,
+                freq_sub: 0,
+                sync_score: 1.0,
+                time_refinement: 0.0,
+            },
+            CostasCandidate {
+                time_step: 1,
+                freq_bin: 30,
+                freq_sub: 0,
+                sync_score: 2.0,
+                time_refinement: 0.0,
+            },
+            CostasCandidate {
+                time_step: 2,
+                freq_bin: 30,
+                freq_sub: 0,
+                sync_score: 3.0,
+                time_refinement: 0.0,
+            },
+        ];
+
+        let selected = select_top_k_per_bin(candidates, 2);
+        assert_eq!(selected.len(), 1 + 2 + 2);
+
+        let bin10: Vec<_> = selected.iter().filter(|c| c.freq_bin == 10).collect();
+        assert_eq!(bin10.len(), 1);
+
+        let bin20: Vec<_> = selected.iter().filter(|c| c.freq_bin == 20).collect();
+        assert_eq!(bin20.len(), 2);
+
+        let bin30: Vec<_> = selected.iter().filter(|c| c.freq_bin == 30).collect();
+        assert_eq!(bin30.len(), 2);
+        let mut bin30_scores: Vec<f64> = bin30.iter().map(|c| c.sync_score).collect();
+        bin30_scores.sort_by(|a, b| b.partial_cmp(a).unwrap());
+        assert_eq!(
+            bin30_scores,
+            vec![3.0, 2.0],
+            "bin 30 must keep its top-2, dropping 1.0"
+        );
+    }
+
+    /// Edge cases: empty input and `k_per_bin = 0` both return empty.
+    #[test]
+    fn test_select_top_k_per_bin_edge_cases() {
+        assert!(select_top_k_per_bin(Vec::new(), 2).is_empty());
+
+        let candidates = vec![CostasCandidate {
+            time_step: 0,
+            freq_bin: 5,
+            freq_sub: 0,
+            sync_score: 42.0,
+            time_refinement: 0.0,
+        }];
+        assert!(
+            select_top_k_per_bin(candidates, 0).is_empty(),
+            "k_per_bin=0 must keep nothing"
+        );
+    }
+
+    /// Config regression guard: `per_bin_candidate_selection` defaults to
+    /// `false`, so the flag has zero effect unless an operator/eval
+    /// harness explicitly opts in.
+    #[test]
+    fn test_per_bin_candidate_selection_default_off() {
+        assert!(!Ft8Config::default().per_bin_candidate_selection);
+    }
+
+    /// Wiring smoke test: with the flag OFF (default), the full sync
+    /// search over a normal single-signal synthetic spectrogram is
+    /// byte-identical to a decoder built without ever touching the flag —
+    /// confirming the new code path is inert when disabled. With the flag
+    /// ON, the search still runs to completion and still finds the real
+    /// signal (no crash, no silent loss of the only genuine candidate in
+    /// an otherwise-uncrowded synthetic scene).
+    /// Local copy of the synthetic-Costas-signal builder used elsewhere in
+    /// this file's test modules (`hb230_relaxed_sync_tests`,
+    /// `auto_passband_tests`) — those copies are private to their own
+    /// module, so `mod tests` needs its own to build a minimal
+    /// single-signal spectrogram for the W5.1 wiring smoke test below.
+    fn w51_build_synthetic_costas(
+        present_groups: &[usize],
+        signal_db: f64,
+        noise_db: f64,
+        f0: usize,
+    ) -> Spectrogram {
+        let steps_per_symbol = TIME_OSR;
+        let num_steps = 79 * steps_per_symbol;
+        let num_bins = SAMPLES_PER_SYMBOL / 2 + 1;
+        let freq_osr = FREQ_OSR;
+
+        let mut power: Vec<SpecScalar> =
+            vec![noise_db as SpecScalar; num_steps * freq_osr * num_bins];
+
+        for &m in present_groups {
+            let group_start = [0usize, 36, 72][m];
+            for j in 0..7 {
+                let sym = group_start + j;
+                let tone = crate::protocol::FT8_COSTAS[j] as usize;
+                for sub in 0..steps_per_symbol {
+                    let time_idx = sym * steps_per_symbol + sub;
+                    if time_idx < num_steps && f0 + tone < num_bins {
+                        power[(time_idx * freq_osr) * num_bins + (f0 + tone)] =
+                            signal_db as SpecScalar;
+                    }
+                }
+            }
+        }
+
+        Spectrogram {
+            power,
+            complex: None,
+            num_steps,
+            num_bins,
+            freq_osr,
+            time_padding: 0,
+        }
+    }
+
+    #[test]
+    fn test_per_bin_candidate_selection_wiring_flag_off_is_noop_flag_on_still_decodes() {
+        let f0 = 240usize;
+        let spec = w51_build_synthetic_costas(&[0, 1, 2], -10.0, -40.0, f0);
+
+        let mut config_off = Ft8Config::default();
+        config_off.nms_enabled = false;
+        assert!(!config_off.per_bin_candidate_selection);
+        let decoder_off = Ft8Decoder::new(config_off.clone()).unwrap();
+        let baseline = decoder_off
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .expect("baseline sync search");
+
+        let mut config_explicit_off = config_off.clone();
+        config_explicit_off.per_bin_candidate_selection = false;
+        let decoder_explicit_off = Ft8Decoder::new(config_explicit_off).unwrap();
+        let explicit_off = decoder_explicit_off
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .expect("explicit-off sync search");
+
+        assert_eq!(
+            baseline.len(),
+            explicit_off.len(),
+            "flag defaulting off vs. explicitly set off must be byte-identical"
+        );
+        for (a, b) in baseline.iter().zip(explicit_off.iter()) {
+            assert_eq!(a.freq_bin, b.freq_bin);
+            assert_eq!(a.time_step, b.time_step);
+            assert_eq!(a.freq_sub, b.freq_sub);
+            assert_eq!(a.sync_score, b.sync_score);
+        }
+
+        let mut config_on = config_off;
+        config_on.per_bin_candidate_selection = true;
+        let decoder_on = Ft8Decoder::new(config_on).unwrap();
+        let with_selection = decoder_on
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .expect("flag-on sync search");
+
+        assert!(
+            with_selection
+                .iter()
+                .any(|c| c.freq_bin == f0 || c.freq_bin.abs_diff(f0) <= 1),
+            "the real synthetic signal near freq_bin={f0} must still be found \
+             with per-bin selection enabled"
+        );
     }
 
     #[test]

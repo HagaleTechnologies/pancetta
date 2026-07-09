@@ -583,6 +583,14 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W5.1 [A/B]: master switch for per-bin
+    /// peak candidate selection. See
+    /// `Ft8Config::per_bin_candidate_selection`.
+    pub fn with_per_bin_candidate_selection(mut self, on: bool) -> Self {
+        self.config.per_bin_candidate_selection = on;
+        self
+    }
+
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     pub fn with_cross_cycle_averaging(mut self, on: bool) -> Self {
         self.config.cross_cycle_averaging = on;
