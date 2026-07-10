@@ -229,6 +229,34 @@ pub fn band_change_attributable_to_command(
 /// so the two halves of the fix can never drift apart.
 pub(crate) const WINDOW_LEAD_SECS: f64 = 0.5;
 
+/// Task W5.3 (decoder-tp-sensitivity plan) [A/B]: widened lead-in used when
+/// `[decoder].extended_capture_window_enabled` is on. Reaches a structural
+/// negative-DT floor of about `-(EXTENDED_WINDOW_LEAD_SECS + 0.16 s)` ≈
+/// -1.16 s (the 0.16 s is `pancetta_ft8::decoder`'s fixed
+/// `SLIDING_FRAME_LOOKBACK_STEPS` frame-centering correction), comfortably
+/// past the -1.0 s target dt range and the -0.8 s empirical test case
+/// (2026-07-09 investigation: default 0.5 s lead reaches only to about
+/// -0.66 s in practice, confirmed by a synthetic-signal probe). See
+/// [`resolve_window_lead_secs`] and `pancetta_config::DecoderConfig::
+/// extended_capture_window_enabled`'s doc comment for the full rationale
+/// (including why the trailing/positive-dt edge is deliberately untouched).
+pub(crate) const EXTENDED_WINDOW_LEAD_SECS: f64 = 1.0;
+
+/// Resolve the effective window lead-in (seconds) honoring the Task W5.3
+/// config flag. Both `dsp.rs` (window slice anchor) and `ft8.rs` (DT
+/// correction) call this at their respective thread-spawn config reads so
+/// the two halves can never drift apart — mirroring the invariant already
+/// documented on [`WINDOW_LEAD_SECS`] itself. Default (flag off) returns the
+/// original constant unchanged, so behavior is byte-identical unless the
+/// operator opts in.
+pub(crate) fn resolve_window_lead_secs(decoder_cfg: &pancetta_config::DecoderConfig) -> f64 {
+    if decoder_cfg.extended_capture_window_enabled {
+        EXTENDED_WINDOW_LEAD_SECS
+    } else {
+        WINDOW_LEAD_SECS
+    }
+}
+
 /// The single 12 kHz sample rate the decode/DSP path is anchored to. The DSP
 /// thread decimates the incoming audio to this rate before windowing; all
 /// derived sample counts (`DspTiming`) are expressed at this rate.
