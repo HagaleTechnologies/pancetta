@@ -1,5 +1,16 @@
 # Decoder Benchmark Baseline
 
+> **Superseded pointer (2026-07-09):** this file is an early-development,
+> pre-2026-04 benchmark history (small hand-picked WAV sets, ft8_lib as the
+> only reference). For the current, rigorous, jt9-referenced methodology —
+> calibrated SNR-sensitivity curve, verified/unverified novel-decode split,
+> and an explicit false-positive-on-noise measurement — see
+> [`docs/decoder-comparison.md`](../docs/decoder-comparison.md). That
+> document also keeps the old ft8_lib-only "+11.6%" comparison, now clearly
+> labeled as a secondary/historical table rather than the headline. Full
+> methodology + results: `docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md`
+> and the per-task experiment logs in `research/experiments/2026-07-0[7-9]-*.md`.
+
 ## Date: 2026-03-30
 
 ## Results (pre-improvement)
