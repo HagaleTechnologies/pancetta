@@ -46,16 +46,29 @@ delta_vs_main: |
      claimed "non-destructive... default true" — stale text predating
      the flat-cap-displacement shelving; corrected in this task.
 
-  3. `dt_history_enabled` (DECLINE-AS-INERT): hard-200 rec Δ=+0 EXACT
-     (every bootstrap resample identical) under the TRUE production
-     default (`max_decode_passes=1`) — structurally a no-op, since the
-     mechanism only touches the residual sync pass, unreachable at
-     max_decode_passes=1 (same "dead path" class as
-     `time_varying_subtraction_enabled`). A diagnostic retest with
-     `max_decode_passes` forced to 3 (where the mechanism IS reachable)
-     STILL showed rec Δ=+0 exactly (novel Δ=-9, 95% CI [-17,-3],
-     significant but tiny). noise_1000 FP unchanged (1→1) in both
-     configurations. No recall benefit found under either configuration.
+  3. `dt_history_enabled` (DECLINE, corrected label — see below): hard-200
+     rec Δ=+0 EXACT (every bootstrap resample identical) under the TRUE
+     production default. **Post-task review correction:** this entry
+     originally labeled the result DECLINE-AS-INERT, reasoning that the
+     mechanism "only touches the residual sync pass, unreachable at
+     max_decode_passes=1" — that reasoning is WRONG. The mechanism
+     (`coherent_subtract_and_repass`) is gated by
+     `coherent_multipass_iterations == 0`, a separate config field from
+     `max_decode_passes`, defaulting to 3 (ON) — it runs unconditionally
+     within the single default pass regardless of `max_decode_passes`.
+     So the "TRUE production default" measurement above was *already*
+     exercising a reachable code path, not an inert one. The so-called
+     "diagnostic retest with `max_decode_passes` forced to 3" therefore
+     did not newly make the mechanism reachable — it was reachable in
+     both configurations — and both showed rec Δ=+0 exactly (the forced-3
+     config also showed novel Δ=-9, 95% CI [-17,-3], significant but
+     tiny). noise_1000 FP unchanged (1→1) in both configurations. No
+     recall benefit found under either configuration; the null is most
+     plausibly a genuine, reproducible one (cold-start: hard-200 is an
+     independent 200-WAV corpus with few-to-no same-callsign repeats for
+     this per-callsign DT prior lookup to act on), not evidence of
+     non-reachability. See `decoder.rs`'s `dt_history_enabled` field doc
+     for the fuller corrected writeup.
 
   4. `relaxed_sync_near_partner_{hz_radius,score_delta}` (DECLINE, no
      real delta found): synthetic isolated-signal marginal-SNR test

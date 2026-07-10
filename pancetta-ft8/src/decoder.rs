@@ -690,21 +690,46 @@ pub struct Ft8Config {
     /// Decoder-TP-sensitivity Task W5.4 [A/B, RETESTED — DECLINED]:
     /// re-measured against the true production default on hard-200:
     /// rec Δ=+0 (exact — every bootstrap resample identical), novel
-    /// Δ=-5 (95% CI [-10,-1], significant but tiny). This mechanism only
-    /// touches the RESIDUAL sync pass, which requires
-    /// `max_decode_passes > 1` — the shipped default is 1
-    /// (`subtract_signal` never runs), so the flag is structurally inert
-    /// in production regardless of this bool's value (same "dead path"
-    /// class as `time_varying_subtraction_enabled`/
-    /// `full_scale_subtraction_enabled`). A diagnostic re-measurement
-    /// with `max_decode_passes` forced to 3 (a config where the residual
-    /// pass — and therefore this mechanism — actually runs) STILL showed
-    /// rec Δ=+0 exactly (novel Δ=-9, 95% CI [-17,-3]) on hard-200: no
-    /// truth-decode benefit was found even when the mechanism is
-    /// reachable, only a small reduction in spurious residual-pass
-    /// novel decodes. noise_1000 FP unchanged (1→1) in both
-    /// configurations. Default stays **false** — no recall benefit was
-    /// found to justify flipping it, on this corpus, in this retest. See
+    /// Δ=-5 (95% CI [-10,-1], significant but tiny).
+    ///
+    /// **Correction (post-task review):** this doc previously claimed the
+    /// mechanism "requires `max_decode_passes > 1`" and cited
+    /// `subtract_signal` as the gate, concluding the flag is
+    /// "structurally inert" at the shipped `max_decode_passes = 1`
+    /// default — that reasoning is **wrong** and has been corrected.
+    /// `dt_history_enabled` is consulted inside
+    /// `coherent_subtract_and_repass` (a DIFFERENT function from
+    /// `subtract_signal`/`subtract_with_sidelobes`, which really is gated
+    /// by `pass + 1 < loop_passes`), and `coherent_subtract_and_repass`'s
+    /// only gate is `coherent_multipass_iterations == 0` — a SEPARATE
+    /// config field from `max_decode_passes`, defaulting to **3** (ON).
+    /// It runs unconditionally within the single default pass (inside
+    /// `for pass in 0..loop_passes`, gated only by
+    /// `coherent_multipass_iterations > 0`), so this mechanism **DOES
+    /// run today at the shipped default** — it is not unreachable. (The
+    /// pre-existing doc comment on `codeword_to_symbols` already stated
+    /// the correct OR-condition — "fires only when `max_decode_passes >
+    /// 1` (or `coherent_multipass_iterations > 0`)" — which directly
+    /// contradicted the claim this doc used to make; that contradiction
+    /// went uncaught before shipping.)
+    ///
+    /// Given the mechanism is actually reachable at the shipped default,
+    /// the measured rec Δ=+0 EXACT ("true production default") result
+    /// above is most plausibly a genuine, reproducible null — the
+    /// mechanism doesn't help — rather than evidence of
+    /// non-reachability. A diagnostic re-measurement with
+    /// `max_decode_passes` forced to 3 STILL showed rec Δ=+0 exactly
+    /// (novel Δ=-9, 95% CI [-17,-3]) on hard-200; noise_1000 FP
+    /// unchanged (1→1) in both configurations. The most plausible
+    /// explanation for the null (not independently confirmed) is a
+    /// cold-start effect: hard-200 is an independent, disjoint 200-WAV
+    /// corpus, so same-callsign repeats — which this per-callsign DT
+    /// prior lookup depends on to have any historical data to act on —
+    /// are rare-to-absent within it, regardless of which pass-count
+    /// config is used.
+    ///
+    /// Default stays **false** — no recall benefit was found to justify
+    /// flipping it, on this corpus, in this retest. See
     /// `research/experiments/2026-07-09-w54-shelved-sync-mechanisms-retest.md`.
     pub dt_history_enabled: bool,
 
@@ -1857,11 +1882,25 @@ impl Default for Ft8Config {
             // V2 default: 25 Hz = ~4 freq_bins. Set to 0.0 to fall back
             // to V1 behavior (union-of-prior-pass-callsigns within-WAV).
             dt_history_freq_window_hz: 25.0,
-            // hb-242: sync_bc partial-Costas metric. Default ON — the
-            // max(full, partial) selection is non-destructive (partial
-            // only wins when block A is degraded; otherwise full wins).
-            // Targets the slot-edge negative-dt bucket (48.3% recall,
-            // 1376 truths in hard-200).
+            // hb-242: sync_bc partial-Costas metric. Default **false**
+            // (see Batch 48 below and the Task W5.4 field-doc retest
+            // above). This comment previously claimed "Default ON" with
+            // a "non-destructive" max(full, partial) selection and cited
+            // a stale "48.3% recall, 1376 truths in hard-200" figure for
+            // the targeted slot-edge negative-dt bucket — all three
+            // claims are wrong/stale and are corrected here:
+            //   - The compiled-in default is `false`, not `true` (see the
+            //     literal value two lines below).
+            //   - "Non-destructive" is no longer accurate: Task W5.4's
+            //     retest found a real 10x false-positive-on-noise
+            //     regression when this flag is enabled (noise_1000:
+            //     1→11) — see the field-level doc comment above for the
+            //     full numbers.
+            //   - The "1376 truths" figure was corrected by Batch 36's C2
+            //     audit: only ~83 truths in hard-200 actually sit at
+            //     dt < -0.5s (1293 of the 1376 sit at dt ∈ [-0.5, 0),
+            //     which the full metric already covers without this
+            //     flag) — see `research/experiments/2026-06-06-batch-36.md`.
             //
             // Batch 48 measurement: default-ON gave -18 TPs net on
             // hard-200 (5301 → 5283). The mechanism never lowers a
