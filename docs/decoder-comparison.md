@@ -79,7 +79,7 @@ count with no signal about how many were plausible vs. not.
   doesn't match a jt9 truth message for its WAV is a "novel." Each novel is
   additionally run (report-only — this never filters or changes any count
   that gates a decision) through Pancetta's existing false-positive
-  plausibility filter (the callsign-continuity heuristic, `hb-062`). A novel
+  plausibility filter (the callsign-continuity heuristic, `hb-052`). A novel
   that passes is counted as **verified**; one that doesn't is **unverified**.
   This is a *plausibility proxy*, not proof either way — a verified novel
   could still be a well-formed false decode, and an unverified one could
@@ -260,14 +260,39 @@ test). A small number of real production changes did ship:
   (`[decoder].extended_capture_window_enabled`, default off), widening the
   audio capture window's negative-dt lead-in.
 
-The single biggest **unresolved** opportunity: Task W3.3's per-candidate
-matched-demodulation fine-sync mechanism shows a genuine +54-truth win on
-hard-200 under an unbounded decode budget (re-confirmed as a +32-truth win
-under a realistic *bounded* production budget, Task W3.3b) — but it is not
-yet wired into production. Shipping it safely needs regime-conditional
-wiring through the coordinator's effort-preset system (so it only runs where
-there's real budget headroom), which is a well-supported next step, not
-something this plan built.
+Two separate mechanisms were measured as real, positive, and still unshipped
+— they are easy to conflate (an earlier draft of this section did) but come
+from different tasks with different, non-interchangeable numbers:
+
+- **Task W3.3 / W3.3b — per-candidate matched-demodulation fine sync.**
+  Task W3.3 measured a genuine **+54-truth win** on hard-200 under an
+  *unbounded* decode budget, but declined to ship because of a ~2.1–2.9x
+  elapsed-cost regression at that budget. Task W3.3b built a real bounded-budget
+  eval mode and re-measured the same mechanism realistically: under the
+  **Standard preset (250ms — the realistic production default)** it
+  **regresses**, Δ=**-23** (flagged by `compare`'s own regression scanner) —
+  not a win. Under the more conservative **Eco preset (1ms)** it *is* a clean,
+  gate-passing win, Δ=**+27** (95% CI [+15, +40]), and faster besides. The
+  cause is architectural, not a tuning miss: the anytime decoder's budget is
+  only checked *between* candidates, so one expensive matched-demod candidate
+  can starve the rest of its window's budget — harmless at Eco (there's no
+  "rest" to starve, only the unconditional floor set runs) but costly at
+  Standard. This remains a genuine, unresolved gap, not a clean win waiting
+  to be flipped on.
+- **Task W4.3 — real multipass (consuming W4.1/W4.2's improved subtraction).**
+  A *separate* mechanism, measured under the same realistic Standard bounded
+  preset, shows a clean **+32-truth win** on hard-200 (95% CI [+12, +57],
+  excludes zero, ~4.0x elapsed cost, zero FP-on-noise cost) — and unlike
+  W3.3/W3.3b, it does **not** regress at Standard. This is the plan's single
+  biggest **unresolved** opportunity: a genuine, gate-passing win under the
+  realistic production regime that still isn't the global default, because
+  that default also has to stay safe for `DecodeBudget::unlimited()`
+  consumers (the test suite, direct `pancetta-ft8` API callers, and the
+  operator-selectable `Max` effort preset), for whom the unbounded
+  measurement shows no benefit at meaningfully higher cost. Shipping it
+  safely needs the same regime-conditional wiring through the coordinator's
+  effort-preset system that W3.3/W3.3b's mechanism would also need — a
+  well-supported next step, not something this plan built.
 
 ## Reproduce
 
