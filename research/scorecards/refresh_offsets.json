@@ -7,6 +7,12 @@
       "applies_from_sha": "e6a1594e158e1db5d201b980d211cf18efa0fa37",
       "offset_to_subtract": 0.009699,
       "note": "hard-200 mix update (2026-05-30 corpus refresh). Computed as score(post-refresh main.json) - score(pre-refresh main.json) = 0.579114 - 0.569415 = +0.009699; same production decoder code (post-hb-068) on both sides, so the delta is purely corpus shift. Pre-refresh card archived at research/scorecards/history/main.2026-05-30-pre-refresh.json."
+    },
+    {
+      "refresh_date": "2026-07-07",
+      "applies_from_sha": "2c738d180a5b056b22df6035600f965940178aff",
+      "offset_to_subtract": -0.011786,
+      "note": "Task W0.2 synth-clean corpus refresh (2500 Hz SNR calibration + real sensitivity curve). Computed as score(post-refresh, synth-clean tier only) - score(pre-refresh, synth-clean tier only) = 0.1382143 - 0.15 = -0.011786; same production decoder (Ft8Config::default(), no changes in this task) on both sides, only the harness/corpus changed (noise-scaling formula recalibrated to the WSJT-X 2500 Hz reference bandwidth [+3.8 dB more noise per label], SNR@50% now genuine linear interpolation instead of first-bin->=-threshold, corpus regenerated at 1 dB steps / n=50 distinct messages per step / randomized base freq 400-2600 Hz + dt in [-0.3,+0.3] s, replacing the old 2 dB steps / n=6 / fixed-1500Hz-fixed-dt manifest), so the delta is purely corpus/harness shift, not decoder change. Pre-refresh single-tier scorecard was NOT archived to research/scorecards/history/ (ephemeral /tmp comparison only) since the pre-refresh corpus itself is regenerated non-deterministically-named per this task and superseded; the raw before/after composite numbers are recorded here and in research/experiments/2026-07-07-snr-calibration.md."
     }
   ]
 }

@@ -3,6 +3,7 @@ use anyhow::Context;
 use serde::Serialize;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 /// One decoded message from a single WAV. Mode-agnostic.
 #[derive(Clone, Debug, Serialize, PartialEq)]
@@ -24,6 +25,19 @@ pub struct Decode {
     /// emit timing (jt9 subprocess, ft8_lib FFI). Used by the TTFD metric.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub decode_time_into_window_s: Option<f64>,
+    /// W2.1 (decoder-tp-sensitivity plan): signal-domain acceptance
+    /// metric fields, flattened from `pancetta_ft8::DecodedMessage::acceptance`
+    /// (see `pancetta_ft8::acceptance`). `None` for decoders/paths that
+    /// didn't compute one — see that module's doc for exactly which paths
+    /// populate it. Used by the W2.1 calibration harness
+    /// (`bin/acceptance_calibration.rs`) to correlate acceptance evidence
+    /// against jt9-verified ground truth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub soft_distance: Option<f32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hard_errors: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub coherence: Option<f32>,
 }
 
 /// Generic interface for any decoder we want to evaluate. Implementors wrap
@@ -98,6 +112,26 @@ pub struct Ft8Decoder {
     /// THIS field with a `CrossTimeState` handle WITHOUT touching the
     /// rolling-window paths used by hb-050.
     chrono_replay_state: Option<ChronoReplayState>,
+    /// Task W3.3b: per-window wall-clock decode budget in milliseconds,
+    /// mirroring production's `decode_effort_budget_ms` atomic
+    /// (`pancetta/src/coordinator/effort.rs`). `None` (the default — no
+    /// flag, no builder call) means every existing behavior is preserved
+    /// byte-for-byte: `decode_budget()` maps `None` to
+    /// `pancetta_ft8::DecodeBudget::unlimited()`, exactly what
+    /// `decode_window`/`decode_window_with_ap` already used internally
+    /// before this task. `Some(0)` (the "unlimited" preset name) is
+    /// treated identically to `None` — both are the harness's "no
+    /// deadline" sentinel, matching production's `decode_effort_budget_ms
+    /// == 0` convention. `Some(ms)` with `ms > 0` builds a FRESH deadline
+    /// (`Instant::now() + ms`) on every `decode_wav` call, since a budget
+    /// is a per-window wall-clock deadline, not a fixed instant computed
+    /// once at CLI-parse time (see `decode_budget`).
+    budget_ms: Option<u64>,
+    /// Task W5.4 [HARNESS]: fixed partner audio frequency (Hz) forwarded
+    /// to every `decode_wav` call. `None` (default) reproduces the
+    /// existing `partner_freq_hz = None` behavior byte-for-byte at every
+    /// call site. See `with_partner_freq_hz`.
+    partner_freq_hz: Option<f64>,
     /// Used only so `config_snapshot` is stable across calls.
     _scratch: Mutex<()>,
 }
@@ -125,6 +159,8 @@ impl Ft8Decoder {
             two_stage_first_config: None,
             dt_history: None,
             chrono_replay_state: None,
+            budget_ms: None,
+            partner_freq_hz: None,
             _scratch: Mutex::new(()),
         }
     }
@@ -220,6 +256,22 @@ impl Ft8Decoder {
         self
     }
 
+    /// Override `osd_input` on the wrapped config — Task W2.3 [A/B]:
+    /// which LLR array drives OSD's search (BP-posterior vs. channel vs.
+    /// offset-subtracted).
+    pub fn with_osd_input(mut self, input: pancetta_ft8::OsdInput) -> Self {
+        self.config.osd_input = input;
+        self
+    }
+
+    /// Override `osd_npre2_preprocessing_enabled` on the wrapped config —
+    /// Task W2.4 [A/B]: WSJT-X mainline-style npre2 warm-start
+    /// preprocessing, active only at `osd_depth >= 3`.
+    pub fn with_npre2_enabled(mut self, enabled: bool) -> Self {
+        self.config.osd_npre2_preprocessing_enabled = enabled;
+        self
+    }
+
     /// Override `ldpc_iterations` on the wrapped config (BP iteration
     /// cap before OSD fallback). hb-005 sweep.
     pub fn with_ldpc_iterations(mut self, n: usize) -> Self {
@@ -274,9 +326,13 @@ impl Ft8Decoder {
         self
     }
 
-    /// Override `time_range` (seconds of ± slot-time search). hb-025 audit.
-    pub fn with_time_range(mut self, v: f64) -> Self {
-        self.config.time_range = v;
+    /// Task W0.4 (2026-07-07): override the decoded protocol
+    /// (`Ft8Config::protocol`). Default (from `Ft8Config::default()`) is
+    /// `Protocol::Ft8`; the FT4 evaluation tier sets `Protocol::Ft4` so
+    /// the wrapped `pancetta_ft8::Ft8Decoder` demodulates FT4 geometry
+    /// (105 symbols, 4-tone, 7.5s cycle) instead of FT8's.
+    pub fn with_protocol(mut self, protocol: pancetta_ft8::Protocol) -> Self {
+        self.config.protocol = protocol;
         self
     }
 
@@ -325,6 +381,17 @@ impl Ft8Decoder {
         self
     }
 
+    /// Task W3.5 [A/B]: combine each symbol's two TIME_OSR sub-steps in
+    /// linear power instead of dB. Distinct from
+    /// `with_sync_time_interp_linear_power` above (that one governs the
+    /// SEPARATE fractional dt-shift lookup); this governs the
+    /// unconditional two-substep average that runs on every symbol of
+    /// every candidate.
+    pub fn with_linear_power_averaging(mut self, on: bool) -> Self {
+        self.config.linear_power_averaging = on;
+        self
+    }
+
     /// hb-067: mBP offset — subtract this magnitude from each LLR
     /// before invoking OSD. 0.0 = no offset.
     pub fn with_bp_offset_subtract(mut self, v: f32) -> Self {
@@ -361,6 +428,144 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W1.3 [A/B]: rectangular (no) window
+    /// on the fine-FFT fallback's symbol-length FFT instead of Hann.
+    /// See `Ft8Config::fine_fft_rect_window`.
+    pub fn with_fine_fft_rect_window(mut self, on: bool) -> Self {
+        self.config.fine_fft_rect_window = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W3.3 [A/B]: master switch for the
+    /// per-candidate fine-sync + matched-demod stage that replaces the
+    /// legacy 21-trial fine-FFT fallback. See `Ft8Config::fine_sync_enabled`.
+    pub fn with_fine_sync_enabled(mut self, on: bool) -> Self {
+        self.config.fine_sync_enabled = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W3.4 [A/B]: master switch for the
+    /// nsym=2/3 noncoherent combining LLR variants layered on top of the
+    /// Task W3.3 matched-demod stage. Only takes effect when
+    /// `fine_sync_enabled` is ALSO `true` — see
+    /// `Ft8Config::nsym_combining_enabled`.
+    pub fn with_nsym_combining_enabled(mut self, on: bool) -> Self {
+        self.config.nsym_combining_enabled = on;
+        self
+    }
+
+    /// Task W3.6 [A/B]: master switch for the per-candidate frequency
+    /// tracker's re-test as a consumer of the Task W3.3 matched-demod
+    /// stage (only takes effect when `fine_sync_enabled` is ALSO
+    /// `true`). See `Ft8Config::per_candidate_freq_tracker_enabled`.
+    pub fn with_per_candidate_freq_tracker_enabled(mut self, on: bool) -> Self {
+        self.config.per_candidate_freq_tracker_enabled = on;
+        self
+    }
+
+    /// Task W4.2 [A/B]: master switch for the per-block time-varying
+    /// complex-amplitude GFSK subtraction path (replaces the legacy
+    /// whole-signal single-estimate fit in `subtract_signal`). Only has
+    /// any observable effect when `max_decode_passes >= 2` (the pass loop
+    /// only calls `subtract_signal` between passes) — see
+    /// `Ft8Config::time_varying_subtraction_enabled`. Added here in Task
+    /// W4.3 because W4.2 never wired a CLI/harness flag (it was a proven
+    /// dead path at the time); this task is the first that needs to
+    /// actually drive it through `eval`.
+    pub fn with_time_varying_subtraction_enabled(mut self, on: bool) -> Self {
+        self.config.time_varying_subtraction_enabled = on;
+        self
+    }
+
+    /// Task W4.2 [A/B]: independent sub-flag controlling whether the
+    /// time-varying path subtracts its fitted estimate at full scale
+    /// (1.0) vs. the legacy path's conservative 0.9 hold-back. Only takes
+    /// effect when `time_varying_subtraction_enabled` is ALSO `true`. See
+    /// `Ft8Config::full_scale_subtraction_enabled` and the W4.2 review's
+    /// carry-forward warning: this sub-flag is UNTESTED on weak signals
+    /// and should be A/B'd independently of the parent mechanism.
+    pub fn with_full_scale_subtraction_enabled(mut self, on: bool) -> Self {
+        self.config.full_scale_subtraction_enabled = on;
+        self
+    }
+
+    /// Task W3.3b [HARNESS]: set the per-window wall-clock decode budget
+    /// (milliseconds). `None` (the default) reproduces
+    /// `DecodeBudget::unlimited()` exactly, matching every prior eval
+    /// invocation. `Some(0)` is also treated as unlimited (matches
+    /// production's `decode_effort_budget_ms == 0` sentinel). This lets
+    /// the eval harness re-measure an A/B under a REAL bounded
+    /// `DecodeBudget` (e.g. the `Standard`=250ms/`Eco`=1ms effort
+    /// presets) instead of always using an unlimited budget — see
+    /// `research/experiments/2026-07-08-w33-matched-demod-fine-sync.md`
+    /// ("DecodeBudget integration") for why this matters: the existing
+    /// S1-floor/S2-rest candidate split already gates per-candidate
+    /// dispatch on `current_budget.has_time()`, so a real bounded budget
+    /// should self-limit an expensive new stage's cost automatically —
+    /// this builder is what makes that measurable.
+    pub fn with_effort_budget_ms(mut self, ms: Option<u64>) -> Self {
+        self.budget_ms = ms;
+        self
+    }
+
+    /// Build the `DecodeBudget` to use for the next `decode_wav` call. A
+    /// budget is a wall-clock DEADLINE, so this must be called freshly
+    /// per WAV (not once at construction) — `Instant::now()` is read at
+    /// call time, right before decoding.
+    fn decode_budget(&self) -> pancetta_ft8::DecodeBudget {
+        match self.budget_ms {
+            None | Some(0) => pancetta_ft8::DecodeBudget::unlimited(),
+            Some(ms) => {
+                pancetta_ft8::DecodeBudget::until(Instant::now() + Duration::from_millis(ms))
+            }
+        }
+    }
+
+    /// Decoder-TP-sensitivity Task W1.4 [A/B]: master switch for the
+    /// divisive LLR whitening step (per-tone/per-symbol noise-median
+    /// normalisation). Default ON in production
+    /// (`Ft8Config::llr_whitening_enabled`, graduated Batch 53); this
+    /// hook lets the research harness re-measure with it forced off
+    /// after the Task W1.4 dB/linear-magnitude unit-consistency fix,
+    /// since the original "+4 TP / -713 FP" graduation measurement may
+    /// not survive the fix. See `Ft8Config::llr_whitening_enabled`.
+    pub fn with_llr_whitening(mut self, on: bool) -> Self {
+        self.config.llr_whitening_enabled = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W2.5 [A/B]: master switch for the
+    /// acceptance-metric-based post-CRC gate that replaces the blunt
+    /// `MIN_DECODE_CONFIDENCE`/`MIN_AP_CONFIDENCE` sync-score floors. See
+    /// `Ft8Config::acceptance_gating_enabled`.
+    pub fn with_acceptance_gating_enabled(mut self, on: bool) -> Self {
+        self.config.acceptance_gating_enabled = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: master switch for
+    /// `ApLevel::Cq` (assume a failed-AP0 candidate is a plain "CQ"
+    /// call). See `Ft8Config::cq_ap_enabled`.
+    pub fn with_cq_ap_enabled(mut self, on: bool) -> Self {
+        self.config.cq_ap_enabled = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: master switch for the AP4
+    /// full message-content mask (RR73/RRR/73). See
+    /// `Ft8Config::ap4_full_message_mask_enabled`.
+    pub fn with_ap4_full_message_mask_enabled(mut self, on: bool) -> Self {
+        self.config.ap4_full_message_mask_enabled = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: AP injection/normalization
+    /// ordering. See `Ft8Config::ap_injection_post_normalization`.
+    pub fn with_ap_injection_post_normalization(mut self, on: bool) -> Self {
+        self.config.ap_injection_post_normalization = on;
+        self
+    }
+
     /// Decoder-speed-overhaul Task 9/10: shallow BP iteration count for
     /// the S1/S2 primary decode. See `Ft8Config::floor_iters`.
     pub fn with_floor_iters(mut self, n: usize) -> Self {
@@ -384,6 +589,54 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W5.1 [A/B]: master switch for per-bin
+    /// peak candidate selection. See
+    /// `Ft8Config::per_bin_candidate_selection`.
+    pub fn with_per_bin_candidate_selection(mut self, on: bool) -> Self {
+        self.config.per_bin_candidate_selection = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W5.2 [A/B]: master switch for the
+    /// percentile-normalized wide-lag two-baseline sync mechanism. See
+    /// `Ft8Config::costas_two_baseline_enabled`.
+    pub fn with_costas_two_baseline_enabled(mut self, on: bool) -> Self {
+        self.config.costas_two_baseline_enabled = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W5.4 [A/B]: master switch for the
+    /// sync_bc partial-Costas (blocks B+C only) parallel score. See
+    /// `Ft8Config::costas_partial_metric_enabled`.
+    pub fn with_costas_partial_metric_enabled(mut self, on: bool) -> Self {
+        self.config.costas_partial_metric_enabled = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W5.4 [A/B]: JTDX-style relaxed Costas
+    /// acceptance threshold near the QSO partner audio frequency. Sets
+    /// both the radius (Hz) and the score delta (dB, applied to
+    /// `min_sync_score`). See `Ft8Config::relaxed_sync_near_partner_hz_radius`
+    /// / `_score_delta`. Only has an observable effect when a
+    /// `partner_freq_hz` is ALSO supplied per-call (`with_partner_freq_hz`).
+    pub fn with_relaxed_sync_near_partner(mut self, radius_hz: f64, score_delta: f64) -> Self {
+        self.config.relaxed_sync_near_partner_hz_radius = Some(radius_hz);
+        self.config.relaxed_sync_near_partner_score_delta = score_delta;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W5.4 [HARNESS]: forward a fixed
+    /// partner audio frequency (Hz) to every `decode_wav` call, simulating
+    /// an active QSO parked at this frequency for the whole run. Threaded
+    /// into `decode_window_with_ap_scoped_partner_budgeted` at every call
+    /// site (constructing a default-empty `ApContext` when none was
+    /// otherwise configured, so the partner-freq argument still reaches
+    /// the decoder without accidentally enabling AP).
+    pub fn with_partner_freq_hz(mut self, hz: f64) -> Self {
+        self.partner_freq_hz = Some(hz);
+        self
+    }
+
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     pub fn with_cross_cycle_averaging(mut self, on: bool) -> Self {
         self.config.cross_cycle_averaging = on;
@@ -402,6 +655,16 @@ impl Ft8Decoder {
     /// unweighted unit-rotor alignment.
     pub fn with_cross_cycle_coherent_mrc(mut self, on: bool) -> Self {
         self.config.cross_cycle_coherent_mrc = on;
+        self
+    }
+
+    /// Task W4.4 [A/B] (decoder-tp-sensitivity plan): content guard for
+    /// `group_for_cross_cycle` — require LLR-sign correlation between a
+    /// candidate and its group's seed to be `>= threshold` before
+    /// accepting it into the group. `None` (default) preserves the
+    /// original geometric-only grouping.
+    pub fn with_cross_cycle_content_guard(mut self, threshold: Option<f32>) -> Self {
+        self.config.cross_cycle_content_guard = threshold;
         self
     }
 
@@ -561,7 +824,13 @@ impl Ft8Decoder {
 
 impl DecoderUnderTest for Ft8Decoder {
     fn mode(&self) -> Mode {
-        Mode::Ft8
+        // Task W0.4: report the wrapped protocol rather than hardcoding
+        // Ft8 — `with_protocol` (used by the FT4 evaluation tier) can
+        // change `self.config.protocol` after construction.
+        match self.config.protocol {
+            pancetta_ft8::Protocol::Ft4 => Mode::Ft4,
+            _ => Mode::Ft8,
+        }
     }
 
     fn identity(&self) -> String {
@@ -636,12 +905,21 @@ impl DecoderUnderTest for Ft8Decoder {
                 recent_calls: recent,
                 active_qso: None,
             };
-            let r = decoder.decode_window_with_ap(&samples, &ctx).map_err(|e| {
-                anyhow::anyhow!(
-                    "decode_window_with_ap (chrono-replay) failed for {}: {e}",
-                    path.display()
+            let r = decoder
+                .decode_window_with_ap_scoped_partner_budgeted(
+                    &samples,
+                    &ctx,
+                    None,
+                    self.partner_freq_hz,
+                    self.decode_budget(),
                 )
-            })?;
+                .map(|(messages, _report)| messages)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "decode_window_with_ap (chrono-replay) failed for {}: {e}",
+                        path.display()
+                    )
+                })?;
             // Push every from/to callsign into the persistent deque. We
             // dedup against current contents so the snapshot doesn't grow
             // with re-sightings (the SET semantics here are what a future
@@ -685,12 +963,21 @@ impl DecoderUnderTest for Ft8Decoder {
                 recent_calls: recent,
                 active_qso: None,
             };
-            let r = decoder.decode_window_with_ap(&samples, &ctx).map_err(|e| {
-                anyhow::anyhow!(
-                    "decode_window_with_ap (rolling) failed for {}: {e}",
-                    path.display()
+            let r = decoder
+                .decode_window_with_ap_scoped_partner_budgeted(
+                    &samples,
+                    &ctx,
+                    None,
+                    self.partner_freq_hz,
+                    self.decode_budget(),
                 )
-            })?;
+                .map(|(messages, _report)| messages)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "decode_window_with_ap (rolling) failed for {}: {e}",
+                        path.display()
+                    )
+                })?;
             // Update the deque with callsigns from these decodes.
             if let Ok(mut deque) = self.rolling_calls.lock() {
                 for msg in &r {
@@ -717,12 +1004,51 @@ impl DecoderUnderTest for Ft8Decoder {
             r
         } else {
             match &self.ap_context {
-                Some(ctx) => decoder.decode_window_with_ap(&samples, ctx).map_err(|e| {
-                    anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display())
-                })?,
-                None => decoder.decode_window(&samples).map_err(|e| {
-                    anyhow::anyhow!("decode_window failed for {}: {e}", path.display())
-                })?,
+                Some(ctx) => decoder
+                    .decode_window_with_ap_scoped_partner_budgeted(
+                        &samples,
+                        ctx,
+                        None,
+                        self.partner_freq_hz,
+                        self.decode_budget(),
+                    )
+                    .map(|(messages, _report)| messages)
+                    .map_err(|e| {
+                        anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display())
+                    })?,
+                // Task W5.4 [HARNESS]: no ApContext was otherwise
+                // configured, but a fixed partner_freq_hz was requested —
+                // build a default-empty ApContext (AP stays inert: no
+                // my_call, no recent_calls, no active_qso) purely so the
+                // partner-frequency argument reaches the decoder.
+                None if self.partner_freq_hz.is_some() => {
+                    let ctx = pancetta_ft8::ap::ApContext {
+                        my_call: None,
+                        recent_calls: Vec::new(),
+                        active_qso: None,
+                    };
+                    decoder
+                        .decode_window_with_ap_scoped_partner_budgeted(
+                            &samples,
+                            &ctx,
+                            None,
+                            self.partner_freq_hz,
+                            self.decode_budget(),
+                        )
+                        .map(|(messages, _report)| messages)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "decode_window_with_ap (partner-freq-only) failed for {}: {e}",
+                                path.display()
+                            )
+                        })?
+                }
+                None => decoder
+                    .decode_window_budgeted(&samples, self.decode_budget())
+                    .map(|(messages, _report)| messages)
+                    .map_err(|e| {
+                        anyhow::anyhow!("decode_window failed for {}: {e}", path.display())
+                    })?,
             }
         };
         // hb-057 V2 (Session 3): record each decoded (callsign, DT, freq)
@@ -759,6 +1085,11 @@ impl DecoderUnderTest for Ft8Decoder {
                     // hb-129: presentation-time elapsed from window start
                     // when this decode passed CRC. Used by TTFD metric.
                     decode_time_into_window_s: d.decode_time_into_window.map(|t| t.as_secs_f64()),
+                    // W2.1: flatten the acceptance metric (if computed) for
+                    // the calibration harness.
+                    soft_distance: d.acceptance.map(|a| a.soft_distance),
+                    hard_errors: d.acceptance.map(|a| a.hard_errors),
+                    coherence: d.acceptance.and_then(|a| a.coherence),
                 });
             }
         };
@@ -873,6 +1204,10 @@ impl Jt9Decoder {
                 crc_valid: true,
                 // hb-129: jt9 doesn't expose per-decode timing.
                 decode_time_into_window_s: None,
+                // W2.1: jt9 is not the native decoder — no acceptance metric.
+                soft_distance: None,
+                hard_errors: None,
+                coherence: None,
             });
         }
         Ok(decodes)

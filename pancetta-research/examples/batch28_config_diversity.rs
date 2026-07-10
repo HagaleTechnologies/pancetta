@@ -1,10 +1,12 @@
 //! Batch 28 / Diagnostic A — Config-permutation decode-set diversity
 //!
-//! Tests three hypotheses on the same decode pass:
+//! Tests two hypotheses on the same decode pass:
 //!
-//! * **hb-040** (time_range dead code): vary `Ft8Config::time_range` ∈
-//!   {1.0, 2.0, 4.0}. Expected: identical decode sets (confirms hb-025
-//!   shelve finding that time_range is not threaded into the spectrogram).
+//! * ~~**hb-040** (time_range dead code): vary `Ft8Config::time_range` ∈
+//!   {1.0, 2.0, 4.0}.~~ CONFIRMED dead (identical decode sets); the field
+//!   itself was deleted from `Ft8Config` in Task W0.5 (2026-07-07), so
+//!   this hypothesis's sweep code is gone too — see git history for the
+//!   original diagnostic.
 //! * **hb-096** (adaptive multipass termination): vary
 //!   `max_decode_passes` ∈ {1, 2}. Expected on production-config corpus
 //!   (which already shipped max_passes=1 via hb-031): pass-2 finds 0 new
@@ -93,15 +95,6 @@ fn main() -> Result<()> {
     // Configs to test. Group by hypothesis.
     let base = Ft8Config::default();
 
-    let time_range_configs: Vec<(String, Ft8Config)> = [1.0_f64, 2.0, 4.0]
-        .iter()
-        .map(|&tr| {
-            let mut c = base.clone();
-            c.time_range = tr;
-            (format!("tr={tr}"), c)
-        })
-        .collect();
-
     let multipass_configs: Vec<(String, Ft8Config)> = [1usize, 2]
         .iter()
         .map(|&n| {
@@ -129,8 +122,6 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    // -- hb-040: time_range invariance --
-    let mut tr_wav_results: Vec<(String, Vec<usize>)> = Vec::new();
     // -- hb-096: multipass increment --
     let mut mp_increments: Vec<i64> = Vec::new();
     let mut mp_tp_increments: Vec<i64> = Vec::new();
@@ -143,34 +134,12 @@ fn main() -> Result<()> {
     let mut tp_individual_max: Vec<usize> = Vec::new();
     let mut tp_union_size: Vec<usize> = Vec::new();
 
-    let total_tr_decoded_sets_match = std::cell::RefCell::new(0usize);
-    let total_tr_decoded_sets_total = std::cell::RefCell::new(0usize);
-
     for entry in entries.iter().take(top_n) {
         let wav_path = entry["wav_path"].as_str().context("wav_path")?;
         let sha = entry["wav_sha256"].as_str().context("wav_sha256")?;
         let samples = load_wav(Path::new(wav_path))?;
         let truth = load_truth(&ws, sha);
         let _ = &truth; // for future use
-
-        // hb-040: time_range sweep
-        let tr_sets: Vec<HashSet<String>> = time_range_configs
-            .iter()
-            .map(|(_, c)| decode_set(&samples, c))
-            .collect::<Result<Vec<_>>>()?;
-        let tr_baseline = &tr_sets[1]; // tr=2.0
-        let mut tr_match_count = 0;
-        for s in &tr_sets {
-            if s == tr_baseline {
-                tr_match_count += 1;
-            }
-        }
-        *total_tr_decoded_sets_match.borrow_mut() += tr_match_count;
-        *total_tr_decoded_sets_total.borrow_mut() += tr_sets.len();
-        tr_wav_results.push((
-            sha[..8].to_string(),
-            tr_sets.iter().map(|s| s.len()).collect(),
-        ));
 
         // hb-096: multipass=2 increment over multipass=1
         let mp_sets: Vec<HashSet<String>> = multipass_configs
@@ -235,32 +204,6 @@ fn main() -> Result<()> {
             (tp_union.len() as f64 - tp_max as f64) / tp_max as f64
         };
         tp_union_lifts.push(tp_lift);
-    }
-
-    // -- hb-040 report --
-    println!("\n### hb-040 — time_range invariance");
-    println!(
-        "  {:>10}  {:>10}  {:>10}  {:>10}",
-        "WAV", "tr=1", "tr=2", "tr=4"
-    );
-    for (sha, counts) in &tr_wav_results {
-        println!(
-            "  {:>10}  {:>10}  {:>10}  {:>10}",
-            sha, counts[0], counts[1], counts[2]
-        );
-    }
-    let match_rate = *total_tr_decoded_sets_match.borrow() as f64
-        / (*total_tr_decoded_sets_total.borrow()).max(1) as f64;
-    println!(
-        "  → {} / {} decode sets match tr=2 baseline ({:.1}%)",
-        total_tr_decoded_sets_match.borrow(),
-        total_tr_decoded_sets_total.borrow(),
-        match_rate * 100.0
-    );
-    if match_rate > 0.99 {
-        println!("  Verdict: SHELVE — time_range is dead config (confirms hb-040 static finding)");
-    } else {
-        println!("  Verdict: REQUIRES-FOLLOWUP — time_range produces decode-set variation");
     }
 
     // -- hb-096 report --

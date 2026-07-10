@@ -306,10 +306,16 @@ impl super::ApplicationCoordinator {
         let gateway_enabled = self.gateway_enabled.clone();
         let self_waterfall_to_auto_tx = self.waterfall_to_auto_tx.clone();
 
-        // Read station callsign for AP decoding before moving into the thread
-        let station_callsign = {
+        // Read station callsign for AP decoding before moving into the thread.
+        // Also resolve the Task W5.3 window lead-in from the SAME config read
+        // dsp.rs uses (`resolve_window_lead_secs`) so the DT correction below
+        // always matches the lead dsp.rs actually anchored the window to.
+        let (station_callsign, window_lead_secs) = {
             let config = self.config.read().await;
-            config.station.callsign.clone()
+            (
+                config.station.callsign.clone(),
+                super::resolve_window_lead_secs(&config.decoder),
+            )
         };
 
         // Shared AP state updated by the QSO component
@@ -678,11 +684,14 @@ impl super::ApplicationCoordinator {
                                 // fast-path also broadcasts to TUI/QSO).
                                 sanitize_decoded_message(&mut decoded_msg);
                                 // Boundary-relative DT: the DSP window's sample 0
-                                // sits at slot_boundary − WINDOW_LEAD_SECS, so the
+                                // sits at slot_boundary − window_lead_secs (Task
+                                // W5.3: resolved once above from
+                                // `[decoder].extended_capture_window_enabled`,
+                                // defaulting to WINDOW_LEAD_SECS), so the
                                 // decoder's slice-relative time_offset overstates DT
                                 // by exactly the lead. Subtract it so the reported DT
                                 // is ≈0 for a station on the slot boundary.
-                                decoded_msg.time_offset -= super::WINDOW_LEAD_SECS;
+                                decoded_msg.time_offset -= window_lead_secs;
                                 info!(
                                     "FT8 scoped fast-path: {} (SNR: {:.0}, freq: {:.1})",
                                     decoded_msg.text,
@@ -961,16 +970,18 @@ impl super::ApplicationCoordinator {
                             sanitize_decoded_message(decoded_msg);
                             // Boundary-relative DT correction (live path only). The
                             // DSP window is anchored so sample 0 = slot_boundary −
-                            // WINDOW_LEAD_SECS; the decoder reports time_offset
-                            // relative to sample 0, so subtracting the lead yields a
-                            // DT that is ≈0 for a station transmitting on the slot
-                            // boundary (was ≈ +2 s with the old last-15-s slice).
+                            // window_lead_secs (Task W5.3: resolved once above,
+                            // defaults to WINDOW_LEAD_SECS); the decoder reports
+                            // time_offset relative to sample 0, so subtracting the
+                            // lead yields a DT that is ≈0 for a station transmitting
+                            // on the slot boundary (was ≈ +2 s with the old
+                            // last-15-s slice).
                             // Applied here, before any consumer (TUI delta_time,
                             // cross-slot state, autonomous time_offset_s, PSKReporter)
                             // reads decoded_msg.time_offset. The WAV-replay path
                             // (wav_playback.rs) has its own slot-aligned slicing and
                             // does NOT pass through this loop, so its DT is untouched.
-                            decoded_msg.time_offset -= super::WINDOW_LEAD_SECS;
+                            decoded_msg.time_offset -= window_lead_secs;
                         }
 
                         // hb-062: apply FP filter post-decode, pre-broadcast.

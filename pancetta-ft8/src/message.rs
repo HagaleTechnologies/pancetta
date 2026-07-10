@@ -1014,6 +1014,18 @@ pub struct DecodedMessage {
     /// also a useful diagnostic for hb-103 content scoring and tier-aware
     /// behaviors. Inspired by spec ref `spec-wsjtx-improved-fdr.md`.
     pub confidence_features: Option<ConfidenceFeatures>,
+    /// W2.1: signal-domain acceptance metric (soft distance + hard-error
+    /// count + optional coherence) computed against the channel LLRs that
+    /// produced this codeword. See [`crate::acceptance`] for how this is
+    /// computed. `Some(_)` when the native LDPC decode path had `score()`
+    /// called on it; `None` for paths that don't run a CRC-verified LDPC
+    /// decode at all (e.g. the a7 cross-sequence template-match path,
+    /// which never runs BP/OSD), for ft8_lib FFI decodes, and for
+    /// hand-built test scaffolding. **Bit-exact task**: nothing in the
+    /// decode pipeline reads this field to accept or reject a decode yet —
+    /// it is purely descriptive telemetry for the W2.1 calibration run and
+    /// later gating tasks (W2.2-W2.5).
+    pub acceptance: Option<crate::acceptance::AcceptanceScore>,
 }
 
 /// FDR per-decode confidence features captured by the BP/OSD path.
@@ -1089,6 +1101,7 @@ impl DecodedMessage {
             decode_time_into_window: None,
             via_cross_sequence_a7: false,
             confidence_features: None,
+            acceptance: None,
         }
     }
 
@@ -1115,6 +1128,7 @@ impl DecodedMessage {
             decode_time_into_window: None,
             via_cross_sequence_a7: false,
             confidence_features: None,
+            acceptance: None,
         }
     }
 

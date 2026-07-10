@@ -80,9 +80,21 @@ pub mod protocol;
 pub mod ap;
 pub use ap::{ApContext, ApLevel, MyCallAp, QsoAp, QsoApProgress, RecentCallAp};
 
+// Signal-domain acceptance metric for CRC-valid decodes (Workstream 2,
+// decoder-true-positive-sensitivity plan, task W2.1). Computed and attached
+// to `DecodedMessage::acceptance`; does not gate anything yet.
+pub mod acceptance;
+pub use acceptance::AcceptanceScore;
+
 /// hb-243 Phase 1: baseband complex-mixer + decimator (isolated DSP block; not
 /// yet wired into the decode path — correctness/cost validation only).
 pub mod baseband;
+
+/// Task W3.2 (decoder-true-positive-sensitivity plan, Workstream 3): fine
+/// dt/df search on a per-candidate baseband slice (builds on [`baseband`]'s
+/// `extract_candidate_baseband`). Standalone and unwired — Task W3.3 is the
+/// planned first caller.
+pub mod fine_sync;
 
 // AP type 7 (a7) — template cross-correlation against decoded callsigns.
 // Session 2 of hb-048; no production hook in this session.
@@ -155,7 +167,8 @@ pub use protocol::{ModulationType, Protocol, ProtocolParams};
 
 // Core decoding exports
 pub use decoder::{
-    CrossSequenceSeed, Ft8Config, Ft8Decoder, LlrMetric, SyncCandidateRecord, WaterfallData,
+    CrossSequenceSeed, Ft8Config, Ft8Decoder, LlrMetric, OsdInput, SyncCandidateRecord,
+    WaterfallData,
 };
 pub use message::{ConfidenceFeatures, DecodedMessage, Ft8Message, MessageType};
 pub use signal_processing::{FftProcessor, WindowFunction};

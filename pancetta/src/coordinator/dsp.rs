@@ -12,6 +12,14 @@
 //! window is written to `~/.pancetta/recordings/ft8_*.wav` for off-line
 //! decoder comparison. Disk usage is capped at 10 GB; oldest files are
 //! evicted when the cap is hit.
+//!
+//! Task W5.3 (decoder-tp-sensitivity plan): the emitted window's lead-in
+//! before the slot boundary — real retained audio, not zero-padding — is
+//! [`super::WINDOW_LEAD_SECS`] by default, widened to
+//! [`super::EXTENDED_WINDOW_LEAD_SECS`] when
+//! `[decoder].extended_capture_window_enabled` is set. See
+//! [`boundary_anchored_slice`] and `resolve_window_lead_secs` in
+//! `coordinator/mod.rs`.
 
 use anyhow::Result;
 use std::sync::atomic::Ordering;
@@ -275,6 +283,10 @@ impl super::ApplicationCoordinator {
             .operating_mode()
             .unwrap_or(pancetta_config::OperatingMode::Ft8);
         let protocol = super::protocol_from_mode(active_operating_mode);
+        // Task W5.3: resolve the window lead-in once at spawn time. `ft8.rs`
+        // reads the same config field independently at its own spawn and
+        // must resolve to the same value — see `resolve_window_lead_secs`.
+        let window_lead_secs = super::resolve_window_lead_secs(&config.decoder);
         drop(config);
         let timing =
             super::derive_dsp_timing(&pancetta_ft8::ProtocolParams::from_protocol(protocol));
@@ -608,6 +620,7 @@ impl super::ApplicationCoordinator {
                                 slot_boundary,
                                 FT8_SAMPLE_RATE,
                                 ft8_window_samples,
+                                window_lead_secs,
                             );
                             let window: Vec<f32> = ft8_buffer[start..start + send_len].to_vec();
                             // Keep overlap for next window — retain enough for the
@@ -676,16 +689,16 @@ impl super::ApplicationCoordinator {
 
 /// Compute the slice `(start, len)` of the FT8 capture buffer for one decode
 /// window, anchored so that the window's sample 0 corresponds to
-/// `slot_boundary − WINDOW_LEAD_SECS`.
+/// `slot_boundary − lead_secs`.
 ///
 /// The buffer is a rolling capture of decimated 12 kHz audio; its newest
 /// sample (`buffer_len - 1`) corresponds to the wall-clock `emit_now` (the
 /// time of the most recently received audio batch). We map that real-time
 /// anchor back into the buffer:
 ///
-/// * The desired window start time is `slot_boundary − WINDOW_LEAD_SECS`.
+/// * The desired window start time is `slot_boundary − lead_secs`.
 /// * Samples from the buffer end back to that start time is
-///   `(emit_now − (slot_boundary − lead)) · SAMPLE_RATE`.
+///   `(emit_now − (slot_boundary − lead_secs)) · SAMPLE_RATE`.
 /// * The window extends from there to the buffer end, so it always contains
 ///   the full FT8 message span (boundary .. boundary+12.64 s) plus the lead.
 ///
@@ -699,19 +712,27 @@ impl super::ApplicationCoordinator {
 /// `min_len` (the FT8 message span in samples) is used only as a floor when
 /// clamping so we never hand the decoder a window too short to contain a
 /// message.
+///
+/// `lead_secs` is normally [`super::WINDOW_LEAD_SECS`]; Task W5.3 threads
+/// [`super::resolve_window_lead_secs`]'s result through instead so the
+/// `[decoder].extended_capture_window_enabled` flag can widen it — the
+/// caller (and `ft8.rs`'s matching DT correction) must use the SAME
+/// resolved value or the reported DT would drift from the true slot-relative
+/// offset.
 fn boundary_anchored_slice(
     buffer_len: usize,
     emit_now: chrono::DateTime<chrono::Utc>,
     slot_boundary: chrono::DateTime<chrono::Utc>,
     sample_rate: usize,
     min_len: usize,
+    lead_secs: f64,
 ) -> (usize, usize) {
     // Seconds from the desired window start (slot_boundary − lead) to emit_now.
     let secs_from_start = (emit_now - slot_boundary)
         .num_nanoseconds()
         .map(|ns| ns as f64 / 1_000_000_000.0)
         .unwrap_or(0.0)
-        + super::WINDOW_LEAD_SECS;
+        + lead_secs;
 
     // Number of samples back from the buffer end to the window start. Negative
     // (emit_now before the anchor) collapses to "from the buffer end".
@@ -809,7 +830,7 @@ mod mode_flush_tests {
 #[cfg(test)]
 mod anchored_slice_tests {
     use super::boundary_anchored_slice;
-    use crate::coordinator::WINDOW_LEAD_SECS;
+    use crate::coordinator::{EXTENDED_WINDOW_LEAD_SECS, WINDOW_LEAD_SECS};
 
     const SR: usize = 12_000;
     // FT8 message span in samples (12.64 s) — the slice floor.
@@ -829,7 +850,14 @@ mod anchored_slice_tests {
         let emit_now = boundary + chrono::Duration::milliseconds(13_000); // exactly :13
                                                                           // Buffer holds 20 s of audio, newest sample == emit_now.
         let buffer_len = SR * 20;
-        let (start, len) = boundary_anchored_slice(buffer_len, emit_now, boundary, SR, MSG_SAMPLES);
+        let (start, len) = boundary_anchored_slice(
+            buffer_len,
+            emit_now,
+            boundary,
+            SR,
+            MSG_SAMPLES,
+            WINDOW_LEAD_SECS,
+        );
         // Wall-clock of sample 0 = emit_now − len/SR.
         let sample0_secs_before_emit = len as f64 / SR as f64;
         let sample0_time_secs = 13.0 - sample0_secs_before_emit; // relative to boundary
@@ -874,6 +902,7 @@ mod anchored_slice_tests {
             boundary,
             SR,
             MSG_SAMPLES,
+            WINDOW_LEAD_SECS,
         );
         let (_, len_late) = boundary_anchored_slice(
             buffer_len,
@@ -881,6 +910,7 @@ mod anchored_slice_tests {
             boundary,
             SR,
             MSG_SAMPLES,
+            WINDOW_LEAD_SECS,
         );
         // Sample-0 wall-clock time is (emit_now − len/SR). For it to be fixed at
         // boundary − lead across both emits, len must grow by exactly the jitter
@@ -901,7 +931,14 @@ mod anchored_slice_tests {
         let boundary = utc(100.0);
         let emit_now = boundary + chrono::Duration::milliseconds(13_000);
         let buffer_len = MSG_SAMPLES + 100; // only just enough for a message
-        let (start, len) = boundary_anchored_slice(buffer_len, emit_now, boundary, SR, MSG_SAMPLES);
+        let (start, len) = boundary_anchored_slice(
+            buffer_len,
+            emit_now,
+            boundary,
+            SR,
+            MSG_SAMPLES,
+            WINDOW_LEAD_SECS,
+        );
         assert!(start + len <= buffer_len, "slice out of bounds");
         assert!(len >= MSG_SAMPLES, "clamped window dropped the message");
     }
@@ -940,8 +977,14 @@ mod anchored_slice_tests {
         }
 
         // Anchored slice exactly as the live pipeline computes it.
-        let (start, len) =
-            boundary_anchored_slice(buffer.len(), emit_now, boundary, SR, MSG_SAMPLES);
+        let (start, len) = boundary_anchored_slice(
+            buffer.len(),
+            emit_now,
+            boundary,
+            SR,
+            MSG_SAMPLES,
+            WINDOW_LEAD_SECS,
+        );
         let window = &buffer[start..start + len];
 
         // Window must still contain the whole message (non-regression).
@@ -965,6 +1008,140 @@ mod anchored_slice_tests {
             corrected.abs() <= 0.1,
             "corrected DT {corrected:.3}s not ≈ 0 (raw {:.3}s)",
             found.unwrap().time_offset
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // Task W5.3 (decoder-tp-sensitivity plan): capture window covers the
+    // real dt range. TDD evidence that (a) a dt=-0.8s signal genuinely
+    // cannot decode today via the real production `boundary_anchored_slice`
+    // + default `WINDOW_LEAD_SECS`, (b) it CAN decode once the lead is
+    // widened to `EXTENDED_WINDOW_LEAD_SECS` (Task W5.3's flag), and (c) a
+    // dt=+2.2s signal (the brief's other named case) ALREADY decodes today
+    // with the default lead — confirming the trailing/positive edge did not
+    // need widening, only the negative side did.
+    // ------------------------------------------------------------------
+
+    /// Build a synthetic "continuous rolling capture" buffer with a real
+    /// modulated FT8 message whose true start is `dt_secs` relative to the
+    /// slot boundary, run the REAL `boundary_anchored_slice` (given
+    /// `lead_secs`) exactly as the live pipeline would, and report whether
+    /// "CQ K5ARH EM12" decodes from the resulting window.
+    ///
+    /// Mirrors `synthetic_boundary_signal_reports_dt_near_zero`'s realism
+    /// (real `Ft8Encoder`/`Ft8Modulator`, real `boundary_anchored_slice`,
+    /// real `Ft8Decoder::decode_window`) but parametrized over dt and lead,
+    /// and models the buffer as ending exactly at `emit_now` (the real
+    /// pipeline's invariant: the rolling capture's newest sample IS "now").
+    fn dt_signal_decodes(dt_secs: f64, lead_secs: f64) -> bool {
+        use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator};
+
+        let mut enc = Ft8Encoder::new();
+        let symbols = enc.encode_message("CQ K5ARH EM12", None).unwrap();
+        let mut modu = Ft8Modulator::new_default().unwrap();
+        let msg_audio = modu.modulate_symbols(&symbols, 500.0).unwrap();
+
+        // Boundary at absolute t=10s within a buffer that ends exactly at
+        // emit_now (decode_phase=13s past boundary, the FT8 default) — the
+        // real ft8_buffer's invariant (newest sample == "now").
+        let boundary_secs = 10.0_f64;
+        let emit_now_secs = boundary_secs + 13.0;
+        let buffer_len = (emit_now_secs * SR as f64).round() as usize;
+        let mut buffer = vec![0.0f32; buffer_len];
+        let msg_start = ((boundary_secs + dt_secs) * SR as f64).round() as isize;
+        for (i, &s) in msg_audio.iter().enumerate() {
+            let idx = msg_start + i as isize;
+            if idx >= 0 && (idx as usize) < buffer.len() {
+                buffer[idx as usize] = s;
+            }
+        }
+
+        let boundary = utc(boundary_secs);
+        let emit_now = utc(emit_now_secs);
+        let (start, len) =
+            boundary_anchored_slice(buffer.len(), emit_now, boundary, SR, MSG_SAMPLES, lead_secs);
+        let window = &buffer[start..start + len];
+
+        let mut dec = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let msgs = dec.decode_window(window).unwrap_or_default();
+        msgs.iter().any(|m| m.text.contains("K5ARH"))
+    }
+
+    /// RED (today's real limitation): a station transmitting 0.8s before the
+    /// slot boundary is NOT recoverable with the current default 0.5s lead
+    /// — the buffer's sample 0 (slot_boundary − 0.5s) is genuinely later
+    /// than the message's true start (slot_boundary − 0.8s), so part of the
+    /// message's audio is simply absent from the window handed to the
+    /// decoder. This is the real, empirically-measured gap this task fixes.
+    #[test]
+    fn dt_minus_0_8s_does_not_decode_with_default_lead() {
+        assert!(
+            !dt_signal_decodes(-0.8, WINDOW_LEAD_SECS),
+            "dt=-0.8s must NOT decode with the default 0.5s lead (today's real capture-window limitation)"
+        );
+    }
+
+    /// GREEN: the same dt=-0.8s signal DOES decode once the lead is widened
+    /// to `EXTENDED_WINDOW_LEAD_SECS` (1.0s) — using REAL audio genuinely
+    /// present earlier in the rolling buffer, not zero-padding (Batch 36 C3
+    /// already showed silence-padding is net-negative; this test's buffer
+    /// contains the actual modulated signal at that position, not silence).
+    #[test]
+    fn dt_minus_0_8s_decodes_with_extended_lead() {
+        assert!(
+            dt_signal_decodes(-0.8, EXTENDED_WINDOW_LEAD_SECS),
+            "dt=-0.8s must decode once the capture window's lead is widened (Task W5.3)"
+        );
+    }
+
+    /// Extended lead reaches comfortably past the brief's -1.0s dt target
+    /// (structural floor ≈ -(lead + 0.16s) ≈ -1.16s with the 1.0s extended
+    /// lead), not just the -0.8s test case.
+    #[test]
+    fn dt_minus_1_0s_decodes_with_extended_lead() {
+        assert!(
+            dt_signal_decodes(-1.0, EXTENDED_WINDOW_LEAD_SECS),
+            "dt=-1.0s must decode with the extended lead (brief's target dt range floor)"
+        );
+    }
+
+    /// Non-negative control: the brief's other named test case (dt=+2.2s)
+    /// ALREADY decodes today with the UNCHANGED default lead — real trailing
+    /// audio plus LDPC redundancy already cover it (confirmed by direct
+    /// investigation before implementing anything). This is a regression
+    /// guard, not a fix target: it must keep passing unchanged by this task.
+    #[test]
+    fn dt_plus_2_2s_already_decodes_with_default_lead() {
+        assert!(
+            dt_signal_decodes(2.2, WINDOW_LEAD_SECS),
+            "dt=+2.2s must already decode with the default lead (non-regression control)"
+        );
+    }
+
+    /// Widening the lead must never regress the already-working positive
+    /// side (the extended lead only moves the window's START earlier; the
+    /// END — and therefore every positive-dt signal's coverage — is
+    /// unchanged).
+    #[test]
+    fn dt_plus_2_2s_still_decodes_with_extended_lead() {
+        assert!(
+            dt_signal_decodes(2.2, EXTENDED_WINDOW_LEAD_SECS),
+            "dt=+2.2s must still decode with the extended lead (no regression on the trailing side)"
+        );
+    }
+
+    /// Boundary station (dt=0) must still decode identically regardless of
+    /// which lead is in effect — a basic sanity/non-regression check for
+    /// both configurations.
+    #[test]
+    fn dt_zero_decodes_with_either_lead() {
+        assert!(
+            dt_signal_decodes(0.0, WINDOW_LEAD_SECS),
+            "dt=0 default lead"
+        );
+        assert!(
+            dt_signal_decodes(0.0, EXTENDED_WINDOW_LEAD_SECS),
+            "dt=0 extended lead"
         );
     }
 }

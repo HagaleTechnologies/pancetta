@@ -276,6 +276,119 @@ fn any_tier_has_per_wav_records(card: &Scorecard) -> bool {
         .any(|t: &TierResult| !t.per_wav_records.is_empty())
 }
 
+/// Workstream 0 (2026-07-06) — the FP-on-noise hard gate. Unlike every
+/// other metric in this binary (advisory: printed as a WIN/REGRESSION but
+/// never fails the process), ANY increase in `false_positives_total` or
+/// `noise_files_decoded` on ANY shared tier is a hard failure: the harness
+/// exists specifically so a hallucinating decoder can no longer score
+/// identically to a correct one (design spec §2, decision D0). There is
+/// no threshold — a +1 is exactly as disqualifying as +7000.
+///
+/// Returns one report line per regressing tier; empty means the gate
+/// passed (A had no FP tier, or B's count never exceeded A's).
+fn fp_on_noise_hard_gate(a: &Scorecard, b: &Scorecard) -> Vec<String> {
+    let mut out = Vec::new();
+    let tier_keys: Vec<&String> = a
+        .tiers
+        .keys()
+        .chain(b.tiers.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    for tier in tier_keys {
+        let (at, bt) = match (a.tiers.get(tier), b.tiers.get(tier)) {
+            (Some(at), Some(bt)) => (at, bt),
+            _ => continue,
+        };
+        let a_fp = at.false_positives_total.unwrap_or(0);
+        let b_fp = bt.false_positives_total.unwrap_or(0);
+        if b_fp > a_fp {
+            out.push(format!(
+                "  {tier:<20}  false_positives_total   {a_fp} → {b_fp}  (+{})",
+                b_fp - a_fp
+            ));
+        }
+        let a_ndec = at.noise_files_decoded.unwrap_or(0);
+        let b_ndec = bt.noise_files_decoded.unwrap_or(0);
+        if b_ndec > a_ndec {
+            out.push(format!(
+                "  {tier:<20}  noise_files_decoded     {a_ndec} → {b_ndec}  (+{})",
+                b_ndec - a_ndec
+            ));
+        }
+    }
+    out
+}
+
+/// Task W0.3 (2026-07-06) — the unverified-novel standing-gate term
+/// (design spec §2, decision D0(c); plan Global Constraints / the
+/// standing TP gate: "unverified-novel count increase ≤ 2× verified-TP
+/// increase"). Unlike the zero-tolerance FP-on-noise gate above, this one
+/// is proportional: recall improvements structurally tend to pick up a
+/// few more borderline decodes alongside genuine gains, so SOME growth in
+/// unverified novels is expected. Growth disproportionate to the
+/// verified-TP gain (more than double) is the "hallucinating harder"
+/// failure mode this term exists to catch.
+///
+/// ΔTP is the aggregate `truth_decodes_recovered` delta and
+/// Δunverified-novels is the aggregate `novels_unverified` delta, summed
+/// across every shared tier where at least one side reports
+/// `novels_unverified` (tiers that never ran novel classification, e.g.
+/// fixtures/synth/noise, are excluded from the sum rather than silently
+/// contributing zero on both sides).
+///
+/// Returns `Vec::new()` when the gate passes (including when neither
+/// scorecard carries any `novels_unverified` data — nothing to gate on).
+fn unverified_novel_standing_gate(a: &Scorecard, b: &Scorecard) -> Vec<String> {
+    let tier_keys: Vec<&String> = a
+        .tiers
+        .keys()
+        .chain(b.tiers.keys())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let mut delta_tp: i64 = 0;
+    let mut delta_unverified: i64 = 0;
+    let mut any_data = false;
+    let mut per_tier: Vec<(String, i64, i64)> = Vec::new();
+    for tier in tier_keys {
+        let (at, bt) = match (a.tiers.get(tier), b.tiers.get(tier)) {
+            (Some(at), Some(bt)) => (at, bt),
+            _ => continue,
+        };
+        if at.novels_unverified.is_none() && bt.novels_unverified.is_none() {
+            continue;
+        }
+        any_data = true;
+        let tier_delta_tp = bt.truth_decodes_recovered.unwrap_or(0) as i64
+            - at.truth_decodes_recovered.unwrap_or(0) as i64;
+        let tier_delta_unverified =
+            bt.novels_unverified.unwrap_or(0) as i64 - at.novels_unverified.unwrap_or(0) as i64;
+        delta_tp += tier_delta_tp;
+        delta_unverified += tier_delta_unverified;
+        per_tier.push((tier.clone(), tier_delta_tp, tier_delta_unverified));
+    }
+    if !any_data {
+        return Vec::new();
+    }
+    let allowance = 2 * delta_tp.max(0);
+    if delta_unverified <= allowance {
+        return Vec::new();
+    }
+    let mut out = vec![format!(
+        "  aggregate: unverified-novels Δ={delta_unverified:+} exceeds allowance {allowance:+} \
+         (2×ΔTP, ΔTP={delta_tp:+})"
+    )];
+    for (tier, tp, unverified) in per_tier {
+        if tp != 0 || unverified != 0 {
+            out.push(format!(
+                "  {tier:<20}  verified-TP Δ={tp:+}   unverified-novels Δ={unverified:+}"
+            ));
+        }
+    }
+    out
+}
+
 fn main() -> anyhow::Result<()> {
     let args = Args::parse()?;
     let a = Scorecard::load(&args.a).with_context(|| format!("loading A: {}", args.a.display()))?;
@@ -419,6 +532,44 @@ fn main() -> anyhow::Result<()> {
         for (k, av, bv) in diffs {
             println!("  decoder.{k:<40} {av} → {bv}");
         }
+    }
+
+    // Workstream 0 (2026-07-06) — HARD GATE. Any FP-on-noise increase
+    // fails the comparison outright, regardless of every other metric
+    // above. Printed last (most prominent — the thing the operator's eye
+    // lands on) and enforced via a nonzero exit code so this gate is
+    // usable in scripts/CI-adjacent tooling, not just human review.
+    let fp_gate_failures = fp_on_noise_hard_gate(&a, &b);
+    if !fp_gate_failures.is_empty() {
+        println!();
+        println!("############################################################");
+        println!("# HARD GATE FAILURE — FALSE POSITIVES INCREASED ON NOISE TIER");
+        println!("# ANY increase disqualifies this change. See design spec §2 (D0).");
+        println!("############################################################");
+        for line in &fp_gate_failures {
+            println!("{line}");
+        }
+        println!();
+        std::process::exit(1);
+    }
+
+    // Task W0.3 (2026-07-06) — the unverified-novel standing-gate term.
+    // Same enforcement style as the FP-on-noise gate above (prominent
+    // banner + nonzero exit), extending the standing A/B gate per the
+    // plan's Global Constraints: "unverified-novel count increase ≤ 2×
+    // verified-TP increase".
+    let novel_gate_failures = unverified_novel_standing_gate(&a, &b);
+    if !novel_gate_failures.is_empty() {
+        println!();
+        println!("############################################################");
+        println!("# HARD GATE FAILURE — UNVERIFIED-NOVEL GROWTH EXCEEDS 2×ΔTP");
+        println!("# See design spec §2 (D0) / plan Global Constraints (standing gate).");
+        println!("############################################################");
+        for line in &novel_gate_failures {
+            println!("{line}");
+        }
+        println!();
+        std::process::exit(1);
     }
 
     Ok(())

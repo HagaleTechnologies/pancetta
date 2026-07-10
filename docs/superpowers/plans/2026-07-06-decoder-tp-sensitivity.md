@@ -41,12 +41,12 @@ Any decode on signal-free audio is a false positive. This tier is the guardrail 
 - Produces: eval tier `noise_1000` → scorecard fields `false_positives_total: u32`, `noise_files_decoded: u32` (any nonzero fails `compare`).
 
 **Steps:**
-- [ ] Write `gen_noise.rs` with a determinism unit test (same seed → byte-identical WAV) and a sanity test (RMS within 5% of target).
-- [ ] Add the eval tier: decode every noise WAV with production `Ft8Config::default()`; every returned message is an FP. Record per-file and total. Write failing integration test first (tier over 5 generated files, asserts fields populated), then implement.
-- [ ] Wire `false_positives_total` into `Scorecard` serialization and into the `compare` binary as a **hard gate** (any increase = FAIL, printed prominently).
-- [ ] Generate the real corpus: `count: 1000, seed: 20260706, birdie_fraction: 0.3` under `~/.pancetta/recordings/noise_1000/`, manifest with SHA-256s at `research/corpus/curated/noise/noise_1000.manifest.json` (same pattern as hard_200). Delete the empty `dead_band_425` / `sparse_419` leftovers or regenerate them for real.
-- [ ] Run the tier on current production config; record the baseline number in `research/experiments/2026-07-XX-noise-tier-baseline.md` and in the scorecard. (Expected near 0 today since OSD is off — that's the point: it must stay 0 as OSD returns.)
-- [ ] Commit.
+- [x] Write `gen_noise.rs` with a determinism unit test (same seed → byte-identical WAV) and a sanity test (RMS within 5% of target).
+- [x] Add the eval tier: decode every noise WAV with production `Ft8Config::default()`; every returned message is an FP. Record per-file and total. Write failing integration test first (tier over 5 generated files, asserts fields populated), then implement.
+- [x] Wire `false_positives_total` into `Scorecard` serialization and into the `compare` binary as a **hard gate** (any increase = FAIL, printed prominently).
+- [x] Generate the real corpus: `count: 1000, seed: 20260706, birdie_fraction: 0.3` under `~/.pancetta/recordings/noise_1000/`, manifest with SHA-256s at `research/corpus/curated/noise/noise_1000.manifest.json` (same pattern as hard_200). Delete the empty `dead_band_425` / `sparse_419` leftovers or regenerate them for real.
+- [x] Run the tier on current production config; record the baseline number in `research/experiments/2026-07-07-noise-tier-baseline.md` and in the scorecard. **Result: 3 FPs / 1000 WAVs — NOT 0. See log for honest root-cause discussion (plausibly CRC-14 chance-passes at the trial volume, not a harness bug); this is now the reference baseline the standing gate compares against.**
+- [x] Commit.
 
 ### Task W0.2: 2500 Hz SNR calibration + real sensitivity curve [HARNESS]
 
@@ -59,12 +59,12 @@ Any decode on signal-free audio is a false positive. This tier is the guardrail 
 - Produces: `snr_at_50pct_recovery_db` computed by **linear interpolation** between the two bins straddling 50%, not "first bin ≥ 50%".
 
 **Steps:**
-- [ ] Failing test: generate a synth WAV at label −15 dB, measure signal power (windowed, over the 79-symbol span, tone-bin sum) and noise power density × 2500 Hz; assert ratio within ±0.3 dB of label. Then fix the generator.
-- [ ] Regenerate `clean` manifest: SNR −24 → −14 dB in **1 dB steps**, **n = 50 distinct messages per step** (seeded), randomized base freq 400–2600 Hz and dt ∈ [−0.3, +0.3] s per file (today: fixed 1500 Hz, fixed dt — decoders must not be allowed to overfit a single grid position).
-- [ ] Record the corpus refresh in `refresh_offsets.json` per the `metrics.rs:78-135` convention so composite history stays comparable.
-- [ ] Run the jt9 oracle (`pancetta-research/src/bin/baseline.rs`, `jt9 -8 -d 3`) over the new corpus to produce the **reference curve**; store per-bin jt9 recall in the scorecard (`jt9_snr_curve`).
-- [ ] Run pancetta; record both curves in an experiment log. This number — pancetta SNR@50% minus jt9 SNR@50%, same corpus, same convention — is the headline sensitivity metric for the rest of the plan.
-- [ ] Commit.
+- [x] Failing test: generate a synth WAV at label −15 dB, measure signal power (windowed, over the 79-symbol span, tone-bin sum) and noise power density × 2500 Hz; assert ratio within ±0.3 dB of label. Then fix the generator.
+- [x] Regenerate `clean` manifest: SNR −24 → −14 dB in **1 dB steps**, **n = 50 distinct messages per step** (seeded), randomized base freq 400–2600 Hz and dt ∈ [−0.3, +0.3] s per file (today: fixed 1500 Hz, fixed dt — decoders must not be allowed to overfit a single grid position).
+- [x] Record the corpus refresh in `refresh_offsets.json` per the `metrics.rs:78-135` convention so composite history stays comparable.
+- [x] Run the jt9 oracle (`pancetta-research/src/bin/baseline.rs`, `jt9 -8 -d 3`) over the new corpus to produce the **reference curve**; store per-bin jt9 recall in the scorecard (`jt9_snr_curve`).
+- [x] Run pancetta; record both curves in an experiment log. This number — pancetta SNR@50% minus jt9 SNR@50%, same corpus, same convention — is the headline sensitivity metric for the rest of the plan. **Result: pancetta SNR@50% = −19.214 dB, jt9 SNR@50% = −21.313 dB → headline gap = +2.10 dB (pancetta needs ~2.1 dB more SNR than jt9 for 50% recall). See `research/experiments/2026-07-07-snr-calibration.md`.**
+- [x] Commit.
 
 ### Task W0.3: Novel-decode accounting + real RegressionFlags [HARNESS]
 
@@ -73,10 +73,10 @@ Any decode on signal-free audio is a false positive. This tier is the guardrail 
 - Test: extend `pancetta-research/tests/` with a classification fixture test
 
 **Steps:**
-- [ ] Report-only wiring: every pancetta-only decode on jt9-truth tiers is classified by callsign continuity (`fp_filter.rs` logic) as verified/unverified; both counts land in the scorecard. **Do not filter decodes** — measure only.
-- [ ] Compute `RegressionFlags` for real: `fixture_regression` from the fixtures tier delta, `false_positive_introduced` from W0.1's tier, `snr_curve_regression_db` from W0.2's curve vs the stored baseline. Failing test first (construct two scorecards, assert flags).
-- [ ] Add the unverified-novel term to `compare`'s standing gate (≤ 2× verified-TP increase).
-- [ ] Commit.
+- [x] Report-only wiring: every pancetta-only decode on jt9-truth tiers is classified by callsign continuity (`fp_filter.rs` logic) as verified/unverified; both counts land in the scorecard. **Do not filter decodes** — measure only. `FpFilter::classify` (report-only wrapper over `accept(msg, false)`, no rolling-window mutation) is called from `run_curated_tier` + `run_chrono_replay_tier` (the two jt9-truth tiers; `noise_1000` and synth tiers are excluded — no jt9 truth to compare against). The classifier is built once in `main` from the whole `research/baselines/ft8` corpus whenever a jt9-truth tier is requested, independent of the opt-in `--fp-filter-*` flags. New `TierResult.{novels_verified, novels_unverified}: Option<u32>`.
+- [x] Compute `RegressionFlags` for real: `fixture_regression` from the fixtures tier delta, `false_positive_introduced` from W0.1's tier, `snr_curve_regression_db` from W0.2's curve vs the stored baseline. Failing test first (construct two scorecards, assert flags). Implemented as a pure `metrics::compute_regression_flags(baseline, current)` (7 unit tests, RED confirmed before implementation), wired into `eval.rs`'s `main` by self-diffing the run against `research/scorecards/main.json` (best-effort — missing/unreadable baseline leaves `RegressionFlags::default()`, read BEFORE the run's own output overwrites `main.json` on a refresh).
+- [x] Add the unverified-novel term to `compare`'s standing gate (≤ 2× verified-TP increase). `unverified_novel_standing_gate` sums `Δtruth_decodes_recovered` (ΔTP) and `Δnovels_unverified` across every shared tier reporting the field; fails (prominent banner + exit 1, same style as the W0.1 FP gate) when `Δunverified-novels > 2×max(ΔTP,0)`. Inert (no failure) when neither scorecard carries `novels_unverified` data.
+- [x] Commit. Verified: `curated_tier_classification_is_report_only_and_correct` / `chrono_replay_tier_classification_is_report_only_and_correct` (in-process, real `run_curated_tier`/`run_chrono_replay_tier`, stub decoder) prove recall/composite fields are byte-identical with/without the classifier; a real smoke run (`--tier chrono-replay` over the 33-WAV mini corpus) confirms end-to-end wiring against the real `research/baselines/ft8` corpus and real `main.json` (novels_verified=28, novels_unverified=742, summing to novel_decodes=770; regression-flags computed and logged). Full `cargo test -p pancetta-research --features research-eval` green (82 lib + all integration tests); `cargo fmt`/`clippy` clean on touched targets (lib/bins/tests — pre-existing clippy noise in unrelated `examples/` untouched).
 
 ### Task W0.4: FT4 evaluation tier [HARNESS]
 

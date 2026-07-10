@@ -35,6 +35,24 @@
 //! behaviour: no tracker is instantiated, no rotation is applied, no
 //! update calls fire. The mechanism is shipped behind the gate so the
 //! research harness can A/B it on drifting-station corpora.
+//!
+//! # Consumers
+//!
+//! Built in Batch 50 (2026-06-09) for the legacy 21-trial fine-FFT
+//! fallback (`pancetta_ft8::decoder::par_extract_symbols_complex`), which
+//! is still its production consumer — measured then at -2 TPs on the
+//! hard-200 corpus ("HF static signals; tracker adds drift noise",
+//! `research/experiments/2026-06-09-batch-50.md`). Task W3.6
+//! (decoder-TP-sensitivity plan, Workstream 3, 2026-07-08) wired this
+//! flag into a SECOND consumer, `matched_demod_attempt`'s per-symbol
+//! loop (the Task W3.3 matched-demod stage,
+//! `Ft8Config::fine_sync_enabled`) — that stage's `fine_sync::refine`
+//! only ever fits one global (dt, df) pair for the whole slot, leaving
+//! intra-slot drift beyond that single estimate uncorrected; there the
+//! tracker re-measures a residual at each of the 3 Costas blocks and
+//! layers the running offset on top of `df_hz` for later symbols. See
+//! `research/experiments/2026-07-08-w36-per-candidate-freq-tracker-retest.md`
+//! for that re-test's result.
 
 use num_complex::Complex;
 

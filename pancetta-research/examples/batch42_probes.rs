@@ -3,7 +3,6 @@
 //! Variants:
 //! - residual_min_sync_score sweep {1.0, 1.5, 2.0, 2.5} — HIGHEST PRIORITY
 //! - min_sync_score sweep {2.0, 2.5} (vs 3.0 default)
-//! - time_range sweep {1.5, 2.5, 3.0}
 //! - max_sync_candidates {450, 500, 700}
 //! - NMS enable
 //! - adaptive_ldpc_iters enable
@@ -160,16 +159,6 @@ fn main() -> Result<()> {
         cfg.min_sync_score = v;
         let (t, p) = run_pass(&entries, &cfg, |_| {})?;
         report(&format!("min_sync_score={}", v), t, p);
-    }
-
-    // === Tier 2 — time_range sweep ===
-    println!("\n### Tier 2 — time_range sweep");
-    for v in [1.5f64, 2.5, 3.0] {
-        eprintln!("  time_range={}…", v);
-        let mut cfg = base.clone();
-        cfg.time_range = v;
-        let (t, p) = run_pass(&entries, &cfg, |_| {})?;
-        report(&format!("time_range={}", v), t, p);
     }
 
     // === Tier 2 — max_sync_candidates sweep ===

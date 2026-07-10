@@ -28,6 +28,8 @@ pub mod synth;
 
 pub mod noise;
 
+pub mod gen_noise;
+
 pub mod curated;
 
 pub mod chrono_replay;

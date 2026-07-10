@@ -72,6 +72,14 @@ pub struct TierResult {
     pub snr_at_90pct_recovery_db: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub false_positives_total: Option<u32>,
+    /// Workstream 0 (2026-07-06): count of noise-tier WAVs that produced
+    /// at least one decode. Every decode against a noise WAV is a false
+    /// positive by construction (there is no FT8 signal present), so a
+    /// nonzero value here — or in `false_positives_total` — is a hard
+    /// gate failure for the `noise_1000` tier. `None` for tiers that
+    /// don't run the noise corpus.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub noise_files_decoded: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fixtures_total: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -92,6 +100,27 @@ pub struct TierResult {
     pub decode_rate: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub novel_decodes: Option<u32>,
+    /// Task W0.3 (2026-07-06): of the decodes counted in `novel_decodes`
+    /// (pancetta-only, not matched to jt9 truth on this tier), how many
+    /// classify as "verified" by the existing callsign-continuity filter
+    /// (`fp_filter::FpFilter::classify` — report-only, does NOT drop or
+    /// alter the decode set actually scored). A verified novel is one
+    /// whose extracted callsign(s) appear in the known-good reference set
+    /// (jt9 baselines across the whole corpus) — plausibly a real station
+    /// jt9 simply missed, not a hallucination. `None` on tiers that don't
+    /// run novel classification (fixtures, synth-*, noise_1000) or when
+    /// the classifier's reference corpus wasn't available for this run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub novels_verified: Option<u32>,
+    /// Task W0.3: the complement of `novels_verified` — novel decodes
+    /// whose extracted callsign(s) do NOT appear in the known-good
+    /// reference set. The design spec's standing gate term
+    /// (`Δunverified-novels ≤ 2× ΔTP`, enforced in `bin/compare.rs`)
+    /// treats growth here, disproportionate to true-positive growth, as
+    /// evidence of a decoder hallucinating harder rather than genuinely
+    /// improving. `None` under the same conditions as `novels_verified`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub novels_unverified: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wsjtx_decoded: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -120,6 +149,24 @@ pub struct TierResult {
     /// `research/ideation/2026-06-01-metric.md` M1.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ttfd_distribution: Option<TtfdDistribution>,
+    /// Task W0.2 (2026-07-06): the `jt9 -8 -d 3` reference recall curve
+    /// over the SAME synth corpus (same WAVs, same SNR bins) — populated
+    /// only for synth tiers when `research/baselines/ft8/<sha>.json`
+    /// caches exist for every entry (produced by
+    /// `cargo run -p pancetta-research --bin baseline -- --tier synth
+    /// --synth-manifest <manifest>`). Lets `snr_at_50pct_recovery_db` be
+    /// compared directly against jt9's own sensitivity, both measured
+    /// under the identical WSJT-X 2500 Hz SNR convention — the headline
+    /// metric for the rest of the decoder-tp-sensitivity plan is
+    /// `snr_at_50pct_recovery_db - jt9_snr_at_50pct_recovery_db` on this
+    /// tier. Empty for tiers/runs where the jt9 baseline wasn't generated.
+    #[serde(skip_serializing_if = "Vec::is_empty", default)]
+    pub jt9_snr_curve: Vec<SnrBin>,
+    /// jt9's own SNR@50%-recovery on the same curve as `jt9_snr_curve`,
+    /// via the same linear-interpolation method as
+    /// `snr_at_50pct_recovery_db`. `None` when `jt9_snr_curve` is empty.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jt9_snr_at_50pct_recovery_db: Option<f64>,
 }
 
 /// hb-129: aggregate Time-To-First-Decode distribution across WAVs in a tier.

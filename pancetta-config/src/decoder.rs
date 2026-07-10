@@ -91,6 +91,39 @@ pub struct DecoderConfig {
     pub effort: DecodeEffort,
     /// Explicit per-window budget in ms; overrides `effort` when Some.
     pub budget_ms: Option<u64>,
+    /// Task W5.3 (decoder-tp-sensitivity plan) [A/B]: widen the DSP capture
+    /// window's lead-in from the default `WINDOW_LEAD_SECS` (0.5 s) to
+    /// `EXTENDED_WINDOW_LEAD_SECS` (1.0 s, `pancetta/src/coordinator/mod.rs`).
+    /// Default OFF — byte-identical capture window when unset.
+    ///
+    /// Root cause this addresses: the FT8 Costas sync sweep's time-step
+    /// search is structurally non-negative (`for t0 in 0..=max_time_step` in
+    /// `pancetta_ft8::decoder`) — it can never find a candidate earlier than
+    /// sample 0 of whatever buffer it is handed. A station transmitting
+    /// before the nominal slot boundary (negative DT, propagation delay /
+    /// clock drift) is only recoverable if the buffer's sample 0 genuinely
+    /// contains real audio from before the boundary. The coordinator
+    /// already prepends `WINDOW_LEAD_SECS` of real (not synthetic/zero-pad)
+    /// audio for exactly this reason; this flag widens that real lead-in
+    /// further, extending the reachable negative-DT floor from about
+    /// -0.66 s to about -1.16 s (`-(lead + 0.16 s)` structural correction).
+    /// Verified empirically (2026-07-09 investigation): a synthetic dt=-0.8s
+    /// signal fails to decode with the default 0.5s lead and decodes once
+    /// widened to 1.0s; a synthetic dt=+2.2s signal ALREADY decodes today
+    /// with the default lead (real trailing audio + LDPC redundancy already
+    /// cover it), so this flag intentionally does not touch the trailing
+    /// edge / `decode_phase` (that is coupled to DX-slot-aware TX scheduling
+    /// elsewhere in the coordinator and was judged out of proportion to a
+    /// benefit this task could not demonstrate a need for).
+    ///
+    /// Cost: the emitted decode window grows by `EXTENDED_WINDOW_LEAD_SECS -
+    /// WINDOW_LEAD_SECS` (0.5 s) of real retained audio (already present in
+    /// the DSP ring buffer's overlap retention — no extra capture latency),
+    /// at a modest extra per-window decode cost (more Costas sync-search
+    /// steps over a longer spectrogram). See the Task W5.3 experiment log
+    /// for the measured elapsed-time delta.
+    #[serde(default)]
+    pub extended_capture_window_enabled: bool,
 }
 
 impl Default for DecoderConfig {
@@ -98,6 +131,7 @@ impl Default for DecoderConfig {
         Self {
             effort: DecodeEffort::Auto,
             budget_ms: None,
+            extended_capture_window_enabled: false,
         }
     }
 }
@@ -116,6 +150,7 @@ impl ConfigSection for DecoderConfig {
     fn merge_with(&mut self, other: Self) {
         self.effort = other.effort;
         self.budget_ms = other.budget_ms;
+        self.extended_capture_window_enabled = other.extended_capture_window_enabled;
     }
 }
 
@@ -130,6 +165,7 @@ mod tests {
         let cfg = DecoderConfig::default();
         assert_eq!(cfg.effort, DecodeEffort::Auto);
         assert_eq!(cfg.budget_ms, None);
+        assert!(!cfg.extended_capture_window_enabled);
     }
 
     #[test]
@@ -145,6 +181,24 @@ mod tests {
         let parsed: Config = toml::from_str(toml).expect("partial config must deserialize");
         assert_eq!(parsed.decoder.effort, DecodeEffort::Auto);
         assert_eq!(parsed.decoder.budget_ms, None);
+        assert!(!parsed.decoder.extended_capture_window_enabled);
+    }
+
+    /// Task W5.3: `extended_capture_window_enabled` must round-trip through
+    /// TOML and default to `false` when the key is absent.
+    #[test]
+    fn extended_capture_window_enabled_parses_and_defaults_false() {
+        let toml_str = "[decoder]\nextended_capture_window_enabled = true\n";
+        let parsed: Config = toml::from_str(toml_str).expect("must parse");
+        assert!(parsed.decoder.extended_capture_window_enabled);
+
+        let rendered = toml::to_string(&parsed).expect("must serialize");
+        let reparsed: Config = toml::from_str(&rendered).expect("must reparse");
+        assert!(reparsed.decoder.extended_capture_window_enabled);
+
+        let toml_no_key = "[decoder]\neffort = \"deep\"\n";
+        let parsed_no_key: Config = toml::from_str(toml_no_key).expect("must parse");
+        assert!(!parsed_no_key.decoder.extended_capture_window_enabled);
     }
 
     #[test]
@@ -219,6 +273,7 @@ mod tests {
         let mut override_cfg = DecoderConfig::default();
         override_cfg.effort = DecodeEffort::Max;
         override_cfg.budget_ms = Some(9_999);
+        override_cfg.extended_capture_window_enabled = true;
 
         base.merge_with(override_cfg);
 
@@ -226,6 +281,10 @@ mod tests {
             base.effort,
             DecodeEffort::Max,
             "effort must survive merge_with"
+        );
+        assert!(
+            base.extended_capture_window_enabled,
+            "extended_capture_window_enabled must survive merge_with (Task W5.3)"
         );
         assert_eq!(
             base.budget_ms,

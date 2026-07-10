@@ -5,10 +5,25 @@
 //! to improve decode success at low SNR by injecting high-confidence
 //! LLR values at known bit positions in the 77-bit FT8 payload.
 //!
-//! FT8 77-bit payload layout:
-//! - Bits 0-27:  calling station callsign (28 bits)
-//! - Bits 28-55: called station callsign (28 bits)
-//! - Bits 56-76: report/grid/message content (21 bits)
+//! FT8 77-bit standard-message (i3=1/2) payload layout (per
+//! `message.rs::parse_type1_standard`, the ground truth): `n29a` occupies
+//! bits 0-28 = `to_callsign` (28-bit packed value at bits 0-27, `/P`-suffix
+//! flag at bit 28); `n29b` occupies bits 29-57 = `from_callsign` (28-bit
+//! packed value at bits 29-56, suffix flag at bit 57); bits 58-76 are
+//! ir/grid/report/i3.
+//!
+//! We are always the message's addressee for anything we decode (we never
+//! decode our own transmissions), so **our callsign is always
+//! `to_callsign` (bits 0-27)** and the other station is always
+//! `from_callsign` (bits 29-56) — there is a 1-bit gap at bit 28 (the
+//! `to_callsign` suffix flag) between the two 28-bit callsign fields, so
+//! they are NOT evenly spaced at offsets 0 and 28.
+//!
+//! - Bits 0-27:  to_callsign / called station (us) — 28 bits
+//! - Bit 28:     to_callsign suffix flag (`/P`/`/R`)
+//! - Bits 29-56: from_callsign / calling station (the other station) — 28 bits
+//! - Bit 57:     from_callsign suffix flag
+//! - Bits 58-76: ir + grid/report + i3 (19 bits)
 
 #![allow(dead_code)]
 // rationale: AP LLR-injection loops index the 77-bit payload positions; the
@@ -176,6 +191,16 @@ pub fn u32_to_bits_28(value: u32) -> [bool; 28] {
     bits
 }
 
+/// Convert a 15-bit packed value to a bool array, MSB first. Used for the
+/// `igrid4` field (payload bits 59-73).
+pub fn u16_to_bits_15(value: u16) -> [bool; 15] {
+    let mut bits = [false; 15];
+    for i in 0..15 {
+        bits[i] = (value >> (14 - i)) & 1 == 1;
+    }
+    bits
+}
+
 // ---------------------------------------------------------------------------
 // AP types
 // ---------------------------------------------------------------------------
@@ -185,15 +210,73 @@ pub fn u32_to_bits_28(value: u32) -> [bool; 28] {
 pub enum ApLevel {
     /// No AP injection.
     Ap0,
-    /// Inject own callsign at bits 28-55 (called station).
+    /// Inject own callsign at bits 0-27 (called station / `to_callsign`
+    /// — we are always the addressee for any message we decode).
     Ap1,
-    /// Inject a recent caller's callsign at bits 0-27 (calling station).
-    /// The specific caller is selected externally via `inject_ap2_caller`.
+    /// Inject a recent caller's callsign at bits 29-56 (calling station /
+    /// `from_callsign`). The specific caller is selected externally via
+    /// `inject_ap2_caller`.
     Ap2,
-    /// Inject both: active QSO partner at bits 0-27, own call at bits 28-55.
+    /// Inject both: own call at bits 0-27 (`to_callsign`), active QSO
+    /// partner at bits 29-56 (`from_callsign`).
     Ap3,
-    /// AP3 + inject i3 type bits (74-76) as 0,0,0 (standard message / RR73).
+    /// AP3 + inject i3 type bits (74-76) as 0,0,1 (i3=1, the "standard
+    /// message" family RR73/RRR/73 actually use).
     Ap4,
+    /// Decoder-TP-sensitivity Task W2.6 [A/B]: assume this candidate is a
+    /// plain "CQ" call. Injects the `to_callsign` field (bits 0-27 + the
+    /// bit-28 suffix flag) with the packed "CQ" special token (`pack28`
+    /// value 2, matching this project's own encoder's `try_encode_standard`
+    /// / `parse_standard_message`) plus the i3 type bits (74-76) as
+    /// (0,0,1) — the same "standard message" family AP4 assumes. Unlike
+    /// AP1-AP4, this level needs **no context at all**: "CQ" is a fixed
+    /// protocol token, not a personal callsign, so it requires neither
+    /// `ApContext.my_call` nor `ApContext.active_qso` and can run
+    /// unconditionally on every candidate. Scope: plain "CQ" only (not
+    /// "CQ DX"/"CQ POTA"/etc modifiers, which pack a different token
+    /// value).
+    Cq,
+}
+
+/// Decoder-TP-sensitivity Task W2.6 [A/B]: which QSO-completion token to
+/// inject the full message-content mask for, on top of the existing AP4
+/// callsign + i3 injection. AP4 alone only pins the message-TYPE (i3=1);
+/// it never pinned the specific completion content (the `ir` bit and the
+/// 15-bit `igrid4` field that actually spells out RRR/RR73/73). Mirrors
+/// `encoder.rs::packgrid` / `message.rs::unpackgrid`'s special
+/// `MAXGRID4`-relative values (`MAXGRID4 = 32400`); ground truth verified
+/// against this project's own encoder in
+/// `pancetta-ft8/tests/ap_i3_tests.rs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmationToken {
+    /// "RRR" — igrid4 = MAXGRID4 + 2.
+    Rrr,
+    /// "RR73" — igrid4 = MAXGRID4 + 3.
+    RR73,
+    /// "73" — igrid4 = MAXGRID4 + 4.
+    Final73,
+}
+
+impl ConfirmationToken {
+    /// The three canonical confirmation tokens, RR73 first (by far the
+    /// most common single completion message in real operator use —
+    /// combines both the "roger" and "73" acknowledgements in one
+    /// transmission), then RRR, then bare 73.
+    pub const ALL: [ConfirmationToken; 3] = [
+        ConfirmationToken::RR73,
+        ConfirmationToken::Rrr,
+        ConfirmationToken::Final73,
+    ];
+
+    /// The 15-bit `igrid4` field value this token packs to.
+    fn igrid4_value(self) -> u16 {
+        const MAXGRID4: u16 = 32400;
+        match self {
+            ConfirmationToken::Rrr => MAXGRID4 + 2,
+            ConfirmationToken::RR73 => MAXGRID4 + 3,
+            ConfirmationToken::Final73 => MAXGRID4 + 4,
+        }
+    }
 }
 
 /// QSO progress within an active AP-tracked contact.
@@ -322,9 +405,13 @@ impl QsoAp {
 /// [`QsoAp::with_expected_texts`].
 ///
 /// Notes
-/// - All texts are uppercase, single-space separated, with the
-///   partner's call (`dx_call`) as the first token (the partner is
-///   addressing us).
+/// - All texts are uppercase, single-space separated, with **our own
+///   call** (`my_call`) as the first token and the partner's call
+///   (`dx_call`) second — matching `Ft8Message::Display`'s
+///   `to_callsign from_callsign ...` text order: any message the
+///   partner sends *to us* has us as the addressee (first token), per
+///   `message.rs::parse_type1_standard`'s bit layout (`to_callsign` at
+///   bits 0-27, `from_callsign` at bits 29-56).
 /// - The enumerations are intentionally small (≤6 entries per state);
 ///   they exist to *gate*, not to *seed* LDPC.
 pub fn enumerate_a8_expected_texts(
@@ -349,8 +436,8 @@ pub fn enumerate_a8_expected_texts(
             let mut out = Vec::with_capacity(24);
             let mut snr = -22i32;
             while snr <= 0 {
-                out.push(format!("{} {} R{:+03}", dx, my, snr));
-                out.push(format!("{} {} {:+03}", dx, my, snr));
+                out.push(format!("{} {} R{:+03}", my, dx, snr));
+                out.push(format!("{} {} {:+03}", my, dx, snr));
                 snr += 2;
             }
             out
@@ -360,9 +447,9 @@ pub fn enumerate_a8_expected_texts(
         // confirmation tokens.
         QsoApProgress::WaitingForConfirmation => {
             vec![
-                format!("{} {} RR73", dx, my),
-                format!("{} {} 73", dx, my),
-                format!("{} {} RRR", dx, my),
+                format!("{} {} RR73", my, dx),
+                format!("{} {} 73", my, dx),
+                format!("{} {} RRR", my, dx),
             ]
         }
     }
@@ -406,10 +493,47 @@ fn inject_bit(llrs: &mut [f32], pos: usize, bit: bool) {
     }
 }
 
+/// The XOR-whitening bit at payload/codeword position `pos`, for an
+/// optional whitening sequence (`None` for FT8/FT2 — no scrambling).
+///
+/// Mirrors `decoder.rs::par_apply_xor`'s bit addressing exactly: byte
+/// index = `pos / 8`, bit within the byte taken MSB-first (`bit_pos = pos
+/// % 8`, tested against `0x80 >> bit_pos`). FT4 (`ProtocolParams::ft4()`)
+/// XOR-scrambles the 77-bit payload with `FT4_XOR_SEQUENCE` *before* LDPC
+/// encoding (`encoder.rs::payload_to_symbols_protocol`) and un-scrambles
+/// it the same way after LDPC decode + CRC check
+/// (`decoder.rs::par_apply_xor`). AP injection sets LLR signs in that
+/// same pre-un-XOR (whitened) codeword-bit space, so an injected "real"
+/// payload bit must be whitened with this same sequence before its LLR
+/// sign is set — otherwise roughly half the injected positions carry the
+/// wrong sign for FT4, actively fighting the correct decode.
+#[inline]
+fn xor_bit_at(xor_sequence: Option<&[u8; 10]>, pos: usize) -> bool {
+    match xor_sequence {
+        Some(seq) => {
+            let byte_idx = pos / 8;
+            let bit_pos = pos % 8;
+            byte_idx < seq.len() && (seq[byte_idx] >> (7 - bit_pos)) & 1 == 1
+        }
+        None => false,
+    }
+}
+
 /// Inject 28 known bits starting at `offset` in the LLR array.
-fn inject_28_bits(llrs: &mut [f32], offset: usize, bits: &[bool; 28]) {
+///
+/// `xor_sequence`: `Some(FT4_XOR_SEQUENCE)` when injecting for FT4 (the
+/// bits are whitened before their LLR sign is set, matching the
+/// pre-un-XOR codeword domain the LDPC decoder operates in); `None` for
+/// FT8/FT2 (no whitening, byte-identical to the pre-fix behavior).
+fn inject_28_bits(
+    llrs: &mut [f32],
+    offset: usize,
+    bits: &[bool; 28],
+    xor_sequence: Option<&[u8; 10]>,
+) {
     for (i, &b) in bits.iter().enumerate() {
-        inject_bit(llrs, offset + i, b);
+        let pos = offset + i;
+        inject_bit(llrs, pos, b ^ xor_bit_at(xor_sequence, pos));
     }
 }
 
@@ -420,14 +544,25 @@ fn inject_28_bits(llrs: &mut [f32], offset: usize, bits: &[bool; 28]) {
 ///   a full FT8 payload, though the function tolerates shorter slices).
 /// * `level` - the AP level to apply.
 /// * `context` - the AP context containing known callsigns / QSO state.
-pub fn inject_ap_llrs(llrs: &mut [f32], level: ApLevel, context: &ApContext) {
+/// * `xor_sequence` - `Some(FT4_XOR_SEQUENCE)` when decoding FT4 (bits are
+///   whitened before their LLR sign is set, matching the pre-un-XOR
+///   codeword domain the LDPC decoder operates in — see [`xor_bit_at`]);
+///   `None` for FT8/FT2, where injection is byte-identical to before this
+///   parameter existed (no whitening applied).
+pub fn inject_ap_llrs(
+    llrs: &mut [f32],
+    level: ApLevel,
+    context: &ApContext,
+    xor_sequence: Option<&[u8; 10]>,
+) {
     match level {
         ApLevel::Ap0 => { /* no injection */ }
 
         ApLevel::Ap1 => {
-            // Inject own callsign at bits 28-55 (called station)
+            // Inject own callsign at bits 0-27 (to_callsign / called
+            // station — we are always the addressee).
             if let Some(ref my_call) = context.my_call {
-                inject_28_bits(llrs, 28, &my_call.bits);
+                inject_28_bits(llrs, 0, &my_call.bits, xor_sequence);
             }
         }
 
@@ -438,48 +573,107 @@ pub fn inject_ap_llrs(llrs: &mut [f32], level: ApLevel, context: &ApContext) {
         }
 
         ApLevel::Ap3 => {
-            // Inject active QSO partner at bits 0-27
-            if let Some(ref qso) = context.active_qso {
-                inject_28_bits(llrs, 0, &qso.their_bits);
-            }
-            // Inject own callsign at bits 28-55
+            // Inject own callsign at bits 0-27 (to_callsign / called station)
             if let Some(ref my_call) = context.my_call {
-                inject_28_bits(llrs, 28, &my_call.bits);
+                inject_28_bits(llrs, 0, &my_call.bits, xor_sequence);
+            }
+            // Inject active QSO partner at bits 29-56 (from_callsign /
+            // calling station)
+            if let Some(ref qso) = context.active_qso {
+                inject_28_bits(llrs, 29, &qso.their_bits, xor_sequence);
             }
         }
 
         ApLevel::Ap4 => {
             // Same as AP3 …
-            if let Some(ref qso) = context.active_qso {
-                inject_28_bits(llrs, 0, &qso.their_bits);
-            }
             if let Some(ref my_call) = context.my_call {
-                inject_28_bits(llrs, 28, &my_call.bits);
+                inject_28_bits(llrs, 0, &my_call.bits, xor_sequence);
             }
-            // … plus i3 type bits at 74-76 = false, false, false (type 0)
-            inject_bit(llrs, 74, false);
-            inject_bit(llrs, 75, false);
-            inject_bit(llrs, 76, false);
+            if let Some(ref qso) = context.active_qso {
+                inject_28_bits(llrs, 29, &qso.their_bits, xor_sequence);
+            }
+            // … plus i3 type bits at 74-76 = false, false, true (i3=1,
+            // the "standard message" family RR73/RRR/73 actually use —
+            // verified empirically against this project's own encoder,
+            // see pancetta-ft8/tests/ap_i3_tests.rs. i3=0 selects the
+            // FreeText/Telemetry/contest family, which
+            // Ft8Message::is_plausible() unconditionally rejects, so the
+            // previous (0,0,0) injection made AP4 fight the very message
+            // class it exists to help decode. Whitened for FT4 like the
+            // callsign fields above — the i3 field is part of the same
+            // 77-bit payload the XOR scrambles.
+            inject_bit(llrs, 74, false ^ xor_bit_at(xor_sequence, 74));
+            inject_bit(llrs, 75, false ^ xor_bit_at(xor_sequence, 75));
+            inject_bit(llrs, 76, true ^ xor_bit_at(xor_sequence, 76));
+        }
+
+        ApLevel::Cq => {
+            // Context-free: "CQ" is a fixed protocol token, not a personal
+            // callsign, so `context` is intentionally unused here.
+            if let Some((cq_packed, cq_ip)) = pack28("CQ") {
+                let cq_bits = u32_to_bits_28(cq_packed);
+                inject_28_bits(llrs, 0, &cq_bits, xor_sequence);
+                // Bit 28: to_callsign suffix flag. pack28("CQ") always
+                // returns ip=0 (no /P or /R on a bare "CQ" token).
+                inject_bit(llrs, 28, (cq_ip != 0) ^ xor_bit_at(xor_sequence, 28));
+            }
+            // i3=1 ("standard message" family) — same assumption AP4
+            // makes, and the only i3 value this project's own encoder
+            // ever emits for standard-message text (see
+            // `pancetta-ft8/tests/ap_i3_tests.rs`).
+            inject_bit(llrs, 74, false ^ xor_bit_at(xor_sequence, 74));
+            inject_bit(llrs, 75, false ^ xor_bit_at(xor_sequence, 75));
+            inject_bit(llrs, 76, true ^ xor_bit_at(xor_sequence, 76));
         }
     }
 }
 
-/// Inject a specific recent callsign at bits 0-27 (AP2 calling station).
+/// Inject the full message-content mask for a QSO-confirmation token
+/// (RRR/RR73/73), on top of the existing AP4 callsign + i3 injection
+/// (call [`inject_ap_llrs`] with `ApLevel::Ap4` first, then this): the
+/// `ir` bit (payload bit 58, always 0 for these three tokens — none of
+/// them carry an R-prefix) and the full 15-bit `igrid4` field (bits
+/// 59-73) for the assumed token. AP4 alone only constrains the message
+/// TYPE (i3=1); this additionally constrains the specific completion
+/// CONTENT.
 ///
-/// This is called externally for each candidate caller when attempting AP2
-/// decoding passes.
-pub fn inject_ap2_caller(llrs: &mut [f32], caller: &RecentCallAp) {
-    inject_28_bits(llrs, 0, &caller.bits);
+/// `xor_sequence`: see [`inject_ap_llrs`].
+pub fn inject_confirmation_token_bits(
+    llrs: &mut [f32],
+    token: ConfirmationToken,
+    xor_sequence: Option<&[u8; 10]>,
+) {
+    inject_bit(llrs, 58, false ^ xor_bit_at(xor_sequence, 58));
+    let bits15 = u16_to_bits_15(token.igrid4_value());
+    for (i, &b) in bits15.iter().enumerate() {
+        let pos = 59 + i;
+        inject_bit(llrs, pos, b ^ xor_bit_at(xor_sequence, pos));
+    }
 }
 
-/// Inject a specific recent callsign at bits 28-55 (called station).
+/// Inject a specific recent callsign at bits 29-56 (AP2 calling station /
+/// `from_callsign`).
+///
+/// This is called externally for each candidate caller when attempting AP2
+/// decoding passes. `xor_sequence`: see [`inject_ap_llrs`].
+pub fn inject_ap2_caller(llrs: &mut [f32], caller: &RecentCallAp, xor_sequence: Option<&[u8; 10]>) {
+    inject_28_bits(llrs, 29, &caller.bits, xor_sequence);
+}
+
+/// Inject a specific recent callsign at bits 0-27 (called station /
+/// `to_callsign`).
 ///
 /// Companion to `inject_ap2_caller`. Used by hb-043 my_call-less AP
 /// injection — when the operator is scanning rather than transmitting,
 /// observed callsigns are still useful priors but might appear at EITHER
 /// position. This function handles the called-position injection.
-pub fn inject_recent_call_at_called(llrs: &mut [f32], call: &RecentCallAp) {
-    inject_28_bits(llrs, 28, &call.bits);
+/// `xor_sequence`: see [`inject_ap_llrs`].
+pub fn inject_recent_call_at_called(
+    llrs: &mut [f32],
+    call: &RecentCallAp,
+    xor_sequence: Option<&[u8; 10]>,
+) {
+    inject_28_bits(llrs, 0, &call.bits, xor_sequence);
 }
 
 // ===========================================================================
@@ -538,16 +732,12 @@ mod tests {
         };
 
         let mut llrs = vec![0.0f32; 77];
-        inject_ap_llrs(&mut llrs, ApLevel::Ap1, &ctx);
+        inject_ap_llrs(&mut llrs, ApLevel::Ap1, &ctx, None);
 
-        // Bits 0-27 should be untouched (0.0)
+        // Bits 0-27 should be injected with own call (to_callsign / called
+        // station — we are always the addressee for any message we decode).
         for i in 0..28 {
-            assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
-        }
-
-        // Bits 28-55 should be injected with +-15.0
-        for i in 28..56 {
-            let expected_bit = my_call.bits[i - 28];
+            let expected_bit = my_call.bits[i];
             let expected_llr = if expected_bit {
                 -AP_LLR_MAGNITUDE
             } else {
@@ -556,8 +746,8 @@ mod tests {
             assert_eq!(llrs[i], expected_llr, "bit {} mismatch", i);
         }
 
-        // Bits 56-76 should be untouched
-        for i in 56..77 {
+        // Bits 28-76 should be untouched
+        for i in 28..77 {
             assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
         }
     }
@@ -573,22 +763,12 @@ mod tests {
         };
 
         let mut llrs = vec![0.0f32; 77];
-        inject_ap_llrs(&mut llrs, ApLevel::Ap3, &ctx);
+        inject_ap_llrs(&mut llrs, ApLevel::Ap3, &ctx, None);
 
-        // Bits 0-27: their callsign (W1AW)
+        // Bits 0-27: my callsign (K1ABC) — to_callsign / called station.
+        // We are always the addressee for any message we decode.
         for i in 0..28 {
-            let expected_bit = qso.their_bits[i];
-            let expected_llr = if expected_bit {
-                -AP_LLR_MAGNITUDE
-            } else {
-                AP_LLR_MAGNITUDE
-            };
-            assert_eq!(llrs[i], expected_llr, "bit {} (their call) mismatch", i);
-        }
-
-        // Bits 28-55: my callsign (K1ABC)
-        for i in 28..56 {
-            let expected_bit = my_call.bits[i - 28];
+            let expected_bit = my_call.bits[i];
             let expected_llr = if expected_bit {
                 -AP_LLR_MAGNITUDE
             } else {
@@ -597,9 +777,174 @@ mod tests {
             assert_eq!(llrs[i], expected_llr, "bit {} (my call) mismatch", i);
         }
 
-        // Bits 56-76 should be untouched
-        for i in 56..77 {
+        // Bit 28 (to_callsign suffix flag) untouched — not part of either
+        // 28-bit callsign field.
+        assert_eq!(
+            llrs[28], 0.0,
+            "bit 28 (suffix flag gap) should be untouched"
+        );
+
+        // Bits 29-56: their callsign (W1AW) — from_callsign / calling
+        // station.
+        for i in 29..57 {
+            let expected_bit = qso.their_bits[i - 29];
+            let expected_llr = if expected_bit {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(llrs[i], expected_llr, "bit {} (their call) mismatch", i);
+        }
+
+        // Bits 57-76 should be untouched
+        for i in 57..77 {
             assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
         }
+    }
+
+    #[test]
+    fn test_inject_ap2_caller_uses_from_callsign_offset() {
+        // AP2's candidate-caller injection targets bits 29-56
+        // (from_callsign / calling station) — the other station, since we
+        // are always the addressee.
+        let caller = RecentCallAp::new("W1AW", -10.0).expect("W1AW should encode");
+        let mut llrs = vec![0.0f32; 77];
+        inject_ap2_caller(&mut llrs, &caller, None);
+
+        for i in 0..29 {
+            assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
+        }
+        for i in 29..57 {
+            let expected_bit = caller.bits[i - 29];
+            let expected_llr = if expected_bit {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(llrs[i], expected_llr, "bit {} mismatch", i);
+        }
+        for i in 57..77 {
+            assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
+        }
+    }
+
+    #[test]
+    fn test_inject_recent_call_at_called_uses_to_callsign_offset() {
+        // The companion "called" injection targets bits 0-27
+        // (to_callsign) — as if the recent call were the addressee.
+        let recent = RecentCallAp::new("K1ABC", -5.0).expect("K1ABC should encode");
+        let mut llrs = vec![0.0f32; 77];
+        inject_recent_call_at_called(&mut llrs, &recent, None);
+
+        for i in 0..28 {
+            let expected_bit = recent.bits[i];
+            let expected_llr = if expected_bit {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(llrs[i], expected_llr, "bit {} mismatch", i);
+        }
+        for i in 28..77 {
+            assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
+        }
+    }
+
+    #[test]
+    fn test_inject_cq_uses_pack28_cq_token_at_called_position() {
+        // "CQ" special token per pack28 is packed value 2 (see the `match
+        // callsign { "CQ" => return Some((2, 0)), ... }` arm above).
+        let (cq_packed, cq_ip) = pack28("CQ").expect("CQ must encode");
+        assert_eq!(cq_packed, 2);
+        assert_eq!(cq_ip, 0);
+
+        let ctx = ApContext::default();
+        let mut llrs = vec![0.0f32; 77];
+        inject_ap_llrs(&mut llrs, ApLevel::Cq, &ctx, None);
+
+        let expected_bits = u32_to_bits_28(cq_packed);
+        for i in 0..28 {
+            let expected_llr = if expected_bits[i] {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(llrs[i], expected_llr, "bit {} (CQ token) mismatch", i);
+        }
+        // Bit 28 (suffix flag): CQ's ip=0 -> false -> positive LLR.
+        assert_eq!(llrs[28], AP_LLR_MAGNITUDE, "bit 28 (suffix flag) mismatch");
+        // i3 bits 74-76 = (0,0,1) — same "standard message" assumption AP4
+        // makes.
+        assert_eq!(llrs[74], AP_LLR_MAGNITUDE);
+        assert_eq!(llrs[75], AP_LLR_MAGNITUDE);
+        assert_eq!(llrs[76], -AP_LLR_MAGNITUDE);
+        // Bits 29-73 (from_callsign + ir + igrid4) untouched — CQ mask
+        // doesn't know or constrain who's calling or what grid they sent.
+        for i in 29..74 {
+            assert_eq!(llrs[i], 0.0, "bit {} should be untouched by CQ mask", i);
+        }
+    }
+
+    #[test]
+    fn test_inject_cq_requires_no_context() {
+        // The whole point of ApLevel::Cq: it must inject identically
+        // regardless of what's in the ApContext (my_call/active_qso
+        // present or absent) — "CQ" is a fixed protocol token, not a
+        // personal callsign.
+        let empty_ctx = ApContext::default();
+        let full_ctx = ApContext {
+            my_call: Some(MyCallAp::new("K1ABC").unwrap()),
+            recent_calls: vec![RecentCallAp::new("W1AW", -5.0).unwrap()],
+            active_qso: Some(QsoAp::new("W1AW", QsoApProgress::WaitingForReport).unwrap()),
+        };
+
+        let mut llrs_empty = vec![0.0f32; 77];
+        inject_ap_llrs(&mut llrs_empty, ApLevel::Cq, &empty_ctx, None);
+        let mut llrs_full = vec![0.0f32; 77];
+        inject_ap_llrs(&mut llrs_full, ApLevel::Cq, &full_ctx, None);
+
+        assert_eq!(
+            llrs_empty, llrs_full,
+            "ApLevel::Cq injection must be identical regardless of ApContext contents"
+        );
+    }
+
+    #[test]
+    fn test_inject_confirmation_token_bits_rr73() {
+        // MAXGRID4 = 32400; RR73 = +3 = 32403.
+        const MAXGRID4: u16 = 32400;
+        let mut llrs = vec![0.0f32; 77];
+        inject_confirmation_token_bits(&mut llrs, ConfirmationToken::RR73, None);
+
+        // ir bit (58) = 0 -> positive LLR.
+        assert_eq!(llrs[58], AP_LLR_MAGNITUDE, "ir bit must be 0 (no R-prefix)");
+
+        let expected_bits = u16_to_bits_15(MAXGRID4 + 3);
+        for i in 0..15 {
+            let expected_llr = if expected_bits[i] {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(
+                llrs[59 + i],
+                expected_llr,
+                "igrid4 bit {} (payload bit {}) mismatch",
+                i,
+                59 + i
+            );
+        }
+        // Everything else untouched.
+        for i in (0..58).chain(74..77) {
+            assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
+        }
+    }
+
+    #[test]
+    fn test_confirmation_token_igrid4_values_match_maxgrid4_offsets() {
+        const MAXGRID4: u16 = 32400;
+        assert_eq!(ConfirmationToken::Rrr.igrid4_value(), MAXGRID4 + 2);
+        assert_eq!(ConfirmationToken::RR73.igrid4_value(), MAXGRID4 + 3);
+        assert_eq!(ConfirmationToken::Final73.igrid4_value(), MAXGRID4 + 4);
     }
 }
