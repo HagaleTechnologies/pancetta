@@ -135,6 +135,21 @@ struct Args {
     /// wide-lag two-baseline sync mechanism. See
     /// `Ft8Config::costas_two_baseline_enabled`.
     costas_two_baseline_enabled: Option<bool>,
+    /// Task W5.4 [A/B]: master switch for the sync_bc partial-Costas
+    /// (blocks B+C only) metric. See `Ft8Config::costas_partial_metric_enabled`.
+    costas_partial_metric_enabled: Option<bool>,
+    /// Task W5.4 [A/B]: half-width (Hz) of the relaxed-sync window around
+    /// the QSO partner. See `Ft8Config::relaxed_sync_near_partner_hz_radius`.
+    relaxed_sync_near_partner_hz_radius: Option<f64>,
+    /// Task W5.4 [A/B]: signed delta applied to `min_sync_score` inside
+    /// the near-partner window. See
+    /// `Ft8Config::relaxed_sync_near_partner_score_delta`.
+    relaxed_sync_near_partner_score_delta: Option<f64>,
+    /// Task W5.4 [HARNESS]: forwards a fixed partner audio frequency (Hz)
+    /// to every `decode_wav` call in the tier (simulating "we have an
+    /// active QSO parked at this frequency" for the whole run). Only has
+    /// an effect when `relaxed_sync_near_partner_hz_radius` is also set.
+    partner_freq_hz: Option<f64>,
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     cross_cycle_averaging: Option<bool>,
     /// hb-074: coherent (phase-aligned complex sum) variant of cross-cycle averaging.
@@ -301,6 +316,10 @@ impl Args {
         let mut escalation_parity_max: Option<usize> = None;
         let mut per_bin_candidate_selection: Option<bool> = None;
         let mut costas_two_baseline_enabled: Option<bool> = None;
+        let mut costas_partial_metric_enabled: Option<bool> = None;
+        let mut relaxed_sync_near_partner_hz_radius: Option<f64> = None;
+        let mut relaxed_sync_near_partner_score_delta: Option<f64> = None;
+        let mut partner_freq_hz: Option<f64> = None;
         let mut cross_cycle_averaging: Option<bool> = None;
         let mut cross_cycle_coherent: Option<bool> = None;
         let mut cross_cycle_coherent_mrc: Option<bool> = None;
@@ -587,6 +606,33 @@ impl Args {
                 }
                 "--no-costas-two-baseline-enabled" => {
                     costas_two_baseline_enabled = Some(false);
+                }
+                "--costas-partial-metric-enabled" => {
+                    costas_partial_metric_enabled = Some(true);
+                }
+                "--no-costas-partial-metric-enabled" => {
+                    costas_partial_metric_enabled = Some(false);
+                }
+                "--relaxed-sync-near-partner-hz-radius" => {
+                    relaxed_sync_near_partner_hz_radius = Some(
+                        iter.next()
+                            .context("--relaxed-sync-near-partner-hz-radius needs a value (Hz, e.g. 3.0)")?
+                            .parse()?,
+                    );
+                }
+                "--relaxed-sync-near-partner-score-delta" => {
+                    relaxed_sync_near_partner_score_delta = Some(
+                        iter.next()
+                            .context("--relaxed-sync-near-partner-score-delta needs a value (signed dB delta, e.g. -1.5)")?
+                            .parse()?,
+                    );
+                }
+                "--partner-freq-hz" => {
+                    partner_freq_hz = Some(
+                        iter.next()
+                            .context("--partner-freq-hz needs a value (Hz, e.g. 1500.0)")?
+                            .parse()?,
+                    );
                 }
                 "--cross-cycle-averaging" => {
                     cross_cycle_averaging = Some(true);
@@ -878,6 +924,9 @@ impl Args {
                     eprintln!("  --ap-post-normalize / --no-ap-post-normalize: decoder-TP-sensitivity Task W2.6 [A/B] — normalize LLRs BEFORE injecting AP bits (not after) at every AP injection site, so the injected magnitude never distorts the channel-evidence scale (production default: off = inject-then-normalize). See Ft8Config::ap_injection_post_normalization.");
                     eprintln!("  --per-bin-candidate-selection / --no-per-bin-candidate-selection: decoder-TP-sensitivity Task W5.1 [A/B] — per-bin (freq_bin) top-K candidate thinning on the main Costas sweep, replacing the flat top-max_sync_candidates cap (production default: off, DECLINED — real regression on hard-200). See Ft8Config::per_bin_candidate_selection.");
                     eprintln!("  --costas-two-baseline-enabled / --no-costas-two-baseline-enabled: decoder-TP-sensitivity Task W5.2 [A/B] — percentile-normalized wide-lag two-baseline (tight+wide) sync candidate emission (production default: off). See Ft8Config::costas_two_baseline_enabled.");
+                    eprintln!("  --costas-partial-metric-enabled / --no-costas-partial-metric-enabled: decoder-TP-sensitivity Task W5.4 [A/B] — sync_bc partial-Costas (blocks B+C only) parallel score, rescuing slot-edge negative-dt candidates whose block A falls outside the window (production default: off). See Ft8Config::costas_partial_metric_enabled.");
+                    eprintln!("  --relaxed-sync-near-partner-hz-radius V / --relaxed-sync-near-partner-score-delta V: decoder-TP-sensitivity Task W5.4 [A/B] — JTDX-style relaxed Costas acceptance threshold inside ±V Hz of the QSO partner audio freq (production default: radius=None, delta=0.0, i.e. inert). See Ft8Config::relaxed_sync_near_partner_hz_radius / _score_delta.");
+                    eprintln!("  --partner-freq-hz V: [HARNESS] forwards a fixed partner audio frequency (Hz) to every decode_wav call in the tier, simulating an active QSO parked at V for the whole run. Only has an effect when --relaxed-sync-near-partner-hz-radius is also set.");
                     eprintln!("  --floor-iters N: shallow BP iteration count for S1/S2 when --escalation-enabled (default 25).");
                     eprintln!("  --deep-iters N: deep BP iteration count a near-miss floor failure is escalated to (default 100).");
                     eprintln!("  --escalation-parity-max N: max unsatisfied parity checks at floor_iters tolerated before escalating (default 30).");
@@ -936,6 +985,10 @@ impl Args {
             escalation_parity_max,
             per_bin_candidate_selection,
             costas_two_baseline_enabled,
+            costas_partial_metric_enabled,
+            relaxed_sync_near_partner_hz_radius,
+            relaxed_sync_near_partner_score_delta,
+            partner_freq_hz,
             cross_cycle_averaging,
             cross_cycle_coherent,
             cross_cycle_coherent_mrc,
@@ -2028,6 +2081,19 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.costas_two_baseline_enabled {
         d = d.with_costas_two_baseline_enabled(on);
+    }
+    if let Some(on) = args.costas_partial_metric_enabled {
+        d = d.with_costas_partial_metric_enabled(on);
+    }
+    if args.relaxed_sync_near_partner_hz_radius.is_some()
+        || args.relaxed_sync_near_partner_score_delta.is_some()
+    {
+        let radius = args.relaxed_sync_near_partner_hz_radius.unwrap_or(3.0);
+        let delta = args.relaxed_sync_near_partner_score_delta.unwrap_or(0.0);
+        d = d.with_relaxed_sync_near_partner(radius, delta);
+    }
+    if let Some(hz) = args.partner_freq_hz {
+        d = d.with_partner_freq_hz(hz);
     }
     if let Some(on) = args.cross_cycle_averaging {
         d = d.with_cross_cycle_averaging(on);

@@ -127,6 +127,11 @@ pub struct Ft8Decoder {
     /// is a per-window wall-clock deadline, not a fixed instant computed
     /// once at CLI-parse time (see `decode_budget`).
     budget_ms: Option<u64>,
+    /// Task W5.4 [HARNESS]: fixed partner audio frequency (Hz) forwarded
+    /// to every `decode_wav` call. `None` (default) reproduces the
+    /// existing `partner_freq_hz = None` behavior byte-for-byte at every
+    /// call site. See `with_partner_freq_hz`.
+    partner_freq_hz: Option<f64>,
     /// Used only so `config_snapshot` is stable across calls.
     _scratch: Mutex<()>,
 }
@@ -155,6 +160,7 @@ impl Ft8Decoder {
             dt_history: None,
             chrono_replay_state: None,
             budget_ms: None,
+            partner_freq_hz: None,
             _scratch: Mutex::new(()),
         }
     }
@@ -599,6 +605,38 @@ impl Ft8Decoder {
         self
     }
 
+    /// Decoder-TP-sensitivity Task W5.4 [A/B]: master switch for the
+    /// sync_bc partial-Costas (blocks B+C only) parallel score. See
+    /// `Ft8Config::costas_partial_metric_enabled`.
+    pub fn with_costas_partial_metric_enabled(mut self, on: bool) -> Self {
+        self.config.costas_partial_metric_enabled = on;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W5.4 [A/B]: JTDX-style relaxed Costas
+    /// acceptance threshold near the QSO partner audio frequency. Sets
+    /// both the radius (Hz) and the score delta (dB, applied to
+    /// `min_sync_score`). See `Ft8Config::relaxed_sync_near_partner_hz_radius`
+    /// / `_score_delta`. Only has an observable effect when a
+    /// `partner_freq_hz` is ALSO supplied per-call (`with_partner_freq_hz`).
+    pub fn with_relaxed_sync_near_partner(mut self, radius_hz: f64, score_delta: f64) -> Self {
+        self.config.relaxed_sync_near_partner_hz_radius = Some(radius_hz);
+        self.config.relaxed_sync_near_partner_score_delta = score_delta;
+        self
+    }
+
+    /// Decoder-TP-sensitivity Task W5.4 [HARNESS]: forward a fixed
+    /// partner audio frequency (Hz) to every `decode_wav` call, simulating
+    /// an active QSO parked at this frequency for the whole run. Threaded
+    /// into `decode_window_with_ap_scoped_partner_budgeted` at every call
+    /// site (constructing a default-empty `ApContext` when none was
+    /// otherwise configured, so the partner-freq argument still reaches
+    /// the decoder without accidentally enabling AP).
+    pub fn with_partner_freq_hz(mut self, hz: f64) -> Self {
+        self.partner_freq_hz = Some(hz);
+        self
+    }
+
     /// hb-056: enable cross-cycle non-coherent symbol averaging.
     pub fn with_cross_cycle_averaging(mut self, on: bool) -> Self {
         self.config.cross_cycle_averaging = on;
@@ -872,7 +910,7 @@ impl DecoderUnderTest for Ft8Decoder {
                     &samples,
                     &ctx,
                     None,
-                    None,
+                    self.partner_freq_hz,
                     self.decode_budget(),
                 )
                 .map(|(messages, _report)| messages)
@@ -930,7 +968,7 @@ impl DecoderUnderTest for Ft8Decoder {
                     &samples,
                     &ctx,
                     None,
-                    None,
+                    self.partner_freq_hz,
                     self.decode_budget(),
                 )
                 .map(|(messages, _report)| messages)
@@ -971,13 +1009,40 @@ impl DecoderUnderTest for Ft8Decoder {
                         &samples,
                         ctx,
                         None,
-                        None,
+                        self.partner_freq_hz,
                         self.decode_budget(),
                     )
                     .map(|(messages, _report)| messages)
                     .map_err(|e| {
                         anyhow::anyhow!("decode_window_with_ap failed for {}: {e}", path.display())
                     })?,
+                // Task W5.4 [HARNESS]: no ApContext was otherwise
+                // configured, but a fixed partner_freq_hz was requested —
+                // build a default-empty ApContext (AP stays inert: no
+                // my_call, no recent_calls, no active_qso) purely so the
+                // partner-frequency argument reaches the decoder.
+                None if self.partner_freq_hz.is_some() => {
+                    let ctx = pancetta_ft8::ap::ApContext {
+                        my_call: None,
+                        recent_calls: Vec::new(),
+                        active_qso: None,
+                    };
+                    decoder
+                        .decode_window_with_ap_scoped_partner_budgeted(
+                            &samples,
+                            &ctx,
+                            None,
+                            self.partner_freq_hz,
+                            self.decode_budget(),
+                        )
+                        .map(|(messages, _report)| messages)
+                        .map_err(|e| {
+                            anyhow::anyhow!(
+                                "decode_window_with_ap (partner-freq-only) failed for {}: {e}",
+                                path.display()
+                            )
+                        })?
+                }
                 None => decoder
                     .decode_window_budgeted(&samples, self.decode_budget())
                     .map(|(messages, _report)| messages)

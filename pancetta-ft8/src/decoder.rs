@@ -686,6 +686,26 @@ pub struct Ft8Config {
     /// retry path — the filter NEVER rejects candidates when no prior
     /// is available (cold-start safe). A meaningful fraction of missed
     /// truths sit in the prior-recoverable population.
+    ///
+    /// Decoder-TP-sensitivity Task W5.4 [A/B, RETESTED — DECLINED]:
+    /// re-measured against the true production default on hard-200:
+    /// rec Δ=+0 (exact — every bootstrap resample identical), novel
+    /// Δ=-5 (95% CI [-10,-1], significant but tiny). This mechanism only
+    /// touches the RESIDUAL sync pass, which requires
+    /// `max_decode_passes > 1` — the shipped default is 1
+    /// (`subtract_signal` never runs), so the flag is structurally inert
+    /// in production regardless of this bool's value (same "dead path"
+    /// class as `time_varying_subtraction_enabled`/
+    /// `full_scale_subtraction_enabled`). A diagnostic re-measurement
+    /// with `max_decode_passes` forced to 3 (a config where the residual
+    /// pass — and therefore this mechanism — actually runs) STILL showed
+    /// rec Δ=+0 exactly (novel Δ=-9, 95% CI [-17,-3]) on hard-200: no
+    /// truth-decode benefit was found even when the mechanism is
+    /// reachable, only a small reduction in spurious residual-pass
+    /// novel decodes. noise_1000 FP unchanged (1→1) in both
+    /// configurations. Default stays **false** — no recall benefit was
+    /// found to justify flipping it, on this corpus, in this retest. See
+    /// `research/experiments/2026-07-09-w54-shelved-sync-mechanisms-retest.md`.
     pub dt_history_enabled: bool,
 
     /// Minimum prior-gate radius (seconds). The gate width is
@@ -717,11 +737,30 @@ pub struct Ft8Config {
     /// score. This rescues slot-edge negative-dt signals where block A
     /// falls outside the recorded window — the full metric collapses
     /// (block A is noise/garbage) while the partial metric is still
-    /// meaningful. Non-destructive: when block A contains real signal,
-    /// the full metric dominates and nothing changes. Inspired by
-    /// wsjtr `sync_bc` / WSJT-X mainline `sync8`. Targets slot-edge
-    /// signals, an under-recovered bucket. Default **true** as a
-    /// non-destructive backstop; flip to false to A/B-test the mechanism.
+    /// meaningful. Inspired by wsjtr `sync_bc` / WSJT-X mainline
+    /// `sync8`. Targets slot-edge signals, an under-recovered bucket.
+    ///
+    /// Decoder-TP-sensitivity Task W5.4 [A/B, RETESTED — DECLINED]:
+    /// this doc previously (incorrectly) described the flag as
+    /// "non-destructive" with a default of **true** — that text was
+    /// stale from before the flat-candidate-cap displacement finding
+    /// (spec §6, "-18 TP") that shelved it to **false**, and this
+    /// retest confirms "non-destructive" was never actually true: on
+    /// hard-200 (true production default, corpus/pipeline unchanged
+    /// since W5.1/W5.2 were both declined), rec Δ=+3 (95% CI [-3,+9],
+    /// NOT significant), novel Δ=-59 (95% CI [-109,-16], significant
+    /// decrease). But on noise_1000: false_positives_total 1→11 (a 10×
+    /// increase) — a clean, decisive HARD GATE FAILURE. A purpose-built
+    /// synthetic slot-edge corpus paired with Task W5.3's
+    /// `extended_capture_window_enabled` (per this task's brief)
+    /// confirmed the same pattern at smaller scale: identical recall at
+    /// every dt/lead combination tested (28/140 vs 28/140 default-lead,
+    /// 51/140 vs 51/140 extended-lead — this flag never changed a
+    /// single outcome even paired with the wider capture window), while
+    /// synthetic noise-only trials went from 0/200 to 1/200 (default
+    /// lead) and 2/200 (extended lead), plus a real elapsed-cost
+    /// increase (+17.6%/+6.8%). Default stays **false**. See
+    /// `research/experiments/2026-07-09-w54-shelved-sync-mechanisms-retest.md`.
     pub costas_partial_metric_enabled: bool,
 
     /// Wide-lag baseline (red2): two-pathway sync candidate
@@ -821,6 +860,20 @@ pub struct Ft8Config {
     /// through the pair. Disabling it measurably reduces recall (and
     /// false positives) at a wall-clock saving, with no localization
     /// benefit.
+    ///
+    /// Decoder-TP-sensitivity Task W5.4 [A/B, RETESTED — DECLINED, again]:
+    /// already independently re-tested once before, in the decoder-
+    /// speed-overhaul plan (Task 6, `research/experiments/2026-07-06-costas-half-loop.md`) —
+    /// same verdict there (rec Δ=-58, 95% CI [-80,-39], significant
+    /// regression on hard-200). This task re-ran the same A/B on the
+    /// current pipeline (30+ commits later, same corpus) per its
+    /// standing instruction to genuinely retest rather than assume the
+    /// prior verdict still holds: rec Δ=-43 (95% CI [-62,-26],
+    /// significant), novel Δ=-64 (95% CI [-125,+3], NOT significant this
+    /// time), noise_1000 FP unchanged (1→1). Same direction, same
+    /// significance, smaller magnitude — a CONSISTENT, expected
+    /// reconfirmation, not a surprise. Default stays **false**. See
+    /// `research/experiments/2026-07-09-w54-shelved-sync-mechanisms-retest.md`.
     pub costas_half_loop_disabled: bool,
 
     /// Half-width (Hz) of the relaxed-sync window centred on the
@@ -836,6 +889,40 @@ pub struct Ft8Config {
     /// — the band-collapse already narrows the sweep; this further
     /// relaxes acceptance inside the narrow window for weak partner
     /// messages (RR73 / 73 at low SNR).
+    ///
+    /// Decoder-TP-sensitivity Task W5.4 [A/B, RETESTED — DECLINED, no
+    /// real delta found]: this task performed the empirical
+    /// recalibration `relaxed_sync_near_partner_score_delta`'s doc calls
+    /// for. A purpose-built synthetic harness embedded a partner reply
+    /// ("W1ABC K5ARH RR73") exactly at the relaxed window's center,
+    /// well-aligned (dt=0), swept across the marginal-SNR cliff this
+    /// message shows on its own (baseline, mechanism off: 43.3%/30.0%/
+    /// 23.3%/6.7%/0.0% recall at -16.2/-16.4/-16.6/-16.8/-17.0 dB) and
+    /// across delta ∈ {0, -1.0, -2.0, -3.0} (the last is the maximum
+    /// possible relaxation — `min_sync_score=3.0`, clamped at 0) at the
+    /// JTDX reference radius of 3.0 Hz. Result: **identical recall at
+    /// every single delta tested, at every SNR point** — the relaxed
+    /// threshold never rescued a single trial, even at maximum
+    /// relaxation. A corpus-level sanity check (hard-200 with a FIXED
+    /// partner freq forced across all 200 WAVs, radius=3.0,
+    /// delta=-2.0) showed a byte-identical composite score to the
+    /// control (0.3126, zero decode-count change) — expected, since only
+    /// signals within ±3 Hz of the forced frequency could ever be
+    /// affected in a 200-WAV corpus with no real partner-frequency
+    /// concept. noise_1000 under the same forced config: FP unchanged
+    /// (1→1) — no FP-risk finding either way. Working theory (not
+    /// independently confirmed): like `costas_partial_metric_enabled`,
+    /// this mechanism's designed benefit is about candidate-CAP
+    /// DISPLACEMENT in a crowded band (spec §6) — an isolated
+    /// single-signal synthetic scene never exercises that failure mode,
+    /// so a delta sweep there can only show whether raw sync-score
+    /// rejection (as opposed to cap displacement) is the bottleneck; it
+    /// wasn't, in this configuration. Since W5.1/W5.2 (the two
+    /// candidate-cap-displacement fixes) are BOTH declined as defaults,
+    /// there is no shippable configuration in which this theory could be
+    /// tested end-to-end either. No delta value found empirical support
+    /// in this retest. Default stays **`None`/`0.0`** (fully inert) — see
+    /// `research/experiments/2026-07-09-w54-shelved-sync-mechanisms-retest.md`.
     pub relaxed_sync_near_partner_hz_radius: Option<f64>,
 
     /// Signed delta added to `min_sync_score` to form the
@@ -846,12 +933,13 @@ pub struct Ft8Config {
     /// JTDX's reference value is `1.1` on a linear-magnitude scale
     /// normalised by the 40th-percentile baseline. Pancetta's
     /// `min_sync_score` is a raw dB-difference metric, so the JTDX
-    /// constant does NOT transfer numerically. **Empirical recalibration
-    /// is required**: collect normalised-vs-raw sync scores on a known
-    /// partner signal at marginal SNR, find the dB-difference level
-    /// corresponding to JTDX's 1.1, and use the negative of
-    /// (raw_threshold - that_level) as this knob. Recalibration is
-    /// recommended before flipping the default ON.
+    /// constant does NOT transfer numerically. See
+    /// `relaxed_sync_near_partner_hz_radius`'s doc for the Task W5.4
+    /// empirical recalibration attempt — no delta value (including the
+    /// maximum possible, -3.0/clamped-at-0) showed measurable recall
+    /// benefit in that retest, so the recommendation to recalibrate
+    /// before flipping the default ON no longer has a candidate value
+    /// backing it. Stays **0.0**.
     pub relaxed_sync_near_partner_score_delta: f64,
 
     /// JTDX cycle audio smoothing: when `true` AND `max_decode_passes > 1`,
