@@ -764,6 +764,26 @@ mod tests {
     }
 
     #[test]
+    fn reopen_unforced_same_device_is_a_true_noop_force_is_required_for_recovery() {
+        // Pins the exact contract pancetta/src/coordinator/audio.rs's
+        // auto-recovery loop depends on: reopen_devices(None, None, false)
+        // on an unchanged device selection is a silent no-op (does NOT
+        // rebuild the stream). Auto-recovery has no new device name to
+        // supply, so it MUST pass force: true or it silently does nothing
+        // while still reporting Ok. This test doesn't assert the stream was
+        // rebuilt (no mock cpal layer exists in this crate today) — it pins
+        // the resolve_reopen_targets contract the no-op path is built on,
+        // which is the part that would silently break this feature.
+        assert_eq!(
+            resolve_reopen_targets(Some("Rig"), Some("RigOut"), None, None),
+            None,
+            "no requested change must resolve to no-op regardless of force; \
+             force is consulted by reopen_devices AFTER this returns None, \
+             which is why auto-recovery must pass force: true explicitly"
+        );
+    }
+
+    #[test]
     fn force_reopen_rebuilds_even_when_unchanged() {
         // The Jump-Desktop reclaim case: an explicit operator pick of the
         // CURRENT device (names unchanged) must still rebuild the stream when
