@@ -148,6 +148,13 @@ impl super::ApplicationCoordinator {
             // `SelectDevice` handler sends an `AudioReopenRequest` here; the
             // thread reopens the cpal stream(s) on the new device(s) in place.
             let (reopen_tx, reopen_rx) = crossbeam_channel::unbounded::<AudioReopenRequest>();
+            // docs/audio-robustness-plan.md item 4: the relay task's stale-
+            // timeout arm below needs its own sender to self-trigger a
+            // recovery reopen through the SAME channel + drain loop the
+            // operator's TUI device picker uses — reusing that path means no
+            // new cross-thread coordination is needed (the audio thread's
+            // loop already serializes every reopen_devices call).
+            let reopen_tx_watchdog = reopen_tx.clone();
             self.audio_reopen_tx = Some(reopen_tx);
 
             // Audio thread sends samples via a tokio mpsc to an async relay
@@ -421,6 +428,7 @@ impl super::ApplicationCoordinator {
             let health_audio_alive_relay = health_audio_alive.clone();
             let handle = tokio::spawn(async move {
                 let mut relay_count: u64 = 0;
+                let mut stale_watchdog = crate::coordinator::audio_recovery::StaleWatchdog::new();
                 // Record 90 seconds of raw 48kHz stereo audio for diagnostics
                 // (covers ~6 FT8 windows regardless of boundary alignment)
                 let raw_capture_samples = 48000 * 2 * 90; // 90s stereo
@@ -438,10 +446,58 @@ impl super::ApplicationCoordinator {
                 loop {
                     let samples =
                         match tokio::time::timeout(AUDIO_STALE_TIMEOUT, result_rx.recv()).await {
-                            Ok(Some(samples)) => samples,
+                            Ok(Some(samples)) => {
+                                stale_watchdog.on_data();
+                                samples
+                            }
                             Ok(None) => break, // sender dropped — audio thread stopped
                             Err(_elapsed) => {
                                 health_audio_alive_relay.store(false, Ordering::Relaxed);
+                                // docs/audio-robustness-plan.md item 4: a
+                                // wedged device (callbacks stopped without a
+                                // cpal StreamError) sets no flag anywhere
+                                // today — process_audio() just keeps
+                                // returning Ok(None) forever. Fire exactly
+                                // once per stale episode (StaleWatchdog
+                                // edge-detects this) rather than every 2s
+                                // tick, since each signal is a real cpal
+                                // teardown+rebuild on the audio thread.
+                                if stale_watchdog.on_timeout() {
+                                    warn!(
+                                        "Audio watchdog: no samples for {:?} — \
+                                         requesting a self-triggered device reopen",
+                                        AUDIO_STALE_TIMEOUT
+                                    );
+                                    let (respond_tx, respond_rx) =
+                                        tokio::sync::oneshot::channel();
+                                    let sent = reopen_tx_watchdog.send(AudioReopenRequest {
+                                        input: None,
+                                        output: None,
+                                        force: true,
+                                        respond: respond_tx,
+                                    });
+                                    if sent.is_err() {
+                                        warn!(
+                                            "Audio watchdog: reopen channel closed, \
+                                             cannot self-trigger recovery"
+                                        );
+                                    } else {
+                                        tokio::spawn(async move {
+                                            match respond_rx.await {
+                                                Ok(Ok(())) => info!(
+                                                    "Audio watchdog: self-triggered \
+                                                     reopen succeeded"
+                                                ),
+                                                Ok(Err(e)) => warn!(
+                                                    "Audio watchdog: self-triggered \
+                                                     reopen failed: {}",
+                                                    e
+                                                ),
+                                                Err(_) => {} // audio thread dropped the responder — shutting down
+                                            }
+                                        });
+                                    }
+                                }
                                 continue;
                             }
                         };
