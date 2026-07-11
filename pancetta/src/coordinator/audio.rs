@@ -476,10 +476,12 @@ impl super::ApplicationCoordinator {
                                 // wedged device (callbacks stopped without a
                                 // cpal StreamError) sets no flag anywhere
                                 // today — process_audio() just keeps
-                                // returning Ok(None) forever. Fire exactly
-                                // once per stale episode (StaleWatchdog
-                                // edge-detects this) rather than every 2s
-                                // tick, since each signal is a real cpal
+                                // returning Ok(None) forever. Fire on the
+                                // first stale tick, then at most once every
+                                // RETRY_AFTER_TICKS (~10s at this 2s
+                                // cadence) while still stale (StaleWatchdog's
+                                // bounded retry) rather than every 2s tick,
+                                // since each signal is a real cpal
                                 // teardown+rebuild on the audio thread.
                                 if stale_watchdog.on_timeout() {
                                     warn!(
