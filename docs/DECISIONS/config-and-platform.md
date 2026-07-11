@@ -33,3 +33,26 @@ Several hand-written `ConfigSection::merge_with` impls silently dropped fields a
 
 - **BP escalation ladder (S3) escalates in candidate rank order, not by promise** — inert today (`escalation_enabled=false`), but if ever flipped on under real time pressure this could waste a tight budget on an early low-promise candidate while skipping a later near-certain one. Fix is a global collect-sort-escalate restructure per the original design, not yet built.
 - **Effort budget is not re-seeded by config hot-reload.** `seed_effort_budget` only runs at coordinator startup and tier-probe completion; editing `[decoder]` in a running instance's config file has no live effect (restart required). The live `e`-key TUI control is unaffected — it writes the atomic directly. Root cause: `pancetta-config`'s hot-reload file watcher is a documented no-op in this codebase today.
+
+## Audio auto-recovery supervisor (2026-07-11)
+
+Closed `docs/audio-robustness-plan.md`'s remaining design gaps (items 1 and 4 — items 2/3 shipped
+earlier in PR #85). The audio thread's `process_audio()` `Err` arm now runs a capped-exponential
+backoff (`RecoveryBackoff`, `pancetta/src/coordinator/audio_recovery.rs`: immediate first attempt,
+250ms->5s capped thereafter) calling the existing `AudioManager::reopen_devices` primitive with
+`force: true` — required because `resolve_reopen_targets` treats an unchanged device selection as a
+no-op before `force` is even consulted, so a same-device recovery call with `force: false` would
+silently do nothing. A silent-death (wedged-device) watchdog was added to the async relay task's
+existing 2-second no-data timeout: instead of only flipping the (already-fixed, PR #85)
+`health_audio_alive` reporting flag, it now also sends a synthetic, force-flagged
+`AudioReopenRequest` through the SAME `reopen_tx` channel the TUI device picker already uses,
+edge-detected via `StaleWatchdog` so a persistently wedged device gets one reopen attempt per stale
+episode rather than one every 2s tick. Both new trigger paths ultimately call `reopen_devices` from
+inside the audio thread's single-threaded loop, which already serializes every call (operator picker,
+Err-arm recovery, watchdog self-trigger) — no new mutex/atomic coordination primitive was needed to
+satisfy the design doc's "don't fight the operator's deliberate device switch" risk note. Real RX
+drop-rate (`AudioCommShared.dropped_samples`, already incremented in the RT callback — NOT
+`AudioManagerStats.underruns`/`.overruns`, confirmed always-zero and dead in this crate) is now
+surfaced as a rate-limited `DiagnosticEvent` (at most once per 30s, only when nonzero). Plan:
+`docs/superpowers/plans/2026-07-11-audio-auto-recovery.md`. Outstanding: the real unplug/replug
+validation is operator-gated hardware time, tracked separately.
