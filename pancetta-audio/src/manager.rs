@@ -304,6 +304,22 @@ impl AudioManager {
         self.stats.clone()
     }
 
+    /// Total RX samples dropped by the real-time ring-buffer producer since
+    /// the current stream was opened (docs/audio-robustness-plan.md item 4).
+    /// Backed by [`AudioCommShared::dropped_samples`], which the RT callback
+    /// increments directly — unlike [`AudioManagerStats`]'s `underruns`/
+    /// `overruns` fields (never incremented anywhere in this crate), this is
+    /// real, live data.
+    pub fn dropped_samples(&self) -> u64 {
+        self.shared.dropped_samples()
+    }
+
+    /// RX sample drop rate as a percentage of (dropped + processed) since the
+    /// current stream was opened. See [`dropped_samples`](Self::dropped_samples).
+    pub fn drop_rate_percent(&self) -> f64 {
+        self.shared.get_drop_rate()
+    }
+
     /// Check if audio is running
     pub fn is_running(&self) -> bool {
         self.stream.as_ref().is_some_and(|s| s.is_running())
@@ -695,6 +711,15 @@ mod tests {
             let result = manager.queue_output(&samples, 12000);
             // Should succeed — producer is available even without a running stream
             assert!(result.is_ok() || result.is_err());
+        }
+    }
+
+    #[test]
+    fn dropped_samples_and_drop_rate_delegate_to_shared_state() {
+        if let Ok(manager) = AudioManager::new() {
+            // A freshly constructed manager has processed nothing yet.
+            assert_eq!(manager.dropped_samples(), 0);
+            assert_eq!(manager.drop_rate_percent(), 0.0);
         }
     }
 

@@ -285,6 +285,8 @@ impl super::ApplicationCoordinator {
                 let mut last_recovery_report =
                     std::time::Instant::now() - std::time::Duration::from_secs(60);
                 let recovery_report_min_gap = std::time::Duration::from_secs(10);
+                let mut last_drop_report = std::time::Instant::now();
+                let drop_report_interval = std::time::Duration::from_secs(30);
 
                 loop {
                     if shutdown.load(Ordering::Acquire) {
@@ -416,6 +418,23 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    if last_drop_report.elapsed() >= drop_report_interval {
+                        last_drop_report = std::time::Instant::now();
+                        let dropped = audio_manager.dropped_samples();
+                        if dropped > 0 {
+                            let rate = audio_manager.drop_rate_percent();
+                            let level = if rate > 1.0 { Level::WARN } else { Level::INFO };
+                            report_audio_diagnostic(
+                                level,
+                                "audio.health",
+                                format!(
+                                    "Audio RX drop rate {:.2}% ({} samples dropped)",
+                                    rate, dropped
+                                ),
+                            );
                         }
                     }
                 }
