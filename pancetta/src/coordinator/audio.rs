@@ -243,12 +243,14 @@ impl super::ApplicationCoordinator {
                 //
                 // Named report_audio_diagnostic (not report_recovery_diagnostic)
                 // because Task 4 reuses it for the periodic drop-rate
-                // diagnostic — it is a generic level+text emitter, not
-                // recovery-specific.
+                // diagnostic — it is a generic level+target+text emitter, not
+                // recovery-specific — target is a caller-supplied parameter
+                // (not hardcoded) precisely so a later, unrelated diagnostic
+                // doesn't get mislabeled under audio.recovery.
                 let report_audio_diagnostic = {
                     let bus = audio_bus.clone();
                     let rt = runtime_handle.clone();
-                    move |level: Level, text: String| {
+                    move |level: Level, target: &'static str, text: String| {
                         let bus = bus.clone();
                         let diagnostic_level = if level == Level::WARN {
                             pancetta_core::DiagnosticLevel::Warn
@@ -260,7 +262,7 @@ impl super::ApplicationCoordinator {
                                 ComponentId::Audio,
                                 ComponentId::Tui,
                                 MessageType::DiagnosticEvent {
-                                    target: "audio.recovery",
+                                    target,
                                     level: diagnostic_level,
                                     text,
                                     qso_id: None,
@@ -380,6 +382,7 @@ impl super::ApplicationCoordinator {
                                     if recovery.attempts() > 1 {
                                         report_audio_diagnostic(
                                             Level::INFO,
+                                            "audio.recovery",
                                             "Audio device recovered".to_string(),
                                         );
                                     }
@@ -394,6 +397,7 @@ impl super::ApplicationCoordinator {
                                     if last_recovery_report.elapsed() >= recovery_report_min_gap {
                                         report_audio_diagnostic(
                                             Level::WARN,
+                                            "audio.recovery",
                                             format!(
                                                 "Audio device lost — retrying \
                                                  (attempt {}): {}",
