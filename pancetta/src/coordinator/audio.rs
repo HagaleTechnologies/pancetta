@@ -487,8 +487,7 @@ impl super::ApplicationCoordinator {
                                          requesting a self-triggered device reopen",
                                         AUDIO_STALE_TIMEOUT
                                     );
-                                    let (respond_tx, respond_rx) =
-                                        tokio::sync::oneshot::channel();
+                                    let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
                                     let sent = reopen_tx_watchdog.send(AudioReopenRequest {
                                         input: None,
                                         output: None,
