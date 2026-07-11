@@ -214,7 +214,10 @@ mod tests {
         assert!(w.on_timeout(), "first tick signals");
         // Ticks 2..RETRY_AFTER_TICKS (exclusive of the retry tick itself) must not re-signal.
         for _ in 0..(RETRY_AFTER_TICKS - 1) {
-            assert!(!w.on_timeout(), "must not re-signal before the retry threshold");
+            assert!(
+                !w.on_timeout(),
+                "must not re-signal before the retry threshold"
+            );
         }
         // The RETRY_AFTER_TICKS-th consecutive stale tick (with no on_data() call
         // in between) must fire again — this is the bounded-retry guarantee.
