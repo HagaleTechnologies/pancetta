@@ -504,7 +504,9 @@ impl super::ApplicationCoordinator {
                                             match respond_rx.await {
                                                 Ok(Ok(())) => info!(
                                                     "Audio watchdog: self-triggered \
-                                                     reopen succeeded"
+                                                     reopen call succeeded (stream \
+                                                     rebuilt); waiting to see if data \
+                                                     resumes"
                                                 ),
                                                 Ok(Err(e)) => warn!(
                                                     "Audio watchdog: self-triggered \

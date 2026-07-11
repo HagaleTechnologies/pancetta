@@ -68,32 +68,60 @@ impl Default for RecoveryBackoff {
 /// thrashing on a device that's slow to reopen. `on_timeout` returns `true`
 /// only on the first tick of a stale episode; `on_data` (called whenever a
 /// fresh sample batch arrives) re-arms it for the next episode.
+///
+/// A device reopen can succeed at the cpal level (the stream rebuilds
+/// cleanly) while the device still never delivers data afterward — still
+/// wedged for some other reason. Since `on_data` never fires in that case,
+/// a pure one-shot latch would abandon the device forever after a single
+/// attempt. To avoid that, the watchdog also re-arms itself after
+/// [`RETRY_AFTER_TICKS`] consecutive stale ticks with no intervening
+/// `on_data` call — a bounded retry, not a permanent latch.
 pub struct StaleWatchdog {
     already_signaled: bool,
+    ticks_since_signal: u32,
 }
+
+/// After this many consecutive stale ticks with no re-arming data, the
+/// watchdog fires again even though the device is still in the same stale
+/// episode — a bounded retry so a device that reopens cleanly at the cpal
+/// level but never actually resumes delivering data (e.g. still physically
+/// wedged) isn't abandoned forever after its first attempt. At the relay
+/// task's 2s tick cadence this is roughly a 10s retry cadence while stale.
+const RETRY_AFTER_TICKS: u32 = 5;
 
 impl StaleWatchdog {
     pub fn new() -> Self {
         Self {
             already_signaled: false,
+            ticks_since_signal: 0,
         }
     }
 
-    /// Call on every stale-timeout tick. Returns `true` exactly once per
-    /// stale episode (the transition edge into staleness).
+    /// Call on every stale-timeout tick. Returns `true` on the first tick of
+    /// a stale episode, and again every [`RETRY_AFTER_TICKS`] ticks
+    /// thereafter while still stale (bounded retry) — `false` on every tick
+    /// in between.
     pub fn on_timeout(&mut self) -> bool {
-        if self.already_signaled {
-            false
-        } else {
+        if !self.already_signaled {
             self.already_signaled = true;
+            self.ticks_since_signal = 0;
             true
+        } else {
+            self.ticks_since_signal += 1;
+            if self.ticks_since_signal >= RETRY_AFTER_TICKS {
+                self.ticks_since_signal = 0;
+                true
+            } else {
+                false
+            }
         }
     }
 
     /// Call whenever fresh data arrives, re-arming the watchdog for the next
-    /// stale episode.
+    /// stale episode (and resetting the bounded-retry counter).
     pub fn on_data(&mut self) {
         self.already_signaled = false;
+        self.ticks_since_signal = 0;
     }
 }
 
@@ -178,5 +206,21 @@ mod tests {
         // this without a failing test.)
         let mut w = w;
         assert!(w.on_timeout());
+    }
+
+    #[test]
+    fn watchdog_retries_after_bounded_stale_ticks_without_data() {
+        let mut w = StaleWatchdog::new();
+        assert!(w.on_timeout(), "first tick signals");
+        // Ticks 2..RETRY_AFTER_TICKS (exclusive of the retry tick itself) must not re-signal.
+        for _ in 0..(RETRY_AFTER_TICKS - 1) {
+            assert!(!w.on_timeout(), "must not re-signal before the retry threshold");
+        }
+        // The RETRY_AFTER_TICKS-th consecutive stale tick (with no on_data() call
+        // in between) must fire again — this is the bounded-retry guarantee.
+        assert!(
+            w.on_timeout(),
+            "must retry after RETRY_AFTER_TICKS consecutive stale ticks with no data"
+        );
     }
 }
