@@ -17,6 +17,7 @@
 //! and exits.
 
 mod audio;
+mod audio_recovery;
 mod autonomous;
 mod dsp;
 mod dx_cluster;
