@@ -730,6 +730,21 @@ pub struct App {
     /// emits (`"QSO with {call} logged (RST …/…)"`, target "qso", Info
     /// level). Rendered as "QSOs: {n}" in the title bar once n > 0.
     pub session_completed: u32,
+    /// Count of QSOs failed this session (Layer 3 health panel sibling to
+    /// `session_completed`). Counted TUI-side from the same DiagnosticEvent
+    /// stream, matching the coordinator's exact failure text ("QSO failed:
+    /// {reason}", target "qso", Warn) from `coordinator/qso.rs`'s
+    /// `QsoFailed` handler.
+    pub session_failed: u32,
+    /// Count of TX drops this session (stale-TX-for-ended-QSO, multi-TX
+    /// per-item/whole-bundle stale drops, backlog-coalesce drops) — matches
+    /// the "tx.policy"-target "dropping stale ..." diagnostic texts added
+    /// in the 2026-07-12 tx.policy observability-wiring pass
+    /// (docs/DECISIONS/tui.md). Deliberately does NOT count TxPolicy-
+    /// Disabled blocks (an intentional operator action, not a drop) or the
+    /// non-TX-message re-enqueue-failure diagnostic (an internal error, not
+    /// a drop).
+    pub session_tx_drops: u32,
     /// Set by the first `x` press (Task 20f — confirm-on-`x`); a second
     /// press within `CLEAR_CONFIRM_WINDOW` actually clears decodes. `None`
     /// = not armed.
@@ -1038,6 +1053,8 @@ impl App {
             show_diagnostics: false,
             diagnostics_scroll: 0,
             session_completed: 0,
+            session_failed: 0,
+            session_tx_drops: 0,
             clear_armed_at: None,
             decoded_messages: VecDeque::with_capacity(1000),
             qso_statuses: Vec::new(),

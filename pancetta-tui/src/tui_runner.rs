@@ -807,6 +807,15 @@ impl TuiRunner {
                 {
                     app.session_completed += 1;
                 }
+                if target == "qso"
+                    && level == pancetta_core::DiagnosticLevel::Warn
+                    && text.starts_with("QSO failed:")
+                {
+                    app.session_failed += 1;
+                }
+                if target == "tx.policy" && text.starts_with("dropping stale") {
+                    app.session_tx_drops += 1;
+                }
                 app.push_diagnostic_event(crate::app::DiagnosticEventRecord {
                     ts,
                     target,
@@ -2954,6 +2963,45 @@ mod key_tests {
         .unwrap();
 
         assert_eq!(app.read().await.session_completed, 2);
+    }
+
+    /// Layer 3 health panel (Task 4): `session_failed` and
+    /// `session_tx_drops` are tallied TUI-side from the same
+    /// DiagnosticEvent stream `session_completed` uses — a QSO-failed event
+    /// (target "qso", Warn, "QSO failed: ...") increments `session_failed`,
+    /// and a tx.policy stale-drop event (target "tx.policy", "dropping
+    /// stale ...") increments `session_tx_drops`. Neither counter reacts to
+    /// the other's event.
+    #[tokio::test]
+    async fn session_failed_and_tx_drops_are_tallied_from_diagnostic_text() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert_eq!(app.read().await.session_failed, 0);
+        assert_eq!(app.read().await.session_tx_drops, 0);
+
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "qso",
+            level: pancetta_core::DiagnosticLevel::Warn,
+            text: "QSO failed: timeout".to_string(),
+            qso_id: None,
+            callsign: None,
+        })
+        .await
+        .unwrap();
+
+        r.handle_message(TuiMessage::DiagnosticEvent {
+            ts: chrono::Utc::now(),
+            target: "tx.policy",
+            level: pancetta_core::DiagnosticLevel::Info,
+            text: "dropping stale TX for ended QSO: 'CQ K5ARH EM12'".to_string(),
+            qso_id: None,
+            callsign: None,
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(app.read().await.session_failed, 1);
+        assert_eq!(app.read().await.session_tx_drops, 1);
     }
 
     /// Whole-branch-review fix (finding 1): `TxOffsetUpdate` (the
