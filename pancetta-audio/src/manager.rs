@@ -304,6 +304,22 @@ impl AudioManager {
         self.stats.clone()
     }
 
+    /// Total RX samples dropped by the real-time ring-buffer producer since
+    /// the current stream was opened (docs/audio-robustness-plan.md item 4).
+    /// Backed by [`AudioCommShared::dropped_samples`], which the RT callback
+    /// increments directly — unlike [`AudioManagerStats`]'s `underruns`/
+    /// `overruns` fields (never incremented anywhere in this crate), this is
+    /// real, live data.
+    pub fn dropped_samples(&self) -> u64 {
+        self.shared.dropped_samples()
+    }
+
+    /// RX sample drop rate as a percentage of (dropped + processed) since the
+    /// current stream was opened. See [`dropped_samples`](Self::dropped_samples).
+    pub fn drop_rate_percent(&self) -> f64 {
+        self.shared.get_drop_rate()
+    }
+
     /// Check if audio is running
     pub fn is_running(&self) -> bool {
         self.stream.as_ref().is_some_and(|s| s.is_running())
@@ -699,6 +715,15 @@ mod tests {
     }
 
     #[test]
+    fn dropped_samples_and_drop_rate_delegate_to_shared_state() {
+        if let Ok(manager) = AudioManager::new() {
+            // A freshly constructed manager has processed nothing yet.
+            assert_eq!(manager.dropped_samples(), 0);
+            assert_eq!(manager.drop_rate_percent(), 0.0);
+        }
+    }
+
+    #[test]
     fn test_resolve_reopen_targets_no_request_is_noop() {
         assert_eq!(
             resolve_reopen_targets(Some("Mic"), Some("Spk"), None, None),
@@ -761,6 +786,26 @@ mod tests {
         if let Ok(mut manager) = AudioManager::new() {
             assert!(manager.reopen_devices(None, None, false).is_ok());
         }
+    }
+
+    #[test]
+    fn reopen_unforced_same_device_is_a_true_noop_force_is_required_for_recovery() {
+        // Pins the exact contract pancetta/src/coordinator/audio.rs's
+        // auto-recovery loop depends on: reopen_devices(None, None, false)
+        // on an unchanged device selection is a silent no-op (does NOT
+        // rebuild the stream). Auto-recovery has no new device name to
+        // supply, so it MUST pass force: true or it silently does nothing
+        // while still reporting Ok. This test doesn't assert the stream was
+        // rebuilt (no mock cpal layer exists in this crate today) — it pins
+        // the resolve_reopen_targets contract the no-op path is built on,
+        // which is the part that would silently break this feature.
+        assert_eq!(
+            resolve_reopen_targets(Some("Rig"), Some("RigOut"), None, None),
+            None,
+            "no requested change must resolve to no-op regardless of force; \
+             force is consulted by reopen_devices AFTER this returns None, \
+             which is why auto-recovery must pass force: true explicitly"
+        );
     }
 
     #[test]

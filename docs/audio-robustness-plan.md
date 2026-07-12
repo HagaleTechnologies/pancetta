@@ -1,5 +1,13 @@
 # Audio device robustness — implementation plan
 
+**Status: items 1-4 shipped** — 2026-07-11. Auto-recovery supervisor (item 1), missing
+`clear_stream_error` (item 2, shipped PR #85 but ultimately unused by the recovery path — see
+rationale in the implementation plan), output-side loss detection (item 3, shipped PR #85), and the
+silent-death watchdog + drop-rate surfacing (item 4) are all live. Remaining: the real-world
+unplug/replug validation test (operator-gated, see `project_meatspace_pending`) and the
+operator-switch-vs-recovery coordination risk, which turned out to need no new code — see
+"Key findings" in `docs/superpowers/plans/2026-07-11-audio-auto-recovery.md`.
+
 Detailed plan to make the audio path survive a **disconnected, replugged, or wedged** USB
 codec — auto-recovering instead of going silently dead until a manual restart. **Plan only
 — no code here.** Grounded in the current code.

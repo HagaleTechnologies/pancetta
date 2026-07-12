@@ -16,7 +16,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
-use tracing::{error, info, span, Level};
+use tracing::{error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
@@ -148,6 +148,13 @@ impl super::ApplicationCoordinator {
             // `SelectDevice` handler sends an `AudioReopenRequest` here; the
             // thread reopens the cpal stream(s) on the new device(s) in place.
             let (reopen_tx, reopen_rx) = crossbeam_channel::unbounded::<AudioReopenRequest>();
+            // docs/audio-robustness-plan.md item 4: the relay task's stale-
+            // timeout arm below needs its own sender to self-trigger a
+            // recovery reopen through the SAME channel + drain loop the
+            // operator's TUI device picker uses — reusing that path means no
+            // new cross-thread coordination is needed (the audio thread's
+            // loop already serializes every reopen_devices call).
+            let reopen_tx_watchdog = reopen_tx.clone();
             self.audio_reopen_tx = Some(reopen_tx);
 
             // Audio thread sends samples via a tokio mpsc to an async relay
@@ -235,6 +242,52 @@ impl super::ApplicationCoordinator {
                     }
                 };
 
+                // docs/audio-robustness-plan.md item 1: unlike report_audio_error
+                // (an ephemeral MessageType::Error, meant for the TUI's
+                // overwrite-prone status line), a "still retrying" recovery
+                // state should be RETAINED so the operator can see it wasn't a
+                // one-frame blip. Uses the DiagnosticEvent bus (PR #84).
+                //
+                // Named report_audio_diagnostic (not report_recovery_diagnostic)
+                // because Task 4 reuses it for the periodic drop-rate
+                // diagnostic — it is a generic level+target+text emitter, not
+                // recovery-specific — target is a caller-supplied parameter
+                // (not hardcoded) precisely so a later, unrelated diagnostic
+                // doesn't get mislabeled under audio.recovery.
+                let report_audio_diagnostic = {
+                    let bus = audio_bus.clone();
+                    let rt = runtime_handle.clone();
+                    move |level: Level, target: &'static str, text: String| {
+                        let bus = bus.clone();
+                        let diagnostic_level = if level == Level::WARN {
+                            pancetta_core::DiagnosticLevel::Warn
+                        } else {
+                            pancetta_core::DiagnosticLevel::Info
+                        };
+                        rt.spawn(async move {
+                            let msg = ComponentMessage::new(
+                                ComponentId::Audio,
+                                ComponentId::Tui,
+                                MessageType::DiagnosticEvent {
+                                    target,
+                                    level: diagnostic_level,
+                                    text,
+                                    qso_id: None,
+                                    callsign: None,
+                                },
+                                Instant::now(),
+                            );
+                            let _ = bus.send_message(msg).await;
+                        });
+                    }
+                };
+                let mut recovery = crate::coordinator::audio_recovery::RecoveryBackoff::new();
+                let mut last_recovery_report =
+                    std::time::Instant::now() - std::time::Duration::from_secs(60);
+                let recovery_report_min_gap = std::time::Duration::from_secs(10);
+                let mut last_drop_report = std::time::Instant::now();
+                let drop_report_interval = std::time::Duration::from_secs(30);
+
                 loop {
                     if shutdown.load(Ordering::Acquire) {
                         break;
@@ -312,17 +365,76 @@ impl super::ApplicationCoordinator {
                             let s = e.to_string();
                             error!("Audio processing error: {}", s);
                             maybe_report_runtime("processing error", s);
-                            // docs/audio-robustness-plan.md item 1: a stream
-                            // error (e.g. device disconnect) makes
-                            // process_audio() return Err on EVERY call from
-                            // here on — this arm had no sleep, so this loop
-                            // would spin as fast as the CPU allows, forever,
-                            // pegging a core and flooding the log with
-                            // "Audio processing error" lines (maybe_report_
-                            // runtime rate-limits the TUI-facing message, but
-                            // not this raw tracing line) until the process is
-                            // restarted. Back off like the Ok(None) arm below.
-                            std::thread::sleep(std::time::Duration::from_millis(200));
+
+                            // docs/audio-robustness-plan.md item 1: auto-
+                            // recovery. force=true is REQUIRED — with no new
+                            // device name, resolve_reopen_targets treats
+                            // input=None/output=None as "nothing requested"
+                            // and reopen_devices no-ops without force (see
+                            // the "Jump Desktop reclaim" case this same
+                            // mechanism already handles for the operator
+                            // picker). The first attempt after a fresh error
+                            // (or after a prior success) fires with zero
+                            // delay — a brief USB blip should recover on the
+                            // very next loop iteration, not after a sleep.
+                            let delay = recovery.next_delay();
+                            if !delay.is_zero() {
+                                std::thread::sleep(delay);
+                            }
+                            match audio_manager.reopen_devices(None, None, true) {
+                                Ok(()) => {
+                                    info!(
+                                        "Audio auto-recovery: device reopened \
+                                         successfully after {} attempt(s)",
+                                        recovery.attempts()
+                                    );
+                                    if recovery.attempts() > 1 {
+                                        report_audio_diagnostic(
+                                            Level::INFO,
+                                            "audio.recovery",
+                                            "Audio device recovered".to_string(),
+                                        );
+                                    }
+                                    recovery.reset();
+                                }
+                                Err(reopen_err) => {
+                                    warn!(
+                                        "Audio auto-recovery attempt {} failed: {}",
+                                        recovery.attempts(),
+                                        reopen_err
+                                    );
+                                    if last_recovery_report.elapsed() >= recovery_report_min_gap {
+                                        report_audio_diagnostic(
+                                            Level::WARN,
+                                            "audio.recovery",
+                                            format!(
+                                                "Audio device lost — retrying \
+                                                 (attempt {}): {}",
+                                                recovery.attempts(),
+                                                reopen_err
+                                            ),
+                                        );
+                                        last_recovery_report = std::time::Instant::now();
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    if last_drop_report.elapsed() >= drop_report_interval {
+                        last_drop_report = std::time::Instant::now();
+                        let dropped = audio_manager.dropped_samples();
+                        if dropped > 0 {
+                            let rate = audio_manager.drop_rate_percent();
+                            let level = if rate > 1.0 { Level::WARN } else { Level::INFO };
+                            report_audio_diagnostic(
+                                level,
+                                "audio.health",
+                                format!(
+                                    "Audio RX drop rate {:.2}% ({} samples dropped)",
+                                    rate, dropped
+                                ),
+                            );
                         }
                     }
                 }
@@ -335,6 +447,7 @@ impl super::ApplicationCoordinator {
             let health_audio_alive_relay = health_audio_alive.clone();
             let handle = tokio::spawn(async move {
                 let mut relay_count: u64 = 0;
+                let mut stale_watchdog = crate::coordinator::audio_recovery::StaleWatchdog::new();
                 // Record 90 seconds of raw 48kHz stereo audio for diagnostics
                 // (covers ~6 FT8 windows regardless of boundary alignment)
                 let raw_capture_samples = 48000 * 2 * 90; // 90s stereo
@@ -352,10 +465,61 @@ impl super::ApplicationCoordinator {
                 loop {
                     let samples =
                         match tokio::time::timeout(AUDIO_STALE_TIMEOUT, result_rx.recv()).await {
-                            Ok(Some(samples)) => samples,
+                            Ok(Some(samples)) => {
+                                stale_watchdog.on_data();
+                                samples
+                            }
                             Ok(None) => break, // sender dropped — audio thread stopped
                             Err(_elapsed) => {
                                 health_audio_alive_relay.store(false, Ordering::Relaxed);
+                                // docs/audio-robustness-plan.md item 4: a
+                                // wedged device (callbacks stopped without a
+                                // cpal StreamError) sets no flag anywhere
+                                // today — process_audio() just keeps
+                                // returning Ok(None) forever. Fire on the
+                                // first stale tick, then at most once every
+                                // RETRY_AFTER_TICKS (~10s at this 2s
+                                // cadence) while still stale (StaleWatchdog's
+                                // bounded retry) rather than every 2s tick,
+                                // since each signal is a real cpal
+                                // teardown+rebuild on the audio thread.
+                                if stale_watchdog.on_timeout() {
+                                    warn!(
+                                        "Audio watchdog: no samples for {:?} — \
+                                         requesting a self-triggered device reopen",
+                                        AUDIO_STALE_TIMEOUT
+                                    );
+                                    let (respond_tx, respond_rx) = tokio::sync::oneshot::channel();
+                                    let sent = reopen_tx_watchdog.send(AudioReopenRequest {
+                                        input: None,
+                                        output: None,
+                                        force: true,
+                                        respond: respond_tx,
+                                    });
+                                    if sent.is_err() {
+                                        warn!(
+                                            "Audio watchdog: reopen channel closed, \
+                                             cannot self-trigger recovery"
+                                        );
+                                    } else {
+                                        tokio::spawn(async move {
+                                            match respond_rx.await {
+                                                Ok(Ok(())) => info!(
+                                                    "Audio watchdog: self-triggered \
+                                                     reopen call succeeded (stream \
+                                                     rebuilt); waiting to see if data \
+                                                     resumes"
+                                                ),
+                                                Ok(Err(e)) => warn!(
+                                                    "Audio watchdog: self-triggered \
+                                                     reopen failed: {}",
+                                                    e
+                                                ),
+                                                Err(_) => {} // audio thread dropped the responder — shutting down
+                                            }
+                                        });
+                                    }
+                                }
                                 continue;
                             }
                         };
