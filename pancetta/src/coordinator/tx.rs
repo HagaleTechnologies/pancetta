@@ -314,20 +314,44 @@ async fn emit_tx_failure_diagnostic(
     message_text: &str,
     reason: &str,
 ) {
+    emit_diagnostic(
+        message_bus,
+        "tx.encode",
+        pancetta_core::DiagnosticLevel::Warn,
+        format!("TX failed for '{}': {}", message_text, reason),
+        qso_id,
+    )
+    .await;
+}
+
+/// Send a `DiagnosticEvent` to the TUI's retained Diagnostics overlay
+/// (observability-diagnostics-plan.md Layer 1, "Emission"). `target` reuses
+/// the same vocabulary already used by the co-located `tracing` call at each
+/// site (e.g. `"tx.policy"`) — this is a SEPARATE field from that macro's own
+/// `target:` (the tracing one gates file-log visibility via `EnvFilter`; this
+/// one is just a TUI-side label used for filtering the Diagnostics panel).
+/// Best-effort: never blocks or fails the TX path.
+async fn emit_diagnostic(
+    message_bus: &MessageBus,
+    target: &'static str,
+    level: pancetta_core::DiagnosticLevel,
+    text: String,
+    qso_id: Option<&str>,
+) {
     let msg = ComponentMessage::new(
         ComponentId::Ft8Transmitter,
         ComponentId::Tui,
         MessageType::DiagnosticEvent {
-            target: "tx.encode",
-            level: pancetta_core::DiagnosticLevel::Warn,
-            text: format!("TX failed for '{}': {}", message_text, reason),
+            target,
+            level,
+            text,
             qso_id: qso_id.map(|s| s.to_string()),
             callsign: None,
         },
         Instant::now(),
     );
     if let Err(e) = message_bus.send_message(msg).await {
-        tracing::debug!("TX-failure DiagnosticEvent relay failed (no TUI?): {}", e);
+        tracing::debug!("DiagnosticEvent({}) relay failed (no TUI?): {}", target, e);
     }
 }
 
@@ -674,10 +698,18 @@ async fn coalesce_backlog_into(
                 // never reorder Tune/Multi ahead of, or behind, TX intent.
                 if let Err(e) = message_bus.send_message(msg).await {
                     warn!(
-                        target: "tx.policy",
+                        target: "pancetta::tx.policy",
                         "failed to re-enqueue non-TX message during coalesce drain: {}",
                         e
                     );
+                    emit_diagnostic(
+                        message_bus,
+                        "tx.policy",
+                        pancetta_core::DiagnosticLevel::Warn,
+                        format!("failed to re-enqueue non-TX message during coalesce drain: {e}"),
+                        None,
+                    )
+                    .await;
                 }
                 break;
             }
@@ -700,8 +732,7 @@ async fn coalesce_backlog_into(
     let outcome = coalesce_transmit_requests(drained, |id| tx_qso_is_live(id, active_tx_qsos));
 
     if !outcome.is_noop() {
-        warn!(
-            target: "tx.policy",
+        let text = format!(
             "TX backlog coalesced: drained {} request(s) → {} retained; \
              coalesced {} stale (newest-per-QSO wins), dropped {} for ended QSOs, \
              truncated {} over the {}-stream cap",
@@ -712,6 +743,15 @@ async fn coalesce_backlog_into(
             outcome.truncated,
             MAX_RETAINED_TX_STREAMS,
         );
+        warn!(target: "pancetta::tx.policy", "{}", text);
+        emit_diagnostic(
+            message_bus,
+            "tx.policy",
+            pancetta_core::DiagnosticLevel::Warn,
+            text,
+            None,
+        )
+        .await;
     }
 
     // Every drained request belonged to an ended QSO (rare: needs ≥2 queued
@@ -1009,10 +1049,20 @@ impl super::ApplicationCoordinator {
                                         == pancetta_core::TxPolicy::Disabled
                                     {
                                         info!(
-                                            target: "tx.policy",
+                                            target: "pancetta::tx.policy",
                                             "TX DISABLED (RX-only): blocking '{}' at {:.0} Hz (qso: {:?})",
                                             message_text, frequency_offset, qso_id
                                         );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX DISABLED (RX-only): blocking '{message_text}' at {frequency_offset:.0} Hz"
+                                            ),
+                                            qso_id.as_deref(),
+                                        )
+                                        .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
@@ -1210,11 +1260,21 @@ impl super::ApplicationCoordinator {
                                         // loop the operator hit).
                                         if !tx_qso_is_live(qso_id.as_deref(), &active_tx_qsos) {
                                             info!(
-                                                target: "tx.policy",
+                                                target: "pancetta::tx.policy",
                                                 "dropping stale TX for ended QSO {} at defer time: '{}'",
                                                 qso_id.as_deref().unwrap_or("?"),
                                                 message_text
                                             );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                    "dropping stale TX for ended QSO at defer time: '{message_text}'"
+                                                ),
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
                                             let complete_msg = ComponentMessage::new(
@@ -1318,11 +1378,21 @@ impl super::ApplicationCoordinator {
                                     // are never gated.
                                     if !tx_qso_is_live(qso_id.as_deref(), &active_tx_qsos) {
                                         info!(
-                                            target: "tx.policy",
+                                            target: "pancetta::tx.policy",
                                             "dropping stale TX for ended QSO {}: '{}'",
                                             qso_id.as_deref().unwrap_or("?"),
                                             message_text
                                         );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "dropping stale TX for ended QSO: '{message_text}'"
+                                            ),
+                                            qso_id.as_deref(),
+                                        )
+                                        .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
@@ -1596,10 +1666,21 @@ impl super::ApplicationCoordinator {
                                         == pancetta_core::TxPolicy::Disabled
                                     {
                                         info!(
-                                            target: "tx.policy",
+                                            target: "pancetta::tx.policy",
                                             "TX DISABLED (RX-only): blocking multi-TX bundle of {} items",
                                             items.len()
                                         );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX DISABLED (RX-only): blocking multi-TX bundle of {} items",
+                                                items.len()
+                                            ),
+                                            None,
+                                        )
+                                        .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
                                             let complete_msg = ComponentMessage::new(
@@ -1668,11 +1749,22 @@ impl super::ApplicationCoordinator {
                                                 kept.push(item);
                                             } else {
                                                 info!(
-                                                    target: "tx.policy",
+                                                    target: "pancetta::tx.policy",
                                                     "dropping stale multi-TX item for ended QSO {}: '{}'",
                                                     item.qso_id.as_deref().unwrap_or("?"),
                                                     item.message_text
                                                 );
+                                                emit_diagnostic(
+                                                    &message_bus,
+                                                    "tx.policy",
+                                                    pancetta_core::DiagnosticLevel::Info,
+                                                    format!(
+                                                        "dropping stale multi-TX item for ended QSO: '{}'",
+                                                        item.message_text
+                                                    ),
+                                                    item.qso_id.as_deref(),
+                                                )
+                                                .await;
                                                 let complete_msg = ComponentMessage::new(
                                                     ComponentId::Ft8Transmitter,
                                                     ComponentId::Autonomous,
@@ -1690,9 +1782,18 @@ impl super::ApplicationCoordinator {
                                         items = kept;
                                         if items.is_empty() {
                                             info!(
-                                                target: "tx.policy",
+                                                target: "pancetta::tx.policy",
                                                 "multi-TX bundle empty after dropping stale items — skipping"
                                             );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                "multi-TX bundle empty after dropping stale items — skipping"
+                                                    .to_string(),
+                                                None,
+                                            )
+                                            .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
                                             continue;
@@ -1952,10 +2053,21 @@ impl super::ApplicationCoordinator {
                                         tx_qso_is_live(it.qso_id.as_deref(), &active_tx_qsos)
                                     }) {
                                         info!(
-                                            target: "tx.policy",
+                                            target: "pancetta::tx.policy",
                                             "dropping stale multi-TX bundle: all {} item(s) belong to ended QSOs",
                                             items.len()
                                         );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "dropping stale multi-TX bundle: all {} item(s) belong to ended QSOs",
+                                                items.len()
+                                            ),
+                                            None,
+                                        )
+                                        .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
                                             let complete_msg = ComponentMessage::new(
@@ -2176,10 +2288,20 @@ impl super::ApplicationCoordinator {
                                         == pancetta_core::TxPolicy::Disabled
                                     {
                                         info!(
-                                            target: "tx.policy",
+                                            target: "pancetta::tx.policy",
                                             "TX DISABLED (RX-only): blocking tune ({}s @ {} Hz)",
                                             duration_secs, tone_offset_hz
                                         );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX DISABLED (RX-only): blocking tune ({duration_secs}s @ {tone_offset_hz} Hz)"
+                                            ),
+                                            None,
+                                        )
+                                        .await;
                                         continue;
                                     }
 
@@ -2738,6 +2860,42 @@ mod tx_failure_diagnostic_tests {
         let msg = receiver.try_recv().expect("diagnostic should still send");
         match msg.message_type {
             MessageType::DiagnosticEvent { qso_id, .. } => assert_eq!(qso_id, None),
+            other => panic!("expected DiagnosticEvent, got {other:?}"),
+        }
+    }
+
+    /// `emit_diagnostic` is the generic sibling wired into the 10
+    /// `"tx.policy"` sites (observability-diagnostics-plan.md Layer 1) —
+    /// unlike `emit_tx_failure_diagnostic`, its `target` and `level` are
+    /// caller-supplied. Pins that both vary correctly and independently.
+    #[tokio::test]
+    async fn emit_diagnostic_carries_caller_supplied_target_and_level() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+
+        emit_diagnostic(
+            &bus,
+            "tx.policy",
+            pancetta_core::DiagnosticLevel::Info,
+            "dropping stale TX for ended QSO: 'CQ K5ARH EM12'".to_string(),
+            Some("qso-7"),
+        )
+        .await;
+
+        let msg = receiver.try_recv().expect("diagnostic should send");
+        match msg.message_type {
+            MessageType::DiagnosticEvent {
+                target,
+                level,
+                text,
+                qso_id,
+                ..
+            } => {
+                assert_eq!(target, "tx.policy");
+                assert_eq!(level, pancetta_core::DiagnosticLevel::Info);
+                assert!(text.contains("CQ K5ARH EM12"));
+                assert_eq!(qso_id.as_deref(), Some("qso-7"));
+            }
             other => panic!("expected DiagnosticEvent, got {other:?}"),
         }
     }
