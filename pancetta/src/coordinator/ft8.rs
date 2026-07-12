@@ -30,6 +30,11 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 /// backstop for faults that cannot unwind (e.g. a native ft8_lib C abort).
 static DECODE_PANIC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Read-only accessor for the Layer 3 health panel (`coordinator/tui_relay.rs`).
+pub(crate) fn decode_panic_count() -> u64 {
+    DECODE_PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Maximum length (in chars) for any human-facing decoded string field.
 /// FT8 message payloads are short (callsigns ≤ ~11 chars, grids 4-6, the
 /// full text well under 64); anything longer is malformed/hostile.

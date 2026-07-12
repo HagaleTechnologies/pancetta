@@ -1236,6 +1236,11 @@ async fn test_rig_command(args: TestRigArgs, cli: &Cli) -> Result<()> {
 /// decode loop.
 static PANIC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Read-only accessor for the Layer 3 health panel (`coordinator/tui_relay.rs`).
+pub(crate) fn panic_count() -> u64 {
+    PANIC_COUNT.load(Ordering::Relaxed)
+}
+
 /// Install a process-wide panic hook so a panic ANYWHERE (including inside a
 /// spawned component task — qso/hamlib/autonomous/etc. currently have no
 /// `catch_unwind` at all) is guaranteed to reach the file log, not just
