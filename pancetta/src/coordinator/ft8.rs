@@ -1046,26 +1046,25 @@ impl super::ApplicationCoordinator {
                                     (&decoded_msg.message.from_callsign, parity_u8)
                                 {
                                     if let Ok(mut cache_guard) = cross_sequence_cache.write() {
-                                        let admitted =
-                                            if let Some(ref filter) =
-                                                cross_sequence_fp_filter_snapshot
-                                            {
-                                                cache_guard.record_decoded_trusted(
-                                                    call,
-                                                    decoded_msg.frequency_offset,
-                                                    parity,
-                                                    decoded_msg.timestamp,
-                                                    filter,
-                                                )
-                                            } else {
-                                                cache_guard.record_decoded(
-                                                    call,
-                                                    decoded_msg.frequency_offset,
-                                                    parity,
-                                                    decoded_msg.timestamp,
-                                                );
-                                                true
-                                            };
+                                        let admitted = if let Some(ref filter) =
+                                            cross_sequence_fp_filter_snapshot
+                                        {
+                                            cache_guard.record_decoded_trusted(
+                                                call,
+                                                decoded_msg.frequency_offset,
+                                                parity,
+                                                decoded_msg.timestamp,
+                                                filter,
+                                            )
+                                        } else {
+                                            cache_guard.record_decoded(
+                                                call,
+                                                decoded_msg.frequency_offset,
+                                                parity,
+                                                decoded_msg.timestamp,
+                                            );
+                                            true
+                                        };
                                         if !admitted {
                                             debug!(
                                                 target: "hb237",
