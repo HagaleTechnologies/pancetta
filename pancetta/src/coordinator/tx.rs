@@ -299,6 +299,38 @@ async fn send_tx_queue_status(
     }
 }
 
+/// Surface a genuine TX-attempt failure (encode/modulate error, invalid
+/// frequency, etc.) as a RETAINED diagnostic so the operator can see "TX
+/// failed: <reason>" instead of a QSO silently sitting until the watchdog
+/// times out — indistinguishable, from the operator's view, from the DX
+/// simply not answering. Deliberate policy/security skips (TxPolicy
+/// Disabled, stale-QSO drops, poisoned-lock fail-closed) are NOT routed
+/// through this — those already have their own operator-visible signal
+/// (TX-policy status, the emergency-stop toggle) and aren't the "invisible
+/// failure" gap this closes. Best-effort: never blocks or fails the TX path.
+async fn emit_tx_failure_diagnostic(
+    message_bus: &MessageBus,
+    qso_id: Option<&str>,
+    message_text: &str,
+    reason: &str,
+) {
+    let msg = ComponentMessage::new(
+        ComponentId::Ft8Transmitter,
+        ComponentId::Tui,
+        MessageType::DiagnosticEvent {
+            target: "tx.encode",
+            level: pancetta_core::DiagnosticLevel::Warn,
+            text: format!("TX failed for '{}': {}", message_text, reason),
+            qso_id: qso_id.map(|s| s.to_string()),
+            callsign: None,
+        },
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(msg).await {
+        tracing::debug!("TX-failure DiagnosticEvent relay failed (no TUI?): {}", e);
+    }
+}
+
 /// Read the current global TX policy from the shared atomic.
 fn current_tx_policy(
     tx_policy: &std::sync::Arc<std::sync::atomic::AtomicU8>,
@@ -1061,6 +1093,15 @@ impl super::ApplicationCoordinator {
                                             "Invalid TX frequency {} Hz for '{}': {}",
                                             frequency_offset, message_text, e
                                         );
+                                        emit_tx_failure_diagnostic(
+                                            &message_bus,
+                                            qso_id.as_deref(),
+                                            &message_text,
+                                            &format!(
+                                                "invalid frequency {frequency_offset} Hz ({e})"
+                                            ),
+                                        )
+                                        .await;
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Autonomous,
@@ -1109,6 +1150,13 @@ impl super::ApplicationCoordinator {
                                                 "Encode/modulate failed for '{}': {}",
                                                 message_text, e
                                             );
+                                            emit_tx_failure_diagnostic(
+                                                &message_bus,
+                                                qso_id.as_deref(),
+                                                &message_text,
+                                                &format!("encode/modulate error ({e})"),
+                                            )
+                                            .await;
                                             let complete_msg = ComponentMessage::new(
                                                 ComponentId::Ft8Transmitter,
                                                 ComponentId::Autonomous,
@@ -1211,6 +1259,13 @@ impl super::ApplicationCoordinator {
                                         // happen because too-late defers), emit nothing and
                                         // skip TX.
                                         warn!("schedule_tx cursor exceeded waveform length; skipping TX");
+                                        emit_tx_failure_diagnostic(
+                                            &message_bus,
+                                            qso_id.as_deref(),
+                                            &message_text,
+                                            "internal scheduling error (cursor exceeded waveform)",
+                                        )
+                                        .await;
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Autonomous,
@@ -1672,6 +1727,12 @@ impl super::ApplicationCoordinator {
                                     );
                                     let mut symbol_sets: Vec<Vec<u8>> = Vec::new();
                                     let mut item_texts: Vec<String> = Vec::new();
+                                    // Parallel to item_texts/symbol_sets (same order,
+                                    // same filter) — needed so a later whole-bundle
+                                    // modulation failure can emit a per-item diagnostic
+                                    // with the right qso_id, without re-diagnosing items
+                                    // that already failed at the encode step above.
+                                    let mut encoded_qso_ids: Vec<Option<String>> = Vec::new();
 
                                     for item in &items {
                                         match encode_for_protocol(
@@ -1681,6 +1742,7 @@ impl super::ApplicationCoordinator {
                                         ) {
                                             Ok(symbols) => {
                                                 item_texts.push(item.message_text.clone());
+                                                encoded_qso_ids.push(item.qso_id.clone());
                                                 symbol_sets.push(symbols);
                                             }
                                             Err(e) => {
@@ -1688,6 +1750,31 @@ impl super::ApplicationCoordinator {
                                                     "Encoding failed for '{}': {}",
                                                     item.message_text, e
                                                 );
+                                                // This item is dropped from item_texts/
+                                                // symbol_sets, so unlike the other failure
+                                                // sites in this file it would otherwise get
+                                                // NO TransmitComplete at all, ever — worse
+                                                // than the delayed-watchdog case, since even
+                                                // that path eventually sends one.
+                                                emit_tx_failure_diagnostic(
+                                                    &message_bus,
+                                                    item.qso_id.as_deref(),
+                                                    &item.message_text,
+                                                    &format!("encoding error ({e})"),
+                                                )
+                                                .await;
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
                                             }
                                         }
                                     }
@@ -1731,6 +1818,17 @@ impl super::ApplicationCoordinator {
                                             }
                                             Err(e) => {
                                                 warn!("Multi-TX modulation failed: {}", e);
+                                                for (text, qso_id) in
+                                                    item_texts.iter().zip(encoded_qso_ids.iter())
+                                                {
+                                                    emit_tx_failure_diagnostic(
+                                                        &message_bus,
+                                                        qso_id.as_deref(),
+                                                        text,
+                                                        &format!("multi-TX modulation error ({e})"),
+                                                    )
+                                                    .await;
+                                                }
                                                 (None, 0)
                                             }
                                         }
@@ -1796,6 +1894,17 @@ impl super::ApplicationCoordinator {
                                         );
                                     } else {
                                         warn!("schedule_tx cursor exceeded multi-TX waveform; skipping");
+                                        for (text, qso_id) in
+                                            item_texts.iter().zip(encoded_qso_ids.iter())
+                                        {
+                                            emit_tx_failure_diagnostic(
+                                                &message_bus,
+                                                qso_id.as_deref(),
+                                                text,
+                                                "internal scheduling error (cursor exceeded multi-TX waveform)",
+                                            )
+                                            .await;
+                                        }
                                         for text in item_texts {
                                             let complete_msg = ComponentMessage::new(
                                                 ComponentId::Ft8Transmitter,
@@ -2567,6 +2676,70 @@ mod schedule_tx_tests {
         assert!(set.is_poisoned());
         // Even for a qso_id that would otherwise be "ended", fail-open → true.
         assert!(super::tx_qso_is_live(Some("qso-ended"), &set));
+    }
+}
+
+/// Regression coverage for the silent-TX-failure gap: an encode/modulate
+/// error used to only log a WARN and send a TransmitComplete no consumer
+/// reads, so the operator had zero visible signal — the QSO just sat until
+/// the watchdog timed out, indistinguishable from the DX not answering.
+/// `emit_tx_failure_diagnostic` is the shared helper wired into every
+/// genuine TX-attempt-failure site in this file (deliberate policy/security
+/// skips are NOT routed through it — see its doc comment). This pins its
+/// exact DiagnosticEvent contract directly, independent of the full
+/// encode/modulate/PTT pipeline the call sites sit inside.
+#[cfg(test)]
+mod tx_failure_diagnostic_tests {
+    use super::*;
+    use crate::message_bus::MessageBus;
+
+    #[tokio::test]
+    async fn emits_a_warn_diagnostic_the_tui_channel_receives() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+
+        emit_tx_failure_diagnostic(
+            &bus,
+            Some("qso-42"),
+            "K5ARH CQ EM12",
+            "encode/modulate error (test)",
+        )
+        .await;
+
+        let msg = receiver
+            .try_recv()
+            .expect("a DiagnosticEvent should have been sent to the Tui channel");
+        match msg.message_type {
+            MessageType::DiagnosticEvent {
+                target,
+                level,
+                text,
+                qso_id,
+                callsign,
+            } => {
+                assert_eq!(target, "tx.encode");
+                assert_eq!(level, pancetta_core::DiagnosticLevel::Warn);
+                assert!(text.contains("K5ARH CQ EM12"));
+                assert!(text.contains("encode/modulate error (test)"));
+                assert_eq!(qso_id.as_deref(), Some("qso-42"));
+                assert_eq!(callsign, None);
+            }
+            other => panic!("expected DiagnosticEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tolerates_a_missing_qso_id() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+
+        emit_tx_failure_diagnostic(&bus, None, "CQ K5ARH EM12", "invalid frequency").await;
+
+        let msg = receiver.try_recv().expect("diagnostic should still send");
+        match msg.message_type {
+            MessageType::DiagnosticEvent { qso_id, .. } => assert_eq!(qso_id, None),
+            other => panic!("expected DiagnosticEvent, got {other:?}"),
+        }
     }
 }
 
