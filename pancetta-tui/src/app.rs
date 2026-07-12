@@ -722,6 +722,11 @@ pub struct App {
     pub diagnostic_events: VecDeque<DiagnosticEventRecord>,
     /// Shift+D overlay visibility for `diagnostic_events`.
     pub show_diagnostics: bool,
+    /// Shift+S overlay visibility for the consolidated station-health panel
+    /// (docs/observability-diagnostics-plan.md Layer 3). Unlike
+    /// `show_diagnostics` (a scrollback), this is a snapshot view — no
+    /// scroll-position field needed.
+    pub show_health: bool,
     /// Scroll cursor into `diagnostic_events` while the overlay is open.
     pub diagnostics_scroll: usize,
     /// Count of QSOs completed this session (Task 20d). Counted TUI-side
@@ -1051,6 +1056,7 @@ impl App {
             theme: config.ui.theme,
             diagnostic_events: VecDeque::with_capacity(500),
             show_diagnostics: false,
+            show_health: false,
             diagnostics_scroll: 0,
             session_completed: 0,
             session_failed: 0,

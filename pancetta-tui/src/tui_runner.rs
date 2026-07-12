@@ -1115,6 +1115,19 @@ impl TuiRunner {
             return Ok(true);
         }
 
+        // Station-health panel (docs/observability-diagnostics-plan.md Layer
+        // 3). A read-only snapshot, so — unlike the Diagnostics overlay —
+        // there is no scroll state; just dismiss.
+        if app.show_health {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('S') => {
+                    app.show_health = false;
+                }
+                _ => {} // swallow other keys while the overlay is open
+            }
+            return Ok(true);
+        }
+
         match key.code {
             // hb-161: Esc clears the operator-stop banner without re-enabling
             // anything. Re-enabling autonomous still requires `a`. Bound here
@@ -1360,6 +1373,12 @@ impl TuiRunner {
             KeyCode::Char('D') => {
                 app.show_diagnostics = true;
                 app.diagnostics_scroll = app.diagnostic_events.len().saturating_sub(1);
+            }
+            // Shift+S — toggle the consolidated station-health panel (is the
+            // station healthy right now?). Lowercase `s` is taken by StopCq,
+            // so health uses S.
+            KeyCode::Char('S') => {
+                app.show_health = true;
             }
             // Shift+H — Engage Hound mode on the selected DX-Hunter station.
             // Lowercase `h` is taken by StopTx (halt TX), so Hound uses H.
@@ -1781,6 +1800,8 @@ impl TuiRunner {
                 crate::ui::render_offset_modal(f, f.area(), &app.offset_modal);
             } else if app.show_diagnostics {
                 crate::ui::render_diagnostics_overlay(f, f.area(), &app);
+            } else if app.show_health {
+                crate::ui::render_health_panel(f, f.area(), &app);
             }
         })?;
 
@@ -1972,6 +1993,14 @@ impl TuiRunner {
             ("Shift+P", "Pause / resume autonomous"),
             ("Shift+H", "Engage Hound on selected DX Hunter station"),
             ("Shift+X", "Toggle Fox (DXpedition) mode"),
+            (
+                "Shift+D",
+                "Toggle Diagnostics overlay (retained event history)",
+            ),
+            (
+                "Shift+S",
+                "Toggle station-health panel (is the station healthy?)",
+            ),
             ("m", "Toggle audio monitoring"),
             ("d", "Device picker"),
             ("x", "Clear decoded messages (press twice within 3s)"),

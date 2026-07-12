@@ -1353,6 +1353,122 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Render the Shift+S station-health panel: a consolidated "is the station
+/// healthy right now?" snapshot (docs/observability-diagnostics-plan.md
+/// Layer 3), aggregating signals already computed elsewhere rather than
+/// introducing new detection logic. Unlike `render_diagnostics_overlay`
+/// (a scrollback), this is a point-in-time view — no scroll state.
+pub fn render_health_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.width < 20 || area.height < 6 {
+        return;
+    }
+    let modal_width = area.width.saturating_sub(4).min(70);
+    let modal_height = area.height.saturating_sub(4).min(16);
+    let modal_area = Rect {
+        x: (area.width.saturating_sub(modal_width)) / 2,
+        y: (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" Station Health — Esc/S close ")
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(modal_area);
+    f.render_widget(block, modal_area);
+
+    fn dot(ok: bool) -> Span<'static> {
+        if ok {
+            Span::styled("●", Style::default().fg(Color::Green))
+        } else {
+            Span::styled("●", Style::default().fg(Color::Red))
+        }
+    }
+
+    let mut lines: Vec<Line> = Vec::new();
+
+    match &app.pipeline_health {
+        Some(h) => {
+            lines.push(Line::from(vec![
+                dot(h.audio_alive),
+                Span::raw(format!(
+                    " Audio: {}  ({} DSP windows)",
+                    if h.audio_alive { "alive" } else { "DEAD" },
+                    h.dsp_windows
+                )),
+            ]));
+            lines.push(Line::from(vec![
+                dot(h.ft8lib_available),
+                Span::raw(format!(
+                    " Decoder: {}",
+                    if h.ft8lib_available {
+                        "ft8_lib (native)"
+                    } else {
+                        "STUB — not compiled in"
+                    }
+                )),
+            ]));
+            lines.push(Line::from(Span::raw(format!(
+                "  Total decodes: {}   Last window: {}ms{}",
+                h.total_decodes,
+                h.last_decode_elapsed_ms,
+                if h.last_decode_budget_exhausted {
+                    " (budget exhausted)"
+                } else {
+                    ""
+                }
+            ))));
+            lines.push(Line::from(Span::raw(format!(
+                "  TX attempts: {}   TX defers: {}",
+                h.tx_attempts, h.tx_defers
+            ))));
+            let panics_ok = h.decode_panic_count == 0 && h.wdt_panic_count == 0;
+            lines.push(Line::from(vec![
+                dot(panics_ok),
+                Span::raw(format!(
+                    " Panics: decode={} watchdog={}",
+                    h.decode_panic_count, h.wdt_panic_count
+                )),
+            ]));
+        }
+        None => {
+            lines.push(Line::from(Span::styled(
+                "  Waiting for first health tick (~2s after startup)...",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    lines.push(Line::from(""));
+
+    let rig_ok = !matches!(app.rig_connected, crate::app::RigConnDisplay::PollingFailed);
+    lines.push(Line::from(vec![
+        dot(rig_ok),
+        Span::raw(format!(" Rig: {:?}", app.rig_connected)),
+    ]));
+    lines.push(Line::from(vec![
+        dot(app.tx_output_default),
+        Span::raw(format!(
+            " TX audio output: {}",
+            if app.tx_output_default {
+                "system default"
+            } else {
+                "NOT default — check device"
+            }
+        )),
+    ]));
+
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::raw(format!(
+        "  QSOs completed: {}   failed: {}   TX drops: {}",
+        app.session_completed, app.session_failed, app.session_tx_drops
+    ))));
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// Render the required out-of-band acknowledgment modal.
 pub fn render_out_of_band_modal(f: &mut Frame<'_>, area: Rect, tx_rf_hz: u64) {
     if area.width < 10 || area.height < 4 {
@@ -1856,6 +1972,62 @@ mod view_render_tests {
                 2,
                 "expected {call} on both the Active-QSOs banner row AND the TX-placement stream-marker row"
             );
+        }
+    }
+
+    /// Task 5: `render_health_panel` (Shift+S station-health panel) must
+    /// not panic before the first health tick (`pipeline_health` is `None`
+    /// for ~2s after startup) nor once populated, and must render the
+    /// aggregated signals it's meant to surface.
+    #[tokio::test]
+    async fn render_health_panel_smoke_test() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+
+        // No pipeline_health yet — must not panic, and shows the
+        // waiting-for-first-tick message.
+        term.draw(|f| render_health_panel(f, f.area(), &app))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(buffer_contains(&buf, "Station Health"));
+        assert!(buffer_contains(&buf, "Waiting for first health tick"));
+
+        // Populated pipeline_health plus session counters — must not panic,
+        // and shows the aggregated signals.
+        app.pipeline_health = Some(crate::app::PipelineHealth {
+            audio_alive: true,
+            dsp_windows: 42,
+            last_rms: 0.01,
+            ft8lib_available: true,
+            total_decodes: 7,
+            last_decode_elapsed_ms: 120,
+            last_decode_budget_exhausted: false,
+            tx_attempts: 3,
+            tx_defers: 1,
+            decode_panic_count: 0,
+            wdt_panic_count: 0,
+        });
+        app.session_completed = 2;
+        app.session_failed = 1;
+        app.session_tx_drops = 0;
+        term.draw(|f| render_health_panel(f, f.area(), &app))
+            .unwrap();
+        let buf2 = term.backend().buffer().clone();
+        assert!(buffer_contains(&buf2, "Audio: alive"));
+        assert!(buffer_contains(&buf2, "ft8_lib (native)"));
+        assert!(buffer_contains(&buf2, "Rig:"));
+        assert!(buffer_contains(&buf2, "QSOs completed: 2"));
+
+        // Also must not panic at tiny/degenerate sizes (mirrors the
+        // device-selection-modal underflow-guard test in tui_runner.rs).
+        for (w, h) in [(1u16, 1u16), (0, 0), (10, 2), (19, 5)] {
+            let backend = TestBackend::new(w.max(1), h.max(1));
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| render_health_panel(f, f.area(), &app))
+                .unwrap();
         }
     }
 }
