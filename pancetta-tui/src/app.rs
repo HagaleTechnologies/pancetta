@@ -742,13 +742,17 @@ pub struct App {
     /// `QsoFailed` handler.
     pub session_failed: u32,
     /// Count of TX drops this session (stale-TX-for-ended-QSO, multi-TX
-    /// per-item/whole-bundle stale drops, backlog-coalesce drops) — matches
-    /// the "tx.policy"-target "dropping stale ..." diagnostic texts added
-    /// in the 2026-07-12 tx.policy observability-wiring pass
-    /// (docs/DECISIONS/tui.md). Deliberately does NOT count TxPolicy-
-    /// Disabled blocks (an intentional operator action, not a drop) or the
-    /// non-TX-message re-enqueue-failure diagnostic (an internal error, not
-    /// a drop).
+    /// per-item/whole-bundle stale drops) — matches the "tx.policy"-target
+    /// "dropping stale ..." diagnostic texts added in the 2026-07-12
+    /// tx.policy observability-wiring pass (docs/DECISIONS/tui.md).
+    /// Deliberately does NOT count TxPolicy-Disabled blocks (an intentional
+    /// operator action, not a drop), the non-TX-message re-enqueue-failure
+    /// diagnostic (an internal error, not a drop), or the backlog-coalesce
+    /// summary line ("TX backlog coalesced: ... dropped N for ended QSOs
+    /// ...") — that summary's text doesn't start with "dropping stale" and,
+    /// even if matched, embeds its own drop count rather than always being
+    /// exactly one drop, so a simple +1-per-event tally can't represent it
+    /// correctly; not worth parsing out for a diagnostics counter.
     pub session_tx_drops: u32,
     /// Set by the first `x` press (Task 20f — confirm-on-`x`); a second
     /// press within `CLEAR_CONFIRM_WINDOW` actually clears decodes. `None`
