@@ -1682,7 +1682,8 @@ impl super::ApplicationCoordinator {
                                     origin,
                                 } => {
                                     info!("Multi-TX request: {} messages", items.len());
-                                    TX_ATTEMPTS_COUNT.fetch_add(items.len() as u64, Ordering::Relaxed);
+                                    TX_ATTEMPTS_COUNT
+                                        .fetch_add(items.len() as u64, Ordering::Relaxed);
 
                                     // --- Step 0: TX-policy hard mute ---
                                     // Disabled (RX-only): never key PTT / play audio /

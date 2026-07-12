@@ -210,6 +210,19 @@ pub struct PipelineHealth {
     /// overhaul Task 12). Always `false` while the operator/preset effort
     /// budget is unlimited (the only value set today).
     pub last_decode_budget_exhausted: bool,
+    /// Total TX attempts this session (single-TX + tune + each multi-TX
+    /// item), before any policy gating (docs/observability-diagnostics-
+    /// plan.md Layer 3 health panel).
+    pub tx_attempts: u64,
+    /// Total single-TX requests deferred to a later slot this session.
+    pub tx_defers: u64,
+    /// Total FT8 decode-thread panics caught this session (already existed
+    /// as `DECODE_PANIC_COUNT` in `coordinator/ft8.rs`; not previously
+    /// surfaced to the TUI).
+    pub decode_panic_count: u64,
+    /// Total top-level process panics caught this session (already existed
+    /// as `PANIC_COUNT` in `main.rs`; not previously surfaced to the TUI).
+    pub wdt_panic_count: u64,
 }
 
 /// Per-QSO entry for the QSO-detail panel. Batch 94: populated live

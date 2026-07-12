@@ -11,6 +11,32 @@ use super::{
 };
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+/// Count of panics observed process-wide since startup, via the top-level
+/// panic hook installed by `main.rs`'s `install_panic_hook`. Lives here
+/// (not in `main.rs`) because `main.rs` is the separate `pancetta` BIN
+/// crate, while this counter must be readable from `tui_relay.rs` (this LIB
+/// crate, `pancetta_lib`) for the Layer 3 health panel — a lib crate can
+/// never reach into its own bin crate, so the counter lives on the lib side
+/// and is written to across the crate boundary via [`record_panic`].
+/// docs/task-supervision-plan.md item 4 ("panics are never silent") —
+/// mirrors the existing `DECODE_PANIC_COUNT` pattern in `coordinator/ft8.rs`,
+/// but process-wide rather than scoped to the two catch_unwind sites in the
+/// decode loop.
+static PANIC_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Increment the process-wide panic counter, returning the new count. Called
+/// from `main.rs`'s `install_panic_hook` closure (the bin crate) — the only
+/// mutation point, kept as a function rather than a public static so the
+/// counter itself stays private to this module.
+pub fn record_panic() -> u64 {
+    PANIC_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// Read-only accessor for the Layer 3 health panel (`coordinator/tui_relay.rs`).
+pub fn panic_count() -> u64 {
+    PANIC_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// C19 — classification of a config hot-reload while QSO state may be latched.
 ///
 /// A config reload must **never** clobber an in-progress QSO's latched partner

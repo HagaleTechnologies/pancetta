@@ -24,7 +24,7 @@ mod dx_cluster;
 mod effort;
 mod ft8;
 mod hamlib;
-mod health;
+pub mod health;
 mod pipeline;
 mod psk_reporter;
 mod qso;
