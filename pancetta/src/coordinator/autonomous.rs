@@ -501,8 +501,8 @@ impl super::ApplicationCoordinator {
         // CQs from callsigns absent from the trust set (defense in
         // depth — the decode-side filter still runs in
         // coordinator/ft8.rs).
-        if let Some(ref filter) = self.fp_filter {
-            let filter = filter.clone();
+        let fp_filter_snapshot = self.fp_filter.read().unwrap().clone();
+        if let Some(filter) = fp_filter_snapshot {
             let op = operator.clone();
             let mut guard = op.lock().await;
             guard.set_fp_filter(Some(filter));

@@ -598,10 +598,21 @@ pub struct ApplicationCoordinator {
     active_qso_freq_hz: std::sync::Arc<std::sync::RwLock<Option<f64>>>,
 
     /// hb-062 FP filter: applied between decode merge and broadcast in the
-    /// FT8 thread. None = filter disabled (default). When enabled, drops
-    /// decodes whose extracted callsigns don't appear in operator-ADIF +
-    /// rolling-window + cqdx-spotted sources.
-    fp_filter: Option<std::sync::Arc<pancetta_qso::CallsignContinuityFilter>>,
+    /// FT8 thread. Inner `None` = filter disabled (default). When enabled,
+    /// drops decodes whose extracted callsigns don't appear in operator-ADIF
+    /// + rolling-window + cqdx-spotted sources.
+    ///
+    /// Shared `RwLock` (same pattern as `active_qso_ap`/`active_qso_freq_hz`
+    /// below), NOT a plain `Option` captured by value at thread-spawn time:
+    /// the production filter is built later in `run()` (after the cqdx
+    /// bridge's async startup), well after `start_pipeline()` has already
+    /// spawned the FT8 thread and cloned this field. A plain `Option` clone
+    /// would permanently capture `None`, silently disabling the filter for
+    /// the life of the process — the FT8 thread reads this fresh every
+    /// window instead.
+    fp_filter: std::sync::Arc<
+        std::sync::RwLock<Option<std::sync::Arc<pancetta_qso::CallsignContinuityFilter>>>,
+    >,
 
     /// Shared cross-slot state (hb-048 a7 / hb-057 DT history / hb-173
     /// within-QSO context substrate). Populated by the FT8 decoder thread
@@ -1162,7 +1173,7 @@ impl ApplicationCoordinator {
             waterfall_to_auto_rx: Some(waterfall_to_auto_rx),
             active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
             active_qso_freq_hz: std::sync::Arc::new(std::sync::RwLock::new(None)),
-            fp_filter: None,
+            fp_filter: std::sync::Arc::new(std::sync::RwLock::new(None)),
             cross_time_state: std::sync::Arc::new(pancetta_qso::CrossTimeState::empty()),
             cross_sequence_cache: std::sync::Arc::new(std::sync::RwLock::new(
                 pancetta_qso::CrossSequenceCallCache::default(),
@@ -1359,13 +1370,13 @@ impl ApplicationCoordinator {
                 Ok(filter) => {
                     let total_unique = filter.reference_size();
                     info!(
-                        target: "fp_filter",
+                        target: "pancetta::fp_filter",
                         "FP filter sources: adif={} cqdx={} seed={} total_unique={} cold_start_threshold={}",
                         adif_count, cqdx_count, seed_count, total_unique, COLD_START_THRESHOLD
                     );
                     if total_unique < COLD_START_THRESHOLD {
                         warn!(
-                            target: "fp_filter",
+                            target: "pancetta::fp_filter",
                             "FP filter reference set is small ({}/{}); decodes will pass unfiltered \
                              until rolling window populates. Populate {} or configure cqdx for \
                              better coverage.",
@@ -1377,7 +1388,7 @@ impl ApplicationCoordinator {
                                 .unwrap_or_else(|| "~/.pancetta/callsign_seed.txt".to_string())
                         );
                     }
-                    self.fp_filter = Some(std::sync::Arc::new(filter));
+                    *self.fp_filter.write().unwrap() = Some(std::sync::Arc::new(filter));
                 }
                 Err(e) => {
                     warn!("FP filter init failed, decodes will pass unfiltered: {}", e);
@@ -1957,6 +1968,65 @@ mod tests {
             coordinator.waterfall_to_auto_rx.is_some(),
             "waterfall_to_auto_rx must be Some at construction time, ready \
              for start_autonomous_component to take()"
+        );
+    }
+
+    /// Regression test for the hb-062 FP-filter dead-code bug: the FT8
+    /// pipeline (started by `start_pipeline()`, well before the production
+    /// FP filter is built later in `run()`) used to clone `self.fp_filter`
+    /// by value while it was still `None` — permanently disabling the
+    /// filter for the life of the process, since a plain `Option` clone
+    /// captures a snapshot, not a live view. `fp_filter` is now a shared
+    /// `Arc<RwLock<Option<...>>>` so a clone taken at construction time
+    /// (before any filter is built) still observes a later write through
+    /// the same lock. This pins that contract directly, independent of the
+    /// full `run()`/cqdx-bridge startup sequence.
+    #[tokio::test]
+    async fn fp_filter_write_is_visible_through_a_clone_taken_before_the_write() {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let coordinator = ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed");
+
+        // Simulates start_ft8_pipeline() cloning the Arc at thread-spawn
+        // time, before any filter has been built.
+        let early_clone = coordinator.fp_filter.clone();
+        assert!(
+            early_clone.read().unwrap().is_none(),
+            "filter should be unbuilt at construction time"
+        );
+
+        // Simulates run()'s later `*self.fp_filter.write().unwrap() = ...`
+        // once the production filter is actually built.
+        let filter = pancetta_qso::callsign_continuity::build_filter_with_seed(
+            None,
+            std::collections::HashSet::new(),
+            vec!["W1AW".to_string()],
+            500,
+            5,
+        )
+        .expect("filter should build with a seed callsign");
+        *coordinator.fp_filter.write().unwrap() = Some(std::sync::Arc::new(filter));
+
+        assert!(
+            early_clone.read().unwrap().is_some(),
+            "a clone taken before the write must observe the later write \
+             through the shared lock — this is the fix for the dead-filter \
+             bug (a plain Option clone would still be None here)"
         );
     }
 

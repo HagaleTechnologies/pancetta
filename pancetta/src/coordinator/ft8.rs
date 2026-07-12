@@ -349,8 +349,11 @@ impl super::ApplicationCoordinator {
             );
         }
 
-        // hb-062: shared FP filter (Option<Arc<...>>). When Some, applied
-        // between decode-merge and broadcast loop. None = no filtering.
+        // hb-062: shared FP filter (Arc<RwLock<Option<Arc<...>>>>). Cloning
+        // the Arc here shares the SAME lock the coordinator later writes the
+        // production filter into (see the comment on the `fp_filter` field
+        // in `mod.rs`) — the thread must read it fresh each window rather
+        // than snapshot it now, since it's still `None` at this point.
         let fp_filter = self.fp_filter.clone();
 
         // Shared cross-slot state substrate (hb-048 / hb-057 / hb-173).
@@ -985,11 +988,14 @@ impl super::ApplicationCoordinator {
                         }
 
                         // hb-062: apply FP filter post-decode, pre-broadcast.
-                        // When fp_filter is None (default), all decodes pass
-                        // through unchanged. When Some, decodes whose extracted
-                        // callsigns don't appear in any reference source are
-                        // dropped (logged at debug level).
-                        if let Some(ref filter) = fp_filter {
+                        // Read fresh each window rather than a value captured
+                        // at thread-spawn time — the production filter is
+                        // built later in `run()` and written into the SAME
+                        // lock (see the `fp_filter` field comment in
+                        // `mod.rs`). When the snapshot is None (default, or
+                        // not yet built), all decodes pass through unchanged.
+                        let fp_filter_snapshot = fp_filter.read().unwrap().clone();
+                        if let Some(ref filter) = fp_filter_snapshot {
                             let pre = decoded_messages.len();
                             decoded_messages.retain(|m| filter.accept(&m.text));
                             let dropped = pre - decoded_messages.len();
@@ -1004,6 +1010,11 @@ impl super::ApplicationCoordinator {
                         // filter judged false. The container is SHIPPED-INFRA
                         // — no consumer reads from it yet; downstream
                         // hypotheses will hook in here in future sessions.
+                        //
+                        // Same live-read rationale as `fp_filter_snapshot`
+                        // above — one read per window, not per message.
+                        let cross_sequence_fp_filter_snapshot =
+                            cross_sequence_fp_filter.read().unwrap().clone();
                         for decoded_msg in &decoded_messages {
                             let parity_u8 = decoded_msg.slot_parity.map(|p| match p {
                                 pancetta_core::slot::SlotParity::Even => 0u8,
@@ -1036,7 +1047,9 @@ impl super::ApplicationCoordinator {
                                 {
                                     if let Ok(mut cache_guard) = cross_sequence_cache.write() {
                                         let admitted =
-                                            if let Some(ref filter) = cross_sequence_fp_filter {
+                                            if let Some(ref filter) =
+                                                cross_sequence_fp_filter_snapshot
+                                            {
                                                 cache_guard.record_decoded_trusted(
                                                     call,
                                                     decoded_msg.frequency_offset,
