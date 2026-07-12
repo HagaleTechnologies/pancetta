@@ -17,7 +17,7 @@ publish.workspace = true
 [dependencies]
 # TUI Framework
 ratatui = "0.30"
-crossterm = "0.28"
+crossterm = "0.29"
 
 # Async runtime and channels
 tokio = { version = "1.50", features = ["full"] }
