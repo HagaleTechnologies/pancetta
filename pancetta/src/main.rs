@@ -1249,7 +1249,7 @@ async fn test_rig_command(args: TestRigArgs, cli: &Cli) -> Result<()> {
 fn install_panic_hook() {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
-        let n = pancetta_lib::coordinator::health::record_panic();
+        let n = pancetta_lib::coordinator::record_panic();
         let location = info
             .location()
             .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()))
@@ -1338,18 +1338,20 @@ mod tests {
 
     /// docs/task-supervision-plan.md item 4: a panic must be counted and
     /// logged (not just chained to the default hook silently). Uses a
-    /// before/after delta rather than an absolute count since the counter
-    /// (`pancetta_lib::coordinator::health::PANIC_COUNT`) is process-global
-    /// and other tests in this binary may also panic concurrently.
+    /// before/after delta rather than an absolute count since the underlying
+    /// counter (a private static in `coordinator/health.rs`, read via the
+    /// re-exported `pancetta_lib::coordinator::panic_count()`) is
+    /// process-global and other tests in this binary may also panic
+    /// concurrently.
     #[test]
     fn panic_hook_counts_and_survives_via_catch_unwind() {
         install_panic_hook();
-        let before = pancetta_lib::coordinator::health::panic_count();
+        let before = pancetta_lib::coordinator::panic_count();
         let result = std::panic::catch_unwind(|| {
             panic!("test panic for install_panic_hook coverage");
         });
         assert!(result.is_err(), "catch_unwind should observe the panic");
-        let after = pancetta_lib::coordinator::health::panic_count();
+        let after = pancetta_lib::coordinator::panic_count();
         assert!(
             after > before,
             "panic_count() must increase after a panic (before={before}, after={after})"

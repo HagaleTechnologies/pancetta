@@ -14,10 +14,14 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 /// Count of panics observed process-wide since startup, via the top-level
 /// panic hook installed by `main.rs`'s `install_panic_hook`. Lives here
 /// (not in `main.rs`) because `main.rs` is the separate `pancetta` BIN
-/// crate, while this counter must be readable from `tui_relay.rs` (this LIB
-/// crate, `pancetta_lib`) for the Layer 3 health panel — a lib crate can
-/// never reach into its own bin crate, so the counter lives on the lib side
-/// and is written to across the crate boundary via [`record_panic`].
+/// crate: a lib crate's sibling modules (like `tui_relay.rs`, which reads
+/// this counter for the Layer 3 health panel) can already see a private
+/// `coordinator::health` module fine — the real constraint is that
+/// `main.rs`, being a DIFFERENT crate, can only reach this counter through
+/// a `pub` path. [`record_panic`]/[`panic_count`] are re-exported at
+/// `coordinator::{record_panic, panic_count}` for exactly that reason,
+/// while `mod health` itself and this static both stay non-`pub` so nothing
+/// else in this file becomes part of `pancetta_lib`'s public surface.
 /// docs/task-supervision-plan.md item 4 ("panics are never silent") —
 /// mirrors the existing `DECODE_PANIC_COUNT` pattern in `coordinator/ft8.rs`,
 /// but process-wide rather than scoped to the two catch_unwind sites in the

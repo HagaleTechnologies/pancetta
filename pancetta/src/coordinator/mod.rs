@@ -24,7 +24,7 @@ mod dx_cluster;
 mod effort;
 mod ft8;
 mod hamlib;
-pub mod health;
+mod health;
 mod pipeline;
 mod psk_reporter;
 mod qso;
@@ -47,9 +47,15 @@ pub use qso::compute_manual_tx_offset;
 
 // Re-export the C19 config-reload classifier (safe-live vs deferred) and the
 // C20 RF-present/no-decode detector so the coordinator-robustness integration
-// tests can exercise the real production decision logic.
+// tests can exercise the real production decision logic. `record_panic`/
+// `panic_count` are re-exported for the same reason `main.rs` (the separate
+// `pancetta` BIN crate) needs them: a lib crate's private submodules are
+// visible to `main.rs` only through a `pub` path, and `mod health` itself
+// stays private so nothing else in `health.rs` is exposed beyond what's
+// explicitly re-exported here.
 pub use health::{
-    classify_config_reload, ConfigReloadApplicability, HealthEdges, RfNoDecodeMonitor,
+    classify_config_reload, panic_count, record_panic, ConfigReloadApplicability, HealthEdges,
+    RfNoDecodeMonitor,
 };
 
 /// Canonical key for the `active_tx_qsos` set: QSO ids are compared
