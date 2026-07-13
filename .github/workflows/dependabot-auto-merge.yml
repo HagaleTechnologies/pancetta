@@ -21,11 +21,12 @@ jobs:
       # "major" — 0.15.3 -> 0.18.1 is breaking-by-convention, but dependabot's
       # update-type still labels it "semver-minor" (root cause of PR #125
       # auto-merging cpal 0.15->0.18 while CI was red; see
-      # docs/DECISIONS/... and the 2026-07-13 incident notes). Reclassify any
-      # 0.x dependency whose second component changed as breaking, in addition
-      # to dependabot's own semver-major flag. updated-dependencies-json (not
-      # the top-level previous-version/new-version, which only reflect a single
-      # dependency) is used so grouped-update PRs are covered per-member.
+      # docs/DECISIONS/config-and-platform.md's 2026-07-13 entry). Reclassify
+      # any 0.x dependency whose second component changed as breaking, in
+      # addition to dependabot's own semver-major flag. updated-dependencies-
+      # json (not the top-level previous-version/new-version, which only
+      # reflect a single dependency) is used so grouped-update PRs are
+      # covered per-member.
       - name: Classify breaking updates
         id: classify
         env:
