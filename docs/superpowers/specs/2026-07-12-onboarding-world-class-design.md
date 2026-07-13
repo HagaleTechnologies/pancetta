@@ -72,7 +72,7 @@ wizard instead of exiting when the saved config fails validation; bare
 counts corrected. Deliverable: a stranger following the README verbatim
 reaches a decoding TUI with the real C decoder, or is told loudly why not.
 
-### Phase 2 — Docs tell the truth (plan when picked up)
+### Phase 2 — Docs tell the truth (plan: `2026-07-13-onboarding-phase2-docs-truth.md`)
 
 - Regenerate CONFIG.md's `[autonomous]` section from the real schema; either
   wire `[duplicate_checking]` into config plumbing or delete its docs (decide
@@ -88,7 +88,7 @@ reaches a decoding TUI with the real C decoder, or is told loudly why not.
   from working notes, defaults.toml regeneration or demotion from
   "source of truth" billing.
 
-### Phase 3 — The true 5-minute install (plan when picked up)
+### Phase 3 — Releases, discoverability, presentation (plan: `2026-07-13-onboarding-phase3-releases.md`)
 
 - Tag `v0.9.5`; add a release workflow (evaluate `cargo-dist` first, else
   hand-rolled matrix build) shipping macOS (arm64), Windows x64, Linux x64
@@ -102,7 +102,7 @@ reaches a decoding TUI with the real C decoder, or is told loudly why not.
 - Fill `description`/`repository` metadata on `pancetta-agent` and
   `pancetta-protocol` so `publish = false` is a choice, not a blocker.
 
-### Phase 4 — Guided use & failure symmetry (plan when picked up)
+### Phase 4 — The five-minute on-air path (plan: `2026-07-13-onboarding-phase4-five-minute-on-air.md`) — owns THE goal
 
 - `pancetta doctor`: one command that checks clock sync (NTP offset), audio
   device presence + level, submodule/stub status, rigctld reachability, config
