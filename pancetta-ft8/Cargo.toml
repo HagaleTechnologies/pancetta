@@ -35,7 +35,7 @@ serialport = { version = "4.9", optional = true }
 # GPIO control for Raspberry Pi
 rppal = { version = "0.22", optional = true }
 # Audio output and control
-cpal = { version = "0.18", optional = true }
+cpal = { version = "0.15", optional = true }
 # Date/time handling for transmission scheduling
 chrono = { version = "0.4", features = ["serde"], optional = true }
 # Atomic operations for thread-safe state

@@ -44,7 +44,7 @@ publish = false
 
 [workspace.dependencies]
 # Real-time audio processing
-cpal = "0.18"
+cpal = "0.15"
 # Lock-free data structures for real-time communication
 ringbuf = "0.5"
 # High-precision timing
