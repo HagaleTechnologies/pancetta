@@ -7,10 +7,13 @@ each get their own plan when picked up.
 
 ## Goal
 
-A stranger — a licensed ham with a computer — goes from "found the repo" to a
-running, decoding pancetta station in **under 5 minutes**, and from there to
-their first QSO without ever opening the source code or hitting a dead end.
-Ongoing "how do I…" workflows are answerable from the product and docs alone.
+**(Clarified by the operator 2026-07-13:)** the 5-minute clock starts **when the
+build completes**: from that moment, a licensed ham must be able to configure
+the station and be **on the air** (rig connected, able to work a QSO) in under
+5 minutes — wizard → doctor-green → decoding → TX-capable, no source-diving, no
+dead ends. Getting *to* a completed build fast (prebuilt binaries, honest build
+docs) is a supporting goal, not the headline. Ongoing "how do I…" workflows are
+answerable from the product and docs alone.
 
 ## Evidence base (2026-07-12 five-track audit)
 
@@ -47,13 +50,15 @@ Full findings live in the audit session; load-bearing facts:
 
 ## North-star funnel definitions
 
-- **5-minute path (binary):** download release artifact → run → wizard →
-  decoding. No Rust toolchain, no compile.
-- **15-minute path (source):** `git clone --recursive` → documented build →
-  wizard → decoding, with zero dead ends and zero silent degradation.
-- **First-QSO path:** decode-only → rig configured (`pancetta setup`) →
-  first manual QSO, guided by a task-oriented doc, ≤30 min for a ham who
-  already has CAT/audio cables.
+- **THE 5-minute path (post-build, the operator's stated goal):** build (or
+  download) completes → first launch → wizard (station + audio + rig) →
+  `pancetta doctor` green → decoding, TX-capable — **≤ 5 minutes** for a ham
+  with CAT/audio cables already attached. Owned by Phase 4.
+- **Supporting: install path (binary):** download release artifact → run.
+  No Rust toolchain, no compile. Owned by Phase 3.
+- **Supporting: source path:** `git clone --recursive` → documented build →
+  first launch, with zero dead ends and zero silent degradation. Owned by
+  Phase 1.
 
 ## Phases
 
@@ -120,7 +125,10 @@ reaches a decoding TUI with the real C decoder, or is told loudly why not.
 
 ## Success metrics
 
-- Binary path: download→decoding < 5 min (Phase 3 exit criterion).
+- **Post-build → on-air ≤ 5 min** (wizard incl. rig → doctor green → decoding,
+  TX-capable) — THE goal; Phase 4 exit criterion, measured by the scripted
+  five-minute drill with a stopwatch.
+- Binary install path: download→first-launch < 2 min (Phase 3 exit criterion).
 - Source path: clone→decoding with real C decoder, zero dead ends, on the
   README's literal commands (Phase 1 exit criterion; CI-checkable for the
   command validity half).
@@ -139,6 +147,8 @@ reaches a decoding TUI with the real C decoder, or is told loudly why not.
   contemporaneous-initiation rules). The competitor audit shows this is the
   reputational line between "great tool" (Hamilton posture) and "robot villain"
   (WSJT-Z posture).
-- **WSJT-X UDP emission** (GridTracker/JTAlert compatibility) is the single
-  biggest ecosystem unlock found by the competitive audit, but it is a product
-  feature, not onboarding — tracked separately, not in these phases.
+- **WSJT-X UDP emit + consume** (GridTracker/JTAlert compatibility, including
+  remote QSO initiation from GridTracker) was green-lit by the operator
+  2026-07-13 as its own initiative — see
+  `docs/superpowers/specs/2026-07-13-wsjtx-udp-design.md` and its plan. It is
+  deliberately NOT one of these onboarding phases.
