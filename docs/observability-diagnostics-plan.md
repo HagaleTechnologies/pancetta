@@ -1,5 +1,11 @@
 # Observability / diagnostics — implementation plan
 
+**Status (2026-07-12): Layer 1 + core Layer 2 shipped PR #84. `tx.policy`-category Layer-1 emission
++ Layer 3 health panel shipped in this pass (Shift+S).** Remaining: `qso.security`-category Layer-1
+emission (blocked on a real architecture change to the QSO state machine — see
+`project_observability_remaining_layers_scoped` memory), Layer 2's structured Recent-QSOs
+ring/panel, Layer 2's optional per-QSO timeline persistence.
+
 Detailed plan to let the operator answer, **without hand-reading the log**: "why did
 that QSO fail?", "why are we retrying / not transmitting?", and "is the station healthy
 right now?" **Plan only — no code here.** Grounded in the current code; every hook cited

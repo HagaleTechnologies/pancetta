@@ -615,6 +615,10 @@ impl super::ApplicationCoordinator {
                             .load(Ordering::Relaxed),
                         last_decode_budget_exhausted: decode_last_budget_exhausted_relay
                             .load(Ordering::Relaxed),
+                        tx_attempts: super::tx::tx_attempts_count(),
+                        tx_defers: super::tx::tx_defers_count(),
+                        decode_panic_count: super::ft8::decode_panic_count(),
+                        wdt_panic_count: super::health::panic_count(),
                     };
                     let _ = tui_msg_tx_relay.send(
                         pancetta_tui::tui_runner::TuiMessage::PipelineHealth(health),

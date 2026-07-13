@@ -21,6 +21,30 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType}
 /// FT8 nominal pre-roll: audio starts 500ms past the slot boundary.
 const DELAY_MS: u64 = 500;
 
+/// Total `TransmitRequest`/`MultiTransmitRequest`/`TuneRequest` messages this
+/// worker has received this session, incremented before any policy gating
+/// (docs/observability-diagnostics-plan.md Layer 3 health panel). Process-
+/// global, matching the existing `DECODE_PANIC_COUNT`
+/// (`coordinator/ft8.rs`) / `PANIC_COUNT` (`main.rs`) counter pattern — no
+/// new locking, no new message-passing.
+static TX_ATTEMPTS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Total single-TX requests deferred to a later slot because the request
+/// arrived too late to make the current one
+/// (`schedule.deferred`, single-TX `TransmitRequest` arm only — multi-TX has
+/// no equivalent defer path).
+static TX_DEFERS_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read-only accessor for the Layer 3 health panel (`coordinator/tui_relay.rs`).
+pub(crate) fn tx_attempts_count() -> u64 {
+    TX_ATTEMPTS_COUNT.load(Ordering::Relaxed)
+}
+
+/// Read-only accessor for the Layer 3 health panel (`coordinator/tui_relay.rs`).
+pub(crate) fn tx_defers_count() -> u64 {
+    TX_DEFERS_COUNT.load(Ordering::Relaxed)
+}
+
 /// Multi-TX coalesce collection window.
 ///
 /// Fix for the "slow-start" bug: when the operator manually starts several
@@ -1037,6 +1061,7 @@ impl super::ApplicationCoordinator {
                                         "Transmit request: '{}' at offset {:.0} Hz (qso: {:?})",
                                         message_text, frequency_offset, qso_id
                                     );
+                                    TX_ATTEMPTS_COUNT.fetch_add(1, Ordering::Relaxed);
 
                                     // --- Step 0: TX-policy hard mute ---
                                     // If the global policy is Disabled (RX-only),
@@ -1253,6 +1278,7 @@ impl super::ApplicationCoordinator {
                                     // the deferred flag so it shows "deferred 30s"
                                     // instead of looking dead during the long wait.
                                     if schedule.deferred {
+                                        TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
                                         // Re-check active-status at defer time: a
                                         // terminal QSO's request must not be re-
                                         // deferred 30s into the future (that is
@@ -1656,6 +1682,8 @@ impl super::ApplicationCoordinator {
                                     origin,
                                 } => {
                                     info!("Multi-TX request: {} messages", items.len());
+                                    TX_ATTEMPTS_COUNT
+                                        .fetch_add(items.len() as u64, Ordering::Relaxed);
 
                                     // --- Step 0: TX-policy hard mute ---
                                     // Disabled (RX-only): never key PTT / play audio /
@@ -2275,6 +2303,7 @@ impl super::ApplicationCoordinator {
                                     tone_offset_hz,
                                 } => {
                                     info!("Tune: {}s tone at {} Hz", duration_secs, tone_offset_hz);
+                                    TX_ATTEMPTS_COUNT.fetch_add(1, Ordering::Relaxed);
 
                                     // --- TX-policy hard mute ---
                                     // A tune carrier is a transmission. If the
@@ -3279,5 +3308,27 @@ mod remote_arm_gate_tests {
             !remote_tx_permitted(&arm, NOW),
             "SAFETY: a poisoned arm lock must fail CLOSED (deny remote TX)"
         );
+    }
+}
+
+#[cfg(test)]
+mod tx_counter_tests {
+    use super::*;
+
+    /// Process-global counters mean concurrent tests in this binary can also
+    /// increment them — assert a delta, not an absolute value (same
+    /// discipline as `main.rs`'s `panic_hook_counts_and_survives_via_catch_unwind`).
+    #[test]
+    fn tx_attempts_count_increments() {
+        let before = tx_attempts_count();
+        TX_ATTEMPTS_COUNT.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(tx_attempts_count(), before + 1);
+    }
+
+    #[test]
+    fn tx_defers_count_increments() {
+        let before = tx_defers_count();
+        TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(tx_defers_count(), before + 1);
     }
 }

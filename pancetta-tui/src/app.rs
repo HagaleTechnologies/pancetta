@@ -210,6 +210,19 @@ pub struct PipelineHealth {
     /// overhaul Task 12). Always `false` while the operator/preset effort
     /// budget is unlimited (the only value set today).
     pub last_decode_budget_exhausted: bool,
+    /// Total TX attempts this session (single-TX + tune + each multi-TX
+    /// item), before any policy gating (docs/observability-diagnostics-
+    /// plan.md Layer 3 health panel).
+    pub tx_attempts: u64,
+    /// Total single-TX requests deferred to a later slot this session.
+    pub tx_defers: u64,
+    /// Total FT8 decode-thread panics caught this session (already existed
+    /// as `DECODE_PANIC_COUNT` in `coordinator/ft8.rs`; not previously
+    /// surfaced to the TUI).
+    pub decode_panic_count: u64,
+    /// Total top-level process panics caught this session (already existed
+    /// as `PANIC_COUNT` in `main.rs`; not previously surfaced to the TUI).
+    pub wdt_panic_count: u64,
 }
 
 /// Per-QSO entry for the QSO-detail panel. Batch 94: populated live
@@ -709,6 +722,11 @@ pub struct App {
     pub diagnostic_events: VecDeque<DiagnosticEventRecord>,
     /// Shift+D overlay visibility for `diagnostic_events`.
     pub show_diagnostics: bool,
+    /// Shift+S overlay visibility for the consolidated station-health panel
+    /// (docs/observability-diagnostics-plan.md Layer 3). Unlike
+    /// `show_diagnostics` (a scrollback), this is a snapshot view — no
+    /// scroll-position field needed.
+    pub show_health: bool,
     /// Scroll cursor into `diagnostic_events` while the overlay is open.
     pub diagnostics_scroll: usize,
     /// Count of QSOs completed this session (Task 20d). Counted TUI-side
@@ -717,6 +735,25 @@ pub struct App {
     /// emits (`"QSO with {call} logged (RST …/…)"`, target "qso", Info
     /// level). Rendered as "QSOs: {n}" in the title bar once n > 0.
     pub session_completed: u32,
+    /// Count of QSOs failed this session (Layer 3 health panel sibling to
+    /// `session_completed`). Counted TUI-side from the same DiagnosticEvent
+    /// stream, matching the coordinator's exact failure text ("QSO failed:
+    /// {reason}", target "qso", Warn) from `coordinator/qso.rs`'s
+    /// `QsoFailed` handler.
+    pub session_failed: u32,
+    /// Count of TX drops this session (stale-TX-for-ended-QSO, multi-TX
+    /// per-item/whole-bundle stale drops) — matches the "tx.policy"-target
+    /// "dropping stale ..." diagnostic texts added in the 2026-07-12
+    /// tx.policy observability-wiring pass (docs/DECISIONS/tui.md).
+    /// Deliberately does NOT count TxPolicy-Disabled blocks (an intentional
+    /// operator action, not a drop), the non-TX-message re-enqueue-failure
+    /// diagnostic (an internal error, not a drop), or the backlog-coalesce
+    /// summary line ("TX backlog coalesced: ... dropped N for ended QSOs
+    /// ...") — that summary's text doesn't start with "dropping stale" and,
+    /// even if matched, embeds its own drop count rather than always being
+    /// exactly one drop, so a simple +1-per-event tally can't represent it
+    /// correctly; not worth parsing out for a diagnostics counter.
+    pub session_tx_drops: u32,
     /// Set by the first `x` press (Task 20f — confirm-on-`x`); a second
     /// press within `CLEAR_CONFIRM_WINDOW` actually clears decodes. `None`
     /// = not armed.
@@ -1023,8 +1060,11 @@ impl App {
             theme: config.ui.theme,
             diagnostic_events: VecDeque::with_capacity(500),
             show_diagnostics: false,
+            show_health: false,
             diagnostics_scroll: 0,
             session_completed: 0,
+            session_failed: 0,
+            session_tx_drops: 0,
             clear_armed_at: None,
             decoded_messages: VecDeque::with_capacity(1000),
             qso_statuses: Vec::new(),
