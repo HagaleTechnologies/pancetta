@@ -33,7 +33,7 @@ tracing = "0.1"
 # Serial port communication for PTT/CAT control
 serialport = { version = "4.9", optional = true }
 # GPIO control for Raspberry Pi
-rppal = { version = "0.17", optional = true }
+rppal = { version = "0.22", optional = true }
 # Audio output and control
 cpal = { version = "0.18", optional = true }
 # Date/time handling for transmission scheduling
