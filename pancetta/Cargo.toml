@@ -42,7 +42,7 @@ tower-http = { workspace = true }
 tokio-tungstenite = { workspace = true }
 futures-util = { workspace = true }
 reqwest = { workspace = true }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
 
 # Async runtime and coordination
 tokio = { version = "1.50", features = ["full", "rt-multi-thread"] }

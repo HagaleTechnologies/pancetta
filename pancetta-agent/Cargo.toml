@@ -15,10 +15,11 @@ tracing = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 dirs = { workspace = true }
-ed25519-dalek = { version = "2", features = ["rand_core"] }
-x25519-dalek = { version = "2", features = ["static_secrets"] }
+ed25519-dalek = { version = "3", features = ["rand_core"] }
+x25519-dalek = { version = "3", features = ["static_secrets"] }
 sha2 = "0.11"
-rand_core = { version = "0.6", features = ["getrandom"] }
+rand_core = "0.10"
+getrandom = { version = "0.4", features = ["sys_rng"] }
 base64 = { workspace = true }
 
 [dev-dependencies]
