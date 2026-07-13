@@ -32,6 +32,15 @@
 
 set -euo pipefail
 
+# When git runs this script as a pre-push hook it exports GIT_DIR (and sometimes
+# GIT_WORK_TREE / GIT_INDEX_FILE / GIT_PREFIX). Those env vars OVERRIDE `git -C`
+# repo discovery in every child process — cargo-deny's RustSec advisory-db
+# auto-update shells out to `git -C ~/.cargo/advisory-dbs/... reset --hard
+# FETCH_HEAD`, which with GIT_DIR leaked would hard-reset THIS repo's pushing
+# branch instead (root-caused 2026-07-13 after six branch-clobber incidents;
+# see docs/superpowers/plans/2026-07-13-fix-prepush-git-clobber.md).
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX
+
 cd "$(git rev-parse --show-toplevel)"
 
 FAST=0
