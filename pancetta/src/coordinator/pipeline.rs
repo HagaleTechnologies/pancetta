@@ -35,15 +35,22 @@ impl super::ApplicationCoordinator {
         let health_last_rms = Arc::new(std::sync::atomic::AtomicU32::new(0)); // f32 bits
         let health_audio_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        let ft8lib_native = pancetta_ft8::ft8lib_is_available();
         info!(
             "Pipeline starting: ft8_lib={}, audio_device={}",
-            if pancetta_ft8::ft8lib_is_available() {
+            if ft8lib_native {
                 "native-C"
             } else {
                 "stub (pure-Rust only)"
             },
             if self.headless { "stub" } else { "real" },
         );
+        if !ft8lib_native {
+            warn!(
+                "ft8_lib C decoder NOT compiled in (ft8lib_stub) — decode recall is degraded. \
+                 Fix: git submodule update --init && cargo build --release"
+            );
+        }
 
         // Also create message bus channels for control messages (hamlib, autonomous, etc.)
         let (_audio_bus_tx, audio_bus_rx) =
@@ -54,6 +61,27 @@ impl super::ApplicationCoordinator {
             .create_channel(ComponentId::Ft8Decoder)
             .await?;
         let (_tui_bus_tx, tui_bus_rx) = self.message_bus.create_channel(ComponentId::Tui).await?;
+
+        if !ft8lib_native {
+            let msg = ComponentMessage::new(
+                ComponentId::Ft8Decoder,
+                ComponentId::Tui,
+                MessageType::DiagnosticEvent {
+                    target: "decode.engine",
+                    level: pancetta_core::DiagnosticLevel::Warn,
+                    text:
+                        "ft8_lib C decoder not compiled in (stub build) — decode recall degraded. \
+                           Fix: git submodule update --init, then rebuild."
+                            .to_string(),
+                    qso_id: None,
+                    callsign: None,
+                },
+                Instant::now(),
+            );
+            if let Err(e) = self.message_bus.send_message(msg).await {
+                tracing::debug!("stub-build DiagnosticEvent relay failed (no TUI?): {e}");
+            }
+        }
 
         // --- Audio component ---
         self.start_audio_pipeline(audio_to_dsp_tx, tx_audio_rx, health_audio_alive.clone())
