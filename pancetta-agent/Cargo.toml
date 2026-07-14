@@ -1,8 +1,11 @@
 [package]
 name = "pancetta-agent"
+description = "Remote-TX security agent for pancetta: arm-state gating, capability verification, device pairing, and audit trail"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
 publish = false
 
 [dependencies]
