@@ -15,8 +15,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real `ft8_lib` C decoder.
 - `pancetta info` now reports the decode engine: `ft8_lib C decoder: native-C`
   or a loud `STUB` line with the fix command.
-- README: CI / release / license badges, a prebuilt-binary install section,
-  and a screenshot slot (`docs/assets/`).
 
 ### Fixed
 
