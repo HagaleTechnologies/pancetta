@@ -111,8 +111,8 @@ callsign → ADIF resolution.
    }
    ```
 
-**Tests:** unit tests for the lookup (W1ABC→291, KH6ABC→110, KL7AB→6, F/K5ARH→France,
-K5ARH/P→291, VE3XYZ→1, 3Y0J→Bouvet-Peter-I... use real CTY expectations); integration
+**Tests:** unit tests for the lookup (W1ABC→291, KH6ABC→110, KL7AB→6, F/N0CALL→France,
+N0CALL/P→291, VE3XYZ→1, 3Y0J→Bouvet-Peter-I... use real CTY expectations); integration
 test that a needed-USA set matches W/N/A/K calls and rejects KH6.
 
 ---
@@ -186,7 +186,7 @@ a 0-TTL config in the test).
 if upper.contains('/') { return true; }   // ← the bug
 ```
 
-`VK9/W1ABC` (DXpedition prefix), `F/K5ARH` (foreign operation), `W1ABC/MM` (maritime
+`VK9/W1ABC` (DXpedition prefix), `F/N0CALL` (foreign operation), `W1ABC/MM` (maritime
 mobile), `W1ABC/QRP` — all flagged as POTA/SOTA and given the 0.15 boost. Portable-prefix
 DX operations are exactly the calls that should be scored by DXCC need/rarity instead.
 **Note:** the existing test at `priority.rs:198` (`assert!(is_pota_sota_candidate("VE3/W1ABC"))`)

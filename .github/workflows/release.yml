@@ -1,0 +1,171 @@
+name: Release
+
+# Builds prebuilt binaries on every v* tag push and attaches them to a DRAFT
+# GitHub Release. The operator publishes the draft — tags and releases are
+# operator-gated (docs/superpowers/plans/2026-07-13-onboarding-phase3-releases.md).
+#
+# Engineering notes (mirrors ci.yml house policy):
+#   - ft8_lib submodule: checkout MUST be `submodules: recursive`, and a hard
+#     guard + a run-the-binary smoke step verify the real C decoder is baked
+#     in. Without the submodule, pancetta-ft8/build.rs silently falls back to
+#     ft8lib_stub (degraded decode recall) — a stub binary must NEVER ship.
+#   - pancetta-research is a local-only iteration harness (CLAUDE.md): never
+#     built in CI. This workflow builds `-p pancetta` only, so it is excluded
+#     structurally — do not change this to a --workspace build.
+#   - Windows uses the GNU (MinGW) toolchain, never MSVC: MSVC cannot compile
+#     the VLAs in vendor/ft8_lib/ft8/decode.c (error C2057; see the
+#     cross-platform-check note in ci.yml, 2026-05-23). The on-rig Windows
+#     MiniPC builds with MinGW already, so gnu is also the proven toolchain.
+#   - crates.io publishing is OUT of scope ([workspace.package] publish=false).
+#     This workflow ships binaries only.
+
+on:
+  push:
+    tags: ['v*']
+  # Dry run: builds + smoke-tests artifacts (named after the branch), but the
+  # release job is tag-gated and will not run.
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: x86_64-pc-windows-gnu
+            os: windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # REQUIRED: without the ft8_lib submodule the binary ships the
+          # degraded ft8lib_stub decoder. Two more gates below back this up.
+          submodules: recursive
+
+      - name: Guard — ft8_lib submodule sources present
+        shell: bash
+        # Exact file pancetta-ft8/build.rs keys the stub fallback on.
+        run: |
+          test -f pancetta-ft8/vendor/ft8_lib/ft8/constants.c \
+            || { echo "::error::ft8_lib submodule not checked out — refusing to build a stub release"; exit 1; }
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
+
+      - name: Assert MinGW gcc available (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        # windows-latest images ship MinGW gcc on PATH; the cc crate uses it to
+        # compile ft8_lib for the gnu target. If a future image drops it, add:
+        #   choco install mingw -y
+        run: gcc --version
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binary
+        # -p pancetta only: excludes pancetta-research (local-only, never in
+        # CI) and every helper binary. Default features (metrics + hamlib
+        # rigctld-TCP client) are the production build; no system hamlib is
+        # needed at build time (runtime-only, via rigctld over TCP).
+        run: cargo build --release -p pancetta --target ${{ matrix.target }}
+
+      - name: Smoke test — binary must embed the real C decoder
+        shell: bash
+        run: |
+          BIN="target/${{ matrix.target }}/release/pancetta"
+          if [ "${{ runner.os }}" = "Windows" ]; then BIN="$BIN.exe"; fi
+          "$BIN" info
+          "$BIN" info | grep -q "ft8_lib C decoder: native-C" \
+            || { echo "::error::binary was built with ft8lib_stub — degraded decoder must not ship"; exit 1; }
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          NAME="pancetta-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir "$NAME"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/${{ matrix.target }}/release/pancetta.exe" "$NAME/"
+          else
+            cp "target/${{ matrix.target }}/release/pancetta" "$NAME/"
+          fi
+          cp README.md CHANGELOG.md LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.md "$NAME/"
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "${NAME}.zip" "$NAME"
+            ARCHIVE="${NAME}.zip"
+          else
+            tar czf "${NAME}.tar.gz" "$NAME"
+            ARCHIVE="${NAME}.tar.gz"
+          fi
+          # sha256sum on Linux + Git-Bash/Windows; shasum on macOS.
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "$ARCHIVE" > "${ARCHIVE}.sha256"
+          else
+            shasum -a 256 "$ARCHIVE" > "${ARCHIVE}.sha256"
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: release-${{ matrix.target }}
+          path: |
+            pancetta-*.tar.gz*
+            pancetta-*.zip*
+          if-no-files-found: error
+
+  release:
+    name: Create draft release
+    # Tag pushes only — workflow_dispatch dry runs stop after build+smoke.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7   # CHANGELOG.md only; no submodule needed
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Extract release notes from CHANGELOG
+        run: |
+          set -euo pipefail
+          VERSION="${GITHUB_REF_NAME#v}"
+          awk -v ver="$VERSION" \
+            'index($0, "## [" ver "]") == 1 {flag=1; next} /^## /{flag=0} flag' \
+            CHANGELOG.md > notes.md
+          test -s notes.md || { echo "::error::CHANGELOG.md has no section for ${VERSION}"; exit 1; }
+          {
+            echo ""
+            echo "---"
+            echo "Tagged at \`${GITHUB_SHA}\`. Prebuilt binaries: macOS (Apple Silicon),"
+            echo "Linux x86_64 (gnu), Windows x86_64 (MinGW). Every binary is CI-verified"
+            echo "to embed the real \`ft8_lib\` C decoder (\`pancetta info\`)."
+          } >> notes.md
+
+      - name: Create draft release (operator publishes)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --draft \
+            --verify-tag \
+            --title "Pancetta $GITHUB_REF_NAME" \
+            --notes-file notes.md

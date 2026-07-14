@@ -204,10 +204,10 @@ mod tests {
         let log = AuditLog::new(tp.path().clone());
 
         let events = vec![
-            ev(1000, AuditKind::Armed, Some("K5ARH"), "armed"),
-            ev(2000, AuditKind::TxRequested, Some("K5ARH"), "tx#1"),
-            ev(3000, AuditKind::TxDenied, Some("K5ARH"), "heartbeat lost"),
-            ev(4000, AuditKind::Disarmed, Some("K5ARH"), "ttl expired"),
+            ev(1000, AuditKind::Armed, Some("N0CALL"), "armed"),
+            ev(2000, AuditKind::TxRequested, Some("N0CALL"), "tx#1"),
+            ev(3000, AuditKind::TxDenied, Some("N0CALL"), "heartbeat lost"),
+            ev(4000, AuditKind::Disarmed, Some("N0CALL"), "ttl expired"),
         ];
         for e in &events {
             log.append(e);
