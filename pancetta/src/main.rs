@@ -656,8 +656,41 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
             .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
         (config, Vec::new())
     } else {
-        Config::load_default_with_warnings()
-            .with_context(|| "Failed to load default configuration")?
+        match Config::load_default_with_warnings() {
+            Ok(pair) => pair,
+            Err(e)
+                if offer_wizard_on_load_failure(
+                    cli.headless,
+                    cli.wav.is_some(),
+                    std::io::stdin().is_terminal(),
+                ) =>
+            {
+                eprintln!();
+                eprintln!("ERROR: your saved configuration failed to load:");
+                eprintln!("  {e}");
+                eprintln!("  (file: ~/.pancetta/pancetta.toml)");
+                eprintln!();
+                if prompt_yes_no(
+                    "Re-run first-time setup? (overwrites the broken config on save)",
+                    false,
+                )? {
+                    let defaults = Config::default();
+                    match run_first_time_setup(&defaults)? {
+                        Some(fixed) => (fixed, Vec::new()),
+                        None => {
+                            return Err(anyhow::anyhow!(e))
+                                .context("Failed to load default configuration")
+                        }
+                    }
+                } else {
+                    eprintln!("Edit the file by hand, or delete it to start fresh.");
+                    return Err(anyhow::anyhow!(e)).context("Failed to load default configuration");
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(e)).context("Failed to load default configuration")
+            }
+        }
     };
 
     // Surface parse failures to the console at startup — a broken/partial config
@@ -679,6 +712,12 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
     }
 
     Ok((config, warnings))
+}
+
+/// The de-brick wizard offer fires only for interactive TUI launches —
+/// exactly the same gate as the first-run wizard (main.rs:675).
+fn offer_wizard_on_load_failure(headless: bool, wav: bool, interactive: bool) -> bool {
+    !headless && !wav && interactive
 }
 
 /// Interactive first-run setup wizard.
@@ -1512,5 +1551,13 @@ mod wizard_validation_tests {
         // Garbage grid must be rejected, not stored
         assert!(try_set_station_field(&cfg, StationField::Grid, "12ab").is_err());
         assert!(try_set_station_field(&cfg, StationField::Grid, "FN4").is_err());
+    }
+
+    #[test]
+    fn debrick_gate_only_fires_interactive_tui_runs() {
+        assert!(offer_wizard_on_load_failure(false, false, true));
+        assert!(!offer_wizard_on_load_failure(true, false, true)); // headless
+        assert!(!offer_wizard_on_load_failure(false, true, true)); // --wav
+        assert!(!offer_wizard_on_load_failure(false, false, false)); // piped stdin
     }
 }
