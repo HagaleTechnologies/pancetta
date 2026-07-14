@@ -569,7 +569,58 @@ impl ConfigLoader {
         // downstream logs/errors. See security fix I-7.
         let expanded_content = shellexpand::tilde(content);
 
-        toml::from_str(&expanded_content).map_err(ConfigError::Toml)
+        let config: Config = toml::from_str(&expanded_content).map_err(ConfigError::Toml)?;
+
+        // Serde silently drops unknown keys, so a misspelled or obsolete
+        // section ([autonomous_operator], [priority_weights], ...) used to be
+        // invisibly inert. Sweep the file's top-level table keys against the
+        // sections Config actually has and record a load-warning for each
+        // stranger — load_warnings() surfaces these to console + TUI.
+        self.warn_unknown_top_level_keys(&expanded_content);
+
+        Ok(config)
+    }
+
+    /// Top-level section names `Config` understands, derived from the struct
+    /// itself (serialize a default and take the object keys) so this set can
+    /// never drift when a config section is added or renamed.
+    fn known_top_level_keys() -> std::collections::BTreeSet<String> {
+        serde_json::to_value(Config::default())
+            .ok()
+            .and_then(|v| {
+                v.as_object()
+                    .map(|o| o.keys().cloned().collect::<std::collections::BTreeSet<_>>())
+            })
+            .unwrap_or_default()
+    }
+
+    /// Compare the raw file's top-level table keys against
+    /// [`Self::known_top_level_keys`] and record one load-warning per unknown
+    /// section. Non-fatal by design; a second-parse failure here is
+    /// unreachable in practice (the typed parse already succeeded).
+    ///
+    /// Uses `toml::Table::from_str` (not `toml::Value::from_str`) — as of the
+    /// `toml` 1.x crate, `Value`'s `FromStr` parses a single bare value, not
+    /// a whole document, and fails on any multi-table file. `Table::from_str`
+    /// parses the full document into its top-level key/value map.
+    fn warn_unknown_top_level_keys(&self, content: &str) {
+        let Ok(table) = content.parse::<toml::Table>() else {
+            return;
+        };
+        let known = Self::known_top_level_keys();
+        for key in table.keys() {
+            if !known.contains(key) {
+                warn!(
+                    "Unknown top-level config section [{key}] — pancetta ignores it. \
+                     Check the spelling against docs/CONFIG.md."
+                );
+                if let Ok(mut wlist) = self.load_warnings.lock() {
+                    wlist.push(format!(
+                        "Unknown config section [{key}] — ignored (check spelling; see docs/CONFIG.md)"
+                    ));
+                }
+            }
+        }
     }
 
     /// Parse JSON configuration
@@ -924,6 +975,57 @@ mod tests {
         assert_eq!(parsed.station.callsign, "K1ABC");
         assert_eq!(parsed.station.grid_square, "FN31pr");
         assert_eq!(parsed.station.power_watts, 100);
+    }
+
+    #[test]
+    fn test_unknown_top_level_section_warns() {
+        let loader = ConfigLoader::new().unwrap();
+        // The exact ghost sections CONFIG.md used to document.
+        let toml_content = r#"
+[autonomous_operator]
+enabled = true
+
+[priority_weights]
+snr = 0.05
+
+[station]
+callsign = "N0CALL"
+"#;
+        let parsed = loader.parse_toml(toml_content);
+        assert!(parsed.is_ok(), "unknown keys must stay non-fatal");
+        let warnings = loader.load_warnings();
+        assert_eq!(
+            warnings.len(),
+            2,
+            "one warning per unknown section: {warnings:?}"
+        );
+        assert!(warnings.iter().any(|w| w.contains("autonomous_operator")));
+        assert!(warnings.iter().any(|w| w.contains("priority_weights")));
+    }
+
+    #[test]
+    fn test_known_top_level_sections_do_not_warn() {
+        let loader = ConfigLoader::new().unwrap();
+        // Note: `[duplicate_checking]` is spelled out with all its fields
+        // rather than left partial. Unlike `[station]` (container-level
+        // `#[serde(default)]` on `StationConfig`, so partial tables fall back
+        // field-by-field), `DuplicateCheckingConfig` has no container-level
+        // `#[serde(default)]`, so a partial table fails typed deserialization
+        // with a "missing field" error — a pre-existing gap unrelated to this
+        // task's unknown-key sweep. `[station]` covers "known section,
+        // partial fields parse fine"; `[duplicate_checking]` here covers
+        // "the Task 5 addition is recognized as a known section".
+        let toml_content = r#"
+[station]
+callsign = "N0CALL"
+
+[duplicate_checking]
+enabled = true
+time_window_hours = 24
+check_frequency = true
+"#;
+        loader.parse_toml(toml_content).unwrap();
+        assert!(loader.load_warnings().is_empty());
     }
 
     #[test]

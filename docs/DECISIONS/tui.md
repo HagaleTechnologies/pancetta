@@ -28,3 +28,21 @@
 **Surfaced a real cross-crate architecture bug along the way**: `pancetta`'s `Cargo.toml` splits it into a `pancetta_lib` LIB crate (all of `coordinator/`, including `tui_relay.rs`) and a `pancetta` BIN crate (`main.rs`, where `PANIC_COUNT` originally lived). A lib crate can never reach into its own bin crate — the original plan text's `crate::panic_count()` call from `tui_relay.rs` could not compile. Fixed by moving `PANIC_COUNT` + `record_panic()`/`panic_count()` into `coordinator/health.rs` (already in the lib crate) and re-exporting just those two functions at `pancetta_lib::coordinator::{record_panic, panic_count}` via the coordinator module's existing `pub use health::{...}` block (the same pattern already used for `classify_config_reload` et al.) — `mod health` itself stays private, so nothing else in `health.rs` becomes part of the lib crate's public surface. `main.rs`'s panic hook now calls `pancetta_lib::coordinator::record_panic()`.
 
 Plan: `docs/superpowers/plans/2026-07-12-health-panel.md`.
+
+## Keybindings single source of truth (2026-07-14, Onboarding Phase 2)
+
+`pancetta-tui/src/keymap.rs` (new): the `?` help overlay (`tui_runner.rs::render_help_overlay`,
+36 hand-maintained entries) and README's keybinding table (~40% wrong/incomplete, missing
+`Shift+Q` EMERGENCY STOP among ~14 missing bindings) had drifted apart independently. Both now
+read from one `KEYBINDINGS: &[KeyBinding]` table (39 entries — the original 36 plus `g`
+cycle-TX-policy, `Shift+M` cycle-operating-mode, `e` cycle-decode-effort, which the overlay had
+silently never gained). Each `KeyBinding` carries a `Category` (7 variants, doc-section grouping)
+and an `essential: bool` (the 10 entries README's shrunk table shows). `render_markdown()`
+generates `docs/KEYBINDINGS.md` (full reference, GENERATED header pointing at the regen command)
+from the same table — drift-guarded by `keymap::tests::keybindings_doc_is_current`, same
+philosophy as `pancetta-config`'s `merge_with` guard: a stale generated doc fails a test, not a
+human review. `essentials_table_is_exactly_ten_rows` and `no_duplicate_keys` are companion
+guards. Regen: `PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-tui keybindings_doc_is_current`.
+README's own keybinding table shrank to the 10 essentials + a link to the generated doc (or `?`
+in the TUI) rather than trying to stay a second hand-maintained copy. Plan:
+`docs/superpowers/plans/2026-07-13-onboarding-phase2-docs-truth.md` Task 7.

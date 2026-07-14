@@ -1947,67 +1947,15 @@ impl TuiRunner {
         f.render_widget(footer, vert_chunks[1]);
     }
 
-    /// Render help overlay as a centered modal
+    /// Render help overlay as a centered modal.
+    /// Content comes from the single-source-of-truth keybinding table
+    /// (`crate::keymap::KEYBINDINGS`) — the same table that generates
+    /// docs/KEYBINDINGS.md, so overlay and docs can never disagree.
     fn render_help_overlay(f: &mut Frame, area: Rect) {
-        let lines: &[(&str, &str)] = &[
-            ("?", "Toggle this help"),
-            ("Tab / Shift+Tab", "Switch panel"),
-            ("Up / Down", "Scroll list"),
-            (
-                "Home / End (or < / >)",
-                "Jump to newest (realtime) / oldest",
-            ),
-            ("PgUp / PgDn", "Page scroll"),
-            ("1/2/3/4/5", "Jump: Band/QSO/Callers/DX/Placement"),
-            (
-                "Left / Right",
-                "TX offset −/+ 50 Hz (Callers: cycle reply step)",
-            ),
-            ("[ / ]", "TX offset −/+ 50 Hz"),
-            ("= / -", "Band up / down"),
-            ("Space", "Call selected station"),
-            ("/", "Compose free-text TX (Enter sends, Esc cancels)"),
-            (
-                "Enter",
-                "Callers: reply at shown step; TX Placement: park at selected slice",
-            ),
-            ("c / s", "Start / stop CQ"),
-            ("k", "Abort selected QSO (QSO Status panel only)"),
-            ("r", "Re-send last TX (QSO Status panel only)"),
-            ("t", "Find clear TX offset (auto-pick + pin)"),
-            (
-                "f",
-                "TX freq mode: HOLD (pin offset) / AUTO (pancetta picks)",
-            ),
-            ("o", "Set TX audio offset Hz (blank=Auto) — implies Hold"),
-            (
-                "Shift+F",
-                "Set dial / split freq (RX MHz + optional TX MHz)",
-            ),
-            ("Shift+T", "Tune (12 s tone; blocked while TX DISABLED)"),
-            ("h", "Halt current TX"),
-            ("p", "Toggle PTT (blocked while TX DISABLED)"),
-            ("v / V", "Cycle activity view: Operate/Hunt/Run/Monitor"),
-            ("z", "Zoom focused panel (again/Esc to restore)"),
-            ("a", "Toggle autonomous mode"),
-            ("Shift+P", "Pause / resume autonomous"),
-            ("Shift+H", "Engage Hound on selected DX Hunter station"),
-            ("Shift+X", "Toggle Fox (DXpedition) mode"),
-            (
-                "Shift+D",
-                "Toggle Diagnostics overlay (retained event history)",
-            ),
-            (
-                "Shift+S",
-                "Toggle station-health panel (is the station healthy?)",
-            ),
-            ("m", "Toggle audio monitoring"),
-            ("d", "Device picker"),
-            ("x", "Clear decoded messages (press twice within 3s)"),
-            ("q", "Quit (with confirm)"),
-            ("Shift+Q", "EMERGENCY STOP (halt TX, autonomous off)"),
-            ("Esc", "Dismiss overlay / cancel modal / clear stop banner"),
-        ];
+        let lines: Vec<(&str, &str)> = crate::keymap::KEYBINDINGS
+            .iter()
+            .map(|b| (b.key, b.action))
+            .collect();
 
         // Modal sizing: size to the widest "  <key:24><desc>" line so nothing
         // wraps, then cap to the available width. The old fixed 52-col width
@@ -2056,7 +2004,7 @@ impl TuiRunner {
                     .fg(Color::Yellow)
                     .add_modifier(Modifier::BOLD),
             );
-            let desc_span = Span::styled(*desc, Style::default().fg(Color::White));
+            let desc_span = Span::styled(desc, Style::default().fg(Color::White));
             text_lines.push(Line::from(vec![key_span, desc_span]));
         }
 

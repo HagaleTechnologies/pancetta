@@ -147,31 +147,21 @@ cargo run --release -p pancetta
 
 ## How to drive the TUI
 
+The essentials (full reference: [`docs/KEYBINDINGS.md`](docs/KEYBINDINGS.md),
+or press `?` in the TUI):
+
 | Key | Action |
 |---|---|
-| `Tab` / `Shift+Tab` | Cycle active panel |
-| `↑` / `↓` | Move selection within active panel |
-| `Home` / `End` (or `<` / `>`) | Jump to newest (realtime) / oldest in the focused list |
-| `←` / `→` or `[` / `]` | TX offset −/+ 50 Hz |
-| `=` / `-` | Band up / down |
+| `?` | Toggle help overlay (every binding, in-app) |
+| `Tab` / `Shift+Tab` | Switch panel |
+| `↑` / `↓` | Scroll / select within the active panel |
 | `Space` | Call selected station |
-| `Enter` | Send the TX text in the input buffer |
 | `c` / `s` | Start / stop repeating CQ |
-| `t` | **Find clear TX offset** — auto-picks a 25 Hz candidate clear in your TX parity. |
-| `Shift+T` | **Tune** — 12 s single tone at TX offset (PTT engages). |
-| `h` | **Halt current TX** (drops PTT within ~150 ms) |
-| `p` | Toggle PTT manually |
-| `g` | Cycle TX policy: Full → Respond-only → Disabled |
-| `f` | TX-frequency mode: **Hold** (pin your offset) / **Auto** (Pancetta picks) |
-| `e` | Cycle decode-effort preset: Eco → Standard → Deep → Max → Auto |
+| `h` | Halt current TX |
 | `a` | Toggle autonomous mode |
-| `Shift+P` | Pause / resume autonomous |
-| `m` | Toggle audio monitoring |
-| `d` | Open audio device picker (also reclaims a hijacked device) |
-| `x` | Clear decoded messages |
-| `?` | Toggle help overlay |
-| `q` | Quit (with `[y/N]` confirm) |
-| `Esc` | Dismiss any overlay / cancel modal |
+| `d` | Open audio device picker |
+| `q` | Quit (with confirm) |
+| `Shift+Q` | **EMERGENCY STOP** — halt TX, autonomous off |
 
 The status bar at the bottom shows live pipeline state, your TX queue,
 and any errors emitted by the audio / QSO components.
@@ -224,11 +214,14 @@ present a transient name on first plug-in; unplug, replug, restart.
 
 ### `Call X failed: duplicate QSO`
 
-Pancetta refuses to call the same station on the same band twice within
-the configured `duplicate_checking.time_window_hours`. Adjust the
-window in config, or remove the prior QSO from `~/.pancetta/qso.db`
-if it was a test. The duplicate check is intentional — it prevents
-embarrassing repeat-calls during a contest or grid hunt.
+Pancetta refuses to call the same station within the configured
+`duplicate_checking.time_window_hours` rolling window (by default, the
+in-memory check scopes this to within 50 Hz of the same frequency —
+see `[duplicate_checking]` in [`docs/CONFIG.md`](docs/CONFIG.md)).
+Adjust the window in config, or remove the prior QSO from
+`~/.pancetta/qso.db` if it was a test. The duplicate check is
+intentional — it prevents embarrassing repeat-calls during a contest
+or grid hunt.
 
 ### `rigctld` won't connect
 

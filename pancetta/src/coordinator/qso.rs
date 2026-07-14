@@ -1025,6 +1025,13 @@ impl super::ApplicationCoordinator {
         // them here (before drop) and pass them as `HoundRegions` to avoid
         // introducing a pancetta-qso → pancetta-config dependency.
         let hound_cfg = config.hound.clone();
+        // Operator-configured duplicate-QSO checking. Copied field-by-field
+        // into pancetta_qso::DuplicateCheckConfig (same pattern as HoundRegions
+        // above) to avoid a pancetta-qso → pancetta-config dependency. The
+        // config-side defaults equal the qso-side defaults (guard test:
+        // config_duplicate_defaults_match_qso_manager_defaults), so a config
+        // without the section behaves exactly like the pre-wiring binary.
+        let dup_cfg = config.duplicate_checking.clone();
         // Station-wide active operating mode string ("FT8"/"FT4"/"FT2"),
         // stamped into every QsoMetadata.mode (→ ADIF MODE). Defaults to FT8
         // on parse error so the legacy path is unchanged.
@@ -1087,7 +1094,9 @@ impl super::ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                use pancetta_qso::{HoundRegions, LoggerConfig, QsoManager, QsoManagerConfig};
+                use pancetta_qso::{
+                    DuplicateCheckConfig, HoundRegions, LoggerConfig, QsoManager, QsoManagerConfig,
+                };
 
                 let qso_config = QsoManagerConfig {
                     our_callsign: our_callsign.clone(),
@@ -1099,6 +1108,15 @@ impl super::ApplicationCoordinator {
                         response_max_hz: hound_cfg.response_max_hz,
                     },
                     active_mode: active_mode.clone(),
+                    duplicate_checking: DuplicateCheckConfig {
+                        enabled: dup_cfg.enabled,
+                        time_window_hours: dup_cfg.time_window_hours,
+                        check_frequency: dup_cfg.check_frequency,
+                        // check_band is defined but unread in pancetta-qso;
+                        // keep the qso-side default rather than exposing a
+                        // dead knob in the config schema.
+                        ..Default::default()
+                    },
                     ..Default::default()
                 };
 
@@ -4203,6 +4221,19 @@ mod auto_73_tests {
         .await;
 
         assert_eq!(drain_sends(&mut rx), 0);
+    }
+
+    /// Guard for the [duplicate_checking] wiring: the pancetta-config defaults
+    /// must equal pancetta-qso's hard-coded DuplicateCheckConfig::default(),
+    /// so a config file WITHOUT the section produces byte-identical behavior
+    /// to the pre-wiring binary. If either side changes, this fails.
+    #[test]
+    fn config_duplicate_defaults_match_qso_manager_defaults() {
+        let c = pancetta_config::Config::default().duplicate_checking;
+        let q = pancetta_qso::DuplicateCheckConfig::default();
+        assert_eq!(c.enabled, q.enabled);
+        assert_eq!(c.time_window_hours, q.time_window_hours);
+        assert_eq!(c.check_frequency, q.check_frequency);
     }
 }
 

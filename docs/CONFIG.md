@@ -4,11 +4,12 @@ Pancetta's configuration lives in a single TOML file at
 `~/.pancetta/pancetta.toml`. The file is loaded at startup and watched for
 changes; most keys hot-reload without a restart.
 
-This document covers the keys you'll actually touch. The full schema —
-including hundreds of advanced knobs (DSP filter coefficients, contest
-categories, multi-antenna routing, etc.) — lives in
-[`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml). Any
-key you don't set in your user config inherits the value from there.
+This document covers the keys you'll actually touch, with explanations.
+The complete schema — every section, every key, every default — is
+[`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml),
+which is **generated from the code's `Config::default()`** and
+drift-tested in CI, so it can't lie. Any key you don't set in your user
+config keeps its default value from there.
 
 > **Security:** the config file is plaintext on disk. If you set any
 > integration password (LoTW, eQSL, Clublog, QRZ), `chmod 600` the file
@@ -39,8 +40,8 @@ baud_rate = 38400
 model = "FTdx10"
 ```
 
-That's enough to run the autonomous operator. Everything else has a
-sensible default in `defaults.toml`.
+That's enough to decode and work stations manually. Hands-off operation
+additionally needs `[autonomous] enabled = true` (see below).
 
 ---
 
@@ -124,46 +125,71 @@ baud_rate = 38400
 
 ---
 
-## `[autonomous_operator]` — the brain
+## `[autonomous]` — the brain
 
 ```toml
-[autonomous_operator]
-enabled = false                 # Master enable. Off by default; opt-in to TX.
-mode = "hybrid"                 # "hunt", "cq", or "hybrid"
-slot_parity_preference = "auto" # "even", "odd", or "auto"
-max_concurrent_qsos = 4         # Cap on simultaneous in-flight QSOs
+[autonomous]
+enabled = false            # Master enable. Off by default; opt-in to TX.
+slot_parity = "auto"       # "even", "odd", or "auto"
+cq_after_idle_cycles = 10  # Idle TX cycles before calling CQ (~150 s at 10)
+max_concurrent_qsos = 1    # Cap on simultaneous in-flight QSOs
+tx_offset_hz = 1500.0      # Preferred TX audio offset (100–3000 Hz)
+min_dx_score = 0.3         # Minimum DX score (0–1) to answer a CQ
+min_multi_slot_score = 0.7 # Higher bar (0–1) for opening a 2nd+ concurrent QSO
+cq_direction = ""          # Directed CQ text ("DX", "NA", …); empty = general CQ
+dry_run = false            # Log autonomous TX decisions without keying the rig
 ```
 
 | Key | Type | Default | Notes |
 |---|---|---|---|
-| `enabled` | bool | `false` | When false, Pancetta runs decode-only — no TX. |
-| `mode` | enum | `"hybrid"` | `hunt` = chase rare CQs only. `cq` = call CQ and answer callers. `hybrid` = hunt when a rare target is on; CQ otherwise. |
-| `slot_parity_preference` | enum | `"auto"` | FT8 alternates even/odd 15s slots; `auto` picks the parity with less local QRM. |
-| `max_concurrent_qsos` | integer | `4` | The `SmartFrequencyAllocator` caps simultaneous TX streams here. |
+| `enabled` | bool | `false` | When false, the autonomous engine never initiates TX. |
+| `slot_parity` | enum | `"auto"` | FT8 alternates even/odd 15 s slots; `auto` picks per conditions. |
+| `cq_after_idle_cycles` | integer | `10` | TX cycles with nothing to do before calling CQ. Must be ≥ 1. |
+| `max_concurrent_qsos` | integer | `1` | Simultaneous in-flight QSOs (multi-stream TX). Must be ≥ 1. |
+| `tx_offset_hz` | float | `1500.0` | Validated to 100–3000 Hz. |
+| `min_dx_score` | float | `0.3` | 0.0–1.0. Decoded CQs scoring below this are not answered. |
+| `min_multi_slot_score` | float | `0.7` | 0.0–1.0. Applies only to second-and-later concurrent QSOs. |
+| `cq_direction` | string | `""` | Appended to CQ (`CQ DX <call> <grid>`). |
+| `dry_run` | bool | `false` | Autonomous TransmitRequests are logged, not sent. Manual TX unaffected. |
 
-### `[priority_weights]` — what to prioritize
+> **There is no `mode` key.** Earlier revisions of this document described
+> `[autonomous_operator]` with `mode = "hunt" / "cq" / "hybrid"`,
+> `slot_parity_preference`, and a top-level `[priority_weights]`. Those keys
+> never existed in the code and were silently ignored. The real behavior is
+> always both: answer scored CQs above `min_dx_score`, and fall back to
+> calling CQ after `cq_after_idle_cycles` idle cycles. Startup now warns
+> about unknown top-level sections, so a stale config will tell you.
 
-Each decoded CQ is scored against these criteria, weighted, and sorted.
-Tuning these is how you specialize Pancetta for DX chasing vs. grid
-hunting vs. contesting.
+### `[autonomous.priorities]` — what to prioritize
+
+Each decoded CQ is scored against these weights (each validated to
+−1.0…1.0; positive attracts, negative penalizes; the final score is
+clamped to 0.0–1.0 and compared against `min_dx_score`).
 
 ```toml
-[priority_weights]
-needed_dxcc = 0.35
-atno_bonus  = 0.15   # extra premium for an all-time-new-one (never worked on any band)
-needed_grid = 0.20
-pota_sota   = 0.15
-rarity      = 0.10
-snr         = 0.05
+[autonomous.priorities]
+needed_dxcc            = 0.35
+needed_grid            = 0.20
+pota_sota              = 0.15
+rarity                 = 0.10
+signal_strength        = 0.05   # SNR weight — stronger = more likely to complete
+duplicate_penalty      = -0.40  # already worked on this band
+recent_failure_penalty = -0.15  # recently called, QSO didn't complete
+atno_bonus             = 0.15   # extra premium on top of needed_dxcc for an
+                                # all-time-new-one; inert unless cqdx.io flags it
 ```
 
-`atno_bonus` is added on top of `needed_dxcc` only when cqdx.io flags the
-entity as an ATNO. It's inert (no entity is ever ATNO) when cqdx is
-unconfigured.
+### Sub-tables you'll rarely touch
 
-Weights need not sum to 1.0; they're combined linearly with the
-duplicate-and-failure penalty applied on top. Set any weight to `0.0`
-to disable that signal entirely.
+- `[autonomous.frequency]` — the `SmartFrequencyAllocator` knobs (center
+  bias, DX-proximity window, own-QSO separation, neighbor guard).
+- `[autonomous.listen_cycle]` — adaptive forced-listen-slot cadence for
+  collision detection.
+- `[autonomous.band_hopping]` — off by default; ordered band list with a
+  low-activity hop threshold.
+
+Defaults for all three live in `Config::default()`; see
+`pancetta-config/src/autonomous.rs` for every field with doc comments.
 
 ### `[duplicate_checking]` — don't call the same station twice
 
@@ -171,13 +197,27 @@ to disable that signal entirely.
 [duplicate_checking]
 enabled = true
 time_window_hours = 24
-check_frequency = false
+check_frequency = true
 ```
 
-`check_frequency = true` allows the same station to be called again on
-a different band. The default (`false`) is one-and-done per UTC day.
 The duplicate check is what makes Space-to-call return `Call X failed:
-duplicate QSO ...` for stations you've already worked.
+duplicate QSO ...` for stations you've already worked. With the default
+`check_frequency = true`, a prior QSO only blocks a re-call when it was
+within 50 Hz of the same RF frequency — so the same station on a
+different band can be worked again. Set `check_frequency = false` for
+strict one-QSO-per-callsign inside the window, or `enabled = false` to
+turn duplicate checking off entirely.
+
+`time_window_hours` is a rolling window from each prior QSO's start
+time (not a UTC-day boundary): a QSO started 23 hours ago still blocks;
+one started 25 hours ago does not.
+
+Note: this 50 Hz frequency scoping applies to the in-memory recent-QSO
+check. The persistent-database fallback (used after a restart, once a
+completed QSO has aged out of memory) always frequency-scopes at a
+wider ±100 Hz regardless of `check_frequency` — a corner case, not
+something an operator normally needs to think about, but noted here
+for completeness.
 
 ---
 
@@ -291,14 +331,16 @@ token   = ""         # cqdx.io Personal Access Token (pat_…), plaintext on dis
 
 ```toml
 [ui]
-theme       = "dark"   # "dark" or "light"
-time_format = "utc"    # "utc" or "local" — UTC strongly recommended for FT8
-target_fps  = 30       # Refresh rate; lower this on slow SSH links
+theme = "dark"   # "dark" or "light"
 ```
 
-The TUI also reads its layout, key bindings, and color scheme details
-from `[ui]`. The full set is in `defaults.toml`; the keys above are the
-ones with practical effect.
+The remaining `[ui]` keys are in `defaults.toml`; `theme` above is the
+one with practical effect (`pancetta-tui/src/app.rs` reads `config.ui.theme`
+directly). Keybindings are not configurable — the full
+map is [`docs/KEYBINDINGS.md`](KEYBINDINGS.md) (or `?` in the TUI). A
+`[ui.keyboard]` block is present in `defaults.toml` (it mirrors a real
+`KeyboardConfig` struct in the Rust schema) but nothing in the runtime
+reads it; it's inert scaffolding, not a way to remap keys.
 
 ---
 
@@ -356,8 +398,10 @@ into a fresh `qsos.adi` before switching over. No manual action required.
 
 ## Where to look next
 
-- The annotated source of truth is
-  [`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml).
+- The complete generated schema is
+  [`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml); the
+  annotated source of truth is the Rust structs under
+  `pancetta-config/src/`.
 - Rust types and validation logic live under `pancetta-config/src/`.
 - See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for how config flows
   through the coordinator.

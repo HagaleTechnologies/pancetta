@@ -3,7 +3,7 @@
 Operational procedures for running pancetta in its various modes.
 Audience: the station operator (probably you, with a license and a
 working rig). Assumes the build is current on `main` and config lives
-at `~/.pancetta/config.toml`.
+at `~/.pancetta/pancetta.toml`.
 
 If you're new here, read [`README.md`](../README.md) first for setup;
 this document is for *running*, not installing.
@@ -21,9 +21,11 @@ Pancetta has four operating modes, distinguished by config:
 | **Auto-CQ** | `true` | `false` | Manual + `c` starts a repeating CQ. Still operator-initiated. |
 | **Autonomous** *(Phase 5)* | `true` | `true` | Decode + autonomous decision engine drives CQ, response, full QSO progression. |
 
-The autonomous-mode toggle is **config-only** — there is no runtime
-key binding to enable or disable it. To switch in or out of autonomous
-mode, edit config and restart pancetta.
+`[autonomous].enabled` sets the **startup** state. At runtime, the TUI
+toggles autonomous mode live with `a` and pauses/resumes it with
+`Shift+P` (no restart needed); `Shift+Q` is the emergency stop (halts
+TX and forces autonomous off). Headless runs have no runtime toggle —
+for a supervised headless station, config is the only switch.
 
 ---
 
@@ -166,7 +168,7 @@ operator-supervised.
 
 ### Enable autonomous mode
 
-10. **Set `[autonomous].enabled = true`** in `~/.pancetta/config.toml`.
+10. **Set `[autonomous].enabled = true`** in `~/.pancetta/pancetta.toml`.
     Save. Restart pancetta.
 
     The startup log line should include `Starting autonomous operator
@@ -248,12 +250,13 @@ operator-supervised.
 
 - Check the full session log:
   ```bash
-  ls -lt ~/.pancetta/log/ | head -5
+  ls -lt ~/.pancetta/logs/ | head -5
   ```
 - Skim for `WARN` / `ERROR` lines:
   ```bash
-  grep -E "WARN|ERROR" ~/.pancetta/log/$(date +%Y%m%d).log | head -50
+  grep -E "WARN|ERROR" ~/.pancetta/logs/pancetta.log.$(date -u +%Y-%m-%d) | head -50
   ```
+  Logs rotate daily (UTC) and pancetta keeps the newest 14 files.
 - Confirm completed QSOs landed in ADIF:
   ```bash
   grep -c "<eor>" ~/.pancetta/qsos.adi
@@ -308,7 +311,7 @@ For first-run / install issues, see [`README.md#troubleshooting`](../README.md#t
 - Check `[autonomous].cq_after_idle_cycles` — if 0 was set, validation
   rejects the config; if very large (50+), CQ takes a long time to
   start on a quiet band.
-- Check `~/.pancetta/log/<date>.log` for `Auto-responding to CQ from`
+- Check `~/.pancetta/logs/pancetta.log.<YYYY-MM-DD>` for `Auto-responding to CQ from`
   log lines. If absent, no CQ has cleared filters yet.
 - Check `[autonomous].response_filters.allowed_callsigns` — if set,
   *only* those callsigns clear the filter.

@@ -39,6 +39,7 @@ pub mod app;
 pub mod config;
 pub mod dxcc;
 mod dxcc_table;
+pub mod keymap;
 pub mod tui_runner;
 pub mod ui;
 pub mod view;
