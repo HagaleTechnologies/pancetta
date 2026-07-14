@@ -18,7 +18,8 @@ use std::path::Path;
 
 use base64::Engine as _;
 use ed25519_dalek::{Signer, SigningKey};
-use rand_core::OsRng;
+use getrandom::SysRng;
+use rand_core::UnwrapErr;
 use sha2::{Digest, Sha256};
 use x25519_dalek::{PublicKey as XPublicKey, StaticSecret as XStaticSecret};
 
@@ -70,8 +71,8 @@ pub struct AgentIdentity {
 impl AgentIdentity {
     /// Generate a fresh identity from the OS CSPRNG.
     pub fn generate() -> Self {
-        let identity = SigningKey::generate(&mut OsRng);
-        let agreement = XStaticSecret::random_from_rng(OsRng);
+        let identity = SigningKey::generate(&mut UnwrapErr(SysRng));
+        let agreement = XStaticSecret::random_from_rng(&mut UnwrapErr(SysRng));
         Self {
             identity,
             agreement,
