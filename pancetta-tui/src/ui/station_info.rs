@@ -267,6 +267,18 @@ fn render_audio_status(f: &mut Frame<'_>, area: Rect, app: &App) {
         ));
     }
 
+    // Persistent warning badge when the configured input device was not
+    // found and RX capture fell back (the "decoding the built-in mic" trap).
+    if app.input_fallback {
+        device_first_line.push(Span::raw("  "));
+        device_first_line.push(Span::styled(
+            "⚠ RX→fallback device",
+            Style::default()
+                .fg(app.theme.error_color())
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+
     let device_lines = vec![
         Line::from(device_first_line),
         Line::from(vec![

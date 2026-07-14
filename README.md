@@ -189,6 +189,27 @@ required) — the `e` key is the only *live* control.
 
 ---
 
+## Command-line tools
+
+Everything below ships in the one `pancetta` binary (`pancetta <cmd> --help`
+for details):
+
+| Command | What it does |
+|---|---|
+| `pancetta` | Run the station (TUI). First run launches the setup wizard. |
+| `pancetta doctor` | Check station health — config, clock vs NTP, audio device + level, decoder, rigctld — with a printed fix per failure. Run it whenever something "doesn't work". |
+| `pancetta setup` | Interactive wizard for station, audio, rig, PTT, and frequency control. Safe to re-run any time. |
+| `pancetta test-audio --list` | List audio input/output devices exactly as pancetta sees them (copy names into `[audio]`). |
+| `pancetta test-rig` | Test the rig link: serial port present, opens, data readable. Add `--ptt` to key TX for 1 s (careful!). |
+| `pancetta config --validate` | Validate the config file and exit non-zero on errors (also `--show`, `--generate <path>`). |
+| `pancetta export --output log.adi` | Export logged QSOs to ADIF (`--callsign` to filter). |
+| `pancetta info` | Version and host capabilities. |
+| `pancetta benchmark-decode <wav-or-dir>` | Compare the native decoder against ft8_lib on WAV captures. |
+| `pancetta --wav <file>` | Decode a 15-s WAV file and exit (no audio hardware needed). |
+| `pancetta --headless` | Run without the TUI (logs to `~/.pancetta/logs/`). |
+
+---
+
 ## Troubleshooting
 
 ### "Audio init failed" appears in the TUI status
@@ -295,6 +316,7 @@ CI runs all of the above on every PR, plus a `cargo check` lane on macOS. `cargo
 
 ## Documentation
 
+- [`docs/GUIDE.md`](docs/GUIDE.md) — **start here**: your first 5 minutes, your first QSO, and how-do-I recipes.
 - [`docs/CONFIG.md`](docs/CONFIG.md) — every config key, with examples and defaults.
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate dependency graph, data flow, key abstractions.
 - [`docs/decoder-comparison.md`](docs/decoder-comparison.md) — native decoder vs. ft8_lib: measured decode yield on a 1,201-file corpus + the parallel-execution approach.

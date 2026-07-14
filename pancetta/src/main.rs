@@ -39,6 +39,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use pancetta_lib::coordinator::ApplicationCoordinator;
 
+mod doctor;
+
 /// Pancetta - High-Performance Amateur Radio FT8 Processing Application
 #[derive(Clone, Parser)]
 #[command(name = "pancetta")]
@@ -138,6 +140,9 @@ enum Commands {
     BenchmarkDecode(BenchmarkDecodeArgs),
     /// Interactive setup wizard for station, audio, rig, and PTT
     Setup,
+    /// Check station health: config, clock, audio, decoder, rig — with a
+    /// printed fix for every failure. Run this before your first session.
+    Doctor,
     /// Test rig connection (serial port, CAT, PTT)
     TestRig(TestRigArgs),
     /// Export logged QSOs to ADIF
@@ -373,6 +378,7 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::Benchmark(args) => benchmark_command(args).await,
         Commands::BenchmarkDecode(args) => benchmark_decode_command(args).await,
         Commands::Setup => setup_command().await,
+        Commands::Doctor => doctor_command(cli).await,
         Commands::TestRig(args) => test_rig_command(args, cli).await,
         Commands::Export(args) => export_command(args).await,
     }
@@ -743,6 +749,21 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
         setup_audio(&mut new_config)?;
     }
 
+    // Rig / CAT control — the other half of the on-air path. Skippable:
+    // decode-only needs no rig, and the rig interface stays disabled by
+    // default (safe-by-default posture). Reuses the exact same helpers as
+    // `pancetta setup`, including serial-port enumeration.
+    if prompt_yes_no(
+        "Configure rig CAT control now? (skip = decode-only for now)",
+        false,
+    )? {
+        setup_rig(&mut new_config)?;
+        if new_config.rig.interface.enabled {
+            setup_ptt(&mut new_config)?;
+            setup_frequency(&mut new_config)?;
+        }
+    }
+
     if let Err(e) = new_config.validate() {
         println!();
         println!("WARNING: configuration is still invalid ({e}).");
@@ -771,6 +792,19 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
         "Station: {} / {} / {}W",
         new_config.station.callsign, new_config.station.grid_square, new_config.station.power_watts
     );
+    if new_config.rig.interface.enabled {
+        println!(
+            "Rig:     {} on {} @ {} (PTT: {:?})",
+            new_config.rig.model,
+            new_config.rig.interface.port,
+            new_config.rig.interface.baud_rate,
+            new_config.rig.ptt.method
+        );
+        println!("         Verify the link any time with: pancetta test-rig");
+    } else {
+        println!("Rig:     not configured — decode-only (no PTT).");
+        println!("         To set up CAT later: pancetta setup");
+    }
     println!("Setup complete! Starting Pancetta...");
     println!();
 
@@ -1186,6 +1220,41 @@ async fn setup_command() -> Result<()> {
     }
 
     println!();
+    Ok(())
+}
+
+async fn doctor_command(cli: &Cli) -> Result<()> {
+    let ctx = doctor::build_ctx(cli.config.clone());
+    let checks = doctor::build_checks();
+    println!();
+    println!(
+        "pancetta doctor — {} checks (config: {})",
+        checks.len(),
+        ctx.config_path.display()
+    );
+    println!();
+    let mut results = Vec::with_capacity(checks.len());
+    for check in &checks {
+        let outcome = (check.run)(&ctx);
+        println!(
+            "[{}] {:<20} {}",
+            doctor::status_label(outcome.status),
+            check.name,
+            outcome.detail
+        );
+        if outcome.status != doctor::CheckStatus::Pass {
+            if let Some(fix) = &outcome.fix {
+                println!("       fix: {fix}");
+            }
+        }
+        results.push((check.hard, outcome.status));
+    }
+    println!();
+    if doctor::doctor_exit_code(&results) != 0 {
+        println!("Result: NOT READY — fix the FAIL lines above, then re-run `pancetta doctor`.");
+        std::process::exit(1);
+    }
+    println!("Result: ready. Start `pancetta` — you should see decodes within ~30 s.");
     Ok(())
 }
 

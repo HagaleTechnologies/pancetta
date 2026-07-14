@@ -253,6 +253,12 @@ pub enum TuiMessage {
         /// `true` = system-default fallback (misconfig).
         is_default: bool,
     },
+    /// The configured `[audio] input_device` was not found and RX capture is
+    /// running on a fallback device (RX mirror of `AudioOutputDefault`).
+    AudioInputFallback {
+        /// `true` = capture is on a fallback device, not the configured one.
+        active: bool,
+    },
     /// TX-placement instrument snapshot, relayed from the coordinator's
     /// `MessageType::TxPlacementUpdate` (which carries a
     /// `pancetta_qso::frequency::PlacementSnapshot`). The relay
@@ -788,6 +794,9 @@ impl TuiRunner {
             }
             TuiMessage::AudioOutputDefault { is_default } => {
                 app.tx_output_default = is_default;
+            }
+            TuiMessage::AudioInputFallback { active } => {
+                app.input_fallback = active;
             }
             TuiMessage::DiagnosticEvent {
                 ts,

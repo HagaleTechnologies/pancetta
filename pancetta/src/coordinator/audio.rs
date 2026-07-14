@@ -168,6 +168,7 @@ impl super::ApplicationCoordinator {
             let audio_bus = self.message_bus.clone();
             let runtime_handle = tokio::runtime::Handle::current();
             let audio_output_default = self.audio_output_default.clone();
+            let audio_input_fallback = self.audio_input_fallback.clone();
 
             std::thread::spawn(move || {
                 let report_audio_error = {
@@ -226,6 +227,21 @@ impl super::ApplicationCoordinator {
                     );
                 } else {
                     audio_output_default.store(false, Ordering::Relaxed);
+                }
+
+                // RX-input fallback: the configured input device wasn't found
+                // and capture silently fell back (pancetta-audio warns to the
+                // log only — stream.rs). Mirror the output-side surfacing:
+                // one-shot TUI error + latched badge flag.
+                if let Some((requested, resolved)) = audio_manager.input_device_fallback() {
+                    audio_input_fallback.store(true, Ordering::Relaxed);
+                    report_audio_error(format!(
+                        "RX audio input '{requested}' NOT FOUND — capturing from '{resolved}' \
+                         instead. You may be decoding the wrong device (e.g. the built-in \
+                         mic). Fix [audio] input_device (run `pancetta test-audio --list`)."
+                    ));
+                } else {
+                    audio_input_fallback.store(false, Ordering::Relaxed);
                 }
 
                 // Rate-limit recurring runtime errors so a wedged device
@@ -318,6 +334,10 @@ impl super::ApplicationCoordinator {
                                 // the live selection.
                                 audio_output_default.store(
                                     audio_manager.output_is_system_default(),
+                                    Ordering::Relaxed,
+                                );
+                                audio_input_fallback.store(
+                                    audio_manager.input_device_fallback().is_some(),
                                     Ordering::Relaxed,
                                 );
                                 Ok(())

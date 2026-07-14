@@ -188,6 +188,14 @@ impl AudioManager {
             .unwrap_or(false)
     }
 
+    /// If the configured INPUT device was not found and capture fell back to
+    /// the best available input, returns `(requested, resolved)` device
+    /// names. Only meaningful after [`start`](Self::start). RX-side mirror
+    /// of [`output_is_system_default`](Self::output_is_system_default).
+    pub fn input_device_fallback(&self) -> Option<(String, String)> {
+        self.stream.as_ref().and_then(|s| s.input_fallback())
+    }
+
     /// List available audio devices
     pub fn list_devices(&self) -> Vec<AudioDeviceInfo> {
         self.device_manager

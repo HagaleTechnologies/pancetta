@@ -13,7 +13,7 @@ use tracing::{debug, error, info, span, warn, Level};
 /// may stamp the wrong band.
 const RIG_INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(8);
 
-use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
 /// Rig connection state surfaced to the TUI as a station-panel badge.
 ///
@@ -56,8 +56,10 @@ impl RigConnState {
 impl super::ApplicationCoordinator {
     /// Map rig model name to hamlib model number.
     /// See: https://github.com/Hamlib/Hamlib/wiki/Supported-Radios
+    /// Public so `pancetta doctor` (in the bin crate) can pre-validate the
+    /// configured model against the same table the spawner uses.
     #[cfg(feature = "pancetta-hamlib")]
-    pub(crate) fn hamlib_model_id(model: &str) -> Option<u32> {
+    pub fn hamlib_model_id(model: &str) -> Option<u32> {
         match model.to_lowercase().replace(['-', ' '], "").as_str() {
             "ftdx10" => Some(1042),
             "ftdx101d" | "ftdx101mp" => Some(1040),
@@ -193,6 +195,14 @@ impl super::ApplicationCoordinator {
                      1-65535 port) — adjust station.interface.port in config.",
                     port_field
                 );
+                report_rig_error(
+                    &self.message_bus,
+                    format!(
+                        "Rig CAT disabled: suspicious [rig.interface].port '{port_field}' — \
+                         run `pancetta setup` to pick a real serial port."
+                    ),
+                )
+                .await;
                 return Ok(());
             }
 
@@ -244,9 +254,19 @@ impl super::ApplicationCoordinator {
                     }
                     Err(e) => {
                         warn!(
-                            "Failed to spawn rigctld: {}. Install hamlib: brew install hamlib",
-                            e
+                            "Failed to spawn rigctld: {}. Install hamlib: {}",
+                            e,
+                            hamlib_install_hint()
                         );
+                        report_rig_error(
+                            &self.message_bus,
+                            format!(
+                                "rigctld failed to start ({e}) — no CAT/PTT this session. \
+                                 Fix: {}",
+                                hamlib_install_hint()
+                            ),
+                        )
+                        .await;
                     }
                 }
             } else {
@@ -255,6 +275,16 @@ impl super::ApplicationCoordinator {
                      Set RIGCTLD_HOST/RIGCTLD_PORT to use an external rigctld.",
                     rig_config.model
                 );
+                report_rig_error(
+                    &self.message_bus,
+                    format!(
+                        "Unknown rig model '{}' — cannot spawn rigctld (no CAT/PTT). \
+                         Run `pancetta setup` to pick a supported model, or run an \
+                         external rigctld and set RIGCTLD_HOST/RIGCTLD_PORT.",
+                        rig_config.model
+                    ),
+                )
+                .await;
             }
         }
 
@@ -322,6 +352,17 @@ impl super::ApplicationCoordinator {
                     Err(e) => {
                         error!("Failed to connect to rig: {}. Continuing without.", e);
                         rig_conn_state.store(RigConnState::NotConnected.as_u8(), Ordering::Relaxed);
+                        if rig_enabled {
+                            report_rig_error(
+                                &message_bus,
+                                format!(
+                                    "Rig connect failed ({e}) — RIG badge is ✗. Check the radio \
+                                     is powered on and the USB cable; verify with \
+                                     `pancetta test-rig`, then restart pancetta."
+                                ),
+                            )
+                            .await;
+                        }
                     }
                 }
 
@@ -754,6 +795,50 @@ impl super::ApplicationCoordinator {
         info!("Hamlib component started");
         Ok(())
     }
+}
+
+/// Platform-appropriate hamlib install hint (mirrors `pancetta doctor`).
+fn hamlib_install_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "brew install hamlib"
+    } else if cfg!(target_os = "windows") {
+        "install hamlib from https://hamlib.github.io and put rigctld.exe on PATH"
+    } else {
+        "sudo apt install libhamlib-utils"
+    }
+}
+
+/// Surface a rig-setup failure to the operator: an ephemeral TUI error line
+/// (`MessageType::Error` → error log/status) PLUS a retained
+/// `DiagnosticEvent` (target `rig.cat`, Shift+D overlay) so the reason for a
+/// RIG ✗ badge survives after the status line scrolls away. Previously these
+/// failures were `warn!`-to-file only — invisible under the TUI's alternate
+/// screen. Sends are best-effort (`let _ =`): headless runs have no TUI channel.
+async fn report_rig_error(message_bus: &MessageBus, text: String) {
+    let err = ComponentMessage::new(
+        ComponentId::Hamlib,
+        ComponentId::Tui,
+        MessageType::Error {
+            component_id: ComponentId::Hamlib,
+            error_message: text.clone(),
+            error_code: None,
+        },
+        Instant::now(),
+    );
+    let _ = message_bus.send_message(err).await;
+    let diag = ComponentMessage::new(
+        ComponentId::Hamlib,
+        ComponentId::Tui,
+        MessageType::DiagnosticEvent {
+            target: "rig.cat",
+            level: pancetta_core::DiagnosticLevel::Warn,
+            text,
+            qso_id: None,
+            callsign: None,
+        },
+        Instant::now(),
+    );
+    let _ = message_bus.send_message(diag).await;
 }
 
 #[cfg(test)]
