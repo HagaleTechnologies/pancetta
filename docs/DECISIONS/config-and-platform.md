@@ -287,3 +287,16 @@ capacity afterward.
   K5ARG/K5ARH tests, compound-call bases, CTY prefix expectations) where a
   blind sed changes test meaning. The remote-TX security crate
   (pancetta-agent) was swept now; the rest is its own pass.
+- **`pancetta-agent`'s sweep has one PERMANENT, intentional exception:**
+  `pancetta-agent/tests/fixtures/tx-arm-grant.vectors.v1.json` still contains
+  `K5ARH` in its `operatorCallsign` field. This is a frozen, Ed25519-signed
+  cross-repo interop vector (cqdx/pancetta/panino concurred, per the file's
+  own `$comment`) — `canonicalBytesHex`/`clientSig` are computed once over
+  the exact literal string and re-verified byte-for-byte at test time
+  (`tx_arm_grant_vectors.rs`); the same file's own
+  `mutated_grant_fails_verification` test proves a blind sed would desync
+  the fixture and break verification. Changing it needs cross-repo
+  coordination via `dispensa`'s `questions/`/`contracts/` process (per this
+  repo's own cross-repo-contracts convention), not a unilateral pancetta
+  edit. If a future `grep K5ARH pancetta-agent/` shows exactly this one hit,
+  that's expected — not a regression.
