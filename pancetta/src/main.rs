@@ -39,6 +39,8 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilte
 
 use pancetta_lib::coordinator::ApplicationCoordinator;
 
+mod doctor;
+
 /// Pancetta - High-Performance Amateur Radio FT8 Processing Application
 #[derive(Clone, Parser)]
 #[command(name = "pancetta")]
@@ -138,6 +140,9 @@ enum Commands {
     BenchmarkDecode(BenchmarkDecodeArgs),
     /// Interactive setup wizard for station, audio, rig, and PTT
     Setup,
+    /// Check station health: config, clock, audio, decoder, rig — with a
+    /// printed fix for every failure. Run this before your first session.
+    Doctor,
     /// Test rig connection (serial port, CAT, PTT)
     TestRig(TestRigArgs),
     /// Export logged QSOs to ADIF
@@ -373,6 +378,7 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::Benchmark(args) => benchmark_command(args).await,
         Commands::BenchmarkDecode(args) => benchmark_decode_command(args).await,
         Commands::Setup => setup_command().await,
+        Commands::Doctor => doctor_command(cli).await,
         Commands::TestRig(args) => test_rig_command(args, cli).await,
         Commands::Export(args) => export_command(args).await,
     }
@@ -1214,6 +1220,41 @@ async fn setup_command() -> Result<()> {
     }
 
     println!();
+    Ok(())
+}
+
+async fn doctor_command(cli: &Cli) -> Result<()> {
+    let ctx = doctor::build_ctx(cli.config.clone());
+    let checks = doctor::build_checks();
+    println!();
+    println!(
+        "pancetta doctor — {} checks (config: {})",
+        checks.len(),
+        ctx.config_path.display()
+    );
+    println!();
+    let mut results = Vec::with_capacity(checks.len());
+    for check in &checks {
+        let outcome = (check.run)(&ctx);
+        println!(
+            "[{}] {:<20} {}",
+            doctor::status_label(outcome.status),
+            check.name,
+            outcome.detail
+        );
+        if outcome.status != doctor::CheckStatus::Pass {
+            if let Some(fix) = &outcome.fix {
+                println!("       fix: {fix}");
+            }
+        }
+        results.push((check.hard, outcome.status));
+    }
+    println!();
+    if doctor::doctor_exit_code(&results) != 0 {
+        println!("Result: NOT READY — fix the FAIL lines above, then re-run `pancetta doctor`.");
+        std::process::exit(1);
+    }
+    println!("Result: ready. Start `pancetta` — you should see decodes within ~30 s.");
     Ok(())
 }
 
