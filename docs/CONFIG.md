@@ -331,13 +331,12 @@ token   = ""         # cqdx.io Personal Access Token (pat_…), plaintext on dis
 
 ```toml
 [ui]
-theme       = "dark"   # "dark" or "light"
-time_format = "utc"    # "utc" or "local" — UTC strongly recommended for FT8
-target_fps  = 30       # Refresh rate; lower this on slow SSH links
+theme = "dark"   # "dark" or "light"
 ```
 
-The remaining `[ui]` keys are in `defaults.toml`; the ones above are the
-ones with practical effect. Keybindings are not configurable — the full
+The remaining `[ui]` keys are in `defaults.toml`; `theme` above is the
+one with practical effect (`pancetta-tui/src/app.rs` reads `config.ui.theme`
+directly). Keybindings are not configurable — the full
 map is [`docs/KEYBINDINGS.md`](KEYBINDINGS.md) (or `?` in the TUI). A
 `[ui.keyboard]` block is present in `defaults.toml` (it mirrors a real
 `KeyboardConfig` struct in the Rust schema) but nothing in the runtime
