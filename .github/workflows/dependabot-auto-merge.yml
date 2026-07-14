@@ -17,9 +17,42 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Per semver's own spec, a 0.x.y crate's SECOND component is its effective
+      # "major" — 0.15.3 -> 0.18.1 is breaking-by-convention, but dependabot's
+      # update-type still labels it "semver-minor" (root cause of PR #125
+      # auto-merging cpal 0.15->0.18 while CI was red; see
+      # docs/DECISIONS/config-and-platform.md's 2026-07-13 entry). Reclassify
+      # any 0.x dependency whose second component changed as breaking, in
+      # addition to dependabot's own semver-major flag. updated-dependencies-
+      # json (not the top-level previous-version/new-version, which only
+      # reflect a single dependency) is used so grouped-update PRs are
+      # covered per-member.
+      - name: Classify breaking updates
+        id: classify
+        env:
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          DEPS_JSON: ${{ steps.metadata.outputs.updated-dependencies-json }}
+        run: |
+          IS_BREAKING=false
+          if [ "$UPDATE_TYPE" = "version-update:semver-major" ]; then
+            IS_BREAKING=true
+          fi
+          ZERO_X_BREAKING=$(echo "$DEPS_JSON" | jq -r '
+            [.[] | select(.prevVersion != null and .prevVersion != "") |
+              (.prevVersion | split(".")) as $p |
+              (.newVersion | split(".")) as $n |
+              select($p[0] == "0" and ($n[0] != $p[0] or $n[1] != $p[1])) |
+              "\(.dependencyName) (\(.prevVersion) -> \(.newVersion))"
+            ] | join(", ")')
+          if [ -n "$ZERO_X_BREAKING" ]; then
+            IS_BREAKING=true
+          fi
+          echo "is-breaking=$IS_BREAKING" >> "$GITHUB_OUTPUT"
+          echo "zero-x-breaking=$ZERO_X_BREAKING" >> "$GITHUB_OUTPUT"
+
       # dependabot/fetch-metadata outputs are safe (controlled by GitHub, not user input)
       - name: Auto-approve minor/patch updates
-        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        if: steps.classify.outputs.is-breaking == 'false'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -29,21 +62,28 @@ jobs:
           gh pr review "$PR_URL" --approve --body "Auto-approved: ${UPDATE_TYPE} update for ${DEP_NAMES}"
 
       - name: Enable auto-merge for minor/patch updates
-        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        if: steps.classify.outputs.is-breaking == 'false'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh pr merge "$PR_URL" --auto --squash
 
-      - name: Label major updates for review
-        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+      - name: Label breaking updates for review
+        if: steps.classify.outputs.is-breaking == 'true'
         env:
           PR_URL: ${{ github.event.pull_request.html_url }}
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
           PREV_VER: ${{ steps.metadata.outputs.previous-version }}
           NEW_VER: ${{ steps.metadata.outputs.new-version }}
+          UPDATE_TYPE: ${{ steps.metadata.outputs.update-type }}
+          ZERO_X_BREAKING: ${{ steps.classify.outputs.zero-x-breaking }}
         run: |
           gh pr edit "$PR_URL" --add-label "major-update,needs-review"
-          gh pr comment "$PR_URL" --body "Major version bump: ${DEP_NAMES} (${PREV_VER} -> ${NEW_VER}). Requires manual review before merge."
+          if [ "$UPDATE_TYPE" = "version-update:semver-major" ]; then
+            REASON="semver-major update: ${DEP_NAMES} (${PREV_VER} -> ${NEW_VER})"
+          else
+            REASON="breaking-by-convention 0.x update: ${ZERO_X_BREAKING}"
+          fi
+          gh pr comment "$PR_URL" --body "${REASON}. Requires manual review before merge."
