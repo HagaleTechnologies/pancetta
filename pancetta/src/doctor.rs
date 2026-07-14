@@ -6,6 +6,7 @@
 
 use pancetta_config::Config;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Outcome status of one doctor check.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -78,8 +79,11 @@ pub fn build_ctx(config_override: Option<PathBuf>) -> DoctorCtx {
 pub fn build_checks() -> Vec<DoctorCheck> {
     vec![
         check_config(),
+        check_clock(),
         check_audio_device(),
+        check_audio_level(),
         check_decoder(),
+        check_rigctld(),
         check_submodule(),
     ]
 }
@@ -110,6 +114,60 @@ fn not_configured() -> CheckOutcome {
         detail: "not configured — run the wizard".to_string(),
         fix: Some("run `pancetta` (first-run wizard) or `pancetta setup`".to_string()),
     }
+}
+
+/// Seconds between the NTP epoch (1900-01-01) and the Unix epoch (1970-01-01).
+const NTP_UNIX_EPOCH_DELTA: f64 = 2_208_988_800.0;
+
+/// Convert an 8-byte NTP timestamp (32.32 fixed point, seconds since 1900)
+/// to Unix seconds as f64.
+pub(crate) fn ntp_ts_to_unix_f64(b: &[u8]) -> f64 {
+    let secs = u32::from_be_bytes([b[0], b[1], b[2], b[3]]) as f64;
+    let frac = u32::from_be_bytes([b[4], b[5], b[6], b[7]]) as f64 / 4_294_967_296.0;
+    secs + frac - NTP_UNIX_EPOCH_DELTA
+}
+
+/// RFC 4330 clock offset from the four timestamps:
+/// T1 local send, T2 server receive, T3 server transmit, T4 local receive.
+/// Positive = the local clock is BEHIND the server.
+pub(crate) fn sntp_offset(t1: f64, t2: f64, t3: f64, t4: f64) -> f64 {
+    ((t2 - t1) + (t3 - t4)) / 2.0
+}
+
+fn unix_now_f64() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs_f64())
+        .unwrap_or(0.0)
+}
+
+/// One-shot SNTP (RFC 4330) query over UDP. Returns the clock offset in
+/// seconds. Hand-rolled on purpose: a 48-byte packet is not worth a crate.
+pub(crate) fn sntp_clock_offset(server: &str, timeout: Duration) -> anyhow::Result<f64> {
+    use std::net::UdpSocket;
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    sock.set_read_timeout(Some(timeout))?;
+    sock.set_write_timeout(Some(timeout))?;
+    sock.connect(server)?;
+
+    // 48-byte client request: LI=0, VN=4, Mode=3 (client) → first byte 0x23.
+    let mut req = [0u8; 48];
+    req[0] = 0x23;
+    let t1 = unix_now_f64();
+    sock.send(&req)?;
+    let mut resp = [0u8; 48];
+    let n = sock.recv(&mut resp)?;
+    let t4 = unix_now_f64();
+    anyhow::ensure!(n >= 48, "short SNTP response ({n} bytes)");
+    let mode = resp[0] & 0x07;
+    anyhow::ensure!(
+        mode == 4 || mode == 5,
+        "not an SNTP server response (mode {mode})"
+    );
+    let t2 = ntp_ts_to_unix_f64(&resp[32..40]); // Receive timestamp
+    let t3 = ntp_ts_to_unix_f64(&resp[40..48]); // Transmit timestamp
+    anyhow::ensure!(t3 > 0.0, "SNTP transmit timestamp is zero");
+    Ok(sntp_offset(t1, t2, t3, t4))
 }
 
 pub(crate) fn check_config() -> DoctorCheck {
@@ -155,6 +213,43 @@ pub(crate) fn check_config() -> DoctorCheck {
                     cfg.station.callsign, cfg.station.grid_square
                 ),
                 fix: None,
+            }
+        }),
+    }
+}
+
+fn clock_fix_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "System Settings → General → Date & Time → 'Set time automatically'"
+    } else if cfg!(target_os = "windows") {
+        "run `w32tm /resync` in an admin prompt (or Settings → Time & Language → Sync now)"
+    } else {
+        "enable an NTP daemon: `sudo apt install chrony` (or systemd-timesyncd)"
+    }
+}
+
+pub(crate) fn check_clock() -> DoctorCheck {
+    DoctorCheck {
+        name: "system clock",
+        hard: true,
+        run: Box::new(|_ctx| {
+            match sntp_clock_offset("pool.ntp.org:123", Duration::from_secs(2)) {
+                // FT8 slots are UTC-aligned; past ~1 s decodes fail systematically.
+                Ok(offset) if offset.abs() < 1.0 => CheckOutcome {
+                    status: CheckStatus::Pass,
+                    detail: format!("offset {offset:+.3} s vs pool.ntp.org"),
+                    fix: None,
+                },
+                Ok(offset) => CheckOutcome {
+                    status: CheckStatus::Fail,
+                    detail: format!("offset {offset:+.2} s — FT8 needs < ~1 s from UTC"),
+                    fix: Some(clock_fix_hint().to_string()),
+                },
+                Err(e) => CheckOutcome {
+                    status: CheckStatus::Warn,
+                    detail: format!("could not reach pool.ntp.org ({e}) — clock unverified"),
+                    fix: Some("check network; FT8 needs the clock within ~1 s of UTC".to_string()),
+                },
             }
         }),
     }
@@ -221,6 +316,81 @@ pub(crate) fn check_audio_device() -> DoctorCheck {
     }
 }
 
+/// Capture `dur` of input audio and return (rms, peak) of the samples.
+fn capture_rms(cfg: &Config, dur: Duration) -> anyhow::Result<(f32, f32)> {
+    use pancetta_audio::{AudioManager, AudioManagerConfig};
+    let mut mgr = AudioManager::with_config(AudioManagerConfig {
+        input_device: Some(cfg.audio.input_device.clone()),
+        output_device: Some(cfg.audio.output_device.clone()),
+        sample_rate: cfg.audio.sample_rate,
+        buffer_size: cfg.audio.buffer_size as usize,
+        channels: cfg.audio.input_channels as u16,
+        ..Default::default()
+    })?;
+    mgr.start()?;
+    let deadline = std::time::Instant::now() + dur;
+    let (mut sum_sq, mut n, mut peak) = (0f64, 0usize, 0f32);
+    while std::time::Instant::now() < deadline {
+        match mgr.process_audio()? {
+            Some(samples) => {
+                for s in &samples {
+                    sum_sq += (*s as f64) * (*s as f64);
+                    peak = peak.max(s.abs());
+                }
+                n += samples.len();
+            }
+            None => std::thread::sleep(Duration::from_millis(5)),
+        }
+    }
+    let _ = mgr.stop();
+    anyhow::ensure!(n > 0, "no samples captured in {dur:?}");
+    Ok(((sum_sq / n as f64).sqrt() as f32, peak))
+}
+
+pub(crate) fn check_audio_level() -> DoctorCheck {
+    DoctorCheck {
+        name: "audio level (2 s)",
+        hard: true,
+        run: Box::new(|ctx| {
+            let Some(cfg) = &ctx.config else {
+                return not_configured();
+            };
+            match capture_rms(cfg, Duration::from_secs(2)) {
+                Ok((rms, peak)) => {
+                    let dbfs = 20.0 * rms.max(1e-9).log10();
+                    if peak < 1e-6 {
+                        CheckOutcome {
+                            status: CheckStatus::Fail,
+                            detail: "FLAT LINE — no signal reaching the input at all".to_string(),
+                            fix: Some(
+                                "wrong input device, OS-muted, or rig AF off — \
+                                 `pancetta test-audio --list`, check OS input level, \
+                                 turn up the rig's USB audio out"
+                                    .to_string(),
+                            ),
+                        }
+                    } else {
+                        CheckOutcome {
+                            status: CheckStatus::Pass,
+                            detail: format!("rms {dbfs:.0} dBFS, peak {peak:.3}"),
+                            fix: None,
+                        }
+                    }
+                }
+                Err(e) => CheckOutcome {
+                    status: CheckStatus::Fail,
+                    detail: format!("could not capture: {e}"),
+                    fix: Some(
+                        "run `pancetta test-audio --list`; close other apps holding the device \
+                         (including a running pancetta)"
+                            .to_string(),
+                    ),
+                },
+            }
+        }),
+    }
+}
+
 pub(crate) fn check_decoder() -> DoctorCheck {
     DoctorCheck {
         name: "ft8_lib decoder",
@@ -240,6 +410,94 @@ pub(crate) fn check_decoder() -> DoctorCheck {
                         .to_string(),
                     fix: Some("git submodule update --init && cargo build --release".to_string()),
                 }
+            }
+        }),
+    }
+}
+
+fn hamlib_install_hint() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "brew install hamlib"
+    } else if cfg!(target_os = "windows") {
+        "install hamlib from https://hamlib.github.io and put rigctld.exe on PATH"
+    } else {
+        "sudo apt install libhamlib-utils"
+    }
+}
+
+pub(crate) fn check_rigctld() -> DoctorCheck {
+    DoctorCheck {
+        name: "rig / rigctld",
+        hard: true,
+        run: Box::new(|ctx| {
+            let Some(cfg) = &ctx.config else {
+                return not_configured();
+            };
+            if !cfg.rig.interface.enabled {
+                return CheckOutcome {
+                    status: CheckStatus::Pass,
+                    detail: "rig disabled — decode-only (mock rig, no PTT)".to_string(),
+                    fix: Some("to go on-air: `pancetta setup` and enable rig control".to_string()),
+                };
+            }
+            // Model must map to a hamlib ID or the coordinator can't spawn rigctld
+            // (hamlib.rs:252-258 warns and gives up).
+            if pancetta_lib::coordinator::ApplicationCoordinator::hamlib_model_id(&cfg.rig.model)
+                .is_none()
+            {
+                return CheckOutcome {
+                    status: CheckStatus::Fail,
+                    detail: format!(
+                        "unknown rig model '{}' — pancetta cannot spawn rigctld for it",
+                        cfg.rig.model
+                    ),
+                    fix: Some(
+                        "run `pancetta setup` and set a supported model (FTdx10, IC-7300, …), \
+                         or run an external rigctld and set RIGCTLD_HOST/RIGCTLD_PORT"
+                            .to_string(),
+                    ),
+                };
+            }
+            // Binary on PATH — pancetta spawns `rigctld` at startup (hamlib.rs:222).
+            let on_path = std::process::Command::new("rigctld")
+                .arg("--version")
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .is_ok();
+            if !on_path {
+                return CheckOutcome {
+                    status: CheckStatus::Fail,
+                    detail: "rig enabled but `rigctld` is not on PATH".to_string(),
+                    fix: Some(hamlib_install_hint().to_string()),
+                };
+            }
+            // Same host/port conventions as the coordinator (hamlib.rs:150-155).
+            let host = std::env::var("RIGCTLD_HOST").unwrap_or_else(|_| "127.0.0.1".to_string());
+            let port: u16 = std::env::var("RIGCTLD_PORT")
+                .ok()
+                .and_then(|p| p.parse().ok())
+                .unwrap_or(4532);
+            use std::net::ToSocketAddrs;
+            let reachable = format!("{host}:{port}")
+                .to_socket_addrs()
+                .ok()
+                .and_then(|mut it| it.next())
+                .map(|a| {
+                    std::net::TcpStream::connect_timeout(&a, Duration::from_millis(500)).is_ok()
+                })
+                .unwrap_or(false);
+            let detail = if reachable {
+                format!("rigctld on PATH; already listening on {host}:{port}")
+            } else {
+                format!(
+                    "rigctld on PATH; nothing on {host}:{port} yet (pancetta spawns it at startup)"
+                )
+            };
+            CheckOutcome {
+                status: CheckStatus::Pass,
+                detail,
+                fix: None,
             }
         }),
     }
@@ -312,5 +570,25 @@ mod tests {
         assert_eq!(outcome.status, CheckStatus::Fail);
         assert!(check_config().hard);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn ntp_timestamp_conversion_handles_epoch_and_fraction() {
+        // NTP epoch is 1900-01-01; Unix is 1970-01-01; delta 2_208_988_800 s.
+        let unix_zero: [u8; 8] = [0x83, 0xAA, 0x7E, 0x80, 0, 0, 0, 0]; // 2_208_988_800.0
+        assert_eq!(ntp_ts_to_unix_f64(&unix_zero), 0.0);
+        // +1 second and a half-fraction (0x8000_0000 / 2^32 = 0.5) → 1.5.
+        let one_and_half: [u8; 8] = [0x83, 0xAA, 0x7E, 0x81, 0x80, 0, 0, 0];
+        assert!((ntp_ts_to_unix_f64(&one_and_half) - 1.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn sntp_offset_recovers_skew_independent_of_symmetric_delay() {
+        // Local clock 5 s slow, 200 ms symmetric round trip:
+        // T1=100.0 (local send), T2=T3=105.1 (server), T4=100.2 (local recv).
+        let offset = sntp_offset(100.0, 105.1, 105.1, 100.2);
+        assert!((offset - 5.0).abs() < 1e-9);
+        // Zero skew, only delay → offset 0.
+        assert!(sntp_offset(100.0, 100.1, 100.1, 100.2).abs() < 1e-9);
     }
 }

@@ -56,8 +56,10 @@ impl RigConnState {
 impl super::ApplicationCoordinator {
     /// Map rig model name to hamlib model number.
     /// See: https://github.com/Hamlib/Hamlib/wiki/Supported-Radios
+    /// Public so `pancetta doctor` (in the bin crate) can pre-validate the
+    /// configured model against the same table the spawner uses.
     #[cfg(feature = "pancetta-hamlib")]
-    pub(crate) fn hamlib_model_id(model: &str) -> Option<u32> {
+    pub fn hamlib_model_id(model: &str) -> Option<u32> {
         match model.to_lowercase().replace(['-', ' '], "").as_str() {
             "ftdx10" => Some(1042),
             "ftdx101d" | "ftdx101mp" => Some(1040),
