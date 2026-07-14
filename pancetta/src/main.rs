@@ -715,7 +715,7 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
 }
 
 /// The de-brick wizard offer fires only for interactive TUI launches —
-/// exactly the same gate as the first-run wizard (main.rs:675).
+/// exactly the same gate as the first-run wizard's `is_interactive` check.
 fn offer_wizard_on_load_failure(headless: bool, wav: bool, interactive: bool) -> bool {
     !headless && !wav && interactive
 }

@@ -76,3 +76,61 @@ pinning cargo-deny to a non-git-CLI fetch mechanism) was investigated and found 
 cargo-deny 0.19.4 exposes only `-d/--disable-fetch` (which weakens the gate by skipping advisory
 freshness entirely, ruled out) — no flag or `deny.toml` key exists to switch the fetch
 *mechanism* while keeping it fresh. Plan: `docs/superpowers/plans/2026-07-13-fix-prepush-git-clobber.md`.
+
+## Onboarding Phase 1 — unbreak the clone→run funnel (2026-07-14)
+
+Six independent fixes closing the gap between "clone the repo" and "a running, decoding TUI,"
+per `docs/superpowers/specs/2026-07-12-onboarding-world-class-design.md`'s empirical build test
+(README's own quickstart commands didn't run as written; a broken saved config permanently
+bricked startup with no recovery path). Plan:
+`docs/superpowers/plans/2026-07-12-onboarding-phase1-funnel.md`.
+
+- **README/CLAUDE.md doc-truth pass:** clone command now includes `--recursive` (with a fallback
+  note for `git submodule update --init`); both run sections use `cargo run --release -p pancetta`
+  instead of ambiguous bare forms; Hamlib marked optional-at-runtime; crate counts corrected
+  12→14 across README.md and CLAUDE.md (`pancetta-agent`/`pancetta-protocol`/`pancetta-research`
+  were undocumented); CI description corrected to match `.github/workflows/ci.yml` reality
+  (macOS-only cross-platform lane, `cargo deny` not `cargo audit`).
+- **Loud ft8lib-stub fallback:** the pure-Rust decoder fallback (used when the C `ft8_lib`
+  submodule isn't built) was silent at every layer. `pancetta-ft8/build.rs`'s stub branch now
+  emits two `cargo:warning=` lines at build time; `pancetta/src/coordinator/pipeline.rs` elevates
+  its startup log to `warn!` and sends a retained `DiagnosticEvent` (`target: "decode.engine"`,
+  `DiagnosticLevel::Warn`, following the `tx.rs:358-380` `emit_diagnostic` construction pattern)
+  so the degraded-recall state is visible in the TUI's Shift+D overlay, not just a log line
+  nobody reads. Fatal-ness was explicitly ruled out — CI worktrees and research flows build
+  without the submodule by design; this is loud, not blocking.
+- **Wizard validates + normalizes at the prompt:** `pancetta/src/main.rs` gained
+  `normalize_grid` (Maidenhead field/square uppercase, subsquare lowercase),
+  `try_set_station_field` (clone-mutate-validate-return, never mutates in place before
+  validation passes), and a `StationField` enum. `setup_station`'s callsign/grid prompts now
+  loop until valid input or an empty Enter (keep existing value) instead of accepting anything;
+  `run_first_time_setup` gained a belt-and-braces validate-before-save check so an invalid
+  config can no longer reach disk. Field-level validators in `pancetta-config` (`validate_callsign`
+  / `validate_grid_square`) were deliberately left untouched — normalization satisfies them, it
+  never loosens them. **Known pre-existing gap, not fixed by this task:** `run_first_time_setup`
+  can still return `Ok(Some(new_config))` when its own final validation fails (prints a warning,
+  doesn't save, but the invalid config becomes the live in-memory session) — a softer version of
+  the silent-invalid-config trap; flagged during review, worth a follow-up.
+- **Startup de-brick:** previously, a saved `~/.pancetta/pancetta.toml` that failed to load
+  (e.g. hand-edited, or written before the wizard hardening above) permanently exited the
+  process — the only recovery was manual file editing. `load_configuration_with_warnings` now
+  offers to re-run the setup wizard on load failure, gated by a new pure function
+  `offer_wizard_on_load_failure(headless, wav, interactive) -> bool` that reproduces the exact
+  same TTY-only gate as the first-run wizard (`!headless && !wav && interactive`, checked via
+  `std::io::stdin().is_terminal()`). The gate function only calls the non-blocking `is_terminal()`
+  check — no code path can reach a stdin-reading prompt when the gate is false, so headless/
+  `--wav`/piped-stdin runs still error out cleanly with zero risk of hanging on stdin that will
+  never arrive.
+- **Bare `cargo run` disambiguation:** removed `pancetta-audio` from the workspace
+  `default-members` list (kept in `members` — still fully buildable/testable via `--workspace`
+  or `-p pancetta-audio`). `pancetta-audio` ships its own `[[bin]]` helper that collided with
+  the main `pancetta` binary for bare `cargo run`/`cargo build` at the workspace root; CI is
+  unaffected since every CI lane already passes explicit `--workspace` flags.
+- **CONTRIBUTING.md truth pass:** replaced fabricated template boilerplate — wrong GitHub org
+  (`pancetta-project` → `HagaleTechnologies`), a nonexistent Discord link (repo has
+  `has_discussions=false`, so Issues-only), placeholder `[@username]` maintainer list (→
+  "Maintained by Hagale Technologies (K5ARH)"), and references to nonexistent
+  `CONTRIBUTORS.md`/`./scripts/pre-submit.sh` (→ the real gate, `scripts/check.sh`). Merge
+  policy corrected from a fabricated "two approvals required" to the real practice ("PRs are
+  reviewed and merged by the maintainer; CI must be green"). License line corrected to the
+  project's actual MIT OR Apache-2.0 dual license.
