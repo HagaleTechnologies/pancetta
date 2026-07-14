@@ -261,3 +261,29 @@ discovered while attempting a build. Reclaimed ~38GB via `cargo sweep --maxsize 
 main checkout and three idle worktrees (health-panel, onboarding-phase1, onboarding-phase2) per
 this repo's disk-hygiene practice — none were mid-build, so this was safe. Back to 22GB free/90%
 capacity afterward.
+
+## 2026-07-13 — v0.9.5 release infrastructure (Onboarding Phase 3)
+
+- **Hand-rolled release workflow over cargo-dist.** cargo-dist is alive and
+  maintained (v0.32, 2026) and was genuinely considered, but rejected on two
+  hard requirements: (1) Windows binaries must build with the MinGW/GNU
+  toolchain — MSVC cannot compile ft8_lib's VLAs (ci.yml cross-platform note,
+  2026-05-23) and windows-gnu is off cargo-dist's happy path; (2) the release
+  gate must run the built binary and fail on `ft8lib_stub` (custom smoke step).
+  A ~150-line matrix workflow in the existing ci.yml house style keeps both
+  under direct control. Revisit cargo-dist if installers/updaters are wanted.
+- Releases are draft-first and tags are operator-gated: the tag push builds
+  and uploads; only the operator publishes.
+- LICENSE-APACHE was discovered to be a *paraphrase* of the Apache-2.0 text
+  (§6 truncated, §9 retitled, appendix garbled); restored verbatim. This also
+  fixes GitHub's NOASSERTION license detection.
+- GitHub community-profile API `documentation` field hardcodes
+  `tree/master/docs` (GitHub-side link generation; no repository setting
+  controls it). Not fixable repo-side without creating a decoy `master`
+  branch — rejected. Mitigation: repo `homepage` now points at
+  `tree/main/docs`.
+- Repo-wide K5ARH→N0CALL fixture sweep deferred: ~800 occurrences across ~85
+  Rust files, several of which encode callsign *semantics* (near-miss
+  K5ARG/K5ARH tests, compound-call bases, CTY prefix expectations) where a
+  blind sed changes test meaning. The remote-TX security crate
+  (pancetta-agent) was swept now; the rest is its own pass.

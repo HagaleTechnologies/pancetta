@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- GitHub release workflow: pushing a `v*` tag builds prebuilt binaries for
+  macOS (Apple Silicon), Linux x86_64, and Windows x86_64 (MinGW) and attaches
+  them to a draft release. CI refuses to ship any binary built without the
+  real `ft8_lib` C decoder.
+- `pancetta info` now reports the decode engine: `ft8_lib C decoder: native-C`
+  or a loud `STUB` line with the fix command.
+- README: CI / release / license badges, a prebuilt-binary install section,
+  and a screenshot slot (`docs/assets/`).
+
+### Fixed
+
+- `LICENSE-APACHE` restored to the canonical Apache-2.0 text — the previous
+  file paraphrased §6 and §9 and carried a corrupted appendix, which is both
+  a legal-hygiene problem and the reason GitHub reported the repo license as
+  `NOASSERTION`.
+- `CHANGELOG.md` link footer (the `[Unreleased]` compare URL was malformed).
+
+### Removed
+
+- `.env.example`, which described a Docker/Grafana deployment that has never
+  existed in this repository (`git ls-files | grep -i docker` is empty).
+
 ## [0.9.5] - 2026-06-24
 
 ### Added
@@ -95,4 +119,5 @@ The ongoing `End-to-End QSO` initiative (`docs/superpowers/specs/`) is
 moving toward Phase 5: a full autonomous CQ → grid → report → RR73
 exchange on real hardware.
 
-[Unreleased]: https://github.com/HagaleTechnologies/pancetta/compare/HEAD
+[Unreleased]: https://github.com/HagaleTechnologies/pancetta/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/HagaleTechnologies/pancetta/releases/tag/v0.9.5
