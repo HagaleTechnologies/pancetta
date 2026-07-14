@@ -546,6 +546,14 @@ async fn info_command() -> Result<()> {
     // Component versions
     println!("Components:");
     println!("  pancetta-dsp: {}", pancetta_dsp::VERSION);
+    println!(
+        "  ft8_lib C decoder: {}",
+        if pancetta_ft8::ft8lib_is_available() {
+            "native-C"
+        } else {
+            "STUB (pure-Rust only — degraded decode recall; fix: git submodule update --init, then rebuild)"
+        }
+    );
     println!();
 
     // Audio devices require the audio subsystem — enumerate via `pancetta test-audio --list`.
