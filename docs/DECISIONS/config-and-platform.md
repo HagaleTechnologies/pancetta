@@ -206,3 +206,58 @@ Eight tasks closing the gap between "what the docs claim" and "what the code doe
 - **Watch-item closed:** Task 1's regenerated CONFIG.md text asserts "startup now warns about
   unknown top-level sections" — true only once the unknown-section-warning task above landed
   later in this same plan; confirmed true by the time of this final gate.
+
+## Onboarding Phase 4 — the five-minute on-air path (2026-07-14)
+
+Eight tasks implementing the operator's clarified goal — **5 minutes measured from build-complete
+to on-air**, not from download to decode — per
+`docs/superpowers/specs/2026-07-12-onboarding-world-class-design.md` §Phase 4. Plan:
+`docs/superpowers/plans/2026-07-13-onboarding-phase4-five-minute-on-air.md`.
+
+- **Wizard rig step:** `run_first_time_setup` (`pancetta/src/main.rs`) gained a skippable
+  rig/CAT step reusing the existing `setup_rig`/`setup_ptt`/`setup_frequency` free functions
+  already used by `pancetta setup` — no new prompt logic. Prompt defaults to **No** (pressing
+  Enter through the whole wizard still produces a decode-only, never-transmits config); the
+  closing summary states the rig outcome (model/port/baud/PTT if configured, or a
+  `pancetta setup` hint if skipped).
+- **`pancetta doctor`:** new subcommand, seven independent checks as `Vec<DoctorCheck>` data
+  (`pancetta/src/doctor.rs`) — config, system clock (hand-rolled SNTP client over UDP per
+  RFC 4330, no new crate), audio input device, a 2-second audio-level RMS/flat-line capture, the
+  `ft8_lib` decoder, rigctld/rig-model reachability, and the git submodule state — each with a
+  one-line fix. Must work with NO config file (every config-dependent check degrades to
+  `WARN … not configured`, never panics/prompts) and never treats the stub decoder as fatal
+  (`hard: false`). `hamlib_model_id` (`coordinator/hamlib.rs`) made `pub` so the bin crate can
+  pre-validate a configured model against the same table the rigctld spawner uses.
+  (See `docs/DECISIONS/tui.md`'s 2026-07-14 entry for the two TUI-surfacing tasks in this same
+  phase: RX input-device fallback badge, rigctld failure surfacing.)
+- **`docs/GUIDE.md`:** new task-oriented stranger guide (first 5 minutes, first QSO, how-do-I
+  recipes). Every keybinding/config-key/compliance claim independently verified against real
+  code during authoring; two real drifts caught and fixed in the guide (not the code): `Shift+M`
+  actually cycles FT8→FT4→FT2 (gated behind the off-by-default `ft2` feature), and LoTW upload
+  is actually wired (shells out to `tqsl`, config keys `enabled`/`tqsl_path`/`station_location`)
+  rather than deferred as earlier drafted.
+- **README CLI surface documented + GUIDE.md linked.** Deliberately omits `benchmark` (bare) and
+  `test-audio --device`/`--duration` — both still print "not yet implemented" and exit 1;
+  documenting them would recreate exactly the kind of dead end this initiative exists to close.
+- **`scripts/five-minute-drill.sh`:** the phase's actual exit criterion — a stopwatch-timed
+  acceptance script (wizard → doctor-green → first decode, ≤300s) for the operator to run at the
+  rig. Syntax-verified; the real timed run needs the FTdx10 attached (operator-gated,
+  meatspace-pending).
+
+**Two real, pre-existing bugs found during Phase 4's verification passes and filed as tracked
+issues (correctly left unfixed — out of scope for a docs/observability phase):**
+- **#141** — `pancetta config --validate`'s implicit `-v` short flag collides with the global
+  `--verbose` flag (both `#[arg(short, long, ...)]`). Panics under `cfg(debug_assertions)`
+  (`cargo run`/debug builds) via clap's own schema assert; silent in `--release` since the
+  workspace's `[profile.release]` explicitly sets `debug-assertions = false` — confirmed by
+  reading the actual clap_builder source and the workspace Cargo.toml, not just inference. Never
+  trips on the only build path README's Quick Start documents.
+- **#140** — `docs/CONFIG.md`'s `[network.lotw]` example still shows a stale
+  `enabled/username/password` schema; the real `LotwUploadConfig` struct is
+  `enabled`/`tqsl_path`/`station_location`. Found while cross-verifying GUIDE.md's LoTW recipe.
+
+**Operational note:** mid-Task-7, `/System/Volumes/Data` hit 100% capacity (120Mi free),
+discovered while attempting a build. Reclaimed ~38GB via `cargo sweep --maxsize 10GB` across the
+main checkout and three idle worktrees (health-panel, onboarding-phase1, onboarding-phase2) per
+this repo's disk-hygiene practice — none were mid-build, so this was safe. Back to 22GB free/90%
+capacity afterward.

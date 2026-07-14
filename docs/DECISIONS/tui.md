@@ -46,3 +46,31 @@ guards. Regen: `PANCETTA_REGEN_DOCS=1 cargo test -p pancetta-tui keybindings_doc
 README's own keybinding table shrank to the 10 essentials + a link to the generated doc (or `?`
 in the TUI) rather than trying to stay a second hand-maintained copy. Plan:
 `docs/superpowers/plans/2026-07-13-onboarding-phase2-docs-truth.md` Task 7.
+
+## RX input-device fallback badge + rigctld error surfacing (2026-07-14, Onboarding Phase 4)
+
+Two "the RIG/AUDIO badge always has a reason" fixes from
+`docs/superpowers/plans/2026-07-13-onboarding-phase4-five-minute-on-air.md` (doctor + wizard
+rig step from the same plan are in `docs/DECISIONS/config-and-platform.md`'s 2026-07-14 entry).
+
+**RX input-device fallback:** the TX-output side already surfaced a misconfigured/system-default
+output device as a persistent TUI badge; the RX input side had the equivalent failure
+(configured `[audio] input_device` not found, capture silently falls back — "the classic
+decoding-the-built-in-mic trap") but only `warn!`-to-log. Mirrored the existing pattern end to
+end across 8 files (`pancetta-audio/src/{stream,manager}.rs` record + expose the fallback;
+`pancetta/src/coordinator/{mod,audio,tui_relay}.rs` latch an `Arc<AtomicBool>`, emit a one-shot
+`MessageType::Error`, push a `TuiMessage` only on change; `pancetta-tui/src/{tui_runner,app}.rs`
++ `pancetta-tui/src/ui/station_info.rs` render a `⚠ RX→fallback device` badge). Additive only —
+confirmed no TX-scheduler/armed-gate/parity/coalesce-window files touched, loopback QSO tests
+unaffected. Known minor gap: `pancetta-tui/src/ui/mod.rs`'s separate compact status-line "dot"
+(which shows TX-output status) wasn't extended to show the RX-input-fallback state — real but
+small, out of this task's 8-file scope.
+
+**rigctld failure surfacing:** rigctld spawn/model/connect failures previously only `warn!`-to-
+file — invisible under the TUI's alternate screen, so a RIG ✗ badge had no visible reason. A new
+`report_rig_error` helper (`pancetta/src/coordinator/hamlib.rs`) emits both an ephemeral
+`MessageType::Error` and a retained `DiagnosticEvent` (`target: "rig.cat"`, Shift+D overlay) at
+all four existing failure sites (suspicious `[rig.interface].port`, `rigctld` spawn failure,
+unknown rig model, connect failure). The `rig_enabled` guard on the connect-failure site keeps a
+disabled/mock rig silent — a missing guard there would have made every disabled-rig (the
+default) station show a spurious rig error.
