@@ -58,6 +58,7 @@ use tracing::{debug, info};
 pub mod audio;
 pub mod autonomous;
 pub mod decoder;
+pub mod duplicate_check;
 pub mod fox;
 pub mod hot_reload;
 pub mod hound;
@@ -71,6 +72,7 @@ pub mod ui;
 pub use audio::*;
 pub use autonomous::*;
 pub use decoder::*;
+pub use duplicate_check::*;
 pub use fox::*;
 pub use hound::*;
 pub use loader::*;
@@ -161,6 +163,10 @@ pub struct Config {
     #[serde(default)]
     pub decoder: decoder::DecoderConfig,
 
+    /// Duplicate-QSO checking (don't call the same station twice)
+    #[serde(default)]
+    pub duplicate_checking: duplicate_check::DuplicateCheckingConfig,
+
     /// Metadata about the configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConfigMetadata>,
@@ -195,6 +201,7 @@ impl Default for Config {
             fox: fox::FoxConfig::default(),
             tx_placement: tx_placement::TxPlacementConfig::default(),
             decoder: decoder::DecoderConfig::default(),
+            duplicate_checking: duplicate_check::DuplicateCheckingConfig::default(),
             metadata: Some(ConfigMetadata {
                 version: "1.0".to_string(),
                 last_modified: Some(chrono::Utc::now()),
@@ -246,6 +253,7 @@ impl Config {
         self.fox.validate_section()?;
         self.tx_placement.validate_section()?;
         self.decoder.validate_section()?;
+        self.duplicate_checking.validate_section()?;
 
         info!("Configuration validation successful");
         Ok(())
@@ -265,6 +273,7 @@ impl Config {
         self.fox.merge_with(other.fox);
         self.tx_placement.merge_with(other.tx_placement);
         self.decoder.merge_with(other.decoder);
+        self.duplicate_checking.merge_with(other.duplicate_checking);
 
         // Update metadata
         if let Some(ref mut metadata) = self.metadata {
@@ -909,5 +918,11 @@ mod merge_guard {
         assert_carries_all::<tx_placement::TxPlacementConfig>("TxPlacementConfig", &[], |a, b| {
             a.merge_with(b)
         });
+
+        assert_carries_all::<duplicate_check::DuplicateCheckingConfig>(
+            "DuplicateCheckingConfig",
+            &[],
+            |a, b| a.merge_with(b),
+        );
     }
 }

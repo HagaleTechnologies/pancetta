@@ -196,13 +196,27 @@ Defaults for all three live in `Config::default()`; see
 [duplicate_checking]
 enabled = true
 time_window_hours = 24
-check_frequency = false
+check_frequency = true
 ```
 
-`check_frequency = true` allows the same station to be called again on
-a different band. The default (`false`) is one-and-done per UTC day.
 The duplicate check is what makes Space-to-call return `Call X failed:
-duplicate QSO ...` for stations you've already worked.
+duplicate QSO ...` for stations you've already worked. With the default
+`check_frequency = true`, a prior QSO only blocks a re-call when it was
+within 50 Hz of the same RF frequency — so the same station on a
+different band can be worked again. Set `check_frequency = false` for
+strict one-QSO-per-callsign inside the window, or `enabled = false` to
+turn duplicate checking off entirely.
+
+`time_window_hours` is a rolling window from each prior QSO's start
+time (not a UTC-day boundary): a QSO started 23 hours ago still blocks;
+one started 25 hours ago does not.
+
+Note: this 50 Hz frequency scoping applies to the in-memory recent-QSO
+check. The persistent-database fallback (used after a restart, once a
+completed QSO has aged out of memory) always frequency-scopes at a
+wider ±100 Hz regardless of `check_frequency` — a corner case, not
+something an operator normally needs to think about, but noted here
+for completeness.
 
 ---
 

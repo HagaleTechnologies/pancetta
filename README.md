@@ -224,11 +224,14 @@ present a transient name on first plug-in; unplug, replug, restart.
 
 ### `Call X failed: duplicate QSO`
 
-Pancetta refuses to call the same station on the same band twice within
-the configured `duplicate_checking.time_window_hours`. Adjust the
-window in config, or remove the prior QSO from `~/.pancetta/qso.db`
-if it was a test. The duplicate check is intentional — it prevents
-embarrassing repeat-calls during a contest or grid hunt.
+Pancetta refuses to call the same station within the configured
+`duplicate_checking.time_window_hours` rolling window (by default, the
+in-memory check scopes this to within 50 Hz of the same frequency —
+see `[duplicate_checking]` in [`docs/CONFIG.md`](docs/CONFIG.md)).
+Adjust the window in config, or remove the prior QSO from
+`~/.pancetta/qso.db` if it was a test. The duplicate check is
+intentional — it prevents embarrassing repeat-calls during a contest
+or grid hunt.
 
 ### `rigctld` won't connect
 
