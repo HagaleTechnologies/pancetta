@@ -4,11 +4,12 @@ Pancetta's configuration lives in a single TOML file at
 `~/.pancetta/pancetta.toml`. The file is loaded at startup and watched for
 changes; most keys hot-reload without a restart.
 
-This document covers the keys you'll actually touch. The full schema —
-including hundreds of advanced knobs (DSP filter coefficients, contest
-categories, multi-antenna routing, etc.) — lives in
-[`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml). Any
-key you don't set in your user config inherits the value from there.
+This document covers the keys you'll actually touch, with explanations.
+The complete schema — every section, every key, every default — is
+[`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml),
+which is **generated from the code's `Config::default()`** and
+drift-tested in CI, so it can't lie. Any key you don't set in your user
+config keeps its default value from there.
 
 > **Security:** the config file is plaintext on disk. If you set any
 > integration password (LoTW, eQSL, Clublog, QRZ), `chmod 600` the file
@@ -335,9 +336,12 @@ time_format = "utc"    # "utc" or "local" — UTC strongly recommended for FT8
 target_fps  = 30       # Refresh rate; lower this on slow SSH links
 ```
 
-The TUI also reads its layout, key bindings, and color scheme details
-from `[ui]`. The full set is in `defaults.toml`; the keys above are the
-ones with practical effect.
+The remaining `[ui]` keys are in `defaults.toml`; the ones above are the
+ones with practical effect. Keybindings are not configurable — the full
+map is [`docs/KEYBINDINGS.md`](KEYBINDINGS.md) (or `?` in the TUI). A
+`[ui.keyboard]` block is present in `defaults.toml` (it mirrors a real
+`KeyboardConfig` struct in the Rust schema) but nothing in the runtime
+reads it; it's inert scaffolding, not a way to remap keys.
 
 ---
 
@@ -395,8 +399,10 @@ into a fresh `qsos.adi` before switching over. No manual action required.
 
 ## Where to look next
 
-- The annotated source of truth is
-  [`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml).
+- The complete generated schema is
+  [`pancetta-config/defaults.toml`](../pancetta-config/defaults.toml); the
+  annotated source of truth is the Rust structs under
+  `pancetta-config/src/`.
 - Rust types and validation logic live under `pancetta-config/src/`.
 - See [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) for how config flows
   through the coordinator.
