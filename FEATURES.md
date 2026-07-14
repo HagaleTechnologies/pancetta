@@ -10,7 +10,15 @@ A single decode window runs as an *anytime* algorithm: candidate stations are de
 
 ## Autonomous Operator
 
-The autonomous operator makes cycle-by-cycle decisions across three modes: hunt mode (pounce on rare or needed stations calling CQ), CQ mode (call CQ and answer incoming callers), and hybrid mode (balance outbound hunting with CQ activity). It manages even/odd 15-second slot parity, drives the full QSO state machine (CQ → grid report → signal report → RR73 → 73), and monitors the TX slot to detect doubling. All behavior is configurable — mode, aggressiveness, slot preference, and priority weights are set at runtime without code changes.
+The autonomous operator makes cycle-by-cycle decisions: it answers decoded
+CQs whose priority score clears `min_dx_score` (pouncing on rare or needed
+stations first), answers stations calling it directly, and falls back to
+calling CQ after a configurable number of idle TX cycles
+(`cq_after_idle_cycles`). It manages even/odd 15-second slot parity, drives
+the full QSO state machine (CQ → grid report → signal report → RR73 → 73),
+and monitors the TX slot to detect doubling. Slot parity, concurrency,
+CQ cadence, and all priority weights are configured under `[autonomous]`
+in `pancetta.toml` (see docs/CONFIG.md) — no code changes required.
 
 ## Priority Scoring Engine
 
@@ -34,7 +42,7 @@ Hamlib CAT control is integrated via a TCP client to `rigctld`, targeting the Ya
 
 ## Terminal Interface
 
-The TUI is built on ratatui and crossterm. It exposes a live waterfall, a band-activity table of decoded messages, a DX hunter panel sourced from cqdx.io spots, a QSO status pane showing in-flight exchanges, and a station info / pipeline-health panel. Core controls — Space to call the selected station, `c` / `s` to start and stop auto-CQ, `D` for the audio device picker, `Tab` to cycle panels — are wired end-to-end through the coordinator. Audio init failures and QSO state-machine rejections surface in the status bar instead of dying silently in the log file. Density-glyph waterfall rendering keeps the panel visible on 16-color terminals when SSH'd in over slow links.
+The TUI is built on ratatui and crossterm. It exposes a live waterfall, a band-activity table of decoded messages, a DX hunter panel sourced from cqdx.io spots, a QSO status pane showing in-flight exchanges, and a station info / pipeline-health panel. Core controls — Space to call the selected station, `c` / `s` to start and stop auto-CQ, `d` for the audio device picker, `Tab` to cycle panels — are wired end-to-end through the coordinator. Audio init failures and QSO state-machine rejections surface in the status bar instead of dying silently in the log file. Density-glyph waterfall rendering keeps the panel visible on 16-color terminals when SSH'd in over slow links.
 
 ## cqdx.io Integration
 
