@@ -134,3 +134,75 @@ bricked startup with no recovery path). Plan:
   policy corrected from a fabricated "two approvals required" to the real practice ("PRs are
   reviewed and merged by the maintainer; CI must be green"). License line corrected to the
   project's actual MIT OR Apache-2.0 dual license.
+
+## Onboarding Phase 2 — docs tell the truth (2026-07-14)
+
+Eight tasks closing the gap between "what the docs claim" and "what the code does," per
+`docs/superpowers/specs/2026-07-12-onboarding-world-class-design.md` §Phase 2. Plan:
+`docs/superpowers/plans/2026-07-13-onboarding-phase2-docs-truth.md`.
+
+- **CONFIG.md `[autonomous]` regen:** the documented schema (`[autonomous_operator]`, a `mode`
+  key, `slot_parity_preference`, a top-level `[priority_weights]` with `snr`) never existed in
+  code — none of those keys, section name, or nesting matched `AutonomousConfig`
+  (`pancetta-config/src/autonomous.rs`). Regenerated from the real struct: `[autonomous]` with
+  9 top-level keys, `[autonomous.priorities]` with `signal_strength` (not `snr`). Every value in
+  the new doc table was independently cross-checked against `AutonomousConfig::default()` and its
+  `#[validate(...)]` ranges during review.
+- **RUNBOOK.md truth pass:** fixed the config filename (`pancetta.toml`, not `config.toml`), a
+  false "autonomous is config-only, no runtime toggle" claim (the `a`/`Shift+P` keys are live —
+  toggle and pause/resume, respectively, confirmed against `tui_runner.rs`), and log paths
+  (`~/.pancetta/logs/` plural, `pancetta.log.YYYY-MM-DD` daily-rotated, 14-file retention —
+  traced into the vendored `tracing-appender` source to confirm UTC timestamp semantics).
+- **FEATURES.md corrections:** removed fabricated hunt/CQ/hybrid autonomous "modes" and a
+  nonexistent runtime mode/aggressiveness knob (the operator makes cycle-by-cycle scored
+  decisions, no mode concept exists); fixed device-picker key (`d`, not `D` — `D`/Shift+D is the
+  diagnostics overlay).
+- **`docs/README.md` index:** new file separating curated (maintained, trustworthy) docs from
+  working notes (point-in-time design/analysis artifacts, unmaintained) — nothing moved, only
+  labeled.
+- **`[duplicate_checking]` wired into config (zero behavior change):** the section was documented
+  in CONFIG.md but never actually read — the coordinator always built `QsoManagerConfig` with
+  `..Default::default()`. New `pancetta-config/src/duplicate_check.rs` module, threaded into
+  `pancetta/src/coordinator/qso.rs` following the existing Hound-regions pattern. Config-side
+  defaults (`enabled=true, time_window_hours=24, check_frequency=true`) guaranteed identical to
+  the pre-existing hard-coded `pancetta_qso::DuplicateCheckConfig::default()` via a cross-crate
+  parity test — so a config file without the section behaves byte-identically to the pre-wiring
+  binary. `check_band` (defined in `pancetta-qso`, never actually read anywhere) was deliberately
+  left out of the exposed schema rather than shipping a dead knob; the coordinator still supplies
+  its qso-side default. **Follow-up found, not fixed (out of scope):** `pancetta-qso/src/
+  async_database.rs`'s persistent-DB duplicate check hard-codes a 100 Hz frequency filter and
+  ignores `check_frequency` entirely, unlike the in-memory check's 50 Hz `check_frequency`-gated
+  logic — a real latent bug (an operator setting `check_frequency = false` still gets
+  frequency-gated suppression once a QSO ages out of memory into the DB-only path). Docs were
+  worded to disclose this discrepancy rather than claim unified behavior.
+- **Warn on unknown top-level config sections:** serde silently drops unrecognized TOML keys, so
+  a misspelled or obsolete section (the exact `[autonomous_operator]`/`[priority_weights]` ghosts
+  this same plan killed from the docs) was invisibly ignored. `pancetta-config/src/loader.rs` now
+  sweeps a parsed file's top-level table keys against `Config`'s own schema (derived dynamically
+  via `serde_json::to_value(Config::default())`, so the known-set can never drift when a section
+  is added) and records a load-warning per stranger, surfaced via the existing `load_warnings`
+  mechanism. TOML only this phase (`parse_json` untouched). **Known gap, disclosed not fixed:**
+  config hot-reload shares the same `parse_toml` sweep (so it fires and logs), but
+  `Config::load_from_file`'s throwaway `ConfigLoader` instance discards its `load_warnings()`, so
+  hot-reload's unknown-section warnings reach logs but never the TUI-facing warnings list the way
+  startup's `load_default_with_warnings` does — worth a tracked follow-up.
+- **`defaults.toml` regenerated from `Config::default()`, drift-tested:** the file is pure
+  documentation — the runtime never reads it (`load_embedded_defaults()` returns
+  `Config::default()` directly) — and was lying: missing `[autonomous]`/`[decoder]`/`[hound]`/
+  `[fox]`/`[tx_placement]` entirely while carrying several TOML sections the plan's own draft
+  believed were dead. **Correction during implementation: `[network.web_api]`, `[network.wspr]`,
+  `[ui.keyboard]`, `[ui.accessibility]`, `[ui.animations]` are NOT dead** — all five are real,
+  live struct fields reachable from `Config`, confirmed by grep and kept in the regenerated
+  output rather than deleted per the plan's now-corrected premise. New
+  `pancetta-config/tests/defaults_drift.rs` regenerates and drift-tests the file. **Determinism
+  fix:** direct `toml::to_string_pretty(&Config::default())` was empirically flaky (a
+  `HashMap<String, KeyboardShortcut>` at `ui.keyboard.shortcuts` serializes in randomized
+  per-process order) — fixed by routing serialization through `toml::Value` (BTreeMap-backed in
+  the pinned `toml` crate version, confirmed against vendored source), test-file-only, no
+  `Config` type change. CONFIG.md's billing updated to point at the generated file as the
+  complete schema; a pre-existing, unrelated `[ui]` example-block bug (documented `time_format`/
+  `target_fps` keys that exist in no Rust struct) was found adjacent to this task's edits and
+  cleaned up in the same pass (only `theme` has confirmed runtime effect).
+- **Watch-item closed:** Task 1's regenerated CONFIG.md text asserts "startup now warns about
+  unknown top-level sections" — true only once the unknown-section-warning task above landed
+  later in this same plan; confirmed true by the time of this final gate.
