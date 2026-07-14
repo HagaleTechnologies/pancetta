@@ -18,7 +18,6 @@ members = [
 default-members = [
     "pancetta",
     "pancetta-agent",
-    "pancetta-audio",
     "pancetta-config",
     "pancetta-core",
     "pancetta-cqdx",
