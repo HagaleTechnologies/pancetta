@@ -392,7 +392,7 @@ mod tests {
         let state = client
             .enroll(
                 "PAIR-CODE-42",
-                Some("K5ARH Rig".into()),
+                Some("N0CALL Rig".into()),
                 Some("pancetta-macos".into()),
             )
             .unwrap();

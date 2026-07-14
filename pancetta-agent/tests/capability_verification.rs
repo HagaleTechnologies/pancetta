@@ -18,7 +18,7 @@ use pancetta_agent::pairing::IdpKey;
 const AGENT_KEY_ID: &str = "agentKeyId000000";
 const CLIENT_KEY_ID: &str = "clientKeyId00000";
 const IDP_KID: &str = "idp-kid-1";
-const OPERATOR: &str = "K5ARH";
+const OPERATOR: &str = "N0CALL";
 const NOW_MS: i64 = 1_700_000_000_000; // fixed "now"
 
 fn b64url(bytes: &[u8]) -> String {

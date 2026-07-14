@@ -480,7 +480,7 @@ mod tests {
 
     fn grant(scope_tx: bool) -> VerifiedArmGrant {
         VerifiedArmGrant {
-            operator_callsign: "K5ARH".to_string(),
+            operator_callsign: "N0CALL".to_string(),
             ttl_ms: TTL,
             scope_tx,
             jti: JTI.to_string(),
@@ -522,7 +522,7 @@ mod tests {
         let st = armed_consented();
         assert!(st.tx_permitted(T0));
         assert_eq!(st.tx_permit_reason(T0), TxPermit::Permitted);
-        assert_eq!(st.operator_callsign(), Some("K5ARH"));
+        assert_eq!(st.operator_callsign(), Some("N0CALL"));
     }
 
     #[test]
@@ -648,7 +648,7 @@ mod tests {
         assert!(st.heartbeat(JTI, 9, T0 + 1_000).is_empty());
         // Re-arm with a DIFFERENT jti (fresh grant): seq resets.
         let g2 = VerifiedArmGrant {
-            operator_callsign: "K5ARH".to_string(),
+            operator_callsign: "N0CALL".to_string(),
             ttl_ms: TTL,
             scope_tx: true,
             jti: "arm-jti-2".to_string(),
@@ -671,7 +671,7 @@ mod tests {
         let short_ttl = 10_000;
         st.arm(
             VerifiedArmGrant {
-                operator_callsign: "K5ARH".into(),
+                operator_callsign: "N0CALL".into(),
                 ttl_ms: short_ttl,
                 scope_tx: true,
                 jti: JTI.to_string(),
@@ -773,7 +773,7 @@ mod tests {
         let short_ttl = 10_000;
         st.arm(
             VerifiedArmGrant {
-                operator_callsign: "K5ARH".into(),
+                operator_callsign: "N0CALL".into(),
                 ttl_ms: short_ttl,
                 scope_tx: true,
                 jti: JTI.to_string(),
@@ -795,7 +795,7 @@ mod tests {
         // Only a fresh arm restores permission.
         st.arm(
             VerifiedArmGrant {
-                operator_callsign: "K5ARH".into(),
+                operator_callsign: "N0CALL".into(),
                 ttl_ms: short_ttl,
                 scope_tx: true,
                 jti: JTI.to_string(),
@@ -838,7 +838,7 @@ mod tests {
         let mut st = ArmState::new();
         st.arm(
             VerifiedArmGrant {
-                operator_callsign: "K5ARH".into(),
+                operator_callsign: "N0CALL".into(),
                 ttl_ms: 10_000,
                 scope_tx: true,
                 jti: JTI.to_string(),
@@ -853,7 +853,7 @@ mod tests {
             ArmEffect::Audit(ev) => {
                 assert_eq!(ev.kind, AuditKind::Disarmed);
                 assert!(ev.detail.contains("ttl-expired"));
-                assert_eq!(ev.operator_callsign.as_deref(), Some("K5ARH"));
+                assert_eq!(ev.operator_callsign.as_deref(), Some("N0CALL"));
             }
             other => panic!("expected audit, got {other:?}"),
         }
@@ -891,7 +891,7 @@ mod tests {
         let mut st = ArmState::new();
         st.arm(
             VerifiedArmGrant {
-                operator_callsign: "K5ARH".into(),
+                operator_callsign: "N0CALL".into(),
                 ttl_ms: 5_000,
                 scope_tx: true,
                 jti: JTI.to_string(),
@@ -1024,7 +1024,7 @@ mod tests {
                         let jti = format!("arm-{arm_ordinal}");
                         st.arm(
                             VerifiedArmGrant {
-                                operator_callsign: "K5ARH".into(),
+                                operator_callsign: "N0CALL".into(),
                                 ttl_ms: ttl,
                                 scope_tx: scope,
                                 jti: jti.clone(),

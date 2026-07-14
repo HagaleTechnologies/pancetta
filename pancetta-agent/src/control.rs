@@ -415,7 +415,7 @@ mod tests {
             "frame": "command",
             "command": {
                 "cmd": "callStation",
-                "callsign": "K5ARH",
+                "callsign": "N0CALL",
                 "frequencyHz": 1500,
                 "dxParity": "even"
             }
@@ -423,7 +423,7 @@ mod tests {
         assert_eq!(
             action,
             ControlAction::TxRequest(TxKind::CallStation {
-                callsign: "K5ARH".to_string(),
+                callsign: "N0CALL".to_string(),
                 frequency_hz: 1500.0,
                 dx_parity: Some("even".to_string()),
             })
@@ -573,7 +573,7 @@ mod tests {
             "clientKeyId": "client-1",
             "sessionId": "sess-1",
             "capabilityJti": "cap-abc",
-            "operatorCallsign": "K5ARH",
+            "operatorCallsign": "N0CALL",
             "armedUntil": 1719000600000_u64,
             "heartbeatIntervalSec": 10,
             "jti": "arm-abc-123",
