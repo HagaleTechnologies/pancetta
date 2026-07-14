@@ -56,3 +56,23 @@ drop-rate (`AudioCommShared.dropped_samples`, already incremented in the RT call
 surfaced as a rate-limited `DiagnosticEvent` (at most once per 30s, only when nonzero). Plan:
 `docs/superpowers/plans/2026-07-11-audio-auto-recovery.md`. Outstanding: the real unplug/replug
 validation is operator-gated hardware time, tracked separately.
+
+## Pre-push hook branch-clobber root cause + fix (2026-07-13)
+
+Six occurrences (2026-07-03 -> 07-12) of a just-pushed branch getting silently hard-reset,
+local and remote, to a stale commit within seconds of `git push`. Root-caused via live process
+capture during a probe push: `scripts/check.sh` runs as the pre-push hook (`.git/hooks/pre-push`
+symlinks to it), and git exports `GIT_DIR` (plus `GIT_WORK_TREE`/`GIT_INDEX_FILE`/`GIT_PREFIX`)
+into every hook-spawned process. `GIT_DIR` **overrides** `git -C`-based repo discovery, so
+`cargo deny check advisories`'s RustSec advisory-db auto-update — which shells out to
+`git -C ~/.cargo/advisory-dbs/<hash> reset --hard && fetch && reset --hard FETCH_HEAD` — ran
+those commands against the *pushing repo* instead of the advisory-db checkout, hard-resetting
+the branch being pushed (and, mid-push, transferring the moved ref to the remote). Fixed with a
+one-line `unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_PREFIX` at the top of `scripts/check.sh`
+(before the `cd "$(git rev-parse --show-toplevel)"` that follows) — protects every cargo child
+process the hook spawns, not just cargo-deny. Live-verified: two full hook runs including the
+advisory-db update produced zero `reset:` reflog entries. **Belt-and-braces (plan Task 2,
+pinning cargo-deny to a non-git-CLI fetch mechanism) was investigated and found not applicable:**
+cargo-deny 0.19.4 exposes only `-d/--disable-fetch` (which weakens the gate by skipping advisory
+freshness entirely, ruled out) — no flag or `deny.toml` key exists to switch the fetch
+*mechanism* while keeping it fresh. Plan: `docs/superpowers/plans/2026-07-13-fix-prepush-git-clobber.md`.
