@@ -743,6 +743,21 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
         setup_audio(&mut new_config)?;
     }
 
+    // Rig / CAT control — the other half of the on-air path. Skippable:
+    // decode-only needs no rig, and the rig interface stays disabled by
+    // default (safe-by-default posture). Reuses the exact same helpers as
+    // `pancetta setup`, including serial-port enumeration.
+    if prompt_yes_no(
+        "Configure rig CAT control now? (skip = decode-only for now)",
+        false,
+    )? {
+        setup_rig(&mut new_config)?;
+        if new_config.rig.interface.enabled {
+            setup_ptt(&mut new_config)?;
+            setup_frequency(&mut new_config)?;
+        }
+    }
+
     if let Err(e) = new_config.validate() {
         println!();
         println!("WARNING: configuration is still invalid ({e}).");
@@ -771,6 +786,19 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
         "Station: {} / {} / {}W",
         new_config.station.callsign, new_config.station.grid_square, new_config.station.power_watts
     );
+    if new_config.rig.interface.enabled {
+        println!(
+            "Rig:     {} on {} @ {} (PTT: {:?})",
+            new_config.rig.model,
+            new_config.rig.interface.port,
+            new_config.rig.interface.baud_rate,
+            new_config.rig.ptt.method
+        );
+        println!("         Verify the link any time with: pancetta test-rig");
+    } else {
+        println!("Rig:     not configured — decode-only (no PTT).");
+        println!("         To set up CAT later: pancetta setup");
+    }
     println!("Setup complete! Starting Pancetta...");
     println!();
 
