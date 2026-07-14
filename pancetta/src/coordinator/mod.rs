@@ -799,6 +799,11 @@ pub struct ApplicationCoordinator {
     /// the TUI relay to drive a persistent station-panel badge.
     audio_output_default: Arc<AtomicBool>,
 
+    /// Latched true when the configured audio INPUT device was not found and
+    /// capture fell back to another device — RX-side mirror of
+    /// `audio_output_default`. Drives a persistent TUI badge via the relay.
+    audio_input_fallback: Arc<AtomicBool>,
+
     /// Command channel into the dedicated audio thread for **live device
     /// switching**. The TUI `SelectDevice` handler sends an
     /// [`AudioReopenRequest`](crate::coordinator::audio::AudioReopenRequest)
@@ -1228,6 +1233,7 @@ impl ApplicationCoordinator {
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             audio_output_default: Arc::new(AtomicBool::new(false)),
+            audio_input_fallback: Arc::new(AtomicBool::new(false)),
             audio_reopen_tx: None,
             rig_conn_state: Arc::new(std::sync::atomic::AtomicU8::new(
                 crate::coordinator::hamlib::RigConnState::default().as_u8(),

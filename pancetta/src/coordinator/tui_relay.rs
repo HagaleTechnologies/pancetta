@@ -153,6 +153,7 @@ impl super::ApplicationCoordinator {
         // tick; pushed only on change so the TUI render stays cheap).
         let rig_conn_state_relay = self.rig_conn_state.clone();
         let audio_output_default_relay = self.audio_output_default.clone();
+        let audio_input_fallback_relay = self.audio_input_fallback.clone();
         // Clone our callsign before the tui-relay thread consumes the original
         // via move. The async command-handler task below needs its own copy.
         let cmd_our_callsign = our_callsign_for_relay.clone();
@@ -173,6 +174,7 @@ impl super::ApplicationCoordinator {
             // first push by seeding sentinels that differ from any real value).
             let mut last_rig_state: Option<u8> = None;
             let mut last_audio_default: Option<bool> = None;
+            let mut last_input_fallback: Option<bool> = None;
             // C20 — RF-present / zero-decodes detector (mode/clock fault),
             // fed from the cumulative DSP-window + decode telemetry below.
             let mut rf_no_decode = super::health::RfNoDecodeMonitor::new();
@@ -652,6 +654,17 @@ impl super::ApplicationCoordinator {
                         let _ = tui_msg_tx_relay.send(
                             pancetta_tui::tui_runner::TuiMessage::AudioOutputDefault {
                                 is_default: audio_default,
+                            },
+                        );
+                    }
+
+                    // RX-input fallback badge — push only when it changes.
+                    let input_fb = audio_input_fallback_relay.load(Ordering::Relaxed);
+                    if last_input_fallback != Some(input_fb) {
+                        last_input_fallback = Some(input_fb);
+                        let _ = tui_msg_tx_relay.send(
+                            pancetta_tui::tui_runner::TuiMessage::AudioInputFallback {
+                                active: input_fb,
                             },
                         );
                     }

@@ -104,6 +104,11 @@ pub struct AudioStreamManager {
     /// on speakers" misconfig instead of it being log-only. Recomputed each
     /// time the output stream is (re)created.
     output_is_system_default: bool,
+    /// Set when the configured INPUT device name did not match any present
+    /// device and capture silently fell back to the best available input
+    /// (`(requested, resolved)` names). Mirror of `output_is_system_default`
+    /// for the RX side; recomputed each time the input stream is (re)created.
+    input_fallback: Option<(String, String)>,
 }
 
 impl AudioStreamManager {
@@ -131,6 +136,7 @@ impl AudioStreamManager {
             shared,
             is_running: false,
             output_is_system_default: false,
+            input_fallback: None,
         })
     }
 
@@ -141,6 +147,13 @@ impl AudioStreamManager {
     /// the rig — the classic "PTT keys, no RF, audio on speakers" misconfig.
     pub fn output_is_system_default(&self) -> bool {
         self.output_is_system_default
+    }
+
+    /// If the configured input device was not found and capture fell back,
+    /// returns `(requested_name, resolved_name)`. Only meaningful after the
+    /// input stream has been created.
+    pub fn input_fallback(&self) -> Option<(String, String)> {
+        self.input_fallback.clone()
     }
 
     /// Take the consumer half out of this manager.
@@ -296,7 +309,10 @@ impl AudioStreamManager {
             }
         }
 
-        // Get input device
+        // Get input device — recording whether we silently fell back so the
+        // coordinator can surface it (previously warn!-only; the classic
+        // "decoding the built-in mic instead of the rig" trap).
+        let mut fallback_from: Option<String> = None;
         let input_device = if let Some(ref device_name) = self.config.input_device_name {
             if device_name.eq_ignore_ascii_case("default") {
                 self.device_manager.get_best_ft8_input_device()?
@@ -310,6 +326,7 @@ impl AudioStreamManager {
                             "Input device matching '{}' not found, falling back to best available",
                             device_name
                         );
+                        fallback_from = Some(device_name.clone());
                         self.device_manager.get_best_ft8_input_device()?
                     }
                 }
@@ -317,6 +334,10 @@ impl AudioStreamManager {
         } else {
             self.device_manager.get_best_ft8_input_device()?
         };
+        let resolved_input_name = input_device
+            .name()
+            .unwrap_or_else(|_| "<unknown>".to_string());
+        self.input_fallback = fallback_from.map(|req| (req, resolved_input_name));
 
         // Get optimal configuration
         let stream_config = self.device_manager.find_optimal_config(

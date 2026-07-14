@@ -944,6 +944,8 @@ pub struct App {
     /// Drives a persistent station-panel warning badge. Mirrored from the
     /// coordinator's `AudioOutputDefault` message.
     pub tx_output_default: bool,
+    /// RX capture fell back to a device other than the configured one.
+    pub input_fallback: bool,
 
     // Band/frequency tracking
     pub current_band_index: usize,
@@ -1118,6 +1120,7 @@ impl App {
             tx_queued: Vec::new(),
             rig_connected: RigConnDisplay::default(),
             tx_output_default: false,
+            input_fallback: false,
             current_band_index: default_band_index,
             radio_frequency: None,
             band_cache: HashMap::new(),
