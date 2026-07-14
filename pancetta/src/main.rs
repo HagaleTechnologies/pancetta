@@ -747,7 +747,7 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
         println!();
         println!("WARNING: configuration is still invalid ({e}).");
         println!("Not saving — fix the value and re-run, or edit the file by hand.");
-        return Ok(Some(new_config));
+        return Ok(None);
     }
 
     let config_dir = dirs::home_dir()
@@ -1559,5 +1559,24 @@ mod wizard_validation_tests {
         assert!(!offer_wizard_on_load_failure(true, false, true)); // headless
         assert!(!offer_wizard_on_load_failure(false, true, true)); // --wav
         assert!(!offer_wizard_on_load_failure(false, false, false)); // piped stdin
+    }
+
+    // Regression test for the run_first_time_setup validate-then-Ok(Some(..))
+    // bug: power_watts is a plain struct field (not routed through
+    // try_set_station_field's own validate-and-reject loop like callsign/grid
+    // are), so an out-of-range value typed at that prompt used to slip past
+    // the wizard's final validate() check and become a live, invalid
+    // in-memory config. This confirms the validator this fix relies on
+    // actually rejects such a config, so run_first_time_setup's `Ok(None)`
+    // branch is reachable and correct.
+    #[test]
+    fn out_of_range_power_watts_fails_config_validate() {
+        let mut cfg = Config::default();
+        cfg.station.power_watts = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::default();
+        cfg.station.power_watts = 5000;
+        assert!(cfg.validate().is_err());
     }
 }
