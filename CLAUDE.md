@@ -11,7 +11,7 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 
 ## Workspace Structure
 
-12-crate Cargo workspace:
+14-crate Cargo workspace:
 
 | Crate | Purpose | Status |
 |-------|---------|--------|
@@ -25,8 +25,10 @@ Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a f
 | `pancetta-cqdx` | cqdx.io HTTP client, cache, types | Needs live API validation |
 | `pancetta-tui` | Terminal UI | Default UI (`--headless` to disable) |
 | `pancetta-core` | Shared types, error handling | Stable |
-| `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
+| `pancetta-agent` | Remote-TX security: arm gating, session binding | Live |
+| `pancetta-protocol` | Remote-operation wire protocol | Live |
 | `pancetta-research` | Local-only decoder-iteration harness | Excluded from CI; never builds in GitHub Actions |
+| `pancetta` | Main binary, coordinator, message bus, runtime | Integration point |
 
 ## Building and Testing
 

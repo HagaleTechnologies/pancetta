@@ -36,7 +36,11 @@ over SSH.
 | Rust toolchain | rustup → stable | rustup → stable | rustup → stable |
 | Audio dev headers | `libasound2-dev`, `libudev-dev` | (built in) | (built in) |
 | TLS | `libssl-dev`, `pkg-config` | (built in) | (built in) |
-| Hamlib (CAT control) | `apt install libhamlib-utils` | `brew install hamlib` | hamlib Windows build |
+| Hamlib (CAT control — optional; runtime-only) | `apt install libhamlib-utils` | `brew install hamlib` | hamlib Windows build |
+
+Hamlib is **not** needed to build, or to run decode-only. Pancetta talks to
+`rigctld` over TCP at runtime, and only when `[rig.interface].enabled = true`.
+Install it when you're ready to key a radio.
 
 Pancetta is developed and tested on:
 - **macOS** (development host, Apple Silicon)
@@ -66,12 +70,16 @@ curl https://sh.rustup.rs -sSf | sh
 ### 2. Clone and build
 
 ```bash
-git clone https://github.com/HagaleTechnologies/pancetta.git
+git clone --recursive https://github.com/HagaleTechnologies/pancetta.git
 cd pancetta
 cargo build --release
 ```
 
-The first build will take 5–10 minutes (workspace is 12 crates and
+> Already cloned without `--recursive`? Run `git submodule update --init`
+> before building — otherwise the build silently falls back to the pure-Rust
+> decoder and you lose the C `ft8_lib` decode pass (the build will warn).
+
+The first build will take 5–10 minutes (workspace is 14 crates and
 compiles a vendored copy of `ft8_lib`, which Pancetta uses as a decoder
 via FFI alongside its own native Rust decoder — see
 [Acknowledgments](#acknowledgments)). After that, incremental builds are
@@ -85,11 +93,14 @@ device names, and rig model. You can also write the file by hand —
 see [`docs/CONFIG.md`](docs/CONFIG.md) for every supported key.
 
 ```bash
-# First-run wizard
-pancetta
+# First-run wizard (runs automatically on first launch)
+./target/release/pancetta
 
-# Or write the config directly, then run:
-$EDITOR ~/.pancetta/pancetta.toml
+# Or, equivalently:
+cargo run --release -p pancetta
+
+# Optional: put `pancetta` on your PATH
+cargo install --path pancetta
 ```
 
 The minimum viable config:
@@ -122,14 +133,14 @@ model = "FTdx10"
 ```bash
 # Decode-only mode (safe — no PTT). Achieved by leaving the rig
 # interface disabled in config (the default).
-cargo run --release
+cargo run --release -p pancetta
 
 # Full pipeline (decode + manual / autonomous TX). Requires:
 #   [rig.interface] enabled = true   in ~/.pancetta/pancetta.toml
 #   [autonomous]    enabled = true   for hands-off operation
 # and an actual antenna + license. See docs/RUNBOOK.md for the
 # Phase 5 (autonomous QSO loop) procedure.
-cargo run --release
+cargo run --release -p pancetta
 ```
 
 ---
@@ -240,7 +251,7 @@ allow-lists `/dev/tty*`, `/dev/cu.*`, `COM<N>`, and `host:port` only.
 
 ## Workspace layout
 
-11-crate Cargo workspace. Crates form a clean layering: a leaf crate
+14-crate Cargo workspace. Crates form a clean layering: a leaf crate
 never reaches up into an orchestrator.
 
 | Crate | Purpose |
@@ -255,6 +266,9 @@ never reaches up into an orchestrator.
 | `pancetta-cqdx` | cqdx.io HTTP client and cache |
 | `pancetta-dx` | DX cluster + PSKReporter + scaffolded LoTW |
 | `pancetta-tui` | Terminal UI (ratatui + crossterm) |
+| `pancetta-agent` | Remote-TX security: ArmState, session gating |
+| `pancetta-protocol` | Remote-operation wire protocol (no bus internals) |
+| `pancetta-research` | Local-only decoder-iteration harness (excluded from CI) |
 | `pancetta` | Coordinator binary, message bus, runtime |
 
 Detailed component diagram and channel topology in
@@ -282,9 +296,7 @@ cargo fmt --all -- --check
 cargo test -p pancetta --test loopback_qso
 ```
 
-CI runs all of the above on every PR plus a cross-platform `cargo
-check` on macOS and Windows. `cargo audit` and `cargo deny check` run
-on every push to catch security advisories and license drift.
+CI runs all of the above on every PR, plus a `cargo check` lane on macOS. `cargo deny check` runs on every push to catch security advisories and license drift.
 
 ---
 

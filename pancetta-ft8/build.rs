@@ -32,6 +32,12 @@ fn main() {
     } else {
         // ft8_lib vendor sources not found — using pure-Rust decoder instead.
         // Signal to the Rust code that stubs should be used instead of real FFI.
+        // Loud but non-fatal: CI worktrees and research builds rely on this path.
+        println!(
+            "cargo:warning=ft8_lib C sources not found at pancetta-ft8/vendor/ft8_lib \
+             — building WITHOUT the C decoder (ft8lib_stub, degraded decode recall)."
+        );
+        println!("cargo:warning=Fix: git submodule update --init  (then rebuild)");
         println!("cargo:rustc-cfg=ft8lib_stub");
     }
 

@@ -656,8 +656,41 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
             .with_context(|| format!("Failed to load config from {}", config_path.display()))?;
         (config, Vec::new())
     } else {
-        Config::load_default_with_warnings()
-            .with_context(|| "Failed to load default configuration")?
+        match Config::load_default_with_warnings() {
+            Ok(pair) => pair,
+            Err(e)
+                if offer_wizard_on_load_failure(
+                    cli.headless,
+                    cli.wav.is_some(),
+                    std::io::stdin().is_terminal(),
+                ) =>
+            {
+                eprintln!();
+                eprintln!("ERROR: your saved configuration failed to load:");
+                eprintln!("  {e}");
+                eprintln!("  (file: ~/.pancetta/pancetta.toml)");
+                eprintln!();
+                if prompt_yes_no(
+                    "Re-run first-time setup? (overwrites the broken config on save)",
+                    false,
+                )? {
+                    let defaults = Config::default();
+                    match run_first_time_setup(&defaults)? {
+                        Some(fixed) => (fixed, Vec::new()),
+                        None => {
+                            return Err(anyhow::anyhow!(e))
+                                .context("Failed to load default configuration")
+                        }
+                    }
+                } else {
+                    eprintln!("Edit the file by hand, or delete it to start fresh.");
+                    return Err(anyhow::anyhow!(e)).context("Failed to load default configuration");
+                }
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!(e)).context("Failed to load default configuration")
+            }
+        }
     };
 
     // Surface parse failures to the console at startup — a broken/partial config
@@ -681,6 +714,12 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
     Ok((config, warnings))
 }
 
+/// The de-brick wizard offer fires only for interactive TUI launches —
+/// exactly the same gate as the first-run wizard's `is_interactive` check.
+fn offer_wizard_on_load_failure(headless: bool, wav: bool, interactive: bool) -> bool {
+    !headless && !wav && interactive
+}
+
 /// Interactive first-run setup wizard.
 /// Prompts for callsign, grid square, and saves the config file.
 fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
@@ -702,6 +741,13 @@ fn run_first_time_setup(config: &Config) -> Result<Option<Config>> {
         true,
     )? {
         setup_audio(&mut new_config)?;
+    }
+
+    if let Err(e) = new_config.validate() {
+        println!();
+        println!("WARNING: configuration is still invalid ({e}).");
+        println!("Not saving — fix the value and re-run, or edit the file by hand.");
+        return Ok(None);
     }
 
     let config_dir = dirs::home_dir()
@@ -767,18 +813,86 @@ fn prompt_choice(prompt: &str, max: usize) -> Result<Option<usize>> {
     }
 }
 
+/// Maidenhead normalization: field+square uppercase (chars 0-3), subsquare
+/// lowercase (chars 4-5), extended digits (6-7) untouched. Matches what
+/// `pancetta-config`'s `validate_grid_square` requires.
+fn normalize_grid(raw: &str) -> String {
+    raw.trim()
+        .char_indices()
+        .map(|(i, c)| {
+            if i < 4 {
+                c.to_ascii_uppercase()
+            } else {
+                c.to_ascii_lowercase()
+            }
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy)]
+enum StationField {
+    Callsign,
+    Grid,
+}
+
+/// Apply a station-field edit on a clone and run full config validation.
+/// Returns the updated Config on success, a user-facing message on failure.
+/// Field-level validators in pancetta-config are private by design; whole-
+/// config validate() is the public contract.
+fn try_set_station_field(
+    config: &Config,
+    field: StationField,
+    value: &str,
+) -> std::result::Result<Config, String> {
+    let mut candidate = config.clone();
+    match field {
+        StationField::Callsign => {
+            candidate.station.callsign = value.trim().to_uppercase();
+        }
+        StationField::Grid => {
+            candidate.station.grid_square = normalize_grid(value);
+        }
+    }
+    candidate
+        .validate()
+        .map_err(|e| format!("{e}"))
+        .map(|()| candidate)
+}
+
 fn setup_station(config: &mut Config) -> Result<()> {
     println!("--- Station ---");
     println!();
 
-    let input = prompt_line(&format!("  Callsign [{}]: ", config.station.callsign))?;
-    if !input.is_empty() {
-        config.station.callsign = input.to_uppercase();
+    loop {
+        let input = prompt_line(&format!("  Callsign [{}]: ", config.station.callsign))?;
+        if input.is_empty() {
+            break;
+        }
+        match try_set_station_field(config, StationField::Callsign, &input) {
+            Ok(updated) => {
+                *config = updated;
+                break;
+            }
+            Err(e) => {
+                println!("  Invalid callsign ({e}). Example: K5ARH — try again or Enter to skip.")
+            }
+        }
     }
 
-    let input = prompt_line(&format!("  Grid square [{}]: ", config.station.grid_square))?;
-    if !input.is_empty() {
-        config.station.grid_square = input;
+    loop {
+        let input = prompt_line(&format!("  Grid square [{}]: ", config.station.grid_square))?;
+        if input.is_empty() {
+            break;
+        }
+        match try_set_station_field(config, StationField::Grid, &input) {
+            Ok(updated) => {
+                *config = updated;
+                break;
+            }
+            Err(e) => println!(
+                "  Invalid grid ({e}). Example: FN42 or FN42ab — try again or Enter to skip."
+            ),
+        }
     }
 
     let input = prompt_line(&format!(
@@ -1407,5 +1521,62 @@ mod tests {
             LogFormat::Json
         ));
         assert!("invalid".parse::<LogFormat>().is_err());
+    }
+}
+
+#[cfg(test)]
+mod wizard_validation_tests {
+    use super::*;
+    use pancetta_config::Config;
+
+    #[test]
+    fn normalize_grid_uppercases_field_lowercases_subsquare() {
+        assert_eq!(normalize_grid("fn42"), "FN42");
+        assert_eq!(normalize_grid("fn42AB"), "FN42ab");
+        assert_eq!(normalize_grid("FN42ab"), "FN42ab");
+        assert_eq!(normalize_grid("fn42ab19"), "FN42ab19");
+    }
+
+    #[test]
+    fn try_set_station_field_accepts_valid_and_rejects_invalid() {
+        let cfg = Config::default();
+        // Valid callsign, any case
+        let ok = try_set_station_field(&cfg, StationField::Callsign, "k5arh").unwrap();
+        assert_eq!(ok.station.callsign, "K5ARH");
+        // Letters-only callsign must be rejected (validator requires a digit)
+        assert!(try_set_station_field(&cfg, StationField::Callsign, "KARH").is_err());
+        // Lowercase grid input must be normalized then accepted
+        let ok = try_set_station_field(&cfg, StationField::Grid, "fn42").unwrap();
+        assert_eq!(ok.station.grid_square, "FN42");
+        // Garbage grid must be rejected, not stored
+        assert!(try_set_station_field(&cfg, StationField::Grid, "12ab").is_err());
+        assert!(try_set_station_field(&cfg, StationField::Grid, "FN4").is_err());
+    }
+
+    #[test]
+    fn debrick_gate_only_fires_interactive_tui_runs() {
+        assert!(offer_wizard_on_load_failure(false, false, true));
+        assert!(!offer_wizard_on_load_failure(true, false, true)); // headless
+        assert!(!offer_wizard_on_load_failure(false, true, true)); // --wav
+        assert!(!offer_wizard_on_load_failure(false, false, false)); // piped stdin
+    }
+
+    // Regression test for the run_first_time_setup validate-then-Ok(Some(..))
+    // bug: power_watts is a plain struct field (not routed through
+    // try_set_station_field's own validate-and-reject loop like callsign/grid
+    // are), so an out-of-range value typed at that prompt used to slip past
+    // the wizard's final validate() check and become a live, invalid
+    // in-memory config. This confirms the validator this fix relies on
+    // actually rejects such a config, so run_first_time_setup's `Ok(None)`
+    // branch is reachable and correct.
+    #[test]
+    fn out_of_range_power_watts_fails_config_validate() {
+        let mut cfg = Config::default();
+        cfg.station.power_watts = 0;
+        assert!(cfg.validate().is_err());
+
+        let mut cfg = Config::default();
+        cfg.station.power_watts = 5000;
+        assert!(cfg.validate().is_err());
     }
 }

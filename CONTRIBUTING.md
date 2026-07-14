@@ -59,7 +59,7 @@ git clone https://github.com/YOUR_USERNAME/pancetta.git
 cd pancetta
 
 # Add upstream remote
-git remote add upstream https://github.com/pancetta-project/pancetta.git
+git remote add upstream https://github.com/HagaleTechnologies/pancetta.git
 
 # Verify remotes
 git remote -v
@@ -112,7 +112,7 @@ let g:rustfmt_autosave = 1
 
 Before starting work:
 
-- Check [existing issues](https://github.com/pancetta-project/pancetta/issues)
+- Check [existing issues](https://github.com/HagaleTechnologies/pancetta/issues)
 - If none exist, create a new issue describing:
   - The problem or feature
   - Your proposed solution
@@ -486,7 +486,7 @@ Brief description of changes
 
 2. **Run full test suite**:
    ```bash
-   ./scripts/pre-submit.sh
+   scripts/check.sh
    ```
 
 3. **Squash commits if needed**:
@@ -508,8 +508,7 @@ Brief description of changes
 1. **Automated Checks**: CI will run tests, formatting, and linting
 2. **Code Review**: Maintainers will review within 48 hours
 3. **Feedback**: Address any requested changes
-4. **Approval**: Two approvals required for merge
-5. **Merge**: Maintainer will merge when ready
+4. **Merge**: PRs are reviewed and merged by the maintainer. CI (fmt, clippy, full test suite, cargo-deny) must be green.
 
 ### Review Criteria
 
@@ -535,27 +534,22 @@ git push origin --delete feature/your-feature
 
 ### Resources
 
-- **Discord**: [Join our server](https://discord.gg/pancetta)
 - **Documentation**: [docs/](./docs/)
-- **Issues**: [GitHub Issues](https://github.com/pancetta-project/pancetta/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/pancetta-project/pancetta/discussions)
+- **Issues**: [GitHub Issues](https://github.com/HagaleTechnologies/pancetta/issues) (bugs and features)
 
 ### Maintainers
 
-- Project Lead: [@username](https://github.com/username)
-- DSP Expert: [@username](https://github.com/username)
-- FT8 Specialist: [@username](https://github.com/username)
+Maintained by Hagale Technologies (K5ARH).
 
 ## Recognition
 
 Contributors are recognized in:
-- [CONTRIBUTORS.md](../CONTRIBUTORS.md)
 - Release notes
 - Project documentation
 
 ## License
 
-By contributing, you agree that your contributions will be licensed under the same license as the project (MIT).
+By contributing, you agree that your contributions will be dual-licensed under MIT OR Apache-2.0, the same terms as the project (see README §License).
 
 ---
 
