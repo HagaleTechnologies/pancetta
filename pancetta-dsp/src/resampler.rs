@@ -69,8 +69,8 @@ impl AudioResampler {
 
         // Configure SINC interpolation parameters for high quality
         let params = SincInterpolationParameters {
-            sinc_len: 256,  // High quality, more taps
-            f_cutoff: 0.95, // Preserve most of the frequency content
+            sinc_len: 256,        // High quality, more taps
+            f_cutoff: Some(0.95), // Preserve most of the frequency content
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 256, // High oversampling for quality
             window: WindowFunction::BlackmanHarris2, // Excellent stopband attenuation
@@ -153,12 +153,11 @@ impl AudioResampler {
                 .map_err(|e| ResamplerError::ProcessingFailed {
                     message: format!("Input buffer error: {}", e),
                 })?;
-            let output_chunk = self
-                .resampler
-                .process(&input_adapter, 0, None)
-                .map_err(|e| ResamplerError::ProcessingFailed {
+            let output_chunk = self.resampler.process(&input_adapter, None).map_err(|e| {
+                ResamplerError::ProcessingFailed {
                     message: format!("Resampling failed: {}", e),
-                })?;
+                }
+            })?;
 
             // Add output samples to buffer
             self.output_buffer.extend(output_chunk.take_data());
@@ -230,12 +229,11 @@ impl AudioResampler {
                 .map_err(|e| ResamplerError::ProcessingFailed {
                     message: format!("Input buffer error: {}", e),
                 })?;
-            let output_chunk = self
-                .resampler
-                .process(&input_adapter, 0, None)
-                .map_err(|e| ResamplerError::ProcessingFailed {
+            let output_chunk = self.resampler.process(&input_adapter, None).map_err(|e| {
+                ResamplerError::ProcessingFailed {
                     message: format!("Final resampling failed: {}", e),
-                })?;
+                }
+            })?;
 
             self.output_buffer.extend(output_chunk.take_data());
         }
@@ -348,5 +346,39 @@ mod tests {
     fn test_decimator_creation() {
         let resampler = AudioResampler::new_decimator(48000.0, 4).unwrap();
         assert_eq!(resampler.output_rate(), 12000.0);
+    }
+
+    fn golden_test_signal(sample_rate: f32, num_samples: usize) -> Vec<f32> {
+        (0..num_samples)
+            .map(|n| {
+                let t = n as f32 / sample_rate;
+                0.5 * (2.0 * std::f32::consts::PI * 1500.0 * t).sin()
+                    + 0.3 * (2.0 * std::f32::consts::PI * 800.0 * t).sin()
+                    + 0.2 * (2.0 * std::f32::consts::PI * 2200.0 * t).sin()
+            })
+            .collect()
+    }
+
+    fn golden_checksum(samples: &[f32]) -> u64 {
+        samples.iter().fold(0u64, |acc, &s| {
+            acc.wrapping_mul(31).wrapping_add(s.to_bits() as u64)
+        })
+    }
+
+    #[test]
+    fn test_resampler_golden_vector_48k_to_12k() {
+        let input = golden_test_signal(48000.0, 12_345);
+        let mut resampler = AudioResampler::new_ft8_optimized().unwrap();
+
+        let mut output = Vec::new();
+        resampler.process(&input, &mut output).unwrap();
+        output.extend(resampler.flush().unwrap());
+
+        assert_eq!(output.len(), 4095, "resampler output length changed");
+        assert_eq!(
+            golden_checksum(&output),
+            17831856880251919678,
+            "resampler output diverged from golden vector"
+        );
     }
 }

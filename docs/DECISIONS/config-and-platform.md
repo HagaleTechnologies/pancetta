@@ -300,3 +300,21 @@ capacity afterward.
   repo's own cross-repo-contracts convention), not a unilateral pancetta
   edit. If a future `grep K5ARH pancetta-agent/` shows exactly this one hit,
   that's expected — not a regression.
+
+## Rubato 3.0 -> 4.0 migration (2026-07-14)
+
+`pancetta-dsp/src/resampler.rs`: migrated off rubato 3.0.0 (dependabot PR #126, deferred because
+the raw version bump alone didn't compile). The `Resampler` trait itself is unchanged in 4.0 —
+`Adjustable`/`Resizable` are new additive sub-traits pancetta never touches, not a split of the
+trait pancetta uses. Two real breaking changes, both confined to this one file:
+`Resampler::process()` collapsed `(input_offset: usize, active_channels_mask: Option<&[bool]>)`
+into a single `Option<&Indexing>`; `SincInterpolationParameters.f_cutoff` changed from `f32` to
+`Option<f32>` (`None` now means "auto-select cutoff", a new 4.0 feature — `Some(0.95)` preserves
+the original explicit value). Verified behavior-preserving via a new bit-exact characterization
+test (`test_resampler_golden_vector_48k_to_12k`) whose baseline was captured against the live
+rubato 3.0.0 code before migrating, then re-asserted unchanged against 4.0.0 — confirmed the
+migration is a pure call-site fix with zero numerical impact. Note for future migrations of this
+crate: neither `pancetta-research`'s eval harness nor `pancetta`'s `loopback_qso` test exercises
+`pancetta-dsp`'s resampler at all (`pancetta-research` doesn't depend on `pancetta-dsp`;
+`loopback_qso` runs entirely at a fixed 12000 Hz), so a dedicated resampler-level regression test
+is the only thing that actually catches a resampling regression in this codebase today.
