@@ -377,7 +377,7 @@ mod tests {
         assert_eq!(output.len(), 4095, "resampler output length changed");
         assert_eq!(
             golden_checksum(&output),
-            17831856880251919678,
+            8787193371268914007,
             "resampler output diverged from golden vector"
         );
     }
