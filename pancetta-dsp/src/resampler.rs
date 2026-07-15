@@ -69,7 +69,7 @@ impl AudioResampler {
 
         // Configure SINC interpolation parameters for high quality
         let params = SincInterpolationParameters {
-            sinc_len: 256,  // High quality, more taps
+            sinc_len: 256,        // High quality, more taps
             f_cutoff: Some(0.95), // Preserve most of the frequency content
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 256, // High oversampling for quality
@@ -153,12 +153,11 @@ impl AudioResampler {
                 .map_err(|e| ResamplerError::ProcessingFailed {
                     message: format!("Input buffer error: {}", e),
                 })?;
-            let output_chunk = self
-                .resampler
-                .process(&input_adapter, None)
-                .map_err(|e| ResamplerError::ProcessingFailed {
+            let output_chunk = self.resampler.process(&input_adapter, None).map_err(|e| {
+                ResamplerError::ProcessingFailed {
                     message: format!("Resampling failed: {}", e),
-                })?;
+                }
+            })?;
 
             // Add output samples to buffer
             self.output_buffer.extend(output_chunk.take_data());
@@ -230,12 +229,11 @@ impl AudioResampler {
                 .map_err(|e| ResamplerError::ProcessingFailed {
                     message: format!("Input buffer error: {}", e),
                 })?;
-            let output_chunk = self
-                .resampler
-                .process(&input_adapter, None)
-                .map_err(|e| ResamplerError::ProcessingFailed {
+            let output_chunk = self.resampler.process(&input_adapter, None).map_err(|e| {
+                ResamplerError::ProcessingFailed {
                     message: format!("Final resampling failed: {}", e),
-                })?;
+                }
+            })?;
 
             self.output_buffer.extend(output_chunk.take_data());
         }
@@ -362,9 +360,9 @@ mod tests {
     }
 
     fn golden_checksum(samples: &[f32]) -> u64 {
-        samples
-            .iter()
-            .fold(0u64, |acc, &s| acc.wrapping_mul(31).wrapping_add(s.to_bits() as u64))
+        samples.iter().fold(0u64, |acc, &s| {
+            acc.wrapping_mul(31).wrapping_add(s.to_bits() as u64)
+        })
     }
 
     #[test]
