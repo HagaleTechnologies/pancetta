@@ -70,7 +70,7 @@ impl AudioResampler {
         // Configure SINC interpolation parameters for high quality
         let params = SincInterpolationParameters {
             sinc_len: 256,  // High quality, more taps
-            f_cutoff: 0.95, // Preserve most of the frequency content
+            f_cutoff: Some(0.95), // Preserve most of the frequency content
             interpolation: SincInterpolationType::Linear,
             oversampling_factor: 256, // High oversampling for quality
             window: WindowFunction::BlackmanHarris2, // Excellent stopband attenuation
@@ -155,7 +155,7 @@ impl AudioResampler {
                 })?;
             let output_chunk = self
                 .resampler
-                .process(&input_adapter, 0, None)
+                .process(&input_adapter, None)
                 .map_err(|e| ResamplerError::ProcessingFailed {
                     message: format!("Resampling failed: {}", e),
                 })?;
@@ -232,7 +232,7 @@ impl AudioResampler {
                 })?;
             let output_chunk = self
                 .resampler
-                .process(&input_adapter, 0, None)
+                .process(&input_adapter, None)
                 .map_err(|e| ResamplerError::ProcessingFailed {
                     message: format!("Final resampling failed: {}", e),
                 })?;
