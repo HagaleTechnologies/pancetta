@@ -739,6 +739,13 @@ pub struct ApplicationCoordinator {
     /// `→Tui`/`→Qso` sends are never touched). See `remote_gateway::relay_to_gateway`.
     gateway_enabled: Arc<AtomicBool>,
 
+    /// `true` when the `wsjtx_udp` companion-protocol component is enabled
+    /// (`[network.wsjtx_udp].enabled`). Cached from config at construction,
+    /// mirroring `gateway_enabled`, so future additive emit sites (the
+    /// decoder fan-out, QSO-logged taps) can cheaply gate their extra send
+    /// to `ComponentId::WsjtxUdp` without an async config read.
+    wsjtx_enabled: Arc<AtomicBool>,
+
     /// `true` when the coordinator is running in Fox (DXpedition operator) mode.
     /// Default `false` (standard Hound / normal operation).
     fox_mode: Arc<AtomicBool>,
@@ -1029,6 +1036,9 @@ impl ApplicationCoordinator {
         // the Arc<RwLock> — the additive dual-destination emit sites read this
         // atomic to gate their (cheap, additive) sends to the gateway.
         let gateway_enabled_init = config.network.remote_gateway.enabled;
+        // Snapshot the wsjtx_udp enabled flag before `config` is moved into
+        // the Arc<RwLock> — mirrors `gateway_enabled_init` above.
+        let wsjtx_enabled_init = config.network.wsjtx_udp.enabled;
         // Snapshot the station-agent LOCAL remote-TX consent before config is
         // moved into the Arc<RwLock>. Seeds the remote-TX arm's local-consent
         // gate; default OFF, so remote TX can never be permitted this phase.
@@ -1222,6 +1232,7 @@ impl ApplicationCoordinator {
             current_decode_effort,
             resolved_hardware_tier,
             gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
+            wsjtx_enabled: Arc::new(AtomicBool::new(wsjtx_enabled_init)),
             fox_mode: Arc::new(AtomicBool::new(false)),
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1488,6 +1499,7 @@ impl ApplicationCoordinator {
         self.start_pskreporter_component().await?;
         self.start_remote_gateway_component().await?;
         self.start_station_agent_component().await?;
+        self.start_wsjtx_udp_component().await?;
 
         // Start coordinator tasks
         self.start_coordinator_tasks().await?;

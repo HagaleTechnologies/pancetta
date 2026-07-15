@@ -59,6 +59,8 @@ pub enum ComponentId {
     RemoteGateway,
     /// Station agent: authenticated remote-control transport (relay + Noise).
     StationAgent,
+    /// WSJT-X UDP companion-protocol component (GridTracker/JTAlert interop).
+    WsjtxUdp,
 }
 
 impl std::fmt::Display for ComponentId {
@@ -78,6 +80,7 @@ impl std::fmt::Display for ComponentId {
             ComponentId::PskReporter => write!(f, "PSKReporter"),
             ComponentId::RemoteGateway => write!(f, "remote_gateway"),
             ComponentId::StationAgent => write!(f, "station_agent"),
+            ComponentId::WsjtxUdp => write!(f, "WsjtxUdp"),
         }
     }
 }
