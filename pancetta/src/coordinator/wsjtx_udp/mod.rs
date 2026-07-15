@@ -21,7 +21,7 @@ use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
-use chrono::{DateTime, Timelike, Utc};
+use chrono::{DateTime, Datelike, Timelike, Utc};
 use tokio::time::{interval, sleep};
 use tracing::{debug, info, warn};
 
@@ -87,6 +87,9 @@ impl super::ApplicationCoordinator {
             de_call: config.station.callsign.clone(),
             de_grid: config.station.grid_square.clone(),
         };
+        // Stamped into QSOLogged's TxPower field the same way qso.rs stamps
+        // it into every rendered ADIF record's TX_PWR.
+        let station_power_watts = config.station.power_watts;
         drop(config);
 
         let socket = match open_socket(&cfg) {
@@ -129,6 +132,14 @@ impl super::ApplicationCoordinator {
         let instance_id = cfg.instance_id.clone();
         let shutdown = self.shutdown_signal.clone();
 
+        // Task 5 (QSOLogged/LoggedADIF): the one-shot handoff `qso.rs`
+        // completes right after `QsoManager::start()` succeeds (see
+        // `wsjtx_qso_events_rx` doc comment on `ApplicationCoordinator`).
+        // Taken here (not earlier) so the disabled/socket-open-failure early
+        // returns above leave it untouched — a legitimate future retry of
+        // this method still finds it.
+        let qso_events_handoff = self.wsjtx_qso_events_rx.take();
+
         let wsjtx_handle = tokio::spawn(async move {
             // GridTracker instance-validity rule (protocol notes §5): the
             // FIRST Status this session emits must precede any Decode —
@@ -141,6 +152,40 @@ impl super::ApplicationCoordinator {
             if let Err(e) = socket.send_to(&last_status, dest).await {
                 warn!("WSJT-X UDP: initial Status send failed: {e}");
             }
+
+            // Task 5: resolve the QSO-event handoff, bounded so a QSO
+            // component that never completes startup can't hang this task
+            // forever. `None` (timeout, sender dropped, or wsjtx_qso_events_rx
+            // already taken by an earlier call) just means QSOLogged/
+            // LoggedADIF stay disabled for this run — every other message
+            // type is unaffected.
+            let mut qso_events: Option<tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>> =
+                match qso_events_handoff {
+                    Some(rx) => match tokio::time::timeout(Duration::from_secs(10), rx).await {
+                        Ok(Ok(rx)) => Some(rx),
+                        Ok(Err(_)) => {
+                            warn!(
+                                "WSJT-X UDP: QSO-event handoff sender dropped — \
+                                 QSOLogged/LoggedADIF disabled for this run"
+                            );
+                            None
+                        }
+                        Err(_) => {
+                            warn!(
+                                "WSJT-X UDP: QSO-event handoff timed out — \
+                                 QSOLogged/LoggedADIF disabled for this run"
+                            );
+                            None
+                        }
+                    },
+                    None => None,
+                };
+            // Renders each completed QSO's ADIF record the identical way the
+            // source-of-truth writer and the per-QSO upload subscriber do
+            // (`qso.rs`'s `start_adif_subscriber` / `start_qso_upload_subscriber`)
+            // — no second ADIF-formatting implementation.
+            let adif_processor =
+                pancetta_qso::AdifProcessor::new().with_station_power_watts(station_power_watts);
 
             let mut heartbeat_timer = interval(HEARTBEAT_INTERVAL);
             let mut status_timer = interval(STATUS_SAMPLE_INTERVAL);
@@ -277,6 +322,59 @@ impl super::ApplicationCoordinator {
                                         n, from
                                     );
                                 }
+                            }
+                        }
+                    }
+                    // (e) Task 5: QSOLogged(5) + LoggedADIF(12) on QSO
+                    // completion. `qso_events` is `None` whenever the
+                    // handoff never resolved (disabled at this coordinator
+                    // level, timed out, or the sender was dropped); the
+                    // `pending()` branch below then simply never fires,
+                    // leaving this arm permanently idle without busy-looping
+                    // the select.
+                    qso_ev = async {
+                        match qso_events.as_mut() {
+                            Some(rx) => rx.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match qso_ev {
+                            Ok(pancetta_qso::QsoEvent::QsoCompleted { metadata, .. }) => {
+                                let adif_qso = adif_processor
+                                    .qso_to_adif(&metadata, metadata.contest_info.as_ref());
+                                match adif_processor.generate_record(&adif_qso) {
+                                    Ok(record) => {
+                                        let (qso_logged, logged_adif) =
+                                            qso_to_msgs(&metadata, station_power_watts, record);
+                                        if let Err(e) = socket
+                                            .send_to(&qso_logged.encode(&instance_id), dest)
+                                            .await
+                                        {
+                                            warn!("WSJT-X UDP: QSOLogged send failed: {e}");
+                                        }
+                                        if let Err(e) = socket
+                                            .send_to(&logged_adif.encode(&instance_id), dest)
+                                            .await
+                                        {
+                                            warn!("WSJT-X UDP: LoggedADIF send failed: {e}");
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!(
+                                            "WSJT-X UDP: skipping QSOLogged/LoggedADIF for QSO {}: \
+                                             ADIF render failed: {e}",
+                                            metadata.qso_id,
+                                        );
+                                    }
+                                }
+                            }
+                            Ok(_) => {}
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                                warn!("WSJT-X UDP: QSO-event stream lagged by {n} events");
+                            }
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                debug!("WSJT-X UDP: QSO-event stream closed");
+                                qso_events = None;
                             }
                         }
                     }
@@ -577,6 +675,96 @@ fn as_replay(out: &OutMsg) -> Option<OutMsg> {
         }),
         _ => None,
     }
+}
+
+/// Julian Day Number for a UTC instant's calendar date (protocol notes §3
+/// `QDateTime`: `qint64` JDN + ms-since-midnight + timespec). Pure
+/// calendar-date math, independent of time-of-day — `2020-10-30` at any
+/// time of day maps to the same JDN `2459153` (protocol notes §3 golden
+/// example).
+///
+/// Implementation: `chrono::NaiveDate::num_days_from_ce()` counts days since
+/// `0001-01-01` (day 1, proleptic Gregorian) — the same epoch/convention as
+/// the civil "days since the epoch" ordinal used by every standard
+/// Gregorian→JDN conversion. `1721425` is the fixed JDN-vs-days-from-CE
+/// offset (equivalently: JDN of the Unix epoch `1970-01-01` is the
+/// well-known `2440588`, and `NaiveDate(1970-01-01).num_days_from_ce()` is
+/// `719163`; `2440588 - 719163 = 1721425`).
+fn unix_to_jdn(t: DateTime<Utc>) -> u64 {
+    const JDN_MINUS_DAYS_FROM_CE: i64 = 1_721_425;
+    (i64::from(t.date_naive().num_days_from_ce()) + JDN_MINUS_DAYS_FROM_CE) as u64
+}
+
+/// Map a UTC instant onto the wire `QDateTime` pair (JDN, ms-since-midnight
+/// UTC). Reuses [`unix_to_jdn`] for the date half and
+/// [`time_ms_since_midnight_utc`] (via the standard `DateTime<Utc> ->
+/// SystemTime` conversion) for the time-of-day half, so there is exactly one
+/// implementation of each half shared with the `Decode` mapping.
+fn qdatetime_of(t: DateTime<Utc>) -> codec::QDateTimeUtc {
+    (unix_to_jdn(t), time_ms_since_midnight_utc(t.into()))
+}
+
+/// dB signal report as WSJT-X's `ReportSent`/`ReportReceived` fields expect
+/// it: signed, zero-padded to 2 digits (matches
+/// `AdifProcessor::signal_report_to_rst`'s `{:+03}` — protocol notes §4
+/// Status gives the worked example `"-15"`). `None` (report not yet
+/// exchanged) maps to the empty string, the same "no live source yet"
+/// convention `build_status` uses for other not-yet-known fields.
+fn format_signal_report(r: Option<pancetta_qso::SignalReport>) -> String {
+    r.map(|v| format!("{v:+03}")).unwrap_or_default()
+}
+
+/// Map a completed QSO's metadata onto the `(QSOLogged, LoggedADIF)` pair
+/// (protocol notes §4 OUT — types 5 and 12), pairing an already-rendered
+/// ADIF record with pancetta's own header. Pure — no I/O, no socket — so
+/// field mapping is exhaustively unit-tested without a running component;
+/// `adif_record` is produced by the caller via the exact same
+/// `AdifProcessor::qso_to_adif` → `generate_record` path the source-of-truth
+/// writer and the per-QSO upload subscriber use (`qso.rs`), so there is no
+/// second ADIF-formatting implementation.
+///
+/// Fields this task has no live source for (Comments, Name, ExchangeSent/
+/// Received, ADIFPropagationMode) are emitted empty — protocol notes §4
+/// marks Comments/ADIFPropagationMode as informational-only for consumers
+/// and ExchangeSent/Received as contest-specific; `build_status` established
+/// the same "no live source yet ⇒ empty string" convention for Status.
+pub(crate) fn qso_to_msgs(
+    m: &pancetta_qso::QsoMetadata,
+    station_power_watts: u32,
+    adif_record: String,
+) -> (OutMsg, OutMsg) {
+    let date_time_off = qdatetime_of(m.end_time.unwrap_or(m.start_time));
+    let date_time_on = qdatetime_of(m.start_time);
+
+    let qso_logged = OutMsg::QsoLogged {
+        date_time_off,
+        dx_call: m.their_callsign.clone().unwrap_or_default(),
+        dx_grid: m.grids.theirs.clone().unwrap_or_default(),
+        // brief: TxFrequency = `frequency as u64`. `metadata.frequency` is
+        // already the actual RF TX frequency (dial + audio offset) — see
+        // `QsoManager::set_dial_frequency_source` in qso.rs — so no further
+        // dial+offset arithmetic belongs here.
+        tx_frequency: m.frequency as u64,
+        mode: m.mode.clone(),
+        report_sent: format_signal_report(m.reports.sent),
+        report_received: format_signal_report(m.reports.received),
+        tx_power: station_power_watts.to_string(),
+        comments: String::new(),
+        name: String::new(),
+        date_time_on,
+        operator_call: m.our_callsign.clone(),
+        my_call: m.our_callsign.clone(),
+        my_grid: m.grids.ours.clone().unwrap_or_default(),
+        exchange_sent: String::new(),
+        exchange_received: String::new(),
+        adif_propagation_mode: String::new(),
+    };
+
+    let logged_adif = OutMsg::LoggedAdif {
+        adif: format!("<adif_ver:5>3.1.0\n<programid:8>pancetta\n<EOH>\n{adif_record}"),
+    };
+
+    (qso_logged, logged_adif)
 }
 
 /// Multicast socket options to apply when the destination is a multicast
@@ -1066,5 +1254,204 @@ mod decode_tests {
     #[test]
     fn as_replay_is_none_for_non_decode_messages() {
         assert!(as_replay(&OutMsg::Clear).is_none());
+    }
+}
+
+#[cfg(test)]
+mod qso_logged_tests {
+    use super::*;
+    use chrono::TimeZone;
+    use pancetta_qso::{GridSquares, QsoMetadata, SignalReports};
+
+    /// Fixture matching the pattern used elsewhere in the coordinator
+    /// (`qso.rs`'s `metadata_with_call`): every `QsoMetadata` field named
+    /// explicitly so new fields fail to compile here instead of silently
+    /// defaulting.
+    fn metadata() -> QsoMetadata {
+        let start = Utc.with_ymd_and_hms(2020, 10, 30, 12, 34, 40).unwrap();
+        let end = Utc
+            .with_ymd_and_hms(2020, 10, 30, 12, 34, 56)
+            .unwrap()
+            .checked_add_signed(chrono::Duration::milliseconds(789))
+            .unwrap();
+        QsoMetadata {
+            qso_id: pancetta_qso::QsoId::new_v4(),
+            our_callsign: "K5ARH".to_string(),
+            their_callsign: Some("K1ABC".to_string()),
+            frequency: 14_074_200.4,
+            mode: "FT8".to_string(),
+            start_time: start,
+            end_time: Some(end),
+            reports: SignalReports {
+                sent: Some(-10),
+                received: Some(-8),
+            },
+            grids: GridSquares {
+                ours: Some("EM12".to_string()),
+                theirs: Some("FN42".to_string()),
+            },
+            contest_info: None,
+            tags: std::collections::HashMap::new(),
+            notes: None,
+            tx_parity: None,
+            initiated_by: Default::default(),
+            role: Default::default(),
+            call_count: 0,
+            first_call_at: None,
+            last_call_at: None,
+            progressed_this_cycle: false,
+            last_rx_text: None,
+            dx_repeat_count: 0,
+            hound: false,
+            partner_freq: None,
+            hound_qsyed: false,
+            remote_origin: false,
+        }
+    }
+
+    #[test]
+    fn unix_to_jdn_matches_the_protocol_notes_golden_date() {
+        // Protocol notes §3: "Example: JDN 2459153 = 2020-10-30".
+        let d = Utc.with_ymd_and_hms(2020, 10, 30, 0, 0, 0).unwrap();
+        assert_eq!(unix_to_jdn(d), 2_459_153);
+    }
+
+    #[test]
+    fn unix_to_jdn_is_stable_across_times_of_day() {
+        // The JDN is a pure calendar-date value; time-of-day must not shift it.
+        let midnight = Utc.with_ymd_and_hms(2020, 10, 30, 0, 0, 0).unwrap();
+        let noon = Utc.with_ymd_and_hms(2020, 10, 30, 12, 0, 0).unwrap();
+        let just_before_midnight = Utc.with_ymd_and_hms(2020, 10, 30, 23, 59, 59).unwrap();
+        assert_eq!(unix_to_jdn(midnight), 2_459_153);
+        assert_eq!(unix_to_jdn(noon), 2_459_153);
+        assert_eq!(unix_to_jdn(just_before_midnight), 2_459_153);
+    }
+
+    #[test]
+    fn qso_to_msgs_maps_date_time_on_and_off() {
+        let m = metadata();
+        let (logged, _adif) = qso_to_msgs(&m, 100, String::new());
+        let OutMsg::QsoLogged {
+            date_time_on,
+            date_time_off,
+            ..
+        } = logged
+        else {
+            panic!("expected OutMsg::QsoLogged");
+        };
+        // start_time = 2020-10-30 12:34:40 UTC.
+        assert_eq!(date_time_on, (2_459_153, 45_280_000));
+        // end_time = 2020-10-30 12:34:56.789 UTC.
+        assert_eq!(date_time_off, (2_459_153, 45_296_789));
+    }
+
+    #[test]
+    fn qso_to_msgs_falls_back_to_start_time_when_end_time_is_none() {
+        let mut m = metadata();
+        m.end_time = None;
+        let (logged, _adif) = qso_to_msgs(&m, 100, String::new());
+        let OutMsg::QsoLogged {
+            date_time_on,
+            date_time_off,
+            ..
+        } = logged
+        else {
+            panic!("expected OutMsg::QsoLogged");
+        };
+        assert_eq!(date_time_off, date_time_on);
+    }
+
+    #[test]
+    fn qso_to_msgs_maps_frequency_calls_grids_mode() {
+        let m = metadata();
+        let (logged, _adif) = qso_to_msgs(&m, 100, String::new());
+        let OutMsg::QsoLogged {
+            dx_call,
+            dx_grid,
+            tx_frequency,
+            mode,
+            operator_call,
+            my_call,
+            my_grid,
+            ..
+        } = logged
+        else {
+            panic!("expected OutMsg::QsoLogged");
+        };
+        assert_eq!(dx_call, "K1ABC");
+        assert_eq!(dx_grid, "FN42");
+        // brief: TxFrequency = `frequency as u64` (metadata.frequency is
+        // already the actual RF freq — dial + audio offset — per the
+        // qso.rs `set_dial_frequency_source` wiring, no further math here).
+        assert_eq!(tx_frequency, 14_074_200);
+        assert_eq!(mode, "FT8");
+        assert_eq!(operator_call, "K5ARH");
+        assert_eq!(my_call, "K5ARH");
+        assert_eq!(my_grid, "EM12");
+    }
+
+    #[test]
+    fn qso_to_msgs_maps_reports_and_tx_power() {
+        let m = metadata();
+        let (logged, _adif) = qso_to_msgs(&m, 100, String::new());
+        let OutMsg::QsoLogged {
+            report_sent,
+            report_received,
+            tx_power,
+            ..
+        } = logged
+        else {
+            panic!("expected OutMsg::QsoLogged");
+        };
+        assert_eq!(report_sent, "-10");
+        assert_eq!(report_received, "-08");
+        assert_eq!(tx_power, "100");
+    }
+
+    #[test]
+    fn qso_to_msgs_maps_missing_reports_and_grids_to_empty_strings() {
+        let mut m = metadata();
+        m.reports = SignalReports {
+            sent: None,
+            received: None,
+        };
+        m.grids = GridSquares {
+            ours: None,
+            theirs: None,
+        };
+        m.their_callsign = None;
+        let (logged, _adif) = qso_to_msgs(&m, 0, String::new());
+        let OutMsg::QsoLogged {
+            dx_call,
+            dx_grid,
+            my_grid,
+            report_sent,
+            report_received,
+            tx_power,
+            ..
+        } = logged
+        else {
+            panic!("expected OutMsg::QsoLogged");
+        };
+        assert_eq!(dx_call, "");
+        assert_eq!(dx_grid, "");
+        assert_eq!(my_grid, "");
+        assert_eq!(report_sent, "");
+        assert_eq!(report_received, "");
+        assert_eq!(tx_power, "0");
+    }
+
+    #[test]
+    fn qso_to_msgs_builds_the_logged_adif_fragment_around_the_given_record() {
+        let m = metadata();
+        let record = "<call:5>K1ABC<band:3>20M<mode:3>FT8<EOR>\n".to_string();
+        let (_logged, adif) = qso_to_msgs(&m, 100, record.clone());
+        let OutMsg::LoggedAdif { adif } = adif else {
+            panic!("expected OutMsg::LoggedAdif");
+        };
+        assert_eq!(
+            adif,
+            format!("<adif_ver:5>3.1.0\n<programid:8>pancetta\n<EOH>\n{record}")
+        );
     }
 }

@@ -1090,6 +1090,19 @@ impl super::ApplicationCoordinator {
         // Maximum concurrent caller-answer QSOs while Fox mode is engaged.
         // When fox_mode is false the normal auto_answer_max_concurrent cap applies.
         let fox_max_streams = self.fox_max_streams();
+
+        // Task 5 (QSOLogged/LoggedADIF): one-shot handoff of a `QsoEvent`
+        // receiver to the WSJT-X UDP component, started later in the boot
+        // sequence (`start_wsjtx_udp_component`). `qso_manager` below is
+        // created inside the spawned task and never escapes it, so this is
+        // the minimal bridge — sent once, right after `QsoManager::start()`
+        // succeeds — that avoids restructuring this component's startup
+        // timing or inventing a new coordinator bus message type.
+        let (wsjtx_qso_events_tx, wsjtx_qso_events_rx) = tokio::sync::oneshot::channel::<
+            tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
+        >();
+        self.wsjtx_qso_events_rx = Some(wsjtx_qso_events_rx);
+
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
@@ -1136,6 +1149,12 @@ impl super::ApplicationCoordinator {
                     error!("Failed to start QSO manager: {}", e);
                     return Err(anyhow::anyhow!("QSO manager startup failed"));
                 }
+
+                // Task 5: complete the one-shot handoff now that the manager
+                // is live. Best-effort — if the WSJT-X UDP component never
+                // reaches its receive point (disabled, or dropped the
+                // receiver), the send is simply ignored.
+                let _ = wsjtx_qso_events_tx.send(qso_manager.subscribe());
 
                 // Initialize QSO logger with SQLite database at ~/.pancetta/qso.db
                 let db_path = dirs::home_dir()

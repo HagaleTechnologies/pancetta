@@ -874,6 +874,20 @@ pub struct ApplicationCoordinator {
     /// (default OFF), so with nothing arming it and no remote requests being
     /// constructed (P0–P2), this gate is inert. Local TX never consults it.
     pub(crate) remote_tx_arm: Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+
+    /// One-shot handoff of a `QsoEvent` broadcast receiver to the WSJT-X UDP
+    /// component (`start_wsjtx_udp_component`, started later in the boot
+    /// sequence than `start_qso_component`). `QsoManager` is constructed
+    /// entirely inside `start_qso_component`'s spawned task and never
+    /// escapes it, so this one-shot is the minimal bridge that lets the
+    /// WSJT-X component `subscribe()` to completed-QSO events without
+    /// restructuring QSO-component startup timing or inventing a new
+    /// coordinator bus message type (qso.rs sends once, right after
+    /// `QsoManager::start()` succeeds; `start_wsjtx_udp_component` takes and
+    /// awaits it, bounded by a timeout). `None` once taken.
+    pub(crate) wsjtx_qso_events_rx: Option<
+        tokio::sync::oneshot::Receiver<tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>>,
+    >,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -1265,6 +1279,7 @@ impl ApplicationCoordinator {
                 let _ = st.set_local_consent(remote_tx_consent_init, now_ms);
                 Arc::new(std::sync::Mutex::new(st))
             },
+            wsjtx_qso_events_rx: None,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);
