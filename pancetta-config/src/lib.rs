@@ -860,11 +860,7 @@ mod merge_guard {
 
     #[test]
     fn merge_with_carries_every_field() {
-        assert_carries_all::<network::NetworkConfig>(
-            "NetworkConfig",
-            &[("wsjtx_udp.allowed_request_hosts", json!(["example.com"]))],
-            |a, b| a.merge_with(b),
-        );
+        assert_carries_all::<network::NetworkConfig>("NetworkConfig", &[], |a, b| a.merge_with(b));
 
         assert_carries_all::<station::StationConfig>(
             "StationConfig",
@@ -926,6 +922,12 @@ mod merge_guard {
         assert_carries_all::<duplicate_check::DuplicateCheckingConfig>(
             "DuplicateCheckingConfig",
             &[],
+            |a, b| a.merge_with(b),
+        );
+
+        assert_carries_all::<network::WsjtxUdpConfig>(
+            "WsjtxUdpConfig",
+            &[("allowed_request_hosts", json!(["example.com"]))],
             |a, b| a.merge_with(b),
         );
     }

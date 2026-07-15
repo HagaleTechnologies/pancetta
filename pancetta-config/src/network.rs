@@ -1587,7 +1587,7 @@ impl ConfigSection for NetworkConfig {
         self.qrz_xml = other.qrz_xml;
         self.remote_gateway = other.remote_gateway;
         self.station_agent = other.station_agent;
-        self.wsjtx_udp = other.wsjtx_udp;
+        self.wsjtx_udp.merge_with(other.wsjtx_udp);
 
         // Merge custom services
         self.custom_services.extend(other.custom_services);
