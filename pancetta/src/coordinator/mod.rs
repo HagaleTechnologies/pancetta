@@ -37,6 +37,7 @@ mod tui_relay;
 mod tx;
 mod util;
 mod wav_playback;
+pub(crate) mod wsjtx_udp;
 
 pub use tx::{
     coalesce_transmit_requests, remote_tx_permitted, resolve_required_parity, schedule_tx,
