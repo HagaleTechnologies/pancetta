@@ -309,6 +309,7 @@ impl super::ApplicationCoordinator {
         // TX-adjacent desense diagnostic input (see `maybe_flag_tx_desense`).
         let last_ptt_on_ms = self.last_ptt_on_ms.clone();
         let gateway_enabled = self.gateway_enabled.clone();
+        let wsjtx_enabled = self.wsjtx_enabled.clone();
         let self_waterfall_to_auto_tx = self.waterfall_to_auto_tx.clone();
 
         // Read station callsign for AP decoding before moving into the thread.
@@ -1156,6 +1157,30 @@ impl super::ApplicationCoordinator {
                                     if let Err(e) = bus4.send_message(gw_msg).await {
                                         debug!(
                                             "Failed to forward decoded message to RemoteGateway: {}",
+                                            e
+                                        );
+                                    }
+                                });
+                            }
+
+                            // Additive: also forward to the WSJT-X UDP
+                            // companion-protocol component when enabled
+                            // (gated — no clone/send when off), exact
+                            // structural mirror of the RemoteGateway block
+                            // above. The →Tui/→Qso/→PskReporter/
+                            // →RemoteGateway sends above are untouched.
+                            if wsjtx_enabled.load(Ordering::Relaxed) {
+                                let wsjtx_msg = ComponentMessage::new(
+                                    ComponentId::Ft8Decoder,
+                                    ComponentId::WsjtxUdp,
+                                    MessageType::DecodedMessage(decoded_msg.clone()),
+                                    Instant::now(),
+                                );
+                                let bus5 = message_bus.clone();
+                                rt.spawn(async move {
+                                    if let Err(e) = bus5.send_message(wsjtx_msg).await {
+                                        debug!(
+                                            "Failed to forward decoded message to WsjtxUdp: {}",
                                             e
                                         );
                                     }
