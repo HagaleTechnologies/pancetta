@@ -399,17 +399,24 @@ impl super::ApplicationCoordinator {
                                 }
                                 Some((_id, reply @ InMsg::Reply { .. })) => {
                                     // Remote QSO initiation — the design spec's
-                                    // five ANDed fail-closed gates. Gates 1
-                                    // (`accept_udp_requests`) and 3 (source
-                                    // filter) were already enforced by the
-                                    // `!request_allowed` refusal arm ABOVE, so
-                                    // only allowed, id-matched Replies reach
-                                    // here. Gates 4 (`allow_tx_initiation` AND
-                                    // `is_cq`) and 5 (`TxPolicy`) are applied
-                                    // below; the retained-decode match
-                                    // (`reply_to_call`) is gate 2's
-                                    // ("does it echo a decode we emitted?")
-                                    // hard precondition. ANY failure ⇒
+                                    // five ANDed fail-closed gates (numbered per
+                                    // the design spec's "Remote QSO initiation"
+                                    // section, not the order checks run in):
+                                    // gate 1 (`accept_udp_requests`) and gate 3
+                                    // (source filter) were already enforced by
+                                    // the `!request_allowed` refusal arm ABOVE,
+                                    // so only allowed, id-matched Replies reach
+                                    // here. Gate 2 (`allow_tx_initiation`) and
+                                    // gate 4 (`TxPolicy::allows_initiation()`)
+                                    // are applied below; gate 5 is the TX
+                                    // worker's `remote_tx_permitted` fail-closed
+                                    // arm check, applied downstream of the
+                                    // `StartQso` this handler sends. The
+                                    // retained-decode match (`reply_to_call`,
+                                    // "does it echo a decode we emitted?") is
+                                    // an additional hard precondition the spec
+                                    // doesn't number — it must pass regardless
+                                    // of gate state. ANY failure ⇒
                                     // refuse-with-audit, no side effect.
                                     match reply_to_call(&reply, &decode_ring) {
                                         None => {
@@ -733,7 +740,9 @@ pub(crate) fn build_status(snapshot: &StatusSnapshot, ids: &StationIds) -> OutMs
 /// against a retained decode (protocol notes §4 IN Reply: "Message + Time +
 /// DeltaFrequency uniquely identify a decode in practice"). Built and
 /// retained alongside each ring entry; [`reply_to_call`] matches an inbound
-/// Reply against it (gate 3 of the remote-initiation model).
+/// Reply against it — an additional hard precondition of the remote-
+/// initiation model, not one of its five numbered gates (see the design
+/// spec's "Remote QSO initiation" section for the canonical numbering).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredKey {
     /// Same value as the paired `OutMsg::Decode`'s `time_ms`.
@@ -894,7 +903,8 @@ fn as_replay(out: &OutMsg) -> Option<OutMsg> {
 /// retained decode. Pure result of [`reply_to_call`] — no atomics, no I/O — so
 /// the match + CQ-extraction logic is exhaustively unit-tested without a
 /// running component. The handler turns an allowed CQ/QRZ intent into
-/// `QsoMessage::StartQso { remote_origin: true }` (gates 4-5 applied there).
+/// `QsoMessage::StartQso { remote_origin: true }` (gates 2 and 4 checked in
+/// the handler first; gate 5, the TX worker's arm check, applies downstream).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallIntent {
     /// The DX station we would call — the CQ/QRZ caller for a CQ, or the
@@ -907,7 +917,8 @@ pub(crate) struct CallIntent {
     /// `MAX_FREQUENCY_DEVIATION = 2500 Hz`.
     pub(crate) frequency_hz: u64,
     /// `true` iff the echoed decode is a CQ or QRZ. Only CQ/QRZ intents are
-    /// TX-eligible; every other match is refused-with-audit (gate 4).
+    /// TX-eligible; every other match is refused-with-audit (checked
+    /// alongside gate 2, `allow_tx_initiation`, in the handler).
     pub(crate) is_cq: bool,
     /// The decoder's own authoritative slot parity for the matched decode
     /// (`StoredKey::slot_parity`, carried through unchanged — never
@@ -917,10 +928,13 @@ pub(crate) struct CallIntent {
     pub(crate) dx_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
-/// Gate 3 of the five-gate model: match an inbound `Reply(4)` against the
-/// retained decode ring and, on a hit, extract the CQ/QRZ caller. Pure —
-/// ring + reply in, `Option<CallIntent>` out, no atomics/I/O — so it is
-/// exhaustively unit-tested without a socket or running coordinator.
+/// Matches an inbound `Reply(4)` against the retained decode ring and, on a
+/// hit, extracts the CQ/QRZ caller. This is the remote-initiation model's
+/// unnumbered hard precondition (see [`CallIntent`] and the design spec's
+/// "Remote QSO initiation" section for the five numbered gates) — it must
+/// pass regardless of gate state. Pure — ring + reply in, `Option<CallIntent>`
+/// out, no atomics/I/O — so it is exhaustively unit-tested without a socket
+/// or running coordinator.
 ///
 /// Returns `None` (⇒ the handler hard-returns, no side effect) when:
 /// - `reply` is not an `InMsg::Reply` (defensive — the caller only ever
@@ -932,7 +946,8 @@ pub(crate) struct CallIntent {
 ///
 /// A matched **non-CQ** decode still yields `Some` (with `is_cq = false`) so
 /// the handler can refuse-with-audit rather than silently drop — the TX
-/// eligibility decision (gate 4) belongs to the handler, not this matcher.
+/// eligibility decision (gate 2, alongside `allow_tx_initiation`) belongs to
+/// the handler, not this matcher.
 pub(crate) fn reply_to_call(
     reply: &InMsg,
     ring: &VecDeque<(OutMsg, StoredKey)>,
@@ -946,8 +961,9 @@ pub(crate) fn reply_to_call(
     else {
         return None;
     };
-    // Exact-triple match against a still-retained decode (gate 3). The ring is
-    // cleared on band change, so a match also proves same-band relevance.
+    // Exact-triple match against a still-retained decode (the unnumbered hard
+    // precondition, not one of the five gates). The ring is cleared on band
+    // change, so a match also proves same-band relevance.
     let (_out, key) = ring.iter().find(|(_, k)| {
         k.time_ms == *time_ms && k.delta_freq == *delta_freq && &k.message == message
     })?;
