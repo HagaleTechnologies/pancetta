@@ -132,12 +132,12 @@ impl super::ApplicationCoordinator {
         let instance_id = cfg.instance_id.clone();
         let shutdown = self.shutdown_signal.clone();
 
-        // Task 5 (QSOLogged/LoggedADIF): the one-shot handoff `qso.rs`
-        // completes right after `QsoManager::start()` succeeds (see
-        // `wsjtx_qso_events_rx` doc comment on `ApplicationCoordinator`).
-        // Taken here (not earlier) so the disabled/socket-open-failure early
-        // returns above leave it untouched — a legitimate future retry of
-        // this method still finds it.
+        // Task 5 (QSOLogged/LoggedADIF): `qso.rs` populates this field
+        // synchronously while constructing `QsoManager`, before
+        // `start_qso_component` returns (see the `wsjtx_qso_events_rx` doc
+        // comment on `ApplicationCoordinator`). Taken here (not earlier) so
+        // the disabled/socket-open-failure early returns above leave it
+        // untouched.
         let qso_events_handoff = self.wsjtx_qso_events_rx.take();
 
         let wsjtx_handle = tokio::spawn(async move {
@@ -153,33 +153,16 @@ impl super::ApplicationCoordinator {
                 warn!("WSJT-X UDP: initial Status send failed: {e}");
             }
 
-            // Task 5: resolve the QSO-event handoff, bounded so a QSO
-            // component that never completes startup can't hang this task
-            // forever. `None` (timeout, sender dropped, or wsjtx_qso_events_rx
-            // already taken by an earlier call) just means QSOLogged/
-            // LoggedADIF stay disabled for this run — every other message
-            // type is unaffected.
-            let mut qso_events: Option<tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>> =
-                match qso_events_handoff {
-                    Some(rx) => match tokio::time::timeout(Duration::from_secs(10), rx).await {
-                        Ok(Ok(rx)) => Some(rx),
-                        Ok(Err(_)) => {
-                            warn!(
-                                "WSJT-X UDP: QSO-event handoff sender dropped — \
-                                 QSOLogged/LoggedADIF disabled for this run"
-                            );
-                            None
-                        }
-                        Err(_) => {
-                            warn!(
-                                "WSJT-X UDP: QSO-event handoff timed out — \
-                                 QSOLogged/LoggedADIF disabled for this run"
-                            );
-                            None
-                        }
-                    },
-                    None => None,
-                };
+            // Task 5: `qso_events_handoff` is already the resolved
+            // `broadcast::Receiver` (populated synchronously by
+            // `start_qso_component`, before this task was ever spawned) — no
+            // channel or timeout to resolve. `None` only when this coordinator
+            // run never wired one up (e.g. a unit test constructing
+            // `ApplicationCoordinator` without going through
+            // `start_qso_component`); QSOLogged/LoggedADIF simply stay
+            // disabled for the run in that case — every other message type is
+            // unaffected.
+            let mut qso_events = qso_events_handoff;
             // Renders each completed QSO's ADIF record the identical way the
             // source-of-truth writer and the per-QSO upload subscriber do
             // (`qso.rs`'s `start_adif_subscriber` / `start_qso_upload_subscriber`)

@@ -875,19 +875,19 @@ pub struct ApplicationCoordinator {
     /// constructed (P0–P2), this gate is inert. Local TX never consults it.
     pub(crate) remote_tx_arm: Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
 
-    /// One-shot handoff of a `QsoEvent` broadcast receiver to the WSJT-X UDP
-    /// component (`start_wsjtx_udp_component`, started later in the boot
-    /// sequence than `start_qso_component`). `QsoManager` is constructed
-    /// entirely inside `start_qso_component`'s spawned task and never
-    /// escapes it, so this one-shot is the minimal bridge that lets the
-    /// WSJT-X component `subscribe()` to completed-QSO events without
-    /// restructuring QSO-component startup timing or inventing a new
-    /// coordinator bus message type (qso.rs sends once, right after
-    /// `QsoManager::start()` succeeds; `start_wsjtx_udp_component` takes and
-    /// awaits it, bounded by a timeout). `None` once taken.
-    pub(crate) wsjtx_qso_events_rx: Option<
-        tokio::sync::oneshot::Receiver<tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>>,
-    >,
+    /// `QsoEvent` broadcast receiver for the WSJT-X UDP component
+    /// (`start_wsjtx_udp_component`, started later in the boot sequence than
+    /// `start_qso_component`). `start_qso_component` constructs `QsoManager`
+    /// synchronously (before spawning its task) specifically so it can call
+    /// `.subscribe()` and populate this field right there — no channel or
+    /// handoff is needed because `run()` `.await`s `start_qso_component`
+    /// before `start_wsjtx_udp_component`, so this field is always already
+    /// populated by the time the latter reads it. `start_wsjtx_udp_component`
+    /// takes it with `Option::take`; documented as `None` afterward mainly so
+    /// a hypothetical future re-invocation of that method (there is none
+    /// today) would see an empty field rather than silently re-subscribing.
+    pub(crate) wsjtx_qso_events_rx:
+        Option<tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
