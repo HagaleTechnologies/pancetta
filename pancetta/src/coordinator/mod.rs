@@ -1053,10 +1053,25 @@ impl ApplicationCoordinator {
         // Snapshot the wsjtx_udp enabled flag before `config` is moved into
         // the Arc<RwLock> — mirrors `gateway_enabled_init` above.
         let wsjtx_enabled_init = config.network.wsjtx_udp.enabled;
-        // Snapshot the station-agent LOCAL remote-TX consent before config is
-        // moved into the Arc<RwLock>. Seeds the remote-TX arm's local-consent
-        // gate; default OFF, so remote TX can never be permitted this phase.
-        let remote_tx_consent_init = config.network.station_agent.remote_tx_enabled;
+        // Snapshot the LOCAL remote-TX consent before config is moved into the
+        // Arc<RwLock>. Seeds the shared remote-TX arm's local-consent gate.
+        // Option A of the WSJT-X-UDP design spec: the arm is the operator's
+        // channel-independent "I consent to remote TX" bit, so EITHER channel's
+        // consent seeds it — the station agent's `remote_tx_enabled` OR the
+        // WSJT-X-UDP `allow_tx_initiation` (both default OFF, so remote TX can
+        // never be permitted this phase unless the operator opts in).
+        let wsjtx_allow_tx_initiation_init = config.network.wsjtx_udp.allow_tx_initiation;
+        let remote_tx_consent_init = crate::coordinator::wsjtx_udp::remote_tx_arm_consent(
+            config.network.station_agent.remote_tx_enabled,
+            wsjtx_allow_tx_initiation_init,
+        );
+        if wsjtx_allow_tx_initiation_init {
+            warn!(
+                target: "remote.wsjtx",
+                "remote-TX arm seeded by [network.wsjtx_udp].allow_tx_initiation \
+                 — UDP Reply may initiate QSOs"
+            );
+        }
         // Snapshot fox.max_streams before config is moved into the Arc<RwLock>.
         // The QSO component reads this to cap concurrent caller-answer QSOs
         // while Fox mode is engaged.

@@ -28,6 +28,7 @@ use tracing::{debug, info, warn};
 use codec::{InMsg, OutMsg};
 use pancetta_config::WsjtxUdpConfig;
 use pancetta_core::DiagnosticLevel;
+use pancetta_ft8::Ft8Message;
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType, QsoMessage};
 
@@ -115,6 +116,23 @@ impl super::ApplicationCoordinator {
             "Starting WSJT-X UDP companion component (destination: {}, id: \"{}\")",
             cfg.destination, cfg.instance_id
         );
+
+        // Design spec Option A audit: when `allow_tx_initiation` is on, the
+        // shared remote-TX arm was seeded by THIS channel (see the constructor
+        // + station-agent seeding sites). Surface it as a startup diagnostic so
+        // the operator sees, in the TUI, that a GridTracker/UDP Reply can now
+        // initiate an (arm-gated) on-air QSO — matching the warn! logged at
+        // seed time.
+        if cfg.allow_tx_initiation {
+            emit_diagnostic(
+                &self.message_bus,
+                DiagnosticLevel::Warn,
+                "remote-TX arm seeded by [network.wsjtx_udp].allow_tx_initiation \
+                 — UDP Reply may initiate QSOs"
+                    .to_string(),
+            )
+            .await;
+        }
 
         let (_wsjtx_tx, wsjtx_rx) = self
             .message_bus
@@ -279,9 +297,10 @@ impl super::ApplicationCoordinator {
                     // who the request was addressed to); everything else
                     // passes through the fail-closed source gate
                     // (`request_allowed`) before dispatch, with a Warn
-                    // diagnostic on refusal. `HaltTx` and `Replay` are
-                    // honored here; `Reply` (remote QSO initiation) is Task
-                    // 7's job — until then it's acknowledged but a no-op.
+                    // diagnostic on refusal. `HaltTx`, `Replay`, and `Reply`
+                    // (remote QSO initiation — the five-gate model) are all
+                    // honored here; a Reply that fails any of gates 2/4/5 is
+                    // refused-with-audit, never partially acted on.
                     // Every honored AND refused request gets a retained
                     // `DiagnosticEvent` (design spec's audit-trail
                     // requirement). The timeout throttles this branch so the
@@ -378,21 +397,110 @@ impl super::ApplicationCoordinator {
                                     )
                                     .await;
                                 }
-                                Some((_id, InMsg::Reply { .. })) => {
-                                    // Task 7 wires actual QSO initiation
-                                    // (gates 2/4/5 of the design spec's
-                                    // five-gate model). Until then, a Reply
-                                    // that passed gates 1+3 is acknowledged
-                                    // but does nothing.
-                                    emit_diagnostic(
-                                        &message_bus,
-                                        DiagnosticLevel::Info,
-                                        format!(
-                                            "Reply received from {from} but remote QSO \
-                                             initiation is not implemented yet"
-                                        ),
-                                    )
-                                    .await;
+                                Some((_id, reply @ InMsg::Reply { .. })) => {
+                                    // Remote QSO initiation — the design spec's
+                                    // five ANDed fail-closed gates. Gates 1
+                                    // (`accept_udp_requests`) and 3 (source
+                                    // filter) were already enforced by the
+                                    // `!request_allowed` refusal arm ABOVE, so
+                                    // only allowed, id-matched Replies reach
+                                    // here. Gates 4 (`allow_tx_initiation` AND
+                                    // `is_cq`) and 5 (`TxPolicy`) are applied
+                                    // below; the retained-decode match
+                                    // (`reply_to_call`) is gate 2's
+                                    // ("does it echo a decode we emitted?")
+                                    // hard precondition. ANY failure ⇒
+                                    // refuse-with-audit, no side effect.
+                                    match reply_to_call(&reply, &decode_ring) {
+                                        None => {
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                DiagnosticLevel::Warn,
+                                                format!(
+                                                    "Reply from {from} matched no retained \
+                                                     decode — ignored"
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                        Some(intent) if !cfg.allow_tx_initiation || !intent.is_cq => {
+                                            // Non-CQ replies are targeting-only
+                                            // upstream too (protocol notes §5);
+                                            // v1 treats both !consent and
+                                            // !is_cq as refusal-with-audit
+                                            // rather than partial action.
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                DiagnosticLevel::Warn,
+                                                format!(
+                                                    "Reply({}) from {from} refused: \
+                                                     allow_tx_initiation={}, is_cq={}",
+                                                    intent.callsign,
+                                                    cfg.allow_tx_initiation,
+                                                    intent.is_cq
+                                                ),
+                                            )
+                                            .await;
+                                        }
+                                        Some(intent) => {
+                                            let policy = pancetta_core::TxPolicy::from_u8(
+                                                state.tx_policy.load(Ordering::Relaxed),
+                                            );
+                                            if !policy.allows_initiation() {
+                                                emit_diagnostic(
+                                                    &message_bus,
+                                                    DiagnosticLevel::Warn,
+                                                    format!(
+                                                        "Reply({}) from {from} refused: \
+                                                         TX policy {policy:?}",
+                                                        intent.callsign
+                                                    ),
+                                                )
+                                                .await;
+                                            } else {
+                                                // All five gates passed.
+                                                // remote_origin: true ⇒ every
+                                                // frame is TxOrigin::Remote ⇒
+                                                // arm-gated fail-closed in the
+                                                // TX worker + parity-admitted +
+                                                // dup-checked in the QSO engine.
+                                                // Never TxOrigin::Local (repo
+                                                // invariant).
+                                                let msg = ComponentMessage::new(
+                                                    ComponentId::WsjtxUdp,
+                                                    ComponentId::Qso,
+                                                    MessageType::QsoMessage(
+                                                        QsoMessage::StartQso {
+                                                            callsign: intent.callsign.clone(),
+                                                            frequency: intent.frequency_hz,
+                                                            dx_parity: intent.dx_parity,
+                                                            remote_origin: true,
+                                                        },
+                                                    ),
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(msg).await
+                                                {
+                                                    warn!(
+                                                        "WSJT-X UDP: Reply StartQso send \
+                                                         failed: {e}"
+                                                    );
+                                                } else {
+                                                    emit_diagnostic(
+                                                        &message_bus,
+                                                        DiagnosticLevel::Info,
+                                                        format!(
+                                                            "GridTracker/UDP Reply → calling \
+                                                             {} (remote-origin, arm-gated)",
+                                                            intent.callsign
+                                                        ),
+                                                    )
+                                                    .await;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                                 Some((_id, msg)) => {
                                     debug!(
@@ -623,9 +731,9 @@ pub(crate) fn build_status(snapshot: &StatusSnapshot, ids: &StationIds) -> OutMs
 
 /// Minimal decode-identity triple used to match an echoed `Reply(4)`
 /// against a retained decode (protocol notes §4 IN Reply: "Message + Time +
-/// DeltaFrequency uniquely identify a decode in practice"). Task 7 wires
-/// the actual match; this task only builds and retains it alongside each
-/// ring entry.
+/// DeltaFrequency uniquely identify a decode in practice"). Built and
+/// retained alongside each ring entry; [`reply_to_call`] matches an inbound
+/// Reply against it (gate 3 of the remote-initiation model).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct StoredKey {
     /// Same value as the paired `OutMsg::Decode`'s `time_ms`.
@@ -761,6 +869,145 @@ fn as_replay(out: &OutMsg) -> Option<OutMsg> {
         }),
         _ => None,
     }
+}
+
+/// A remote QSO-initiation intent derived from a `Reply(4)` that matched a
+/// retained decode. Pure result of [`reply_to_call`] — no atomics, no I/O — so
+/// the match + CQ-extraction logic is exhaustively unit-tested without a
+/// running component. The handler turns an allowed CQ/QRZ intent into
+/// `QsoMessage::StartQso { remote_origin: true }` (gates 4-5 applied there).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallIntent {
+    /// The DX station we would call — the CQ/QRZ caller for a CQ, or the
+    /// message sender otherwise (only CQ/QRZ intents are ever acted on).
+    pub(crate) callsign: String,
+    /// TX **audio offset** in Hz within the FT8 passband, clamped to
+    /// `[200, 2500]` exactly like the TUI CallStation path
+    /// (`app.rs::get_selected_station`). `StartQso.frequency` is an audio
+    /// offset, NOT an absolute RF frequency — the modulator validates against
+    /// `MAX_FREQUENCY_DEVIATION = 2500 Hz`.
+    pub(crate) frequency_hz: u64,
+    /// `true` iff the echoed decode is a CQ or QRZ. Only CQ/QRZ intents are
+    /// TX-eligible; every other match is refused-with-audit (gate 4).
+    pub(crate) is_cq: bool,
+    /// The decoded station's slot parity, matching CallStation's
+    /// `station.slot_parity`. The QSO engine TXes on `opposite(dx_parity)` for
+    /// this pounce (`desired_tx_parity = dx_parity.map(opposite)` in qso.rs).
+    pub(crate) dx_parity: Option<pancetta_core::slot::SlotParity>,
+}
+
+/// Gate 3 of the five-gate model: match an inbound `Reply(4)` against the
+/// retained decode ring and, on a hit, extract the CQ/QRZ caller. Pure —
+/// ring + reply in, `Option<CallIntent>` out, no atomics/I/O — so it is
+/// exhaustively unit-tested without a socket or running coordinator.
+///
+/// Returns `None` (⇒ the handler hard-returns, no side effect) when:
+/// - `reply` is not an `InMsg::Reply` (defensive — the caller only ever
+///   passes a Reply), or
+/// - no retained decode matches the echoed `(message, time_ms, delta_freq)`
+///   triple (protocol notes §4/§5: "Message + Time + DeltaFrequency uniquely
+///   identify a decode"; an unmatched Reply is silently dropped), or
+/// - the matched decode carries no extractable caller callsign.
+///
+/// A matched **non-CQ** decode still yields `Some` (with `is_cq = false`) so
+/// the handler can refuse-with-audit rather than silently drop — the TX
+/// eligibility decision (gate 4) belongs to the handler, not this matcher.
+pub(crate) fn reply_to_call(
+    reply: &InMsg,
+    ring: &VecDeque<(OutMsg, StoredKey)>,
+) -> Option<CallIntent> {
+    let InMsg::Reply {
+        time_ms,
+        delta_freq,
+        message,
+        ..
+    } = reply
+    else {
+        return None;
+    };
+    // Exact-triple match against a still-retained decode (gate 3). The ring is
+    // cleared on band change, so a match also proves same-band relevance.
+    let (_out, key) = ring.iter().find(|(_, k)| {
+        k.time_ms == *time_ms && k.delta_freq == *delta_freq && &k.message == message
+    })?;
+    let (callsign, is_cq) = parse_cq_caller(&key.message)?;
+    Some(CallIntent {
+        // Reply there: the audio offset where the DX was decoded, clamped into
+        // the FT8 passband identically to `app.rs::get_selected_station`.
+        frequency_hz: (key.delta_freq as u64).clamp(200, 2500),
+        dx_parity: Some(decode_slot_parity(key.time_ms)),
+        callsign,
+        is_cq,
+    })
+}
+
+/// Extract the callsign we would call from a decode's text, plus whether it is
+/// a CQ/QRZ (the only TX-eligible forms). Reuses `pancetta_ft8::Ft8Message`'s
+/// text parser (`from_text`) for callsign extraction — including its CQ
+/// directional/DX-modifier handling (`CQ DX <call>`) — rather than a
+/// hand-rolled split. `is_cq` is keyed off the first token (`CQ`/`QRZ`);
+/// `QRZ` is normalized to `CQ` so the shared parser extracts the caller after
+/// any modifier identically. Returns `None` when no caller can be extracted.
+fn parse_cq_caller(message: &str) -> Option<(String, bool)> {
+    let first = message.split_whitespace().next()?;
+    let is_cq = first == "CQ" || first == "QRZ";
+    // Normalize a leading QRZ to CQ so `from_text`'s CQ-modifier handling runs.
+    let parsed = if first == "QRZ" {
+        Ft8Message::from_text(&normalize_qrz(message))
+    } else {
+        Ft8Message::from_text(message)
+    };
+    let callsign = parsed.from_callsign?;
+    Some((callsign, is_cq))
+}
+
+/// Rewrite a leading `QRZ` token to `CQ`, preserving the rest of the message
+/// verbatim, so [`parse_cq_caller`] can hand it to the shared CQ parser.
+fn normalize_qrz(message: &str) -> String {
+    let rest = message
+        .split_whitespace()
+        .skip(1)
+        .collect::<Vec<_>>()
+        .join(" ");
+    if rest.is_empty() {
+        "CQ".to_string()
+    } else {
+        format!("CQ {rest}")
+    }
+}
+
+/// Slot parity of a retained decode, from its `time_ms` (ms since UTC
+/// midnight). Matches the TUI CallStation path's `station.slot_parity`
+/// (`SlotParity::of` on the decode's UTC time), reusing the canonical
+/// [`pancetta_core::slot::SlotParity::of`] rather than a new formula.
+///
+/// Date-independent: a UTC day is exactly `86400 / 15 = 5760` whole 15-second
+/// slots, an even count, so every UTC midnight begins an Even-parity slot and
+/// the parity of any instant depends only on its offset within the day.
+/// Reconstructing a `DateTime<Utc>` at `1970-01-01T00:00:00 + time_ms` (whose
+/// day count is 0) therefore yields the same parity `SlotParity::of` would for
+/// the decode's real calendar date.
+fn decode_slot_parity(time_ms: u32) -> pancetta_core::slot::SlotParity {
+    let t = DateTime::<Utc>::from_timestamp_millis(i64::from(time_ms))
+        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp_millis(0).expect("epoch is valid"));
+    pancetta_core::slot::SlotParity::of(t)
+}
+
+/// Option A of the design spec's arm-gate decision: the shared
+/// `remote_tx_arm` local-consent bit is seeded true when EITHER channel's
+/// operator consent is on — the station agent's `remote_tx_enabled` OR the
+/// WSJT-X-UDP `allow_tx_initiation`. The arm is the operator's
+/// channel-independent "I consent to remote TX" last line; each channel still
+/// carries its own upstream consent (this returns only the *arm* seed, not a
+/// bypass) and source filtering. Pure, so the seeding rule is unit-tested
+/// directly. Used at BOTH `set_local_consent` sites (coordinator constructor
+/// and `start_station_agent_component`) so the later seed never clobbers the
+/// wsjtx contribution.
+pub(crate) fn remote_tx_arm_consent(
+    station_agent_enabled: bool,
+    wsjtx_allow_tx_initiation: bool,
+) -> bool {
+    station_agent_enabled || wsjtx_allow_tx_initiation
 }
 
 /// Julian Day Number for a UTC instant's calendar date (protocol notes §3
@@ -1672,5 +1919,167 @@ mod qso_logged_tests {
             adif,
             format!("<adif_ver:5>3.1.0\n<programid:8>pancetta\n<EOH>\n{record}")
         );
+    }
+}
+
+#[cfg(test)]
+mod reply_tests {
+    use super::*;
+    use pancetta_core::slot::SlotParity;
+
+    /// A retained decode `(OutMsg::Decode, StoredKey)` ring entry, keyed by
+    /// `(message, time_ms, delta_freq)` — the exact triple `reply_to_call`
+    /// matches against.
+    fn stored(message: &str, time_ms: u32, delta_freq: u32) -> (OutMsg, StoredKey) {
+        let out = OutMsg::Decode {
+            new: true,
+            time_ms,
+            snr: 0,
+            delta_time: 0.0,
+            delta_freq,
+            mode: "~".to_string(),
+            message: message.to_string(),
+            low_confidence: false,
+            off_air: false,
+        };
+        let key = stored_key(&out).expect("Decode yields a StoredKey");
+        (out, key)
+    }
+
+    /// An inbound `Reply(4)` echoing a decode's `(message, time_ms,
+    /// delta_freq)` — the "double-click" GridTracker sends back.
+    fn reply(message: &str, time_ms: u32, delta_freq: u32) -> InMsg {
+        InMsg::Reply {
+            time_ms,
+            snr: 0,
+            delta_time: 0.0,
+            delta_freq,
+            mode: "~".to_string(),
+            message: message.to_string(),
+            low_confidence: false,
+            modifiers: 0,
+        }
+    }
+
+    #[test]
+    fn reply_matches_only_retained_decodes_and_extracts_cq_caller() {
+        let mut ring = VecDeque::new();
+        ring.push_back(stored("CQ W1AW FN31", 45_296_000, 1302));
+        ring.push_back(stored("K1ABC W9XYZ -07", 45_296_000, 800));
+        // Exact echo of a retained CQ → intent on W1AW, is_cq.
+        let r = reply("CQ W1AW FN31", 45_296_000, 1302);
+        let intent = reply_to_call(&r, &ring).unwrap();
+        assert_eq!((intent.callsign.as_str(), intent.is_cq), ("W1AW", true));
+        // Non-CQ decode matches but is flagged !is_cq (never arms TX).
+        let r = reply("K1ABC W9XYZ -07", 45_296_000, 800);
+        assert!(!reply_to_call(&r, &ring).unwrap().is_cq);
+        // Unknown decode → None (silently dropped per protocol notes §5).
+        assert!(reply_to_call(&reply("CQ NOBODY AA00", 1, 1), &ring).is_none());
+        // CQ with directional prefix still extracts the caller.
+        ring.push_back(stored("CQ DX ZL1XYZ RF80", 45_297_000, 400));
+        let r = reply("CQ DX ZL1XYZ RF80", 45_297_000, 400);
+        assert_eq!(reply_to_call(&r, &ring).unwrap().callsign, "ZL1XYZ");
+    }
+
+    #[test]
+    fn a_reply_that_differs_in_any_key_field_does_not_match() {
+        let mut ring = VecDeque::new();
+        ring.push_back(stored("CQ W1AW FN31", 45_296_000, 1302));
+        // Same message + delta_freq, different time.
+        assert!(reply_to_call(&reply("CQ W1AW FN31", 45_296_001, 1302), &ring).is_none());
+        // Same message + time, different delta_freq.
+        assert!(reply_to_call(&reply("CQ W1AW FN31", 45_296_000, 1303), &ring).is_none());
+        // Same time + delta_freq, different message text.
+        assert!(reply_to_call(&reply("CQ W1AW EM10", 45_296_000, 1302), &ring).is_none());
+    }
+
+    #[test]
+    fn frequency_hz_is_the_audio_offset_clamped_to_the_ft8_passband() {
+        let mut ring = VecDeque::new();
+        // In-band offset passes through unchanged.
+        ring.push_back(stored("CQ W1AW FN31", 10, 1302));
+        assert_eq!(
+            reply_to_call(&reply("CQ W1AW FN31", 10, 1302), &ring)
+                .unwrap()
+                .frequency_hz,
+            1302
+        );
+        // Below the passband floor → clamped up to 200.
+        ring.push_back(stored("CQ K1ABC FN42", 20, 50));
+        assert_eq!(
+            reply_to_call(&reply("CQ K1ABC FN42", 20, 50), &ring)
+                .unwrap()
+                .frequency_hz,
+            200
+        );
+        // Above the passband ceiling → clamped down to 2500.
+        ring.push_back(stored("CQ N0AX EN10", 30, 9000));
+        assert_eq!(
+            reply_to_call(&reply("CQ N0AX EN10", 30, 9000), &ring)
+                .unwrap()
+                .frequency_hz,
+            2500
+        );
+    }
+
+    #[test]
+    fn dx_parity_is_the_decodes_own_slot_parity() {
+        let mut ring = VecDeque::new();
+        // 45_296_000 ms = 45296 s; 45296 / 15 = 3019 (odd slot) → Odd.
+        ring.push_back(stored("CQ W1AW FN31", 45_296_000, 1302));
+        assert_eq!(
+            reply_to_call(&reply("CQ W1AW FN31", 45_296_000, 1302), &ring)
+                .unwrap()
+                .dx_parity,
+            Some(SlotParity::Odd)
+        );
+        // 30_000 ms = 30 s; 30 / 15 = 2 (even slot) → Even.
+        ring.push_back(stored("CQ K1ABC FN42", 30_000, 600));
+        assert_eq!(
+            reply_to_call(&reply("CQ K1ABC FN42", 30_000, 600), &ring)
+                .unwrap()
+                .dx_parity,
+            Some(SlotParity::Even)
+        );
+    }
+
+    #[test]
+    fn decode_slot_parity_matches_slotparity_of_on_the_real_date() {
+        use chrono::TimeZone;
+        // A real decode at 2026-07-15 12:34:56.000 UTC. Its ms-since-midnight
+        // must yield the same parity `SlotParity::of` gives for the full date.
+        let full = Utc.with_ymd_and_hms(2026, 7, 15, 12, 34, 56).unwrap();
+        let time_ms = (12 * 3600 + 34 * 60 + 56) * 1000;
+        assert_eq!(decode_slot_parity(time_ms), SlotParity::of(full));
+    }
+
+    #[test]
+    fn qrz_is_treated_as_cq_and_extracts_the_caller() {
+        let mut ring = VecDeque::new();
+        ring.push_back(stored("QRZ W1AW FN31", 45_296_000, 1302));
+        let intent = reply_to_call(&reply("QRZ W1AW FN31", 45_296_000, 1302), &ring).unwrap();
+        assert_eq!((intent.callsign.as_str(), intent.is_cq), ("W1AW", true));
+        // QRZ with a directional prefix still extracts the caller.
+        ring.push_back(stored("QRZ DX ZL1XYZ RF80", 45_297_000, 400));
+        let intent = reply_to_call(&reply("QRZ DX ZL1XYZ RF80", 45_297_000, 400), &ring).unwrap();
+        assert_eq!((intent.callsign.as_str(), intent.is_cq), ("ZL1XYZ", true));
+    }
+
+    #[test]
+    fn non_reply_inmsg_yields_no_intent() {
+        let ring = VecDeque::new();
+        assert!(reply_to_call(&InMsg::Replay, &ring).is_none());
+        assert!(reply_to_call(&InMsg::Close, &ring).is_none());
+    }
+
+    #[test]
+    fn remote_tx_arm_consent_is_the_or_of_both_channels() {
+        // Option A: the wsjtx flag alone seeds (arms) the shared consent.
+        assert!(remote_tx_arm_consent(false, true));
+        // Station-agent flag alone still seeds it (unchanged behavior).
+        assert!(remote_tx_arm_consent(true, false));
+        assert!(remote_tx_arm_consent(true, true));
+        // Both off ⇒ not seeded (fail-closed default).
+        assert!(!remote_tx_arm_consent(false, false));
     }
 }
