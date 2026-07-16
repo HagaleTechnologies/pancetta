@@ -272,7 +272,10 @@ allowed_request_hosts = ["192.168.1.60"]  # 3. machine B's IP, for multicast des
 
 Miss any one of the three and the double-click is refused (and logged —
 `Shift+D` in the TUI shows every honored and refused request under
-`remote.wsjtx`). For a unicast `destination` the peer host is inferred
+`remote.wsjtx`). Two more gates apply but aren't config toggles — the
+`Reply` must match a CQ decode pancetta itself sent, and the TX policy
+must permit initiation — so if the three above are all set correctly and
+a double-click is still refused, check those next. For a unicast `destination` the peer host is inferred
 automatically, so `allowed_request_hosts` isn't needed in that case —
 but `accept_udp_requests` and `allow_tx_initiation` are still both
 required. GridTracker's "Halt TX" button (`HaltTx`) is always honored
