@@ -1060,7 +1060,21 @@ impl ApplicationCoordinator {
         // consent seeds it — the station agent's `remote_tx_enabled` OR the
         // WSJT-X-UDP `allow_tx_initiation` (both default OFF, so remote TX can
         // never be permitted this phase unless the operator opts in).
-        let wsjtx_allow_tx_initiation_init = config.network.wsjtx_udp.allow_tx_initiation;
+        //
+        // The wsjtx contribution is additionally gated on `enabled`: when the
+        // component is disabled there is no Reply-handling code path at all,
+        // so seeding the arm from a disabled component's flag is pure risk
+        // (an armed-but-unreachable seed) with no functional benefit. This
+        // also closes an audit-visibility gap — with `enabled = false`, the
+        // startup DiagnosticEvent in `start_wsjtx_udp_component` never fires
+        // (it's behind that component's own enabled check), so an operator
+        // with `enabled = false, allow_tx_initiation = true` would otherwise
+        // get only a `warn!` log line for a misconfiguration that still arms
+        // remote TX. `enabled && allow_tx_initiation` equals
+        // `allow_tx_initiation` whenever `enabled` is already true, so this
+        // is a no-op for the `enabled = true` case.
+        let wsjtx_allow_tx_initiation_init =
+            wsjtx_enabled_init && config.network.wsjtx_udp.allow_tx_initiation;
         let remote_tx_consent_init = crate::coordinator::wsjtx_udp::remote_tx_arm_consent(
             config.network.station_agent.remote_tx_enabled,
             wsjtx_allow_tx_initiation_init,

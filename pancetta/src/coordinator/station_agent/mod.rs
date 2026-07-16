@@ -569,7 +569,13 @@ impl super::ApplicationCoordinator {
         // EITHER channel's operator consent. `set_local_consent` OVERWRITES, so
         // this later seed must carry the combined value — otherwise it would
         // clobber a wsjtx-contributed arm back to `remote_tx_enabled` alone.
-        let wsjtx_allow_tx_initiation = config.network.wsjtx_udp.allow_tx_initiation;
+        //
+        // The wsjtx contribution is gated on `enabled` too (mirrors the
+        // coordinator-constructor seeding): with the component disabled there
+        // is no Reply-handling path, so an armed-but-unreachable seed from
+        // `allow_tx_initiation` alone is pure risk with no benefit.
+        let wsjtx_allow_tx_initiation =
+            config.network.wsjtx_udp.enabled && config.network.wsjtx_udp.allow_tx_initiation;
         drop(config);
 
         // Seed local consent from config regardless of enabled/paired, so the

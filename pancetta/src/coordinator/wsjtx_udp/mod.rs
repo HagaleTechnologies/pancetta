@@ -217,7 +217,7 @@ impl super::ApplicationCoordinator {
                                     state.active_protocol_mode.load(Ordering::Relaxed),
                                 );
                                 if let Some(out) = decode_to_msg(&decoded, mode) {
-                                    if let Some(key) = stored_key(&out) {
+                                    if let Some(key) = stored_key(&out, decoded.slot_parity) {
                                         push_decode_ring(
                                             &mut decode_ring,
                                             (out.clone(), key),
@@ -444,7 +444,7 @@ impl super::ApplicationCoordinator {
                                         }
                                         Some(intent) => {
                                             let policy = pancetta_core::TxPolicy::from_u8(
-                                                state.tx_policy.load(Ordering::Relaxed),
+                                                state.tx_policy.load(Ordering::Acquire),
                                             );
                                             if !policy.allows_initiation() {
                                                 emit_diagnostic(
@@ -742,6 +742,16 @@ pub(crate) struct StoredKey {
     pub(crate) delta_freq: u32,
     /// Same value as the paired `OutMsg::Decode`'s `message`.
     pub(crate) message: String,
+    /// The decoder's own authoritative slot parity for this decode
+    /// (`DecodedMessage::slot_parity`, set in `ft8.rs` via
+    /// `slot_parity_for_receipt` — which subtracts `decode_phase` to recover
+    /// the true slot start before taking parity). Carried verbatim from the
+    /// `DecodedMessage` this entry was built from; [`reply_to_call`] reads it
+    /// straight off a matched entry rather than re-deriving parity from
+    /// `time_ms` (which is stamped at decode-completion time, already past
+    /// the slot boundary, and would floor into the wrong 15s slot under
+    /// decode latency).
+    pub(crate) slot_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
 /// Map a live FT8 decode onto the wire `Decode` message (protocol notes §4
@@ -786,7 +796,15 @@ fn time_ms_since_midnight_utc(t: SystemTime) -> u32 {
 /// Extract the `StoredKey` for a just-built `Decode` message. `None` for
 /// any other `OutMsg` variant (defensive — only ever called right after
 /// [`decode_to_msg`] returns `Some`).
-fn stored_key(out: &OutMsg) -> Option<StoredKey> {
+///
+/// `slot_parity` is the source `DecodedMessage`'s own authoritative
+/// `slot_parity` field — passed in verbatim, never re-derived from `out`'s
+/// `time_ms`, so the retained key carries the same parity the decoder itself
+/// computed (see [`StoredKey::slot_parity`]).
+fn stored_key(
+    out: &OutMsg,
+    slot_parity: Option<pancetta_core::slot::SlotParity>,
+) -> Option<StoredKey> {
     match out {
         OutMsg::Decode {
             time_ms,
@@ -797,6 +815,7 @@ fn stored_key(out: &OutMsg) -> Option<StoredKey> {
             time_ms: *time_ms,
             delta_freq: *delta_freq,
             message: message.clone(),
+            slot_parity,
         }),
         _ => None,
     }
@@ -890,7 +909,9 @@ pub(crate) struct CallIntent {
     /// `true` iff the echoed decode is a CQ or QRZ. Only CQ/QRZ intents are
     /// TX-eligible; every other match is refused-with-audit (gate 4).
     pub(crate) is_cq: bool,
-    /// The decoded station's slot parity, matching CallStation's
+    /// The decoder's own authoritative slot parity for the matched decode
+    /// (`StoredKey::slot_parity`, carried through unchanged — never
+    /// re-derived from `time_ms`), matching CallStation's
     /// `station.slot_parity`. The QSO engine TXes on `opposite(dx_parity)` for
     /// this pounce (`desired_tx_parity = dx_parity.map(opposite)` in qso.rs).
     pub(crate) dx_parity: Option<pancetta_core::slot::SlotParity>,
@@ -935,7 +956,11 @@ pub(crate) fn reply_to_call(
         // Reply there: the audio offset where the DX was decoded, clamped into
         // the FT8 passband identically to `app.rs::get_selected_station`.
         frequency_hz: (key.delta_freq as u64).clamp(200, 2500),
-        dx_parity: Some(decode_slot_parity(key.time_ms)),
+        // The decoder's own authoritative parity, carried verbatim off the
+        // matched `StoredKey` — never re-derived from `time_ms` here. See
+        // `StoredKey::slot_parity` for why re-derivation is unsafe (decode
+        // latency can floor a raw timestamp into the wrong 15s slot).
+        dx_parity: key.slot_parity,
         callsign,
         is_cq,
     })
@@ -974,23 +999,6 @@ fn normalize_qrz(message: &str) -> String {
     } else {
         format!("CQ {rest}")
     }
-}
-
-/// Slot parity of a retained decode, from its `time_ms` (ms since UTC
-/// midnight). Matches the TUI CallStation path's `station.slot_parity`
-/// (`SlotParity::of` on the decode's UTC time), reusing the canonical
-/// [`pancetta_core::slot::SlotParity::of`] rather than a new formula.
-///
-/// Date-independent: a UTC day is exactly `86400 / 15 = 5760` whole 15-second
-/// slots, an even count, so every UTC midnight begins an Even-parity slot and
-/// the parity of any instant depends only on its offset within the day.
-/// Reconstructing a `DateTime<Utc>` at `1970-01-01T00:00:00 + time_ms` (whose
-/// day count is 0) therefore yields the same parity `SlotParity::of` would for
-/// the decode's real calendar date.
-fn decode_slot_parity(time_ms: u32) -> pancetta_core::slot::SlotParity {
-    let t = DateTime::<Utc>::from_timestamp_millis(i64::from(time_ms))
-        .unwrap_or_else(|| DateTime::<Utc>::from_timestamp_millis(0).expect("epoch is valid"));
-    pancetta_core::slot::SlotParity::of(t)
 }
 
 /// Option A of the design spec's arm-gate decision: the shared
@@ -1612,9 +1620,10 @@ mod decode_tests {
 
     #[test]
     fn stored_key_matches_the_decode_it_was_built_from() {
-        let d = decoded(-5.0, 1302.0, 0.2, "CQ K1ABC FN42", known_timestamp());
+        let mut d = decoded(-5.0, 1302.0, 0.2, "CQ K1ABC FN42", known_timestamp());
+        d.slot_parity = Some(pancetta_core::slot::SlotParity::Odd);
         let out = decode_to_msg(&d, OperatingMode::Ft8).unwrap();
-        let key = stored_key(&out).expect("Decode variant must yield a StoredKey");
+        let key = stored_key(&out, d.slot_parity).expect("Decode variant must yield a StoredKey");
         let OutMsg::Decode {
             time_ms,
             delta_freq,
@@ -1627,11 +1636,53 @@ mod decode_tests {
         assert_eq!(key.time_ms, *time_ms);
         assert_eq!(key.delta_freq, *delta_freq);
         assert_eq!(&key.message, message);
+        // The decoder's own slot_parity is carried through verbatim, not
+        // re-derived from time_ms.
+        assert_eq!(key.slot_parity, d.slot_parity);
+    }
+
+    #[test]
+    fn stored_key_carries_none_slot_parity_when_the_decoded_message_has_none() {
+        let d = decoded(-5.0, 1302.0, 0.2, "CQ K1ABC FN42", known_timestamp());
+        assert_eq!(d.slot_parity, None);
+        let out = decode_to_msg(&d, OperatingMode::Ft8).unwrap();
+        let key = stored_key(&out, d.slot_parity).expect("Decode variant must yield a StoredKey");
+        assert_eq!(key.slot_parity, None);
     }
 
     #[test]
     fn stored_key_is_none_for_non_decode_messages() {
-        assert!(stored_key(&OutMsg::Clear).is_none());
+        assert!(stored_key(&OutMsg::Clear, None).is_none());
+    }
+
+    #[test]
+    fn slot_parity_flows_unchanged_from_decoded_message_through_ring_to_reply_to_call() {
+        // End-to-end: a DecodedMessage carrying the decoder's authoritative
+        // slot_parity (Odd here, deliberately NOT matching what a raw
+        // time_ms re-derivation would produce for this timestamp) is mapped
+        // to a wire Decode, keyed into the retention ring, and a matching
+        // Reply(4) must yield exactly that stored parity — never a
+        // re-derivation from time_ms.
+        let mut d = decoded(-5.0, 1302.0, 0.2, "CQ K1ABC FN42", known_timestamp());
+        d.slot_parity = Some(pancetta_core::slot::SlotParity::Odd);
+        let out = decode_to_msg(&d, OperatingMode::Ft8).unwrap();
+        let key = stored_key(&out, d.slot_parity).expect("Decode variant must yield a StoredKey");
+        let mut ring: VecDeque<(OutMsg, StoredKey)> = VecDeque::new();
+        let (time_ms, delta_freq, message) = (key.time_ms, key.delta_freq, key.message.clone());
+        push_decode_ring(&mut ring, (out, key), DECODE_RING_CAPACITY);
+
+        let reply = InMsg::Reply {
+            time_ms,
+            snr: 0,
+            delta_time: 0.0,
+            delta_freq,
+            mode: "~".to_string(),
+            message,
+            low_confidence: false,
+            modifiers: 0,
+        };
+        let intent = reply_to_call(&reply, &ring).expect("Reply must match the retained decode");
+        assert_eq!(intent.dx_parity, Some(pancetta_core::slot::SlotParity::Odd));
     }
 
     #[test]
@@ -1644,6 +1695,7 @@ mod decode_tests {
                     time_ms: i,
                     delta_freq: 0,
                     message: i.to_string(),
+                    slot_parity: None,
                 },
             );
             push_decode_ring(&mut ring, entry, 3);
@@ -1667,6 +1719,7 @@ mod decode_tests {
                     time_ms: i,
                     delta_freq: 0,
                     message: String::new(),
+                    slot_parity: None,
                 },
             );
             push_decode_ring(&mut ring, entry, DECODE_RING_CAPACITY);
@@ -1929,8 +1982,17 @@ mod reply_tests {
 
     /// A retained decode `(OutMsg::Decode, StoredKey)` ring entry, keyed by
     /// `(message, time_ms, delta_freq)` — the exact triple `reply_to_call`
-    /// matches against.
-    fn stored(message: &str, time_ms: u32, delta_freq: u32) -> (OutMsg, StoredKey) {
+    /// matches against. `slot_parity` is stored verbatim (as the decoder
+    /// would hand it to `stored_key`, via `DecodedMessage::slot_parity`) —
+    /// most tests here don't care about parity and pass `None`; the parity
+    /// tests pass an explicit, deliberately-not-time-derived value to prove
+    /// `reply_to_call` reads it back unchanged rather than recomputing it.
+    fn stored(
+        message: &str,
+        time_ms: u32,
+        delta_freq: u32,
+        slot_parity: Option<SlotParity>,
+    ) -> (OutMsg, StoredKey) {
         let out = OutMsg::Decode {
             new: true,
             time_ms,
@@ -1942,7 +2004,7 @@ mod reply_tests {
             low_confidence: false,
             off_air: false,
         };
-        let key = stored_key(&out).expect("Decode yields a StoredKey");
+        let key = stored_key(&out, slot_parity).expect("Decode yields a StoredKey");
         (out, key)
     }
 
@@ -1964,8 +2026,8 @@ mod reply_tests {
     #[test]
     fn reply_matches_only_retained_decodes_and_extracts_cq_caller() {
         let mut ring = VecDeque::new();
-        ring.push_back(stored("CQ W1AW FN31", 45_296_000, 1302));
-        ring.push_back(stored("K1ABC W9XYZ -07", 45_296_000, 800));
+        ring.push_back(stored("CQ W1AW FN31", 45_296_000, 1302, None));
+        ring.push_back(stored("K1ABC W9XYZ -07", 45_296_000, 800, None));
         // Exact echo of a retained CQ → intent on W1AW, is_cq.
         let r = reply("CQ W1AW FN31", 45_296_000, 1302);
         let intent = reply_to_call(&r, &ring).unwrap();
@@ -1976,7 +2038,7 @@ mod reply_tests {
         // Unknown decode → None (silently dropped per protocol notes §5).
         assert!(reply_to_call(&reply("CQ NOBODY AA00", 1, 1), &ring).is_none());
         // CQ with directional prefix still extracts the caller.
-        ring.push_back(stored("CQ DX ZL1XYZ RF80", 45_297_000, 400));
+        ring.push_back(stored("CQ DX ZL1XYZ RF80", 45_297_000, 400, None));
         let r = reply("CQ DX ZL1XYZ RF80", 45_297_000, 400);
         assert_eq!(reply_to_call(&r, &ring).unwrap().callsign, "ZL1XYZ");
     }
@@ -1984,7 +2046,7 @@ mod reply_tests {
     #[test]
     fn a_reply_that_differs_in_any_key_field_does_not_match() {
         let mut ring = VecDeque::new();
-        ring.push_back(stored("CQ W1AW FN31", 45_296_000, 1302));
+        ring.push_back(stored("CQ W1AW FN31", 45_296_000, 1302, None));
         // Same message + delta_freq, different time.
         assert!(reply_to_call(&reply("CQ W1AW FN31", 45_296_001, 1302), &ring).is_none());
         // Same message + time, different delta_freq.
@@ -1997,7 +2059,7 @@ mod reply_tests {
     fn frequency_hz_is_the_audio_offset_clamped_to_the_ft8_passband() {
         let mut ring = VecDeque::new();
         // In-band offset passes through unchanged.
-        ring.push_back(stored("CQ W1AW FN31", 10, 1302));
+        ring.push_back(stored("CQ W1AW FN31", 10, 1302, None));
         assert_eq!(
             reply_to_call(&reply("CQ W1AW FN31", 10, 1302), &ring)
                 .unwrap()
@@ -2005,7 +2067,7 @@ mod reply_tests {
             1302
         );
         // Below the passband floor → clamped up to 200.
-        ring.push_back(stored("CQ K1ABC FN42", 20, 50));
+        ring.push_back(stored("CQ K1ABC FN42", 20, 50, None));
         assert_eq!(
             reply_to_call(&reply("CQ K1ABC FN42", 20, 50), &ring)
                 .unwrap()
@@ -2013,7 +2075,7 @@ mod reply_tests {
             200
         );
         // Above the passband ceiling → clamped down to 2500.
-        ring.push_back(stored("CQ N0AX EN10", 30, 9000));
+        ring.push_back(stored("CQ N0AX EN10", 30, 9000, None));
         assert_eq!(
             reply_to_call(&reply("CQ N0AX EN10", 30, 9000), &ring)
                 .unwrap()
@@ -2023,44 +2085,53 @@ mod reply_tests {
     }
 
     #[test]
-    fn dx_parity_is_the_decodes_own_slot_parity() {
+    fn dx_parity_is_the_stored_parity_carried_through_unchanged_not_rederived() {
+        // 45_296_000 ms = 45296 s; 45296 / 15 = 3019 (an ODD slot index), so a
+        // re-derivation from time_ms via SlotParity::of would yield Odd. Store
+        // Even instead — deliberately the OPPOSITE of what re-derivation would
+        // produce — and assert reply_to_call still returns Even: proof it
+        // reads the authoritative stored value, not a recomputation.
         let mut ring = VecDeque::new();
-        // 45_296_000 ms = 45296 s; 45296 / 15 = 3019 (odd slot) → Odd.
-        ring.push_back(stored("CQ W1AW FN31", 45_296_000, 1302));
+        ring.push_back(stored(
+            "CQ W1AW FN31",
+            45_296_000,
+            1302,
+            Some(SlotParity::Even),
+        ));
         assert_eq!(
             reply_to_call(&reply("CQ W1AW FN31", 45_296_000, 1302), &ring)
                 .unwrap()
                 .dx_parity,
-            Some(SlotParity::Odd)
+            Some(SlotParity::Even)
         );
-        // 30_000 ms = 30 s; 30 / 15 = 2 (even slot) → Even.
-        ring.push_back(stored("CQ K1ABC FN42", 30_000, 600));
+        // 30_000 ms = 30 s; 30 / 15 = 2 (an EVEN slot index) — store Odd,
+        // again the opposite of what re-derivation would give.
+        ring.push_back(stored("CQ K1ABC FN42", 30_000, 600, Some(SlotParity::Odd)));
         assert_eq!(
             reply_to_call(&reply("CQ K1ABC FN42", 30_000, 600), &ring)
                 .unwrap()
                 .dx_parity,
-            Some(SlotParity::Even)
+            Some(SlotParity::Odd)
         );
-    }
-
-    #[test]
-    fn decode_slot_parity_matches_slotparity_of_on_the_real_date() {
-        use chrono::TimeZone;
-        // A real decode at 2026-07-15 12:34:56.000 UTC. Its ms-since-midnight
-        // must yield the same parity `SlotParity::of` gives for the full date.
-        let full = Utc.with_ymd_and_hms(2026, 7, 15, 12, 34, 56).unwrap();
-        let time_ms = (12 * 3600 + 34 * 60 + 56) * 1000;
-        assert_eq!(decode_slot_parity(time_ms), SlotParity::of(full));
+        // No stored parity (decoder hadn't set slot_parity) ⇒ None passed
+        // through, never defaulted or re-derived.
+        ring.push_back(stored("CQ N0AX EN10", 40_000, 700, None));
+        assert_eq!(
+            reply_to_call(&reply("CQ N0AX EN10", 40_000, 700), &ring)
+                .unwrap()
+                .dx_parity,
+            None
+        );
     }
 
     #[test]
     fn qrz_is_treated_as_cq_and_extracts_the_caller() {
         let mut ring = VecDeque::new();
-        ring.push_back(stored("QRZ W1AW FN31", 45_296_000, 1302));
+        ring.push_back(stored("QRZ W1AW FN31", 45_296_000, 1302, None));
         let intent = reply_to_call(&reply("QRZ W1AW FN31", 45_296_000, 1302), &ring).unwrap();
         assert_eq!((intent.callsign.as_str(), intent.is_cq), ("W1AW", true));
         // QRZ with a directional prefix still extracts the caller.
-        ring.push_back(stored("QRZ DX ZL1XYZ RF80", 45_297_000, 400));
+        ring.push_back(stored("QRZ DX ZL1XYZ RF80", 45_297_000, 400, None));
         let intent = reply_to_call(&reply("QRZ DX ZL1XYZ RF80", 45_297_000, 400), &ring).unwrap();
         assert_eq!((intent.callsign.as_str(), intent.is_cq), ("ZL1XYZ", true));
     }
