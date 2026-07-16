@@ -214,6 +214,71 @@ then obeys the Fox's QSY instruction after being called. `Shift+X`
 toggles Fox mode itself (running your own pileup — read
 `docs/superpowers/specs/` on Fox mode before using this in anger).
 
+### …use GridTracker with pancetta?
+
+Pancetta speaks the WSJT-X-compatible UDP protocol, so GridTracker (and
+JTAlert, and most loggers) light up with pancetta's decodes, status, and
+logged QSOs — no work needed on the companion app's side. It's off by
+default; enable it in `~/.pancetta/pancetta.toml`.
+
+**Same host (pancetta and GridTracker on one machine):**
+
+```toml
+[network.wsjtx_udp]
+enabled = true
+destination = "127.0.0.1:2237"
+```
+
+Point GridTracker at `127.0.0.1` port `2237` (unicast, no multicast
+needed for same-host). Restart both after changing network settings.
+You should see pancetta's decodes appear in GridTracker's Band Activity
+and its map populate from your Status.
+
+**Cross-machine (pancetta on the rig machine "A", GridTracker on another
+machine "B" on your LAN):**
+
+```toml
+[network.wsjtx_udp]
+enabled = true
+destination = "224.0.0.73:2237"     # multicast group; GridTracker's recommended choice
+multicast_interface = "192.168.1.50" # A's real LAN NIC IP — NOT "" (loopback-only default)
+multicast_ttl = 3
+```
+
+On machine B, open GridTracker's **Settings → General**: set port
+**2237**, turn on **Multicast**, and enter the same group IP
+(`224.0.0.73`, or any `239.255.x.x`). GridTracker binds 2237 and joins
+the group on every IPv4 interface. Restart both programs after changing
+network settings.
+
+**Firewall note:** machine B's OS firewall must allow inbound UDP 2237 /
+multicast for GridTracker to receive anything. Machine A doesn't need an
+inbound rule for the emit-only direction, but the Reply/HaltTx path below
+sends back unicast to A's source port — keep that in mind if A also has a
+strict inbound firewall.
+
+**Double-click-to-call (GridTracker calling a station through pancetta):**
+GridTracker's double-click sends a `Reply` request, which is *remote TX
+initiation* — pancetta treats it with the same care as any other
+remote-TX path. It only works when **all three** of the following are
+set:
+
+```toml
+[network.wsjtx_udp]
+accept_udp_requests = true      # 1. master switch for ALL inbound requests
+allow_tx_initiation = true      # 2. Reply(4) specifically may start a QSO
+allowed_request_hosts = ["192.168.1.60"]  # 3. machine B's IP, for multicast destinations
+```
+
+Miss any one of the three and the double-click is refused (and logged —
+`Shift+D` in the TUI shows every honored and refused request under
+`remote.wsjtx`). For a unicast `destination` the peer host is inferred
+automatically, so `allowed_request_hosts` isn't needed in that case —
+but `accept_udp_requests` and `allow_tx_initiation` are still both
+required. GridTracker's "Halt TX" button (`HaltTx`) is always honored
+once `accept_udp_requests = true`, independent of `allow_tx_initiation`
+— stopping TX doesn't need the same consent as starting it.
+
 ### …see why something isn't working?
 
 1. `pancetta doctor` from a shell — config, clock, audio, decoder, rig.
