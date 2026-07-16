@@ -15,10 +15,10 @@
 pub mod codec;
 
 use std::collections::VecDeque;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Datelike, Timelike, Utc};
@@ -27,8 +27,9 @@ use tracing::{debug, info, warn};
 
 use codec::{InMsg, OutMsg};
 use pancetta_config::WsjtxUdpConfig;
+use pancetta_core::DiagnosticLevel;
 
-use crate::message_bus::{ComponentId, MessageType};
+use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType, QsoMessage};
 
 /// Heartbeat cadence (protocol notes §1: every 15s, starting immediately at
 /// boot — `tokio::time::interval`'s first tick fires immediately).
@@ -131,6 +132,12 @@ impl super::ApplicationCoordinator {
 
         let instance_id = cfg.instance_id.clone();
         let shutdown = self.shutdown_signal.clone();
+        // Task 6 (inbound dispatch): the audit trail (`emit_diagnostic`) and
+        // HaltTx's immediate-stop effect both need these — cloned here, the
+        // same pattern as every other `Arc`/`MessageBus` handoff into this
+        // spawned task.
+        let message_bus = self.message_bus.clone();
+        let abort_current_tx = self.abort_current_tx.clone();
 
         // Task 5 (QSOLogged/LoggedADIF): `qso.rs` populates this field
         // synchronously while constructing `QsoManager`, before
@@ -265,17 +272,89 @@ impl super::ApplicationCoordinator {
                             last_status = encoded;
                         }
                     }
-                    // (d) Inbound poll. Replay(7) is handled here: re-emit
-                    // every retained decode as Decode(2) with New=false,
-                    // then a Status (protocol notes §4 IN Replay). Every
-                    // other inbound message type's dispatch (Reply/HaltTx/
-                    // ...) arrives in a later task (Task 6); those datagrams
-                    // are still read (to keep the socket buffer draining)
-                    // and discarded at debug level. The timeout also
-                    // throttles this branch so the loop never busy-spins.
+                    // (d) Inbound poll: decode, gate, dispatch. Bad-magic
+                    // datagrams are dropped silently (`InMsg::decode` ->
+                    // `None`); a mismatched `id` is debug-logged and ignored
+                    // (protocol notes §5 "Id targeting" — this instance isn't
+                    // who the request was addressed to); everything else
+                    // passes through the fail-closed source gate
+                    // (`request_allowed`) before dispatch, with a Warn
+                    // diagnostic on refusal. `HaltTx` and `Replay` are
+                    // honored here; `Reply` (remote QSO initiation) is Task
+                    // 7's job — until then it's acknowledged but a no-op.
+                    // Every honored AND refused request gets a retained
+                    // `DiagnosticEvent` (design spec's audit-trail
+                    // requirement). The timeout throttles this branch so the
+                    // loop never busy-spins.
                     recv = tokio::time::timeout(INBOUND_POLL_TIMEOUT, socket.recv_from(&mut inbound_buf)) => {
                         if let Ok(Ok((n, from))) = recv {
                             match InMsg::decode(&inbound_buf[..n]) {
+                                Some((id, _msg)) if id != instance_id => {
+                                    debug!(
+                                        "WSJT-X UDP: {} inbound bytes from {} addressed to id \
+                                         {:?} (this instance is {:?}), ignored",
+                                        n, from, id, instance_id
+                                    );
+                                }
+                                Some((_id, msg)) if !request_allowed(&cfg, from.ip(), &dest) => {
+                                    emit_diagnostic(
+                                        &message_bus,
+                                        DiagnosticLevel::Warn,
+                                        format!(
+                                            "refused request from {}: {}",
+                                            from,
+                                            msg_type_label(&msg)
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                Some((_id, InMsg::HaltTx { auto_tx_only })) => {
+                                    // Drop-stale-TX / emergency-stop posture:
+                                    // the abort flag is set unconditionally
+                                    // and immediately — the TX worker's
+                                    // `interruptible_sleep` wakes within
+                                    // ~50ms regardless of `AutoTxOnly`
+                                    // (protocol notes §4 IN HaltTx: "false =
+                                    // stop TX immediately; true = only
+                                    // disable auto-transmit" — the in-flight
+                                    // transmission itself is stopped either
+                                    // way; `AutoTxOnly=true` only skips
+                                    // clearing the QSO/CQ *sources* below).
+                                    abort_current_tx.store(true, Ordering::Release);
+                                    if !auto_tx_only {
+                                        let cancel_all = ComponentMessage::new(
+                                            ComponentId::WsjtxUdp,
+                                            ComponentId::Qso,
+                                            MessageType::QsoMessage(QsoMessage::CancelAllQsos),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(cancel_all).await {
+                                            warn!(
+                                                "WSJT-X UDP: HaltTx: failed to send \
+                                                 CancelAllQsos: {e}"
+                                            );
+                                        }
+                                        let stop_cq = ComponentMessage::new(
+                                            ComponentId::WsjtxUdp,
+                                            ComponentId::Qso,
+                                            MessageType::QsoMessage(QsoMessage::StopCq),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(stop_cq).await {
+                                            warn!(
+                                                "WSJT-X UDP: HaltTx: failed to send StopCq: {e}"
+                                            );
+                                        }
+                                    }
+                                    emit_diagnostic(
+                                        &message_bus,
+                                        DiagnosticLevel::Info,
+                                        format!(
+                                            "HaltTx from {from} honored (AutoTxOnly={auto_tx_only})"
+                                        ),
+                                    )
+                                    .await;
+                                }
                                 Some((_id, InMsg::Replay)) => {
                                     for (out, _key) in &decode_ring {
                                         if let Some(replay) = as_replay(out) {
@@ -292,11 +371,35 @@ impl super::ApplicationCoordinator {
                                         warn!("WSJT-X UDP: post-replay status send failed: {e}");
                                     }
                                     last_status = encoded;
+                                    emit_diagnostic(
+                                        &message_bus,
+                                        DiagnosticLevel::Info,
+                                        format!("Replay from {from} honored"),
+                                    )
+                                    .await;
                                 }
-                                Some(_) => {
+                                Some((_id, InMsg::Reply { .. })) => {
+                                    // Task 7 wires actual QSO initiation
+                                    // (gates 2/4/5 of the design spec's
+                                    // five-gate model). Until then, a Reply
+                                    // that passed gates 1+3 is acknowledged
+                                    // but does nothing.
+                                    emit_diagnostic(
+                                        &message_bus,
+                                        DiagnosticLevel::Info,
+                                        format!(
+                                            "Reply received from {from} but remote QSO \
+                                             initiation is not implemented yet"
+                                        ),
+                                    )
+                                    .await;
+                                }
+                                Some((_id, msg)) => {
                                     debug!(
-                                        "WSJT-X UDP: {} inbound bytes from {} (dispatch not wired yet, Task 6)",
-                                        n, from
+                                        "WSJT-X UDP: {} inbound bytes from {} ({}), no action",
+                                        n,
+                                        from,
+                                        msg_type_label(&msg)
                                     );
                                 }
                                 None => {
@@ -790,6 +893,92 @@ pub(crate) fn multicast_options(
     })
 }
 
+/// Whether `dest` is a multicast destination, for gating purposes. Deliberately
+/// broader than [`multicast_options`]'s IPv4-only scope (that function derives
+/// *socket options*, which v1 only ever applies to IPv4 — design spec
+/// non-goals: "IPv6"): here an IPv6 multicast destination must still be
+/// treated as multicast so [`request_allowed`] routes it through the
+/// allowlist check rather than falling through to the (never-true) unicast
+/// host-equality branch. Fail-closed: when in doubt, this leans toward
+/// "multicast" (the stricter, allowlist-gated path), never toward "unicast"
+/// (the looser, single-peer path).
+fn is_multicast_dest(dest: &SocketAddr) -> bool {
+    match dest {
+        SocketAddr::V4(v4) => v4.ip().is_multicast(),
+        SocketAddr::V6(v6) => v6.ip().is_multicast(),
+    }
+}
+
+/// Fail-closed source gate for every inbound WSJT-X UDP request
+/// (Reply/HaltTx/Replay/...) — design spec's gates 1 ("master switch") and 3
+/// ("source filtering"), ANDed. Pure and side-effect-free (no I/O, no
+/// atomics) so it is exhaustively unit-tested in isolation; the inbound-poll
+/// arm of `start_wsjtx_udp_component`'s select loop is the only caller and
+/// checks this before dispatching anything.
+///
+/// - `accept_udp_requests == false` ⇒ always refuse (repo invariant: the
+///   armed-TX gate — and every gate feeding it — fails CLOSED; this is gate
+///   1, the master switch, and is checked first so every other branch below
+///   is unreachable while it's off).
+/// - `dest` unicast ⇒ allow only when `src` is exactly the configured
+///   destination host (the only peer that could plausibly be the companion
+///   app WSJT-X-role datagrams are being sent to).
+/// - `dest` multicast ⇒ allow only when `src` is in `allowed_request_hosts`.
+///   An empty allowlist refuses every request (never defaults to allowing
+///   "everyone on the multicast group") — the operator must opt a host in
+///   explicitly.
+pub(crate) fn request_allowed(cfg: &WsjtxUdpConfig, src: IpAddr, dest: &SocketAddr) -> bool {
+    if !cfg.accept_udp_requests {
+        return false;
+    }
+    if is_multicast_dest(dest) {
+        cfg.allowed_request_hosts
+            .iter()
+            .any(|host| host.parse::<IpAddr>().map(|ip| ip == src).unwrap_or(false))
+    } else {
+        src == dest.ip()
+    }
+}
+
+/// Short label for an inbound message type, for diagnostic/debug text.
+/// `Other` includes the raw numeric type id since there's no name for it.
+fn msg_type_label(msg: &InMsg) -> String {
+    match msg {
+        InMsg::Heartbeat { .. } => "Heartbeat".to_string(),
+        InMsg::Clear { .. } => "Clear".to_string(),
+        InMsg::Reply { .. } => "Reply".to_string(),
+        InMsg::Close => "Close".to_string(),
+        InMsg::Replay => "Replay".to_string(),
+        InMsg::HaltTx { .. } => "HaltTx".to_string(),
+        InMsg::Other(t) => format!("Other({t})"),
+    }
+}
+
+/// Send a `DiagnosticEvent` to the TUI's retained Diagnostics overlay
+/// (Shift+D) with `target: "remote.wsjtx"` — the audit trail the design spec
+/// requires for every honored *and* every refused inbound request. Mirrors
+/// `tx.rs`'s `emit_diagnostic` (same message shape, same best-effort "never
+/// blocks/fails the caller" contract); this component has its own copy
+/// because it's the only one that needs `target: "remote.wsjtx"` and there's
+/// no shared coordinator-wide helper to call instead.
+async fn emit_diagnostic(message_bus: &MessageBus, level: DiagnosticLevel, text: String) {
+    let msg = ComponentMessage::new(
+        ComponentId::WsjtxUdp,
+        ComponentId::Tui,
+        MessageType::DiagnosticEvent {
+            target: "remote.wsjtx",
+            level,
+            text,
+            qso_id: None,
+            callsign: None,
+        },
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(msg).await {
+        debug!("WSJT-X UDP: DiagnosticEvent relay failed (no TUI?): {e}");
+    }
+}
+
 /// Open the WSJT-X-role UDP socket: bind an ephemeral local port, apply
 /// multicast options when the configured destination is a multicast group,
 /// and set non-blocking so the tokio-wrapped socket can be polled in the
@@ -895,6 +1084,53 @@ mod socket_tests {
         // socket, confirming it doesn't error for a multicast destination.
         let socket = open_socket(&cfg).expect("multicast open_socket should succeed");
         assert_ne!(socket.local_addr().unwrap().port(), 0);
+    }
+}
+
+#[cfg(test)]
+mod gate_tests {
+    use super::*;
+
+    #[test]
+    fn request_gate_is_fail_closed() {
+        let mut cfg = WsjtxUdpConfig::default();
+        let dest: SocketAddr = "192.168.1.20:2237".parse().unwrap();
+        let peer: IpAddr = "192.168.1.20".parse().unwrap();
+        let stranger: IpAddr = "192.168.1.99".parse().unwrap();
+        assert!(!request_allowed(&cfg, peer, &dest)); // master off
+        cfg.accept_udp_requests = true;
+        assert!(request_allowed(&cfg, peer, &dest)); // unicast: peer == dest host
+        assert!(!request_allowed(&cfg, stranger, &dest));
+        let mcast: SocketAddr = "224.0.0.73:2237".parse().unwrap();
+        assert!(!request_allowed(&cfg, peer, &mcast)); // multicast + empty allowlist ⇒ refuse
+        cfg.allowed_request_hosts = vec!["192.168.1.20".into()];
+        assert!(request_allowed(&cfg, peer, &mcast));
+    }
+
+    #[test]
+    fn unicast_stranger_is_refused_even_with_master_on() {
+        let mut cfg = WsjtxUdpConfig::default();
+        cfg.accept_udp_requests = true;
+        let dest: SocketAddr = "192.168.1.20:2237".parse().unwrap();
+        let stranger: IpAddr = "10.0.0.1".parse().unwrap();
+        assert!(!request_allowed(&cfg, stranger, &dest));
+    }
+
+    #[test]
+    fn multicast_allowlist_only_admits_listed_hosts() {
+        let mut cfg = WsjtxUdpConfig {
+            accept_udp_requests: true,
+            allowed_request_hosts: vec!["192.168.1.20".into()],
+            ..WsjtxUdpConfig::default()
+        };
+        let mcast: SocketAddr = "224.0.0.73:2237".parse().unwrap();
+        let listed: IpAddr = "192.168.1.20".parse().unwrap();
+        let unlisted: IpAddr = "192.168.1.21".parse().unwrap();
+        assert!(request_allowed(&cfg, listed, &mcast));
+        assert!(!request_allowed(&cfg, unlisted, &mcast));
+        // A malformed allowlist entry must not panic or accidentally match.
+        cfg.allowed_request_hosts = vec!["not-an-ip".into()];
+        assert!(!request_allowed(&cfg, listed, &mcast));
     }
 }
 
