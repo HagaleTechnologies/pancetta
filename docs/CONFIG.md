@@ -239,9 +239,9 @@ username = ""
 password = ""        # plaintext on disk
 
 [network.lotw]
-enabled  = false
-username = ""
-password = ""        # plaintext on disk
+enabled          = false
+tqsl_path        = ""   # path to your installed tqsl binary
+station_location = ""   # must match a "Station Location" name in TQSL
 
 [network.psk_reporter]
 enabled        = true   # Local-only spotter; no credentials
@@ -253,12 +253,12 @@ integration enabled by default — your local copy contributes spots
 back to the global PSKReporter database, which makes you reciprocally
 visible for spot lookups.
 
-LoTW credential handling refuses to send the username/password unless
-`base_url` is `https://`. This matches the real LoTW endpoint
-(`https://lotw.arrl.org`) and protects you from a typo or hostile
-config override that would otherwise transmit credentials in cleartext.
+LoTW has no username/password/`base_url` fields — unlike the other
+integrations, pancetta never talks to LoTW's servers directly. It shells
+out to your locally-installed `tqsl` binary, which signs the QSO record
+with your TQSL certificate and handles the actual upload itself.
 
-### Per-QSO log upload — ClubLog and QRZ Logbook
+### Per-QSO log upload — ClubLog, QRZ Logbook, and LoTW
 
 When a QSO completes, pancetta can upload that single QSO (as one ADIF
 record) straight to your online logbooks. Both integrations are
@@ -268,10 +268,13 @@ block or fail the QSO pipeline; results are logged under the
 this file and never logged. Keep the file readable only by you:
 `chmod 600 ~/.pancetta/pancetta.toml`.
 
-> **LoTW auto-upload is deferred.** Unlike ClubLog/QRZ, LoTW requires
-> each record to be digitally signed with your TQSL certificate, not a
-> raw ADIF POST, so per-QSO LoTW upload is not yet wired. Point WSJT-X /
-> TQSL at `~/.pancetta/qsos.adi` for LoTW in the meantime.
+> **LoTW auto-upload works differently from ClubLog/QRZ.** Each record
+> must be digitally signed with your TQSL certificate, not a raw ADIF
+> POST — so instead of an HTTP client, pancetta shells out to your
+> locally-installed `tqsl` binary per completed QSO (`[network.lotw]`
+> above). If `tqsl` is missing or fails, the upload is skipped
+> best-effort, same as ClubLog/QRZ. `~/.pancetta/qsos.adi` remains
+> available if you'd rather point WSJT-X / TQSL at it manually.
 
 ```toml
 [network.clublog]
