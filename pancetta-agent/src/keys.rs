@@ -13,7 +13,6 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::io::Write as _;
-use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt};
 use std::path::Path;
 
 use base64::Engine as _;
@@ -32,6 +31,63 @@ const ED25519_SPKI_PREFIX: [u8; 12] = [
 
 const IDENTITY_KEY_FILE: &str = "identity.key";
 const AGREEMENT_KEY_FILE: &str = "agreement.key";
+
+/// Platform-specific key-directory/key-file hardening.
+///
+/// Unix has POSIX permission bits, so we tighten a key directory to 0700 and
+/// key files to 0600. Windows has no equivalent bit-mode API in `std`; NTFS
+/// access control is ACL-based, and a file created under the user's own
+/// per-user config directory (where the agent always stores keys) already
+/// inherits ACLs granting access to that user, Administrators, and SYSTEM
+/// only — no other local account can read it by default. So the Windows arm
+/// is deliberately a no-op rather than a false sense of parity with 0600:
+/// full ACL hardening (matching Unix's belt-and-suspenders re-tightening on
+/// every persist) would need an explicit ACL-manipulation dependency and is
+/// tracked as a follow-up, not attempted here.
+mod perms {
+    use std::io;
+    use std::path::Path;
+
+    /// Tighten `dir`'s permissions to 0700 (owner rwx only) on Unix.
+    #[cfg(unix)]
+    pub(super) fn tighten_dir(dir: &Path) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn tighten_dir(_dir: &Path) -> io::Result<()> {
+        Ok(())
+    }
+
+    /// Open `path` for writing, created with mode 0600 on Unix (no umask-wide
+    /// window between create and chmod). On Windows, plain `OpenOptions`
+    /// (relies on the parent directory's inherited ACLs — see the module doc).
+    pub(super) fn create_key_file(path: &Path) -> io::Result<std::fs::File> {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        opts.open(path)
+    }
+
+    /// Belt-and-suspenders re-tightening of `path` to 0600 on Unix, for the
+    /// re-persist (pre-existing file) case where the create-mode above is a
+    /// no-op. No-op on Windows — see the module doc.
+    #[cfg(unix)]
+    pub(super) fn tighten_file(path: &Path) -> io::Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
+    }
+
+    #[cfg(not(unix))]
+    pub(super) fn tighten_file(_path: &Path) -> io::Result<()> {
+        Ok(())
+    }
+}
 
 /// Errors from loading/persisting/using an [`AgentIdentity`].
 #[derive(Debug, thiserror::Error)]
@@ -114,7 +170,7 @@ impl AgentIdentity {
         })?;
         // Tighten to 0700 unconditionally — a pre-existing key dir may have been
         // created with looser (umask-default) perms before we owned it.
-        fs::set_permissions(dir, fs::Permissions::from_mode(0o700)).map_err(|e| KeyError::Io {
+        perms::tighten_dir(dir).map_err(|e| KeyError::Io {
             path: dir.display().to_string(),
             source: e,
         })?;
@@ -217,17 +273,11 @@ fn write_key_file(path: &Path, bytes: &[u8; 32]) -> Result<(), KeyError> {
         path: path.display().to_string(),
         source: e,
     };
-    let mut f = fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(io_err)?;
+    let mut f = perms::create_key_file(path).map_err(io_err)?;
     f.write_all(bytes).map_err(io_err)?;
     // Belt-and-suspenders for the re-persist (pre-existing file) case, where the
     // create-mode above is a no-op.
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(io_err)?;
+    perms::tighten_file(path).map_err(io_err)?;
     Ok(())
 }
 
@@ -235,6 +285,8 @@ fn write_key_file(path: &Path, bytes: &[u8; 32]) -> Result<(), KeyError> {
 mod tests {
     use super::*;
     use ed25519_dalek::{Signature, Verifier};
+    #[cfg(unix)]
+    use std::os::unix::fs::PermissionsExt;
 
     fn temp_dir(name: &str) -> std::path::PathBuf {
         let mut p = std::env::temp_dir();
@@ -275,6 +327,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn persisted_key_files_are_mode_0600() {
         let dir = temp_dir("perms");
         let _ = AgentIdentity::load_or_generate(&dir).unwrap();
@@ -291,6 +344,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn persist_tightens_a_preexisting_world_readable_dir() {
         // A key dir that already exists with loose (0755) perms must be tightened
         // to 0700 on persist — the TOCTOU-hardening path.
@@ -314,6 +368,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)]
     fn write_key_file_creates_with_0600_never_umask_wide() {
         // Directly exercise write_key_file into a fresh path: the file must be
         // 0600 immediately (created with the mode, not chmod'd after a wide open).
