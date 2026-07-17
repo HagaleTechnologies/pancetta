@@ -3159,6 +3159,7 @@ impl QsoManager {
                     frequency,
                     now,
                     self.config.duplicate_checking.time_window_hours,
+                    self.config.duplicate_checking.check_frequency,
                 )
                 .await
             {

@@ -631,30 +631,56 @@ impl QsoDatabase {
         })
     }
 
-    /// Check for duplicate QSOs
+    /// Check for duplicate QSOs.
+    ///
+    /// `check_frequency` mirrors `QsoManager`'s in-memory check: when `true`,
+    /// only a re-call within 50 Hz of the same RF frequency counts as a
+    /// duplicate; when `false`, any re-call of the same callsign within the
+    /// time window counts, regardless of frequency. Both paths must apply
+    /// the same semantics — a QSO that ages out of the in-memory working set
+    /// (e.g. after `cleanup_completed_qsos`) falls through to this DB-only
+    /// check, and previously it ignored `check_frequency` entirely (always
+    /// requiring proximity), silently reverting an operator's
+    /// `check_frequency = false` setting once a QSO left memory.
     pub async fn check_duplicate(
         &self,
         callsign: &str,
         frequency: f64,
         start_time: DateTime<Utc>,
         time_window_hours: u32,
+        check_frequency: bool,
     ) -> Result<Option<QsoId>, AsyncDatabaseError> {
         let time_threshold = start_time - chrono::Duration::hours(time_window_hours as i64);
 
-        let duplicate_id: Option<String> = sqlx::query_scalar(
-            "SELECT qso_id FROM qsos 
-             WHERE json_extract(metadata, '$.their_callsign') = ?
-             AND ABS(json_extract(metadata, '$.frequency') - ?) < 100.0
-             AND datetime(json_extract(metadata, '$.start_time')) > datetime(?)
-             AND datetime(json_extract(metadata, '$.start_time')) < datetime(?)
-             LIMIT 1",
-        )
-        .bind(callsign)
-        .bind(frequency)
-        .bind(time_threshold.to_rfc3339())
-        .bind(start_time.to_rfc3339())
-        .fetch_optional(&self.pool)
-        .await?;
+        let duplicate_id: Option<String> = if check_frequency {
+            sqlx::query_scalar(
+                "SELECT qso_id FROM qsos
+                 WHERE json_extract(metadata, '$.their_callsign') = ?
+                 AND ABS(json_extract(metadata, '$.frequency') - ?) < 50.0
+                 AND datetime(json_extract(metadata, '$.start_time')) > datetime(?)
+                 AND datetime(json_extract(metadata, '$.start_time')) < datetime(?)
+                 LIMIT 1",
+            )
+            .bind(callsign)
+            .bind(frequency)
+            .bind(time_threshold.to_rfc3339())
+            .bind(start_time.to_rfc3339())
+            .fetch_optional(&self.pool)
+            .await?
+        } else {
+            sqlx::query_scalar(
+                "SELECT qso_id FROM qsos
+                 WHERE json_extract(metadata, '$.their_callsign') = ?
+                 AND datetime(json_extract(metadata, '$.start_time')) > datetime(?)
+                 AND datetime(json_extract(metadata, '$.start_time')) < datetime(?)
+                 LIMIT 1",
+            )
+            .bind(callsign)
+            .bind(time_threshold.to_rfc3339())
+            .bind(start_time.to_rfc3339())
+            .fetch_optional(&self.pool)
+            .await?
+        };
 
         if let Some(id_str) = duplicate_id {
             if let Ok(qso_id) = Uuid::parse_str(&id_str) {
@@ -1052,6 +1078,121 @@ mod tests {
         // Get QSO back
         let retrieved = db.get_qso(progress.metadata.qso_id).await.unwrap();
         assert_eq!(retrieved.metadata.qso_id, progress.metadata.qso_id);
+    }
+
+    fn duplicate_check_test_progress(callsign: &str, frequency: f64) -> QsoProgress {
+        QsoProgress {
+            state: QsoState::Idle,
+            state_history: vec![],
+            messages: vec![],
+            metadata: QsoMetadata {
+                qso_id: Uuid::new_v4(),
+                our_callsign: "W1ABC".to_string(),
+                their_callsign: Some(callsign.to_string()),
+                frequency,
+                mode: "FT8".to_string(),
+                // Strictly in the past relative to a check_duplicate call
+                // made moments after insert — the query's upper time bound
+                // is `datetime(existing_start_time) < datetime(query_now)`,
+                // and SQLite's `datetime()` truncates to whole-second
+                // granularity, so `Utc::now()` for both would risk landing
+                // in the same second and failing the strict `<`.
+                start_time: Utc::now() - chrono::Duration::minutes(5),
+                end_time: None,
+                reports: SignalReports::default(),
+                grids: GridSquares::default(),
+                contest_info: None,
+                tags: HashMap::new(),
+                notes: None,
+                tx_parity: None,
+                initiated_by: Default::default(),
+                role: Default::default(),
+                call_count: 0,
+                first_call_at: None,
+                last_call_at: None,
+                progressed_this_cycle: false,
+                last_rx_text: None,
+                dx_repeat_count: 0,
+                hound: false,
+                partner_freq: None,
+                hound_qsyed: false,
+                remote_origin: false,
+            },
+        }
+    }
+
+    // Regression tests for #137: the persistent-DB check_duplicate path used
+    // to unconditionally require frequency proximity (100 Hz), ignoring
+    // check_frequency entirely — so an operator who set check_frequency =
+    // false to get strict one-QSO-per-callsign-per-window behavior would
+    // silently get frequency-gated behavior back the moment the QSO aged out
+    // of the in-memory working set. These three cases mirror QsoManager's
+    // in-memory check_duplicate semantics exactly (50 Hz threshold, same
+    // check_frequency branching).
+
+    #[tokio::test]
+    async fn check_duplicate_with_check_frequency_true_requires_proximity() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        let progress = duplicate_check_test_progress("K2DEF", 14074000.0);
+        db.insert_qso(&progress).await.unwrap();
+
+        // Same callsign, 200 Hz away, check_frequency=true — not a duplicate.
+        let far = db
+            .check_duplicate("K2DEF", 14074200.0, Utc::now(), 24, true)
+            .await
+            .unwrap();
+        assert!(
+            far.is_none(),
+            "200 Hz away must not count as a duplicate when check_frequency=true"
+        );
+
+        // Same callsign, 10 Hz away, check_frequency=true — a duplicate.
+        let near = db
+            .check_duplicate("K2DEF", 14074010.0, Utc::now(), 24, true)
+            .await
+            .unwrap();
+        assert!(
+            near.is_some(),
+            "10 Hz away must count as a duplicate when check_frequency=true"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_duplicate_with_check_frequency_false_ignores_frequency() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        let progress = duplicate_check_test_progress("K2DEF", 14074000.0);
+        db.insert_qso(&progress).await.unwrap();
+
+        // Same callsign, 200 Hz away, check_frequency=false — still a
+        // duplicate. This is the exact case #137 reported broken: the old
+        // unconditional 100 Hz SQL filter would have returned None here.
+        let far = db
+            .check_duplicate("K2DEF", 14074200.0, Utc::now(), 24, false)
+            .await
+            .unwrap();
+        assert!(
+            far.is_some(),
+            "200 Hz away must still count as a duplicate when check_frequency=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn check_duplicate_matches_in_memory_50hz_threshold_not_100hz() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        let progress = duplicate_check_test_progress("K2DEF", 14074000.0);
+        db.insert_qso(&progress).await.unwrap();
+
+        // 75 Hz away: outside the in-memory path's 50 Hz threshold, so the
+        // DB path must now agree (not a duplicate) rather than using the old
+        // 100 Hz threshold (which would have wrongly said "duplicate").
+        let mid = db
+            .check_duplicate("K2DEF", 14074075.0, Utc::now(), 24, true)
+            .await
+            .unwrap();
+        assert!(
+            mid.is_none(),
+            "75 Hz away must not count as a duplicate — must match the in-memory 50 Hz threshold, not the old 100 Hz one"
+        );
     }
 
     #[tokio::test]

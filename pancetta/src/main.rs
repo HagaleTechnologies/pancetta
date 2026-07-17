@@ -204,7 +204,7 @@ struct TestAudioArgs {
 #[derive(Clone, Args)]
 struct ConfigArgs {
     /// Validate configuration and exit
-    #[arg(short, long)]
+    #[arg(long)]
     validate: bool,
 
     /// Show current configuration

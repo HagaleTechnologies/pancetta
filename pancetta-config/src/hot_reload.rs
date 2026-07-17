@@ -23,6 +23,11 @@ pub struct ConfigReloadEvent {
     pub config: Option<Config>,
     /// Error message (if reload failed)
     pub error: Option<String>,
+    /// Non-fatal load warnings (e.g. an unrecognized top-level config
+    /// section) from this reload. Empty on a clean load or a failed reload
+    /// (`error.is_some()`) — a failed load has no config to have warned
+    /// about beyond the fatal error itself.
+    pub warnings: Vec<String>,
     /// Timestamp of the event
     pub timestamp: Instant,
 }
@@ -123,8 +128,13 @@ impl ConfigHotReload {
 
                                 // Perform reload
                                 match Self::reload_config(&config_path, validate).await {
-                                    Ok(new_config) => {
+                                    Ok((new_config, warnings)) => {
                                         info!("Configuration reloaded successfully");
+                                        if !warnings.is_empty() {
+                                            for w in &warnings {
+                                                tracing::warn!("Config reload warning: {}", w);
+                                            }
+                                        }
 
                                         // Update configuration
                                         {
@@ -149,6 +159,7 @@ impl ConfigHotReload {
                                             path: config_path.clone(),
                                             config: Some(new_config),
                                             error: None,
+                                            warnings,
                                             timestamp: Instant::now(),
                                         };
 
@@ -164,6 +175,7 @@ impl ConfigHotReload {
                                             path: config_path.clone(),
                                             config: None,
                                             error: Some(e.to_string()),
+                                            warnings: Vec::new(),
                                             timestamp: Instant::now(),
                                         };
 
@@ -232,6 +244,7 @@ impl ConfigHotReload {
                 path: self.config_path.clone(),
                 config: Some(good_config),
                 error: None,
+                warnings: Vec::new(),
                 timestamp: Instant::now(),
             };
 
@@ -266,13 +279,16 @@ impl ConfigHotReload {
         }
     }
 
-    /// Reload configuration from file
-    async fn reload_config(path: &Path, validate: bool) -> Result<Config> {
+    /// Reload configuration from file, along with any non-fatal load
+    /// warnings (e.g. an unrecognized top-level config section) — the same
+    /// warnings the startup path (`Config::load_default_with_warnings`)
+    /// surfaces, so a live reload doesn't silently drop them.
+    async fn reload_config(path: &Path, validate: bool) -> Result<(Config, Vec<String>)> {
         debug!("Reloading configuration from: {}", path.display());
 
         // Load new configuration
-        let new_config =
-            Config::load_from_file(path).context("Failed to load configuration file")?;
+        let (new_config, warnings) = Config::load_from_file_with_warnings(path)
+            .context("Failed to load configuration file")?;
 
         // Validate if requested
         if validate {
@@ -281,7 +297,7 @@ impl ConfigHotReload {
                 .context("Configuration validation failed")?;
         }
 
-        Ok(new_config)
+        Ok((new_config, warnings))
     }
 }
 
@@ -407,6 +423,36 @@ mod tests {
         // Check current config
         let current = manager.get_config().await;
         assert_eq!(current.station.callsign, "TEST2");
+    }
+
+    #[tokio::test]
+    async fn reload_config_surfaces_unknown_section_warnings() {
+        // Regression test: reload_config used to call Config::load_from_file
+        // (discarding the loader's warnings) instead of the _with_warnings
+        // variant, so an unrecognized section on a live reload never
+        // reached the caller — only a startup load's warnings did.
+        let temp_file = NamedTempFile::new().unwrap();
+        let path = temp_file.path();
+        std::fs::write(
+            path,
+            r#"
+[station]
+callsign = "N0CALL"
+
+[autonomous_operator]
+enabled = true
+"#,
+        )
+        .unwrap();
+
+        let (config, warnings) = ConfigHotReload::reload_config(path, false).await.unwrap();
+        assert_eq!(config.station.callsign, "N0CALL");
+        assert_eq!(
+            warnings.len(),
+            1,
+            "unknown [autonomous_operator] section must warn: {warnings:?}"
+        );
+        assert!(warnings[0].contains("autonomous_operator"));
     }
 
     #[tokio::test]

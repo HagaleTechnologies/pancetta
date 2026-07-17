@@ -238,6 +238,21 @@ impl Config {
         loader.load_from_file(path)
     }
 
+    /// Load configuration from a specific file, additionally returning any
+    /// non-fatal load warnings (e.g. an unrecognized top-level config
+    /// section). See [`load_default_with_warnings`](Self::load_default_with_warnings)
+    /// for the equivalent startup-path variant — this is the one hot-reload
+    /// callers should use so the same warnings that reach the TUI at startup
+    /// also reach it on a live reload.
+    pub fn load_from_file_with_warnings<P: AsRef<std::path::Path>>(
+        path: P,
+    ) -> ConfigResult<(Self, Vec<String>)> {
+        let loader = ConfigLoader::new()?;
+        let config = loader.load_from_file(path)?;
+        let warnings = loader.load_warnings();
+        Ok((config, warnings))
+    }
+
     /// Validate the entire configuration
     pub fn validate(&self) -> ConfigResult<()> {
         debug!("Validating configuration");
