@@ -978,6 +978,146 @@ mod tests {
     }
 
     #[test]
+    fn docs_psk_reporter_minimal_example_fails_without_full_fields() {
+        // Regression guard for the exact bug CONFIG.md's old example shipped:
+        // PskReporterConfig has no per-field defaults, so a partial table
+        // (just enabled + a nonexistent `report_decodes` key) does NOT fall
+        // back to defaults -- it's a hard parse error. If this ever starts
+        // parsing OK, PskReporterConfig gained #[serde(default)] support and
+        // CONFIG.md's "don't write a partial block" warning is stale.
+        let loader = ConfigLoader::new().unwrap();
+        let toml_content = r#"
+[network.psk_reporter]
+enabled        = true
+report_decodes = true
+"#;
+        assert!(
+            loader.parse_toml(toml_content).is_err(),
+            "PskReporterConfig unexpectedly accepted a partial table -- \
+             update CONFIG.md's \"don't write a partial block\" warning"
+        );
+    }
+
+    #[test]
+    fn docs_psk_reporter_full_example_parses() {
+        // The exact "Customizing PSKReporter" block from CONFIG.md -- must
+        // stay parseable and must match PskReporterConfig::default() field
+        // for field (asserted below), since the doc claims these ARE the
+        // real defaults.
+        let loader = ConfigLoader::new().unwrap();
+        let toml_content = r#"
+[network.psk_reporter]
+enabled                  = false
+server_url               = "https://pskreporter.info/cgi-bin/pskdata.pl"
+upload_interval_seconds  = 300
+batch_size               = 50
+include_receives         = true
+include_transmits        = true
+min_snr_db               = -20.0
+max_age_hours            = 24
+frequency_accuracy_hz    = 1
+
+[network.psk_reporter.reporter_info]
+software_name    = "Pancetta"
+software_version = "0.9.5"
+
+[network.psk_reporter.filters]
+enabled_modes = ["PSK31", "PSK63", "FT8", "FT4", "JS8"]
+enabled_bands = ["40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m"]
+
+[network.psk_reporter.filters.geographic]
+include_dxcc = []
+exclude_dxcc = []
+include_itu_zones = []
+exclude_itu_zones = []
+include_cq_zones = []
+exclude_cq_zones = []
+
+[network.psk_reporter.filters.geographic.distance]
+great_circle = true
+"#;
+        let parsed = loader.parse_toml(toml_content).unwrap();
+        // software_version is hardcoded "0.9.5" in the doc (informational
+        // only, per the doc's own comment); everything else must match
+        // Default::default() exactly, so compare with that field zeroed.
+        let mut expected = crate::network::PskReporterConfig::default();
+        expected.reporter_info.software_version = "0.9.5".to_string();
+        assert_eq!(
+            toml::to_string(&parsed.network.psk_reporter).unwrap(),
+            toml::to_string(&expected).unwrap(),
+            "CONFIG.md's psk_reporter block has drifted from PskReporterConfig::default()"
+        );
+    }
+
+    #[test]
+    fn docs_cqdx_full_example_parses_and_matches_defaults() {
+        // The exact [network.cqdx] block from CONFIG.md -- CqdxConfig also
+        // has no per-field defaults (see the doc's note), so every field
+        // must be present, and the doc claims these values ARE the real
+        // defaults.
+        let loader = ConfigLoader::new().unwrap();
+        let toml_content = r#"
+[network.cqdx]
+enabled             = false
+token               = ""
+base_url            = "https://cqdx.io"
+poll_interval_secs  = 30
+"#;
+        let parsed = loader.parse_toml(toml_content).unwrap();
+        assert!(!parsed.network.cqdx.enabled);
+        assert_eq!(parsed.network.cqdx.base_url, "https://cqdx.io");
+        assert_eq!(parsed.network.cqdx.poll_interval_secs, 30);
+        assert_eq!(
+            parsed.network.cqdx.base_url,
+            crate::network::CqdxConfig::default().base_url
+        );
+        assert_eq!(
+            parsed.network.cqdx.poll_interval_secs,
+            crate::network::CqdxConfig::default().poll_interval_secs
+        );
+    }
+
+    #[test]
+    fn docs_qrz_section_name_is_qrz_xml_not_qrz() {
+        // Regression guard for a real bug: CONFIG.md used to document
+        // `[network.qrz]`, but the real field/section is `qrz_xml` --
+        // `NetworkConfig` has no `qrz` field at all, so `[network.qrz]` is
+        // silently ignored as an unrecognized section (warned, not fatal)
+        // and QRZ XML lookup never actually gets configured.
+        let loader = ConfigLoader::new().unwrap();
+        let wrong_section = loader
+            .parse_toml(
+                r#"
+[network.qrz]
+enabled  = true
+username = "N0CALL"
+password = "secret"
+"#,
+            )
+            .unwrap();
+        assert!(
+            !wrong_section.network.qrz_xml.enabled,
+            "a [network.qrz] section must NOT configure qrz_xml -- if this \
+             now passes, NetworkConfig gained a real `qrz` field and \
+             CONFIG.md's warning about the old wrong section name is stale"
+        );
+
+        // The corrected section name from CONFIG.md's example.
+        let right_section = loader
+            .parse_toml(
+                r#"
+[network.qrz_xml]
+enabled  = true
+username = "N0CALL"
+password = "secret"
+"#,
+            )
+            .unwrap();
+        assert!(right_section.network.qrz_xml.enabled);
+        assert_eq!(right_section.network.qrz_xml.username, "N0CALL");
+    }
+
+    #[test]
     fn test_unknown_top_level_section_warns() {
         let loader = ConfigLoader::new().unwrap();
         // The exact ghost sections CONFIG.md used to document.
