@@ -7,7 +7,8 @@ fn main() {
     // Only compile the C library if the vendor source files are present
     // (they may be absent in worktrees where the git submodule is not initialized)
     if std::path::Path::new(&constants_path).exists() {
-        cc::Build::new()
+        let mut build = cc::Build::new();
+        build
             .files([
                 constants_path,
                 format!("{}/ft8/encode.c", ft8_dir),
@@ -27,8 +28,22 @@ fn main() {
             // actual output macro) to a no-op before debug.h sees it.
             .flag("-DLOG_PRINTF(...)=")
             .warnings(false)
-            .opt_level(2)
-            .compile("ft8_lib");
+            .opt_level(2);
+
+        // MinGW's <string.h> doesn't reliably declare `stpcpy` (used by
+        // message.c) on current toolchain versions, and GCC 14+ makes an
+        // implicit function declaration a hard error — worse, it would
+        // default to `int stpcpy()`, truncating the real 64-bit pointer
+        // return. Force-include our own correct prototype for this target
+        // only; Linux/macOS already declare it via their own libc headers.
+        if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
+            let manifest_dir =
+                std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
+            let shim_path = std::path::Path::new(&manifest_dir).join("mingw_stpcpy_shim.h");
+            build.flag("-include").flag(shim_path.to_str().unwrap());
+        }
+
+        build.compile("ft8_lib");
     } else {
         // ft8_lib vendor sources not found — using pure-Rust decoder instead.
         // Signal to the Rust code that stubs should be used instead of real FFI.
