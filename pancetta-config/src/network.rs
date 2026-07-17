@@ -68,6 +68,10 @@ pub struct NetworkConfig {
     #[serde(default)]
     pub station_agent: StationAgentConfig,
 
+    /// WSJT-X UDP companion-protocol settings (opt-in; default disabled)
+    #[serde(default)]
+    pub wsjtx_udp: WsjtxUdpConfig,
+
     /// Custom service integrations
     #[serde(default)]
     pub custom_services: HashMap<String, CustomServiceConfig>,
@@ -195,6 +199,78 @@ pub struct QrzXmlConfig {
     /// QRZ.com account password.
     #[serde(default)]
     pub password: String,
+}
+
+/// WSJT-X-compatible UDP companion-protocol settings (GridTracker, JTAlert,
+/// loggers). See docs/superpowers/specs/2026-07-13-wsjtx-udp-design.md.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WsjtxUdpConfig {
+    /// Master enable. Off ⇒ no socket is bound and nothing is emitted.
+    pub enabled: bool,
+    /// Destination `host:port` — unicast (e.g. "192.168.1.20:2237") or a
+    /// multicast group (e.g. "224.0.0.73:2237").
+    pub destination: String,
+    /// Local interface IP to send multicast from ("" = OS default). Only
+    /// used when `destination` is a multicast group.
+    pub multicast_interface: String,
+    /// Multicast TTL (GridTracker uses 3). Only used for multicast.
+    pub multicast_ttl: u32,
+    /// The protocol `Id` field. Companion apps route by it.
+    pub instance_id: String,
+    /// Master switch for processing ANY inbound request (Reply/HaltTx/...).
+    pub accept_udp_requests: bool,
+    /// Reply(4) may initiate a QSO. Also seeds the remote-TX arm gate —
+    /// see the design spec's security model. Fail-closed everywhere.
+    pub allow_tx_initiation: bool,
+    /// For multicast destinations: hosts allowed to send requests. Empty ⇒
+    /// all requests refused (and logged). Unicast infers the peer host.
+    pub allowed_request_hosts: Vec<String>,
+}
+
+impl Default for WsjtxUdpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            destination: "127.0.0.1:2237".to_string(),
+            multicast_interface: String::new(),
+            multicast_ttl: 3,
+            instance_id: "WSJT-X - pancetta".to_string(),
+            accept_udp_requests: false,
+            allow_tx_initiation: false,
+            allowed_request_hosts: Vec::new(),
+        }
+    }
+}
+
+impl ConfigSection for WsjtxUdpConfig {
+    fn validate_section(&self) -> ConfigResult<()> {
+        if self.enabled {
+            self.destination
+                .parse::<std::net::SocketAddr>()
+                .map_err(|_| ConfigError::InvalidValue {
+                    field: "network.wsjtx_udp.destination".to_string(),
+                    value: self.destination.clone(),
+                })?;
+            if self.instance_id.trim().is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "network.wsjtx_udp.instance_id".to_string(),
+                    value: self.instance_id.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
+    fn merge_with(&mut self, other: Self) {
+        self.enabled = other.enabled;
+        self.destination = other.destination;
+        self.multicast_interface = other.multicast_interface;
+        self.multicast_ttl = other.multicast_ttl;
+        self.instance_id = other.instance_id;
+        self.accept_udp_requests = other.accept_udp_requests;
+        self.allow_tx_initiation = other.allow_tx_initiation;
+        self.allowed_request_hosts = other.allowed_request_hosts;
+    }
 }
 
 /// Read-only remote view gateway (Panino client). Default OFF; localhost-bound.
@@ -1486,6 +1562,9 @@ impl ConfigSection for NetworkConfig {
             );
         }
 
+        // WSJT-X UDP validation
+        self.wsjtx_udp.validate_section()?;
+
         Ok(())
     }
 
@@ -1508,6 +1587,7 @@ impl ConfigSection for NetworkConfig {
         self.qrz_xml = other.qrz_xml;
         self.remote_gateway = other.remote_gateway;
         self.station_agent = other.station_agent;
+        self.wsjtx_udp.merge_with(other.wsjtx_udp);
 
         // Merge custom services
         self.custom_services.extend(other.custom_services);

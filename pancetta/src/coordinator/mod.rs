@@ -37,6 +37,7 @@ mod tui_relay;
 mod tx;
 mod util;
 mod wav_playback;
+pub(crate) mod wsjtx_udp;
 
 pub use tx::{
     coalesce_transmit_requests, remote_tx_permitted, resolve_required_parity, schedule_tx,
@@ -738,6 +739,13 @@ pub struct ApplicationCoordinator {
     /// `→Tui`/`→Qso` sends are never touched). See `remote_gateway::relay_to_gateway`.
     gateway_enabled: Arc<AtomicBool>,
 
+    /// `true` when the `wsjtx_udp` companion-protocol component is enabled
+    /// (`[network.wsjtx_udp].enabled`). Cached from config at construction,
+    /// mirroring `gateway_enabled`, so future additive emit sites (the
+    /// decoder fan-out, QSO-logged taps) can cheaply gate their extra send
+    /// to `ComponentId::WsjtxUdp` without an async config read.
+    wsjtx_enabled: Arc<AtomicBool>,
+
     /// `true` when the coordinator is running in Fox (DXpedition operator) mode.
     /// Default `false` (standard Hound / normal operation).
     fox_mode: Arc<AtomicBool>,
@@ -866,6 +874,20 @@ pub struct ApplicationCoordinator {
     /// (default OFF), so with nothing arming it and no remote requests being
     /// constructed (P0–P2), this gate is inert. Local TX never consults it.
     pub(crate) remote_tx_arm: Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+
+    /// `QsoEvent` broadcast receiver for the WSJT-X UDP component
+    /// (`start_wsjtx_udp_component`, started later in the boot sequence than
+    /// `start_qso_component`). `start_qso_component` constructs `QsoManager`
+    /// synchronously (before spawning its task) specifically so it can call
+    /// `.subscribe()` and populate this field right there — no channel or
+    /// handoff is needed because `run()` `.await`s `start_qso_component`
+    /// before `start_wsjtx_udp_component`, so this field is always already
+    /// populated by the time the latter reads it. `start_wsjtx_udp_component`
+    /// takes it with `Option::take`; documented as `None` afterward mainly so
+    /// a hypothetical future re-invocation of that method (there is none
+    /// today) would see an empty field rather than silently re-subscribing.
+    pub(crate) wsjtx_qso_events_rx:
+        Option<tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -1028,10 +1050,42 @@ impl ApplicationCoordinator {
         // the Arc<RwLock> — the additive dual-destination emit sites read this
         // atomic to gate their (cheap, additive) sends to the gateway.
         let gateway_enabled_init = config.network.remote_gateway.enabled;
-        // Snapshot the station-agent LOCAL remote-TX consent before config is
-        // moved into the Arc<RwLock>. Seeds the remote-TX arm's local-consent
-        // gate; default OFF, so remote TX can never be permitted this phase.
-        let remote_tx_consent_init = config.network.station_agent.remote_tx_enabled;
+        // Snapshot the wsjtx_udp enabled flag before `config` is moved into
+        // the Arc<RwLock> — mirrors `gateway_enabled_init` above.
+        let wsjtx_enabled_init = config.network.wsjtx_udp.enabled;
+        // Snapshot the LOCAL remote-TX consent before config is moved into the
+        // Arc<RwLock>. Seeds the shared remote-TX arm's local-consent gate.
+        // Option A of the WSJT-X-UDP design spec: the arm is the operator's
+        // channel-independent "I consent to remote TX" bit, so EITHER channel's
+        // consent seeds it — the station agent's `remote_tx_enabled` OR the
+        // WSJT-X-UDP `allow_tx_initiation` (both default OFF, so remote TX can
+        // never be permitted this phase unless the operator opts in).
+        //
+        // The wsjtx contribution is additionally gated on `enabled`: when the
+        // component is disabled there is no Reply-handling code path at all,
+        // so seeding the arm from a disabled component's flag is pure risk
+        // (an armed-but-unreachable seed) with no functional benefit. This
+        // also closes an audit-visibility gap — with `enabled = false`, the
+        // startup DiagnosticEvent in `start_wsjtx_udp_component` never fires
+        // (it's behind that component's own enabled check), so an operator
+        // with `enabled = false, allow_tx_initiation = true` would otherwise
+        // get only a `warn!` log line for a misconfiguration that still arms
+        // remote TX. `enabled && allow_tx_initiation` equals
+        // `allow_tx_initiation` whenever `enabled` is already true, so this
+        // is a no-op for the `enabled = true` case.
+        let wsjtx_allow_tx_initiation_init =
+            wsjtx_enabled_init && config.network.wsjtx_udp.allow_tx_initiation;
+        let remote_tx_consent_init = crate::coordinator::wsjtx_udp::remote_tx_arm_consent(
+            config.network.station_agent.remote_tx_enabled,
+            wsjtx_allow_tx_initiation_init,
+        );
+        if wsjtx_allow_tx_initiation_init {
+            warn!(
+                target: "remote.wsjtx",
+                "remote-TX arm seeded by [network.wsjtx_udp].allow_tx_initiation \
+                 — UDP Reply may initiate QSOs"
+            );
+        }
         // Snapshot fox.max_streams before config is moved into the Arc<RwLock>.
         // The QSO component reads this to cap concurrent caller-answer QSOs
         // while Fox mode is engaged.
@@ -1221,6 +1275,7 @@ impl ApplicationCoordinator {
             current_decode_effort,
             resolved_hardware_tier,
             gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
+            wsjtx_enabled: Arc::new(AtomicBool::new(wsjtx_enabled_init)),
             fox_mode: Arc::new(AtomicBool::new(false)),
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
             ptt_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -1253,6 +1308,7 @@ impl ApplicationCoordinator {
                 let _ = st.set_local_consent(remote_tx_consent_init, now_ms);
                 Arc::new(std::sync::Mutex::new(st))
             },
+            wsjtx_qso_events_rx: None,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);
@@ -1487,6 +1543,7 @@ impl ApplicationCoordinator {
         self.start_pskreporter_component().await?;
         self.start_remote_gateway_component().await?;
         self.start_station_agent_component().await?;
+        self.start_wsjtx_udp_component().await?;
 
         // Start coordinator tasks
         self.start_coordinator_tasks().await?;

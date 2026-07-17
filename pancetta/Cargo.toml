@@ -47,6 +47,10 @@ ed25519-dalek = { version = "3", features = ["rand_core"] }
 # Async runtime and coordination
 tokio = { version = "1.50", features = ["full", "rt-multi-thread"] }
 
+# WSJT-X UDP multicast socket options (IP_MULTICAST_IF): not exposed by
+# std::net::UdpSocket, only by socket2's Socket wrapper.
+socket2 = "0.6"
+
 # Inter-process communication
 crossbeam-channel = "0.5"
 

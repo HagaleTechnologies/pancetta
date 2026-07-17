@@ -96,6 +96,22 @@ ft8_to_tui_tx    ->  ft8_to_tui_rx     (DecodedMessage, unbounded)
 waterfall_tx     ->  waterfall_rx       (Vec<Vec<f32>>, unbounded)
 ```
 
+**`wsjtx_udp` component** (`pancetta/src/coordinator/wsjtx_udp/{mod.rs,codec.rs}`) speaks
+the WSJT-X-compatible UDP protocol for GridTracker/JTAlert/logger interop, following the
+same disabled-drain / enabled-task lifecycle as `psk_reporter.rs`. It taps into the rest
+of the coordinator additively, in three places: an FT8-decode fan-out tap in `ft8.rs`
+(gated on a `wsjtx_enabled: Arc<AtomicBool>`, mirroring the remote-gateway decode tap)
+feeds live decodes out as `Decode(2)` messages and into a bounded retention ring used to
+answer `Replay(7)`; a `QsoManager::subscribe()` broadcast subscriber — the third
+subscriber alongside the ADIF writer and the upload subscriber — turns each completed
+QSO into `QSOLogged(5)` + `LoggedADIF(12)`; and an inbound-dispatch gate on the same UDP
+socket processes `Reply`/`HaltTx`/`Replay` requests only after they pass the fail-closed
+source/consent checks described in `docs/DECISIONS/remote-operation.md` (a GridTracker
+double-click becomes a `QsoMessage::StartQso { remote_origin: true }`, which routes
+through the same `TxOrigin::Remote` arm-gating every other remote-TX path uses). None of
+these taps touch an existing `→Tui` send path — `pancetta-tui` behavior stays
+byte-identical whether or not `[network.wsjtx_udp]` is enabled.
+
 ---
 
 ## Key Abstractions

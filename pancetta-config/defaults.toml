@@ -392,6 +392,16 @@ by_ip = true
 enabled = true
 requests_per_minute = 60
 
+[network.wsjtx_udp]
+accept_udp_requests = false
+allow_tx_initiation = false
+allowed_request_hosts = []
+destination = "127.0.0.1:2237"
+enabled = false
+instance_id = "WSJT-X - pancetta"
+multicast_interface = ""
+multicast_ttl = 3
+
 [network.wspr]
 database_url = "http://wsprnet.org/drupal/wsprnet/spotquery"
 download_spots = false

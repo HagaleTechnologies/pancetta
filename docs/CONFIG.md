@@ -325,6 +325,44 @@ token   = ""         # cqdx.io Personal Access Token (pat_…), plaintext on dis
   duplicate and skipped (non-fatal). The same `[network.cqdx]` block also
   drives live spot discovery; enabling it turns on both.
 
+### `[network.wsjtx_udp]` — GridTracker / JTAlert / logger interop
+
+Pancetta can speak the WSJT-X-compatible UDP protocol that GridTracker,
+JTAlert, and most loggers already consume — decodes, status, and logged
+QSOs show up live with zero work on the companion app's side. It can
+also *consume* the protocol's Reply/HaltTx requests, which is what makes
+a GridTracker double-click call a station on pancetta's behalf. Default
+**off** end to end: `enabled = false` binds no socket and emits nothing.
+See `docs/GUIDE.md`'s "…use GridTracker with pancetta?" section for the
+same-host and cross-machine setup recipes.
+
+```toml
+[network.wsjtx_udp]
+enabled = false                     # master: emit nothing, bind nothing
+destination = "127.0.0.1:2237"      # unicast host:port or multicast group:port
+multicast_interface = ""            # LAN IP to send multicast from ("" = OS default)
+multicast_ttl = 3                   # only used for multicast destinations
+instance_id = "WSJT-X - pancetta"   # the protocol Id field
+accept_udp_requests = false         # master switch for ALL inbound processing
+allow_tx_initiation = false         # Reply(4) may start a QSO (arm-gated, see below)
+allowed_request_hosts = []          # required for multicast inbound; unicast infers the peer
+```
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Master switch. `false` ⇒ no socket is ever bound and nothing is emitted. |
+| `destination` | string | `"127.0.0.1:2237"` | Where pancetta sends. A unicast `host:port` for a same-host or point-to-point companion, or a multicast group `address:port` (e.g. `"224.0.0.73:2237"`) to reach multiple companions / another machine. |
+| `multicast_interface` | string | `""` | Local LAN interface IP to send multicast from. `""` = OS default (which is typically loopback-only — cross-host multicast needs this set to your real NIC's IP). Only used when `destination` is a multicast group. |
+| `multicast_ttl` | integer (`u32`) | `3` | IP multicast TTL/hop-limit. Only used for multicast destinations; GridTracker uses `3` for its own sends, so `3` is a safe match. |
+| `instance_id` | string | `"WSJT-X - pancetta"` | The protocol's `Id` field. Companion apps display and route by it; a second pancetta instance should get a distinct value. Must be non-empty when `enabled = true`. |
+| `accept_udp_requests` | bool | `false` | Master switch for processing **any** inbound request (Reply, HaltTx, Replay, …). `false` ⇒ every inbound datagram is ignored (with an audit entry) — the same "Accept UDP requests" checkbox WSJT-X itself has. |
+| `allow_tx_initiation` | bool | `false` | Whether an inbound `Reply(4)` (a GridTracker double-click on a CQ) may start a QSO. Also seeds the shared remote-TX arm gate — see `docs/DECISIONS/remote-operation.md`. Requires `enabled = true` to seed the arm; requires `accept_udp_requests = true` (in addition) for an inbound `Reply` to actually be dispatched. Fail-closed: `false` means neither effect occurs. |
+| `allowed_request_hosts` | list of strings (IPs) | `[]` (empty) | For a **multicast** `destination`: the IP addresses allowed to send inbound requests. Empty ⇒ every request is refused (and logged), even with `accept_udp_requests = true` — you must opt a host in explicitly. For a **unicast** `destination`, the peer is inferred (only the configured destination host is accepted) and this list is unused. |
+
+`destination` must parse as a valid `host:port` socket address, and
+`instance_id` must be non-empty, whenever `enabled = true` — otherwise
+config validation rejects the file.
+
 ---
 
 ## `[ui]` — TUI behaviour

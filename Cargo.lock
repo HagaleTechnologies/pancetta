@@ -3169,6 +3169,7 @@ dependencies = [
  "serialport",
  "signal-hook 0.4.4",
  "snow",
+ "socket2",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",

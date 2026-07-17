@@ -1090,48 +1090,67 @@ impl super::ApplicationCoordinator {
         // Maximum concurrent caller-answer QSOs while Fox mode is engaged.
         // When fox_mode is false the normal auto_answer_max_concurrent cap applies.
         let fox_max_streams = self.fox_max_streams();
+
+        // `QsoManager::new` and its three `set_*_source` setters are plain
+        // synchronous, non-blocking calls — nothing about them needs the
+        // spawned task's async context. Constructing the manager here (instead
+        // of inside `tokio::spawn` below) lets us call `.subscribe()`
+        // synchronously and populate `self.wsjtx_qso_events_rx` before this
+        // method returns. `run()` `.await`s `start_qso_component` before
+        // `start_wsjtx_udp_component`, so the field is always already
+        // populated by the time the latter reads it — no channel, handoff, or
+        // timeout needed.
+        let qso_config = {
+            use pancetta_qso::{DuplicateCheckConfig, HoundRegions, QsoManagerConfig};
+
+            QsoManagerConfig {
+                our_callsign: our_callsign.clone(),
+                our_grid: our_grid.clone(),
+                hound: HoundRegions {
+                    call_min_hz: hound_cfg.call_min_hz,
+                    call_max_hz: hound_cfg.call_max_hz,
+                    response_min_hz: hound_cfg.response_min_hz,
+                    response_max_hz: hound_cfg.response_max_hz,
+                },
+                active_mode: active_mode.clone(),
+                duplicate_checking: DuplicateCheckConfig {
+                    enabled: dup_cfg.enabled,
+                    time_window_hours: dup_cfg.time_window_hours,
+                    check_frequency: dup_cfg.check_frequency,
+                    // check_band is defined but unread in pancetta-qso;
+                    // keep the qso-side default rather than exposing a
+                    // dead knob in the config schema.
+                    ..Default::default()
+                },
+                ..Default::default()
+            }
+        };
+
+        let mut qso_manager = pancetta_qso::QsoManager::new(qso_config);
+        // Share the rig dial-frequency source so completed QSOs log the
+        // real RF frequency (dial + audio offset), not the bare offset
+        // (was producing ADIF FREQ ~0.001 / BAND 0MHZ).
+        qso_manager.set_dial_frequency_source(operating_frequency_hz.clone());
+        // Share the split-TX dial source (0 = simplex). Written by the
+        // TUI SetSplit relay; the QSO RF stamp uses this for the
+        // effective TX dial frequency when split is active.
+        qso_manager.set_split_tx_frequency_source(split_tx_frequency_hz.clone());
+        // Share the operator's Hold/Auto TX-frequency mode so the
+        // stuck-DX hop only fires in Auto (Hold keeps the offset sticky).
+        qso_manager.set_tx_freq_mode_source(tx_freq_mode.clone());
+
+        // Task 5 (QSOLogged/LoggedADIF): subscribe synchronously, before
+        // `qso_manager` is moved into the spawned task below, so the WSJT-X
+        // UDP component can pick this receiver straight off the coordinator
+        // field with no channel or timeout involved.
+        self.wsjtx_qso_events_rx = Some(qso_manager.subscribe());
+
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                use pancetta_qso::{
-                    DuplicateCheckConfig, HoundRegions, LoggerConfig, QsoManager, QsoManagerConfig,
-                };
+                use pancetta_qso::LoggerConfig;
 
-                let qso_config = QsoManagerConfig {
-                    our_callsign: our_callsign.clone(),
-                    our_grid: our_grid.clone(),
-                    hound: HoundRegions {
-                        call_min_hz: hound_cfg.call_min_hz,
-                        call_max_hz: hound_cfg.call_max_hz,
-                        response_min_hz: hound_cfg.response_min_hz,
-                        response_max_hz: hound_cfg.response_max_hz,
-                    },
-                    active_mode: active_mode.clone(),
-                    duplicate_checking: DuplicateCheckConfig {
-                        enabled: dup_cfg.enabled,
-                        time_window_hours: dup_cfg.time_window_hours,
-                        check_frequency: dup_cfg.check_frequency,
-                        // check_band is defined but unread in pancetta-qso;
-                        // keep the qso-side default rather than exposing a
-                        // dead knob in the config schema.
-                        ..Default::default()
-                    },
-                    ..Default::default()
-                };
-
-                let mut qso_manager = QsoManager::new(qso_config);
-                // Share the rig dial-frequency source so completed QSOs log the
-                // real RF frequency (dial + audio offset), not the bare offset
-                // (was producing ADIF FREQ ~0.001 / BAND 0MHZ).
-                qso_manager.set_dial_frequency_source(operating_frequency_hz.clone());
-                // Share the split-TX dial source (0 = simplex). Written by the
-                // TUI SetSplit relay; the QSO RF stamp uses this for the
-                // effective TX dial frequency when split is active.
-                qso_manager.set_split_tx_frequency_source(split_tx_frequency_hz.clone());
-                // Share the operator's Hold/Auto TX-frequency mode so the
-                // stuck-DX hop only fires in Auto (Hold keeps the offset sticky).
-                qso_manager.set_tx_freq_mode_source(tx_freq_mode.clone());
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
                     return Err(anyhow::anyhow!("QSO manager startup failed"));

@@ -6,7 +6,7 @@
 
 **Architecture:** Per `docs/superpowers/specs/2026-07-13-wsjtx-udp-design.md`. New coordinator component `pancetta/src/coordinator/wsjtx_udp/{mod.rs,codec.rs}`; one ephemeral-bound tokio UdpSocket; additive-only emit taps; five ANDed fail-closed gates on remote initiation. Wire format per `docs/superpowers/specs/2026-07-13-wsjtx-udp-protocol-notes.md` (byte-exact tables; "the protocol notes" below). Every field list referenced from the notes §4 is normative — do not improvise fields.
 
-**Tech Stack:** tokio UdpSocket (`socket2` only if `IP_MULTICAST_IF` needs it — check whether tokio's `UdpSocket` + `std::net` cover `set_multicast_if_v4`/`set_multicast_ttl_v4`; std's `UdpSocket` does, so bind std → convert with `UdpSocket::from_std`). Hand-rolled big-endian codec in the PSKReporter style. No serde for the wire.
+**Tech Stack:** tokio UdpSocket. **Correction (found during Task 3):** `std::net::UdpSocket` covers `set_multicast_ttl_v4` but does NOT expose `set_multicast_if_v4` (`IP_MULTICAST_IF`) — that gap is exactly what `socket2` exists to fill. Build the socket via `socket2::Socket` (bind, TTL, interface, non-blocking), then convert once via `.into()` → `UdpSocket::from_std`. Hand-rolled big-endian codec in the PSKReporter style. No serde for the wire.
 
 ## Global Constraints
 

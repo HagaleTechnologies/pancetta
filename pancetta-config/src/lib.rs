@@ -924,5 +924,11 @@ mod merge_guard {
             &[],
             |a, b| a.merge_with(b),
         );
+
+        assert_carries_all::<network::WsjtxUdpConfig>(
+            "WsjtxUdpConfig",
+            &[("allowed_request_hosts", json!(["example.com"]))],
+            |a, b| a.merge_with(b),
+        );
     }
 }
