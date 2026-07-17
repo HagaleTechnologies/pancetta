@@ -39,8 +39,7 @@ fn main() {
         if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
             let manifest_dir =
                 std::env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR is set by cargo");
-            let shim_path =
-                std::path::Path::new(&manifest_dir).join("mingw_stpcpy_shim.h");
+            let shim_path = std::path::Path::new(&manifest_dir).join("mingw_stpcpy_shim.h");
             build.flag("-include").flag(shim_path.to_str().unwrap());
         }
 
