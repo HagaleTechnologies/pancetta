@@ -346,6 +346,21 @@ pub struct QsoMetadata {
     /// on the slot the contra station expects.
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
 
+    /// `true` when the latched [`Self::tx_parity`] above was picked WITHOUT
+    /// ever having observed the DX's actual decoded slot parity (e.g. a
+    /// cluster/DX-Hunter spot answered before any live decode exists for that
+    /// station, so `respond_to_cq_with`/`respond_to_caller` had to fall back
+    /// to `latch_cq_parity_if_none`'s "nearest next slot" heuristic instead of
+    /// flipping a real observed `dx_parity`). Such a provisional latch should
+    /// be refined to the true opposite-of-DX parity the first time a frame
+    /// from the latched partner is actually decoded (see
+    /// `process_message_for_qso`'s first-decode refinement). `false` — the
+    /// common case — means `tx_parity` was latched from a real observed
+    /// `dx_parity` (or via a CQ-path latch, which is self-consistent by
+    /// construction) and must never be touched again.
+    #[serde(default)]
+    pub tx_parity_provisional: bool,
+
     /// How this QSO was initiated. Manual calls bypass the self-duplicate
     /// gate and keep-call under the manual watchdog; auto calls do not.
     /// Defaults to `Auto` (the pre-existing behavior for every internal

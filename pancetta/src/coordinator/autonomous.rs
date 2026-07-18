@@ -1139,17 +1139,77 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
                             } else if tx_items.len() > 1 {
+                                // Anchor on the first-seen item's parity (mirrors the
+                                // TX-worker coalescer's "oldest-retained stream wins"
+                                // rule — see `coalesce_transmit_requests` in tx.rs).
+                                // A later item whose CONCRETE parity disagrees with the
+                                // anchor must NOT be silently folded into this bundle
+                                // (that would put it in the wrong slot window — the
+                                // exact class of bug this invariant exists to prevent).
+                                // Exclude it from the bundle instead; it still goes out,
+                                // just via the normal single-item TX path below, on its
+                                // own parity.
                                 let bundle_parity = tx_items[0].1;
-                                for (idx, (_, p)) in tx_items.iter().enumerate().skip(1) {
-                                    if *p != bundle_parity {
+                                let mut bundled = Vec::with_capacity(tx_items.len());
+                                let mut excluded = Vec::new();
+                                for (idx, (item, p)) in tx_items.into_iter().enumerate() {
+                                    let disagrees = match (bundle_parity, p) {
+                                        (Some(anchor), Some(this)) => anchor != this,
+                                        _ => false,
+                                    };
+                                    if idx > 0 && disagrees {
                                         warn!(
-                                            "Multi-TX item {} has tx_parity {:?}, bundle is {:?}; \
-                                             using bundle parity",
-                                            idx, p, bundle_parity
+                                            target: "pancetta::tx.policy",
+                                            "Multi-TX item {} (qso_id={:?}) has tx_parity {:?}, \
+                                             bundle is anchored to {:?} (first-seen item); \
+                                             excluding it from this bundle instead of \
+                                             coercing it onto the wrong slot — it will be sent \
+                                             individually on its own parity",
+                                            idx, item.qso_id, p, bundle_parity
                                         );
+                                        excluded.push((item, p));
+                                    } else {
+                                        bundled.push((item, p));
                                     }
                                 }
-                                let items: Vec<_> = tx_items.into_iter().map(|(it, _)| it).collect();
+
+                                // Excluded items still transmit — individually, each on
+                                // its own (disagreeing) parity — via the same single-TX
+                                // path used for the `tx_items.len() == 1` case above.
+                                for (item, p) in excluded {
+                                    if dry_run {
+                                        info!(
+                                            target: "autonomous.dry_run",
+                                            "DRY RUN: would have transmitted '{}' at offset {:.0} Hz \
+                                             (qso_id={:?}, parity={:?}) [excluded from bundle: parity conflict]",
+                                            item.message_text,
+                                            item.frequency_offset,
+                                            item.qso_id,
+                                            p
+                                        );
+                                    } else {
+                                        let msg = ComponentMessage::new(
+                                            ComponentId::Autonomous,
+                                            ComponentId::Ft8Transmitter,
+                                            MessageType::TransmitRequest {
+                                                message_text: item.message_text,
+                                                frequency_offset: item.frequency_offset,
+                                                qso_id: item.qso_id,
+                                                tx_parity: p,
+                                                origin: crate::message_bus::TxOrigin::Local,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(msg).await {
+                                            warn!(
+                                                "Failed to send TransmitRequest for parity-excluded item: {}",
+                                                e
+                                            );
+                                        }
+                                    }
+                                }
+
+                                let items: Vec<_> = bundled.into_iter().map(|(it, _)| it).collect();
                                 if dry_run {
                                     info!(
                                         target: "autonomous.dry_run",

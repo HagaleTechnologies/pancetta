@@ -730,6 +730,18 @@ pub struct CoalesceOutcome {
     /// How many distinct streams were dropped because the retained set hit
     /// the [`MAX_RETAINED_TX_STREAMS`] cap (silent truncation made visible).
     pub truncated: usize,
+    /// How many retained streams were excluded from THIS cycle's bundle
+    /// because their concrete `tx_parity` disagreed with the bundle anchor's
+    /// (the first-seen retained stream's parity — see
+    /// [`coalesce_transmit_requests`]'s parity-conflict check). Folding a
+    /// disagreeing stream into the bundle would silently put it on the wrong
+    /// slot window, which is exactly the "every concurrent active QSO
+    /// transmits on the same parity" invariant this excludes to protect.
+    /// Excluded streams are NOT retained here, but they are not dropped
+    /// permanently either — the QSO's own TX cadence (keep-call/rearm) will
+    /// produce a fresh request for it next slot, sent individually on its own
+    /// parity.
+    pub parity_excluded: usize,
 }
 
 impl CoalesceOutcome {
@@ -737,7 +749,10 @@ impl CoalesceOutcome {
     /// happened to be one fresh frame per distinct live QSO with no overflow).
     /// Used only for the log-suppression decision in the worker.
     fn is_noop(&self) -> bool {
-        self.coalesced == 0 && self.dropped_terminal == 0 && self.truncated == 0
+        self.coalesced == 0
+            && self.dropped_terminal == 0
+            && self.truncated == 0
+            && self.parity_excluded == 0
     }
 }
 
@@ -761,6 +776,16 @@ impl CoalesceOutcome {
 /// 4. **Bound the retained set.** At most [`MAX_RETAINED_TX_STREAMS`] distinct
 ///    streams survive; the rest are counted in `truncated` and dropped. The
 ///    earliest-seen streams are kept (FIFO fairness).
+/// 5. **Never coerce a bundle-parity conflict.** When ≥2 distinct streams
+///    survive, the caller folds them into one `MultiTransmitRequest` stamped
+///    with a single `tx_parity` (the first-seen/oldest-retained stream's — the
+///    "bundle anchor"). Any later stream whose OWN concrete `tx_parity`
+///    disagrees with the anchor is excluded here (counted in
+///    `parity_excluded`) rather than silently forced onto the anchor's
+///    parity — every concurrent active QSO must transmit on the same parity
+///    (see CLAUDE.md), and coercing would put the disagreeing stream in the
+///    wrong slot window. Excluded streams are not gone permanently: the QSO's
+///    own cadence produces a fresh request for it next slot.
 ///
 /// The single-request, no-backlog case returns `retained == [that request]`
 /// with all counters zero, so the worker's normal path is unchanged.
@@ -814,6 +839,43 @@ pub fn coalesce_transmit_requests(
     if retained.len() > MAX_RETAINED_TX_STREAMS {
         outcome.truncated = retained.len() - MAX_RETAINED_TX_STREAMS;
         retained.truncate(MAX_RETAINED_TX_STREAMS);
+    }
+
+    // Bundle-parity conflict check. When ≥2 distinct streams survive, they may
+    // get folded into a single `MultiTransmitRequest` by the caller, stamped
+    // with ONE `tx_parity` (the first-seen/oldest-retained stream's — the
+    // "bundle anchor"). A later stream whose OWN concrete `tx_parity` disagrees
+    // with the anchor must never silently ride that bundle: every concurrent
+    // active QSO must transmit on the same parity (CLAUDE.md invariant), and
+    // coercing a disagreeing stream onto the bundle's parity would put it in
+    // the wrong slot window for its actual partner. `None` (no preference) is
+    // NOT a disagreement — only two concrete, differing `Some` values are a
+    // genuine conflict. Excluded streams are dropped from `retained` for THIS
+    // cycle only; they are not gone — the QSO's own cadence produces a fresh
+    // request for it next slot, which will then coalesce/bundle normally.
+    if retained.len() > 1 {
+        let anchor = retained[0].tx_parity;
+        let mut kept = Vec::with_capacity(retained.len());
+        for (idx, entry) in retained.into_iter().enumerate() {
+            let disagrees = match (anchor, entry.tx_parity) {
+                (Some(a), Some(p)) => a != p,
+                _ => false,
+            };
+            if idx > 0 && disagrees {
+                warn!(
+                    target: "pancetta::tx.policy",
+                    "TX bundle parity conflict: stream qso_id={:?} requested parity {:?} \
+                     but this cycle's bundle is anchored to {:?} (first-seen stream); \
+                     excluding it from this bundle — it will be retried individually on \
+                     its own parity next cycle",
+                    entry.qso_id, entry.tx_parity, anchor
+                );
+                outcome.parity_excluded += 1;
+            } else {
+                kept.push(entry);
+            }
+        }
+        retained = kept;
     }
 
     outcome.retained = retained;
@@ -928,13 +990,14 @@ async fn coalesce_backlog_into(
         let text = format!(
             "TX backlog coalesced: drained {} request(s) → {} retained; \
              coalesced {} stale (newest-per-QSO wins), dropped {} for ended QSOs, \
-             truncated {} over the {}-stream cap",
+             truncated {} over the {}-stream cap, excluded {} for a bundle-parity conflict",
             backlog_total,
             outcome.retained.len(),
             outcome.coalesced,
             outcome.dropped_terminal,
             outcome.truncated,
             MAX_RETAINED_TX_STREAMS,
+            outcome.parity_excluded,
         );
         warn!(target: "pancetta::tx.policy", "{}", text);
         emit_diagnostic(
@@ -974,8 +1037,13 @@ async fn coalesce_backlog_into(
 
     // Several distinct live streams survived → fold into the existing multi-TX
     // path. All bundle items share one slot, so the bundle parity is the
-    // freshest stream's parity (first retained entry, which the existing arm
-    // resolves via resolve_required_parity).
+    // FIRST-SEEN/oldest-retained stream's parity (not the freshest — order
+    // here is first-seen order from the coalescer), which the existing arm
+    // resolves via resolve_required_parity. Any stream that disagreed with
+    // this anchor has already been excluded from `outcome.retained` above
+    // (see the parity-conflict check in `coalesce_transmit_requests`), so
+    // every remaining entry's `tx_parity` is either `None` or equal to this
+    // value.
     let bundle_parity = outcome.retained[0].tx_parity;
     // Fail-safe origin fold: if ANY folded stream is Remote, the whole bundle is
     // Remote so the arm gate applies. (In practice a coalesced backlog is one
@@ -3688,6 +3756,88 @@ mod coalesce_tests {
         assert!(out.retained.is_empty());
         assert_eq!(out.dropped_terminal, 2);
         assert!(!out.is_noop());
+    }
+
+    // ── Bundle-parity conflict exclusion (Batch 2, part 2) ───────────────────
+
+    fn entry_with_parity(
+        text: &str,
+        qso_id: Option<&str>,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+    ) -> CoalesceEntry {
+        CoalesceEntry {
+            message_text: text.to_string(),
+            frequency_offset: 1000.0,
+            qso_id: qso_id.map(|s| s.to_string()),
+            tx_parity,
+            origin: crate::message_bus::TxOrigin::Local,
+        }
+    }
+
+    /// Three distinct-QSO streams survive coalescing: two share `Some(Even)`
+    /// and one is `Some(Odd)`. The bundle must NOT silently coerce the Odd
+    /// outlier onto the Even anchor (that would put it in the wrong slot
+    /// window for its actual partner) — it is excluded from `retained` for
+    /// this cycle and counted in `parity_excluded`, keeping only the two
+    /// agreeing Even entries.
+    #[test]
+    fn disagreeing_parity_stream_is_excluded_not_coerced() {
+        use pancetta_core::slot::SlotParity;
+
+        let live = liveset(&["qso-a", "qso-b", "qso-c"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry_with_parity("A", Some("qso-a"), Some(SlotParity::Even)),
+                entry_with_parity("B", Some("qso-b"), Some(SlotParity::Even)),
+                entry_with_parity("C", Some("qso-c"), Some(SlotParity::Odd)),
+            ],
+            live_in(&live),
+        );
+        assert_eq!(
+            out.retained.len(),
+            2,
+            "the Odd outlier must be excluded, keeping only the two Even entries"
+        );
+        assert_eq!(out.retained[0].message_text, "A");
+        assert_eq!(out.retained[1].message_text, "B");
+        assert!(
+            out.retained
+                .iter()
+                .all(|e| e.tx_parity == Some(SlotParity::Even)),
+            "every surviving entry must agree with the bundle anchor"
+        );
+        assert_eq!(
+            out.parity_excluded, 1,
+            "exactly one stream excluded for a parity conflict"
+        );
+        assert!(
+            !out.is_noop(),
+            "a parity exclusion must not be reported as a no-op"
+        );
+    }
+
+    /// A `None` (no-preference) `tx_parity` must NOT be treated as
+    /// disagreeing with a concrete anchor — it rides along unchanged, exactly
+    /// like the pre-existing manual/None-keyed behavior.
+    #[test]
+    fn none_parity_stream_is_not_treated_as_a_conflict() {
+        use pancetta_core::slot::SlotParity;
+
+        let live = liveset(&["qso-a", "qso-b"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry_with_parity("A", Some("qso-a"), Some(SlotParity::Even)),
+                entry_with_parity("B", Some("qso-b"), None),
+            ],
+            live_in(&live),
+        );
+        assert_eq!(
+            out.retained.len(),
+            2,
+            "a None-parity stream must not be excluded"
+        );
+        assert_eq!(out.parity_excluded, 0);
+        assert!(out.is_noop());
     }
 }
 

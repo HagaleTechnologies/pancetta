@@ -123,6 +123,21 @@ struct PendingManualCall {
     /// promoted QSO is opened with `remote_origin = true` — its TX stays
     /// `TxOrigin::Remote` and armed-TX-gated. `false` for every local/TUI call.
     remote_origin: bool,
+    /// Which rung of the response ladder to open at on promotion — replayed
+    /// via `respond_to_caller` (see [`promote_pending_manual_calls`]).
+    /// `StartQso`-originated entries always use [`pancetta_core::ResponseStep::Grid`],
+    /// which `respond_to_caller` degrades to exactly the `respond_to_cq_with`
+    /// call this queue used before `RespondToCaller` entries existed — byte-
+    /// identical for the pre-existing StartQso path.
+    step: pancetta_core::ResponseStep,
+    /// Our measurement of the caller's signal (drives the report WE send).
+    /// Only meaningful for `RespondToCaller`-originated entries opening at
+    /// `Report`/`ReportAck`/`Rr73`/`SeventyThree`. `None` for `StartQso`
+    /// entries (a `Grid` open has no report to send yet).
+    our_snr_of_them: Option<f32>,
+    /// Their report of us, if known. Currently always `None` at both call
+    /// sites (the engine defaults it) — carried for forward completeness.
+    their_report: Option<i8>,
 }
 
 impl PendingManualCall {
@@ -450,12 +465,21 @@ async fn promote_pending_manual_calls(
                     p.callsign, p.held_hz, p.hold_mode, p.frequency_hz, tx_off, active.len()
                 );
             }
+            // Replay via `respond_to_caller`, which degrades a `Grid` step to
+            // exactly the `respond_to_cq_with` call this promotion path used
+            // before `RespondToCaller` entries could be queued here — so a
+            // `StartQso`-originated entry (always `step == Grid`) is
+            // byte-identical to the pre-existing behavior. A
+            // `RespondToCaller`-originated entry opens at its own step
+            // (Report/ReportAck/Rr73/SeventyThree) instead.
             qso_manager
-                .respond_to_cq_with(
+                .respond_to_caller(
                     p.callsign.clone(),
                     tx_off,
                     p.dx_parity,
-                    pancetta_qso::CallInitiation::Manual,
+                    p.step,
+                    p.our_snr_of_them,
+                    p.their_report,
                     partner,
                     p.remote_origin,
                 )
@@ -2109,12 +2133,22 @@ impl super::ApplicationCoordinator {
                                             // QSO — runs unconditionally for every
                                             // decode so the state machine always
                                             // sees the latest copy.
+                                            // Use the parity-carrying entry point: this
+                                            // is a live decode, so `slot_parity` is a
+                                            // real observation, letting a
+                                            // provisionally-latched QSO (e.g. answered
+                                            // from a DX-cluster/DX-Hunter spot before any
+                                            // live decode existed) refine its `tx_parity`
+                                            // to the true opposite-of-DX value on first
+                                            // contact — see
+                                            // `QsoMetadata::tx_parity_provisional`.
                                             if let Err(e) = qso_manager
-                                                .process_message(
+                                                .process_message_with_parity(
                                                     msg_type.clone(),
                                                     raw_text.clone(),
                                                     frequency,
                                                     Some(snr),
+                                                    decoded_msg.slot_parity,
                                                 )
                                                 .await
                                             {
@@ -2290,6 +2324,9 @@ impl super::ApplicationCoordinator {
                                                         held_hz: queued_held,
                                                         hold_mode: queued_hold_mode,
                                                         remote_origin,
+                                                        step: pancetta_core::ResponseStep::Grid,
+                                                        our_snr_of_them: None,
+                                                        their_report: None,
                                                     });
                                                 }
                                                 let queue_depth = q.len();
@@ -2533,6 +2570,12 @@ impl super::ApplicationCoordinator {
                                                         hold_mode: false,
                                                         // Hound (Shift+H) is a local operator action.
                                                         remote_origin: false,
+                                                        // Hound entries promote via `engage_hound`,
+                                                        // not `respond_to_caller` — these fields are
+                                                        // unused when `hound == true`.
+                                                        step: pancetta_core::ResponseStep::Grid,
+                                                        our_snr_of_them: None,
+                                                        their_report: None,
                                                     });
                                                 }
                                                 let queue_depth = q.len();
@@ -2617,6 +2660,78 @@ impl super::ApplicationCoordinator {
                                                  (manual)",
                                                 callsign, frequency, step
                                             );
+                                            // #40 half-duplex parity gate (same admission check
+                                            // as StartQso, applied here for consistency — a
+                                            // RespondToCaller that would TX in the *opposite*
+                                            // window from the one our active QSOs hold is
+                                            // DEFERRED, not started immediately, to keep the
+                                            // opposite window free to hear responses (no
+                                            // sequential-window TX). Promoted automatically once
+                                            // the current side's QSOs finish
+                                            // (promote_pending_manual_calls), replayed via
+                                            // `respond_to_caller` at its own `step`.
+                                            let desired_tx_parity = dx_parity.map(|p| p.opposite());
+                                            let current_side = qso_manager.current_tx_side().await;
+                                            if matches!(
+                                                pancetta_qso::qso_manager::admit_new_qso(
+                                                    current_side,
+                                                    desired_tx_parity,
+                                                ),
+                                                pancetta_qso::qso_manager::TxAdmission::Queue
+                                            ) {
+                                                let mut q = pending_manual_calls.lock().await;
+                                                let dup = q.iter().any(|p| {
+                                                    p.callsign.eq_ignore_ascii_case(&callsign)
+                                                });
+                                                if !dup {
+                                                    if q.len() >= MAX_PENDING_MANUAL_CALLS {
+                                                        q.pop_front();
+                                                    }
+                                                    let queued_held =
+                                                        tx_offset_hold_hz.load(Ordering::Relaxed);
+                                                    let queued_hold_mode =
+                                                        pancetta_core::TxFreqMode::from_u8(
+                                                            tx_freq_mode.load(Ordering::Relaxed),
+                                                        ) == pancetta_core::TxFreqMode::Hold;
+                                                    q.push_back(PendingManualCall {
+                                                        callsign: callsign.clone(),
+                                                        frequency_hz: frequency as f64,
+                                                        dx_parity,
+                                                        queued_at: std::time::Instant::now(),
+                                                        hound: false,
+                                                        fox_freq_hz: None,
+                                                        fox_grid: None,
+                                                        held_hz: queued_held,
+                                                        hold_mode: queued_hold_mode,
+                                                        remote_origin,
+                                                        step,
+                                                        our_snr_of_them: snr,
+                                                        // The immediate path below always passes
+                                                        // `None` (the engine defaults it); match
+                                                        // that here for the deferred replay too.
+                                                        their_report: None,
+                                                    });
+                                                }
+                                                let queue_depth = q.len();
+                                                drop(q);
+                                                info!(
+                                                    target: "qso",
+                                                    "Queued caller-response to {} ({:?}) — \
+                                                     opposite window (active side {:?}); queue \
+                                                     now {} pending",
+                                                    callsign, dx_parity, current_side, queue_depth
+                                                );
+                                                emit_status(
+                                                    &message_bus,
+                                                    format!(
+                                                        "Queued {} — waiting for current window \
+                                                         to clear",
+                                                        callsign
+                                                    ),
+                                                )
+                                                .await;
+                                                continue;
+                                            }
                                             // TX-offset selection (T3): same priority as StartQso:
                                             // held offset → de-conflict → Tx=Rx fallback.
                                             let dx_freq = frequency as f64;
@@ -3307,11 +3422,78 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            step: pancetta_core::ResponseStep::Grid,
+            our_snr_of_them: None,
+            their_report: None,
         }
     }
 
     fn names(v: &[PendingManualCall]) -> Vec<String> {
         v.iter().map(|p| p.callsign.clone()).collect()
+    }
+
+    // Build a RespondToCaller-shaped pending call (non-Grid step) whose DX is
+    // on `dx`, so its desired TX parity is the opposite. Used to verify a
+    // `RespondToCaller` entry queued by the admission gate participates in
+    // exactly the SAME cross-parity partition logic as a `StartQso` entry
+    // (`call` above), not a separate/duplicated path.
+    fn caller_call(
+        name: &str,
+        dx: SlotParity,
+        step: pancetta_core::ResponseStep,
+    ) -> PendingManualCall {
+        PendingManualCall {
+            callsign: name.to_string(),
+            frequency_hz: 1500.0,
+            dx_parity: Some(dx),
+            queued_at: std::time::Instant::now(),
+            hound: false,
+            fox_freq_hz: None,
+            fox_grid: None,
+            held_hz: 0,
+            hold_mode: false,
+            remote_origin: false,
+            step,
+            our_snr_of_them: Some(-8.0),
+            their_report: None,
+        }
+    }
+
+    /// A `RespondToCaller`-shaped entry (step = Report, i.e. NOT the
+    /// `StartQso`-equivalent `Grid` step) that wants the opposite parity from
+    /// our committed side stays queued — it is gated by the SAME half-duplex
+    /// admission logic as a `StartQso` entry, not bypassed.
+    #[test]
+    fn respond_to_caller_shaped_entry_stays_queued_on_opposite_side() {
+        let q: VecDeque<_> = [caller_call(
+            "DX1",
+            SlotParity::Even, // wants Odd
+            pancetta_core::ResponseStep::Report,
+        )]
+        .into();
+        // Committed to Even already: the Odd-wanting caller-response stays queued.
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Even));
+        assert!(
+            start.is_empty(),
+            "opposite-parity caller-response must not start"
+        );
+        assert_eq!(names(&keep.into_iter().collect::<Vec<_>>()), vec!["DX1"]);
+    }
+
+    /// The same `RespondToCaller`-shaped entry starts once the committed side
+    /// flips to match it (mirrors what promotion after a QSO going terminal
+    /// looks like from the partition step's point of view).
+    #[test]
+    fn respond_to_caller_shaped_entry_starts_when_side_matches() {
+        let q: VecDeque<_> = [caller_call(
+            "DX1",
+            SlotParity::Even, // wants Odd
+            pancetta_core::ResponseStep::Report,
+        )]
+        .into();
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd));
+        assert_eq!(names(&start), vec!["DX1"]);
+        assert!(keep.is_empty());
     }
 
     #[test]
@@ -3377,6 +3559,9 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            step: pancetta_core::ResponseStep::Grid,
+            our_snr_of_them: None,
+            their_report: None,
         }
     }
 
@@ -3456,6 +3641,9 @@ mod pending_manual_tests {
             held_hz: 1500,
             hold_mode: true,
             remote_origin: false,
+            step: pancetta_core::ResponseStep::Grid,
+            our_snr_of_them: None,
+            their_report: None,
         };
         let active: Vec<f64> = vec![];
         let (tx_off, partner) =
@@ -3483,6 +3671,9 @@ mod pending_manual_tests {
             held_hz: 1500,
             hold_mode: true,
             remote_origin: false,
+            step: pancetta_core::ResponseStep::Grid,
+            our_snr_of_them: None,
+            their_report: None,
         };
         // An active QSO is already on 1500 Hz at promotion time.
         let active: Vec<f64> = vec![1500.0];
@@ -3518,12 +3709,83 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            step: pancetta_core::ResponseStep::Grid,
+            our_snr_of_them: None,
+            their_report: None,
         };
         let active: Vec<f64> = vec![];
         let (tx_off, partner) =
             compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
         assert_eq!(tx_off, 1750.0, "Auto + no collision → Tx=Rx");
         assert_eq!(partner, None, "Tx=Rx → partner_freq is None");
+    }
+
+    // ── RespondToCaller admission-gate promotion (Batch 2, part 3) ───────────
+    //
+    // These exercise the REAL `promote_pending_manual_calls` (not just the
+    // pure partition step) against a REAL `QsoManager`, proving a
+    // `RespondToCaller`-shaped queued entry replays via `respond_to_caller`
+    // at its OWN step on promotion — not the old hardcoded
+    // `respond_to_cq_with` (which would always reopen at `RespondingToCq`
+    // regardless of what step the operator actually chose).
+
+    use super::{promote_pending_manual_calls, PendingManualCalls};
+    use crate::message_bus::MessageBus;
+    use pancetta_qso::{QsoManager, QsoManagerConfig, QsoState};
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    async fn test_manager(our_callsign: &str) -> QsoManager {
+        let m = QsoManager::new(QsoManagerConfig {
+            our_callsign: our_callsign.to_string(),
+            our_grid: Some("EM10".to_string()),
+            ..Default::default()
+        });
+        m.start().await.expect("manager start");
+        m
+    }
+
+    /// A `RespondToCaller` (step = Report) queued because it wanted the
+    /// opposite parity from our (idle) committed side promotes — via
+    /// `promote_pending_manual_calls` — into a REAL QSO opened at
+    /// `SendingReport` (the Report step's initial state), not `RespondingToCq`
+    /// (the Grid/StartQso shape). This is the admission-gate + promotion
+    /// round-trip for Part 3: queued-not-admitted-immediately, then promoted
+    /// once a window is free.
+    #[tokio::test]
+    async fn respond_to_caller_shaped_queued_call_promotes_at_its_own_step() {
+        let mgr = test_manager("K5ARH").await;
+        let bus = MessageBus::new(1000).expect("bus");
+        let pending: PendingManualCalls = Arc::new(TokioMutex::new(VecDeque::from([caller_call(
+            "JA1ABC",
+            SlotParity::Even,
+            pancetta_core::ResponseStep::Report,
+        )])));
+
+        // Idle (no active QSOs) — `promote_pending_manual_calls` will adopt
+        // the queue's own desired parity (Odd, opposite of Even) as the side
+        // to commit to, and start it.
+        promote_pending_manual_calls(&mgr, &pending, &bus).await;
+
+        assert!(
+            pending.lock().await.is_empty(),
+            "the queued caller-response must be promoted (queue drained), not left waiting"
+        );
+
+        let active = mgr.get_active_qsos().await;
+        assert_eq!(active.len(), 1, "exactly one QSO should have started");
+        let (_, progress) = &active[0];
+        assert_eq!(progress.metadata.their_callsign.as_deref(), Some("JA1ABC"));
+        assert!(
+            matches!(progress.state, QsoState::SendingReport { .. }),
+            "step=Report must open at SendingReport (not RespondingToCq/Grid), got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(SlotParity::Odd),
+            "tx_parity must be opposite of the caller's Even slot"
+        );
     }
 }
 
@@ -3763,6 +4025,7 @@ mod snapshot_tests {
                 partner_freq: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                tx_parity_provisional: false,
             },
         }
     }
@@ -4891,6 +5154,7 @@ mod cqdx_upload_tests {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 
@@ -4962,6 +5226,7 @@ mod qrz_enrichment_tests {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 

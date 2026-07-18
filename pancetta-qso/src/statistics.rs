@@ -2308,6 +2308,7 @@ mod tests {
                 partner_freq: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                tx_parity_provisional: false,
             };
 
             let adif_data = crate::adif::AdifQso {

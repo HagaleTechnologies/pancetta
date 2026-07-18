@@ -833,6 +833,9 @@ impl QsoManager {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin,
+            // CQ-path latch: resolved from our own preference, not an
+            // observed DX parity — always self-consistent, never provisional.
+            tx_parity_provisional: false,
         };
 
         let progress = QsoProgress {
@@ -964,6 +967,9 @@ impl QsoManager {
             // `false` for operator-pressed `c` (local); `true` for a remote
             // operator's `startCq` routed via the station agent.
             remote_origin,
+            // CQ-path latch: resolved from our own preference, not an
+            // observed DX parity — always self-consistent, never provisional.
+            tx_parity_provisional: false,
         };
 
         let progress = QsoProgress {
@@ -1223,7 +1229,20 @@ impl QsoManager {
 
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
-        let tx_parity = dx_parity.map(|p| p.opposite());
+        // When `dx_parity` is `None` (e.g. answering a DX-cluster/DX-Hunter
+        // spot that has never actually been decoded live, so there is no
+        // observed slot parity to oppose), fall back to the same "nearest
+        // next slot" latch the CQ paths use instead of leaving `tx_parity`
+        // permanently `None` (which would make the TX scheduler re-resolve
+        // "nearest next slot" independently every subsequent slot and
+        // alternate parity — the exact failure `latch_cq_parity_if_none` was
+        // built to prevent). Mark the latch `tx_parity_provisional` so the
+        // first real decode from this partner can refine it to the true
+        // opposite-of-DX parity (see `process_message_for_qso`).
+        let (tx_parity, tx_parity_provisional) = match dx_parity {
+            Some(p) => (Some(p.opposite()), false),
+            None => (Self::latch_cq_parity_if_none(None, now), true),
+        };
 
         let state = QsoState::RespondingToCq {
             target_callsign: target_callsign.clone(),
@@ -1267,6 +1286,7 @@ impl QsoManager {
             partner_freq,
             hound_qsyed: false,
             remote_origin,
+            tx_parity_provisional,
         };
 
         // Send response message
@@ -1466,7 +1486,14 @@ impl QsoManager {
 
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
-        let tx_parity = dx_parity.map(|p| p.opposite());
+        // See the matching comment in `respond_to_cq_with`: a `None`
+        // `dx_parity` (no observed decode for this caller yet) falls back to
+        // the "nearest next slot" latch and is marked provisional so the
+        // first real decode from this partner can refine it.
+        let (tx_parity, tx_parity_provisional) = match dx_parity {
+            Some(p) => (Some(p.opposite()), false),
+            None => (Self::latch_cq_parity_if_none(None, now), true),
+        };
 
         // Build (initial_state, first_message) for the chosen step.
         let (state, message): (QsoState, MessageType) = match step {
@@ -1564,6 +1591,7 @@ impl QsoManager {
             partner_freq,
             hound_qsyed: false,
             remote_origin,
+            tx_parity_provisional,
         };
 
         // If we are opening at the close (SeventyThree → Completed), stamp the
@@ -1638,13 +1666,42 @@ impl QsoManager {
         Ok(qso_id)
     }
 
-    /// Process an incoming message
+    /// Process an incoming message.
+    ///
+    /// Does not carry a decoded slot parity — the first-decode provisional-
+    /// parity refinement (see `process_message_for_qso`) is a no-op on this
+    /// path. Callers that have a real observed slot parity for the decode
+    /// (the live coordinator decode path) should use
+    /// [`Self::process_message_with_parity`] instead so a provisionally-
+    /// latched QSO parity can be refined.
     pub async fn process_message(
         &self,
         message_type: MessageType,
         raw_text: String,
         frequency: f64,
         signal_strength: Option<f32>,
+    ) -> Result<(), QsoManagerError> {
+        self.process_message_with_parity(message_type, raw_text, frequency, signal_strength, None)
+            .await
+    }
+
+    /// Process an incoming message that carries a known decoded slot parity.
+    ///
+    /// Identical to [`Self::process_message`] except `observed_slot_parity` is
+    /// threaded through to `process_message_for_qso`, where it drives the
+    /// first-decode provisional-parity refinement: a QSO whose `tx_parity`
+    /// was latched without ever having observed the DX's real slot parity
+    /// (see `QsoMetadata::tx_parity_provisional`) gets that latch corrected
+    /// to the true opposite-of-DX parity the first time a verified frame from
+    /// the latched partner arrives. Pass `None` when the slot parity of this
+    /// decode is not tracked (byte-identical to `process_message`).
+    pub async fn process_message_with_parity(
+        &self,
+        message_type: MessageType,
+        raw_text: String,
+        frequency: f64,
+        signal_strength: Option<f32>,
+        observed_slot_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<(), QsoManagerError> {
         let timestamp = Utc::now();
 
@@ -1661,7 +1718,8 @@ impl QsoManager {
                 frequency,
             };
 
-            self.process_message_for_qso(qso_id, message).await?;
+            self.process_message_for_qso(qso_id, message, observed_slot_parity)
+                .await?;
         }
 
         Ok(())
@@ -1816,6 +1874,7 @@ impl QsoManager {
         &self,
         qso_id: QsoId,
         message: QsoMessage,
+        observed_slot_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<(), QsoManagerError> {
         let mut qsos = self.qsos.write().await;
         let progress = qsos
@@ -1823,6 +1882,34 @@ impl QsoManager {
             .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
 
         let old_state = progress.state.clone();
+
+        // --- First-decode parity refinement ---
+        // This QSO's `tx_parity` may have been latched PROVISIONALLY: when
+        // `respond_to_cq_with`/`respond_to_caller` answered a DX-cluster/
+        // DX-Hunter spot with no observed live decode yet, there was no real
+        // DX parity to oppose, so the latch fell back to a "nearest next
+        // slot" guess (`tx_parity_provisional == true`). The first time a
+        // frame genuinely FROM that latched partner arrives carrying a
+        // determinable slot parity, refine the latch to the TRUE
+        // opposite-of-DX parity. Sender verification reuses the same
+        // `is_partner` check the rest of this function relies on elsewhere —
+        // never weakened for this purpose. This runs exactly once (the flag
+        // flip prevents re-running) and emits no event of its own; it must
+        // happen BEFORE `qso_tx_parity` is captured just below so a reply
+        // this SAME call emits already carries the refined value.
+        if progress.metadata.tx_parity_provisional {
+            if let (Some(sender), Some(latched), Some(observed_parity)) = (
+                message.message_type.sender_callsign(),
+                progress.metadata.their_callsign.as_deref(),
+                observed_slot_parity,
+            ) {
+                if Self::is_partner(sender, latched) {
+                    progress.metadata.tx_parity = Some(observed_parity.opposite());
+                    progress.metadata.tx_parity_provisional = false;
+                }
+            }
+        }
+
         // Capture per-QSO routing data while we hold the write lock so the
         // reply emission below does not need to re-acquire it (which would
         // deadlock against this guard).
@@ -4024,6 +4111,256 @@ mod tests {
         );
     }
 
+    // ── Batch 2: responder-side provisional parity latch + first-decode
+    //    refinement ──────────────────────────────────────────────────────────
+
+    /// `respond_to_cq_with` answering a spot with NO observed dx_parity (e.g.
+    /// a DX-cluster/DX-Hunter spot never actually decoded live) must latch a
+    /// CONCRETE parity immediately, marked provisional — not leave
+    /// `tx_parity` permanently `None` (which used to make the TX scheduler
+    /// re-resolve "nearest next slot" independently every subsequent slot and
+    /// alternate parity).
+    #[tokio::test]
+    async fn respond_to_cq_with_no_dx_parity_latches_provisional() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K1DEF".to_string(),
+                14074000.0,
+                None,
+                CallInitiation::Manual,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            progress.metadata.tx_parity.is_some(),
+            "must latch a concrete parity, not leave None"
+        );
+        assert!(
+            progress.metadata.tx_parity_provisional,
+            "a parity latched with no observed dx_parity must be marked provisional"
+        );
+    }
+
+    /// `respond_to_caller` answering with NO observed dx_parity (non-Grid
+    /// step) latches the same way: concrete + provisional.
+    #[tokio::test]
+    async fn respond_to_caller_with_no_dx_parity_latches_provisional() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_caller(
+                "K1DEF".to_string(),
+                14074000.0,
+                None,
+                pancetta_core::ResponseStep::Report,
+                Some(-8.0),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            progress.metadata.tx_parity.is_some(),
+            "must latch a concrete parity, not leave None"
+        );
+        assert!(
+            progress.metadata.tx_parity_provisional,
+            "a parity latched with no observed dx_parity must be marked provisional"
+        );
+    }
+
+    /// Regression: `respond_to_cq_with` with a REAL observed `dx_parity` sets
+    /// `tx_parity_provisional: false` — unchanged behavior for the common
+    /// case (a genuine live decode drove the answer).
+    #[tokio::test]
+    async fn respond_to_cq_with_real_dx_parity_is_not_provisional() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K1DEF".to_string(),
+                14074000.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                CallInitiation::Manual,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(pancetta_core::slot::SlotParity::Odd)
+        );
+        assert!(
+            !progress.metadata.tx_parity_provisional,
+            "a parity latched from a REAL observed dx_parity must not be provisional"
+        );
+    }
+
+    /// Regression: `respond_to_caller` with a REAL observed `dx_parity` also
+    /// sets `tx_parity_provisional: false`.
+    #[tokio::test]
+    async fn respond_to_caller_with_real_dx_parity_is_not_provisional() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_caller(
+                "K1DEF".to_string(),
+                14074000.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                pancetta_core::ResponseStep::Report,
+                Some(-8.0),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(pancetta_core::slot::SlotParity::Odd)
+        );
+        assert!(
+            !progress.metadata.tx_parity_provisional,
+            "a parity latched from a REAL observed dx_parity must not be provisional"
+        );
+    }
+
+    /// First-decode refinement: a QSO answered with no observed dx_parity
+    /// (provisional latch) gets its `tx_parity` corrected to the TRUE
+    /// opposite-of-DX parity the first time a genuine frame FROM the latched
+    /// partner arrives carrying a determinable slot parity — and the
+    /// refinement is one-shot (a second frame with a DIFFERENT parity does
+    /// NOT change it again).
+    #[tokio::test]
+    async fn first_decode_from_partner_refines_provisional_parity_once() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K1DEF".to_string(),
+                14074000.0,
+                None, // no observed dx_parity — provisional latch
+                CallInitiation::Manual,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .tx_parity_provisional
+        );
+
+        // First real frame FROM the latched partner (K1DEF), observed on an
+        // Even slot. This must refine tx_parity to Odd (opposite) and clear
+        // the provisional flag.
+        manager
+            .process_message_with_parity(
+                MessageType::SignalReport {
+                    from_station: "K1DEF".to_string(),
+                    to_station: "W1ABC".to_string(),
+                    report: -10,
+                },
+                "W1ABC K1DEF -10".to_string(),
+                14074000.0,
+                Some(-10.0),
+                Some(SlotParity::Even),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(SlotParity::Odd),
+            "tx_parity must refine to the opposite of the observed DX parity"
+        );
+        assert!(
+            !progress.metadata.tx_parity_provisional,
+            "the provisional flag must clear after the first refinement"
+        );
+
+        // Second frame from the partner, this time observed on Odd (would
+        // imply Even if re-refined) — must NOT change the already-refined
+        // parity (one-shot).
+        manager
+            .process_message_with_parity(
+                MessageType::ReportAck {
+                    from_station: "K1DEF".to_string(),
+                    to_station: "W1ABC".to_string(),
+                    report: -10,
+                },
+                "W1ABC K1DEF R-10".to_string(),
+                14074000.0,
+                Some(-10.0),
+                Some(SlotParity::Odd),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(SlotParity::Odd),
+            "a second frame must NOT re-refine an already-refined parity"
+        );
+    }
+
+    /// Security: a frame from a NON-partner (sender mismatch) must NOT
+    /// trigger the refinement, even though it carries a determinable slot
+    /// parity — sender verification is never weakened for this purpose.
+    #[tokio::test]
+    async fn refinement_does_not_fire_for_non_partner_sender() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K1DEF".to_string(),
+                14074000.0,
+                None, // provisional latch
+                CallInitiation::Manual,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A frame from a DIFFERENT station, addressed to someone else
+        // entirely, must not be routed to this QSO at all (find_qsos_for_message
+        // relevance gate) and must not refine its provisional parity.
+        manager
+            .process_message_with_parity(
+                MessageType::SignalReport {
+                    from_station: "NF4KE".to_string(),
+                    to_station: "W1ABC".to_string(),
+                    report: -12,
+                },
+                "W1ABC NF4KE -12".to_string(),
+                14074000.0,
+                Some(-12.0),
+                Some(SlotParity::Even),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            progress.metadata.tx_parity_provisional,
+            "a non-partner frame must not refine the provisional latch"
+        );
+    }
+
     #[tokio::test]
     async fn test_respond_to_cq() {
         let manager = QsoManager::new(test_config());
@@ -5388,6 +5725,7 @@ mod tests {
                 partner_freq: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                tx_parity_provisional: false,
             },
         };
         manager.qsos.write().await.insert(qso_id, progress);
@@ -5932,6 +6270,7 @@ mod sender_verification_tests {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 
@@ -8043,6 +8382,7 @@ mod has_active_or_recent_qso_tests {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 
@@ -8227,6 +8567,7 @@ mod hound_tests {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 
@@ -8473,8 +8814,12 @@ mod hound_tests {
         }
     }
 
-    /// engage_hound with dx_parity=None produces tx_parity=None (no preferred
-    /// slot when the Fox's parity is unknown).
+    /// engage_hound with dx_parity=None (Fox's parity unknown) now LATCHES a
+    /// concrete provisional parity via `engage_hound` → `respond_to_cq_with`'s
+    /// `None`-dx_parity fallback (Batch 2 remediation), instead of leaving
+    /// `tx_parity` permanently `None` (the old behavior, which made the TX
+    /// scheduler re-resolve "nearest next slot" independently every
+    /// subsequent slot and alternate parity — the exact bug this fixes).
     #[tokio::test]
     async fn engage_hound_no_parity_when_dx_parity_unknown() {
         let manager = QsoManager::new(hound_test_config());
@@ -8485,9 +8830,14 @@ mod hound_tests {
             .expect("engage_hound with no parity");
 
         let progress = manager.get_qso(qso_id).await.unwrap();
-        assert_eq!(
-            progress.metadata.tx_parity, None,
-            "tx_parity should be None when dx_parity is None"
+        assert!(
+            progress.metadata.tx_parity.is_some(),
+            "tx_parity should be latched to a concrete parity even when \
+             dx_parity is None (provisional latch, not left None forever)"
+        );
+        assert!(
+            progress.metadata.tx_parity_provisional,
+            "a parity latched with no observed dx_parity must be marked provisional"
         );
         assert!(
             progress.metadata.hound,
