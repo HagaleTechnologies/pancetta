@@ -107,6 +107,21 @@ pub enum TimeSlot {
     Second,
 }
 
+impl TimeSlot {
+    /// The other slot. `First <-> Second`. Idempotent under double-flip.
+    ///
+    /// Mirrors `pancetta_core::slot::SlotParity::opposite` — used to map a
+    /// DX station's own `SlotParity` (Even/Odd) into the `TimeSlot` we would
+    /// actually transmit in (the opposite slot), for parity-aware scoring
+    /// (FQ-F8).
+    pub fn opposite(self) -> TimeSlot {
+        match self {
+            TimeSlot::First => TimeSlot::Second,
+            TimeSlot::Second => TimeSlot::First,
+        }
+    }
+}
+
 /// A record of one decoded signal for occupancy tracking.
 #[derive(Debug, Clone)]
 pub struct DecodeRecord {
@@ -218,6 +233,16 @@ impl SmartFrequencyAllocator {
     /// - `history`: recent decode activity
     /// - `own_frequencies`: offsets in use by our active QSOs
     /// - `dx_target_hz`: optional offset of the DX station we're calling
+    ///
+    /// Slot-blind: does not know which `TimeSlot` a candidate would
+    /// actually transmit in, so occupancy scoring can't distinguish "clear
+    /// in the slot that matters for our TX" from "clear in the DX's/
+    /// opposite slot" (FQ-F8). Delegates to
+    /// [`Self::rank_candidates_with_parity`] with `target_parity: None`,
+    /// which is exactly today's behavior — kept as a stable, unbroken
+    /// entry point for callers that don't (yet) know their TX parity at
+    /// scoring time (e.g. the self-CQ path, where either parity may be
+    /// chosen).
     pub fn rank_candidates(
         &self,
         spectral: &SpectralSnapshot,
@@ -225,14 +250,39 @@ impl SmartFrequencyAllocator {
         own_frequencies: &[f64],
         dx_target_hz: Option<f64>,
     ) -> Vec<FrequencyCandidate> {
+        self.rank_candidates_with_parity(spectral, history, own_frequencies, dx_target_hz, None)
+    }
+
+    /// Same as [`Self::rank_candidates`], but additionally takes the
+    /// `TimeSlot` parity the candidate would actually transmit in, when
+    /// knowable (FQ-F8). For a pounce, this is the opposite of the DX
+    /// station's own observed slot parity (mirroring the `tx_parity =
+    /// slot_parity.opposite()` convention used when latching a response's
+    /// TX parity elsewhere in this crate). When `None` (e.g. a self-CQ,
+    /// where either slot may end up being chosen), scoring degrades
+    /// gracefully to the slot-blind behavior of [`Self::rank_candidates`].
+    pub fn rank_candidates_with_parity(
+        &self,
+        spectral: &SpectralSnapshot,
+        history: &DecodeHistory,
+        own_frequencies: &[f64],
+        dx_target_hz: Option<f64>,
+        target_parity: Option<TimeSlot>,
+    ) -> Vec<FrequencyCandidate> {
         let (min_f, max_f) = self.config.range;
         let step = self.config.step_hz;
         let mut candidates = Vec::new();
 
         let mut freq = min_f;
         while freq <= max_f {
-            let score =
-                self.score_candidate(freq, spectral, history, own_frequencies, dx_target_hz);
+            let score = self.score_candidate(
+                freq,
+                spectral,
+                history,
+                own_frequencies,
+                dx_target_hz,
+                target_parity,
+            );
             let noise = spectral.power_near(freq, 25.0);
             let clear = history.is_clear_both_slots(freq, 50.0);
             let clear_first = history.activity_near_in_slot(freq, 50.0, TimeSlot::First) == 0;
@@ -265,6 +315,7 @@ impl SmartFrequencyAllocator {
         history: &DecodeHistory,
         own_frequencies: &[f64],
         dx_target_hz: Option<f64>,
+        target_parity: Option<TimeSlot>,
     ) -> f64 {
         let mut score = 0.0;
 
@@ -273,10 +324,43 @@ impl SmartFrequencyAllocator {
         if clear_both {
             score += 30.0;
         } else {
-            // Partially clear (only our TX slot is free) gets some credit
-            // We don't know our slot here — caller should filter if needed
-            let activity = history.activity_near(freq, 50.0);
-            score += 15.0_f64.max(25.0 - activity as f64 * 5.0);
+            match target_parity {
+                Some(target) => {
+                    // FQ-F8: we now know which slot we'd actually transmit
+                    // in, so weight clearness in THAT slot much more
+                    // heavily than the opposite/DX slot — a decode in the
+                    // DX's own listening window is irrelevant to whether
+                    // OUR transmission collides with something.
+                    let target_activity = history.activity_near_in_slot(freq, 50.0, target);
+                    if target_activity == 0 {
+                        // Our TX slot is clear; activity in the opposite
+                        // slot poses no collision risk to us, so it earns
+                        // only a token deduction — kept a hair below the
+                        // genuinely-clear-both bonus (30) so that outcome
+                        // still ranks best.
+                        let opposite_activity =
+                            history.activity_near_in_slot(freq, 50.0, target.opposite());
+                        score += (28.0 - opposite_activity as f64 * 1.0).max(20.0);
+                    } else {
+                        // Our TX slot itself has decode activity — real
+                        // collision risk, regardless of what the
+                        // opposite/DX slot looks like. Floors at 0 for a
+                        // heavily busy target slot.
+                        score += (12.0 - target_activity as f64 * 4.0).max(0.0);
+                    }
+                }
+                None => {
+                    // Slot-blind fallback (self-CQ path, or any caller
+                    // that doesn't know its TX parity yet): identical to
+                    // the pre-FQ-F8 formula.
+                    // FQ-F7: floor this term at 0, not 15 — `15.0_f64.max(...)`
+                    // previously clamped UP, so any bin with activity >= 2 scored
+                    // an identical flat 15 regardless of how busy it actually was,
+                    // defeating the whole point of penalizing busy bins.
+                    let activity = history.activity_near(freq, 50.0);
+                    score += (25.0 - activity as f64 * 5.0).max(0.0);
+                }
+            }
         }
 
         // 2. Low noise floor (lower = better, scale 0–20)
@@ -498,6 +582,167 @@ mod tests {
         );
     }
 
+    /// FQ-F7 regression: the "partially clear" occupancy term must floor at
+    /// 0, not 15 — a heavily-active bin should score far worse than a
+    /// lightly-active one, not get clamped up to the same flat partial
+    /// credit.
+    #[test]
+    fn partially_clear_score_floors_at_zero_not_fifteen() {
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let spectral = empty_spectral();
+
+        // Lightly busy: 1 decode near 1500 Hz, only in the First slot, so
+        // the Second slot remains clear -> "partially clear" branch with
+        // activity=1: (25 - 1*5).max(0) = 20.
+        let mut light_history = empty_history();
+        light_history.push_cycle(vec![DecodeRecord {
+            frequency_hz: 1500.0,
+            time_slot: TimeSlot::First,
+        }]);
+
+        // Heavily busy: 10 decodes clustered near 1500 Hz in the First
+        // slot -> activity=10, so (25 - 10*5).max(0) should floor at 0,
+        // not clamp back up to 15.
+        let mut heavy_history = empty_history();
+        let mut heavy_records = Vec::new();
+        for i in 0..10 {
+            heavy_records.push(DecodeRecord {
+                frequency_hz: 1500.0 + i as f64, // all within the 50 Hz radius
+                time_slot: TimeSlot::First,
+            });
+        }
+        heavy_history.push_cycle(heavy_records);
+
+        let light_score =
+            allocator.score_candidate(1500.0, &spectral, &light_history, &[], None, None);
+        let heavy_score =
+            allocator.score_candidate(1500.0, &spectral, &heavy_history, &[], None, None);
+
+        // Isolate the effect: only the occupancy-related terms (#1 and #4)
+        // differ between light and heavy history; everything else (noise,
+        // neighbor peak, center bias, DX proximity, own-freq) is identical
+        // since both histories are otherwise empty. Term #1 alone should
+        // account for a 20-point swing (20 -> 0), not the pre-fix 5-point
+        // swing (20 -> 15, since `.max(15.0)` used to clamp the heavy case
+        // back up).
+        assert!(
+            heavy_score < light_score - 15.0,
+            "heavy occupancy (score={heavy_score}) should score much worse \
+             than light occupancy (score={light_score}); pre-fix the gap \
+             was clamped to only ~5 points"
+        );
+    }
+
+    /// FQ-F8: when the candidate's actual TX slot parity is known, a
+    /// candidate that is clear in that slot but occupied in the opposite
+    /// (DX's) slot must score meaningfully higher than one that is occupied
+    /// in the target slot but clear in the opposite slot — the exact
+    /// scenario the old slot-blind code treated identically (both had
+    /// `activity_near == 2`, so both got the same flat partial credit).
+    #[test]
+    fn parity_aware_scoring_favors_clear_target_slot_over_clear_opposite_slot() {
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let spectral = empty_spectral();
+        let target = TimeSlot::First;
+
+        // Scenario A: target slot (First) is clear; opposite (Second) is
+        // busy with 2 decodes near 1500 Hz.
+        let mut history_target_clear = empty_history();
+        history_target_clear.push_cycle(vec![
+            DecodeRecord {
+                frequency_hz: 1500.0,
+                time_slot: TimeSlot::Second,
+            },
+            DecodeRecord {
+                frequency_hz: 1501.0,
+                time_slot: TimeSlot::Second,
+            },
+        ]);
+
+        // Scenario B: target slot (First) is busy with 2 decodes near
+        // 1500 Hz; opposite (Second) is clear. Total activity_near is the
+        // same magnitude as scenario A, so term #4 (recent activity) and
+        // every other additive term are identical between A and B — only
+        // the parity-aware term #1 branch differs.
+        let mut history_target_busy = empty_history();
+        history_target_busy.push_cycle(vec![
+            DecodeRecord {
+                frequency_hz: 1500.0,
+                time_slot: TimeSlot::First,
+            },
+            DecodeRecord {
+                frequency_hz: 1501.0,
+                time_slot: TimeSlot::First,
+            },
+        ]);
+
+        let score_target_clear = allocator.score_candidate(
+            1500.0,
+            &spectral,
+            &history_target_clear,
+            &[],
+            None,
+            Some(target),
+        );
+        let score_target_busy = allocator.score_candidate(
+            1500.0,
+            &spectral,
+            &history_target_busy,
+            &[],
+            None,
+            Some(target),
+        );
+
+        assert!(
+            score_target_clear > score_target_busy + 15.0,
+            "clear-in-target-slot (score={score_target_clear}) should score much \
+             higher than clear-in-opposite-slot-only (score={score_target_busy}); \
+             the old slot-blind code scored these identically"
+        );
+    }
+
+    /// FQ-F8 regression: when `target_parity` is `None` (the self-CQ path,
+    /// which can't commit to a single TX parity at scoring time), the
+    /// "partially clear" branch must remain byte-identical to the original
+    /// slot-blind formula `(25.0 - activity * 5.0).max(0.0)`. This pins the
+    /// full additive score for a known scenario so any accidental change to
+    /// the None-path arithmetic (or any other term) trips this test.
+    #[test]
+    fn target_parity_none_is_byte_identical_to_legacy_slot_blind_scoring() {
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let spectral = empty_spectral(); // all-zero power bins -> noise=0, peak=0
+        let mut history = empty_history();
+        // 2 decodes near 1500 Hz (one per slot) -> activity_near == 2,
+        // not clear_both.
+        history.push_cycle(vec![
+            DecodeRecord {
+                frequency_hz: 1500.0,
+                time_slot: TimeSlot::First,
+            },
+            DecodeRecord {
+                frequency_hz: 1500.0,
+                time_slot: TimeSlot::Second,
+            },
+        ]);
+
+        let score = allocator.score_candidate(1500.0, &spectral, &history, &[], None, None);
+
+        // Hand-computed expected total at freq=1500.0 with default config,
+        // empty spectral, no own frequencies, no DX target:
+        //   #1 partial-clear (activity=2, slot-blind): (25 - 2*5).max(0) = 15
+        //   #2 noise floor (noise=0):                   20*(1-0)         = 20
+        //   #3 neighbor peak (peak=0):                  15*(1-0)         = 15
+        //   #4 recent activity (activity=2):             (10 - 2*2.5).max(0) = 5
+        //   #5 center bias (freq == center_bias_hz):     10*(1-0/1300)   = 10
+        //   #6 DX proximity: dx_target_hz is None -> 0
+        //   #7 own-frequency separation: no own freqs -> 0
+        //   total = 15 + 20 + 15 + 5 + 10 = 65
+        assert!(
+            (score - 65.0).abs() < 1e-9,
+            "expected legacy slot-blind total score 65.0, got {score}"
+        );
+    }
+
     #[test]
     fn test_decode_history_rolling_buffer() {
         // max-2 buffer: push 3 cycles, oldest should be dropped
@@ -577,6 +822,62 @@ mod tests {
             power_at_600 < 0.01,
             "Expected quiet power near 600 Hz, got {}",
             power_at_600
+        );
+    }
+
+    /// FQ-F1 regression: the FT8 decoder's waterfall bins start at 0 Hz
+    /// (`pancetta-ft8/src/decoder.rs`'s `bin_start = 0usize`, spanning
+    /// ~0-3000 Hz), so a `SpectralSnapshot` built from real waterfall data
+    /// must be labeled `freq_min_hz: 0.0` to match — NOT 200.0, which used
+    /// to mislabel the axis and make `power_near`/`peak_near` read a bin
+    /// ~100-200 Hz away from the frequency actually being scored. This
+    /// proves the bin-index math in this file is correct for the corrected
+    /// (0-3000 Hz) axis: a synthetic peak placed at a known real-world
+    /// offset must be read back from exactly that offset, not a shifted one.
+    #[test]
+    fn power_near_reads_correct_bin_on_corrected_zero_hz_axis() {
+        let num_bins = 150; // matches the ~150-bin waterfall used in production
+        let mut power_bins = vec![0.0f32; num_bins];
+        let freq_min_hz = 0.0;
+        let freq_max_hz = 3000.0;
+        let bin_width = (freq_max_hz - freq_min_hz) / num_bins as f64;
+
+        // Place a synthetic peak at a known real-world offset: 1500 Hz.
+        let peak_offset_hz = 1500.0;
+        let peak_bin = (peak_offset_hz / bin_width) as usize;
+        power_bins[peak_bin] = 0.9;
+
+        let spectral = SpectralSnapshot {
+            power_bins,
+            freq_min_hz,
+            freq_max_hz,
+        };
+
+        // Reading AT the real offset must see the peak (radius 0 pins the
+        // lookup to exactly the center bin, avoiding averaging dilution).
+        let at_peak = spectral.power_near(peak_offset_hz, 0.0);
+        assert!(
+            (at_peak - 0.9).abs() < 1e-6,
+            "Expected to find the peak at its real 1500 Hz offset, got {}",
+            at_peak
+        );
+        let peak_val = spectral.peak_near(peak_offset_hz, 20.0);
+        assert!(
+            (peak_val - 0.9).abs() < 1e-6,
+            "Expected peak_near to read the exact peak value at 1500 Hz, got {}",
+            peak_val
+        );
+
+        // Reading at the OLD (mislabeled) 200-Hz-shifted interpretation of
+        // this offset (i.e. what a caller using freq_min_hz=200.0 would
+        // have actually landed on, roughly 200 Hz away) must NOT see it —
+        // this is what the bug looked like: scoring code asking for 1500 Hz
+        // actually read data belonging to a different real frequency.
+        let shifted = spectral.power_near(peak_offset_hz - 200.0, 20.0);
+        assert!(
+            shifted < 0.1,
+            "Expected no peak 200 Hz away from the real peak location, got {}",
+            shifted
         );
     }
 }

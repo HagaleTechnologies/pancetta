@@ -1,5 +1,16 @@
 # QSO state machine + TX timing — broad analysis
 
+> **Superseded as of 2026-07-18** by `docs/qso-tx-deep-review-2026-07-18.md`, a broader
+> re-audit whose findings are current and whose 5-batch remediation is fully landed
+> (commits `6b2ceaf9`/`584dd81a`/`a43419df`/`e16b0370`/`6927e02c`). This file's own
+> findings are historical: Symptom A (rearm coordination), Symptom B (collection-window
+> timestamp), BUG 1 (CQ parity latch), and the GAP-1/GAP-2 early-close/rearm-rung arms
+> were all fixed at the time this analysis was written (PRs #80/#81/#82, referenced
+> below). Symptom C (multi-TX slow-start) is still open — see
+> `project_symptom_c_multi_tx_deferred` in the assistant's memory or the code comment at
+> `coordinator/tx.rs`'s `COALESCE_COLLECT_WINDOW_MS`. For anything else, trust the newer
+> review; this file is kept for historical context only.
+
 A deep pass over pancetta's autonomous QSO handling: (A) state-machine correctness for
 happy-path and edge-case QSOs, and (B) the TX-timing "jank" the operator observes
 (redundant re-transmits, full-cycle start delays, multi-TX slow-start). **Analysis only

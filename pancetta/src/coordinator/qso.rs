@@ -33,7 +33,9 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType}
 ///   - at most [`AUTO_73_MAX_RESENDS`] extra 73s per completed QSO,
 ///   - at most once per ~15 s FT8 slot (so two decodes of the same RR73 in
 ///     one slot fire only once),
-///   - never when a live QSO with that station is already active.
+///   - never when a live QSO with that station is already active,
+///   - the FIRST auto-resend never fires before [`AUTO_73_FIRST_RESEND_MIN_DELAY`]
+///     has elapsed since completion (SM-F3/TX-F10 — see that constant's doc).
 const AUTO_73_WINDOW: chrono::Duration = chrono::Duration::minutes(3);
 /// Maximum number of auto re-sends of our 73 per completed manual QSO.
 const AUTO_73_MAX_RESENDS: u8 = 3;
@@ -41,6 +43,23 @@ const AUTO_73_MAX_RESENDS: u8 = 3;
 /// slightly-under-slot guard so we fire at most once per slot even if the
 /// DX's RR73 is decoded a hair early/late).
 const AUTO_73_MIN_SPACING: chrono::Duration = chrono::Duration::seconds(14);
+/// SM-F3/TX-F10: minimum time that must elapse since `completed_at` before
+/// the FIRST auto-resend (`resends` 0 → 1) is allowed to fire.
+///
+/// Guards against a real race two independent review tracks flagged: FT8
+/// decoders routinely emit 2-4 copies of one frame, and `maybe_auto_resend_73`
+/// runs per decode copy, *before* `process_message` gets to it. The QSO's own
+/// closing `MessageToSend(73)` — emitted by the very same `QsoCompleted` that
+/// stashes this entry — can still be waiting out the TX scheduler's defer
+/// logic (`schedule_tx`: late-in-slot pushes to the next slot of the required
+/// parity, up to ~30s away) when a duplicate decode of the DX's RR73 arrives.
+/// Without this guard, that duplicate decode reads `resends == 0` and fires a
+/// SECOND 73 for a QSO whose FIRST 73 hasn't even keyed yet — a double-PTT
+/// bug in the making. 30s (one worst-case defer window) plus a small margin
+/// comfortably covers it while staying tiny next to [`AUTO_73_WINDOW`] (3
+/// min), so a truly later, genuine repeat of RR73 (the DX really didn't copy
+/// our first 73) is unaffected.
+const AUTO_73_FIRST_RESEND_MIN_DELAY: chrono::Duration = chrono::Duration::seconds(32);
 
 /// One recently-completed **manual** QSO, tracked so we can auto-re-send our
 /// 73 if the DX keeps sending RR73/RRR. Keyed (in the map) by uppercased
@@ -123,6 +142,21 @@ struct PendingManualCall {
     /// promoted QSO is opened with `remote_origin = true` — its TX stays
     /// `TxOrigin::Remote` and armed-TX-gated. `false` for every local/TUI call.
     remote_origin: bool,
+    /// Which rung of the response ladder to open at on promotion — replayed
+    /// via `respond_to_caller` (see [`promote_pending_manual_calls`]).
+    /// `StartQso`-originated entries always use [`pancetta_core::ResponseStep::Grid`],
+    /// which `respond_to_caller` degrades to exactly the `respond_to_cq_with`
+    /// call this queue used before `RespondToCaller` entries existed — byte-
+    /// identical for the pre-existing StartQso path.
+    step: pancetta_core::ResponseStep,
+    /// Our measurement of the caller's signal (drives the report WE send).
+    /// Only meaningful for `RespondToCaller`-originated entries opening at
+    /// `Report`/`ReportAck`/`Rr73`/`SeventyThree`. `None` for `StartQso`
+    /// entries (a `Grid` open has no report to send yet).
+    our_snr_of_them: Option<f32>,
+    /// Their report of us, if known. Currently always `None` at both call
+    /// sites (the engine defaults it) — carried for forward completeness.
+    their_report: Option<i8>,
 }
 
 impl PendingManualCall {
@@ -450,12 +484,21 @@ async fn promote_pending_manual_calls(
                     p.callsign, p.held_hz, p.hold_mode, p.frequency_hz, tx_off, active.len()
                 );
             }
+            // Replay via `respond_to_caller`, which degrades a `Grid` step to
+            // exactly the `respond_to_cq_with` call this promotion path used
+            // before `RespondToCaller` entries could be queued here — so a
+            // `StartQso`-originated entry (always `step == Grid`) is
+            // byte-identical to the pre-existing behavior. A
+            // `RespondToCaller`-originated entry opens at its own step
+            // (Report/ReportAck/Rr73/SeventyThree) instead.
             qso_manager
-                .respond_to_cq_with(
+                .respond_to_caller(
                     p.callsign.clone(),
                     tx_off,
                     p.dx_parity,
-                    pancetta_qso::CallInitiation::Manual,
+                    p.step,
+                    p.our_snr_of_them,
+                    p.their_report,
                     partner,
                     p.remote_origin,
                 )
@@ -629,6 +672,20 @@ async fn maybe_auto_resend_73(
         if entry.resends >= AUTO_73_MAX_RESENDS {
             // Cap reached — stop and drop the entry so we never reconsider it.
             map.remove(&key);
+            return;
+        }
+        // SM-F3/TX-F10: don't let a duplicate/near-immediate decode of the
+        // closing RR73 fire our FIRST auto-resend before the original 73
+        // (emitted by the same QsoCompleted that stashed this entry) has had
+        // time to clear the TX scheduler's defer window. Only gates the
+        // 0 -> 1 transition — once a genuine first resend has gone out, later
+        // resends are governed by AUTO_73_MIN_SPACING as before. We do NOT
+        // consume the budget here: this is a no-op skip, not a burned
+        // attempt, so a genuine later RR73 (past this guard) still gets its
+        // full allotment.
+        if entry.resends == 0
+            && now.signed_duration_since(entry.completed_at) < AUTO_73_FIRST_RESEND_MIN_DELAY
+        {
             return;
         }
         if let Some(last) = entry.last_resend_at {
@@ -930,15 +987,34 @@ async fn maybe_answer_caller(
         answer.their_call, answer.step, frequency_hz
     );
 
+    // FQ-F4/TX-F6: de-conflict the raw Tx=Rx candidate (the caller's own
+    // decoded frequency) against our OTHER active streams before latching
+    // it — exactly mirroring `compute_manual_tx_offset`'s pattern (the
+    // manual-call path already does this). Without this, two concurrent
+    // QSOs can collide within MIN_TX_SEPARATION_HZ, which can make
+    // `modulate_multi_tx`'s pairwise-separation check fail the ENTIRE
+    // multi-TX bundle when the coalescer folds them together. A genuine
+    // no-op (byte-identical) when nothing is within MIN_TX_SEPARATION_HZ —
+    // `deconflict_offset` returns the input unchanged in that case.
+    let active = qso_manager.active_tx_offsets().await;
+    let (tx_off, partner_freq) = compute_manual_tx_offset(frequency_hz, false, 0, &active);
+    if tx_off != frequency_hz {
+        info!(
+            target: "qso",
+            "Auto-answer TX offset de-conflicted: caller_freq={:.0} → tx_off={:.0} Hz ({} active)",
+            frequency_hz, tx_off, active.len()
+        );
+    }
+
     match qso_manager
         .respond_to_caller(
             answer.their_call.clone(),
-            frequency_hz,
+            tx_off,
             their_parity,
             answer.step,
             Some(snr),
             answer.their_report,
-            None,  // classify_caller_answer: always Tx=Rx (answering a caller, no held-offset)
+            partner_freq,
             false, // local decode-loop auto-answer, never remote
         )
         .await
@@ -1078,6 +1154,11 @@ impl super::ApplicationCoordinator {
         // gate. The QSO component keeps it in sync from the QsoEvent stream
         // below.
         let active_tx_qsos = self.active_tx_qsos.clone();
+        // FQ-F3: active QSO id -> TX offset (Hz), mirroring `active_tx_qsos`'s
+        // exact insert/remove points (including the 45s completed-grace
+        // window) so the autonomous frequency allocator's own-frequency
+        // registry can be kept in sync each tick.
+        let active_tx_offsets = self.active_tx_offsets.clone();
         // Newest-TX-intent map — written as we forward each MessageToSend so
         // the TX worker can pivot to the freshest message at key-time.
         let latest_tx_intent = self.latest_tx_intent.clone();
@@ -1428,6 +1509,7 @@ impl super::ApplicationCoordinator {
                 let ap_state = active_qso_ap;
                 let qso_freq_state = active_qso_freq_hz;
                 let active_tx_qsos = active_tx_qsos.clone();
+                let active_tx_offsets = active_tx_offsets.clone();
                 let latest_tx_intent = latest_tx_intent.clone();
                 let snapshot_qso_manager = qso_manager.clone();
                 let snapshot_bus = tx_bus.clone();
@@ -1457,7 +1539,15 @@ impl super::ApplicationCoordinator {
                                     let key = super::active_tx_qso_key(&qso_id.to_string());
                                     if new_state.is_active() {
                                         if let Ok(mut set) = active_tx_qsos.write() {
-                                            set.insert(key);
+                                            set.insert(key.clone());
+                                        }
+                                        // FQ-F3: keep the own-frequency
+                                        // registry's source map in sync
+                                        // alongside `active_tx_qsos`.
+                                        if let Some(freq) = new_state.frequency() {
+                                            if let Ok(mut offsets) = active_tx_offsets.write() {
+                                                offsets.insert(key, freq);
+                                            }
                                         }
                                     } else if matches!(
                                         new_state,
@@ -1468,6 +1558,9 @@ impl super::ApplicationCoordinator {
                                         }
                                         if let Ok(mut m) = latest_tx_intent.write() {
                                             m.remove(&key);
+                                        }
+                                        if let Ok(mut offsets) = active_tx_offsets.write() {
+                                            offsets.remove(&key);
                                         }
                                         info!(
                                             target: "tx.policy",
@@ -1789,8 +1882,15 @@ impl super::ApplicationCoordinator {
                                     if let Ok(mut s) = active_tx_qsos.write() {
                                         s.insert(key.clone());
                                     }
+                                    // FQ-F3: same idempotent insert for the
+                                    // offset registry, mirroring the
+                                    // active_tx_qsos insert immediately above.
+                                    if let Ok(mut offsets) = active_tx_offsets.write() {
+                                        offsets.insert(key.clone(), metadata.frequency);
+                                    }
                                     let set = active_tx_qsos.clone();
                                     let intent_map = latest_tx_intent.clone();
+                                    let offsets_map = active_tx_offsets.clone();
                                     let qid = qso_id;
                                     // #40: promote any operator-deferred
                                     // cross-parity manual call once THIS QSO's
@@ -1808,6 +1908,9 @@ impl super::ApplicationCoordinator {
                                         }
                                         if let Ok(mut m) = intent_map.write() {
                                             m.remove(&key);
+                                        }
+                                        if let Ok(mut offsets) = offsets_map.write() {
+                                            offsets.remove(&key);
                                         }
                                         info!(
                                             target: "tx.policy",
@@ -1961,6 +2064,9 @@ impl super::ApplicationCoordinator {
                                     if let Ok(mut m) = latest_tx_intent.write() {
                                         m.remove(&key);
                                     }
+                                    if let Ok(mut offsets) = active_tx_offsets.write() {
+                                        offsets.remove(&key);
+                                    }
                                 }
                                 // #40: window freed — promote a deferred call.
                                 promote_pending_manual_calls(
@@ -2109,12 +2215,22 @@ impl super::ApplicationCoordinator {
                                             // QSO — runs unconditionally for every
                                             // decode so the state machine always
                                             // sees the latest copy.
+                                            // Use the parity-carrying entry point: this
+                                            // is a live decode, so `slot_parity` is a
+                                            // real observation, letting a
+                                            // provisionally-latched QSO (e.g. answered
+                                            // from a DX-cluster/DX-Hunter spot before any
+                                            // live decode existed) refine its `tx_parity`
+                                            // to the true opposite-of-DX value on first
+                                            // contact — see
+                                            // `QsoMetadata::tx_parity_provisional`.
                                             if let Err(e) = qso_manager
-                                                .process_message(
+                                                .process_message_with_parity(
                                                     msg_type.clone(),
                                                     raw_text.clone(),
                                                     frequency,
                                                     Some(snr),
+                                                    decoded_msg.slot_parity,
                                                 )
                                                 .await
                                             {
@@ -2290,6 +2406,9 @@ impl super::ApplicationCoordinator {
                                                         held_hz: queued_held,
                                                         hold_mode: queued_hold_mode,
                                                         remote_origin,
+                                                        step: pancetta_core::ResponseStep::Grid,
+                                                        our_snr_of_them: None,
+                                                        their_report: None,
                                                     });
                                                 }
                                                 let queue_depth = q.len();
@@ -2435,11 +2554,38 @@ impl super::ApplicationCoordinator {
                                             }
                                             let result = match &callsign {
                                                 Some(dx) => {
+                                                    // FQ-F4/TX-F6: de-conflict the
+                                                    // raw Tx=Rx candidate (the DX's
+                                                    // own decoded frequency) against
+                                                    // our OTHER active streams before
+                                                    // latching it, mirroring the
+                                                    // manual-call path's
+                                                    // `compute_manual_tx_offset`
+                                                    // pattern. Byte-identical no-op
+                                                    // when nothing collides.
+                                                    let active =
+                                                        qso_manager.active_tx_offsets().await;
+                                                    let (tx_off, partner) =
+                                                        compute_manual_tx_offset(
+                                                            frequency, false, 0, &active,
+                                                        );
+                                                    if tx_off != frequency {
+                                                        info!(
+                                                            target: "qso.autonomous",
+                                                            "Autonomous pounce TX offset \
+                                                             de-conflicted: dx_freq={:.0} \
+                                                             → tx_off={:.0} Hz ({} active)",
+                                                            frequency, tx_off, active.len()
+                                                        );
+                                                    }
                                                     qso_manager
-                                                        .respond_to_cq(
+                                                        .respond_to_cq_with(
                                                             dx.clone(),
-                                                            frequency,
+                                                            tx_off,
                                                             parity,
+                                                            pancetta_qso::CallInitiation::Auto,
+                                                            partner,
+                                                            false,
                                                         )
                                                         .await
                                                 }
@@ -2533,6 +2679,12 @@ impl super::ApplicationCoordinator {
                                                         hold_mode: false,
                                                         // Hound (Shift+H) is a local operator action.
                                                         remote_origin: false,
+                                                        // Hound entries promote via `engage_hound`,
+                                                        // not `respond_to_caller` — these fields are
+                                                        // unused when `hound == true`.
+                                                        step: pancetta_core::ResponseStep::Grid,
+                                                        our_snr_of_them: None,
+                                                        their_report: None,
                                                     });
                                                 }
                                                 let queue_depth = q.len();
@@ -2617,6 +2769,78 @@ impl super::ApplicationCoordinator {
                                                  (manual)",
                                                 callsign, frequency, step
                                             );
+                                            // #40 half-duplex parity gate (same admission check
+                                            // as StartQso, applied here for consistency — a
+                                            // RespondToCaller that would TX in the *opposite*
+                                            // window from the one our active QSOs hold is
+                                            // DEFERRED, not started immediately, to keep the
+                                            // opposite window free to hear responses (no
+                                            // sequential-window TX). Promoted automatically once
+                                            // the current side's QSOs finish
+                                            // (promote_pending_manual_calls), replayed via
+                                            // `respond_to_caller` at its own `step`.
+                                            let desired_tx_parity = dx_parity.map(|p| p.opposite());
+                                            let current_side = qso_manager.current_tx_side().await;
+                                            if matches!(
+                                                pancetta_qso::qso_manager::admit_new_qso(
+                                                    current_side,
+                                                    desired_tx_parity,
+                                                ),
+                                                pancetta_qso::qso_manager::TxAdmission::Queue
+                                            ) {
+                                                let mut q = pending_manual_calls.lock().await;
+                                                let dup = q.iter().any(|p| {
+                                                    p.callsign.eq_ignore_ascii_case(&callsign)
+                                                });
+                                                if !dup {
+                                                    if q.len() >= MAX_PENDING_MANUAL_CALLS {
+                                                        q.pop_front();
+                                                    }
+                                                    let queued_held =
+                                                        tx_offset_hold_hz.load(Ordering::Relaxed);
+                                                    let queued_hold_mode =
+                                                        pancetta_core::TxFreqMode::from_u8(
+                                                            tx_freq_mode.load(Ordering::Relaxed),
+                                                        ) == pancetta_core::TxFreqMode::Hold;
+                                                    q.push_back(PendingManualCall {
+                                                        callsign: callsign.clone(),
+                                                        frequency_hz: frequency as f64,
+                                                        dx_parity,
+                                                        queued_at: std::time::Instant::now(),
+                                                        hound: false,
+                                                        fox_freq_hz: None,
+                                                        fox_grid: None,
+                                                        held_hz: queued_held,
+                                                        hold_mode: queued_hold_mode,
+                                                        remote_origin,
+                                                        step,
+                                                        our_snr_of_them: snr,
+                                                        // The immediate path below always passes
+                                                        // `None` (the engine defaults it); match
+                                                        // that here for the deferred replay too.
+                                                        their_report: None,
+                                                    });
+                                                }
+                                                let queue_depth = q.len();
+                                                drop(q);
+                                                info!(
+                                                    target: "qso",
+                                                    "Queued caller-response to {} ({:?}) — \
+                                                     opposite window (active side {:?}); queue \
+                                                     now {} pending",
+                                                    callsign, dx_parity, current_side, queue_depth
+                                                );
+                                                emit_status(
+                                                    &message_bus,
+                                                    format!(
+                                                        "Queued {} — waiting for current window \
+                                                         to clear",
+                                                        callsign
+                                                    ),
+                                                )
+                                                .await;
+                                                continue;
+                                            }
                                             // TX-offset selection (T3): same priority as StartQso:
                                             // held offset → de-conflict → Tx=Rx fallback.
                                             let dx_freq = frequency as f64;
@@ -3307,11 +3531,78 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            step: pancetta_core::ResponseStep::Grid,
+            our_snr_of_them: None,
+            their_report: None,
         }
     }
 
     fn names(v: &[PendingManualCall]) -> Vec<String> {
         v.iter().map(|p| p.callsign.clone()).collect()
+    }
+
+    // Build a RespondToCaller-shaped pending call (non-Grid step) whose DX is
+    // on `dx`, so its desired TX parity is the opposite. Used to verify a
+    // `RespondToCaller` entry queued by the admission gate participates in
+    // exactly the SAME cross-parity partition logic as a `StartQso` entry
+    // (`call` above), not a separate/duplicated path.
+    fn caller_call(
+        name: &str,
+        dx: SlotParity,
+        step: pancetta_core::ResponseStep,
+    ) -> PendingManualCall {
+        PendingManualCall {
+            callsign: name.to_string(),
+            frequency_hz: 1500.0,
+            dx_parity: Some(dx),
+            queued_at: std::time::Instant::now(),
+            hound: false,
+            fox_freq_hz: None,
+            fox_grid: None,
+            held_hz: 0,
+            hold_mode: false,
+            remote_origin: false,
+            step,
+            our_snr_of_them: Some(-8.0),
+            their_report: None,
+        }
+    }
+
+    /// A `RespondToCaller`-shaped entry (step = Report, i.e. NOT the
+    /// `StartQso`-equivalent `Grid` step) that wants the opposite parity from
+    /// our committed side stays queued — it is gated by the SAME half-duplex
+    /// admission logic as a `StartQso` entry, not bypassed.
+    #[test]
+    fn respond_to_caller_shaped_entry_stays_queued_on_opposite_side() {
+        let q: VecDeque<_> = [caller_call(
+            "DX1",
+            SlotParity::Even, // wants Odd
+            pancetta_core::ResponseStep::Report,
+        )]
+        .into();
+        // Committed to Even already: the Odd-wanting caller-response stays queued.
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Even));
+        assert!(
+            start.is_empty(),
+            "opposite-parity caller-response must not start"
+        );
+        assert_eq!(names(&keep.into_iter().collect::<Vec<_>>()), vec!["DX1"]);
+    }
+
+    /// The same `RespondToCaller`-shaped entry starts once the committed side
+    /// flips to match it (mirrors what promotion after a QSO going terminal
+    /// looks like from the partition step's point of view).
+    #[test]
+    fn respond_to_caller_shaped_entry_starts_when_side_matches() {
+        let q: VecDeque<_> = [caller_call(
+            "DX1",
+            SlotParity::Even, // wants Odd
+            pancetta_core::ResponseStep::Report,
+        )]
+        .into();
+        let (start, keep) = partition_pending_calls(q, Some(SlotParity::Odd));
+        assert_eq!(names(&start), vec!["DX1"]);
+        assert!(keep.is_empty());
     }
 
     #[test]
@@ -3377,6 +3668,9 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            step: pancetta_core::ResponseStep::Grid,
+            our_snr_of_them: None,
+            their_report: None,
         }
     }
 
@@ -3456,6 +3750,9 @@ mod pending_manual_tests {
             held_hz: 1500,
             hold_mode: true,
             remote_origin: false,
+            step: pancetta_core::ResponseStep::Grid,
+            our_snr_of_them: None,
+            their_report: None,
         };
         let active: Vec<f64> = vec![];
         let (tx_off, partner) =
@@ -3483,6 +3780,9 @@ mod pending_manual_tests {
             held_hz: 1500,
             hold_mode: true,
             remote_origin: false,
+            step: pancetta_core::ResponseStep::Grid,
+            our_snr_of_them: None,
+            their_report: None,
         };
         // An active QSO is already on 1500 Hz at promotion time.
         let active: Vec<f64> = vec![1500.0];
@@ -3518,12 +3818,83 @@ mod pending_manual_tests {
             held_hz: 0,
             hold_mode: false,
             remote_origin: false,
+            step: pancetta_core::ResponseStep::Grid,
+            our_snr_of_them: None,
+            their_report: None,
         };
         let active: Vec<f64> = vec![];
         let (tx_off, partner) =
             compute_manual_tx_offset(p.frequency_hz, p.hold_mode, p.held_hz, &active);
         assert_eq!(tx_off, 1750.0, "Auto + no collision → Tx=Rx");
         assert_eq!(partner, None, "Tx=Rx → partner_freq is None");
+    }
+
+    // ── RespondToCaller admission-gate promotion (Batch 2, part 3) ───────────
+    //
+    // These exercise the REAL `promote_pending_manual_calls` (not just the
+    // pure partition step) against a REAL `QsoManager`, proving a
+    // `RespondToCaller`-shaped queued entry replays via `respond_to_caller`
+    // at its OWN step on promotion — not the old hardcoded
+    // `respond_to_cq_with` (which would always reopen at `RespondingToCq`
+    // regardless of what step the operator actually chose).
+
+    use super::{promote_pending_manual_calls, PendingManualCalls};
+    use crate::message_bus::MessageBus;
+    use pancetta_qso::{QsoManager, QsoManagerConfig, QsoState};
+    use std::sync::Arc;
+    use tokio::sync::Mutex as TokioMutex;
+
+    async fn test_manager(our_callsign: &str) -> QsoManager {
+        let m = QsoManager::new(QsoManagerConfig {
+            our_callsign: our_callsign.to_string(),
+            our_grid: Some("EM10".to_string()),
+            ..Default::default()
+        });
+        m.start().await.expect("manager start");
+        m
+    }
+
+    /// A `RespondToCaller` (step = Report) queued because it wanted the
+    /// opposite parity from our (idle) committed side promotes — via
+    /// `promote_pending_manual_calls` — into a REAL QSO opened at
+    /// `SendingReport` (the Report step's initial state), not `RespondingToCq`
+    /// (the Grid/StartQso shape). This is the admission-gate + promotion
+    /// round-trip for Part 3: queued-not-admitted-immediately, then promoted
+    /// once a window is free.
+    #[tokio::test]
+    async fn respond_to_caller_shaped_queued_call_promotes_at_its_own_step() {
+        let mgr = test_manager("K5ARH").await;
+        let bus = MessageBus::new(1000).expect("bus");
+        let pending: PendingManualCalls = Arc::new(TokioMutex::new(VecDeque::from([caller_call(
+            "JA1ABC",
+            SlotParity::Even,
+            pancetta_core::ResponseStep::Report,
+        )])));
+
+        // Idle (no active QSOs) — `promote_pending_manual_calls` will adopt
+        // the queue's own desired parity (Odd, opposite of Even) as the side
+        // to commit to, and start it.
+        promote_pending_manual_calls(&mgr, &pending, &bus).await;
+
+        assert!(
+            pending.lock().await.is_empty(),
+            "the queued caller-response must be promoted (queue drained), not left waiting"
+        );
+
+        let active = mgr.get_active_qsos().await;
+        assert_eq!(active.len(), 1, "exactly one QSO should have started");
+        let (_, progress) = &active[0];
+        assert_eq!(progress.metadata.their_callsign.as_deref(), Some("JA1ABC"));
+        assert!(
+            matches!(progress.state, QsoState::SendingReport { .. }),
+            "step=Report must open at SendingReport (not RespondingToCq/Grid), got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(SlotParity::Odd),
+            "tx_parity must be opposite of the caller's Even slot"
+        );
     }
 }
 
@@ -3763,6 +4134,7 @@ mod snapshot_tests {
                 partner_freq: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                tx_parity_provisional: false,
             },
         }
     }
@@ -3908,8 +4280,8 @@ mod snapshot_tests {
 #[cfg(test)]
 mod auto_73_tests {
     use super::{
-        maybe_auto_resend_73, RecentManualCompletion, RecentManualCompletions, AUTO_73_MAX_RESENDS,
-        AUTO_73_WINDOW,
+        maybe_auto_resend_73, RecentManualCompletion, RecentManualCompletions,
+        AUTO_73_FIRST_RESEND_MIN_DELAY, AUTO_73_MAX_RESENDS, AUTO_73_WINDOW,
     };
     use crate::message_bus::MessageBus;
     use pancetta_core::slot::SlotParity;
@@ -3938,13 +4310,18 @@ mod auto_73_tests {
         MessageBus::new(1000).expect("bus")
     }
 
-    /// A completions map containing a single fresh manual completion for `DX`.
+    /// A completions map containing a single manual completion for `DX`,
+    /// completed far enough in the past to clear the SM-F3/TX-F10
+    /// first-resend guard (`AUTO_73_FIRST_RESEND_MIN_DELAY`) but still well
+    /// within `AUTO_73_WINDOW` — i.e. a stashed completion whose original 73
+    /// has certainly gone out by now, matching how these tests were written
+    /// before that guard existed.
     fn map_with_dx() -> RecentManualCompletions {
         let mut map = HashMap::new();
         map.insert(
             DX.to_string(),
             RecentManualCompletion {
-                completed_at: chrono::Utc::now(),
+                completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
                 frequency_hz: 1500.0,
                 dx_parity: Some(SlotParity::Even),
                 resends: 0,
@@ -4249,6 +4626,111 @@ mod auto_73_tests {
         .await;
 
         assert_eq!(drain_sends(&mut rx), 0);
+    }
+
+    /// SM-F3/TX-F10: two decodes of the SAME closing RR73, arriving
+    /// back-to-back immediately after `QsoCompleted` (i.e. within the
+    /// original 73's TX-scheduler defer window), must NOT fire a second 73 —
+    /// the first one may not have keyed yet. Neither call may consume the
+    /// resend budget.
+    #[tokio::test]
+    async fn duplicate_decode_within_guard_window_no_resend() {
+        let mgr = manager().await;
+        // Completion JUST happened — the original 73 may still be deferred.
+        let map = {
+            let mut m = HashMap::new();
+            m.insert(
+                DX.to_string(),
+                RecentManualCompletion {
+                    completed_at: chrono::Utc::now(),
+                    frequency_hz: 1500.0,
+                    dx_parity: Some(SlotParity::Even),
+                    resends: 0,
+                    last_resend_at: None,
+                    remote_origin: false,
+                },
+            );
+            Arc::new(Mutex::new(m))
+        };
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        // Two "copies" of the same decode (as FT8 decoders routinely emit),
+        // arriving in immediate succession.
+        for _ in 0..2 {
+            maybe_auto_resend_73(
+                &rr73_to_us(),
+                OUR,
+                1500.0,
+                Some(SlotParity::Even),
+                &mgr,
+                &map,
+                &policy,
+                &bus,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            drain_sends(&mut rx),
+            0,
+            "duplicate decodes within the first-resend guard window must not \
+             fire a 2nd 73 before the 1st one's scheduled defer could complete"
+        );
+        assert_eq!(
+            map.lock().await.get(DX).map(|e| e.resends),
+            Some(0),
+            "guarded attempts must not consume the resend budget"
+        );
+    }
+
+    /// A GENUINE later resend — the DX truly didn't copy our first 73 and
+    /// repeats RR73 well after the first-resend guard window elapses — must
+    /// still fire normally. This is the feature `maybe_auto_resend_73` exists
+    /// for; the SM-F3/TX-F10 guard must not regress it.
+    #[tokio::test]
+    async fn genuine_later_resend_past_guard_window_fires() {
+        let mgr = manager().await;
+        let map = {
+            let mut m = HashMap::new();
+            m.insert(
+                DX.to_string(),
+                RecentManualCompletion {
+                    completed_at: chrono::Utc::now()
+                        - AUTO_73_FIRST_RESEND_MIN_DELAY
+                        - chrono::Duration::seconds(5),
+                    frequency_hz: 1500.0,
+                    dx_parity: Some(SlotParity::Even),
+                    resends: 0,
+                    last_resend_at: None,
+                    remote_origin: false,
+                },
+            );
+            Arc::new(Mutex::new(m))
+        };
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+        )
+        .await;
+
+        assert_eq!(
+            drain_sends(&mut rx),
+            1,
+            "a genuine later resend past the guard window must still fire"
+        );
+        assert_eq!(map.lock().await.get(DX).map(|e| e.resends), Some(1));
     }
 
     /// Guard for the [duplicate_checking] wiring: the pancetta-config defaults
@@ -4891,6 +5373,7 @@ mod cqdx_upload_tests {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 
@@ -4962,6 +5445,7 @@ mod qrz_enrichment_tests {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 

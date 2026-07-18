@@ -4,6 +4,19 @@
 **Author:** K5ARH (with Claude)
 **Status:** Draft — pending review
 
+> **Update 2026-07-18:** the waterfall itself was later replaced by the TX-placement
+> instrument (2026-07-03 TUI redesign), and this spec's parity-aware allocator scoring
+> (`is_blocked_in_parity`) and `T`/`FindClearOffset` flow are now implemented — but via a
+> different, simpler path than sketched below: `rank_candidates_with_parity`
+> (`pancetta-qso/src/frequency.rs`) weights target-slot clearness directly in the
+> allocator's own scoring rather than a separate post-hoc filter, and `FindClearOffset`
+> is resolved client-side in `pancetta-tui` (`App::find_clear_offset_preferring_placement`,
+> `tui_runner.rs`'s `t` handler) against the already-relayed placement snapshot, not by a
+> new `tui_relay.rs` command handler. Treat this spec as historical design rationale for
+> *why* parity-aware scoring matters, not as an accurate description of the current
+> implementation — see `docs/qso-tx-deep-review-2026-07-18.md` (finding FQ-F8) and its
+> Batch 5 commit (`6927e02c`) for what actually shipped.
+
 ## Goal
 
 Make the TUI waterfall the operator's primary tool for choosing a clean TX

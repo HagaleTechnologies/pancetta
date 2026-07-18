@@ -50,6 +50,15 @@ pub enum QsoState {
         /// when the response carried no grid.
         #[serde(default)]
         their_grid: Option<GridSquare>,
+        /// The report WE sent them on the CallingCq → WaitingForReport
+        /// transition (SM-F4). Latched at construction time so a repeated
+        /// `CqResponse` (the caller never copied our report) can re-send an
+        /// IDENTICAL value instead of recomputing from that decode's SNR —
+        /// the same anti-jitter rationale as `SendingReport::our_report`
+        /// (see "REGRESSION 2": the report we give a station must not
+        /// jitter with per-decode SNR noise when they re-request).
+        #[serde(default)]
+        our_report: SignalReport,
     },
 
     /// Sending signal report
@@ -345,6 +354,21 @@ pub struct QsoMetadata {
     /// carries the same value, ensuring all of our transmissions stay
     /// on the slot the contra station expects.
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
+
+    /// `true` when the latched [`Self::tx_parity`] above was picked WITHOUT
+    /// ever having observed the DX's actual decoded slot parity (e.g. a
+    /// cluster/DX-Hunter spot answered before any live decode exists for that
+    /// station, so `respond_to_cq_with`/`respond_to_caller` had to fall back
+    /// to `latch_cq_parity_if_none`'s "nearest next slot" heuristic instead of
+    /// flipping a real observed `dx_parity`). Such a provisional latch should
+    /// be refined to the true opposite-of-DX parity the first time a frame
+    /// from the latched partner is actually decoded (see
+    /// `process_message_for_qso`'s first-decode refinement). `false` — the
+    /// common case — means `tx_parity` was latched from a real observed
+    /// `dx_parity` (or via a CQ-path latch, which is self-consistent by
+    /// construction) and must never be touched again.
+    #[serde(default)]
+    pub tx_parity_provisional: bool,
 
     /// How this QSO was initiated. Manual calls bypass the self-duplicate
     /// gate and keep-call under the manual watchdog; auto calls do not.
@@ -807,6 +831,7 @@ mod tests {
             frequency: 14074000.0,
             started_at: Utc::now(),
             their_grid: None,
+            our_report: -10,
         };
         assert!(!active.is_terminal());
         assert!(active.is_active());
@@ -835,6 +860,7 @@ mod tests {
             frequency: 14074000.0,
             started_at: Utc::now(),
             their_grid: None,
+            our_report: -10,
         };
         let v = wait_rpt.ladder_view(QsoRole::Caller).unwrap();
         assert_eq!(v.index, 1);
@@ -893,6 +919,7 @@ mod tests {
             frequency: 14074000.0,
             started_at: Utc::now(),
             their_grid: None,
+            our_report: -10,
         };
         let v = wait_rpt.ladder_view(QsoRole::Cqer).unwrap();
         assert_eq!(v.labels, vec!["CQ", "Grid", "Rpt", "R-Rpt", "RR73"]);

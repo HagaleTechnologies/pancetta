@@ -433,6 +433,27 @@ fn multi_tx_bundle_still_fully_live(
         .all(|id| tx_qso_is_live(id.as_deref(), active_tx_qsos))
 }
 
+/// Build the TX-strip status items for a multi-TX bundle, tagging every item
+/// with the SAME `deferred` flag — a bundle either defers as a whole or
+/// doesn't (all its items share one parity/slot, per the bundling logic).
+/// Shared by the initial "QUEUED" status (`deferred: false`) and the
+/// Step-2b defer-time status refresh (`deferred: true`, TX-F8) so the two
+/// call sites can't drift out of sync.
+fn multi_tx_status_items(
+    items: &[crate::message_bus::TransmitRequestItem],
+    deferred: bool,
+) -> Vec<crate::message_bus::TxItem> {
+    items
+        .iter()
+        .map(|it| crate::message_bus::TxItem {
+            text: it.message_text.clone(),
+            freq_hz: it.frequency_offset,
+            qso_id: it.qso_id.clone(),
+            deferred,
+        })
+        .collect()
+}
+
 /// Result of [`encode_and_modulate_multi_tx`].
 struct MultiTxEncodeOutcome {
     /// `Ok(samples)` — the summed waveform — when at least one item
@@ -730,6 +751,31 @@ pub struct CoalesceOutcome {
     /// How many distinct streams were dropped because the retained set hit
     /// the [`MAX_RETAINED_TX_STREAMS`] cap (silent truncation made visible).
     pub truncated: usize,
+    /// How many retained streams were excluded from THIS cycle's bundle
+    /// because their concrete `tx_parity` disagreed with the bundle anchor's
+    /// (the first-seen retained stream's parity — see
+    /// [`coalesce_transmit_requests`]'s parity-conflict check). Folding a
+    /// disagreeing stream into the bundle would silently put it on the wrong
+    /// slot window, which is exactly the "every concurrent active QSO
+    /// transmits on the same parity" invariant this excludes to protect.
+    /// Excluded streams are NOT retained here, but they are not dropped
+    /// permanently either — the QSO's own TX cadence (keep-call/rearm) will
+    /// produce a fresh request for it next slot, sent individually on its own
+    /// parity.
+    pub parity_excluded: usize,
+    /// FQ-F4/TX-F6 defense-in-depth: how many retained streams were excluded
+    /// from THIS cycle's bundle because their `frequency_offset` fell within
+    /// [`pancetta_qso::MIN_TX_SEPARATION_HZ`] of an already-retained stream.
+    /// `modulate_multi_tx`'s pairwise separation check (bandwidth + 25 Hz
+    /// guard) fails the ENTIRE bundle — not just the colliding pair — if two
+    /// folded streams are too close, so this excludes the later one instead
+    /// of letting the whole bundle's TX silently vanish. Fix 5's own
+    /// de-confliction at QSO-open time (`compute_manual_tx_offset` in
+    /// `coordinator/qso.rs`) should make this rare in practice; this is
+    /// cheap insurance against any other path that still produces
+    /// close-together streams. Same "exclude, don't coerce, it retries
+    /// individually next cycle" semantics as `parity_excluded` above.
+    pub freq_excluded: usize,
 }
 
 impl CoalesceOutcome {
@@ -737,7 +783,11 @@ impl CoalesceOutcome {
     /// happened to be one fresh frame per distinct live QSO with no overflow).
     /// Used only for the log-suppression decision in the worker.
     fn is_noop(&self) -> bool {
-        self.coalesced == 0 && self.dropped_terminal == 0 && self.truncated == 0
+        self.coalesced == 0
+            && self.dropped_terminal == 0
+            && self.truncated == 0
+            && self.parity_excluded == 0
+            && self.freq_excluded == 0
     }
 }
 
@@ -761,6 +811,16 @@ impl CoalesceOutcome {
 /// 4. **Bound the retained set.** At most [`MAX_RETAINED_TX_STREAMS`] distinct
 ///    streams survive; the rest are counted in `truncated` and dropped. The
 ///    earliest-seen streams are kept (FIFO fairness).
+/// 5. **Never coerce a bundle-parity conflict.** When ≥2 distinct streams
+///    survive, the caller folds them into one `MultiTransmitRequest` stamped
+///    with a single `tx_parity` (the first-seen/oldest-retained stream's — the
+///    "bundle anchor"). Any later stream whose OWN concrete `tx_parity`
+///    disagrees with the anchor is excluded here (counted in
+///    `parity_excluded`) rather than silently forced onto the anchor's
+///    parity — every concurrent active QSO must transmit on the same parity
+///    (see CLAUDE.md), and coercing would put the disagreeing stream in the
+///    wrong slot window. Excluded streams are not gone permanently: the QSO's
+///    own cadence produces a fresh request for it next slot.
 ///
 /// The single-request, no-backlog case returns `retained == [that request]`
 /// with all counters zero, so the worker's normal path is unchanged.
@@ -814,6 +874,78 @@ pub fn coalesce_transmit_requests(
     if retained.len() > MAX_RETAINED_TX_STREAMS {
         outcome.truncated = retained.len() - MAX_RETAINED_TX_STREAMS;
         retained.truncate(MAX_RETAINED_TX_STREAMS);
+    }
+
+    // Bundle-parity conflict check. When ≥2 distinct streams survive, they may
+    // get folded into a single `MultiTransmitRequest` by the caller, stamped
+    // with ONE `tx_parity` (the first-seen/oldest-retained stream's — the
+    // "bundle anchor"). A later stream whose OWN concrete `tx_parity` disagrees
+    // with the anchor must never silently ride that bundle: every concurrent
+    // active QSO must transmit on the same parity (CLAUDE.md invariant), and
+    // coercing a disagreeing stream onto the bundle's parity would put it in
+    // the wrong slot window for its actual partner. `None` (no preference) is
+    // NOT a disagreement — only two concrete, differing `Some` values are a
+    // genuine conflict. Excluded streams are dropped from `retained` for THIS
+    // cycle only; they are not gone — the QSO's own cadence produces a fresh
+    // request for it next slot, which will then coalesce/bundle normally.
+    if retained.len() > 1 {
+        let anchor = retained[0].tx_parity;
+        let mut kept = Vec::with_capacity(retained.len());
+        for (idx, entry) in retained.into_iter().enumerate() {
+            let disagrees = match (anchor, entry.tx_parity) {
+                (Some(a), Some(p)) => a != p,
+                _ => false,
+            };
+            if idx > 0 && disagrees {
+                warn!(
+                    target: "pancetta::tx.policy",
+                    "TX bundle parity conflict: stream qso_id={:?} requested parity {:?} \
+                     but this cycle's bundle is anchored to {:?} (first-seen stream); \
+                     excluding it from this bundle — it will be retried individually on \
+                     its own parity next cycle",
+                    entry.qso_id, entry.tx_parity, anchor
+                );
+                outcome.parity_excluded += 1;
+            } else {
+                kept.push(entry);
+            }
+        }
+        retained = kept;
+    }
+
+    // FQ-F4/TX-F6 defense-in-depth: pairwise frequency-separation check.
+    // `modulate_multi_tx` fails the WHOLE bundle (not just the colliding
+    // pair) if any two folded streams' `frequency_offset`s are closer than
+    // its minimum separation (signal bandwidth + 25 Hz guard). Fix 5's own
+    // de-confliction at QSO-open time should make a collision here rare,
+    // but this is cheap insurance against any other path that still
+    // produces close-together streams. Greedy, order-preserving: the
+    // earliest-seen (already-kept) stream at a given offset wins; a later
+    // stream too close to ANY already-kept stream is excluded from this
+    // cycle's bundle only — not coerced onto a different offset, and not
+    // gone permanently (its own TX cadence produces a fresh request next
+    // cycle, which will then coalesce/bundle normally).
+    if retained.len() > 1 {
+        let mut kept: Vec<CoalesceEntry> = Vec::with_capacity(retained.len());
+        for entry in retained.into_iter() {
+            let too_close = kept.iter().any(|k: &CoalesceEntry| {
+                (k.frequency_offset - entry.frequency_offset).abs()
+                    < pancetta_qso::MIN_TX_SEPARATION_HZ
+            });
+            if too_close {
+                warn!(
+                    target: "pancetta::tx.policy",
+                    "TX bundle frequency conflict: stream qso_id={:?} at {:.0} Hz is within \
+                     {:.0} Hz of an already-retained stream this cycle; excluding it from \
+                     this bundle — it will be retried individually on its own offset next cycle",
+                    entry.qso_id, entry.frequency_offset, pancetta_qso::MIN_TX_SEPARATION_HZ
+                );
+                outcome.freq_excluded += 1;
+            } else {
+                kept.push(entry);
+            }
+        }
+        retained = kept;
     }
 
     outcome.retained = retained;
@@ -928,13 +1060,16 @@ async fn coalesce_backlog_into(
         let text = format!(
             "TX backlog coalesced: drained {} request(s) → {} retained; \
              coalesced {} stale (newest-per-QSO wins), dropped {} for ended QSOs, \
-             truncated {} over the {}-stream cap",
+             truncated {} over the {}-stream cap, excluded {} for a bundle-parity conflict, \
+             excluded {} for a bundle-frequency conflict",
             backlog_total,
             outcome.retained.len(),
             outcome.coalesced,
             outcome.dropped_terminal,
             outcome.truncated,
             MAX_RETAINED_TX_STREAMS,
+            outcome.parity_excluded,
+            outcome.freq_excluded,
         );
         warn!(target: "pancetta::tx.policy", "{}", text);
         emit_diagnostic(
@@ -974,8 +1109,13 @@ async fn coalesce_backlog_into(
 
     // Several distinct live streams survived → fold into the existing multi-TX
     // path. All bundle items share one slot, so the bundle parity is the
-    // freshest stream's parity (first retained entry, which the existing arm
-    // resolves via resolve_required_parity).
+    // FIRST-SEEN/oldest-retained stream's parity (not the freshest — order
+    // here is first-seen order from the coalescer), which the existing arm
+    // resolves via resolve_required_parity. Any stream that disagreed with
+    // this anchor has already been excluded from `outcome.retained` above
+    // (see the parity-conflict check in `coalesce_transmit_requests`), so
+    // every remaining entry's `tx_parity` is either `None` or equal to this
+    // value.
     let bundle_parity = outcome.retained[0].tx_parity;
     // Fail-safe origin fold: if ANY folded stream is Remote, the whole bundle is
     // Remote so the arm gate applies. (In practice a coalesced backlog is one
@@ -1131,6 +1271,23 @@ impl super::ApplicationCoordinator {
                         return Err(anyhow::anyhow!("Modulator init failed: {}", e));
                     }
                 };
+
+                // Double-PTT fix (docs/qso-tx-deep-review-2026-07-18.md):
+                // pivot consume-once tombstone. Step 4c below (the late
+                // pivot) can swap the in-flight frame's text for a fresher
+                // `LatestTxIntent` and key PTT with it — but the newer
+                // `MessageToSend` that produced that fresher intent ALSO
+                // already enqueued its own separate `TransmitRequest`, still
+                // sitting behind the pivoted one in this worker's channel.
+                // Record every successful pivot here (qso_key -> text) so
+                // that request, once dequeued, is recognized as an
+                // already-sent duplicate and dropped instead of keying PTT
+                // a second time. Worker-local (this loop is the single
+                // consumer; no concurrent access), so a plain `HashMap`
+                // suffices — no new `Arc`/lock. See `is_pivot_duplicate`
+                // (coordinator/mod.rs) for the pure membership check.
+                let mut pivoted_once: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
 
                 while !shutdown.load(Ordering::Acquire) {
                     // Reset the per-message abort flag at the start of every
@@ -1297,6 +1454,57 @@ impl super::ApplicationCoordinator {
                                         message_text, frequency_offset, qso_id
                                     );
                                     TX_ATTEMPTS_COUNT.fetch_add(1, Ordering::Relaxed);
+
+                                    // --- Step 0-dup: pivot-tombstone duplicate gate ---
+                                    // Double-PTT fix (docs/qso-tx-deep-review-2026-07-18.md).
+                                    // A prior TransmitRequest for this SAME qso_id may
+                                    // already have been pivoted (Step 4c below) to this
+                                    // exact text and physically keyed, while THIS request
+                                    // — the one that produced that newer text in the first
+                                    // place — was still sitting behind it in the channel.
+                                    // If so, this is a stale duplicate of an already-sent
+                                    // frame: drop it exactly like the Step 4b stale-QSO
+                                    // drop (no PTT, no schedule), and clear the tombstone so
+                                    // a genuinely later legitimate re-send of the same text
+                                    // (e.g. a keep-call rearm) is never wrongly suppressed.
+                                    if super::is_pivot_duplicate(
+                                        qso_id.as_deref(),
+                                        &message_text,
+                                        &pivoted_once,
+                                    ) {
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "dropping stale TX for {}: '{}' — already sent via pivot",
+                                            qso_id.as_deref().unwrap_or("?"),
+                                            message_text
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "dropping stale TX for '{message_text}' — already sent via pivot"
+                                            ),
+                                            qso_id.as_deref(),
+                                        )
+                                        .await;
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        if let Some(id) = qso_id.as_deref() {
+                                            pivoted_once.remove(&super::active_tx_qso_key(id));
+                                        }
+                                        let complete_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Autonomous,
+                                            MessageType::TransmitComplete {
+                                                success: false,
+                                                message_text,
+                                                duration_ms: 0,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(complete_msg).await;
+                                        continue;
+                                    }
 
                                     // --- Step 0: TX-policy hard mute ---
                                     // If the global policy is Disabled (RX-only),
@@ -1655,6 +1863,14 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        // Bound `pivoted_once`: a QSO ending via normal
+                                        // drop-stale cleanup also clears its own
+                                        // pivot-tombstone entry so the worker-local map
+                                        // can't grow unboundedly across a long-running
+                                        // process.
+                                        if let Some(id) = qso_id.as_deref() {
+                                            pivoted_once.remove(&super::active_tx_qso_key(id));
+                                        }
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Autonomous,
@@ -1729,11 +1945,32 @@ impl super::ApplicationCoordinator {
                                     {
                                         let new_text = intent.message_text;
                                         let new_freq = intent.frequency_offset;
+                                        // TX-F4: protocol-aware re-encode/re-modulate
+                                        // (mirrors Step 1's `encode_for_protocol` /
+                                        // `modulate_for_protocol` call above) — the
+                                        // legacy FT8-only `encode_message` /
+                                        // `modulate_symbols` pair used here previously
+                                        // would emit an FT8-shaped (151,680-sample)
+                                        // waveform onto the FT4/FT2 grid on a pivot in
+                                        // those modes (wrong length, wrong symbol
+                                        // timing). FT8 is unaffected: `encode_for_protocol`
+                                        // /`modulate_for_protocol` dispatch to the exact
+                                        // legacy calls for `Protocol::Ft8`.
                                         let remod = match modulator.set_base_frequency(new_freq) {
-                                            Ok(()) => encoder
-                                                .encode_message(&new_text, None)
-                                                .and_then(|s| modulator.modulate_symbols(&s, 0.0))
-                                                .ok(),
+                                            Ok(()) => encode_for_protocol(
+                                                &mut encoder,
+                                                active_protocol,
+                                                &new_text,
+                                            )
+                                            .and_then(|s| {
+                                                modulate_for_protocol(
+                                                    &mut modulator,
+                                                    active_protocol,
+                                                    &s,
+                                                    0.0,
+                                                )
+                                            })
+                                            .ok(),
                                             Err(_) => None,
                                         };
                                         match remod {
@@ -1749,7 +1986,7 @@ impl super::ApplicationCoordinator {
                                                     &new_samples[schedule.cursor_offset_samples..],
                                                 );
                                                 info!(
-                                                    target: "tx.pivot",
+                                                    target: "pancetta::tx.pivot",
                                                     "TX pivot: '{}' -> '{}' @{:.0}Hz for qso {} (fresher message arrived during pre-PTT wait)",
                                                     message_text,
                                                     new_text,
@@ -1759,6 +1996,24 @@ impl super::ApplicationCoordinator {
                                                 message_text = new_text;
                                                 frequency_offset = new_freq;
                                                 audio_out = rebuilt;
+                                                // Double-PTT fix: record this pivot so the
+                                                // newer request that PRODUCED `message_text`
+                                                // — still queued behind this one — is
+                                                // recognized as an already-sent duplicate
+                                                // (Step 0-dup above) instead of keying PTT a
+                                                // second time for the same text. `qso_id` is
+                                                // guaranteed `Some` here: `tx_pivot_target`
+                                                // (mod.rs) only returns `Some` when the
+                                                // `qso_id` argument is `Some` (manual/tune/
+                                                // test-TX with `qso_id == None` are never
+                                                // pivoted), so this `if let` always matches
+                                                // for a `None` id; guarded defensively anyway.
+                                                if let Some(id) = qso_id.as_deref() {
+                                                    pivoted_once.insert(
+                                                        super::active_tx_qso_key(id),
+                                                        message_text.clone(),
+                                                    );
+                                                }
                                             }
                                             _ => {
                                                 warn!(
@@ -2067,15 +2322,7 @@ impl super::ApplicationCoordinator {
                                     send_tx_queue_status(
                                         &message_bus,
                                         None,
-                                        items
-                                            .iter()
-                                            .map(|it| crate::message_bus::TxItem {
-                                                text: it.message_text.clone(),
-                                                freq_hz: it.frequency_offset,
-                                                qso_id: it.qso_id.clone(),
-                                                deferred: false,
-                                            })
-                                            .collect(),
+                                        multi_tx_status_items(&items, false),
                                     )
                                     .await;
 
@@ -2221,6 +2468,228 @@ impl super::ApplicationCoordinator {
                                         schedule.cursor_offset_samples,
                                         item_texts.len(),
                                     );
+
+                                    // --- Step 2b: defer-time liveness recheck (TX-F8) ---
+                                    // Mirrors the single-TX arm's defer-time recheck (the
+                                    // `if schedule.deferred` block right after its own
+                                    // Step 2, before building audio): a bundle either
+                                    // defers as a whole or doesn't (all items share one
+                                    // parity/slot), so if we missed the current slot and
+                                    // deferred to a later one (~30s), we (a) count it in
+                                    // `TX_DEFERS_COUNT` the same way the single-TX arm
+                                    // does, (b) re-check liveness for every item in the
+                                    // bundle NOW — reusing the exact live_mask
+                                    // partial-liveness mechanism Step 4b's key-time gate
+                                    // uses below — instead of silently waiting out the
+                                    // full ~30s defer for a bundle that's already
+                                    // (partially or wholly) dead, and (c) refresh the
+                                    // TUI-visible per-item TX-strip status with
+                                    // `deferred: true` (previously always `false`, so a
+                                    // deferred bundle was indistinguishable from a dead
+                                    // one for up to 30s).
+                                    let (items, samples, item_texts, encoded_qso_ids) = if schedule
+                                        .deferred
+                                    {
+                                        TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
+
+                                        let live_mask: Vec<bool> = encoded_qso_ids
+                                            .iter()
+                                            .map(|id| {
+                                                tx_qso_is_live(id.as_deref(), &active_tx_qsos)
+                                            })
+                                            .collect();
+
+                                        if !live_mask.iter().any(|&live| live) {
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "dropping stale multi-TX bundle at defer time: all {} item(s) already ended",
+                                                items.len()
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                    "dropping stale multi-TX bundle at defer time: all {} item(s) already ended",
+                                                    items.len()
+                                                ),
+                                                None,
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            for item in &items {
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
+                                            }
+                                            continue;
+                                        }
+
+                                        let (items, samples, item_texts, encoded_qso_ids) =
+                                            if live_mask.iter().all(|&live| live) {
+                                                (items, samples, item_texts, encoded_qso_ids)
+                                            } else {
+                                                for (item, &live) in
+                                                    items.iter().zip(live_mask.iter())
+                                                {
+                                                    if !live {
+                                                        info!(
+                                                            target: "pancetta::tx.policy",
+                                                            "dropping stale multi-TX item at defer time for ended QSO {}: '{}'",
+                                                            item.qso_id.as_deref().unwrap_or("?"),
+                                                            item.message_text
+                                                        );
+                                                        emit_diagnostic(
+                                                            &message_bus,
+                                                            "tx.policy",
+                                                            pancetta_core::DiagnosticLevel::Info,
+                                                            format!(
+                                                                "dropping stale multi-TX item at defer time for ended QSO: '{}'",
+                                                                item.message_text
+                                                            ),
+                                                            item.qso_id.as_deref(),
+                                                        )
+                                                        .await;
+                                                        let complete_msg = ComponentMessage::new(
+                                                            ComponentId::Ft8Transmitter,
+                                                            ComponentId::Autonomous,
+                                                            MessageType::TransmitComplete {
+                                                                success: false,
+                                                                message_text: item
+                                                                    .message_text
+                                                                    .clone(),
+                                                                duration_ms: 0,
+                                                            },
+                                                            Instant::now(),
+                                                        );
+                                                        let _ = message_bus
+                                                            .send_message(complete_msg)
+                                                            .await;
+                                                    }
+                                                }
+
+                                                let live_items: Vec<
+                                                    crate::message_bus::TransmitRequestItem,
+                                                > = items
+                                                    .iter()
+                                                    .zip(live_mask.iter())
+                                                    .filter(|(_, &live)| live)
+                                                    .map(|(item, _)| item.clone())
+                                                    .collect();
+
+                                                let rebuild = encode_and_modulate_multi_tx(
+                                                    &mut encoder,
+                                                    active_protocol,
+                                                    &tx_params,
+                                                    &live_items,
+                                                );
+
+                                                for item in &rebuild.encode_failed {
+                                                    emit_tx_failure_diagnostic(
+                                                        &message_bus,
+                                                        item.qso_id.as_deref(),
+                                                        &item.message_text,
+                                                        "defer-time re-encode error",
+                                                    )
+                                                    .await;
+                                                    let complete_msg = ComponentMessage::new(
+                                                        ComponentId::Ft8Transmitter,
+                                                        ComponentId::Autonomous,
+                                                        MessageType::TransmitComplete {
+                                                            success: false,
+                                                            message_text: item.message_text.clone(),
+                                                            duration_ms: 0,
+                                                        },
+                                                        Instant::now(),
+                                                    );
+                                                    let _ = message_bus
+                                                        .send_message(complete_msg)
+                                                        .await;
+                                                }
+
+                                                let rebuilt_texts = rebuild.item_texts;
+                                                let rebuilt_qso_ids = rebuild.encoded_qso_ids;
+
+                                                let new_samples = match rebuild.samples {
+                                                    Ok(s) => s,
+                                                    Err(reason) => {
+                                                        if !rebuilt_texts.is_empty() {
+                                                            warn!(
+                                                                "Defer-time re-modulation failed: {}",
+                                                                reason
+                                                            );
+                                                            for (text, qso_id) in rebuilt_texts
+                                                                .iter()
+                                                                .zip(rebuilt_qso_ids.iter())
+                                                            {
+                                                                emit_tx_failure_diagnostic(
+                                                                    &message_bus,
+                                                                    qso_id.as_deref(),
+                                                                    text,
+                                                                    &format!(
+                                                                        "defer-time re-modulation error ({reason})"
+                                                                    ),
+                                                                )
+                                                                .await;
+                                                            }
+                                                        }
+                                                        send_tx_queue_status(
+                                                            &message_bus,
+                                                            None,
+                                                            Vec::new(),
+                                                        )
+                                                        .await;
+                                                        for text in rebuilt_texts {
+                                                            let complete_msg =
+                                                                ComponentMessage::new(
+                                                                    ComponentId::Ft8Transmitter,
+                                                                    ComponentId::Autonomous,
+                                                                    MessageType::TransmitComplete {
+                                                                        success: false,
+                                                                        message_text: text,
+                                                                        duration_ms: 0,
+                                                                    },
+                                                                    Instant::now(),
+                                                                );
+                                                            let _ = message_bus
+                                                                .send_message(complete_msg)
+                                                                .await;
+                                                        }
+                                                        continue;
+                                                    }
+                                                };
+
+                                                (
+                                                    live_items,
+                                                    new_samples,
+                                                    rebuilt_texts,
+                                                    rebuilt_qso_ids,
+                                                )
+                                            };
+
+                                        // Refresh the TUI TX strip: this bundle is
+                                        // deferred (waiting for its slot), not dead.
+                                        send_tx_queue_status(
+                                            &message_bus,
+                                            None,
+                                            multi_tx_status_items(&items, true),
+                                        )
+                                        .await;
+
+                                        (items, samples, item_texts, encoded_qso_ids)
+                                    } else {
+                                        (items, samples, item_texts, encoded_qso_ids)
+                                    };
 
                                     // --- Step 3: Build the audio buffer ---
                                     let mut audio_out: Vec<f32> = Vec::with_capacity(
@@ -3427,6 +3896,22 @@ mod coalesce_tests {
         }
     }
 
+    /// Like [`entry`] but with an explicit `frequency_offset` — used by tests
+    /// that expect ≥2 entries to survive together in `retained` (the
+    /// FQ-F4/TX-F6 frequency-separation exclusion pass would otherwise treat
+    /// same-frequency retained entries as a bundle-frequency conflict, since
+    /// `entry`'s default 1000.0 Hz is shared by every plain `entry(...)`
+    /// call in this module).
+    fn entry_freq(text: &str, qso_id: Option<&str>, freq: f64) -> CoalesceEntry {
+        CoalesceEntry {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            qso_id: qso_id.map(|s| s.to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        }
+    }
+
     /// Predicate over a fixed live-set (uppercased+trimmed to match the
     /// production canonicalization). `None` is always live.
     fn live_in(set: &HashSet<String>) -> impl FnMut(Option<&str>) -> bool + '_ {
@@ -3507,9 +3992,14 @@ mod coalesce_tests {
     fn manual_none_entries_preserved_and_never_coalesced() {
         // Two distinct manual sends (qso_id == None) must BOTH survive — they
         // are never coalesced into each other, and never gated by liveness.
+        // Distinct, well-separated frequencies so the FQ-F4/TX-F6 bundle-
+        // frequency check (a SEPARATE reduction) doesn't also fire here.
         let live = liveset(&[]); // empty: no QSO is "live"
         let out = coalesce_transmit_requests(
-            vec![entry("MANUAL-1", None), entry("MANUAL-2", None)],
+            vec![
+                entry_freq("MANUAL-1", None, 1000.0),
+                entry_freq("MANUAL-2", None, 3000.0),
+            ],
             live_in(&live),
         );
         assert_eq!(out.retained.len(), 2);
@@ -3523,12 +4013,14 @@ mod coalesce_tests {
     fn manual_send_survives_keepcall_flood() {
         // A flood of keep-calls for one QSO plus an operator manual send: the
         // QSO collapses to its newest frame, and the manual send is retained.
+        // MANUAL is on a well-separated frequency so the FQ-F4/TX-F6 bundle-
+        // frequency check (a SEPARATE reduction) doesn't also fire here.
         let live = liveset(&["qso-a"]);
         let out = coalesce_transmit_requests(
             vec![
                 entry("KC-1", Some("qso-a")),
                 entry("KC-2", Some("qso-a")),
-                entry("MANUAL", None),
+                entry_freq("MANUAL", None, 3000.0),
                 entry("KC-3", Some("qso-a")),
             ],
             live_in(&live),
@@ -3543,7 +4035,10 @@ mod coalesce_tests {
     #[test]
     fn cap_enforced_with_truncation_count() {
         // More distinct live streams than the cap → truncated to the cap,
-        // first-seen streams kept, overflow counted.
+        // first-seen streams kept, overflow counted. Distinct, well-separated
+        // frequencies (100 Hz apart) so the FQ-F4/TX-F6 bundle-frequency
+        // check (a SEPARATE reduction from the cap) doesn't also fire here —
+        // this test is purely about the cap/truncation count.
         let ids: Vec<String> = (0..MAX_RETAINED_TX_STREAMS + 3)
             .map(|i| format!("qso-{i}"))
             .collect();
@@ -3551,7 +4046,11 @@ mod coalesce_tests {
             .iter()
             .map(|s| super::super::active_tx_qso_key(s))
             .collect();
-        let drained: Vec<CoalesceEntry> = ids.iter().map(|id| entry(id, Some(id))).collect();
+        let drained: Vec<CoalesceEntry> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| entry_freq(id, Some(id), 1000.0 + i as f64 * 100.0))
+            .collect();
         let out = coalesce_transmit_requests(drained, live_in(&live));
         assert_eq!(out.retained.len(), MAX_RETAINED_TX_STREAMS);
         assert_eq!(out.truncated, 3);
@@ -3566,10 +4065,14 @@ mod coalesce_tests {
     #[test]
     fn distinct_live_qsos_all_retained_under_cap() {
         // Two distinct live QSOs, one frame each, under cap → both retained,
-        // nothing reduced (is_noop).
+        // nothing reduced (is_noop). Distinct, well-separated frequencies so
+        // the FQ-F4/TX-F6 bundle-frequency check doesn't also fire.
         let live = liveset(&["qso-a", "qso-b"]);
         let out = coalesce_transmit_requests(
-            vec![entry("A", Some("qso-a")), entry("B", Some("qso-b"))],
+            vec![
+                entry("A", Some("qso-a")),
+                entry_freq("B", Some("qso-b"), 3000.0),
+            ],
             live_in(&live),
         );
         assert_eq!(out.retained.len(), 2);
@@ -3594,6 +4097,115 @@ mod coalesce_tests {
         assert!(out.retained.is_empty());
         assert_eq!(out.dropped_terminal, 2);
         assert!(!out.is_noop());
+    }
+
+    // ── Bundle-parity conflict exclusion (Batch 2, part 2) ───────────────────
+
+    fn entry_with_parity(
+        text: &str,
+        qso_id: Option<&str>,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+    ) -> CoalesceEntry {
+        CoalesceEntry {
+            message_text: text.to_string(),
+            frequency_offset: 1000.0,
+            qso_id: qso_id.map(|s| s.to_string()),
+            tx_parity,
+            origin: crate::message_bus::TxOrigin::Local,
+        }
+    }
+
+    /// Like [`entry_with_parity`] but with an explicit `frequency_offset` —
+    /// see [`entry_freq`]'s doc comment for why some multi-entry tests need
+    /// distinct frequencies now that the FQ-F4/TX-F6 bundle-frequency
+    /// exclusion pass is a separate reduction alongside the parity one.
+    fn entry_with_parity_freq(
+        text: &str,
+        qso_id: Option<&str>,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+        freq: f64,
+    ) -> CoalesceEntry {
+        CoalesceEntry {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            qso_id: qso_id.map(|s| s.to_string()),
+            tx_parity,
+            origin: crate::message_bus::TxOrigin::Local,
+        }
+    }
+
+    /// Three distinct-QSO streams survive coalescing: two share `Some(Even)`
+    /// and one is `Some(Odd)`. The bundle must NOT silently coerce the Odd
+    /// outlier onto the Even anchor (that would put it in the wrong slot
+    /// window for its actual partner) — it is excluded from `retained` for
+    /// this cycle and counted in `parity_excluded`, keeping only the two
+    /// agreeing Even entries.
+    #[test]
+    fn disagreeing_parity_stream_is_excluded_not_coerced() {
+        use pancetta_core::slot::SlotParity;
+
+        // A and B (both Even, both expected to survive together) get
+        // distinct, well-separated frequencies so the FQ-F4/TX-F6
+        // bundle-frequency check (a separate reduction) doesn't also fire.
+        // C's frequency doesn't matter — it's excluded by the parity check
+        // before the frequency pass ever sees it.
+        let live = liveset(&["qso-a", "qso-b", "qso-c"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry_with_parity("A", Some("qso-a"), Some(SlotParity::Even)),
+                entry_with_parity_freq("B", Some("qso-b"), Some(SlotParity::Even), 3000.0),
+                entry_with_parity("C", Some("qso-c"), Some(SlotParity::Odd)),
+            ],
+            live_in(&live),
+        );
+        assert_eq!(
+            out.retained.len(),
+            2,
+            "the Odd outlier must be excluded, keeping only the two Even entries"
+        );
+        assert_eq!(out.retained[0].message_text, "A");
+        assert_eq!(out.retained[1].message_text, "B");
+        assert!(
+            out.retained
+                .iter()
+                .all(|e| e.tx_parity == Some(SlotParity::Even)),
+            "every surviving entry must agree with the bundle anchor"
+        );
+        assert_eq!(
+            out.parity_excluded, 1,
+            "exactly one stream excluded for a parity conflict"
+        );
+        assert!(
+            !out.is_noop(),
+            "a parity exclusion must not be reported as a no-op"
+        );
+    }
+
+    /// A `None` (no-preference) `tx_parity` must NOT be treated as
+    /// disagreeing with a concrete anchor — it rides along unchanged, exactly
+    /// like the pre-existing manual/None-keyed behavior.
+    #[test]
+    fn none_parity_stream_is_not_treated_as_a_conflict() {
+        use pancetta_core::slot::SlotParity;
+
+        // Distinct, well-separated frequencies so the FQ-F4/TX-F6
+        // bundle-frequency check doesn't also fire — this test is purely
+        // about parity, and both entries are expected to survive together.
+        let live = liveset(&["qso-a", "qso-b"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry_with_parity("A", Some("qso-a"), Some(SlotParity::Even)),
+                entry_with_parity_freq("B", Some("qso-b"), None, 3000.0),
+            ],
+            live_in(&live),
+        );
+        assert_eq!(
+            out.retained.len(),
+            2,
+            "a None-parity stream must not be excluded"
+        );
+        assert_eq!(out.parity_excluded, 0);
+        assert!(out.is_noop());
     }
 }
 
@@ -3647,6 +4259,39 @@ mod protocol_tx_tests {
             samples.len(),
             151_680,
             "FT4 must not emit an FT8-length (12.64s) waveform"
+        );
+    }
+
+    /// TX-F4: the Step-4c late-pivot re-encode (`coordinator/tx.rs`, "Step 4c:
+    /// late pivot to the freshest message") must use the SAME protocol-aware
+    /// `encode_for_protocol` + `modulate_for_protocol` pair Step 1's initial
+    /// encode uses, not the legacy FT8-only `encode_message`/`modulate_symbols`
+    /// pair. Before this fix, a pivot in FT4/FT2 mode would emit an FT8-shaped
+    /// (151_680-sample) waveform onto the FT4/FT2 grid — wrong length, wrong
+    /// symbol timing. This test exercises the exact call shape the pivot now
+    /// uses and proves it yields the FT4-length waveform (60_480 samples).
+    #[test]
+    fn ft4_pivot_reencode_produces_ft4_shaped_waveform_not_ft8() {
+        let mut enc = Ft8Encoder::with_protocol(ProtocolParams::ft4());
+        let mut modu = Ft8Modulator::new_default().unwrap();
+        // Mirrors the pivot's `modulator.set_base_frequency(new_freq)` call.
+        modu.set_base_frequency(1500.0).unwrap();
+
+        let samples = encode_for_protocol(&mut enc, Protocol::Ft4, MSG)
+            .and_then(|s| modulate_for_protocol(&mut modu, Protocol::Ft4, &s, 0.0))
+            .expect("FT4 pivot re-encode should succeed");
+
+        assert_eq!(
+            samples.len(),
+            60_480,
+            "a Step-4c pivot re-encode in FT4 mode must produce the FT4-shaped \
+             waveform (60_480 samples @ 12 kHz)"
+        );
+        assert_ne!(
+            samples.len(),
+            151_680,
+            "a Step-4c pivot re-encode in FT4 mode must NOT fall back to the \
+             FT8-shaped (151_680-sample) waveform"
         );
     }
 
@@ -3721,6 +4366,39 @@ mod protocol_tx_tests {
             frequency_offset: freq,
             qso_id: qso_id.map(|s| s.to_string()),
         }
+    }
+
+    /// TX-F8: `multi_tx_status_items` is the single source both the initial
+    /// "QUEUED" status and the Step-2b defer-time refresh use to build the
+    /// TUI-visible TX-strip items — prove it tags every item with the
+    /// requested `deferred` flag (not the previously-unconditional `false`).
+    #[test]
+    fn multi_tx_status_items_tags_deferred_flag() {
+        let items = vec![
+            tx_item("CQ K5ARH EM12", 800.0, None),
+            tx_item("W1AW K5ARH EM12", 1200.0, Some("qso-1")),
+        ];
+
+        let queued = multi_tx_status_items(&items, false);
+        assert_eq!(queued.len(), 2);
+        assert!(
+            queued.iter().all(|it| !it.deferred),
+            "the initial QUEUED status must show deferred: false"
+        );
+
+        let deferred = multi_tx_status_items(&items, true);
+        assert_eq!(deferred.len(), 2);
+        assert!(
+            deferred.iter().all(|it| it.deferred),
+            "the Step-2b defer-time refresh must show deferred: true on every \
+             item in the bundle (a bundle defers as a whole)"
+        );
+        // Content is otherwise preserved (text/freq/qso_id) regardless of
+        // the deferred flag.
+        assert_eq!(deferred[0].text, "CQ K5ARH EM12");
+        assert_eq!(deferred[0].freq_hz, 800.0);
+        assert_eq!(deferred[0].qso_id, None);
+        assert_eq!(deferred[1].qso_id, Some("qso-1".to_string()));
     }
 
     #[test]
@@ -4030,6 +4708,17 @@ mod tx_counter_tests {
 
     #[test]
     fn tx_defers_count_increments() {
+        let before = tx_defers_count();
+        TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(tx_defers_count(), before + 1);
+    }
+
+    /// TX-F8: the multi-TX arm's defer-time recheck must bump the SAME
+    /// process-global counter the single-TX arm's defer-time recheck does
+    /// (mirrors `tx_defers_count_increments` above — see `coordinator/tx.rs`'s
+    /// Step-2b block in the `MultiTransmitRequest` worker arm).
+    #[test]
+    fn tx_defers_count_increments_for_multi_tx() {
         let before = tx_defers_count();
         TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
         assert_eq!(tx_defers_count(), before + 1);

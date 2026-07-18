@@ -45,7 +45,17 @@ async fn respond_to_cq_latches_opposite_parity() {
 }
 
 #[tokio::test]
-async fn respond_to_cq_with_no_dx_parity_latches_none() {
+async fn respond_to_cq_with_no_dx_parity_latches_provisional_parity() {
+    // Batch 2 remediation: `dx_parity == None` (answering a DX-cluster/
+    // DX-Hunter spot with no live decode yet) used to leave `tx_parity`
+    // permanently `None`, which made the TX scheduler re-resolve "nearest
+    // next slot" independently every subsequent slot and alternate parity —
+    // transmitting in BOTH windows instead of holding one side (the same
+    // failure class `latch_cq_parity_if_none` prevents on the CQ paths).
+    // The fix latches a CONCRETE parity immediately (marked provisional so
+    // the first real decode from the partner can refine it — see
+    // `qso_manager::tests` for the refinement tests), instead of leaving it
+    // `None` forever.
     let mgr = QsoManager::new(QsoManagerConfig {
         our_callsign: "K5ARH".to_string(),
         our_grid: Some("EM10".to_string()),
@@ -59,7 +69,14 @@ async fn respond_to_cq_with_no_dx_parity_latches_none() {
         .expect("respond_to_cq");
 
     let progress = mgr.get_qso(qso_id).await.expect("get_qso");
-    assert_eq!(progress.metadata.tx_parity, None);
+    assert!(
+        progress.metadata.tx_parity.is_some(),
+        "tx_parity must be latched to a concrete parity immediately, not left None"
+    );
+    assert!(
+        progress.metadata.tx_parity_provisional,
+        "a parity latched with no observed dx_parity must be marked provisional"
+    );
 }
 
 /// A multi-message QSO progression must produce MessageToSend events that

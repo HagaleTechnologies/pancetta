@@ -660,6 +660,26 @@ impl FrequencyAllocator {
         self.own_frequencies.remove(qso_id);
     }
 
+    /// FQ-F3: wholesale-replace the own-frequency registry from a fresh
+    /// snapshot (qso_id -> TX offset Hz).
+    ///
+    /// This is the production entry point the coordinator's autonomous slot
+    /// loop calls each tick with a snapshot of `active_tx_offsets` (see
+    /// `pancetta/src/coordinator/autonomous.rs`) — a bulk replace rather
+    /// than diffing against the previous tick and calling
+    /// `register_qso_frequency`/`release_qso_frequency` for the deltas.
+    /// Bulk-replace was chosen over diffing because it can never leak a
+    /// stale entry: if the coordinator-side map and this registry ever
+    /// drift out of sync for any reason (a missed event, a task restart,
+    /// races between insert/remove call sites), the very next tick's
+    /// wholesale replace self-heals it. A diff-based approach would need
+    /// its own separate bookkeeping of "what did we register last tick"
+    /// and any bug in THAT bookkeeping could leave a released QSO's
+    /// frequency registered forever.
+    pub fn set_own_frequencies(&mut self, frequencies: HashMap<String, f64>) {
+        self.own_frequencies = frequencies;
+    }
+
     /// Check if a frequency is clear of our own TX signals.
     pub fn is_clear_of_own(&self, frequency_hz: f64) -> bool {
         self.own_frequencies
@@ -804,6 +824,15 @@ pub struct AutonomousOperator {
     /// jitter is suppressed. `Auto` re-enables both. Defaults to a private
     /// `Hold` atomic so any caller that never injects a source holds frequency.
     tx_freq_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Operator's LIVE parked TX offset (Hz), shared from the coordinator's
+    /// `tx_offset_hold_hz` atomic (the same one the `o` modal writes via
+    /// `TuiCommand::SetTxOffset`). `0` is the "unset/unparked" sentinel —
+    /// same convention as `coordinator/autonomous.rs`'s `parked_bin_coverage`
+    /// and `coordinator/qso.rs`'s `compute_manual_tx_offset`. When `None`
+    /// (never wired, e.g. in unit tests) or when the atomic reads `0`,
+    /// Hold-mode falls back to the static `config.tx_offset_hz` — today's
+    /// behavior is preserved byte-for-byte.
+    tx_offset_hold_hz: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
 }
 
 impl AutonomousOperator {
@@ -840,6 +869,7 @@ impl AutonomousOperator {
             tx_freq_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
                 pancetta_core::TxFreqMode::Hold.as_u8(),
             )),
+            tx_offset_hold_hz: None,
         }
     }
 
@@ -851,6 +881,20 @@ impl AutonomousOperator {
     /// autonomously).
     pub fn set_tx_freq_mode_source(&mut self, source: std::sync::Arc<std::sync::atomic::AtomicU8>) {
         self.tx_freq_mode = source;
+    }
+
+    /// Share the coordinator's live parked-TX-offset atomic
+    /// (`tx_offset_hold_hz`) so Hold-mode frequency allocation reflects the
+    /// operator's actual parked offset (set via the TUI's `o` modal) instead
+    /// of the static config value baked in at construction. Pass the same
+    /// `Arc<AtomicU64>` the coordinator's `tx_offset_hold_hz()` accessor
+    /// returns. If never called, Hold-mode uses `config.tx_offset_hz` only —
+    /// today's behavior.
+    pub fn set_tx_offset_hold_source(
+        &mut self,
+        hold_hz: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) {
+        self.tx_offset_hold_hz = Some(hold_hz);
     }
 
     /// Current TX-frequency mode (decoded from the shared atomic).
@@ -900,10 +944,37 @@ impl AutonomousOperator {
         evaluator: &dyn DxEvaluator,
         now: DateTime<Utc>,
     ) {
-        // Auto-parity detection.
+        // Auto-parity detection. FQ-F2: stamp each message's activity under
+        // its OWN decoded slot parity (`m.slot_parity`) rather than the
+        // wall-clock parity at feed time — a decode completed just before a
+        // slot boundary must not be attributed to the next slot just because
+        // this function happens to run after the boundary. Messages without
+        // a tracked parity (test scaffolding / untracked decodes) fall back
+        // to the wall-clock parity, preserving existing behavior for callers
+        // that don't set `slot_parity`.
         let current_parity = SlotParity::current();
-        self.slot_manager
-            .record_slot_activity(current_parity, messages.len() as u32);
+        let mut even_count: u32 = 0;
+        let mut odd_count: u32 = 0;
+        let mut untracked_count: u32 = 0;
+        for m in messages {
+            match m.slot_parity {
+                Some(pancetta_core::slot::SlotParity::Even) => even_count += 1,
+                Some(pancetta_core::slot::SlotParity::Odd) => odd_count += 1,
+                None => untracked_count += 1,
+            }
+        }
+        if even_count > 0 {
+            self.slot_manager
+                .record_slot_activity(SlotParity::Even, even_count);
+        }
+        if odd_count > 0 {
+            self.slot_manager
+                .record_slot_activity(SlotParity::Odd, odd_count);
+        }
+        if untracked_count > 0 {
+            self.slot_manager
+                .record_slot_activity(current_parity, untracked_count);
+        }
 
         // Band-hopping activity tracking.
         self.band_strategy.record_activity(messages.len() as u32);
@@ -911,8 +982,11 @@ impl AutonomousOperator {
         // Update frequency allocator with observed activity.
         self.frequency_allocator.update_observed(messages);
 
-        // Record decode history for smart frequency allocation.
-        let current_slot = if SlotParity::current() == SlotParity::Even {
+        // Record decode history for smart frequency allocation. Same
+        // per-message-parity fix as above (FQ-F2): use each message's own
+        // `slot_parity` when present, falling back to the wall-clock-derived
+        // slot only when it's `None`.
+        let current_slot = if current_parity == SlotParity::Even {
             TimeSlot::First
         } else {
             TimeSlot::Second
@@ -921,7 +995,11 @@ impl AutonomousOperator {
             .iter()
             .map(|m| DecodeRecord {
                 frequency_hz: m.frequency_hz,
-                time_slot: current_slot,
+                time_slot: match m.slot_parity {
+                    Some(pancetta_core::slot::SlotParity::Even) => TimeSlot::First,
+                    Some(pancetta_core::slot::SlotParity::Odd) => TimeSlot::Second,
+                    None => current_slot,
+                },
             })
             .collect();
         self.decode_history.push_cycle(records);
@@ -1060,10 +1138,25 @@ impl AutonomousOperator {
 
     /// Get the best frequency for a new QSO using the smart allocator.
     /// Falls back to the legacy allocator if no spectral data is available.
-    fn allocate_smart_frequency(&self, dx_target_hz: Option<f64>) -> f64 {
+    fn allocate_smart_frequency(
+        &self,
+        dx_target_hz: Option<f64>,
+        target_parity: Option<pancetta_core::slot::SlotParity>,
+    ) -> f64 {
         // Hold mode (default): pancetta does not choose the offset — every
         // autonomous transmission goes out on the operator's pinned offset.
+        // Prefer the LIVE parked offset (set via the TUI's `o` modal) over
+        // the static config value when one is actually parked (non-zero);
+        // `0` is the shared "unset" sentinel, so an unparked atomic (or no
+        // source wired at all) falls back to `config.tx_offset_hz` exactly
+        // as before this fix (FQ-F6).
         if !self.tx_freq_auto() {
+            if let Some(ref hold) = self.tx_offset_hold_hz {
+                let parked_hz = hold.load(std::sync::atomic::Ordering::Relaxed);
+                if parked_hz != 0 {
+                    return parked_hz as f64;
+                }
+            }
             return self.config.tx_offset_hz;
         }
 
@@ -1074,12 +1167,26 @@ impl AutonomousOperator {
             .copied()
             .collect();
 
+        // FQ-F8: map the caller's known TX slot parity (for a pounce, the
+        // opposite of the DX's own observed slot — same convention as the
+        // `tx_parity = cq.slot_parity.map(|p| p.opposite())` this operator
+        // already latches for the actual transmission, see `decide()`'s
+        // pounce arm) into the `TimeSlot` `rank_candidates_with_parity`
+        // scores against. `None` (e.g. a self-CQ, which can commit to
+        // either slot) degrades to the slot-blind scoring `rank_candidates`
+        // already provided.
+        let target_slot = target_parity.map(|p| match p {
+            pancetta_core::slot::SlotParity::Even => TimeSlot::First,
+            pancetta_core::slot::SlotParity::Odd => TimeSlot::Second,
+        });
+
         if let Some(ref spectral) = self.spectral_snapshot {
-            let mut candidates = self.smart_allocator.rank_candidates(
+            let mut candidates = self.smart_allocator.rank_candidates_with_parity(
                 spectral,
                 &self.decode_history,
                 &own_freqs,
                 dx_target_hz,
+                target_slot,
             );
 
             // When calling CQ, prefer frequencies near rare DX spots.
@@ -1458,8 +1565,15 @@ impl AutonomousOperator {
                         }
                         self.idle_cycles = 0;
 
-                        // Use smart allocator to find best TX frequency near the DX station
-                        let tx_freq = self.allocate_smart_frequency(Some(cq.frequency_hz));
+                        // Use smart allocator to find best TX frequency near the DX station.
+                        // FQ-F8: our TX slot is the opposite of the DX's own observed
+                        // slot — the SAME expression latched as `tx_parity` for the actual
+                        // transmission below, so scoring and the real transmit decision can
+                        // never disagree about which slot we're targeting.
+                        let tx_freq = self.allocate_smart_frequency(
+                            Some(cq.frequency_hz),
+                            cq.slot_parity.map(|p| p.opposite()),
+                        );
 
                         let grid_part = self
                             .our_grid
@@ -1493,7 +1607,10 @@ impl AutonomousOperator {
                             self.state = OperatingState::CallingCq;
                             self.idle_cycles = 0;
 
-                            let cq_freq = self.allocate_smart_frequency(None);
+                            // FQ-F8: a self-CQ can land on either slot parity, so
+                            // there's no single known target at scoring time —
+                            // degrades to the slot-blind scoring path.
+                            let cq_freq = self.allocate_smart_frequency(None, None);
 
                             let cq_text = if self.config.cq_direction.is_empty() {
                                 format!(
@@ -2227,6 +2344,209 @@ mod tests {
         assert!(alloc.is_clear_of_own(1550.0));
     }
 
+    /// FQ-F3: `set_own_frequencies` must wholesale-replace the registry —
+    /// entries from a previous call that are absent from a new snapshot
+    /// must be gone, not merged/accumulated.
+    #[test]
+    fn test_frequency_allocator_set_own_frequencies_bulk_replace() {
+        let mut alloc = FrequencyAllocator::new(75.0, (200.0, 2800.0));
+        alloc.register_qso_frequency("qso1", 1500.0);
+        assert!(!alloc.is_clear_of_own(1550.0));
+
+        // A fresh snapshot that does NOT include qso1 must fully replace
+        // the old state — qso1's entry must be gone, not merged.
+        let mut snapshot = HashMap::new();
+        snapshot.insert("qso2".to_string(), 2000.0);
+        alloc.set_own_frequencies(snapshot);
+
+        assert!(
+            alloc.is_clear_of_own(1550.0),
+            "stale qso1 entry must be gone after a bulk replace that omits it"
+        );
+        assert!(
+            !alloc.is_clear_of_own(2050.0),
+            "qso2's entry must be present"
+        );
+
+        // Replacing with an empty map clears everything.
+        alloc.set_own_frequencies(HashMap::new());
+        assert!(alloc.is_clear_of_own(2050.0));
+    }
+
+    /// FQ-F3: syncing the own-frequency registry via `set_own_frequencies`
+    /// must actually change `allocate_smart_frequency`'s real output —
+    /// proving the registry isn't just plumbed in but load-bearing: a
+    /// candidate that collides with a registered own-frequency must be
+    /// avoided in favor of a different offset once registered.
+    #[test]
+    fn set_own_frequencies_changes_allocate_smart_frequency_output() {
+        let config = AutonomousConfig {
+            enabled: true,
+            ..AutonomousConfig::default()
+        };
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0; 128],
+            freq_min_hz: 0.0,
+            freq_max_hz: 3000.0,
+        });
+
+        let baseline = op.allocate_smart_frequency(None, None);
+
+        // Register (via bulk replace) an own-frequency exactly at the
+        // baseline pick — criterion #7's -50 penalty should knock it out
+        // of contention, so the new best pick must differ.
+        let mut frequencies = HashMap::new();
+        frequencies.insert("qso-1".to_string(), baseline);
+        op.frequency_allocator_mut()
+            .set_own_frequencies(frequencies);
+
+        let after = op.allocate_smart_frequency(None, None);
+        assert_ne!(
+            after, baseline,
+            "an own-frequency collision at the baseline pick must move the \
+             allocator's choice away from it"
+        );
+    }
+
+    /// FQ-F6: Hold-mode must prefer the LIVE parked-offset atomic (set via
+    /// the TUI's `o` modal) over the static `config.tx_offset_hz` when a
+    /// non-zero value is actually parked.
+    #[test]
+    fn hold_mode_prefers_live_parked_offset_over_config() {
+        let config = AutonomousConfig {
+            tx_offset_hz: 1500.0,
+            ..AutonomousConfig::default()
+        };
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        // Explicit Hold mode (also the default).
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Hold.as_u8(),
+        )));
+
+        let hold_hz = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        op.set_tx_offset_hold_source(hold_hz.clone());
+
+        // Nothing parked yet (atomic == 0): must fall back to the static
+        // config value, byte-identical to pre-fix behavior.
+        assert_eq!(
+            op.allocate_smart_frequency(None, None),
+            1500.0,
+            "unset parked-offset atomic must fall back to config.tx_offset_hz"
+        );
+
+        // Operator parks a live offset via the `o` modal (simulated store).
+        hold_hz.store(2137, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            op.allocate_smart_frequency(None, None),
+            2137.0,
+            "a non-zero parked offset must win over the static config value"
+        );
+
+        // Operator clears the park (0 = unset again): must revert to config.
+        hold_hz.store(0, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            op.allocate_smart_frequency(None, None),
+            1500.0,
+            "clearing the park (0) must revert to config.tx_offset_hz"
+        );
+    }
+
+    /// FQ-F6 regression: an `AutonomousOperator` that never had
+    /// `set_tx_offset_hold_source` called (e.g. a bare unit test or any
+    /// caller that predates this fix) must behave exactly as before —
+    /// Hold mode returns the static config value.
+    #[test]
+    fn hold_mode_without_offset_source_wired_uses_config_value() {
+        let config = AutonomousConfig {
+            tx_offset_hz: 1234.0,
+            ..AutonomousConfig::default()
+        };
+        let op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        // Default mode is Hold; no `set_tx_offset_hold_source` call at all.
+        assert_eq!(op.allocate_smart_frequency(None, None), 1234.0);
+    }
+
+    /// FQ-F8: `allocate_smart_frequency`'s `target_parity` parameter must
+    /// actually reach `rank_candidates_with_parity`, correctly mapped
+    /// (`SlotParity::Even -> TimeSlot::First`, `Odd -> TimeSlot::Second`) —
+    /// this is the wiring gap between the parity-aware scoring fix and the
+    /// one production caller (the pounce path) that has a real DX parity to
+    /// supply. Rather than trying to force the overall winning frequency to
+    /// flip (fragile — the DX-proximity term can dominate a small, localized
+    /// occupancy difference and mask a mapping bug), this asserts a direct
+    /// consistency property: calling `allocate_smart_frequency` with a given
+    /// `SlotParity` must produce EXACTLY the same result as calling
+    /// `rank_candidates_with_parity` directly with the correspondingly
+    /// mapped `TimeSlot` — proving the mapping and the plumbing are both
+    /// correct, not just that the parameter is silently accepted and ignored
+    /// (which None/None already covers via the `hold_mode_*` tests above).
+    #[test]
+    fn allocate_smart_frequency_honors_target_parity_end_to_end() {
+        use pancetta_core::slot::SlotParity;
+
+        let config = AutonomousConfig {
+            enabled: true,
+            ..AutonomousConfig::default()
+        };
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0; 128],
+            freq_min_hz: 0.0,
+            freq_max_hz: 3000.0,
+        });
+        op.decode_history.push_cycle(vec![
+            DecodeRecord {
+                frequency_hz: 1500.0,
+                time_slot: TimeSlot::First,
+            },
+            DecodeRecord {
+                frequency_hz: 1500.0,
+                time_slot: TimeSlot::First,
+            },
+        ]);
+
+        let own_freqs: Vec<f64> = op
+            .frequency_allocator
+            .own_frequencies()
+            .values()
+            .copied()
+            .collect();
+        let spectral = op.spectral_snapshot.as_ref().unwrap();
+
+        for (slot_parity, expected_time_slot) in [
+            (SlotParity::Even, TimeSlot::First),
+            (SlotParity::Odd, TimeSlot::Second),
+        ] {
+            let via_operator = op.allocate_smart_frequency(Some(1500.0), Some(slot_parity));
+            let via_direct_ranking = op
+                .smart_allocator
+                .rank_candidates_with_parity(
+                    spectral,
+                    &op.decode_history,
+                    &own_freqs,
+                    Some(1500.0),
+                    Some(expected_time_slot),
+                )
+                .first()
+                .unwrap()
+                .offset_hz;
+
+            assert_eq!(
+                via_operator, via_direct_ranking,
+                "allocate_smart_frequency(Some(1500.0), Some({slot_parity:?})) must match \
+                 rank_candidates_with_parity's own top pick for the mapped TimeSlot \
+                 ({expected_time_slot:?}) — a dropped/mismapped target_parity would diverge"
+            );
+        }
+    }
+
     #[test]
     fn test_frequency_allocator_cq_avoids_own() {
         let mut alloc = FrequencyAllocator::new(75.0, (200.0, 2800.0));
@@ -2624,7 +2944,7 @@ mod tests {
         assert_eq!(unboosted, 1500.0, "sanity: unboosted winner is band center");
 
         // Real CQ-frequency decision path.
-        let real_freq = op.allocate_smart_frequency(None);
+        let real_freq = op.allocate_smart_frequency(None, None);
 
         // TX-placement instrument.
         let snap = op.placement_snapshot(usize::MAX).unwrap();
@@ -2830,6 +3150,125 @@ mod dx_busy_tests {
         assert!(
             !op.is_dx_busy("JA1ABC", now),
             "busy flag older than dx_busy_window_secs (90s) must expire"
+        );
+    }
+
+    /// FQ-F2 (part 1): `feed_decoded_messages_at` must stamp each decoded
+    /// message's `DecodeHistory` entry using THAT message's own carried
+    /// `slot_parity`, not the wall clock at feed time. We prove this by
+    /// picking a message parity that DISAGREES with the real wall-clock
+    /// parity at the moment of the call — if the old wall-clock-stamping
+    /// bug were still present, the disagreeing message would land in the
+    /// wall-clock's slot instead of its own.
+    #[test]
+    fn decode_history_uses_message_own_parity_not_wall_clock() {
+        let mut op = op_even("K5ARH");
+        let evaluator = NullDxEvaluator;
+
+        let wall_clock = SlotParity::current();
+        let disagreeing = match wall_clock {
+            SlotParity::Even => pancetta_core::slot::SlotParity::Odd,
+            SlotParity::Odd => pancetta_core::slot::SlotParity::Even,
+        };
+        let agreeing = match wall_clock {
+            SlotParity::Even => pancetta_core::slot::SlotParity::Even,
+            SlotParity::Odd => pancetta_core::slot::SlotParity::Odd,
+        };
+        let expected_slot_for_disagreeing = match disagreeing {
+            pancetta_core::slot::SlotParity::Even => TimeSlot::First,
+            pancetta_core::slot::SlotParity::Odd => TimeSlot::Second,
+        };
+        let expected_slot_for_agreeing = match agreeing {
+            pancetta_core::slot::SlotParity::Even => TimeSlot::First,
+            pancetta_core::slot::SlotParity::Odd => TimeSlot::Second,
+        };
+        assert_ne!(
+            expected_slot_for_disagreeing, expected_slot_for_agreeing,
+            "sanity: disagreeing and agreeing parities must map to different TimeSlots"
+        );
+
+        let mut msg = dmi("K1ABC W1XYZ -12", Some("K1ABC"), 1500.0);
+        msg.slot_parity = Some(disagreeing);
+
+        op.feed_decoded_messages_at(&[msg], &evaluator, Utc::now());
+
+        assert_eq!(
+            op.decode_history
+                .activity_near_in_slot(1500.0, 10.0, expected_slot_for_disagreeing),
+            1,
+            "message must be recorded under ITS OWN carried parity's slot"
+        );
+        assert_eq!(
+            op.decode_history
+                .activity_near_in_slot(1500.0, 10.0, expected_slot_for_agreeing),
+            0,
+            "message must NOT be recorded under the wall-clock's slot when \
+             it disagrees with the message's own carried parity"
+        );
+    }
+
+    /// FQ-F2 regression: messages with `slot_parity: None` (test scaffolding
+    /// / untracked decodes) must keep falling back to the wall-clock-derived
+    /// slot, unchanged from pre-fix behavior.
+    #[test]
+    fn decode_history_falls_back_to_wall_clock_when_parity_untracked() {
+        let mut op = op_even("K5ARH");
+        let evaluator = NullDxEvaluator;
+
+        let wall_clock = SlotParity::current();
+        let expected_slot = if wall_clock == SlotParity::Even {
+            TimeSlot::First
+        } else {
+            TimeSlot::Second
+        };
+
+        let msg = dmi("K1ABC W1XYZ -12", Some("K1ABC"), 1500.0); // slot_parity: None
+        op.feed_decoded_messages_at(&[msg], &evaluator, Utc::now());
+
+        assert_eq!(
+            op.decode_history
+                .activity_near_in_slot(1500.0, 10.0, expected_slot),
+            1,
+            "untracked-parity message must fall back to the wall-clock slot"
+        );
+    }
+
+    /// FQ-F2 (part 2): `record_slot_activity` (which feeds
+    /// `SlotParityConfig::Auto`'s quieter-slot decision) must split a mixed
+    /// batch's counts by each message's own carried parity, rather than
+    /// lumping the whole batch's count under one wall-clock parity.
+    #[test]
+    fn record_slot_activity_splits_by_message_own_parity() {
+        let config = AutonomousConfig {
+            enabled: true,
+            slot_parity: SlotParityConfig::Auto, // keep auto-detecting
+            min_dx_score: 0.3,
+            ..AutonomousConfig::default()
+        };
+        let mut op = AutonomousOperator::new(config, "K5ARH".into(), Some("FN42".into()));
+        let evaluator = NullDxEvaluator;
+
+        let mut even1 = dmi("K1ABC W1XYZ -12", Some("K1ABC"), 1500.0);
+        even1.slot_parity = Some(pancetta_core::slot::SlotParity::Even);
+        let mut even2 = dmi("K2ABC W2XYZ -12", Some("K2ABC"), 1600.0);
+        even2.slot_parity = Some(pancetta_core::slot::SlotParity::Even);
+        let mut odd1 = dmi("K3ABC W3XYZ -12", Some("K3ABC"), 1700.0);
+        odd1.slot_parity = Some(pancetta_core::slot::SlotParity::Odd);
+        let mut odd2 = dmi("K4ABC W4XYZ -12", Some("K4ABC"), 1800.0);
+        odd2.slot_parity = Some(pancetta_core::slot::SlotParity::Odd);
+        let mut odd3 = dmi("K5ABC W5XYZ -12", Some("K5ABC"), 1900.0);
+        odd3.slot_parity = Some(pancetta_core::slot::SlotParity::Odd);
+
+        op.feed_decoded_messages_at(&[even1, even2, odd1, odd2, odd3], &evaluator, Utc::now());
+
+        assert_eq!(
+            op.slot_manager.auto_detect_even_activity, 2,
+            "2 Even-carried messages should be attributed to Even, \
+             regardless of the batch's Odd majority or wall clock"
+        );
+        assert_eq!(
+            op.slot_manager.auto_detect_odd_activity, 3,
+            "3 Odd-carried messages should be attributed to Odd"
         );
     }
 }

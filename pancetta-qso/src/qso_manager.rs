@@ -833,6 +833,9 @@ impl QsoManager {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin,
+            // CQ-path latch: resolved from our own preference, not an
+            // observed DX parity — always self-consistent, never provisional.
+            tx_parity_provisional: false,
         };
 
         let progress = QsoProgress {
@@ -964,6 +967,9 @@ impl QsoManager {
             // `false` for operator-pressed `c` (local); `true` for a remote
             // operator's `startCq` routed via the station agent.
             remote_origin,
+            // CQ-path latch: resolved from our own preference, not an
+            // observed DX parity — always self-consistent, never provisional.
+            tx_parity_provisional: false,
         };
 
         let progress = QsoProgress {
@@ -1223,7 +1229,20 @@ impl QsoManager {
 
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
-        let tx_parity = dx_parity.map(|p| p.opposite());
+        // When `dx_parity` is `None` (e.g. answering a DX-cluster/DX-Hunter
+        // spot that has never actually been decoded live, so there is no
+        // observed slot parity to oppose), fall back to the same "nearest
+        // next slot" latch the CQ paths use instead of leaving `tx_parity`
+        // permanently `None` (which would make the TX scheduler re-resolve
+        // "nearest next slot" independently every subsequent slot and
+        // alternate parity — the exact failure `latch_cq_parity_if_none` was
+        // built to prevent). Mark the latch `tx_parity_provisional` so the
+        // first real decode from this partner can refine it to the true
+        // opposite-of-DX parity (see `process_message_for_qso`).
+        let (tx_parity, tx_parity_provisional) = match dx_parity {
+            Some(p) => (Some(p.opposite()), false),
+            None => (Self::latch_cq_parity_if_none(None, now), true),
+        };
 
         let state = QsoState::RespondingToCq {
             target_callsign: target_callsign.clone(),
@@ -1267,6 +1286,7 @@ impl QsoManager {
             partner_freq,
             hound_qsyed: false,
             remote_origin,
+            tx_parity_provisional,
         };
 
         // Send response message
@@ -1466,7 +1486,14 @@ impl QsoManager {
 
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
-        let tx_parity = dx_parity.map(|p| p.opposite());
+        // See the matching comment in `respond_to_cq_with`: a `None`
+        // `dx_parity` (no observed decode for this caller yet) falls back to
+        // the "nearest next slot" latch and is marked provisional so the
+        // first real decode from this partner can refine it.
+        let (tx_parity, tx_parity_provisional) = match dx_parity {
+            Some(p) => (Some(p.opposite()), false),
+            None => (Self::latch_cq_parity_if_none(None, now), true),
+        };
 
         // Build (initial_state, first_message) for the chosen step.
         let (state, message): (QsoState, MessageType) = match step {
@@ -1564,6 +1591,7 @@ impl QsoManager {
             partner_freq,
             hound_qsyed: false,
             remote_origin,
+            tx_parity_provisional,
         };
 
         // If we are opening at the close (SeventyThree → Completed), stamp the
@@ -1638,13 +1666,42 @@ impl QsoManager {
         Ok(qso_id)
     }
 
-    /// Process an incoming message
+    /// Process an incoming message.
+    ///
+    /// Does not carry a decoded slot parity — the first-decode provisional-
+    /// parity refinement (see `process_message_for_qso`) is a no-op on this
+    /// path. Callers that have a real observed slot parity for the decode
+    /// (the live coordinator decode path) should use
+    /// [`Self::process_message_with_parity`] instead so a provisionally-
+    /// latched QSO parity can be refined.
     pub async fn process_message(
         &self,
         message_type: MessageType,
         raw_text: String,
         frequency: f64,
         signal_strength: Option<f32>,
+    ) -> Result<(), QsoManagerError> {
+        self.process_message_with_parity(message_type, raw_text, frequency, signal_strength, None)
+            .await
+    }
+
+    /// Process an incoming message that carries a known decoded slot parity.
+    ///
+    /// Identical to [`Self::process_message`] except `observed_slot_parity` is
+    /// threaded through to `process_message_for_qso`, where it drives the
+    /// first-decode provisional-parity refinement: a QSO whose `tx_parity`
+    /// was latched without ever having observed the DX's real slot parity
+    /// (see `QsoMetadata::tx_parity_provisional`) gets that latch corrected
+    /// to the true opposite-of-DX parity the first time a verified frame from
+    /// the latched partner arrives. Pass `None` when the slot parity of this
+    /// decode is not tracked (byte-identical to `process_message`).
+    pub async fn process_message_with_parity(
+        &self,
+        message_type: MessageType,
+        raw_text: String,
+        frequency: f64,
+        signal_strength: Option<f32>,
+        observed_slot_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<(), QsoManagerError> {
         let timestamp = Utc::now();
 
@@ -1661,7 +1718,8 @@ impl QsoManager {
                 frequency,
             };
 
-            self.process_message_for_qso(qso_id, message).await?;
+            self.process_message_for_qso(qso_id, message, observed_slot_parity)
+                .await?;
         }
 
         Ok(())
@@ -1706,9 +1764,24 @@ impl QsoManager {
                 failed_at: Utc::now(),
                 last_state: Box::new(old_state.clone()),
             };
+            // Capture metadata before it's consumed below (Batch 4, SM-F5).
+            let metadata = progress.metadata.clone();
 
             self.emit_state_change(qso_id, old_state, progress.state.clone())
                 .await;
+            // SM-F5: this producer previously emitted only StateChanged →
+            // Failed, leaving `QsoEvent::QsoFailed` dead — the coordinator's
+            // priority-scoring failure backoff (`record_failure`) subscribes
+            // to QsoFailed specifically, so a cancelled QSO never counted
+            // against a station's priority score. The coordinator's
+            // active_tx_qsos removal is a HashSet::remove on both this event
+            // and the StateChanged above, so emitting both is idempotent.
+            self.emit_event(QsoEvent::QsoFailed {
+                qso_id,
+                reason: QsoFailureReason::UserCancelled,
+                metadata,
+            })
+            .await;
 
             // Remove from callsign mapping
             if let Some(callsign) = progress.metadata.their_callsign.as_ref() {
@@ -1753,11 +1826,19 @@ impl QsoManager {
     /// uses (carrying the QSO's frequency and latched `tx_parity`). Returns
     /// `QsoNotFound` for an unknown id; returns `Ok(())` (a benign no-op) when
     /// the QSO has no prior outbound message to resend.
+    ///
+    /// Stamps `last_call_at` (and bumps `call_count`) exactly like the
+    /// keep-call rearm (`rearm_manual_calls_at`) does on every re-emission,
+    /// so an operator-triggered resend is accounted the same way a
+    /// rearm-driven send is for watchdog/cap purposes, and so an operator
+    /// re-pressing Space/resend near a slot boundary can't produce a
+    /// same-text emission the rearm/coalescer machinery doesn't know about.
     pub async fn resend_last_tx(&self, qso_id: QsoId) -> Result<(), QsoManagerError> {
+        let now = Utc::now();
         let (message, frequency) = {
-            let qsos = self.qsos.read().await;
+            let mut qsos = self.qsos.write().await;
             let progress = qsos
-                .get(&qso_id)
+                .get_mut(&qso_id)
                 .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
             match progress
                 .messages
@@ -1765,7 +1846,13 @@ impl QsoManager {
                 .rev()
                 .find(|m| m.direction == MessageDirection::Sent)
             {
-                Some(m) => (m.message_type.clone(), progress.metadata.frequency),
+                Some(m) => {
+                    let message = m.message_type.clone();
+                    let frequency = progress.metadata.frequency;
+                    progress.metadata.call_count += 1;
+                    progress.metadata.last_call_at = Some(now);
+                    (message, frequency)
+                }
                 None => {
                     info!("resend_last_tx: no prior Sent message for QSO {}", qso_id);
                     return Ok(());
@@ -1802,6 +1889,7 @@ impl QsoManager {
         &self,
         qso_id: QsoId,
         message: QsoMessage,
+        observed_slot_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<(), QsoManagerError> {
         let mut qsos = self.qsos.write().await;
         let progress = qsos
@@ -1809,6 +1897,34 @@ impl QsoManager {
             .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
 
         let old_state = progress.state.clone();
+
+        // --- First-decode parity refinement ---
+        // This QSO's `tx_parity` may have been latched PROVISIONALLY: when
+        // `respond_to_cq_with`/`respond_to_caller` answered a DX-cluster/
+        // DX-Hunter spot with no observed live decode yet, there was no real
+        // DX parity to oppose, so the latch fell back to a "nearest next
+        // slot" guess (`tx_parity_provisional == true`). The first time a
+        // frame genuinely FROM that latched partner arrives carrying a
+        // determinable slot parity, refine the latch to the TRUE
+        // opposite-of-DX parity. Sender verification reuses the same
+        // `is_partner` check the rest of this function relies on elsewhere —
+        // never weakened for this purpose. This runs exactly once (the flag
+        // flip prevents re-running) and emits no event of its own; it must
+        // happen BEFORE `qso_tx_parity` is captured just below so a reply
+        // this SAME call emits already carries the refined value.
+        if progress.metadata.tx_parity_provisional {
+            if let (Some(sender), Some(latched), Some(observed_parity)) = (
+                message.message_type.sender_callsign(),
+                progress.metadata.their_callsign.as_deref(),
+                observed_slot_parity,
+            ) {
+                if Self::is_partner(sender, latched) {
+                    progress.metadata.tx_parity = Some(observed_parity.opposite());
+                    progress.metadata.tx_parity_provisional = false;
+                }
+            }
+        }
+
         // Capture per-QSO routing data while we hold the write lock so the
         // reply emission below does not need to re-acquire it (which would
         // deadlock against this guard).
@@ -2292,11 +2408,22 @@ impl QsoManager {
                     );
                     return Ok(current_state.clone());
                 }
+                // SM-F4: latch the report we're about to send (the reply
+                // emitter answers with our SignalReport on this transition)
+                // so a repeated CqResponse can re-send an IDENTICAL value —
+                // see WaitingForReport::our_report's doc comment. No prior
+                // report exists to fall back on here, so the no-SNR default
+                // matches every other first-time-computed report in this
+                // file (-15).
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
+                    .unwrap_or(-15);
                 Ok(QsoState::WaitingForReport {
                     their_callsign: responding_station.clone(),
                     frequency: *frequency,
                     started_at: Utc::now(),
                     their_grid: grid.clone(),
+                    our_report,
                 })
             }
 
@@ -2331,11 +2458,18 @@ impl QsoManager {
                     );
                     return Ok(current_state.clone());
                 }
+                // SM-F4: same latch as the CqResponse arm above — the reply
+                // emitter answers with our SignalReport here too, so the
+                // value must be captured now for anti-jitter re-sends.
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
+                    .unwrap_or(-15);
                 Ok(QsoState::WaitingForReport {
                     their_callsign: from_station.clone(),
                     frequency: *frequency,
                     started_at: Utc::now(),
                     their_grid: None,
+                    our_report,
                 })
             }
 
@@ -2389,6 +2523,68 @@ impl QsoManager {
                     grid_square: None,
                     completed_at: Utc::now(),
                     duration_seconds: duration,
+                })
+            }
+
+            // SM-F4: we (the CQer) sent our SignalReport on the CallingCq →
+            // WaitingForReport transition, but the caller never copied it and
+            // repeats their opening CqResponse (their grid again). There was
+            // previously NO arm at all for (WaitingForReport, CqResponse) — it
+            // fell through to the no-op default and the QSO silently died at
+            // the 30s report_timeout even though the caller was still there.
+            // STAY in WaitingForReport (do not advance) and re-send the
+            // IDENTICAL `our_report` we already latched — mirrors REGRESSION
+            // 2's anti-jitter principle (recomputing from this decode's SNR
+            // would jitter the report across repeats). exchange.rs has no
+            // (WaitingForReport, CqResponse) reply arm, so returning
+            // WaitingForReport here is a no-op for the in-slot reply emitter;
+            // the rearm (`rearm_manual_calls_at`) owns the actual re-send.
+            //
+            // Keep the ALREADY-latched grid: we've already answered with a
+            // report, not a grid, so a repeat carrying a (possibly different)
+            // grid doesn't need to overwrite what we logged the first time.
+            // Sender-verified exactly like the original CallingCq + CqResponse
+            // arm (calling_station must be us; the responding_station must be
+            // the SAME caller we already latched, not a new one hijacking the
+            // slot).
+            (
+                QsoState::WaitingForReport {
+                    their_callsign,
+                    frequency,
+                    started_at,
+                    their_grid,
+                    our_report,
+                },
+                MessageType::CqResponse {
+                    calling_station,
+                    responding_station,
+                    ..
+                },
+            ) => {
+                if !Self::is_partner(responding_station, their_callsign)
+                    || !self.is_us(calling_station)
+                {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %their_callsign,
+                        got_from = %responding_station,
+                        got_to = %calling_station,
+                        "spurious CqResponse in WaitingForReport ignored — no regression (SM-F4)"
+                    );
+                    return Ok(current_state.clone());
+                }
+                info!(
+                    target: "qso.regression",
+                    %their_callsign,
+                    "CQer QSO staying in WaitingForReport \
+                     (caller repeated their grid; they never copied our report)"
+                );
+                Ok(QsoState::WaitingForReport {
+                    their_callsign: their_callsign.clone(),
+                    frequency: *frequency,
+                    started_at: *started_at,
+                    their_grid: their_grid.clone(),
+                    our_report: *our_report,
                 })
             }
 
@@ -2758,6 +2954,17 @@ impl QsoManager {
             // Back up two steps to SendingReport and re-send our R-report (the
             // reply emitter answers a ReportAck for this (state, msg) pair).
             // Latch the newest report value the DX sent.
+            //
+            // SM-F6 safety note: this arm resets `started_at: Utc::now()` on
+            // every fire, which would let a repeatedly-regressing QSO reset
+            // its own timeout clock indefinitely. Deliberately left
+            // Manual-only (not extended to Auto) rather than adding a bounded
+            // counter — WaitingForConfirmation is also outside SM-F6's scope
+            // (only RespondingToCq/SendingReport get Auto resend/regression),
+            // and it already has a uniform `confirmation_timeout` bound for
+            // BOTH Manual and Auto QSOs (it's not in the Manual keep-call
+            // watchdog list), so an Auto QSO here is already safely bounded
+            // by that timeout without this arm's help.
             (
                 QsoState::WaitingForConfirmation {
                     their_callsign,
@@ -2813,6 +3020,14 @@ impl QsoManager {
             // without the reply emitter double-sending: exchange.rs has no
             // (SendingReport, SignalReport) response arm, so the in-slot emit
             // path is a no-op and the rearm owns the (now stable-valued) re-send.
+            //
+            // SM-F6: extended to Auto QSOs too (no `initiated_by` guard) —
+            // unlike REGRESSION 1/3, this arm explicitly PRESERVES
+            // `started_at` (see below) rather than resetting it, so an Auto
+            // QSO stuck here is still bounded by the ordinary 30s
+            // report_timeout counted from when SendingReport was first
+            // entered; it cannot reset its own clock by looping through this
+            // arm. Safe to extend.
             (
                 QsoState::SendingReport {
                     their_callsign,
@@ -2826,7 +3041,7 @@ impl QsoManager {
                     to_station,
                     report,
                 },
-            ) if initiated_by == CallInitiation::Manual => {
+            ) => {
                 if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
                     warn!(
                         target: "qso.security",
@@ -2856,6 +3071,13 @@ impl QsoManager {
             // the whole exchange. Back up to RespondingToCq and re-send our
             // grid/call. Only observable when the repeated message parses as a
             // CqResponse directed appropriately for this QSO.
+            //
+            // SM-F6 safety note: like REGRESSION 1, this arm resets
+            // `started_at: Utc::now()` on every fire. Deliberately left
+            // Manual-only for the same reason as REGRESSION 1 — it operates
+            // on WaitingForConfirmation, which is outside SM-F6's scope and
+            // already carries a uniform `confirmation_timeout` bound for both
+            // Manual and Auto QSOs.
             (
                 QsoState::WaitingForConfirmation {
                     their_callsign,
@@ -3430,7 +3652,7 @@ impl QsoManager {
         };
 
         for qso_id in to_supersede {
-            let old_state = {
+            let old_state_and_metadata = {
                 let mut qsos = self.qsos.write().await;
                 match qsos.get_mut(&qso_id) {
                     Some(progress) => {
@@ -3440,16 +3662,28 @@ impl QsoManager {
                             failed_at: Utc::now(),
                             last_state: Box::new(old_state.clone()),
                         };
-                        Some(old_state)
+                        // Capture metadata before this loop iteration's lock
+                        // guard drops (Batch 4, SM-F5 — needed for QsoFailed).
+                        Some((old_state, progress.metadata.clone()))
                     }
                     None => None,
                 }
             };
-            if let Some(old_state) = old_state {
+            if let Some((old_state, metadata)) = old_state_and_metadata {
                 let new_state = self.qsos.read().await.get(&qso_id).map(|p| p.state.clone());
                 if let Some(new_state) = new_state {
                     self.emit_state_change(qso_id, old_state, new_state).await;
                 }
+                // SM-F5: also emit QsoFailed alongside StateChanged — see the
+                // cancel_qso comment for why (dead priority-scoring backoff
+                // consumer; idempotent HashSet::remove on the coordinator
+                // side makes emitting both events safe).
+                self.emit_event(QsoEvent::QsoFailed {
+                    qso_id,
+                    reason: QsoFailureReason::Superseded,
+                    metadata,
+                })
+                .await;
                 self.remove_callsign_mapping(callsign, qso_id).await;
                 info!(
                     "Superseded older active QSO {} with {} on band {} (re-call)",
@@ -3564,22 +3798,44 @@ impl QsoManager {
         self.rearm_manual_calls_at(Utc::now()).await;
     }
 
-    /// For every manual-initiated QSO still in `RespondingToCq` (waiting
-    /// for the DX to come back), re-emit the call (a `CqResponse`
-    /// `MessageToSend`) at most once per FT8 slot so the operator keeps
-    /// calling the DX every slot until they answer or the manual watchdog
-    /// fires. The TX scheduler downstream resolves slot parity from the
-    /// `tx_parity` latched on the QSO, so re-emitting more often than a
-    /// slot is harmless, but we gate to ~one per slot to avoid flooding
-    /// the bus.
+    /// For every manual-initiated QSO still in `CallingCq`, `WaitingForReport`,
+    /// `RespondingToCq`, or `SendingReport` (waiting for the DX to come
+    /// back / copy our last frame), re-emit that frame at most once per FT8
+    /// slot so the operator keeps calling every slot until the DX answers or
+    /// the manual watchdog fires. The TX scheduler downstream resolves slot
+    /// parity from the `tx_parity` latched on the QSO, so re-emitting more
+    /// often than a slot is harmless, but we gate to ~one per slot to avoid
+    /// flooding the bus.
+    ///
+    /// SM-F6: autonomous (`CallInitiation::Auto`) QSOs in `RespondingToCq` or
+    /// `SendingReport` are ALSO re-armed here now, but under a small,
+    /// hardcoded cap (`AUTO_RESEND_MAX_CALLS`) distinct from Manual's
+    /// operator-supervised `manual_call_max_calls` — see the constant's doc
+    /// comment for the safety rationale. `CallingCq` and `WaitingForReport`
+    /// remain Manual-only (an Auto QSO doesn't reach those rearm-eligible
+    /// states via a self-initiated CQ opening; extending that is a separate,
+    /// out-of-scope initiative).
     ///
     /// Re-arming increments `call_count` and updates `last_call_at`; the
     /// watchdog ([`Self::check_timeouts_at`]) reads `call_count` and
-    /// `first_call_at` to decide when to stop.
+    /// `first_call_at` (Manual) or the per-state `report_timeout` (Auto) to
+    /// decide when to stop.
     pub async fn rearm_manual_calls_at(&self, now: DateTime<Utc>) {
         // One FT8 slot is 15s; re-arm only when at least a slot has
         // elapsed since the last call to keep ~one call per slot.
         const SLOT_SECONDS: i64 = 15;
+
+        // SM-F6: bounded resend cap for AUTONOMOUS QSOs. This is deliberately
+        // NOT `manual_call_max_calls` (25 calls, an operator-supervised,
+        // long-running bound) — an Auto QSO is unattended TX and must stay
+        // conservative. `call_count` starts at 1 (the opening send), so a cap
+        // of 2 allows exactly ONE resend. Combined with the SLOT_SECONDS=15s
+        // cadence below, that resend lands around the ~15s mark, safely
+        // inside the existing 30s `report_timeout` (see check_timeouts_at's
+        // "Phase 5" Auto branch) — we are NOT extending that 30s outer bound,
+        // only making use of the window with an actual mid-window resend
+        // instead of dead silence. No new config surface.
+        const AUTO_RESEND_MAX_CALLS: u32 = 2;
 
         // Each entry carries the exact MessageType to re-emit so a
         // RespondingToCq QSO re-sends the call (CqResponse) while a
@@ -3595,17 +3851,42 @@ impl QsoManager {
         {
             let mut qsos = self.qsos.write().await;
             for (&qso_id, progress) in qsos.iter_mut() {
-                if progress.metadata.initiated_by != CallInitiation::Manual {
-                    continue;
-                }
+                let is_manual = progress.metadata.initiated_by == CallInitiation::Manual;
                 let message = match &progress.state {
                     // Manual CQ (operator `c`): keep calling CQ every slot
                     // until a station answers (→ WaitingForReport, handled by
-                    // the normal sequence) or the watchdog retires us.
-                    QsoState::CallingCq { .. } => MessageType::Cq {
+                    // the normal sequence) or the watchdog retires us. Manual
+                    // only — SM-F6 deliberately does NOT extend autonomous
+                    // keep-calling to a self-CQ opening; that's a separate,
+                    // out-of-scope initiative (Auto QSOs don't currently
+                    // keep-call a CQ this way at all).
+                    QsoState::CallingCq { .. } if is_manual => MessageType::Cq {
                         callsign: self.config.our_callsign.clone(),
                         grid: self.config.our_grid.clone(),
                     },
+                    // SM-F4: the CQer's report was sent on the CallingCq →
+                    // WaitingForReport transition; if the caller never copied
+                    // it and repeats their grid, re-send the SAME latched
+                    // value (no SNR jitter — see the (WaitingForReport,
+                    // CqResponse) regression arm's doc comment). Manual only,
+                    // for the same reason CallingCq above is Manual only: an
+                    // Auto QSO never reaches WaitingForReport via a
+                    // rearm-eligible CQ opening.
+                    QsoState::WaitingForReport {
+                        their_callsign,
+                        our_report,
+                        ..
+                    } if is_manual => MessageType::SignalReport {
+                        to_station: their_callsign.clone(),
+                        from_station: self.config.our_callsign.clone(),
+                        report: *our_report,
+                    },
+                    // SM-F6: re-send our call/grid every slot while waiting
+                    // for the DX to come back. Now covers BOTH Manual
+                    // (keep-calling, long watchdog) and Auto (a single
+                    // bounded resend, capped below) — an autonomous pounce
+                    // whose CqResponse the DX missed previously got ZERO
+                    // re-sends and died silently at the 30s report_timeout.
                     QsoState::RespondingToCq {
                         target_callsign, ..
                     } => MessageType::CqResponse {
@@ -3628,6 +3909,9 @@ impl QsoManager {
                     //     re-send our R-report each slot, under the SAME
                     //     watchdog, until the DX advances (RR73) or the
                     //     watchdog retires us.
+                    // SM-F6: also covers Auto (a single bounded resend,
+                    // capped below) — the second of the two Auto-eligible
+                    // states (RespondingToCq, SendingReport) per this fix.
                     QsoState::SendingReport {
                         their_callsign,
                         their_report: None,
@@ -3654,7 +3938,13 @@ impl QsoManager {
 
                 // Stop re-arming once the watchdog bound is reached; the
                 // watchdog itself will retire the QSO on its own pass.
-                let max_calls = self.config.timeouts.manual_call_max_calls;
+                // Manual gets the long, operator-supervised bound; Auto gets
+                // the small, hardcoded, strictly-bounded cap above (SM-F6).
+                let max_calls = if is_manual {
+                    self.config.timeouts.manual_call_max_calls
+                } else {
+                    AUTO_RESEND_MAX_CALLS
+                };
                 if progress.metadata.call_count >= max_calls {
                     continue;
                 }
@@ -3783,19 +4073,22 @@ impl QsoManager {
 
             // Manual keep-calling watchdog. Covers CallingCq (operator `c`:
             // re-calling CQ until someone answers), RespondingToCq
-            // (re-calling the DX) and SendingReport (FIX 4: re-sending our
-            // R-report when the DX repeats their report). In all phases the
-            // operator is actively keep-calling, and `call_count` /
-            // `first_call_at` span the whole QSO, so the 10-calls / 5-min
-            // bound applies to the QSO as a whole. Once the DX advances past
-            // these states (a caller answers / ReportAck / RR73 received),
-            // the normal state timeouts take over.
+            // (re-calling the DX), SendingReport (FIX 4: re-sending our
+            // R-report when the DX repeats their report), and WaitingForReport
+            // (SM-F4: re-sending our report when a caller repeats their grid
+            // because they never copied it). In all phases the operator is
+            // actively keep-calling, and `call_count` / `first_call_at` span
+            // the whole QSO, so the 10-calls / 5-min bound applies to the QSO
+            // as a whole. Once the DX advances past these states (a caller
+            // answers / ReportAck / RR73 received), the normal state timeouts
+            // take over.
             if progress.metadata.initiated_by == CallInitiation::Manual
                 && matches!(
                     progress.state,
                     QsoState::CallingCq { .. }
                         | QsoState::RespondingToCq { .. }
                         | QsoState::SendingReport { .. }
+                        | QsoState::WaitingForReport { .. }
                 )
             {
                 let max_calls = self.config.timeouts.manual_call_max_calls;
@@ -3828,6 +4121,17 @@ impl QsoManager {
                 // hand.) In SendingReport, only the (longer) time watchdog and
                 // the DX's own messages drive the QSO; the call cap does not
                 // apply.
+                //
+                // SM-F4: WaitingForReport belongs with SendingReport here, NOT
+                // with CallingCq/RespondingToCq — a CQer in WaitingForReport
+                // has already been ANSWERED (a station replied to our CQ and
+                // we've already sent them our report); this is the identical
+                // "DX has engaged us" situation as SendingReport, just on the
+                // CQer ladder rather than the Caller ladder. Applying the
+                // call-count cap here would risk the same 9K2MP-style
+                // premature drop for a CQer whose caller is slow to close, so
+                // WaitingForReport is likewise exempt from the cap and
+                // governed only by the (longer) time watchdog.
                 let in_initial_call = matches!(
                     progress.state,
                     QsoState::CallingCq { .. } | QsoState::RespondingToCq { .. }
@@ -3879,14 +4183,29 @@ impl QsoManager {
             if let Some(mut progress) = qsos.remove(&qso_id) {
                 let old_state = progress.state.clone();
                 progress.state = QsoState::Failed {
-                    reason,
+                    reason: reason.clone(),
                     failed_at: now,
                     last_state: Box::new(old_state.clone()),
                 };
+                // Capture metadata before it's consumed below (Batch 4,
+                // SM-F5 — needed for QsoFailed).
+                let metadata = progress.metadata.clone();
 
                 drop(qsos); // Release lock before emitting events
                 self.emit_state_change(qso_id, old_state, progress.state.clone())
                     .await;
+                // SM-F5: this is the most common failure producer (every
+                // watchdog/timeout retirement runs through here) and
+                // previously never emitted QsoFailed, so the coordinator's
+                // priority-scoring failure backoff (`record_failure`) never
+                // fired for a timed-out QSO. `reason` here is
+                // QsoFailureReason::Timeout for every push site above.
+                self.emit_event(QsoEvent::QsoFailed {
+                    qso_id,
+                    reason,
+                    metadata,
+                })
+                .await;
 
                 if let Some(callsign) = &progress.metadata.their_callsign {
                     self.remove_callsign_mapping(callsign, qso_id).await;
@@ -4007,6 +4326,256 @@ mod tests {
                 .tx_parity
                 .is_some(),
             "start_cq(tx_parity: None) must latch a concrete parity, not leave it None"
+        );
+    }
+
+    // ── Batch 2: responder-side provisional parity latch + first-decode
+    //    refinement ──────────────────────────────────────────────────────────
+
+    /// `respond_to_cq_with` answering a spot with NO observed dx_parity (e.g.
+    /// a DX-cluster/DX-Hunter spot never actually decoded live) must latch a
+    /// CONCRETE parity immediately, marked provisional — not leave
+    /// `tx_parity` permanently `None` (which used to make the TX scheduler
+    /// re-resolve "nearest next slot" independently every subsequent slot and
+    /// alternate parity).
+    #[tokio::test]
+    async fn respond_to_cq_with_no_dx_parity_latches_provisional() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K1DEF".to_string(),
+                14074000.0,
+                None,
+                CallInitiation::Manual,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            progress.metadata.tx_parity.is_some(),
+            "must latch a concrete parity, not leave None"
+        );
+        assert!(
+            progress.metadata.tx_parity_provisional,
+            "a parity latched with no observed dx_parity must be marked provisional"
+        );
+    }
+
+    /// `respond_to_caller` answering with NO observed dx_parity (non-Grid
+    /// step) latches the same way: concrete + provisional.
+    #[tokio::test]
+    async fn respond_to_caller_with_no_dx_parity_latches_provisional() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_caller(
+                "K1DEF".to_string(),
+                14074000.0,
+                None,
+                pancetta_core::ResponseStep::Report,
+                Some(-8.0),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            progress.metadata.tx_parity.is_some(),
+            "must latch a concrete parity, not leave None"
+        );
+        assert!(
+            progress.metadata.tx_parity_provisional,
+            "a parity latched with no observed dx_parity must be marked provisional"
+        );
+    }
+
+    /// Regression: `respond_to_cq_with` with a REAL observed `dx_parity` sets
+    /// `tx_parity_provisional: false` — unchanged behavior for the common
+    /// case (a genuine live decode drove the answer).
+    #[tokio::test]
+    async fn respond_to_cq_with_real_dx_parity_is_not_provisional() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K1DEF".to_string(),
+                14074000.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                CallInitiation::Manual,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(pancetta_core::slot::SlotParity::Odd)
+        );
+        assert!(
+            !progress.metadata.tx_parity_provisional,
+            "a parity latched from a REAL observed dx_parity must not be provisional"
+        );
+    }
+
+    /// Regression: `respond_to_caller` with a REAL observed `dx_parity` also
+    /// sets `tx_parity_provisional: false`.
+    #[tokio::test]
+    async fn respond_to_caller_with_real_dx_parity_is_not_provisional() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_caller(
+                "K1DEF".to_string(),
+                14074000.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                pancetta_core::ResponseStep::Report,
+                Some(-8.0),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(pancetta_core::slot::SlotParity::Odd)
+        );
+        assert!(
+            !progress.metadata.tx_parity_provisional,
+            "a parity latched from a REAL observed dx_parity must not be provisional"
+        );
+    }
+
+    /// First-decode refinement: a QSO answered with no observed dx_parity
+    /// (provisional latch) gets its `tx_parity` corrected to the TRUE
+    /// opposite-of-DX parity the first time a genuine frame FROM the latched
+    /// partner arrives carrying a determinable slot parity — and the
+    /// refinement is one-shot (a second frame with a DIFFERENT parity does
+    /// NOT change it again).
+    #[tokio::test]
+    async fn first_decode_from_partner_refines_provisional_parity_once() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K1DEF".to_string(),
+                14074000.0,
+                None, // no observed dx_parity — provisional latch
+                CallInitiation::Manual,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .tx_parity_provisional
+        );
+
+        // First real frame FROM the latched partner (K1DEF), observed on an
+        // Even slot. This must refine tx_parity to Odd (opposite) and clear
+        // the provisional flag.
+        manager
+            .process_message_with_parity(
+                MessageType::SignalReport {
+                    from_station: "K1DEF".to_string(),
+                    to_station: "W1ABC".to_string(),
+                    report: -10,
+                },
+                "W1ABC K1DEF -10".to_string(),
+                14074000.0,
+                Some(-10.0),
+                Some(SlotParity::Even),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(SlotParity::Odd),
+            "tx_parity must refine to the opposite of the observed DX parity"
+        );
+        assert!(
+            !progress.metadata.tx_parity_provisional,
+            "the provisional flag must clear after the first refinement"
+        );
+
+        // Second frame from the partner, this time observed on Odd (would
+        // imply Even if re-refined) — must NOT change the already-refined
+        // parity (one-shot).
+        manager
+            .process_message_with_parity(
+                MessageType::ReportAck {
+                    from_station: "K1DEF".to_string(),
+                    to_station: "W1ABC".to_string(),
+                    report: -10,
+                },
+                "W1ABC K1DEF R-10".to_string(),
+                14074000.0,
+                Some(-10.0),
+                Some(SlotParity::Odd),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.tx_parity,
+            Some(SlotParity::Odd),
+            "a second frame must NOT re-refine an already-refined parity"
+        );
+    }
+
+    /// Security: a frame from a NON-partner (sender mismatch) must NOT
+    /// trigger the refinement, even though it carries a determinable slot
+    /// parity — sender verification is never weakened for this purpose.
+    #[tokio::test]
+    async fn refinement_does_not_fire_for_non_partner_sender() {
+        use pancetta_core::slot::SlotParity;
+
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K1DEF".to_string(),
+                14074000.0,
+                None, // provisional latch
+                CallInitiation::Manual,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+
+        // A frame from a DIFFERENT station, addressed to someone else
+        // entirely, must not be routed to this QSO at all (find_qsos_for_message
+        // relevance gate) and must not refine its provisional parity.
+        manager
+            .process_message_with_parity(
+                MessageType::SignalReport {
+                    from_station: "NF4KE".to_string(),
+                    to_station: "W1ABC".to_string(),
+                    report: -12,
+                },
+                "W1ABC NF4KE -12".to_string(),
+                14074000.0,
+                Some(-12.0),
+                Some(SlotParity::Even),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            progress.metadata.tx_parity_provisional,
+            "a non-partner frame must not refine the provisional latch"
         );
     }
 
@@ -4800,6 +5369,43 @@ mod tests {
         assert!(matches!(resends[0].1, MessageType::CqResponse { .. }));
     }
 
+    /// resend_last_tx stamps `last_call_at` and bumps `call_count` exactly
+    /// like the keep-call rearm does, so an operator-triggered resend is
+    /// accounted for watchdog/cap purposes and the rearm/coalescer
+    /// machinery is aware of it (double-PTT hardening,
+    /// docs/qso-tx-deep-review-2026-07-18.md).
+    #[tokio::test]
+    async fn resend_last_tx_stamps_last_call_at_and_call_count() {
+        let manager = QsoManager::new(test_config());
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        let before = manager.get_qso(qso_id).await.unwrap().metadata;
+        assert_eq!(before.call_count, 1);
+        let last_call_before = before.last_call_at;
+
+        // Ensure the clock actually advances so last_call_at is observably
+        // different, mirroring the rearm test's own timing discipline.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        manager.resend_last_tx(qso_id).await.unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap().metadata;
+        assert_eq!(
+            after.call_count, 2,
+            "resend must bump call_count exactly like a rearm re-send"
+        );
+        assert!(
+            after.last_call_at.is_some() && after.last_call_at != last_call_before,
+            "resend must stamp last_call_at to now, like rearm_manual_calls_at does"
+        );
+    }
+
     /// resend_last_tx on an unknown QSO id returns QsoNotFound.
     #[tokio::test]
     async fn resend_last_tx_unknown_id_not_found() {
@@ -5337,6 +5943,7 @@ mod tests {
                 partner_freq: None,
                 hound_qsyed: false,
                 remote_origin: false,
+                tx_parity_provisional: false,
             },
         };
         manager.qsos.write().await.insert(qso_id, progress);
@@ -5881,6 +6488,7 @@ mod sender_verification_tests {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 
@@ -7737,6 +8345,643 @@ mod state_regression_tests {
 }
 
 #[cfg(test)]
+mod sm_f4_waiting_for_report_resend_tests {
+    //! SM-F4 (Batch 4): the CQer role previously had NO resilience to a
+    //! caller repeating their grid (CqResponse) after missing our
+    //! SignalReport in `WaitingForReport` — the (WaitingForReport,
+    //! CqResponse) pair fell through to a no-op, so a caller who never copied
+    //! our report caused the QSO to silently die at the 30s report_timeout.
+    //!
+    //! This module tests the new regression arm (stay in WaitingForReport,
+    //! re-send the SAME latched `our_report` — no SNR jitter), its sender
+    //! verification, and the watchdog-exemption change that lets a CQer in
+    //! WaitingForReport survive the generic 30s timeout under the manual
+    //! keep-call watchdog (mirroring SendingReport's existing exemption).
+    use super::*;
+
+    const OUR: &str = "W1ABC"; // test_config()'s our_callsign
+    const CALLER: &str = "K1DEF";
+    const FREQ: f64 = 14074000.0;
+
+    fn test_config() -> QsoManagerConfig {
+        QsoManagerConfig {
+            our_callsign: OUR.to_string(),
+            our_grid: Some("FN42".to_string()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
+            active_mode: default_active_mode(),
+        }
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn sends(events: &[QsoEvent]) -> Vec<MessageType> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                QsoEvent::MessageToSend { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Drive a Manual CQ to `WaitingForReport` (opening CQ, then a caller's
+    /// grid-bearing CqResponse), returning the qso_id and the `our_report`
+    /// value latched on that transition.
+    async fn manual_cq_to_waiting_for_report(manager: &QsoManager, snr: f32) -> (QsoId, i8) {
+        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.to_string(),
+                    responding_station: CALLER.to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                format!("{OUR} {CALLER} FN31"),
+                FREQ,
+                Some(snr),
+            )
+            .await
+            .unwrap();
+        let our_report = match manager.get_qso(qso_id).await.unwrap().state {
+            QsoState::WaitingForReport { our_report, .. } => our_report,
+            other => panic!("expected WaitingForReport, got {other:?}"),
+        };
+        (qso_id, our_report)
+    }
+
+    /// A repeated CqResponse from the SAME caller stays in WaitingForReport
+    /// (does not advance, does not fail) and the rearm re-sends the SAME
+    /// `our_report` value both times — proving no SNR-jitter across repeats,
+    /// mirroring REGRESSION 2's anti-jitter contract for the CQer role.
+    #[tokio::test]
+    async fn repeated_cq_response_stays_and_resends_identical_report() {
+        let manager = QsoManager::new(test_config());
+        let mut rx = manager.subscribe();
+        let (qso_id, first_report) = manual_cq_to_waiting_for_report(&manager, -9.0).await;
+        let _ = drain(&mut rx);
+
+        // Caller repeats their grid (never copied our report) — a fresh
+        // decode with a DIFFERENT SNR, to prove our_report does NOT jitter.
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.to_string(),
+                    responding_station: CALLER.to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                format!("{OUR} {CALLER} FN31"),
+                FREQ,
+                Some(-2.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        let (state_report, their_grid) = match &progress.state {
+            QsoState::WaitingForReport {
+                our_report,
+                their_grid,
+                ..
+            } => (*our_report, their_grid.clone()),
+            other => panic!("expected to stay in WaitingForReport, got {other:?}"),
+        };
+        assert_eq!(
+            state_report, first_report,
+            "our_report must stay latched across a repeated CqResponse (no SNR jitter)"
+        );
+        assert_eq!(their_grid, Some("FN31".to_string()));
+
+        // The transition itself must not emit (exchange.rs has no
+        // (WaitingForReport, CqResponse) arm) — the rearm owns the re-send.
+        assert!(
+            sends(&drain(&mut rx)).is_empty(),
+            "transition must not re-send directly; rearm owns it"
+        );
+
+        // A slot later, the rearm re-sends our SignalReport with the
+        // IDENTICAL report value.
+        let last_call_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(last_call_at + Duration::seconds(15))
+            .await;
+        let rearmed = sends(&drain(&mut rx));
+        assert_eq!(
+            rearmed.len(),
+            1,
+            "expected one rearm re-send, got {rearmed:?}"
+        );
+        match &rearmed[0] {
+            MessageType::SignalReport {
+                to_station,
+                from_station,
+                report,
+            } => {
+                assert_eq!(to_station, CALLER);
+                assert_eq!(from_station, OUR);
+                assert_eq!(
+                    *report, first_report,
+                    "rearm must re-send the SAME report value latched at the first send"
+                );
+            }
+            other => panic!("expected SignalReport, got {other:?}"),
+        }
+
+        // Drive a SECOND repeat + rearm cycle and confirm the value is STILL
+        // byte-identical across both repeats (not just the first one).
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.to_string(),
+                    responding_station: CALLER.to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                format!("{OUR} {CALLER} FN31"),
+                FREQ,
+                Some(12.0),
+            )
+            .await
+            .unwrap();
+        let last_call_at2 = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(last_call_at2 + Duration::seconds(15))
+            .await;
+        let rearmed2 = sends(&drain(&mut rx));
+        assert_eq!(rearmed2.len(), 1);
+        match &rearmed2[0] {
+            MessageType::SignalReport { report, .. } => {
+                assert_eq!(
+                    *report, first_report,
+                    "report must remain byte-identical across BOTH repeats, no jitter"
+                );
+            }
+            other => panic!("expected SignalReport, got {other:?}"),
+        }
+    }
+
+    /// A repeated CqResponse from a DIFFERENT (non-partner) station is
+    /// rejected via the qso.security path and does NOT trigger the stay-arm.
+    #[tokio::test]
+    async fn repeated_cq_response_from_non_partner_is_rejected() {
+        let manager = QsoManager::new(test_config());
+        let mut rx = manager.subscribe();
+        let (qso_id, first_report) = manual_cq_to_waiting_for_report(&manager, -9.0).await;
+        let _ = drain(&mut rx);
+
+        // A DIFFERENT station answers our CQ with the SAME slot pattern —
+        // must not be treated as our caller's repeat.
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.to_string(),
+                    responding_station: "NF4KE".to_string(),
+                    grid: Some("EM12".to_string()),
+                },
+                format!("{OUR} NF4KE EM12"),
+                FREQ,
+                Some(5.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        match &progress.state {
+            QsoState::WaitingForReport {
+                their_callsign,
+                our_report,
+                ..
+            } => {
+                assert_eq!(their_callsign, CALLER, "partner must not change");
+                assert_eq!(
+                    *our_report, first_report,
+                    "our_report must not change from a spurious sender"
+                );
+            }
+            other => panic!("expected to remain in WaitingForReport, got {other:?}"),
+        }
+        assert!(
+            sends(&drain(&mut rx)).is_empty(),
+            "spurious sender must not trigger a re-send"
+        );
+    }
+
+    /// A Manual CQer in WaitingForReport is NOT retired by the generic 30s
+    /// report_timeout — it survives well past 30s under the manual
+    /// watchdog's longer bound (mirrors the 9K2MP-style SendingReport
+    /// watchdog-exemption test) but IS eventually retired by the 5-min /
+    /// max-calls watchdog bound.
+    #[tokio::test]
+    async fn manual_waiting_for_report_survives_generic_timeout_but_not_watchdog() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 20;
+        config.timeouts.manual_call_watchdog_minutes = 5;
+        let manager = QsoManager::new(config);
+        let (qso_id, _first_report) = manual_cq_to_waiting_for_report(&manager, -9.0).await;
+
+        // Well past the generic 30s report_timeout, but well within the 5-min
+        // manual watchdog — must still be alive.
+        manager
+            .check_timeouts_at(Utc::now() + Duration::seconds(90))
+            .await;
+        assert!(
+            manager.get_qso(qso_id).await.is_ok(),
+            "a Manual CQer in WaitingForReport must survive past the generic 30s report_timeout"
+        );
+
+        // Past the 5-min watchdog bound — must now be retired (not immortal).
+        let first_call_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .first_call_at
+            .unwrap();
+        manager
+            .check_timeouts_at(first_call_at + Duration::minutes(6))
+            .await;
+        assert!(
+            matches!(
+                manager.get_qso(qso_id).await,
+                Err(QsoManagerError::QsoNotFound { .. })
+            ),
+            "the manual watchdog must still retire a WaitingForReport CQer eventually"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sm_f6_auto_bounded_resend_tests {
+    //! SM-F6 (Batch 4): bounded re-send/regression resilience for AUTO QSOs.
+    //!
+    //! `rearm_manual_calls_at` previously skipped every Auto QSO outright
+    //! (`if initiated_by != Manual { continue; }`), so an autonomous pounce
+    //! whose reply the DX missed got ZERO re-sends and silently died at the
+    //! existing 30s `report_timeout`. This module proves the new bounded
+    //! resend (`AUTO_RESEND_MAX_CALLS = 2`: the opening send plus exactly one
+    //! resend) lands within that unchanged 30s window and does NOT make the
+    //! QSO immortal.
+    use super::*;
+
+    const OUR: &str = "W1ABC"; // test_config()'s our_callsign
+    const DX: &str = "K1DEF";
+    const FREQ: f64 = 14074000.0;
+
+    fn test_config() -> QsoManagerConfig {
+        QsoManagerConfig {
+            our_callsign: OUR.to_string(),
+            our_grid: Some("FN42".to_string()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
+            active_mode: default_active_mode(),
+        }
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn sends(events: &[QsoEvent]) -> Vec<MessageType> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                QsoEvent::MessageToSend { message, .. } => Some(message.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// An Auto QSO in `RespondingToCq` that never gets a DX reply receives
+    /// exactly ONE bounded resend around the ~15s mark (the SLOT_SECONDS
+    /// cadence), and is still retired at the (unmodified) 30s report_timeout
+    /// — not immortal.
+    #[tokio::test]
+    async fn auto_responding_to_cq_gets_one_bounded_resend_then_retires_at_30s() {
+        let manager = QsoManager::new(test_config());
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq(DX.to_string(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // At +15s (one FT8 slot): the bounded Auto resend fires.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+        let resent = sends(&drain(&mut rx));
+        assert_eq!(
+            resent.len(),
+            1,
+            "expected exactly one bounded Auto resend at +15s, got {resent:?}"
+        );
+        assert!(
+            matches!(resent[0], MessageType::CqResponse { .. }),
+            "Auto resend in RespondingToCq must re-send our CqResponse (call), got {:?}",
+            resent[0]
+        );
+
+        // At +30s (another slot): the cap (AUTO_RESEND_MAX_CALLS = 2) must
+        // now block any further resend — call_count is already 2.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .await;
+        assert!(
+            sends(&drain(&mut rx)).is_empty(),
+            "Auto resend must be capped — no second resend"
+        );
+
+        // Still alive at +30s exactly (state_duration comparison is strict
+        // `>`), then check_timeouts_at retires it once duration exceeds the
+        // 30s report_timeout — not immortal.
+        assert!(
+            manager.get_qso(qso_id).await.is_ok(),
+            "QSO should still be alive exactly at the 30s boundary"
+        );
+        manager
+            .check_timeouts_at(opened_at + Duration::seconds(31))
+            .await;
+        assert!(
+            matches!(
+                manager.get_qso(qso_id).await,
+                Err(QsoManagerError::QsoNotFound { .. })
+            ),
+            "an unanswered Auto pounce must still retire at the unmodified 30s report_timeout"
+        );
+    }
+
+    /// The bounded Auto resend also covers `SendingReport` (the DX never
+    /// rogers our R-report): one resend, then the same 30s bound applies.
+    #[tokio::test]
+    async fn auto_sending_report_gets_one_bounded_resend_then_retires_at_30s() {
+        let manager = QsoManager::new(test_config());
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq(DX.to_string(), FREQ, None)
+            .await
+            .unwrap();
+        // DX sends their report → advances RespondingToCq -> SendingReport.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.to_string(),
+                    from_station: DX.to_string(),
+                    report: -9,
+                },
+                format!("{OUR} {DX} -09"),
+                FREQ,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        let entered_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_id).await.unwrap().state,
+            QsoState::SendingReport { .. }
+        ));
+        let _ = drain(&mut rx);
+
+        // +15s: one bounded resend of our R-report (ReportAck) — the DX
+        // already gave us their plain report to get here (their_report is
+        // Some on this rung), so the rearm arm re-sends ReportAck, not a
+        // plain SignalReport (see the SendingReport rearm arm's own comment).
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+            .await;
+        let resent = sends(&drain(&mut rx));
+        assert_eq!(
+            resent.len(),
+            1,
+            "expected one bounded resend, got {resent:?}"
+        );
+        assert!(matches!(resent[0], MessageType::ReportAck { .. }));
+
+        // +30s: capped, no further resend.
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(30))
+            .await;
+        assert!(sends(&drain(&mut rx)).is_empty(), "resend must be capped");
+
+        // Still bounded by the unmodified 30s report_timeout. `entered_at` is
+        // `last_call_at` stamped when the QSO OPENED (Auto forward advances
+        // do not stamp `last_call_at` — see `process_message_for_qso`'s
+        // Manual-only gate), which lands a fraction of a millisecond BEFORE
+        // the SendingReport state's own `started_at` (stamped moments later
+        // by the SignalReport transition). `chrono::Duration::num_seconds`
+        // truncates towards zero, so a tight +31s margin can read as 30
+        // (e.g. 30.9996s) and spuriously miss the boundary — use a
+        // comfortable +33s margin instead.
+        manager
+            .check_timeouts_at(entered_at + Duration::seconds(33))
+            .await;
+        assert!(
+            matches!(
+                manager.get_qso(qso_id).await,
+                Err(QsoManagerError::QsoNotFound { .. })
+            ),
+            "an Auto SendingReport that never closes must still retire at 30s"
+        );
+    }
+}
+
+#[cfg(test)]
+mod sm_f5_qso_failed_event_tests {
+    //! SM-F5 (Batch 4): `QsoEvent::QsoFailed` was never emitted by `cancel_qso`,
+    //! `check_timeouts_at`'s retirement loop, or `supersede_active_qsos_for` —
+    //! only `StateChanged → Failed`. The coordinator's priority-scoring
+    //! failure backoff (`record_failure`) subscribes to `QsoFailed`
+    //! specifically, so this dropped the backoff signal entirely for every
+    //! failure path. This module proves all three producer sites now emit
+    //! `QsoFailed` with the correct reason and non-empty metadata.
+    use super::*;
+
+    const OUR: &str = "W1ABC"; // test_config()'s our_callsign
+    const DX: &str = "K1DEF";
+    const FREQ: f64 = 14074000.0;
+
+    fn test_config() -> QsoManagerConfig {
+        QsoManagerConfig {
+            our_callsign: OUR.to_string(),
+            our_grid: Some("FN42".to_string()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
+            active_mode: default_active_mode(),
+        }
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    fn qso_failed_events(events: &[QsoEvent]) -> Vec<(QsoId, QsoFailureReason, QsoMetadata)> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                QsoEvent::QsoFailed {
+                    qso_id,
+                    reason,
+                    metadata,
+                } => Some((*qso_id, reason.clone(), metadata.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn cancel_qso_emits_qso_failed_with_user_cancelled() {
+        let manager = QsoManager::new(test_config());
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq(DX.to_string(), FREQ, None)
+            .await
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        manager.cancel_qso(qso_id).await.unwrap();
+
+        let events = drain(&mut rx);
+        // Both surfaces must fire: StateChanged -> Failed (existing) AND the
+        // revived QsoFailed (SM-F5).
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                QsoEvent::StateChanged {
+                    new_state: QsoState::Failed { .. },
+                    ..
+                }
+            )),
+            "expected a StateChanged -> Failed, got {events:?}"
+        );
+        let failed = qso_failed_events(&events);
+        assert_eq!(
+            failed.len(),
+            1,
+            "expected exactly one QsoFailed, got {failed:?}"
+        );
+        let (failed_id, reason, metadata) = &failed[0];
+        assert_eq!(*failed_id, qso_id);
+        assert_eq!(*reason, QsoFailureReason::UserCancelled);
+        assert_eq!(metadata.their_callsign.as_deref(), Some(DX));
+    }
+
+    #[tokio::test]
+    async fn check_timeouts_at_retirement_emits_qso_failed_with_timeout() {
+        let manager = QsoManager::new(test_config());
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq(DX.to_string(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // Past the 30s report_timeout, past the one bounded Auto resend cap
+        // too, so this retires cleanly via the timeout path.
+        manager
+            .check_timeouts_at(opened_at + Duration::seconds(45))
+            .await;
+
+        let events = drain(&mut rx);
+        let failed = qso_failed_events(&events);
+        assert_eq!(
+            failed.len(),
+            1,
+            "expected exactly one QsoFailed, got {failed:?}"
+        );
+        let (failed_id, reason, metadata) = &failed[0];
+        assert_eq!(*failed_id, qso_id);
+        assert_eq!(*reason, QsoFailureReason::Timeout);
+        assert_eq!(metadata.their_callsign.as_deref(), Some(DX));
+    }
+
+    #[tokio::test]
+    async fn supersede_active_qsos_for_emits_qso_failed_with_superseded() {
+        let manager = QsoManager::new(test_config());
+        let mut rx = manager.subscribe();
+        let qso_id_1 = manager
+            .respond_to_cq_manual(DX.to_string(), FREQ, None)
+            .await
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // Drive the producer directly (FIX 3's own entry point) — a fresh
+        // `respond_to_cq_manual` for the SAME (callsign, band) instead hits the
+        // idempotent re-call branch (`find_active_manual_qso_for`) while the
+        // first QSO is still active, which is a separate code path from the
+        // genuine supersede this test targets.
+        manager.supersede_active_qsos_for(DX, FREQ).await;
+
+        let events = drain(&mut rx);
+        let failed = qso_failed_events(&events);
+        assert_eq!(
+            failed.len(),
+            1,
+            "expected exactly one QsoFailed for the superseded QSO, got {failed:?}"
+        );
+        let (failed_id, reason, metadata) = &failed[0];
+        assert_eq!(
+            *failed_id, qso_id_1,
+            "the OLDER qso must be the one superseded"
+        );
+        assert_eq!(*reason, QsoFailureReason::Superseded);
+        assert_eq!(metadata.their_callsign.as_deref(), Some(DX));
+    }
+}
+
+#[cfg(test)]
 mod stuck_dx_tests {
     //! Mid-QSO TX-frequency hold + stuck-DX escape (operator request).
     //!
@@ -7992,6 +9237,7 @@ mod has_active_or_recent_qso_tests {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 
@@ -8176,6 +9422,7 @@ mod hound_tests {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 
@@ -8422,8 +9669,12 @@ mod hound_tests {
         }
     }
 
-    /// engage_hound with dx_parity=None produces tx_parity=None (no preferred
-    /// slot when the Fox's parity is unknown).
+    /// engage_hound with dx_parity=None (Fox's parity unknown) now LATCHES a
+    /// concrete provisional parity via `engage_hound` → `respond_to_cq_with`'s
+    /// `None`-dx_parity fallback (Batch 2 remediation), instead of leaving
+    /// `tx_parity` permanently `None` (the old behavior, which made the TX
+    /// scheduler re-resolve "nearest next slot" independently every
+    /// subsequent slot and alternate parity — the exact bug this fixes).
     #[tokio::test]
     async fn engage_hound_no_parity_when_dx_parity_unknown() {
         let manager = QsoManager::new(hound_test_config());
@@ -8434,9 +9685,14 @@ mod hound_tests {
             .expect("engage_hound with no parity");
 
         let progress = manager.get_qso(qso_id).await.unwrap();
-        assert_eq!(
-            progress.metadata.tx_parity, None,
-            "tx_parity should be None when dx_parity is None"
+        assert!(
+            progress.metadata.tx_parity.is_some(),
+            "tx_parity should be latched to a concrete parity even when \
+             dx_parity is None (provisional latch, not left None forever)"
+        );
+        assert!(
+            progress.metadata.tx_parity_provisional,
+            "a parity latched with no observed dx_parity must be marked provisional"
         );
         assert!(
             progress.metadata.hound,

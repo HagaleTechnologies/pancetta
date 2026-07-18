@@ -129,6 +129,39 @@ pub fn tx_pivot_target(
     }
 }
 
+/// Pivot consume-once tombstone check (double-PTT fix,
+/// docs/qso-tx-deep-review-2026-07-18.md).
+///
+/// The TX worker's Step-4c late pivot (`tx.rs`) swaps the in-flight frame's
+/// text for a fresher [`LatestTxIntent`] and keys PTT with the swapped text —
+/// but the newer `MessageToSend` that produced that fresher intent ALSO
+/// already enqueued its own separate `TransmitRequest`, which is still
+/// sitting behind the pivoted one in the worker's channel. When the worker
+/// later dequeues that second request, it is a stale duplicate of a frame
+/// that was **already physically transmitted** via the pivot: same qso_id,
+/// same text. This predicate lets the worker recognize and drop that
+/// duplicate instead of keying PTT a second time for the same message.
+///
+/// The worker records `(qso_key -> text)` in its own `pivoted_once` map every
+/// time Step 4c successfully pivots (see `tx.rs`); this function is the pure
+/// membership check against that map. Returns `false` for `qso_id == None`
+/// (manual / tune / test-TX are never pivoted, so this never applies to
+/// them) and for any request whose text does not exactly match the recorded
+/// pivot text (a genuinely new / different message is never suppressed).
+pub fn is_pivot_duplicate(
+    qso_id: Option<&str>,
+    text: &str,
+    pivoted_once: &HashMap<String, String>,
+) -> bool {
+    let Some(id) = qso_id else {
+        return false;
+    };
+    match pivoted_once.get(&active_tx_qso_key(id)) {
+        Some(pivoted_text) => pivoted_text == text,
+        None => false,
+    }
+}
+
 /// Threshold (Hz) for treating a same-band (or out-of-band) dial move as a
 /// "band change" for the C9 active-QSO teardown. Sized to ride over normal
 /// fine-tuning / passband nudges within an FT8 sub-band (a few kHz) while
@@ -862,6 +895,21 @@ pub struct ApplicationCoordinator {
     /// closes that gap. Requests with `qso_id == None` (manual free-text,
     /// tune, test-TX) are never gated by this set.
     pub(crate) active_tx_qsos: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// FQ-F3: active QSO id -> its current TX audio-offset frequency (Hz).
+    /// Maintained by the SAME QSO-event-forwarding task, at the SAME
+    /// insert/remove points (including the 45s completed-grace window), as
+    /// `active_tx_qsos` above — so the two stay consistent. Read each tick
+    /// by the autonomous component's slot loop and synced (bulk-replace)
+    /// into `AutonomousOperator`'s own-frequency registry via
+    /// `set_own_frequencies`, so the smart frequency allocator's
+    /// own-frequency-separation criterion (-50 penalty near an active QSO's
+    /// real offset) can actually fire — before this field existed, that
+    /// registry was permanently empty because `register_qso_frequency` /
+    /// `release_qso_frequency` were only ever called from unit tests, never
+    /// from production wiring (the `AutonomousOperator` instance lives
+    /// entirely inside `coordinator/autonomous.rs`'s own task and was never
+    /// reachable from this file's QSO-event task).
+    pub(crate) active_tx_offsets: Arc<std::sync::RwLock<HashMap<String, f64>>>,
     /// Newest transmit intent per QSO (see [`LatestTxIntent`]). Written by
     /// the QSO component as it forwards each `MessageToSend`; read by the TX
     /// worker at key-time to pivot to the freshest message for the QSO.
@@ -1238,6 +1286,7 @@ impl ApplicationCoordinator {
             waterfall_to_auto_rx: Some(waterfall_to_auto_rx),
             active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
             active_qso_freq_hz: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            active_tx_offsets: Arc::new(std::sync::RwLock::new(HashMap::new())),
             fp_filter: std::sync::Arc::new(std::sync::RwLock::new(None)),
             cross_time_state: std::sync::Arc::new(pancetta_qso::CrossTimeState::empty()),
             cross_sequence_cache: std::sync::Arc::new(std::sync::RwLock::new(
@@ -1747,6 +1796,89 @@ mod tx_active_set_tests {
         // Grace elapsed (delayed task removed it): backlog dropped.
         active.remove(&c);
         assert!(!tx_qso_is_live(Some("qso-c"), &active));
+    }
+}
+
+#[cfg(test)]
+mod pivot_duplicate_tests {
+    use super::{active_tx_qso_key, is_pivot_duplicate};
+    use std::collections::HashMap;
+
+    /// A subsequent request for the same qso_id + identical text as an
+    /// already-recorded pivot is recognized as the stale duplicate that
+    /// caused the double-PTT bug.
+    #[test]
+    fn identical_text_after_pivot_is_duplicate() {
+        let mut pivoted_once: HashMap<String, String> = HashMap::new();
+        pivoted_once.insert(active_tx_qso_key("qso-a"), "KF9UG K5ARH 73".to_string());
+
+        assert!(is_pivot_duplicate(
+            Some("qso-a"),
+            "KF9UG K5ARH 73",
+            &pivoted_once
+        ));
+        // Case/whitespace-insensitive key match, matching active_tx_qso_key.
+        assert!(is_pivot_duplicate(
+            Some("QSO-a "),
+            "KF9UG K5ARH 73",
+            &pivoted_once
+        ));
+    }
+
+    /// A genuinely fresh keep-call re-send is NOT flagged as a duplicate:
+    /// a different qso_id, or the same qso_id once its tombstone has been
+    /// cleared (e.g. by the Step-4b stale-QSO drop path), must still
+    /// transmit normally.
+    #[test]
+    fn fresh_resend_not_flagged_duplicate() {
+        let mut pivoted_once: HashMap<String, String> = HashMap::new();
+        pivoted_once.insert(active_tx_qso_key("qso-a"), "KF9UG K5ARH 73".to_string());
+
+        // Different qso_id, same text: not a duplicate.
+        assert!(!is_pivot_duplicate(
+            Some("qso-b"),
+            "KF9UG K5ARH 73",
+            &pivoted_once
+        ));
+
+        // Same qso_id, different text (a real ladder advance / different
+        // rung): not a duplicate.
+        assert!(!is_pivot_duplicate(
+            Some("qso-a"),
+            "KF9UG K5ARH RR73",
+            &pivoted_once
+        ));
+
+        // Tombstone cleared (as the drop-gate does after firing, or the
+        // Step-4b stale-QSO drop does on QSO end) → a later legitimate
+        // re-send of the same text is no longer suppressed.
+        let mut cleared = pivoted_once.clone();
+        cleared.remove(&active_tx_qso_key("qso-a"));
+        assert!(!is_pivot_duplicate(
+            Some("qso-a"),
+            "KF9UG K5ARH 73",
+            &cleared
+        ));
+    }
+
+    /// Manual / tune / test-TX (qso_id == None) is never pivoted, so it can
+    /// never be flagged as a pivot duplicate either.
+    #[test]
+    fn no_qso_id_never_duplicate() {
+        let mut pivoted_once: HashMap<String, String> = HashMap::new();
+        pivoted_once.insert(active_tx_qso_key("qso-a"), "CQ K5ARH EM10".to_string());
+        assert!(!is_pivot_duplicate(None, "CQ K5ARH EM10", &pivoted_once));
+    }
+
+    /// No prior pivot recorded for this qso_id → not a duplicate.
+    #[test]
+    fn no_prior_pivot_not_duplicate() {
+        let pivoted_once: HashMap<String, String> = HashMap::new();
+        assert!(!is_pivot_duplicate(
+            Some("qso-a"),
+            "KF9UG K5ARH 73",
+            &pivoted_once
+        ));
     }
 }
 

@@ -598,6 +598,7 @@ impl AdifProcessor {
             partner_freq: None,
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 
@@ -1234,6 +1235,7 @@ ADIF Export for Test Program
             partner_freq: if hound { Some(1500.0) } else { None },
             hound_qsyed: false,
             remote_origin: false,
+            tx_parity_provisional: false,
         }
     }
 

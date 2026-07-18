@@ -62,7 +62,7 @@
 
 #![allow(clippy::expect_used)]
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
@@ -70,8 +70,8 @@ use std::time::{Duration, Instant};
 use pancetta_config::OperatingMode;
 use pancetta_hamlib::{MockRig, PttState, RigControl, Vfo};
 use pancetta_lib::coordinator::{
-    active_tx_qso_key, coalesce_transmit_requests, remote_tx_permitted, try_switch_operating_mode,
-    tx_qso_is_live, CoalesceEntry, ModeSwitchError,
+    active_tx_qso_key, coalesce_transmit_requests, compute_manual_tx_offset, remote_tx_permitted,
+    try_switch_operating_mode, tx_qso_is_live, CoalesceEntry, ModeSwitchError,
 };
 use pancetta_lib::message_bus::{
     ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
@@ -312,6 +312,12 @@ pub struct CoordSim {
     /// Shared TX-active set (drop-stale-TX gate), exactly as the coordinator
     /// holds it.
     pub active_tx_qsos: Arc<RwLock<HashSet<String>>>,
+    /// FQ-F3: shared qso_id -> TX offset (Hz) map, exactly as the
+    /// coordinator's `active_tx_offsets` field. Populated/depopulated at the
+    /// SAME points as `active_tx_qsos` above (see `apply_event`/`expire_qso`)
+    /// so the autonomous frequency allocator's own-frequency registry can be
+    /// synced from a real, event-driven snapshot in tests.
+    pub active_tx_offsets: Arc<RwLock<HashMap<String, f64>>>,
     /// Shared tri-state TX policy atomic, exactly as the coordinator holds it.
     pub tx_policy: Arc<AtomicU8>,
     /// Shared FT8 decoder config, exactly as the coordinator holds it —
@@ -372,6 +378,7 @@ impl CoordSim {
             qso_rx,
             rig,
             active_tx_qsos: Arc::new(RwLock::new(HashSet::new())),
+            active_tx_offsets: Arc::new(RwLock::new(HashMap::new())),
             tx_policy: Arc::new(AtomicU8::new(TxPolicy::Full.as_u8())),
             ft8_config: Arc::new(tokio::sync::RwLock::new(pancetta_ft8::Ft8Config::default())),
             active_protocol_mode: Arc::new(AtomicU8::new(OperatingMode::Ft8.as_u8())),
@@ -462,9 +469,15 @@ impl CoordSim {
             } => {
                 let key = active_tx_qso_key(&qso_id.to_string());
                 if new_state.is_active() {
-                    self.active_tx_qsos.write().unwrap().insert(key);
+                    self.active_tx_qsos.write().unwrap().insert(key.clone());
+                    // FQ-F3 mirror: keep the offset map in sync alongside
+                    // active_tx_qsos, exactly as coordinator/qso.rs does.
+                    if let Some(freq) = new_state.frequency() {
+                        self.active_tx_offsets.write().unwrap().insert(key, freq);
+                    }
                 } else if matches!(new_state, QsoState::Failed { .. }) {
                     self.active_tx_qsos.write().unwrap().remove(&key);
+                    self.active_tx_offsets.write().unwrap().remove(&key);
                 }
             }
             QsoEvent::QsoCompleted { qso_id, metadata } => {
@@ -472,7 +485,11 @@ impl CoordSim {
                 // The scenario removes it explicitly via `expire_qso` when it
                 // wants to model grace elapsing.
                 let key = active_tx_qso_key(&qso_id.to_string());
-                self.active_tx_qsos.write().unwrap().insert(key);
+                self.active_tx_qsos.write().unwrap().insert(key.clone());
+                self.active_tx_offsets
+                    .write()
+                    .unwrap()
+                    .insert(key, metadata.frequency);
                 // Capture the completed metadata so scenarios can assert on the
                 // stamped RF frequency (dial + audio offset).
                 self.completed.push(metadata);
@@ -480,6 +497,7 @@ impl CoordSim {
             QsoEvent::QsoFailed { qso_id, .. } => {
                 let key = active_tx_qso_key(&qso_id.to_string());
                 self.active_tx_qsos.write().unwrap().remove(&key);
+                self.active_tx_offsets.write().unwrap().remove(&key);
             }
             QsoEvent::MessageToSend {
                 qso_id,
@@ -522,6 +540,7 @@ impl CoordSim {
     pub fn expire_qso(&mut self, qso_id: &str) {
         let key = active_tx_qso_key(qso_id);
         self.active_tx_qsos.write().unwrap().remove(&key);
+        self.active_tx_offsets.write().unwrap().remove(&key);
     }
 
     /// Inject a manual (`qso_id == None`) free-text / tune-like transmit intent
@@ -725,19 +744,31 @@ impl CoordSim {
     }
 
     /// Open an **autonomous** (Auto) QSO exactly as the coordinator's
-    /// `QsoMessage::StartAutonomousQso` handler does for a pounce: a plain
-    /// `respond_to_cq` (= `CallInitiation::Auto`) at the DX's decoded frequency.
-    /// Returns the new QSO id.
+    /// `QsoMessage::StartAutonomousQso` handler does for a pounce (FQ-F4/TX-F6):
+    /// de-conflict the raw Tx=Rx candidate (the DX's own decoded frequency)
+    /// against our other active streams via `compute_manual_tx_offset`, then
+    /// `respond_to_cq_with` (= `CallInitiation::Auto`) at the de-conflicted
+    /// offset, setting `partner_freq` when it diverges from the DX's freq.
+    /// A byte-identical no-op when nothing collides. Returns the new QSO id.
     pub async fn autonomous_pounce(
         &self,
         dx: &str,
         dx_freq_hz: f64,
         dx_parity: Option<SlotParity>,
     ) -> String {
+        let active = self.manager.active_tx_offsets().await;
+        let (tx_off, partner) = compute_manual_tx_offset(dx_freq_hz, false, 0, &active);
         self.manager
-            .respond_to_cq(dx.to_string(), dx_freq_hz, dx_parity)
+            .respond_to_cq_with(
+                dx.to_string(),
+                tx_off,
+                dx_parity,
+                CallInitiation::Auto,
+                partner,
+                false,
+            )
             .await
-            .expect("autonomous respond_to_cq")
+            .expect("autonomous respond_to_cq_with")
             .to_string()
     }
 
@@ -905,6 +936,63 @@ async fn ptt_keys_for_scheduled_qso() {
     // And it keyed at the requested offset.
     sim.timeline
         .assert_keyed_at_offset(&qso_id.to_string(), 1500.0);
+}
+
+/// FQ-F3: `active_tx_offsets` (the own-frequency-registry source map) is
+/// populated at the same point as `active_tx_qsos` — a StateChanged into an
+/// active state — and carries the QSO's real audio-offset frequency, not
+/// just its id. It is then depopulated by the same removal paths
+/// (`expire_qso`, mirroring the coordinator's Failed / completed-grace
+/// purge), keeping the two maps consistent.
+#[tokio::test]
+async fn active_tx_offsets_populated_and_depopulated_with_active_tx_qsos() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    let qso_id = sim
+        .manager
+        .respond_to_cq_with(
+            "W1AW".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+            false,
+        )
+        .await
+        .expect("respond_to_cq_with");
+
+    let pending = sim.pump_qso_events();
+    assert!(!pending.is_empty());
+
+    let key = active_tx_qso_key(&qso_id.to_string());
+
+    // Populated: active_tx_qsos and active_tx_offsets must agree on
+    // membership, and the offset must be the QSO's real frequency.
+    assert!(
+        sim.active_tx_qsos.read().unwrap().contains(&key),
+        "sanity: active_tx_qsos should contain the started QSO"
+    );
+    let offset = *sim
+        .active_tx_offsets
+        .read()
+        .unwrap()
+        .get(&key)
+        .expect("active_tx_offsets should contain the started QSO's offset");
+    assert_eq!(offset, 1500.0, "offset must be the QSO's real frequency");
+
+    // Depopulated: the same removal path (mirroring the coordinator's
+    // Failed / completed-grace purge) must clear BOTH maps together.
+    sim.expire_qso(&qso_id.to_string());
+    assert!(
+        !sim.active_tx_qsos.read().unwrap().contains(&key),
+        "active_tx_qsos must be empty after expiry"
+    );
+    assert!(
+        !sim.active_tx_offsets.read().unwrap().contains_key(&key),
+        "active_tx_offsets must be empty after expiry — a leaked entry here \
+         would permanently penalize a real future candidate at 1500 Hz"
+    );
+
+    sim.drive_slot(pending).await;
 }
 
 /// Stale-TX drop: a superseded / cancelled / completed-past-grace QSO's queued
@@ -1343,6 +1431,74 @@ async fn autonomous_pounce_opening_keys_exactly_once() {
         sim.timeline
     );
     assert_eq!(keyed_this_slot[0].qso_id.as_deref(), Some(qso_id.as_str()));
+}
+
+/// FQ-F4/TX-F6: the autonomous pounce path must de-conflict its raw Tx=Rx
+/// candidate (the DX's own decoded frequency) against an already-active
+/// stream, exactly like the manual-call path already does. With a first QSO
+/// active at 1500 Hz, pouncing on a second DX decoded at 1520 Hz (within
+/// MIN_TX_SEPARATION_HZ=75) must NOT key at 1520 Hz — it must land at least
+/// 75 Hz away from 1500, and `partner_freq` must route the DX's replies
+/// (which still arrive at their own 1520 Hz) to the right QSO.
+#[tokio::test]
+async fn autonomous_pounce_deconflicts_against_active_stream() {
+    let mut sim = CoordSim::new("K5ARH").await;
+
+    // First QSO already active at 1500 Hz.
+    let first = sim
+        .manager
+        .respond_to_cq_with(
+            "VK3ABC".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+            false,
+        )
+        .await
+        .expect("first qso");
+    // Ensure the manager's internal active-QSO view sees it before pouncing
+    // (mirrors production: the QSO exists in the manager before the second
+    // pounce is evaluated).
+    let active_before = sim.manager.active_tx_offsets().await;
+    assert_eq!(active_before, vec![1500.0]);
+
+    // Pounce on a second DX decoded only 20 Hz away — a raw Tx=Rx collision.
+    // Same dx_parity as the first QSO (Even) so our own TX parity for both
+    // streams is the SAME opposite parity — the invariant required for two
+    // truly concurrent QSOs (never TX in sequential windows).
+    let second = sim
+        .autonomous_pounce("VB7F", 1520.0, Some(SlotParity::Even))
+        .await;
+
+    let pending = sim.pump_qso_events();
+    let slot = sim.drive_slot(pending).await;
+
+    sim.timeline.assert_keyed_for_qso(&first.to_string());
+    sim.timeline.assert_keyed_for_qso(&second);
+    sim.timeline
+        .assert_keyed_at_offset(&first.to_string(), 1500.0);
+
+    let second_keyed = sim
+        .timeline
+        .keyed
+        .iter()
+        .find(|k| k.slot == slot && k.qso_id.as_deref() == Some(second.as_str()))
+        .expect("second QSO should have keyed");
+    assert!(
+        (second_keyed.freq_hz - 1520.0).abs() > 1.0,
+        "second QSO must NOT key at the raw colliding 1520 Hz, got {}",
+        second_keyed.freq_hz
+    );
+    assert!(
+        (second_keyed.freq_hz - 1500.0).abs() >= 75.0,
+        "second QSO's de-conflicted offset ({}) must be >= 75 Hz from the \
+         first QSO's 1500 Hz",
+        second_keyed.freq_hz
+    );
+
+    sim.timeline.assert_distinct_offsets_in_slot(slot, 2);
+    sim.timeline.assert_all_released();
 }
 
 /// Under TX policy Disabled, an autonomous QSO's transmit is hard-muted at the
@@ -2438,4 +2594,85 @@ async fn mode_switch_never_requested_is_byte_identical_to_today() {
     sim.timeline.assert_all_released();
     sim.timeline
         .assert_keyed_at_offset(&qso_id.to_string(), 1500.0);
+}
+
+/// SM-F5 (Batch 4): `cancel_qso` / `check_timeouts_at` / `supersede_active_qsos_for`
+/// now emit `QsoEvent::QsoFailed` ALONGSIDE the pre-existing `StateChanged ->
+/// Failed` for the same failure, reviving the priority-scoring failure-backoff
+/// consumer (`coordinator/qso.rs`'s `record_failure`) that subscribes to
+/// `QsoFailed` specifically. `pump_qso_events`'s populater (mirroring the real
+/// coordinator) removes from `active_tx_qsos` on BOTH events via
+/// `HashSet::remove`, which is a no-op on an absent key — so emitting both for
+/// one failure must be idempotent: exactly one qso_id, cleanly removed once,
+/// no panic and no double-free. This exercises the TIMEOUT path (the easiest
+/// of the 3 SM-F5 producer sites to drive with an explicit virtual `now`).
+#[tokio::test]
+async fn sm_f5_timeout_retirement_emits_both_events_and_purges_active_tx_qsos_once() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    let qso_id = sim
+        .manager
+        .respond_to_cq_with(
+            "W1AW".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+            false,
+        )
+        .await
+        .expect("respond_to_cq_with");
+    let key = active_tx_qso_key(&qso_id.to_string());
+
+    // Populated by the opening StateChanged.
+    let pending = sim.pump_qso_events();
+    assert!(!pending.is_empty());
+    assert!(
+        sim.active_tx_qsos.read().unwrap().contains(&key),
+        "sanity: active_tx_qsos should contain the started QSO"
+    );
+
+    // Retire it well past the 30s report_timeout (Auto RespondingToCq never
+    // got a DX reply). This now fires BOTH a StateChanged -> Failed and a
+    // QsoFailed for the SAME qso_id.
+    let now = chrono::Utc::now() + chrono::Duration::seconds(45);
+    sim.manager.check_timeouts_at(now).await;
+
+    // Both events must have been emitted (StateChanged->Failed AND QsoFailed)
+    // — `pump_qso_events` applies each event's removal rule in turn.
+    let mut saw_state_changed_failed = false;
+    let mut saw_qso_failed = false;
+    while let Ok(ev) = sim.qso_rx.try_recv() {
+        match &ev {
+            QsoEvent::StateChanged { new_state, .. } => {
+                if matches!(new_state, QsoState::Failed { .. }) {
+                    saw_state_changed_failed = true;
+                }
+            }
+            QsoEvent::QsoFailed { qso_id: fid, .. } => {
+                assert_eq!(*fid, qso_id, "QsoFailed must carry the retired QSO's id");
+                saw_qso_failed = true;
+            }
+            _ => {}
+        }
+        sim.apply_event(ev, &mut Vec::new());
+    }
+    assert!(
+        saw_state_changed_failed,
+        "expected a StateChanged -> Failed for the timed-out QSO"
+    );
+    assert!(
+        saw_qso_failed,
+        "expected a QsoFailed for the timed-out QSO (SM-F5 — was previously dead)"
+    );
+
+    // Idempotent, clean removal: exactly one qso_id worth of entry, now gone
+    // from BOTH maps, no panic from the double `HashSet::remove`.
+    assert!(
+        !sim.active_tx_qsos.read().unwrap().contains(&key),
+        "active_tx_qsos must be empty after a timeout retirement that emits both events"
+    );
+    assert!(
+        !sim.active_tx_offsets.read().unwrap().contains_key(&key),
+        "active_tx_offsets must be empty after a timeout retirement that emits both events"
+    );
 }
