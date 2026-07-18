@@ -1739,7 +1739,7 @@ impl super::ApplicationCoordinator {
                                         warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
                                     } else {
                                         info!(
-                                            target: "tx.ptt",
+                                            target: "pancetta::tx.ptt",
                                             "PTT ON (scheduled TX) sent to rig: '{}' @{:.0}Hz qso={}",
                                             message_text,
                                             frequency_offset,
@@ -2561,7 +2561,7 @@ impl super::ApplicationCoordinator {
                                         warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
                                     } else {
                                         info!(
-                                            target: "tx.ptt",
+                                            target: "pancetta::tx.ptt",
                                             "PTT ON (scheduled multi-TX) sent to rig"
                                         );
                                     }

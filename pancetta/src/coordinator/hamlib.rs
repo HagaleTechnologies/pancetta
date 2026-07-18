@@ -703,7 +703,7 @@ impl super::ApplicationCoordinator {
                                             .await
                                         {
                                             Ok(()) => info!(
-                                                target: "tx.ptt",
+                                                target: "pancetta::tx.ptt",
                                                 "rig set_ptt {} OK",
                                                 if *state { "ON" } else { "OFF" }
                                             ),
