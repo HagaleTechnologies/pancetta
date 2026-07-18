@@ -1130,11 +1130,34 @@ impl super::ApplicationCoordinator {
                         let fp_filter_snapshot = fp_filter.read().unwrap().clone();
                         if let Some(ref filter) = fp_filter_snapshot {
                             let pre = decoded_messages.len();
+                            // 2026-07-17 operator finding: capture the raw,
+                            // pre-filter texts before `retain` narrows
+                            // `decoded_messages` down to only the accepted
+                            // subset. `note_window_raw_calls` needs the
+                            // FULL raw set (below) so a genuinely new,
+                            // repeating station that gets rejected THIS
+                            // window can still gain continuity for the
+                            // NEXT one — without it, a solo unpaired novel
+                            // callsign (no static/cqdx/rolling anchor) was
+                            // rejected on every window forever, since
+                            // `accept()` only ever recorded callsigns from
+                            // decodes it had already accepted. See the
+                            // `observed` field doc on `CallsignContinuityFilter`.
+                            let raw_texts: Vec<String> =
+                                decoded_messages.iter().map(|m| m.text.clone()).collect();
                             decoded_messages.retain(|m| filter.accept(&m.text));
                             let dropped = pre - decoded_messages.len();
                             if dropped > 0 {
-                                debug!("FP filter dropped {} of {} decodes", dropped, pre);
+                                // Was debug! (invisible at the default info
+                                // level) — bumped to info! so the operator
+                                // can actually see how much the FP filter
+                                // is suppressing, since this is exactly the
+                                // number that was invisible while diagnosing
+                                // the 2026-07-17 "far fewer decodes than
+                                // expected" report.
+                                info!("FP filter dropped {} of {} decodes", dropped, pre);
                             }
+                            filter.note_window_raw_calls(&raw_texts);
                         }
 
                         // `[decoder].ap_eval_mode`: pull AP-derived decodes
