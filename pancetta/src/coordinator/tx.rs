@@ -433,6 +433,27 @@ fn multi_tx_bundle_still_fully_live(
         .all(|id| tx_qso_is_live(id.as_deref(), active_tx_qsos))
 }
 
+/// Build the TX-strip status items for a multi-TX bundle, tagging every item
+/// with the SAME `deferred` flag — a bundle either defers as a whole or
+/// doesn't (all its items share one parity/slot, per the bundling logic).
+/// Shared by the initial "QUEUED" status (`deferred: false`) and the
+/// Step-2b defer-time status refresh (`deferred: true`, TX-F8) so the two
+/// call sites can't drift out of sync.
+fn multi_tx_status_items(
+    items: &[crate::message_bus::TransmitRequestItem],
+    deferred: bool,
+) -> Vec<crate::message_bus::TxItem> {
+    items
+        .iter()
+        .map(|it| crate::message_bus::TxItem {
+            text: it.message_text.clone(),
+            freq_hz: it.frequency_offset,
+            qso_id: it.qso_id.clone(),
+            deferred,
+        })
+        .collect()
+}
+
 /// Result of [`encode_and_modulate_multi_tx`].
 struct MultiTxEncodeOutcome {
     /// `Ok(samples)` — the summed waveform — when at least one item
@@ -1924,11 +1945,32 @@ impl super::ApplicationCoordinator {
                                     {
                                         let new_text = intent.message_text;
                                         let new_freq = intent.frequency_offset;
+                                        // TX-F4: protocol-aware re-encode/re-modulate
+                                        // (mirrors Step 1's `encode_for_protocol` /
+                                        // `modulate_for_protocol` call above) — the
+                                        // legacy FT8-only `encode_message` /
+                                        // `modulate_symbols` pair used here previously
+                                        // would emit an FT8-shaped (151,680-sample)
+                                        // waveform onto the FT4/FT2 grid on a pivot in
+                                        // those modes (wrong length, wrong symbol
+                                        // timing). FT8 is unaffected: `encode_for_protocol`
+                                        // /`modulate_for_protocol` dispatch to the exact
+                                        // legacy calls for `Protocol::Ft8`.
                                         let remod = match modulator.set_base_frequency(new_freq) {
-                                            Ok(()) => encoder
-                                                .encode_message(&new_text, None)
-                                                .and_then(|s| modulator.modulate_symbols(&s, 0.0))
-                                                .ok(),
+                                            Ok(()) => encode_for_protocol(
+                                                &mut encoder,
+                                                active_protocol,
+                                                &new_text,
+                                            )
+                                            .and_then(|s| {
+                                                modulate_for_protocol(
+                                                    &mut modulator,
+                                                    active_protocol,
+                                                    &s,
+                                                    0.0,
+                                                )
+                                            })
+                                            .ok(),
                                             Err(_) => None,
                                         };
                                         match remod {
@@ -2280,15 +2322,7 @@ impl super::ApplicationCoordinator {
                                     send_tx_queue_status(
                                         &message_bus,
                                         None,
-                                        items
-                                            .iter()
-                                            .map(|it| crate::message_bus::TxItem {
-                                                text: it.message_text.clone(),
-                                                freq_hz: it.frequency_offset,
-                                                qso_id: it.qso_id.clone(),
-                                                deferred: false,
-                                            })
-                                            .collect(),
+                                        multi_tx_status_items(&items, false),
                                     )
                                     .await;
 
@@ -2434,6 +2468,228 @@ impl super::ApplicationCoordinator {
                                         schedule.cursor_offset_samples,
                                         item_texts.len(),
                                     );
+
+                                    // --- Step 2b: defer-time liveness recheck (TX-F8) ---
+                                    // Mirrors the single-TX arm's defer-time recheck (the
+                                    // `if schedule.deferred` block right after its own
+                                    // Step 2, before building audio): a bundle either
+                                    // defers as a whole or doesn't (all items share one
+                                    // parity/slot), so if we missed the current slot and
+                                    // deferred to a later one (~30s), we (a) count it in
+                                    // `TX_DEFERS_COUNT` the same way the single-TX arm
+                                    // does, (b) re-check liveness for every item in the
+                                    // bundle NOW — reusing the exact live_mask
+                                    // partial-liveness mechanism Step 4b's key-time gate
+                                    // uses below — instead of silently waiting out the
+                                    // full ~30s defer for a bundle that's already
+                                    // (partially or wholly) dead, and (c) refresh the
+                                    // TUI-visible per-item TX-strip status with
+                                    // `deferred: true` (previously always `false`, so a
+                                    // deferred bundle was indistinguishable from a dead
+                                    // one for up to 30s).
+                                    let (items, samples, item_texts, encoded_qso_ids) = if schedule
+                                        .deferred
+                                    {
+                                        TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
+
+                                        let live_mask: Vec<bool> = encoded_qso_ids
+                                            .iter()
+                                            .map(|id| {
+                                                tx_qso_is_live(id.as_deref(), &active_tx_qsos)
+                                            })
+                                            .collect();
+
+                                        if !live_mask.iter().any(|&live| live) {
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "dropping stale multi-TX bundle at defer time: all {} item(s) already ended",
+                                                items.len()
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                    "dropping stale multi-TX bundle at defer time: all {} item(s) already ended",
+                                                    items.len()
+                                                ),
+                                                None,
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            for item in &items {
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
+                                            }
+                                            continue;
+                                        }
+
+                                        let (items, samples, item_texts, encoded_qso_ids) =
+                                            if live_mask.iter().all(|&live| live) {
+                                                (items, samples, item_texts, encoded_qso_ids)
+                                            } else {
+                                                for (item, &live) in
+                                                    items.iter().zip(live_mask.iter())
+                                                {
+                                                    if !live {
+                                                        info!(
+                                                            target: "pancetta::tx.policy",
+                                                            "dropping stale multi-TX item at defer time for ended QSO {}: '{}'",
+                                                            item.qso_id.as_deref().unwrap_or("?"),
+                                                            item.message_text
+                                                        );
+                                                        emit_diagnostic(
+                                                            &message_bus,
+                                                            "tx.policy",
+                                                            pancetta_core::DiagnosticLevel::Info,
+                                                            format!(
+                                                                "dropping stale multi-TX item at defer time for ended QSO: '{}'",
+                                                                item.message_text
+                                                            ),
+                                                            item.qso_id.as_deref(),
+                                                        )
+                                                        .await;
+                                                        let complete_msg = ComponentMessage::new(
+                                                            ComponentId::Ft8Transmitter,
+                                                            ComponentId::Autonomous,
+                                                            MessageType::TransmitComplete {
+                                                                success: false,
+                                                                message_text: item
+                                                                    .message_text
+                                                                    .clone(),
+                                                                duration_ms: 0,
+                                                            },
+                                                            Instant::now(),
+                                                        );
+                                                        let _ = message_bus
+                                                            .send_message(complete_msg)
+                                                            .await;
+                                                    }
+                                                }
+
+                                                let live_items: Vec<
+                                                    crate::message_bus::TransmitRequestItem,
+                                                > = items
+                                                    .iter()
+                                                    .zip(live_mask.iter())
+                                                    .filter(|(_, &live)| live)
+                                                    .map(|(item, _)| item.clone())
+                                                    .collect();
+
+                                                let rebuild = encode_and_modulate_multi_tx(
+                                                    &mut encoder,
+                                                    active_protocol,
+                                                    &tx_params,
+                                                    &live_items,
+                                                );
+
+                                                for item in &rebuild.encode_failed {
+                                                    emit_tx_failure_diagnostic(
+                                                        &message_bus,
+                                                        item.qso_id.as_deref(),
+                                                        &item.message_text,
+                                                        "defer-time re-encode error",
+                                                    )
+                                                    .await;
+                                                    let complete_msg = ComponentMessage::new(
+                                                        ComponentId::Ft8Transmitter,
+                                                        ComponentId::Autonomous,
+                                                        MessageType::TransmitComplete {
+                                                            success: false,
+                                                            message_text: item.message_text.clone(),
+                                                            duration_ms: 0,
+                                                        },
+                                                        Instant::now(),
+                                                    );
+                                                    let _ = message_bus
+                                                        .send_message(complete_msg)
+                                                        .await;
+                                                }
+
+                                                let rebuilt_texts = rebuild.item_texts;
+                                                let rebuilt_qso_ids = rebuild.encoded_qso_ids;
+
+                                                let new_samples = match rebuild.samples {
+                                                    Ok(s) => s,
+                                                    Err(reason) => {
+                                                        if !rebuilt_texts.is_empty() {
+                                                            warn!(
+                                                                "Defer-time re-modulation failed: {}",
+                                                                reason
+                                                            );
+                                                            for (text, qso_id) in rebuilt_texts
+                                                                .iter()
+                                                                .zip(rebuilt_qso_ids.iter())
+                                                            {
+                                                                emit_tx_failure_diagnostic(
+                                                                    &message_bus,
+                                                                    qso_id.as_deref(),
+                                                                    text,
+                                                                    &format!(
+                                                                        "defer-time re-modulation error ({reason})"
+                                                                    ),
+                                                                )
+                                                                .await;
+                                                            }
+                                                        }
+                                                        send_tx_queue_status(
+                                                            &message_bus,
+                                                            None,
+                                                            Vec::new(),
+                                                        )
+                                                        .await;
+                                                        for text in rebuilt_texts {
+                                                            let complete_msg =
+                                                                ComponentMessage::new(
+                                                                    ComponentId::Ft8Transmitter,
+                                                                    ComponentId::Autonomous,
+                                                                    MessageType::TransmitComplete {
+                                                                        success: false,
+                                                                        message_text: text,
+                                                                        duration_ms: 0,
+                                                                    },
+                                                                    Instant::now(),
+                                                                );
+                                                            let _ = message_bus
+                                                                .send_message(complete_msg)
+                                                                .await;
+                                                        }
+                                                        continue;
+                                                    }
+                                                };
+
+                                                (
+                                                    live_items,
+                                                    new_samples,
+                                                    rebuilt_texts,
+                                                    rebuilt_qso_ids,
+                                                )
+                                            };
+
+                                        // Refresh the TUI TX strip: this bundle is
+                                        // deferred (waiting for its slot), not dead.
+                                        send_tx_queue_status(
+                                            &message_bus,
+                                            None,
+                                            multi_tx_status_items(&items, true),
+                                        )
+                                        .await;
+
+                                        (items, samples, item_texts, encoded_qso_ids)
+                                    } else {
+                                        (items, samples, item_texts, encoded_qso_ids)
+                                    };
 
                                     // --- Step 3: Build the audio buffer ---
                                     let mut audio_out: Vec<f32> = Vec::with_capacity(
@@ -4006,6 +4262,39 @@ mod protocol_tx_tests {
         );
     }
 
+    /// TX-F4: the Step-4c late-pivot re-encode (`coordinator/tx.rs`, "Step 4c:
+    /// late pivot to the freshest message") must use the SAME protocol-aware
+    /// `encode_for_protocol` + `modulate_for_protocol` pair Step 1's initial
+    /// encode uses, not the legacy FT8-only `encode_message`/`modulate_symbols`
+    /// pair. Before this fix, a pivot in FT4/FT2 mode would emit an FT8-shaped
+    /// (151_680-sample) waveform onto the FT4/FT2 grid — wrong length, wrong
+    /// symbol timing. This test exercises the exact call shape the pivot now
+    /// uses and proves it yields the FT4-length waveform (60_480 samples).
+    #[test]
+    fn ft4_pivot_reencode_produces_ft4_shaped_waveform_not_ft8() {
+        let mut enc = Ft8Encoder::with_protocol(ProtocolParams::ft4());
+        let mut modu = Ft8Modulator::new_default().unwrap();
+        // Mirrors the pivot's `modulator.set_base_frequency(new_freq)` call.
+        modu.set_base_frequency(1500.0).unwrap();
+
+        let samples = encode_for_protocol(&mut enc, Protocol::Ft4, MSG)
+            .and_then(|s| modulate_for_protocol(&mut modu, Protocol::Ft4, &s, 0.0))
+            .expect("FT4 pivot re-encode should succeed");
+
+        assert_eq!(
+            samples.len(),
+            60_480,
+            "a Step-4c pivot re-encode in FT4 mode must produce the FT4-shaped \
+             waveform (60_480 samples @ 12 kHz)"
+        );
+        assert_ne!(
+            samples.len(),
+            151_680,
+            "a Step-4c pivot re-encode in FT4 mode must NOT fall back to the \
+             FT8-shaped (151_680-sample) waveform"
+        );
+    }
+
     #[test]
     fn ft8_waveform_is_ft8_length() {
         let samples = encode_and_modulate(Protocol::Ft8, MSG, 0.0)
@@ -4077,6 +4366,39 @@ mod protocol_tx_tests {
             frequency_offset: freq,
             qso_id: qso_id.map(|s| s.to_string()),
         }
+    }
+
+    /// TX-F8: `multi_tx_status_items` is the single source both the initial
+    /// "QUEUED" status and the Step-2b defer-time refresh use to build the
+    /// TUI-visible TX-strip items — prove it tags every item with the
+    /// requested `deferred` flag (not the previously-unconditional `false`).
+    #[test]
+    fn multi_tx_status_items_tags_deferred_flag() {
+        let items = vec![
+            tx_item("CQ K5ARH EM12", 800.0, None),
+            tx_item("W1AW K5ARH EM12", 1200.0, Some("qso-1")),
+        ];
+
+        let queued = multi_tx_status_items(&items, false);
+        assert_eq!(queued.len(), 2);
+        assert!(
+            queued.iter().all(|it| !it.deferred),
+            "the initial QUEUED status must show deferred: false"
+        );
+
+        let deferred = multi_tx_status_items(&items, true);
+        assert_eq!(deferred.len(), 2);
+        assert!(
+            deferred.iter().all(|it| it.deferred),
+            "the Step-2b defer-time refresh must show deferred: true on every \
+             item in the bundle (a bundle defers as a whole)"
+        );
+        // Content is otherwise preserved (text/freq/qso_id) regardless of
+        // the deferred flag.
+        assert_eq!(deferred[0].text, "CQ K5ARH EM12");
+        assert_eq!(deferred[0].freq_hz, 800.0);
+        assert_eq!(deferred[0].qso_id, None);
+        assert_eq!(deferred[1].qso_id, Some("qso-1".to_string()));
     }
 
     #[test]
@@ -4386,6 +4708,17 @@ mod tx_counter_tests {
 
     #[test]
     fn tx_defers_count_increments() {
+        let before = tx_defers_count();
+        TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(tx_defers_count(), before + 1);
+    }
+
+    /// TX-F8: the multi-TX arm's defer-time recheck must bump the SAME
+    /// process-global counter the single-TX arm's defer-time recheck does
+    /// (mirrors `tx_defers_count_increments` above — see `coordinator/tx.rs`'s
+    /// Step-2b block in the `MultiTransmitRequest` worker arm).
+    #[test]
+    fn tx_defers_count_increments_for_multi_tx() {
         let before = tx_defers_count();
         TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
         assert_eq!(tx_defers_count(), before + 1);

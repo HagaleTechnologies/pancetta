@@ -303,9 +303,16 @@ pub enum TuiCommand {
     /// (turn off repeating CQ). Drops PTT within ~150ms via the same
     /// PttGuard mechanism the shutdown path uses.
     StopTx,
-    /// Operator pressed `T` — find a clear TX audio offset and jump the
-    /// cursor there. TUI-local: the handler calls `App::find_clear_offset`
-    /// and updates `tx_frequency_offset` directly. No bus message needed.
+    /// Operator pressed `t` — find and hold the clearest TX audio offset.
+    /// TUI-local trigger: the handler prefers
+    /// `App::find_clear_offset_preferring_placement` (the authoritative
+    /// TX-placement snapshot, parity-aware) and falls back to
+    /// `App::find_clear_offset` (local heuristic) when no snapshot has
+    /// arrived yet. The pick is committed via the existing `SetTxOffset`
+    /// command — the same path the `o` modal and TxPlacement-panel Enter
+    /// use — rather than only moving the local cursor with no lasting
+    /// effect (FQ-F8: this variant itself is never constructed/sent; it
+    /// documents the trigger the local handler realizes).
     #[allow(dead_code)]
     // Part of the TuiCommand API for future remote-control or scripting use
     FindClearOffset,
@@ -1506,17 +1513,39 @@ impl TuiRunner {
                 }
             }
             KeyCode::Char('t') => {
-                // Lowercase t: jump the cursor to the best TX offset. Always
-                // picks something (least-congested if nothing is truly clear).
-                match app.find_clear_offset() {
-                    Some((hz, true)) => {
+                // Lowercase t: find and HOLD the best TX offset. Always
+                // picks something (least-congested if nothing is truly
+                // clear). FQ-F8: prefers the authoritative TX-placement
+                // snapshot (same single-scorer ranking the TxPlacement
+                // panel and the autonomous operator use, and parity-aware
+                // — see `find_clear_offset_preferring_placement`) and
+                // falls back to the local waterfall/decode-history
+                // heuristic when no snapshot has arrived yet. Commits via
+                // the existing `SetTxOffset` command (the same path the
+                // `o` modal and TxPlacement-panel Enter use) so this is a
+                // real, lasting pin of the operator's held TX offset —
+                // not just a cursor preview with no bus effect.
+                let picked = app
+                    .find_clear_offset_preferring_placement()
+                    .or_else(|| app.find_clear_offset());
+                match picked {
+                    Some((hz, is_clear)) => {
+                        let hz_u64 = hz.round() as u64;
                         app.tx_frequency_offset = hz;
-                        app.status_message = format!("TX cursor → {:.0} Hz (clear)", hz);
-                    }
-                    Some((hz, false)) => {
-                        app.tx_frequency_offset = hz;
-                        app.status_message =
-                            format!("TX cursor → {:.0} Hz (best available — band is busy)", hz);
+                        app.tx_offset_hold_hz = Some(hz_u64);
+                        app.tx_freq_mode = pancetta_core::TxFreqMode::Hold;
+                        app.parked_since = Some(chrono::Utc::now());
+                        app.status_message = if is_clear {
+                            format!("TX cursor → {:.0} Hz (clear, held)", hz)
+                        } else {
+                            format!(
+                                "TX cursor → {:.0} Hz (best available — band is busy, held)",
+                                hz
+                            )
+                        };
+                        self.message_tx.send(TuiCommand::SetTxOffset {
+                            offset_hz: Some(hz_u64),
+                        })?;
                     }
                     None => {
                         app.status_message = "No TX offset available".to_string();
@@ -2346,10 +2375,40 @@ mod key_tests {
 
     #[tokio::test]
     async fn key_lowercase_t_does_not_emit_toggle_tune() {
-        // Lowercase t is FindClearOffset (handled locally; no command sent).
+        // Lowercase t is FindClearOffset, distinct from Shift+T (ToggleTune):
+        // it must never fire a tone-tune transmission.
         let (mut r, cmd_rx, _app) = make_runner().await;
         r.handle_key_event(key('t')).await.unwrap();
-        assert!(cmd_rx.try_recv().is_err());
+        assert!(!matches!(cmd_rx.try_recv(), Ok(TuiCommand::ToggleTune)));
+    }
+
+    /// FQ-F8: lowercase `t` (FindClearOffset) must not be a no-op — it
+    /// commits the picked offset via the existing `SetTxOffset` command
+    /// (the same path the `o` modal and TxPlacement-panel Enter use), not
+    /// just move a local-only cursor with no bus effect. With no placement
+    /// snapshot and an empty band (the `make_runner()` default fixture),
+    /// the local heuristic fallback picks the center of the range.
+    #[tokio::test]
+    async fn key_lowercase_t_commits_a_real_offset_via_set_tx_offset() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        r.handle_key_event(key('t')).await.unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::SetTxOffset {
+                offset_hz: Some(hz),
+            }) => {
+                assert!(
+                    (200..=2800).contains(&hz),
+                    "expected a real in-range offset, got {hz}"
+                );
+            }
+            other => panic!("expected SetTxOffset(Some(_)), got {other:?}"),
+        }
+        let a = app.read().await;
+        assert!(
+            a.tx_offset_hold_hz.is_some(),
+            "FindClearOffset must set the operator's held TX offset"
+        );
+        assert_eq!(a.tx_freq_mode, pancetta_core::TxFreqMode::Hold);
     }
 
     #[tokio::test]

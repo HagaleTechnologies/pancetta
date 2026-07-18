@@ -3423,6 +3423,51 @@ impl App {
         best.map(|(hz, _, is_clear)| (hz, is_clear))
     }
 
+    /// Find the best TX offset from the authoritative TX-placement
+    /// snapshot (`self.placement`), when one has arrived, rather than
+    /// [`Self::find_clear_offset`]'s locally re-derived heuristic (FQ-F8).
+    ///
+    /// `self.placement`'s slices come from
+    /// `AutonomousOperator::placement_snapshot`, the SAME `SmartFrequencyAllocator`
+    /// ranking the autonomous operator uses for real TX-frequency decisions
+    /// (the single-scorer invariant) — so a pick made here can never
+    /// disagree with what the TxPlacement panel is showing or what the
+    /// autonomous engine would actually choose, unlike a separately-computed
+    /// local score.
+    ///
+    /// When our own TX parity is resolvable ([`Self::resolve_tx_parity`]),
+    /// prefers the highest-scored slice that is clear in THAT specific slot
+    /// (`clear_first` for Even, `clear_second` for Odd) — a decode in the
+    /// opposite/DX slot cannot collide with our own transmission, so it's
+    /// irrelevant to this pick. Falls back to the single best-scored slice
+    /// overall (regardless of parity) when parity is unknown, or when no
+    /// slice is clear in our own parity.
+    ///
+    /// Returns `None` if no placement snapshot has arrived yet or it has no
+    /// slices — callers should fall back to
+    /// [`Self::find_clear_offset`] in that case.
+    pub fn find_clear_offset_preferring_placement(&self) -> Option<(f64, bool)> {
+        use pancetta_core::slot::SlotParity;
+
+        let placement = self.placement.as_ref()?;
+        let top = placement.slices.first()?;
+
+        if let Some(parity) = self.resolve_tx_parity() {
+            let clear_in_our_slot = |s: &&PlacementSlice| match parity {
+                SlotParity::Even => s.clear_first,
+                SlotParity::Odd => s.clear_second,
+            };
+            if let Some(best) = placement.slices.iter().find(clear_in_our_slot) {
+                return Some((best.offset_hz, true));
+            }
+        }
+
+        // Parity unknown, or nothing is clear in our own slot: best
+        // available regardless of parity — the top-ranked slice overall
+        // (slices are sorted score-descending by the allocator).
+        Some((top.offset_hz, top.clear_first && top.clear_second))
+    }
+
     /// The parity our station will TX in. Active QSO wins; otherwise fall
     /// back to config (Even/Odd) or None for Auto.
     pub fn resolve_tx_parity(&self) -> Option<pancetta_core::slot::SlotParity> {
@@ -4431,6 +4476,101 @@ mod tests {
             .expect("must still return a best-effort offset on a busy band");
         assert!(!is_clear, "saturated band cannot yield a truly clear slot");
         assert!((200.0..=2800.0).contains(&pick));
+    }
+
+    /// FQ-F8: with a placement snapshot present, `find_clear_offset_preferring_placement`
+    /// must prefer a lower-scored slice that's clear in OUR OWN TX parity
+    /// over a higher-scored slice that's busy in our parity but clear in
+    /// the opposite/DX slot — a decode in the opposite slot cannot collide
+    /// with our own transmission, so it's irrelevant to this pick.
+    #[tokio::test]
+    async fn find_clear_offset_preferring_placement_favors_own_parity_over_higher_score() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.config.station.tx_self_parity = pancetta_config::station::TxSelfParity::Even;
+
+        app.apply_placement(PlacementView {
+            slices: vec![
+                // Highest score, but busy in OUR slot (First/Even) — a real
+                // collision risk for us, regardless of Second being clear.
+                PlacementSlice {
+                    offset_hz: 1500.0,
+                    score: 90.0,
+                    clear_first: false,
+                    clear_second: true,
+                },
+                // Lower score, but clear in OUR slot (First/Even) — no
+                // collision risk to us.
+                PlacementSlice {
+                    offset_hz: 900.0,
+                    score: 60.0,
+                    clear_first: true,
+                    clear_second: false,
+                },
+            ],
+            openness: vec![3; 96],
+            bin_hz: 25.0,
+            range: (200.0, 2600.0),
+            received_at: Utc::now(),
+        });
+
+        let (pick, is_clear) = app
+            .find_clear_offset_preferring_placement()
+            .expect("placement snapshot present, should yield a pick");
+        assert_eq!(
+            pick, 900.0,
+            "expected the lower-scored-but-parity-clear slice to win, got {pick}"
+        );
+        assert!(is_clear);
+    }
+
+    /// FQ-F8: when our own TX parity is unknown (Auto, no active QSO), the
+    /// placement-preferring picker degrades gracefully to the single
+    /// best-scored slice overall — it must not guess or reject a top-ranked
+    /// slice just because we don't know which slot we'd transmit in.
+    #[tokio::test]
+    async fn find_clear_offset_preferring_placement_falls_back_to_top_score_when_parity_unknown() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        // Default tx_self_parity is Auto and no active QSO -> resolve_tx_parity() == None.
+        assert_eq!(app.resolve_tx_parity(), None);
+
+        app.apply_placement(PlacementView {
+            slices: vec![
+                PlacementSlice {
+                    offset_hz: 1500.0,
+                    score: 90.0,
+                    clear_first: false,
+                    clear_second: true,
+                },
+                PlacementSlice {
+                    offset_hz: 900.0,
+                    score: 60.0,
+                    clear_first: true,
+                    clear_second: false,
+                },
+            ],
+            openness: vec![3; 96],
+            bin_hz: 25.0,
+            range: (200.0, 2600.0),
+            received_at: Utc::now(),
+        });
+
+        let (pick, is_clear) = app
+            .find_clear_offset_preferring_placement()
+            .expect("placement snapshot present, should yield a pick");
+        assert_eq!(pick, 1500.0, "expected the top-scored slice to win");
+        assert!(
+            !is_clear,
+            "top slice is only clear_second, not clear in both -> not fully clear"
+        );
+    }
+
+    /// FQ-F8: with no placement snapshot at all, the placement-preferring
+    /// picker must return `None` so callers fall back to
+    /// `find_clear_offset`'s local heuristic.
+    #[tokio::test]
+    async fn find_clear_offset_preferring_placement_returns_none_without_a_snapshot() {
+        let app = App::new(Config::default(), None).await.unwrap();
+        assert!(app.find_clear_offset_preferring_placement().is_none());
     }
 
     #[tokio::test]

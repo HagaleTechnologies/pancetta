@@ -33,7 +33,9 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType}
 ///   - at most [`AUTO_73_MAX_RESENDS`] extra 73s per completed QSO,
 ///   - at most once per ~15 s FT8 slot (so two decodes of the same RR73 in
 ///     one slot fire only once),
-///   - never when a live QSO with that station is already active.
+///   - never when a live QSO with that station is already active,
+///   - the FIRST auto-resend never fires before [`AUTO_73_FIRST_RESEND_MIN_DELAY`]
+///     has elapsed since completion (SM-F3/TX-F10 — see that constant's doc).
 const AUTO_73_WINDOW: chrono::Duration = chrono::Duration::minutes(3);
 /// Maximum number of auto re-sends of our 73 per completed manual QSO.
 const AUTO_73_MAX_RESENDS: u8 = 3;
@@ -41,6 +43,23 @@ const AUTO_73_MAX_RESENDS: u8 = 3;
 /// slightly-under-slot guard so we fire at most once per slot even if the
 /// DX's RR73 is decoded a hair early/late).
 const AUTO_73_MIN_SPACING: chrono::Duration = chrono::Duration::seconds(14);
+/// SM-F3/TX-F10: minimum time that must elapse since `completed_at` before
+/// the FIRST auto-resend (`resends` 0 → 1) is allowed to fire.
+///
+/// Guards against a real race two independent review tracks flagged: FT8
+/// decoders routinely emit 2-4 copies of one frame, and `maybe_auto_resend_73`
+/// runs per decode copy, *before* `process_message` gets to it. The QSO's own
+/// closing `MessageToSend(73)` — emitted by the very same `QsoCompleted` that
+/// stashes this entry — can still be waiting out the TX scheduler's defer
+/// logic (`schedule_tx`: late-in-slot pushes to the next slot of the required
+/// parity, up to ~30s away) when a duplicate decode of the DX's RR73 arrives.
+/// Without this guard, that duplicate decode reads `resends == 0` and fires a
+/// SECOND 73 for a QSO whose FIRST 73 hasn't even keyed yet — a double-PTT
+/// bug in the making. 30s (one worst-case defer window) plus a small margin
+/// comfortably covers it while staying tiny next to [`AUTO_73_WINDOW`] (3
+/// min), so a truly later, genuine repeat of RR73 (the DX really didn't copy
+/// our first 73) is unaffected.
+const AUTO_73_FIRST_RESEND_MIN_DELAY: chrono::Duration = chrono::Duration::seconds(32);
 
 /// One recently-completed **manual** QSO, tracked so we can auto-re-send our
 /// 73 if the DX keeps sending RR73/RRR. Keyed (in the map) by uppercased
@@ -653,6 +672,20 @@ async fn maybe_auto_resend_73(
         if entry.resends >= AUTO_73_MAX_RESENDS {
             // Cap reached — stop and drop the entry so we never reconsider it.
             map.remove(&key);
+            return;
+        }
+        // SM-F3/TX-F10: don't let a duplicate/near-immediate decode of the
+        // closing RR73 fire our FIRST auto-resend before the original 73
+        // (emitted by the same QsoCompleted that stashed this entry) has had
+        // time to clear the TX scheduler's defer window. Only gates the
+        // 0 -> 1 transition — once a genuine first resend has gone out, later
+        // resends are governed by AUTO_73_MIN_SPACING as before. We do NOT
+        // consume the budget here: this is a no-op skip, not a burned
+        // attempt, so a genuine later RR73 (past this guard) still gets its
+        // full allotment.
+        if entry.resends == 0
+            && now.signed_duration_since(entry.completed_at) < AUTO_73_FIRST_RESEND_MIN_DELAY
+        {
             return;
         }
         if let Some(last) = entry.last_resend_at {
@@ -4247,8 +4280,8 @@ mod snapshot_tests {
 #[cfg(test)]
 mod auto_73_tests {
     use super::{
-        maybe_auto_resend_73, RecentManualCompletion, RecentManualCompletions, AUTO_73_MAX_RESENDS,
-        AUTO_73_WINDOW,
+        maybe_auto_resend_73, RecentManualCompletion, RecentManualCompletions,
+        AUTO_73_FIRST_RESEND_MIN_DELAY, AUTO_73_MAX_RESENDS, AUTO_73_WINDOW,
     };
     use crate::message_bus::MessageBus;
     use pancetta_core::slot::SlotParity;
@@ -4277,13 +4310,18 @@ mod auto_73_tests {
         MessageBus::new(1000).expect("bus")
     }
 
-    /// A completions map containing a single fresh manual completion for `DX`.
+    /// A completions map containing a single manual completion for `DX`,
+    /// completed far enough in the past to clear the SM-F3/TX-F10
+    /// first-resend guard (`AUTO_73_FIRST_RESEND_MIN_DELAY`) but still well
+    /// within `AUTO_73_WINDOW` — i.e. a stashed completion whose original 73
+    /// has certainly gone out by now, matching how these tests were written
+    /// before that guard existed.
     fn map_with_dx() -> RecentManualCompletions {
         let mut map = HashMap::new();
         map.insert(
             DX.to_string(),
             RecentManualCompletion {
-                completed_at: chrono::Utc::now(),
+                completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
                 frequency_hz: 1500.0,
                 dx_parity: Some(SlotParity::Even),
                 resends: 0,
@@ -4588,6 +4626,111 @@ mod auto_73_tests {
         .await;
 
         assert_eq!(drain_sends(&mut rx), 0);
+    }
+
+    /// SM-F3/TX-F10: two decodes of the SAME closing RR73, arriving
+    /// back-to-back immediately after `QsoCompleted` (i.e. within the
+    /// original 73's TX-scheduler defer window), must NOT fire a second 73 —
+    /// the first one may not have keyed yet. Neither call may consume the
+    /// resend budget.
+    #[tokio::test]
+    async fn duplicate_decode_within_guard_window_no_resend() {
+        let mgr = manager().await;
+        // Completion JUST happened — the original 73 may still be deferred.
+        let map = {
+            let mut m = HashMap::new();
+            m.insert(
+                DX.to_string(),
+                RecentManualCompletion {
+                    completed_at: chrono::Utc::now(),
+                    frequency_hz: 1500.0,
+                    dx_parity: Some(SlotParity::Even),
+                    resends: 0,
+                    last_resend_at: None,
+                    remote_origin: false,
+                },
+            );
+            Arc::new(Mutex::new(m))
+        };
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        // Two "copies" of the same decode (as FT8 decoders routinely emit),
+        // arriving in immediate succession.
+        for _ in 0..2 {
+            maybe_auto_resend_73(
+                &rr73_to_us(),
+                OUR,
+                1500.0,
+                Some(SlotParity::Even),
+                &mgr,
+                &map,
+                &policy,
+                &bus,
+            )
+            .await;
+        }
+
+        assert_eq!(
+            drain_sends(&mut rx),
+            0,
+            "duplicate decodes within the first-resend guard window must not \
+             fire a 2nd 73 before the 1st one's scheduled defer could complete"
+        );
+        assert_eq!(
+            map.lock().await.get(DX).map(|e| e.resends),
+            Some(0),
+            "guarded attempts must not consume the resend budget"
+        );
+    }
+
+    /// A GENUINE later resend — the DX truly didn't copy our first 73 and
+    /// repeats RR73 well after the first-resend guard window elapses — must
+    /// still fire normally. This is the feature `maybe_auto_resend_73` exists
+    /// for; the SM-F3/TX-F10 guard must not regress it.
+    #[tokio::test]
+    async fn genuine_later_resend_past_guard_window_fires() {
+        let mgr = manager().await;
+        let map = {
+            let mut m = HashMap::new();
+            m.insert(
+                DX.to_string(),
+                RecentManualCompletion {
+                    completed_at: chrono::Utc::now()
+                        - AUTO_73_FIRST_RESEND_MIN_DELAY
+                        - chrono::Duration::seconds(5),
+                    frequency_hz: 1500.0,
+                    dx_parity: Some(SlotParity::Even),
+                    resends: 0,
+                    last_resend_at: None,
+                    remote_origin: false,
+                },
+            );
+            Arc::new(Mutex::new(m))
+        };
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+        )
+        .await;
+
+        assert_eq!(
+            drain_sends(&mut rx),
+            1,
+            "a genuine later resend past the guard window must still fire"
+        );
+        assert_eq!(map.lock().await.get(DX).map(|e| e.resends), Some(1));
     }
 
     /// Guard for the [duplicate_checking] wiring: the pancetta-config defaults

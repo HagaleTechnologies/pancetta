@@ -10,7 +10,7 @@ use anyhow::Result;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
-use tracing::{debug, error, info, span, warn, Level};
+use tracing::{error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 use pancetta_core::slot::SlotParity;
@@ -341,42 +341,25 @@ impl super::ApplicationCoordinator {
         self.autonomous_enabled_runtime
             .store(auto_config_enabled, Ordering::Release);
 
-        if !auto_config_enabled {
-            info!("Autonomous operator disabled in configuration");
-            drop(config);
-            // The decoder fans every decoded message out to Autonomous via the
-            // message bus unconditionally. If we created the channel without a
-            // reader, it would fill within a few cycles and emit a continuous
-            // "Channel full" warning flood (10k+ warnings/session observed in
-            // the 2026-05-30 live capture). Spawn a noop drain task so the
-            // channel stays open but messages are silently discarded.
-            let (_drain_tx, drain_rx) = self
-                .message_bus
-                .create_channel(ComponentId::Autonomous)
-                .await?;
-            let shutdown = self.shutdown_signal.clone();
-            let drain_handle = tokio::spawn(async move {
-                while !shutdown.load(Ordering::Acquire) {
-                    loop {
-                        match drain_rx.try_recv() {
-                            Ok(_) => {}
-                            Err(crossbeam_channel::TryRecvError::Empty) => break,
-                            Err(crossbeam_channel::TryRecvError::Disconnected) => {
-                                debug!("Autonomous drain channel disconnected");
-                                return Ok(());
-                            }
-                        }
-                    }
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Ok(())
-            });
-            self.named_task_handles
-                .push((ComponentId::Autonomous, drain_handle));
-            return Ok(());
+        // FQ-F9: `auto_config_enabled` no longer early-returns into a
+        // no-op drain task. The slot-tick loop below always runs — it
+        // drives the TX-placement instrument (spectral snapshot,
+        // decode-history feed, `TxPlacementUpdate`) for every operator,
+        // manual-only included, since the 2026-07-03 TUI redesign made
+        // that instrument the primary spectrum/openness view for ALL
+        // operators, not just autonomous users. Only the decision-making
+        // (`op.decide()`) and TX/action dispatch downstream of it are
+        // gated on `auto_config_enabled` — see the slot-tick loop body.
+        if auto_config_enabled {
+            info!("Starting autonomous operator component");
+        } else {
+            info!(
+                "Autonomous operator disabled in configuration; TX-placement \
+                 feed (spectral snapshot, decode-history) still runs so the \
+                 TX-placement instrument stays live, but no CQ/pounce/collision \
+                 TX decisions will be made or dispatched"
+            );
         }
-
-        info!("Starting autonomous operator component");
 
         let qso_auto_config = pancetta_qso::AutonomousConfig {
             enabled: config.autonomous.enabled,
@@ -433,7 +416,12 @@ impl super::ApplicationCoordinator {
         };
 
         let dry_run = config.autonomous.dry_run;
-        if dry_run {
+        // FQ-F9: only banner the DRY RUN mode when autonomous is actually
+        // engaged — a manual-only operator (autonomous.enabled = false)
+        // never reaches `op.decide()`/TX dispatch at all, so a dry-run
+        // banner here would misleadingly imply autonomous behavior is
+        // active.
+        if dry_run && auto_config_enabled {
             warn!(
                 target: "autonomous.dry_run",
                 "Autonomous DRY RUN mode ENABLED: TransmitRequest / MultiTransmitRequest \
@@ -494,6 +482,11 @@ impl super::ApplicationCoordinator {
             let op = operator.clone();
             let mut guard = op.lock().await;
             guard.set_tx_freq_mode_source(self.tx_freq_mode.clone());
+            // FQ-F6: also share the live parked-offset atomic so Hold-mode
+            // frequency allocation reflects the operator's actual `o`-modal
+            // parked offset, not just the static config value baked in at
+            // construction.
+            guard.set_tx_offset_hold_source(self.tx_offset_hold_hz());
         }
 
         // Phase-5 hardening #1: install the same callsign-continuity FP
@@ -864,6 +857,26 @@ impl super::ApplicationCoordinator {
 
                             let listen_messages = slot_messages.clone();
                             slot_messages.clear();
+
+                            // FQ-F9: decision-making (`op.decide()`) and
+                            // everything downstream of it (the whole
+                            // OperatorAction/Transmit dispatch block below,
+                            // including single-TX and multi-TX bundling) is
+                            // gated on `auto_config_enabled`. A manual-only
+                            // operator (autonomous.enabled = false) must see
+                            // zero Transmit/OperatorAction/MessageToSend-
+                            // shaped output escape to the message bus — the
+                            // housekeeping above (spectral snapshot,
+                            // feed_decoded_messages, TxPlacementUpdate,
+                            // active-QSO/own-frequency sync, auto-repark)
+                            // already ran unconditionally so the
+                            // TX-placement instrument stays live regardless.
+                            if !auto_config_enabled {
+                                // Nothing further needed from the operator
+                                // lock this tick; drop it promptly rather
+                                // than holding it through `decide()`/dispatch.
+                                drop(op);
+                            } else {
                             let actions = op.decide();
                             drop(op);
 
@@ -1319,6 +1332,7 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
                             }
+                            } // end `if auto_config_enabled` decision/dispatch gate (FQ-F9)
                         }
 
                         _ = async {
@@ -1909,5 +1923,244 @@ mod plan_slot_transmissions_tests {
             plan.policy_dropped, 0,
             "runtime gate already cleared the list"
         );
+    }
+}
+
+/// FQ-F9: `autonomous.enabled = false` must not fully silence the
+/// `start_autonomous_component` slot-tick loop anymore. The spectral/decode
+/// housekeeping (spectral snapshot, `feed_decoded_messages`,
+/// `TxPlacementUpdate`) now runs unconditionally so the TX-placement
+/// instrument stays live for manual-only operators, while `op.decide()` and
+/// everything downstream of it (TX/action dispatch) stays gated on
+/// `auto_config_enabled` — no `Transmit`/`OperatorAction`-shaped output may
+/// ever escape to the message bus when disabled.
+///
+/// These are full coordinator-level integration tests (real
+/// `ApplicationCoordinator`, real `MessageBus`, real spawned slot-tick task)
+/// rather than unit tests of a pure helper, because the invariant under test
+/// — "nothing escapes the message bus" — lives in the wiring of
+/// `start_autonomous_component` itself, not in a function that can be
+/// extracted and called directly. They wait for one real FT8 slot boundary
+/// (bounded by ~15s, the same cadence the production loop aligns to) rather
+/// than paused/mocked tokio time, because the loop busy-polls a
+/// `tokio::select!` arm every scheduler pass (a decode-drain sub-future that
+/// resolves almost immediately whenever the channel is empty) which would
+/// starve `tokio::time::advance()`'s requirement that the runtime go idle
+/// before jumping the clock.
+#[cfg(test)]
+mod fq_f9_placement_feed_when_disabled_tests {
+    use super::super::ApplicationCoordinator;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+    use pancetta_config::Config;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_ft8::{DecodedMessage, Ft8Message};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::{Duration, Instant};
+
+    /// A synthetic decoded CQ — enough to exercise
+    /// `feed_decoded_messages`'s decode-history accumulation. Content is
+    /// irrelevant to both tests below: the disabled test never reaches
+    /// `decide()` regardless of what's fed, and the enabled control test
+    /// asserts on the ALWAYS-appended `StatusUpdate` action, not on any
+    /// CQ-triggered behavior.
+    fn cq_decoded_message() -> DecodedMessage {
+        let mut msg = DecodedMessage::new(
+            Ft8Message {
+                from_callsign: Some("W1AW".to_string()),
+                ..Ft8Message::default()
+            },
+            -10.0,  // snr_db
+            0.9,    // confidence
+            1500.0, // frequency_offset
+            0.05,   // time_offset
+        );
+        msg.text = "CQ W1AW FN31".to_string();
+        msg.slot_parity = Some(SlotParity::Even);
+        msg
+    }
+
+    async fn build_coordinator(autonomous_enabled: bool) -> ApplicationCoordinator {
+        let mut config = Config::default();
+        config.autonomous.enabled = autonomous_enabled;
+        let shutdown = Arc::new(AtomicBool::new(false));
+        ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// Waits until just past the next FT8 slot boundary — the SAME
+    /// `next_slot_start`/`duration_until` computation
+    /// `start_autonomous_component`'s spawned task uses to align its
+    /// `slot_interval`, plus a generous buffer. By the time this returns,
+    /// that task's first `slot_interval.tick()` has fired. Real wall-clock
+    /// (bounded to one FT8 slot, ~15s worst case) — see the module doc
+    /// comment for why paused tokio time isn't used here.
+    async fn wait_for_next_slot_tick() {
+        let now = chrono::Utc::now();
+        let next_slot = pancetta_core::slot::next_slot_start(now, chrono::Duration::zero());
+        let wait =
+            pancetta_core::slot::duration_until(next_slot, now) + Duration::from_millis(2500);
+        tokio::time::sleep(wait).await;
+    }
+
+    fn drain(rx: &crossbeam_channel::Receiver<ComponentMessage>) -> Vec<ComponentMessage> {
+        let mut out = Vec::new();
+        while let Ok(m) = rx.try_recv() {
+            out.push(m);
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn disabled_feed_emits_placement_update_but_never_dispatches() {
+        let mut coordinator = build_coordinator(false).await;
+
+        // Subscribe to every destination the (gated) dispatch block could
+        // possibly write to, PLUS Tui (the housekeeping destination), all
+        // BEFORE starting the component — `create_channel` errors if called
+        // twice for the same `ComponentId`, and `start_autonomous_component`
+        // only ever creates its OWN (`Autonomous`) channel, so this is safe.
+        let (_tui_tx, tui_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .expect("Tui channel should not already exist");
+        let (_ft8_tx, ft8_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .expect("Ft8Transmitter channel should not already exist");
+        let (_qso_tx, qso_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Qso)
+            .await
+            .expect("Qso channel should not already exist");
+
+        coordinator
+            .start_autonomous_component()
+            .await
+            .expect("start_autonomous_component must succeed even when disabled");
+
+        // Feed exactly what the ENABLED path's own housekeeping consumes:
+        // a waterfall row (drives `update_spectral`, required for
+        // `placement_snapshot()` to return `Some`) and a decoded CQ (drives
+        // `feed_decoded_messages`).
+        coordinator
+            .waterfall_to_auto_tx
+            .as_ref()
+            .expect("waterfall sender wired at construction time")
+            .send(vec![vec![0.001f32; 100]])
+            .expect("waterfall channel should accept a row");
+
+        coordinator
+            .message_bus
+            .send_message(ComponentMessage::new(
+                ComponentId::Ft8Decoder,
+                ComponentId::Autonomous,
+                MessageType::DecodedMessage(cq_decoded_message()),
+                Instant::now(),
+            ))
+            .await
+            .expect(
+                "send to Autonomous should succeed — start_autonomous_component \
+                 already created that channel above",
+            );
+
+        wait_for_next_slot_tick().await;
+
+        let tui_messages = drain(&tui_rx);
+        assert!(
+            tui_messages
+                .iter()
+                .any(|m| matches!(m.message_type, MessageType::TxPlacementUpdate { .. })),
+            "the TX-placement feed (spectral snapshot + decode history) must \
+             keep running and emit TxPlacementUpdate even when \
+             autonomous.enabled = false — this is the FQ-F9 fix"
+        );
+        assert!(
+            !tui_messages
+                .iter()
+                .any(|m| matches!(m.message_type, MessageType::AutonomousStatus(_))),
+            "op.decide() must NEVER run when autonomous.enabled = false — an \
+             AutonomousStatus message can only be produced by decide()'s \
+             unconditional status_action() append"
+        );
+        assert!(
+            drain(&ft8_rx).is_empty(),
+            "no TransmitRequest/MultiTransmitRequest may ever escape to \
+             Ft8Transmitter when autonomous.enabled = false"
+        );
+        assert!(
+            drain(&qso_rx).is_empty(),
+            "no StartAutonomousQso may ever escape to Qso when \
+             autonomous.enabled = false"
+        );
+
+        coordinator.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    /// Control test: proves the harness (and the now-shared slot-tick loop)
+    /// DOES surface decision-engine output once the gate is open — i.e. the
+    /// silence asserted above is because the gate actually blocks
+    /// `decide()`, not because the test fixture is inert. `decide_at`
+    /// unconditionally appends a `StatusUpdate` action every cycle
+    /// regardless of what else happens that tick (see
+    /// `pancetta_qso::AutonomousOperator::decide_at`), so its presence is a
+    /// reliable, non-flaky witness that `op.decide()` ran — independent of
+    /// whether any CQ/pounce/collision decision happened to fire.
+    #[tokio::test]
+    async fn enabled_control_dispatches_autonomous_status_every_tick() {
+        let mut coordinator = build_coordinator(true).await;
+
+        let (_tui_tx, tui_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .expect("Tui channel should not already exist");
+
+        coordinator
+            .start_autonomous_component()
+            .await
+            .expect("start_autonomous_component must succeed when enabled");
+
+        coordinator
+            .waterfall_to_auto_tx
+            .as_ref()
+            .expect("waterfall sender wired at construction time")
+            .send(vec![vec![0.001f32; 100]])
+            .expect("waterfall channel should accept a row");
+
+        wait_for_next_slot_tick().await;
+
+        let tui_messages = drain(&tui_rx);
+        assert!(
+            tui_messages
+                .iter()
+                .any(|m| matches!(m.message_type, MessageType::TxPlacementUpdate { .. })),
+            "control: TxPlacementUpdate should still appear when enabled"
+        );
+        assert!(
+            tui_messages
+                .iter()
+                .any(|m| matches!(m.message_type, MessageType::AutonomousStatus(_))),
+            "control failed: with autonomous.enabled = true, decide() should \
+             run every tick and emit AutonomousStatus — if this fails, the \
+             disabled test above proves nothing"
+        );
+
+        coordinator.shutdown_signal.store(true, Ordering::Release);
     }
 }
