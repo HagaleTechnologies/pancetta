@@ -3,14 +3,19 @@
 //! hb-052 production version. The eval-harness MVP
 //! (pancetta-research/src/fp_filter.rs) showed -21.7% novels at -0.02%
 //! recall on hard-200 with a corpus-baseline reference set. Production
-//! deployment uses three combined sources:
+//! deployment uses four combined sources:
 //!
 //! 1. **ADIF log** — operator's logged QSO callsigns (~/.pancetta/qsos.adi)
-//! 2. **Rolling window** — callsigns from recent decodes this session
+//! 2. **Rolling window** — callsigns from decodes ACCEPTED this session
 //! 3. **cqdx.io spots** — live network-wide spotted callsigns
+//! 4. **Observed** (2026-07-17) — callsigns seen in ANY prior window's raw
+//!    decode, accepted or not (see `note_window_raw_calls`). Grants a
+//!    genuinely new, repeating station continuity starting its second
+//!    window instead of being permanently rejected (source 2 alone can
+//!    never grow from a rejected decode, since it only records acceptances).
 //!
 //! The filter accepts a decode if any of its extracted callsigns appear
-//! in the union of those three sources. Decodes with no extractable
+//! in the union of those four sources. Decodes with no extractable
 //! callsigns are rejected.
 //!
 //! **Cold-start handling:** at session start, the rolling window is
@@ -20,8 +25,8 @@
 //! threshold is crossed, the filter activates.
 //!
 //! Threading: `accept` takes `&self` and uses interior mutability for
-//! the rolling window — safe to share across the coordinator's decode
-//! pipeline.
+//! the rolling window and the observed-window set — safe to share across
+//! the coordinator's decode pipeline.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -198,10 +203,13 @@ pub fn parse_adif_calls(text: &str) -> Vec<String> {
 
 /// Production callsign-continuity filter. Reference set built from:
 /// - Static ADIF log (loaded once on construction or via extend_from_adif)
-/// - Rolling window of recent decodes (interior-mutable)
+/// - Rolling window of recent ACCEPTED decodes (interior-mutable)
 /// - cqdx.io spots (refreshed by the caller via update_spotted)
+/// - Observed set of callsigns from ANY prior window's raw decode,
+///   accepted or not (interior-mutable; see `note_window_raw_calls`)
 ///
-/// Thread-safe via RwLock on rolling window + cqdx set.
+/// Thread-safe via RwLock on the rolling window, the observed set, and
+/// the cqdx set.
 pub struct CallsignContinuityFilter {
     /// Static reference: operator's ADIF log (and any explicit additions).
     /// Built up before/during startup; not modified per-decode.
@@ -210,6 +218,22 @@ pub struct CallsignContinuityFilter {
     rolling: RwLock<VecDeque<String>>,
     /// Capacity of the rolling window.
     rolling_cap: usize,
+    /// 2026-07-17 operator finding: callsigns seen in a PRIOR window's raw
+    /// decode set, whether or not that decode was itself accepted. Distinct
+    /// from `rolling` (which only grows on acceptance): without this, a
+    /// genuinely new station — not in static/cqdx, and not paired in the
+    /// same message with an already-trusted call — could never be accepted,
+    /// no matter how many times it repeated the identical CQ, because
+    /// `rolling` never had anywhere to record an unaccepted sighting. Real
+    /// signals repeat their message for many consecutive 15s cycles; OSD/LDPC
+    /// noise artifacts are statistically independent draws per window and
+    /// rarely reproduce the same fabricated callsign twice in a row — so
+    /// requiring a callsign to have appeared in an EARLIER window (via
+    /// `note_window_raw_calls`) before granting it continuity preserves the
+    /// original noise defense while fixing the permanent-lockout bug. Kept
+    /// separate from `rolling` so within-window pairing-based trust (see
+    /// `rolling_window_grows_via_static_match`) is unaffected.
+    observed: RwLock<VecDeque<String>>,
     /// cqdx.io spotted callsigns; refreshed periodically by the bridge.
     cqdx_spotted: RwLock<HashSet<String>>,
     /// When `static_ref + cqdx_spotted` is below this threshold, the
@@ -225,6 +249,7 @@ impl CallsignContinuityFilter {
             static_ref: HashSet::new(),
             rolling: RwLock::new(VecDeque::new()),
             rolling_cap,
+            observed: RwLock::new(VecDeque::new()),
             cqdx_spotted: RwLock::new(HashSet::new()),
             cold_start_threshold: 0,
         }
@@ -238,6 +263,7 @@ impl CallsignContinuityFilter {
             static_ref: HashSet::new(),
             rolling: RwLock::new(VecDeque::new()),
             rolling_cap,
+            observed: RwLock::new(VecDeque::new()),
             cqdx_spotted: RwLock::new(HashSet::new()),
             cold_start_threshold,
         }
@@ -288,9 +314,11 @@ impl CallsignContinuityFilter {
     }
 
     /// True if any of the message's extracted callsigns appear in any
-    /// source. In lenient mode, returns true when the reference set is
-    /// below threshold (passing everything through to populate the
-    /// rolling window).
+    /// source — static (ADIF), cqdx-spotted, rolling (accepted this
+    /// session), or observed (seen in a PRIOR window's raw decode, whether
+    /// or not accepted; see `note_window_raw_calls`). In lenient mode,
+    /// returns true when the reference set is below threshold (passing
+    /// everything through to populate the rolling window).
     ///
     /// Always pushes the decode's callsigns into the rolling window on
     /// acceptance (or in lenient cold-start), so the window keeps growing.
@@ -326,7 +354,12 @@ impl CallsignContinuityFilter {
             .read()
             .map(|g| calls.iter().any(|c| g.iter().any(|q| q == c)))
             .unwrap_or(false);
-        if !(in_static || in_cqdx || in_rolling) {
+        let in_observed = self
+            .observed
+            .read()
+            .map(|g| calls.iter().any(|c| g.iter().any(|q| q == c)))
+            .unwrap_or(false);
+        if !(in_static || in_cqdx || in_rolling || in_observed) {
             return false;
         }
         self.push_rolling(&calls);
@@ -360,7 +393,50 @@ impl CallsignContinuityFilter {
                 return true;
             }
         }
+        if let Ok(g) = self.observed.read() {
+            if g.iter().any(|q| q == &upper) {
+                return true;
+            }
+        }
         false
+    }
+
+    /// 2026-07-17 continuity-bootstrap fix: record the callsigns extracted
+    /// from a WHOLE window's raw decodes (accepted or not) so a genuinely
+    /// new, repeating station can be granted continuity starting the NEXT
+    /// window instead of being rejected forever. Call this ONCE per window,
+    /// AFTER `accept()` has already been run over that window's decodes —
+    /// entries land in `observed`, which `accept()`/`would_accept_callsign`
+    /// consult but which this window's own `accept()` calls never see
+    /// (avoids same-window self-bootstrapping; see the `observed` field
+    /// doc for why that distinction matters).
+    ///
+    /// Skips messages matching `has_high_risk_fp_pattern` (the same
+    /// pre-check `accept()` applies) so a `/R`-suffix or degenerate-grid
+    /// decode can't seed continuity for its own callsigns.
+    pub fn note_window_raw_calls(&self, raw_messages: &[String]) {
+        for message in raw_messages {
+            if has_high_risk_fp_pattern(message) {
+                continue;
+            }
+            let calls = callsigns_in(message);
+            if !calls.is_empty() {
+                self.push_observed(&calls);
+            }
+        }
+    }
+
+    fn push_observed(&self, calls: &[String]) {
+        if let Ok(mut g) = self.observed.write() {
+            for c in calls {
+                if !g.iter().any(|q| q == c) {
+                    g.push_back(c.clone());
+                    while g.len() > self.rolling_cap {
+                        g.pop_front();
+                    }
+                }
+            }
+        }
     }
 
     fn push_rolling(&self, calls: &[String]) {
@@ -578,6 +654,50 @@ mod tests {
         assert!(f.accept("K1ABC W9XYZ EM48"));
         // Real-looking but untrusted → reject (no anchor in static or rolling yet).
         assert!(!f.accept("K7ZZX KC4XYZ EM10"));
+    }
+
+    #[test]
+    fn cross_window_continuity_bootstraps_repeating_novel_station() {
+        // 2026-07-17 fix: a solo, unpaired, genuinely new station (no static/
+        // cqdx/rolling anchor) is rejected the first time it's seen...
+        let f = CallsignContinuityFilter::new(100);
+        assert!(!f.accept("CQ K7ZZX EM10"));
+        // ...but note_window_raw_calls (called once per window by the
+        // coordinator, after accept() has run) records it as "observed"...
+        f.note_window_raw_calls(&["CQ K7ZZX EM10".to_string()]);
+        // ...so the SAME repeating CQ is accepted starting next window,
+        // without ever needing a static/cqdx match or a lucky pairing.
+        assert!(f.accept("CQ K7ZZX EM10"));
+    }
+
+    #[test]
+    fn cross_window_continuity_does_not_bootstrap_within_the_same_window() {
+        // Rejecting a decode must NOT immediately unlock it — only a
+        // note_window_raw_calls call (representing "this window has ended")
+        // does. Otherwise this would silently degrade back into the old
+        // reject-once-then-accept-forever loophole within a single window.
+        let f = CallsignContinuityFilter::new(100);
+        assert!(!f.accept("CQ K7ZZX EM10"));
+        assert!(!f.accept("CQ K7ZZX EM10"));
+    }
+
+    #[test]
+    fn cross_window_continuity_skips_high_risk_fp_patterns() {
+        // A /R-suffix decode must not seed continuity for its own callsign,
+        // matching accept()'s own pre-callsign-lookup reject (hb-058).
+        let f = CallsignContinuityFilter::new(100);
+        assert!(!f.accept("CQ K7ZZX/R EM10"));
+        f.note_window_raw_calls(&["CQ K7ZZX/R EM10".to_string()]);
+        assert!(!f.accept("CQ K7ZZX/R EM10"));
+        assert!(!f.accept("CQ K7ZZX EM10"));
+    }
+
+    #[test]
+    fn cross_window_continuity_respected_by_would_accept_callsign() {
+        let f = CallsignContinuityFilter::new(100);
+        assert!(!f.would_accept_callsign("K7ZZX"));
+        f.note_window_raw_calls(&["CQ K7ZZX EM10".to_string()]);
+        assert!(f.would_accept_callsign("K7ZZX"));
     }
 
     #[test]
