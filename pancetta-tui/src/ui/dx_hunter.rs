@@ -162,10 +162,22 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
 
     // Callsign with need/notable markers. `!` = ATNO (all-time new one),
     // `+` = needed DXCC (not ATNO), `★` = notable. Markers stack so an
-    // ATNO that's also notable reads "!★CALL".
+    // ATNO that's also notable reads "!★CALL". `▲` = band_needed (never
+    // worked this entity on THIS band before, per the local QSO database —
+    // a signal independent of `atno`/`needed`, which reflect cqdx's needed
+    // set for the operator's currently-tuned band, not necessarily this
+    // row's own band). Suppressed when `atno` is already set, since ATNO
+    // (never worked on ANY band) already implies band-needed and a second
+    // marker would be redundant noise. 2026-07-18, DX Hunter
+    // per-band-needed gap.
     let call_display = format!(
-        "{}{}{}",
+        "{}{}{}{}",
         need_marker(station.atno, station.needed, station.is_notable),
+        if station.band_needed && !station.atno {
+            "▲"
+        } else {
+            ""
+        },
         if is_engaged { "● " } else { "" },
         station.call_sign
     );
@@ -537,6 +549,7 @@ mod tests {
             worked_before: false,
             needed: true,
             atno: true,
+            band_needed: false,
             priority_score: 0,
             source: crate::app::SpotSource::Local,
             entity_name: None,

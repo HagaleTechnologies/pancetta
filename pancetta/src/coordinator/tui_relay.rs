@@ -242,6 +242,11 @@ impl super::ApplicationCoordinator {
                             );
                             let (needed, atno) =
                                 needed_atno_for(&relay_station_lookup, call_sign.as_deref());
+                            let band_needed = dxcc_needed_on_band_for(
+                                &relay_station_lookup,
+                                call_sign.as_deref(),
+                                dial_mhz * 1_000_000.0,
+                            );
 
                             // Compute nuanced priority score via the real
                             // PriorityScorer (continuous f64 in [0,1] mapped
@@ -291,6 +296,7 @@ impl super::ApplicationCoordinator {
                                 worked_before,
                                 needed,
                                 atno,
+                                band_needed,
                                 priority_score,
                             };
 
@@ -496,6 +502,11 @@ impl super::ApplicationCoordinator {
                             );
                             let (needed, atno) =
                                 needed_atno_for(&relay_station_lookup, Some(callsign.as_str()));
+                            let band_needed = dxcc_needed_on_band_for(
+                                &relay_station_lookup,
+                                Some(callsign.as_str()),
+                                frequency as f64,
+                            );
                             let _ = tui_msg_tx_relay.send(
                                 pancetta_tui::tui_runner::TuiMessage::DxSpot {
                                     callsign,
@@ -504,6 +515,7 @@ impl super::ApplicationCoordinator {
                                     worked_before,
                                     needed,
                                     atno,
+                                    band_needed,
                                 },
                             );
                         }
@@ -2199,6 +2211,24 @@ fn needed_atno_for(
     match callsign {
         Some(c) if !c.is_empty() => (lookup.is_needed_dxcc(c), lookup.is_atno(c)),
         _ => (false, false),
+    }
+}
+
+/// Is this callsign's DXCC entity needed specifically on the band implied
+/// by `freq_hz` — i.e. never worked THERE before, per the local QSO
+/// database — independent of `needed_atno_for` (which reflects cqdx's
+/// needed set for the operator's currently-tuned band, not necessarily
+/// this row's own band). See `WorkedStationLookup::is_dxcc_needed_on_band`
+/// (2026-07-18, DX Hunter per-band-needed gap).
+fn dxcc_needed_on_band_for(
+    lookup: &crate::priority_evaluator::CachedStationLookup,
+    callsign: Option<&str>,
+    freq_hz: f64,
+) -> bool {
+    use pancetta_qso::priority::WorkedStationLookup;
+    match callsign {
+        Some(c) if !c.is_empty() => lookup.is_dxcc_needed_on_band(c, freq_hz),
+        _ => false,
     }
 }
 

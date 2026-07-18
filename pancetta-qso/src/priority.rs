@@ -74,6 +74,17 @@ pub trait WorkedStationLookup: Send + Sync {
         false
     }
 
+    /// Is this callsign's DXCC entity needed specifically on THIS band —
+    /// i.e. never worked there before, per the local QSO database —
+    /// independent of `is_needed_dxcc`/`is_atno` (which reflect cqdx's
+    /// needed set for whichever band the operator currently happens to be
+    /// tuned to, not necessarily this row's own band). A local,
+    /// cqdx-independent signal (2026-07-18, DX Hunter per-band-needed gap).
+    /// Defaults to `false` for lookups that don't track this.
+    fn is_dxcc_needed_on_band(&self, _callsign: &str, _freq_hz: f64) -> bool {
+        false
+    }
+
     /// Is this grid square needed for award tracking?
     fn is_needed_grid(&self, grid: &str) -> bool;
 

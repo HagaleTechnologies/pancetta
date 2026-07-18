@@ -808,6 +808,38 @@ impl QsoDatabase {
         }
     }
 
+    /// Get every distinct (band, callsign) pair ever worked, across ALL
+    /// bands in one query.
+    ///
+    /// Unlike [`Self::get_worked_callsigns`] (one band at a time, used to
+    /// seed the duplicate filter for whichever band the rig happens to be
+    /// tuned to at startup), the DX Hunter needs to evaluate rows on bands
+    /// OTHER than the current dial — so this pulls the whole log at once to
+    /// seed a per-band-DXCC-entity worked-set (2026-07-18, DX Hunter
+    /// per-band-needed gap).
+    pub async fn get_worked_bands_and_callsigns(&self) -> Vec<(String, String)> {
+        let result: Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
+            "SELECT DISTINCT json_extract(adif_data, '$.band'), \
+                             json_extract(metadata, '$.their_callsign') \
+             FROM qsos \
+             WHERE json_extract(adif_data, '$.band') IS NOT NULL \
+               AND json_extract(metadata, '$.their_callsign') IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await;
+
+        match result {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                tracing::warn!(
+                    "get_worked_bands_and_callsigns: query failed: {} — treating as empty",
+                    e
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Build a fresh index at `db_path` by replaying every record in `adif_path`.
     ///
     /// If `db_path` exists, it is deleted first — caller should only invoke this
@@ -1078,6 +1110,39 @@ mod tests {
         // Get QSO back
         let retrieved = db.get_qso(progress.metadata.qso_id).await.unwrap();
         assert_eq!(retrieved.metadata.qso_id, progress.metadata.qso_id);
+    }
+
+    // --- DX Hunter per-band-needed (2026-07-18): get_worked_bands_and_callsigns ---
+
+    #[tokio::test]
+    async fn get_worked_bands_and_callsigns_returns_every_band_in_one_query() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        // 20m (14.074 MHz) and 40m (7.074 MHz) — distinct bands, distinct
+        // callsigns. Unlike get_worked_callsigns (one band per call), this
+        // must return BOTH pairs from a single query.
+        db.insert_qso(&duplicate_check_test_progress("JA1ABC", 14_074_000.0))
+            .await
+            .unwrap();
+        db.insert_qso(&duplicate_check_test_progress("VK2XYZ", 7_074_000.0))
+            .await
+            .unwrap();
+
+        let mut pairs = db.get_worked_bands_and_callsigns().await;
+        pairs.sort();
+
+        assert_eq!(pairs.len(), 2);
+        assert!(pairs
+            .iter()
+            .any(|(band, call)| band.eq_ignore_ascii_case("20m") && call == "JA1ABC"));
+        assert!(pairs
+            .iter()
+            .any(|(band, call)| band.eq_ignore_ascii_case("40m") && call == "VK2XYZ"));
+    }
+
+    #[tokio::test]
+    async fn get_worked_bands_and_callsigns_empty_db_returns_empty() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        assert!(db.get_worked_bands_and_callsigns().await.is_empty());
     }
 
     fn duplicate_check_test_progress(callsign: &str, frequency: f64) -> QsoProgress {
