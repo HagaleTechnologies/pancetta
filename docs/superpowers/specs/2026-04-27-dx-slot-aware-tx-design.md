@@ -217,11 +217,19 @@ matches WSJT-X: the TX-even toggle is updated on first reply.
 
 - **DX cluster spots (no `slot_parity`).** DX Hunter spots come from
   the cluster, not from on-air decodes; they have no slot parity.
-  `dx_parity = None` flows through, so calling a clustered DX
-  behaves the same as CQing — `tx_self_parity` fallback. Acceptable
-  because the operator hasn't actually heard the station yet on this
-  pass; the first received decode will refine the parity for any
-  subsequent QSO responses.
+  `dx_parity = None` used to leave `tx_parity` permanently `None` on
+  the responder paths (`respond_to_cq_with`/`respond_to_caller`),
+  which then re-resolved "nearest next slot" independently on every
+  emission and alternated TX windows — a real bug (2026-07-18 review,
+  finding SM-F2/TX-F2), not the intended "fall back to
+  `tx_self_parity`" behavior this paragraph originally promised.
+  **Fixed in the review's Batch 2**: the QSO now latches a
+  provisional concrete parity immediately via the same
+  `latch_cq_parity_if_none` the CQ paths use, and the first received
+  decode from the latched partner refines it to the true
+  opposite-of-DX value — delivering the "first received decode will
+  refine the parity" promise this paragraph made but that was never
+  actually implemented until then.
 
 - **PTT engage time variance.** `ptt_lead_ms` is configurable in
   case 80ms isn't enough on a slow mechanical relay. Documented in

@@ -1,11 +1,27 @@
 # QSO management + TX physical-path deep review — 2026-07-18
 
+> **Status: remediation COMPLETE (2026-07-18).** All 5 batches in the executive
+> synthesis's remediation order landed: Batch 1 `6b2ceaf9` (double-PTT closure), Batch 2
+> `584dd81a` (responder parity latch + bundle verification), Batch 3 `a43419df`
+> (frequency-allocator correctness), Batch 4 `e16b0370` (completion-rate fixes), Batch 5
+> `6927e02c`/`41a8d8da` (second tier: Hold-mode offset, auto-73 guard, protocol-aware
+> pivot, multi-TX defer, parity-aware scoring, live instrument when disabled). Every fix
+> was independently re-verified by the controlling session (diff review + full test
+> suite + clippy) beyond the implementing subagent's own report before landing. Doc
+> reconciliation (this file's own findings against `docs/DECISIONS/{qso-engine,
+> tx-scheduling}.md`, the 2026-04-27/2026-04-29 specs, and `docs/qso-state-machine-
+> analysis.md`) is also complete. Deferred items (TX-F3/TX-F7 worker concurrency, SM-F7/
+> F9/F10/F11/F12, FQ-F11/F12/F13, FQ-F10 stuck-hop stream-blindness) remain open per the
+> "Out of scope / deferred" section below — none were silently dropped, they were never
+> in the 5-batch plan. The analysis below is preserved as-written (the historical
+> record); trust the code + the DECISIONS docs' newer notes for current behavior where
+> they've since been updated.
+
 A three-track deep review of (A) the QSO state machine and progression logic,
 (B) automatic TX audio-offset selection, and (C) TX scheduling / parity /
-multi-TX. **Analysis only — nothing implemented.** Conducted against
-`origin/main @ 3bd81e86` (worktree `dx-hunter-entity-atno-perband`). Successor
-to `docs/qso-state-machine-analysis.md` (2026-07-03), which is now partially
-superseded (see §A.4).
+multi-TX. Conducted against `origin/main @ 3bd81e86` (worktree
+`dx-hunter-entity-atno-perband`). Successor to `docs/qso-state-machine-analysis.md`
+(2026-07-03), which is now (fully) superseded (see §A.4).
 
 Findings are prefixed **SM-** (state machine), **FQ-** (frequency selection),
 **TX-** (scheduling/multi-TX). CONFIRMED = code path traced fully; SUSPECTED =
