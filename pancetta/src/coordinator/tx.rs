@@ -995,6 +995,45 @@ impl super::ApplicationCoordinator {
 
                     match tx_rx.try_recv() {
                         Ok(mut message) => {
+                            // 2026-07-18 operator finding: the emit_event(MessageToSend)
+                            // trace added in pancetta-qso proved the QSO state machine
+                            // sends a QSO's final 73 exactly once, yet PTT keys twice
+                            // (confirmed live with YO6BHN, UT7UJ, KF6VPA) — so the
+                            // duplicate is downstream of qso.rs, inside this worker or
+                            // its channel. `message.id` is a fresh, globally unique id
+                            // assigned by `generate_message_id()` at every
+                            // `ComponentMessage::new()` call, so logging it on every
+                            // dequeue answers the open question directly: the SAME id
+                            // appearing twice means the channel/bus redelivered one
+                            // message (a bug here or in `MessageBus`); two DIFFERENT
+                            // ids with identical `TransmitRequest` content mean a
+                            // second, distinct send this worker was never told about
+                            // by anything already ruled out (all 4 `TransmitRequest`
+                            // construction sites, the backlog coalescer, the manual
+                            // keep-call timer, the bounded auto-73 resend, the
+                            // autonomous engine's gated-closed TX path). Log-only; no
+                            // behavior change; remove once root-caused.
+                            let msg_summary = match &message.message_type {
+                                MessageType::TransmitRequest {
+                                    message_text,
+                                    qso_id,
+                                    ..
+                                } => {
+                                    format!(
+                                        "TransmitRequest(text='{message_text}', qso={qso_id:?})"
+                                    )
+                                }
+                                MessageType::MultiTransmitRequest { items, .. } => {
+                                    format!("MultiTransmitRequest({} items)", items.len())
+                                }
+                                other => format!("{other:?}"),
+                            };
+                            info!(
+                                target: "pancetta::tx.recv_diag",
+                                "tx_rx dequeued: msg_id={} from={} {}",
+                                message.id, message.source, msg_summary
+                            );
+
                             // qso-state-machine-analysis Symptom B fix: capture
                             // "now" HERE, at pickup, before the collection sleep
                             // below (and any coalescing). Both scheduling sites
@@ -1047,6 +1086,33 @@ impl super::ApplicationCoordinator {
                                     &active_tx_qsos,
                                 )
                                 .await;
+
+                                // Same 2026-07-18 diagnostic: show what coalescing
+                                // produced, unconditionally (not just when the
+                                // "TX backlog coalesced" warning already fires),
+                                // so a duplicate that appears ONLY after this step
+                                // (and not at the dequeue log above) would point
+                                // at this function specifically.
+                                let post_coalesce_summary = match &message.message_type {
+                                    MessageType::TransmitRequest {
+                                        message_text,
+                                        qso_id,
+                                        ..
+                                    } => {
+                                        format!(
+                                            "TransmitRequest(text='{message_text}', qso={qso_id:?})"
+                                        )
+                                    }
+                                    MessageType::MultiTransmitRequest { items, .. } => {
+                                        format!("MultiTransmitRequest({} items)", items.len())
+                                    }
+                                    other => format!("{other:?}"),
+                                };
+                                info!(
+                                    target: "pancetta::tx.recv_diag",
+                                    "post-coalesce: msg_id={} {}",
+                                    message.id, post_coalesce_summary
+                                );
                             }
 
                             match message.message_type {
