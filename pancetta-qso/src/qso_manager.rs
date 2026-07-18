@@ -3472,6 +3472,39 @@ impl QsoManager {
     }
 
     async fn emit_event(&self, event: QsoEvent) {
+        // 2026-07-18 operator finding: PTT keyed twice for the same QSO's
+        // final 73 (confirmed via YO6BHN and UT7UJ — real rig set_ptt ON
+        // events, one FT8 slot [~15s] apart, for the identical message and
+        // qso_id), from what should be a single send. Every send site
+        // upstream of the coordinator's TX worker has been individually
+        // read and ruled out as the origin: the 4 places that construct a
+        // `TransmitRequest`, `MessageBus::send_message` (plain point-to-
+        // point, no retry/fan-out), `coalesce_backlog_into`'s drain/re-
+        // enqueue (only re-enqueues the non-TX message that stops the
+        // drain, never a `TransmitRequest`), `rearm_manual_calls_at`
+        // (its state match excludes `Completed`), `maybe_auto_resend_73`
+        // (needs a fresh directed RR73/RRR decode — none found), and the
+        // autonomous engine's own TX path (its runtime gate is seeded
+        // from `[autonomous].enabled` and stays closed when that's
+        // false). This traces every `MessageToSend` at its true source —
+        // inside the state machine itself, the one place not yet ruled
+        // out — so the next occurrence shows definitively whether this
+        // fires twice for one logical send (root cause is here or
+        // upstream of here) or once (root cause is downstream, in event
+        // delivery/consumption not yet found). Log-only; no behavior
+        // change. Remove once root-caused.
+        if let QsoEvent::MessageToSend {
+            qso_id,
+            ref message,
+            ..
+        } = event
+        {
+            info!(
+                target: "pancetta::qso.send_diag",
+                "emit_event(MessageToSend): qso={} message={:?}",
+                qso_id, message
+            );
+        }
         if let Err(e) = self.event_sender.send(event) {
             warn!("Failed to emit QSO event: {}", e);
         }
