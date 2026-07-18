@@ -86,14 +86,12 @@ cargo sweep --maxsize 10GB       # cap target/ size
 
 ## Knowledge Wiki and Multi-Agent Hygiene
 
-`wiki/INDEX.md` maps accumulated knowledge — read it before deep exploration; after
-substantive work, run /wiki-update to distill gotchas/decisions into it (or docs/ if
-normative). The wiki is descriptive; code and docs/ win any conflict.
+`wiki/INDEX.md` maps accumulated knowledge — read it before deep exploration; run /wiki-update after substantive work to distill gotchas/decisions into it (or docs/ if normative). The wiki is descriptive; code and docs/ win any conflict.
 
-You are never alone in this repo — other agents may work concurrently in other
-clones, branches, or worktrees. **Start fresh:** `git fetch` and rebase onto
-`origin/main` before deciding anything (confirm your `main` still shares ancestry
-with `origin/main` — a stale clone can diverge silently). **Claim before work:**
-an early draft PR *is* the claim. **Isolate:** always a branch (worktree
-preferred), never a shared checkout's main. **Flush at the end:** push
-(`--force-with-lease` only) before finishing. **Main moves only by PR merge.**
+You are never alone in this repo — other agents may work concurrently in other clones, branches, or worktrees.
+
+- **Start fresh:** `git fetch` and rebase onto `origin/main` before deciding anything; a stale clone can diverge silently.
+- **Claim before work:** search open PRs/issues first, then open a draft PR early — the draft PR *is* the claim; don't duplicate in-flight work.
+- **Isolate:** always a branch (worktree preferred), never a shared checkout's main; use per-session scratch dirs and don't bind fixed ports.
+- **Flush at the end:** push (`--force-with-lease` only) and open/update your PR before finishing — unpushed work is invisible work.
+- **Main moves only by PR merge.**
