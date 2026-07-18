@@ -978,6 +978,187 @@ mod tests {
     }
 
     #[test]
+    fn docs_psk_reporter_minimal_example_fails_without_full_fields() {
+        // Regression guard for the exact bug CONFIG.md's old example shipped:
+        // PskReporterConfig has no per-field defaults, so a partial table
+        // (just enabled + a nonexistent `report_decodes` key) does NOT fall
+        // back to defaults -- it's a hard parse error. If this ever starts
+        // parsing OK, PskReporterConfig gained #[serde(default)] support and
+        // CONFIG.md's "don't write a partial block" warning is stale.
+        let loader = ConfigLoader::new().unwrap();
+        let toml_content = r#"
+[network.psk_reporter]
+enabled        = true
+report_decodes = true
+"#;
+        assert!(
+            loader.parse_toml(toml_content).is_err(),
+            "PskReporterConfig unexpectedly accepted a partial table -- \
+             update CONFIG.md's \"don't write a partial block\" warning"
+        );
+    }
+
+    #[test]
+    fn docs_psk_reporter_full_example_parses() {
+        // The exact "Customizing PSKReporter" block from CONFIG.md -- must
+        // stay parseable and must match PskReporterConfig::default() field
+        // for field (asserted below), since the doc claims these ARE the
+        // real defaults.
+        let loader = ConfigLoader::new().unwrap();
+        let toml_content = r#"
+[network.psk_reporter]
+enabled                  = false
+server_url               = "https://pskreporter.info/cgi-bin/pskdata.pl"
+upload_interval_seconds  = 300
+batch_size               = 50
+include_receives         = true
+include_transmits        = true
+min_snr_db               = -20.0
+max_age_hours            = 24
+frequency_accuracy_hz    = 1
+
+[network.psk_reporter.reporter_info]
+software_name    = "Pancetta"
+software_version = "0.9.5"
+
+[network.psk_reporter.filters]
+enabled_modes = ["PSK31", "PSK63", "FT8", "FT4", "JS8"]
+enabled_bands = ["40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m"]
+
+[network.psk_reporter.filters.geographic]
+include_dxcc = []
+exclude_dxcc = []
+include_itu_zones = []
+exclude_itu_zones = []
+include_cq_zones = []
+exclude_cq_zones = []
+
+[network.psk_reporter.filters.geographic.distance]
+great_circle = true
+"#;
+        let parsed = loader.parse_toml(toml_content).unwrap();
+        // software_version is hardcoded "0.9.5" in the doc (informational
+        // only, per the doc's own comment); everything else must match
+        // Default::default() exactly, so compare with that field zeroed.
+        let mut expected = crate::network::PskReporterConfig::default();
+        expected.reporter_info.software_version = "0.9.5".to_string();
+        assert_eq!(
+            toml::to_string(&parsed.network.psk_reporter).unwrap(),
+            toml::to_string(&expected).unwrap(),
+            "CONFIG.md's psk_reporter block has drifted from PskReporterConfig::default()"
+        );
+    }
+
+    #[test]
+    fn docs_cqdx_full_example_parses_and_matches_defaults() {
+        // The exact [network.cqdx] block from CONFIG.md -- CqdxConfig also
+        // has no per-field defaults (see the doc's note), so every field
+        // must be present.
+        //
+        // `token` is the one field that's deliberately NOT byte-identical
+        // to CqdxConfig::default() (which is `token: None`): TOML has no
+        // way to write `None` for an Option<String>, so the doc shows
+        // `token = ""` as a copy-paste-and-fill-in placeholder instead.
+        // This is safe because the app's own gating treats them
+        // identically -- qso.rs's cqdx-upload-client construction does
+        // `cqdx_cfg.token.as_ref().filter(|t| !t.is_empty())`, so
+        // `None` and `Some("")` both result in no client being built.
+        let loader = ConfigLoader::new().unwrap();
+        let toml_content = r#"
+[network.cqdx]
+enabled             = false
+token               = ""
+base_url            = "https://cqdx.io"
+poll_interval_secs  = 30
+"#;
+        let parsed = loader.parse_toml(toml_content).unwrap();
+        assert_eq!(parsed.network.cqdx.token.as_deref(), Some(""));
+
+        // Every other field must match Default::default() exactly -- do a
+        // full struct comparison (not per-field assertions, which is how
+        // the previous version of this test missed that `token` doesn't
+        // literally match) with `token` normalized to the same
+        // representation on both sides first.
+        let mut normalized = parsed.network.cqdx.clone();
+        normalized.token = None;
+        assert_eq!(
+            toml::to_string(&normalized).unwrap(),
+            toml::to_string(&crate::network::CqdxConfig::default()).unwrap(),
+            "CONFIG.md's cqdx block (aside from the documented token placeholder) \
+             has drifted from CqdxConfig::default()"
+        );
+    }
+
+    #[test]
+    fn docs_qrz_section_name_is_qrz_xml_not_qrz() {
+        // Regression guard for a real bug: CONFIG.md used to document
+        // `[network.qrz]`, but the real field/section is `qrz_xml` --
+        // `NetworkConfig` has no `qrz` field at all, so `[network.qrz]` is
+        // silently ignored as an unrecognized section (warned, not fatal)
+        // and QRZ XML lookup never actually gets configured.
+        let loader = ConfigLoader::new().unwrap();
+        let wrong_section = loader
+            .parse_toml(
+                r#"
+[network.qrz]
+enabled  = true
+username = "N0CALL"
+password = "secret"
+"#,
+            )
+            .unwrap();
+        assert!(
+            !wrong_section.network.qrz_xml.enabled,
+            "a [network.qrz] section must NOT configure qrz_xml -- if this \
+             now passes, NetworkConfig gained a real `qrz` field and \
+             CONFIG.md's warning about the old wrong section name is stale"
+        );
+
+        // The corrected section name from CONFIG.md's example.
+        let right_section = loader
+            .parse_toml(
+                r#"
+[network.qrz_xml]
+enabled  = true
+username = "N0CALL"
+password = "secret"
+"#,
+            )
+            .unwrap();
+        assert!(right_section.network.qrz_xml.enabled);
+        assert_eq!(right_section.network.qrz_xml.username, "N0CALL");
+    }
+
+    #[test]
+    fn docs_eqsl_example_parses_and_matches_defaults() {
+        // The exact [network.eqsl] block from CONFIG.md. EqslConfig's
+        // fields all carry #[serde(default)], so this isn't a
+        // parse-failure regression guard like psk_reporter/cqdx -- it's a
+        // guard against the section name or field names silently
+        // typo'ing into an unrecognized-section warning (the same failure
+        // class as the old [network.qrz] bug), which a partial-table-
+        // tolerant struct wouldn't surface as a parse error.
+        let loader = ConfigLoader::new().unwrap();
+        let toml_content = r#"
+[network.eqsl]
+enabled      = false
+username     = ""
+password     = ""
+qth_nickname = ""
+"#;
+        let parsed = loader.parse_toml(toml_content).unwrap();
+        assert!(
+            loader.load_warnings().is_empty(),
+            "eqsl section name/fields must be recognized, not warned-about"
+        );
+        assert_eq!(
+            toml::to_string(&parsed.network.eqsl).unwrap(),
+            toml::to_string(&crate::network::EqslConfig::default()).unwrap(),
+            "CONFIG.md's eqsl block has drifted from EqslConfig::default()"
+        );
+    }
+
+    #[test]
     fn test_unknown_top_level_section_warns() {
         let loader = ConfigLoader::new().unwrap();
         // The exact ghost sections CONFIG.md used to document.

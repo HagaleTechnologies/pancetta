@@ -233,7 +233,7 @@ Each has an `enabled` flag and a credentials block.
 > about what's on disk.
 
 ```toml
-[network.qrz]
+[network.qrz_xml]
 enabled  = false
 username = ""
 password = ""        # plaintext on disk
@@ -243,25 +243,36 @@ enabled          = false
 tqsl_path        = ""   # path to your installed tqsl binary
 station_location = ""   # must match a "Station Location" name in TQSL
 
-[network.psk_reporter]
-enabled        = true   # Local-only spotter; no credentials
-report_decodes = true
+[network.eqsl]
+enabled      = false
+username     = ""
+password     = ""        # plaintext on disk
+qth_nickname = ""         # only needed if your eQSL account has >1 location
 ```
 
-`pskreporter` doesn't require credentials and is the only network
-integration enabled by default — your local copy contributes spots
-back to the global PSKReporter database, which makes you reciprocally
-visible for spot lookups.
+`psk_reporter` doesn't require credentials, but — unlike its historical
+reputation as "the default-on spotter" — it is **off by default**
+(`PskReporterConfig::default().enabled == false`, verified by
+`test_default_network_config`). Set `enabled = true` to have your local
+copy contribute spots back to the global PSKReporter database, which
+makes you reciprocally visible for spot lookups. **Don't write a
+`[network.psk_reporter]` block at all unless you need to change
+something** — unlike every other section here, `PskReporterConfig` has
+no per-field defaults, so a *partial* override (e.g. just `enabled =
+true`) fails to parse with a "missing field" error instead of falling
+back to defaults for the rest. If you do need to override it, see
+"Customizing PSKReporter" below for a verified-complete block to start
+from.
 
 LoTW has no username/password/`base_url` fields — unlike the other
 integrations, pancetta never talks to LoTW's servers directly. It shells
 out to your locally-installed `tqsl` binary, which signs the QSO record
 with your TQSL certificate and handles the actual upload itself.
 
-### Per-QSO log upload — ClubLog, QRZ Logbook, and LoTW
+### Per-QSO log upload — ClubLog, QRZ Logbook, LoTW, and eQSL
 
 When a QSO completes, pancetta can upload that single QSO (as one ADIF
-record) straight to your online logbooks. Both integrations are
+record) straight to your online logbooks. All four integrations are
 **opt-in and default `enabled = false`**. They run best-effort and never
 block or fail the QSO pipeline; results are logged under the
 `qso.upload` target. **Credentials stay local** — they are read from
@@ -289,11 +300,19 @@ enabled = false
 api_key = ""         # per-logbook API access key, plaintext on disk
 
 [network.cqdx]
-enabled = false      # also gates the spot-discovery integration; when true with a
-                     # token set, each completed QSO is ALSO logged to your cqdx.io logbook
-token   = ""         # cqdx.io Personal Access Token (pat_…), plaintext on disk
-# base_url = "https://cqdx.io"   # optional; defaults to https://cqdx.io
+enabled            = false   # also gates the spot-discovery integration; when true with a
+                              # token set, each completed QSO is ALSO logged to your cqdx.io logbook
+token              = ""      # cqdx.io Personal Access Token (pat_…), plaintext on disk
+base_url           = "https://cqdx.io"   # not actually optional to omit — see note below
+poll_interval_secs = 30      # how often to poll for new priority spots
 ```
+
+> `cqdx.base_url` and `poll_interval_secs` must both be present if you
+> write a `[network.cqdx]` block at all — like `psk_reporter`,
+> `CqdxConfig` has no per-field defaults, so a partial table (e.g. just
+> `enabled`/`token`) fails to parse rather than falling back to
+> defaults for the rest. The values shown above ARE the real defaults,
+> so copying this block verbatim and only changing `token` is safe.
 
 | Key | Service | Notes |
 |---|---|---|
@@ -304,8 +323,14 @@ token   = ""         # cqdx.io Personal Access Token (pat_…), plaintext on dis
 | `clublog.api_key` | ClubLog | Application API key. |
 | `qrz_logbook.enabled` | QRZ | Master switch. When `true`, `api_key` is required. |
 | `qrz_logbook.api_key` | QRZ | Per-logbook API access key. |
+| `eqsl.enabled` | eQSL.cc | Master switch. When `true`, `username` and `password` are required. |
+| `eqsl.username` | eQSL.cc | Account username. |
+| `eqsl.password` | eQSL.cc | Account password. Plaintext on disk. |
+| `eqsl.qth_nickname` | eQSL.cc | Optional "Profile" name — only needed if your account has more than one QTH location configured. |
 | `cqdx.enabled` | cqdx.io | Master switch for the cqdx.io integration. When `true` **and** `cqdx.token` is non-empty, each completed QSO is uploaded to your cqdx.io logbook (in addition to the spot-discovery features the same flag enables). |
 | `cqdx.token` | cqdx.io | Personal Access Token (`pat_…`). Plaintext on disk; never logged. |
+| `cqdx.base_url` | cqdx.io | API base URL. Only change this for local development against a non-production cqdx.io instance. |
+| `cqdx.poll_interval_secs` | cqdx.io | How often to poll for new priority spots. |
 
 **Getting the keys:**
 
@@ -327,6 +352,53 @@ token   = ""         # cqdx.io Personal Access Token (pat_…), plaintext on dis
   frequency and both grids. A QSO cqdx already has is reported as a
   duplicate and skipped (non-fatal). The same `[network.cqdx]` block also
   drives live spot discovery; enabling it turns on both.
+- **eQSL.cc:** use your existing eQSL.cc account username and password —
+  there's no separate API key. Uploads POST a single-record ADIF file to
+  `https://www.eqsl.cc/qslcard/importADIF.cfm`. If your account has more
+  than one "Profile" (QTH) configured on eQSL, set `qth_nickname` to the
+  one uploads should file under; leave it empty for a single-location
+  account.
+
+### Customizing PSKReporter
+
+`psk_reporter` ships off (`enabled = false`) with otherwise-sane
+defaults — most operators only need to flip `enabled` to `true`, but
+since `PskReporterConfig` has no per-field defaults (see the note
+above), turning it on means supplying every field, not just `enabled`.
+This block is the verified-complete set of current defaults; copy it,
+flip `enabled`, and change anything else you need:
+
+```toml
+[network.psk_reporter]
+enabled                  = false
+server_url               = "https://pskreporter.info/cgi-bin/pskdata.pl"
+upload_interval_seconds  = 300
+batch_size               = 50
+include_receives         = true
+include_transmits        = true
+min_snr_db               = -20.0
+max_age_hours            = 24
+frequency_accuracy_hz    = 1
+
+[network.psk_reporter.reporter_info]
+software_name    = "Pancetta"
+software_version = "0.9.5"   # informational only; not validated against the running binary
+
+[network.psk_reporter.filters]
+enabled_modes = ["PSK31", "PSK63", "FT8", "FT4", "JS8"]
+enabled_bands = ["40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m"]
+
+[network.psk_reporter.filters.geographic]
+include_dxcc = []
+exclude_dxcc = []
+include_itu_zones = []
+exclude_itu_zones = []
+include_cq_zones = []
+exclude_cq_zones = []
+
+[network.psk_reporter.filters.geographic.distance]
+great_circle = true
+```
 
 ### `[network.wsjtx_udp]` — GridTracker / JTAlert / logger interop
 
