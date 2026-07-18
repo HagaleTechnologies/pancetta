@@ -9,9 +9,7 @@ Project instructions for Claude Code when working in this repository.
 
 Pancetta is an autonomous FT8 ham radio station written in Rust. The goal is a fully operational on-air system: decode, call, complete QSOs, and log — with priority-based station selection, multi-stream TX, and integration with cqdx.io.
 
-## Workspace Structure
-
-14-crate Cargo workspace:
+## Workspace Structure (14-crate Cargo workspace)
 
 | Crate | Purpose | Status |
 |-------|---------|--------|
@@ -46,7 +44,7 @@ cargo test -p pancetta-ft8                         # LDPC/CRC tests only
 # Loopback integration tests (end-to-end QSO through encode→modulate→decode)
 cargo test -p pancetta --test loopback_qso
 
-# pancetta-hamlib (single-threaded for deterministic mock-rig tests)
+# pancetta-hamlib: per-test current_thread tokio runtime; run single-threaded for deterministic mock-rig tests
 cargo test -p pancetta-hamlib --lib -- --test-threads=1
 ```
 
@@ -69,20 +67,13 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 ## Where Things Live
 
 - `docs/superpowers/specs/` — design specs (authoritative for current behavior)
-- `docs/DECISIONS/` — decision digests by subsystem (tx-scheduling, qso-engine, modes, remote-operation, tui, logging-uploads, config-and-platform)
+- `docs/DECISIONS/` — decision digests by subsystem (tx-scheduling, qso-engine, modes, remote-operation, tui, logging-uploads, config-and-platform); known gaps/TODOs live in `2026-07-development-phases-and-gaps.md`
 - `docs/ARCHITECTURE.md` — crate relationships and data flows
 - `docs/CONFIG.md` — configuration reference
 - `docs/fcc-part97-compliance.md` — regulatory / TX-safety notes
 - `CHANGELOG.md` — release history
 
-## Known Gaps and TODOs
-
-- **DX Hunter — DXCC entity / ATNO / per-band-needed**: local-only decodes show `---` for the entity name (no prefix→entity resolver exposed to the TUI yet); ATNO (all-time-needed DXCC) is pulled from cqdx and drives the autonomous scorer but is not surfaced in the DX Hunter; per-band-needed is not pulled from cqdx (only the local `worked_on_band` set exists) — surfacing it needs a new cqdx endpoint or local QSO-DB cross-referencing threaded into the TUI.
-- **cqdx `GET /api/v1/spots?live=true` response envelope key (`groups`) unverified against live API** — a gated live test exists: `CQDX_TOKEN=pat_xxx cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored --nocapture`.
-
-## Documentation Policy
-
-After significant work: update inline docs (`///` / `//!` on modified public items) and the relevant `docs/DECISIONS/<subsystem>.md` digest (append a dated entry). CLAUDE.md changes ONLY when build commands, crate structure, invariants, or open gaps change — never append feature narratives here. Missing-docs enforcement: `pancetta-core` is `#![warn(missing_docs)]`, `pancetta-hamlib` is `#![deny(missing_docs)]`, all other crates carry `#![allow(missing_docs)]` with a TODO — switch each to `warn`/`deny` as docs land.
+**Documentation policy:** keep CLAUDE.md under ~100 lines as the standing brief — decision narratives, feature history, and gap tracking go to `docs/DECISIONS/`, never appended here.
 
 ## Build Hygiene
 
@@ -93,25 +84,16 @@ cargo sweep --installed          # remove artifacts from unused toolchains
 cargo sweep --maxsize 10GB       # cap target/ size
 ```
 
-## Knowledge wiki
+## Knowledge Wiki and Multi-Agent Hygiene
 
-`wiki/INDEX.md` is the map of accumulated knowledge — read it before deep
-exploration; open pages relevant to your task. After substantive work, run
-/wiki-update: distill new gotchas/decisions/corrections into the wiki (or
-into docs/ if normative — the wiki points, it never restates). The wiki is
-descriptive and always loses conflicts with code and docs/.
+`wiki/INDEX.md` maps accumulated knowledge — read it before deep exploration; after
+substantive work, run /wiki-update to distill gotchas/decisions into it (or docs/ if
+normative). The wiki is descriptive; code and docs/ win any conflict.
 
-## Multi-agent hygiene
-
-You are never alone in this repo — other agents may be working concurrently
-in other clones, branches, or worktrees.
-
-- **Start fresh:** `git fetch` and rebase onto `origin/main` before reading
-  code or making decisions; stale context produces wrong work.
-- **Claim before work:** search open PRs/issues first; open a draft PR early —
-  the draft PR *is* the claim. Don't duplicate in-flight work.
-- **Isolate:** always a branch (worktree preferred), never a shared checkout's
-  main. Use per-session scratch dirs; don't bind fixed ports.
-- **Flush at the end:** push (`--force-with-lease` only) and open/update your
-  PR before finishing. Unpushed work is invisible work.
-- **Main moves only by PR merge.**
+You are never alone in this repo — other agents may work concurrently in other
+clones, branches, or worktrees. **Start fresh:** `git fetch` and rebase onto
+`origin/main` before deciding anything (confirm your `main` still shares ancestry
+with `origin/main` — a stale clone can diverge silently). **Claim before work:**
+an early draft PR *is* the claim. **Isolate:** always a branch (worktree
+preferred), never a shared checkout's main. **Flush at the end:** push
+(`--force-with-lease` only) before finishing. **Main moves only by PR merge.**
