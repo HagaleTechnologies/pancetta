@@ -178,6 +178,15 @@ async fn auto_g3_pileup_picks_exactly_one() {
 // G4. Duplicate suppression: after answering a DX, an immediate re-CQ from
 //     the SAME DX within the recently-responded window must NOT spawn a
 //     second pounce / second QSO.
+//
+//     SM-F6 (Batch 4) update: an AUTONOMOUS pounce is no longer silent for
+//     its entire report_timeout window — `rearm_manual_calls_at` now grants
+//     Auto QSOs in RespondingToCq/SendingReport ONE bounded resend (capped by
+//     `AUTO_RESEND_MAX_CALLS = 2`) roughly one FT8 slot after the opening
+//     call, so the DX gets a second chance to hear us before the 30s
+//     report_timeout retires the QSO. This test's contract is still that no
+//     SECOND POUNCE / duplicate QSO is spawned — it now allows for that one
+//     bounded resend rather than exactly one transmission.
 // ---------------------------------------------------------------------
 #[tokio::test]
 async fn auto_g4_does_not_rework_recently_answered_station() {
@@ -197,24 +206,31 @@ async fn auto_g4_does_not_rework_recently_answered_station() {
     let tl = sim.into_timeline();
     // Still exactly one QSO id across the whole run (no duplicate pounce).
     tl.assert_at_most_qsos(1);
-    // And we only ever sent ONE opening call to VB7F (Auto path does not
-    // keep-call, and the dupe gate blocks re-pounce).
+    // SM-F6: exactly ONE opening call plus the single bounded rearm resend
+    // (2 total) — never more, and never a re-pounce (the dupe gate blocks
+    // that independently).
     assert_eq!(
         tl.count_transmitted_containing("VB7F K5ARH EM10"),
-        1,
-        "expected exactly one opening call to VB7F (no re-pounce, no keep-call)\n{tl}"
+        2,
+        "expected the opening call plus exactly one bounded SM-F6 resend to \
+         VB7F (no re-pounce, no unbounded keep-call)\n{tl}"
     );
 }
 
 // ---------------------------------------------------------------------
-// G5. Auto-call "no keep-call storm": unlike a MANUAL call (which keep-calls
-//     every slot under the watchdog), an unanswered AUTONOMOUS pounce sends
-//     its opening call ONCE and then goes quiet — the operator does not
-//     hammer the DX every slot. (Validates the Auto-vs-Manual distinction;
-//     the *retirement* of the dangling Auto QSO is Phase-5 — see P-watchdog.)
+// G5. Auto-call bounded resend (SM-F6, Batch 4): unlike a MANUAL call (which
+//     keep-calls every slot under the long operator-supervised watchdog), an
+//     unanswered AUTONOMOUS pounce gets exactly ONE bounded resend — never an
+//     unbounded per-slot storm. Before SM-F6 the opening call was sent once
+//     and then the QSO went completely silent until the 30s report_timeout
+//     retired it with zero resilience to a missed frame; now `call_count`
+//     (capped at `AUTO_RESEND_MAX_CALLS = 2`) bounds it to a single extra
+//     attempt around the ~15s mark. (Validates the Auto-vs-Manual distinction
+//     still holds — Auto is bounded, Manual is not; the *retirement* of the
+//     dangling Auto QSO is Phase-5 — see P-watchdog.)
 // ---------------------------------------------------------------------
 #[tokio::test]
-async fn auto_g5_unanswered_auto_call_does_not_keep_calling() {
+async fn auto_g5_unanswered_auto_call_gets_one_bounded_resend() {
     let mut sim = auto_sim().await;
 
     // Slot 0: DX CQs once; we pounce.
@@ -225,12 +241,14 @@ async fn auto_g5_unanswered_auto_call_does_not_keep_calling() {
     sim.tick_n(8).await;
 
     let tl = sim.into_timeline();
-    // Exactly one transmission toward VB7F across the whole run — no per-slot
-    // keep-call storm (that is manual-only behavior).
+    // Exactly TWO transmissions toward VB7F across the whole run — the
+    // opening call plus one bounded SM-F6 resend, never an unbounded
+    // per-slot storm (that remains manual-only behavior).
     assert_eq!(
         tl.count_transmitted_containing("VB7F"),
-        1,
-        "an unanswered AUTO pounce must not keep-call every slot\n{tl}"
+        2,
+        "an unanswered AUTO pounce must get exactly one bounded resend, not \
+         zero (dead) and not an unbounded keep-call storm\n{tl}"
     );
 }
 

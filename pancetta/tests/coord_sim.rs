@@ -2595,3 +2595,84 @@ async fn mode_switch_never_requested_is_byte_identical_to_today() {
     sim.timeline
         .assert_keyed_at_offset(&qso_id.to_string(), 1500.0);
 }
+
+/// SM-F5 (Batch 4): `cancel_qso` / `check_timeouts_at` / `supersede_active_qsos_for`
+/// now emit `QsoEvent::QsoFailed` ALONGSIDE the pre-existing `StateChanged ->
+/// Failed` for the same failure, reviving the priority-scoring failure-backoff
+/// consumer (`coordinator/qso.rs`'s `record_failure`) that subscribes to
+/// `QsoFailed` specifically. `pump_qso_events`'s populater (mirroring the real
+/// coordinator) removes from `active_tx_qsos` on BOTH events via
+/// `HashSet::remove`, which is a no-op on an absent key — so emitting both for
+/// one failure must be idempotent: exactly one qso_id, cleanly removed once,
+/// no panic and no double-free. This exercises the TIMEOUT path (the easiest
+/// of the 3 SM-F5 producer sites to drive with an explicit virtual `now`).
+#[tokio::test]
+async fn sm_f5_timeout_retirement_emits_both_events_and_purges_active_tx_qsos_once() {
+    let mut sim = CoordSim::new("K5ARH").await;
+    let qso_id = sim
+        .manager
+        .respond_to_cq_with(
+            "W1AW".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+            false,
+        )
+        .await
+        .expect("respond_to_cq_with");
+    let key = active_tx_qso_key(&qso_id.to_string());
+
+    // Populated by the opening StateChanged.
+    let pending = sim.pump_qso_events();
+    assert!(!pending.is_empty());
+    assert!(
+        sim.active_tx_qsos.read().unwrap().contains(&key),
+        "sanity: active_tx_qsos should contain the started QSO"
+    );
+
+    // Retire it well past the 30s report_timeout (Auto RespondingToCq never
+    // got a DX reply). This now fires BOTH a StateChanged -> Failed and a
+    // QsoFailed for the SAME qso_id.
+    let now = chrono::Utc::now() + chrono::Duration::seconds(45);
+    sim.manager.check_timeouts_at(now).await;
+
+    // Both events must have been emitted (StateChanged->Failed AND QsoFailed)
+    // — `pump_qso_events` applies each event's removal rule in turn.
+    let mut saw_state_changed_failed = false;
+    let mut saw_qso_failed = false;
+    while let Ok(ev) = sim.qso_rx.try_recv() {
+        match &ev {
+            QsoEvent::StateChanged { new_state, .. } => {
+                if matches!(new_state, QsoState::Failed { .. }) {
+                    saw_state_changed_failed = true;
+                }
+            }
+            QsoEvent::QsoFailed { qso_id: fid, .. } => {
+                assert_eq!(*fid, qso_id, "QsoFailed must carry the retired QSO's id");
+                saw_qso_failed = true;
+            }
+            _ => {}
+        }
+        sim.apply_event(ev, &mut Vec::new());
+    }
+    assert!(
+        saw_state_changed_failed,
+        "expected a StateChanged -> Failed for the timed-out QSO"
+    );
+    assert!(
+        saw_qso_failed,
+        "expected a QsoFailed for the timed-out QSO (SM-F5 — was previously dead)"
+    );
+
+    // Idempotent, clean removal: exactly one qso_id worth of entry, now gone
+    // from BOTH maps, no panic from the double `HashSet::remove`.
+    assert!(
+        !sim.active_tx_qsos.read().unwrap().contains(&key),
+        "active_tx_qsos must be empty after a timeout retirement that emits both events"
+    );
+    assert!(
+        !sim.active_tx_offsets.read().unwrap().contains_key(&key),
+        "active_tx_offsets must be empty after a timeout retirement that emits both events"
+    );
+}

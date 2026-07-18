@@ -50,6 +50,15 @@ pub enum QsoState {
         /// when the response carried no grid.
         #[serde(default)]
         their_grid: Option<GridSquare>,
+        /// The report WE sent them on the CallingCq → WaitingForReport
+        /// transition (SM-F4). Latched at construction time so a repeated
+        /// `CqResponse` (the caller never copied our report) can re-send an
+        /// IDENTICAL value instead of recomputing from that decode's SNR —
+        /// the same anti-jitter rationale as `SendingReport::our_report`
+        /// (see "REGRESSION 2": the report we give a station must not
+        /// jitter with per-decode SNR noise when they re-request).
+        #[serde(default)]
+        our_report: SignalReport,
     },
 
     /// Sending signal report
@@ -822,6 +831,7 @@ mod tests {
             frequency: 14074000.0,
             started_at: Utc::now(),
             their_grid: None,
+            our_report: -10,
         };
         assert!(!active.is_terminal());
         assert!(active.is_active());
@@ -850,6 +860,7 @@ mod tests {
             frequency: 14074000.0,
             started_at: Utc::now(),
             their_grid: None,
+            our_report: -10,
         };
         let v = wait_rpt.ladder_view(QsoRole::Caller).unwrap();
         assert_eq!(v.index, 1);
@@ -908,6 +919,7 @@ mod tests {
             frequency: 14074000.0,
             started_at: Utc::now(),
             their_grid: None,
+            our_report: -10,
         };
         let v = wait_rpt.ladder_view(QsoRole::Cqer).unwrap();
         assert_eq!(v.labels, vec!["CQ", "Grid", "Rpt", "R-Rpt", "RR73"]);
