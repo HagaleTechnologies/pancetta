@@ -114,6 +114,11 @@ pub enum TuiMessage {
         needed: bool,
         /// Entity is an ATNO (all-time new one). Subset of `needed`.
         atno: bool,
+        /// Entity never worked on THIS specific band before, per the local
+        /// QSO database. Independent of `needed`/`atno` (cqdx's needed set
+        /// for the operator's currently-tuned band, not necessarily this
+        /// spot's own band). 2026-07-18, DX Hunter per-band-needed gap.
+        band_needed: bool,
     },
     /// Error message
     Error { component: String, message: String },
@@ -682,6 +687,7 @@ impl TuiRunner {
                 worked_before,
                 needed,
                 atno,
+                band_needed,
             } => {
                 // For now use FT8 as default mode
                 app.add_dx_spot(
@@ -692,6 +698,7 @@ impl TuiRunner {
                     worked_before,
                     needed,
                     atno,
+                    band_needed,
                 );
             }
             TuiMessage::Error {
@@ -3416,6 +3423,7 @@ mod key_tests {
                     worked_before: false,
                     needed: true,
                     atno: false,
+                    band_needed: false,
                     priority_score: 800,
                     source: crate::app::SpotSource::Local,
                     entity_name: None,
@@ -3974,6 +3982,7 @@ mod key_tests {
             worked_before: false,
             needed: false,
             atno: false,
+            band_needed: false,
             priority_score: None,
         };
         app.write().await.add_decoded_message(stale).await.unwrap();
@@ -4069,6 +4078,7 @@ mod key_tests {
                     worked_before: false,
                     needed: true,
                     atno: false,
+                    band_needed: false,
                     priority_score: 800,
                     source: crate::app::SpotSource::Local,
                     entity_name: None,
@@ -4243,6 +4253,7 @@ mod key_tests {
                     worked_before: false,
                     needed: false,
                     atno: false,
+                    band_needed: false,
                     priority_score: None,
                 });
             assert_eq!(a.focused_callsign().as_deref(), Some("G8KHF"));

@@ -94,6 +94,14 @@ pub struct CachedStationLookup {
     /// Callsigns worked per band.  Key = uppercase band name (e.g. "20M"),
     /// value = set of uppercased callsigns worked on that band.
     worked_on_band: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// DXCC entities worked per band, derived locally from `worked_on_band`
+    /// via the offline prefix→entity resolver (`pancetta_tui::dxcc`) — no
+    /// cqdx dependency. Key = uppercase band name, value = set of resolved
+    /// entity names (e.g. "Japan"). A callsign whose prefix doesn't resolve
+    /// contributes nothing (safe: never claims an unresolvable entity is
+    /// "needed"). Powers `is_dxcc_needed_on_band` (2026-07-18, DX Hunter
+    /// per-band-needed gap — see docs/DECISIONS/2026-07-development-phases-and-gaps.md).
+    worked_dxcc_on_band: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Callsigns where a recent QSO attempt failed.
     recent_failures: Arc<RwLock<HashSet<String>>>,
     /// DXCC entities still needed.
@@ -138,6 +146,7 @@ impl CachedStationLookup {
     pub fn new() -> Self {
         Self {
             worked_on_band: Arc::new(RwLock::new(HashMap::new())),
+            worked_dxcc_on_band: Arc::new(RwLock::new(HashMap::new())),
             recent_failures: Arc::new(RwLock::new(HashSet::new())),
             needed_dxcc: Arc::new(RwLock::new(HashSet::new())),
             needed_atno: Arc::new(RwLock::new(HashSet::new())),
@@ -181,6 +190,37 @@ impl CachedStationLookup {
             "CachedStationLookup: seeded {} worked station(s) on {} from QSO database",
             set.len(),
             band
+        );
+    }
+
+    /// Seed `worked_dxcc_on_band` from every (band, callsign) pair ever
+    /// worked, loaded out-of-band (the QSO database at startup — see
+    /// `QsoDatabase::get_worked_bands_and_callsigns`, which pulls ALL bands
+    /// in one query since, unlike `seed_worked_from_list`, the DX Hunter
+    /// needs this for bands other than wherever the rig happens to be
+    /// tuned at startup). Each callsign is resolved to a DXCC entity name
+    /// via the offline prefix resolver; unresolvable callsigns are skipped.
+    pub fn seed_worked_dxcc_from_list(&self, pairs: Vec<(String, String)>) {
+        let mut map = self.worked_dxcc_on_band.write();
+        let mut resolved = 0usize;
+        let mut skipped = 0usize;
+        for (band, callsign) in pairs {
+            match pancetta_tui::dxcc::entity_for_callsign(&callsign) {
+                Some(entity) => {
+                    map.entry(band.to_uppercase())
+                        .or_default()
+                        .insert(entity.to_string());
+                    resolved += 1;
+                }
+                None => skipped += 1,
+            }
+        }
+        tracing::info!(
+            "CachedStationLookup: seeded per-band worked-DXCC from {} resolved QSO(s) \
+             across {} band(s) ({} callsign(s) had no resolvable entity)",
+            resolved,
+            map.len(),
+            skipped
         );
     }
 
@@ -238,6 +278,16 @@ impl CachedStationLookup {
             .entry(band.to_uppercase())
             .or_default()
             .insert(callsign.to_uppercase());
+        // Keep worked_dxcc_on_band live-updated as QSOs complete during the
+        // session, not just at startup seeding — same resolver, same
+        // skip-if-unresolvable behavior as seed_worked_dxcc_from_list.
+        if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(callsign) {
+            self.worked_dxcc_on_band
+                .write()
+                .entry(band.to_uppercase())
+                .or_default()
+                .insert(entity.to_string());
+        }
     }
 }
 
@@ -292,6 +342,17 @@ impl WorkedStationLookup for CachedStationLookup {
         }
         let upper = callsign.to_uppercase();
         atno.iter().any(|prefix| upper.starts_with(prefix.as_str()))
+    }
+
+    fn is_dxcc_needed_on_band(&self, callsign: &str, freq_hz: f64) -> bool {
+        // Unresolvable callsign (no matching prefix in the offline table):
+        // never claim "needed" for an entity we can't even identify.
+        let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(callsign) else {
+            return false;
+        };
+        let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
+        let worked = self.worked_dxcc_on_band.read();
+        !worked.get(&band).is_some_and(|set| set.contains(entity))
     }
 
     fn is_needed_grid(&self, grid: &str) -> bool {
@@ -388,6 +449,75 @@ mod tests {
         assert!(lookup.is_duplicate("W1ABC", 14_074_000.0));
         assert!(lookup.is_duplicate("K2DEF", 14_074_000.0));
         assert!(!lookup.is_duplicate("W1ABC", 7_074_000.0)); // not on 40m
+    }
+
+    // --- DX Hunter per-band-needed (2026-07-18) ---
+
+    #[test]
+    fn dxcc_needed_on_band_true_before_ever_worked() {
+        let lookup = CachedStationLookup::new();
+        // JA1ABC resolves to a real DXCC entity (Japan) via the offline
+        // prefix table; nothing has been worked yet, so it's needed.
+        assert!(lookup.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
+    }
+
+    #[test]
+    fn dxcc_needed_on_band_false_after_working_that_band() {
+        let lookup = CachedStationLookup::new();
+        lookup.record_worked("JA1ABC", "20m");
+        assert!(!lookup.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
+    }
+
+    #[test]
+    fn dxcc_needed_on_band_true_on_a_different_band() {
+        // The whole point of this feature: worked on 20m must NOT satisfy
+        // "needed" on 40m — this is per-band, not all-time.
+        let lookup = CachedStationLookup::new();
+        lookup.record_worked("JA1ABC", "20m");
+        assert!(lookup.is_dxcc_needed_on_band("JA1ABC", 7_074_000.0));
+    }
+
+    #[test]
+    fn dxcc_needed_on_band_is_entity_scoped_not_callsign_scoped() {
+        // Working a DIFFERENT station from the SAME DXCC entity on a band
+        // must also satisfy "needed" for that band — this tracks entities,
+        // not individual callsigns (unlike is_duplicate).
+        let lookup = CachedStationLookup::new();
+        lookup.record_worked("JA2XYZ", "20m");
+        assert!(!lookup.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
+    }
+
+    #[test]
+    fn dxcc_needed_on_band_false_for_unresolvable_callsign() {
+        // A callsign with no matching entry in the offline prefix table
+        // must never be reported as "needed" for an entity we can't even
+        // identify (safe default, matches the fn's own doc contract).
+        let lookup = CachedStationLookup::new();
+        assert!(!lookup.is_dxcc_needed_on_band("1", 14_074_000.0));
+    }
+
+    #[test]
+    fn seed_worked_dxcc_from_list_matches_record_worked() {
+        let seeded = CachedStationLookup::new();
+        seeded.seed_worked_dxcc_from_list(vec![("20m".to_string(), "JA1ABC".to_string())]);
+
+        let recorded = CachedStationLookup::new();
+        recorded.record_worked("JA1ABC", "20m");
+
+        for lookup in [&seeded, &recorded] {
+            assert!(!lookup.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
+            assert!(lookup.is_dxcc_needed_on_band("JA1ABC", 7_074_000.0));
+        }
+    }
+
+    #[test]
+    fn seed_worked_dxcc_from_list_skips_unresolvable_callsigns_without_panicking() {
+        let lookup = CachedStationLookup::new();
+        lookup.seed_worked_dxcc_from_list(vec![
+            ("20m".to_string(), "1".to_string()),
+            ("20m".to_string(), "JA1ABC".to_string()),
+        ]);
+        assert!(!lookup.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
     }
 
     #[test]

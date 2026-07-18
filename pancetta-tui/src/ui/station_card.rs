@@ -184,6 +184,7 @@ mod tests {
             worked_before: false,
             needed: false,
             atno: false,
+            band_needed: false,
             priority_score: None,
         }
     }
@@ -314,6 +315,7 @@ mod tests {
                 worked_before: false,
                 needed: false,
                 atno: false,
+                band_needed: false,
                 priority_score: 0,
                 source: crate::app::SpotSource::Local,
                 entity_name: Some("Japan".to_string()),

@@ -96,6 +96,14 @@ pub struct DecodedMessageView {
     /// any band). A strict subset of `needed`. Test-default false.
     #[serde(default)]
     pub atno: bool,
+    /// `true` if this station's DXCC entity has never been worked on THIS
+    /// SPECIFIC band before, per the local QSO database — independent of
+    /// `needed`/`atno` (which reflect cqdx's needed set for the operator's
+    /// currently-tuned band, not necessarily this row's own band). A
+    /// local, cqdx-independent signal (2026-07-18, DX Hunter
+    /// per-band-needed gap). Test-default false.
+    #[serde(default)]
+    pub band_needed: bool,
     /// Pre-computed display priority score from the coordinator's real
     /// `PriorityScorer` (continuous f64 mapped to [0, 1000]). Set by the
     /// tui-relay thread which has access to `CachedStationLookup` and the
@@ -330,12 +338,21 @@ pub struct DxStation {
     pub needed: bool,
     /// Entity is an ATNO (all-time new one). Subset of `needed`.
     pub atno: bool,
+    /// Entity never worked on THIS specific band before, per the local QSO
+    /// database — independent of `needed`/`atno` (cqdx's needed set for
+    /// the operator's currently-tuned band, not necessarily this row's own
+    /// band). 2026-07-18, DX Hunter per-band-needed gap.
+    pub band_needed: bool,
     pub priority_score: u32,
     // CQDX network metadata
     pub source: SpotSource,
     /// DXCC entity / country name (e.g. "Japan"), from the cqdx live-spot
     /// `dxEntityName`. `Some` for network/Both spots; `None` for local-only
-    /// decodes and DX-cluster spots (no entity resolver in the TUI yet).
+    /// decodes and DX-cluster spots — but `dx_hunter::draw`'s row renderer
+    /// falls back to the offline `crate::dxcc::entity_for_callsign` prefix
+    /// resolver in that case, so the DX Hunter column is not blank ("---")
+    /// for local-only stations (fixed 2026-06-26; this field itself stays
+    /// `None`, only the rendered column is filled in).
     pub entity_name: Option<String>,
     pub rarity_tier: Option<String>,
     pub reporter_count: Option<u32>,
@@ -1559,6 +1576,7 @@ impl App {
                     entry.worked_before = message.worked_before;
                     entry.needed = message.needed;
                     entry.atno = message.atno;
+                    entry.band_needed = message.band_needed;
                     entry.audio_offset_hz = Some(audio_offset_hz);
                     entry.slot_parity = message.slot_parity;
                     // A station previously known only from the network is
@@ -1593,6 +1611,7 @@ impl App {
                             worked_before: message.worked_before,
                             needed: message.needed,
                             atno: message.atno,
+                            band_needed: message.band_needed,
                             priority_score: local_score,
                             source: SpotSource::Local,
                             entity_name: None,
@@ -2317,6 +2336,7 @@ impl App {
         worked_before: bool,
         needed: bool,
         atno: bool,
+        band_needed: bool,
     ) {
         // Never insert our own station into the DX Hunter. (#42 extension)
         if self.is_our_call(&callsign) {
@@ -2337,6 +2357,7 @@ impl App {
             worked_before,
             needed,
             atno,
+            band_needed,
             priority_score: 0,
             source: SpotSource::Local,
             entity_name: None,
@@ -3215,6 +3236,12 @@ impl App {
                     worked_before: false,
                     needed: spot.needed,
                     atno: spot.atno,
+                    // Not computed for cqdx live-spot groups: this path (the
+                    // TUI's cqdx network feed) has no access to the
+                    // coordinator's CachedStationLookup that the local
+                    // per-band QSO-DB cross-reference needs. Network spots
+                    // rely on cqdx's own `needed`/`atno` flags instead.
+                    band_needed: false,
                     priority_score: 0,
                     source: SpotSource::Network,
                     entity_name: Some(spot.entity_name.clone()).filter(|s| !s.is_empty()),
@@ -3712,6 +3739,7 @@ mod tests {
             worked_before: false,
             needed: false,
             atno: false,
+            band_needed: false,
             priority_score: None,
         }
     }
@@ -4587,12 +4615,14 @@ mod tests {
             false,
             false,
             false,
+            false,
         );
         app.add_dx_spot(
             "k5arh".to_string(),
             14.074,
             "FT8".to_string(),
             -10,
+            false,
             false,
             false,
             false,
@@ -4608,6 +4638,7 @@ mod tests {
             14.074,
             "FT8".to_string(),
             -5,
+            false,
             false,
             false,
             false,
@@ -4682,6 +4713,7 @@ mod tests {
                 worked_before: false,
                 needed: false,
                 atno: false,
+                band_needed: false,
                 priority_score: 0,
                 source: SpotSource::Local,
                 entity_name: None,
@@ -4792,6 +4824,7 @@ mod tests {
             worked_before,
             needed: false,
             atno: false,
+            band_needed: false,
             priority_score: priority,
             source: SpotSource::Local,
             entity_name: None,

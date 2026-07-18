@@ -479,6 +479,7 @@ mod tests {
             worked_before: false,
             needed: false,
             atno: false,
+            band_needed: false,
             priority_score: None,
         }
     }

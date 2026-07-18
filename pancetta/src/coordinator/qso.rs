@@ -1352,6 +1352,15 @@ impl super::ApplicationCoordinator {
                         } else {
                             qso_lookup.seed_worked_from_list(&band, callsigns);
                         }
+
+                        // DX Hunter per-band-needed (2026-07-18): unlike the
+                        // duplicate-filter seed above (current band only),
+                        // this pulls every band in one query so DX Hunter
+                        // rows on OTHER bands can be evaluated too.
+                        let band_callsign_pairs = db.get_worked_bands_and_callsigns().await;
+                        if !band_callsign_pairs.is_empty() {
+                            qso_lookup.seed_worked_dxcc_from_list(band_callsign_pairs);
+                        }
                     } else {
                         warn!(
                             "Could not open QSO database for startup seed ({}) — \
