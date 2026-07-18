@@ -2520,9 +2520,10 @@ mod tests {
             .collect();
         let spectral = op.spectral_snapshot.as_ref().unwrap();
 
-        for (slot_parity, expected_time_slot) in
-            [(SlotParity::Even, TimeSlot::First), (SlotParity::Odd, TimeSlot::Second)]
-        {
+        for (slot_parity, expected_time_slot) in [
+            (SlotParity::Even, TimeSlot::First),
+            (SlotParity::Odd, TimeSlot::Second),
+        ] {
             let via_operator = op.allocate_smart_frequency(Some(1500.0), Some(slot_parity));
             let via_direct_ranking = op
                 .smart_allocator
