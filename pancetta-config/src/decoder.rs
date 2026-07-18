@@ -124,6 +124,32 @@ pub struct DecoderConfig {
     /// for the measured elapsed-time delta.
     #[serde(default)]
     pub extended_capture_window_enabled: bool,
+    /// 2026-07-17 operator finding: AP (a priori) decoding biases the LDPC
+    /// solver toward finding *our own callsign* in a signal — by design, so
+    /// weak genuine calls to us decode — but the same bias can converge on
+    /// pure noise and produce a phantom "someone is calling us" message
+    /// (`pancetta-ft8/src/decoder.rs`'s own comment: "AP injection biases
+    /// the LDPC solver toward our callsign, producing phantom messages...
+    /// from noise"). Observed live: repeated decodes of other stations
+    /// calling a `/P`-suffixed variant of the operator's callsign at very
+    /// weak SNR (-15 to -17 dB), triggering the always-answer-callers path
+    /// (#39) to reply mid-QSO to calls that were never actually made.
+    ///
+    /// When `true`: every decode (AP and non-AP) is still logged with its
+    /// `ap_level`, but any decode with `ap_level > 0` is filtered out
+    /// immediately after the FP filter — before it reaches the TUI, the
+    /// QSO engine (so it can never trigger always-answer-callers or be
+    /// pounced on by the autonomous operator), cross-slot state, or any
+    /// other consumer. Non-AP decodes (`ap_level == 0`, i.e. plain ft8_lib
+    /// / native LDPC decodes with no callsign-hypothesis injection) are
+    /// completely unaffected. This is a data-collection mode: it lets an
+    /// operator see what AP WOULD have decoded, without letting it drive
+    /// real QSO behavior, while the false-positive rate is investigated.
+    ///
+    /// Default `false` (AP decodes participate normally, matching behavior
+    /// before this flag existed).
+    #[serde(default)]
+    pub ap_eval_mode: bool,
 }
 
 impl Default for DecoderConfig {
@@ -132,6 +158,7 @@ impl Default for DecoderConfig {
             effort: DecodeEffort::Auto,
             budget_ms: None,
             extended_capture_window_enabled: false,
+            ap_eval_mode: false,
         }
     }
 }
@@ -151,6 +178,7 @@ impl ConfigSection for DecoderConfig {
         self.effort = other.effort;
         self.budget_ms = other.budget_ms;
         self.extended_capture_window_enabled = other.extended_capture_window_enabled;
+        self.ap_eval_mode = other.ap_eval_mode;
     }
 }
 

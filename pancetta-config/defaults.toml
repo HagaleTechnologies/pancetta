@@ -173,6 +173,7 @@ recent_failure_penalty = -0.15
 signal_strength = 0.05
 
 [decoder]
+ap_eval_mode = false
 effort = "auto"
 extended_capture_window_enabled = false
 
