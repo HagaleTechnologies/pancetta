@@ -3,14 +3,19 @@
 //! hb-052 production version. The eval-harness MVP
 //! (pancetta-research/src/fp_filter.rs) showed -21.7% novels at -0.02%
 //! recall on hard-200 with a corpus-baseline reference set. Production
-//! deployment uses three combined sources:
+//! deployment uses four combined sources:
 //!
 //! 1. **ADIF log** — operator's logged QSO callsigns (~/.pancetta/qsos.adi)
-//! 2. **Rolling window** — callsigns from recent decodes this session
+//! 2. **Rolling window** — callsigns from decodes ACCEPTED this session
 //! 3. **cqdx.io spots** — live network-wide spotted callsigns
+//! 4. **Observed** (2026-07-17) — callsigns seen in ANY prior window's raw
+//!    decode, accepted or not (see `note_window_raw_calls`). Grants a
+//!    genuinely new, repeating station continuity starting its second
+//!    window instead of being permanently rejected (source 2 alone can
+//!    never grow from a rejected decode, since it only records acceptances).
 //!
 //! The filter accepts a decode if any of its extracted callsigns appear
-//! in the union of those three sources. Decodes with no extractable
+//! in the union of those four sources. Decodes with no extractable
 //! callsigns are rejected.
 //!
 //! **Cold-start handling:** at session start, the rolling window is
@@ -20,8 +25,8 @@
 //! threshold is crossed, the filter activates.
 //!
 //! Threading: `accept` takes `&self` and uses interior mutability for
-//! the rolling window — safe to share across the coordinator's decode
-//! pipeline.
+//! the rolling window and the observed-window set — safe to share across
+//! the coordinator's decode pipeline.
 
 use std::collections::{HashSet, VecDeque};
 use std::path::Path;
@@ -198,10 +203,13 @@ pub fn parse_adif_calls(text: &str) -> Vec<String> {
 
 /// Production callsign-continuity filter. Reference set built from:
 /// - Static ADIF log (loaded once on construction or via extend_from_adif)
-/// - Rolling window of recent decodes (interior-mutable)
+/// - Rolling window of recent ACCEPTED decodes (interior-mutable)
 /// - cqdx.io spots (refreshed by the caller via update_spotted)
+/// - Observed set of callsigns from ANY prior window's raw decode,
+///   accepted or not (interior-mutable; see `note_window_raw_calls`)
 ///
-/// Thread-safe via RwLock on rolling window + cqdx set.
+/// Thread-safe via RwLock on the rolling window, the observed set, and
+/// the cqdx set.
 pub struct CallsignContinuityFilter {
     /// Static reference: operator's ADIF log (and any explicit additions).
     /// Built up before/during startup; not modified per-decode.
