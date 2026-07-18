@@ -753,6 +753,20 @@ impl super::ApplicationCoordinator {
                         // the authoritative result; the QSO state machine
                         // deduplicates by verifying from_station ==
                         // expected DX callsign per is_message_relevant.
+                        //
+                        // `[decoder].ap_eval_mode` does NOT gate this path:
+                        // it dispatches straight to the QSO component below,
+                        // before `partition_ap_eval_decodes` runs on the
+                        // standard pipeline's output. This is safe today
+                        // only because it always calls with
+                        // `ApContext::default()` (`my_call: None`), which
+                        // structurally disables the own-callsign AP hypotheses
+                        // (AP1-4) that the eval mode exists to gate — see
+                        // `decode_window_with_ap_scoped_partner_budgeted`'s
+                        // `my_call.is_some()` guard. If this path ever starts
+                        // passing a real `ApContext`, it must also route
+                        // through `partition_ap_eval_decodes` (or be dropped
+                        // when `ap_eval_mode` is on).
                         const SCOPED_HALF_WIDTH: usize = 5;
                         let scoped_fast_path_enabled = scoped_fast_path.load(Ordering::Relaxed);
                         let scoped_decodes: Vec<pancetta_ft8::DecodedMessage> =
