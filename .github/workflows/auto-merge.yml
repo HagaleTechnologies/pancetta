@@ -1,0 +1,41 @@
+name: Auto-Merge
+
+# General-purpose auto-merge for PRs from trusted authors, once all CI
+# checks pass. Complements dependabot-auto-merge.yml (which handles
+# dependabot[bot] PRs with its own semver-classification logic) —
+# this one covers everyone else.
+#
+# Requires branch protection on `main` with `CI` as a required status
+# check (added 2026-07-18). Without that, `gh pr merge --auto` has
+# nothing formal to wait for and can complete before CI finishes — this
+# is exactly what caused PR #125 to auto-merge while CI was still red
+# (see dependabot-auto-merge.yml's classify-breaking-updates comment).
+on:
+  pull_request_target:
+    types: [opened, reopened, synchronize, ready_for_review]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    # Trusted-author gate, mirroring dependabot-auto-merge.yml's
+    # `github.actor == 'dependabot[bot]'` pattern. This repo is public:
+    # without this gate, any external contributor's PR would merge
+    # itself the moment CI turns green, with no human in the loop.
+    # OWNER / MEMBER / COLLABORATOR covers the repo owner and anyone
+    # explicitly granted collaborator access; a first-time or outside
+    # contributor's PR (CONTRIBUTOR / FIRST_TIME_CONTRIBUTOR / NONE)
+    # still needs a manual merge even after CI passes.
+    if: |
+      github.event.pull_request.draft == false &&
+      contains(fromJSON('["OWNER", "COLLABORATOR", "MEMBER"]'), github.event.pull_request.author_association)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enable auto-merge
+        env:
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr merge "$PR_URL" --auto --squash
