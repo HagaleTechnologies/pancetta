@@ -402,6 +402,34 @@ fn tx_qso_is_live(
     }
 }
 
+/// Multi-TX key-time drop decision (Step 4b).
+///
+/// 2026-07-17 operator finding: a multi-TX bundle's waveform is summed
+/// once, up front (Step 1), from whichever items survived Step 0b's
+/// per-item liveness filter. The bundle then waits (Step 4) for the PTT
+/// engage instant, and that wait CAN span an operator abort ('k') of one
+/// of the bundled QSOs. Because the waveform is already a single summed
+/// buffer at that point, it can't be partially re-filtered — so the OLD
+/// key-time gate only checked "did EVERY item go stale" and, if even one
+/// item was still live, transmitted the WHOLE pre-summed audio, including
+/// the now-cancelled item's already-baked-in call. Operator-observed
+/// symptom: killing a QSO to one DX station while a second, still-live
+/// QSO shared the same bundle still transmitted a call to the killed one.
+///
+/// Fix: require EVERY bundled item to still be live at key-time, not just
+/// one. If anything went stale during the wait, the whole bundle is
+/// dropped — the still-live item(s) lose one 15s TX cycle (they'll be
+/// re-planned into the next slot normally), which is a far smaller cost
+/// than transmitting a call to a station the operator explicitly killed.
+fn multi_tx_bundle_still_fully_live(
+    qso_ids: &[Option<String>],
+    active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+) -> bool {
+    qso_ids
+        .iter()
+        .all(|id| tx_qso_is_live(id.as_deref(), active_tx_qsos))
+}
+
 /// Whether a **remote-originated** TX request is permitted to key PTT right now,
 /// per the station-agent arm gate.
 ///
@@ -2073,25 +2101,34 @@ impl super::ApplicationCoordinator {
 
                                     // --- Step 4b: Drop-stale-TX gate (key-time) ---
                                     // The slot wait can span the moment a QSO ends.
-                                    // The summed waveform can't be re-filtered now,
-                                    // but if EVERY item's QSO went terminal during
-                                    // the wait, skip the whole bundle rather than key
-                                    // PTT for a dead exchange.
-                                    if !items.iter().any(|it| {
-                                        tx_qso_is_live(it.qso_id.as_deref(), &active_tx_qsos)
-                                    }) {
+                                    // The summed waveform can't be partially
+                                    // re-filtered now, so this is all-or-nothing:
+                                    // if ANY encoded item's QSO went terminal
+                                    // during the wait, drop the WHOLE bundle
+                                    // rather than transmit a cancelled QSO's call
+                                    // baked into the same audio as a still-live
+                                    // one (2026-07-17 fix — was `.any(..)`, which
+                                    // let a single still-live item carry a
+                                    // cancelled bundle-mate's stale call onto the
+                                    // air). Checked against `encoded_qso_ids`
+                                    // (what actually made it into the summed
+                                    // waveform), not the pre-encode `items` list.
+                                    if !multi_tx_bundle_still_fully_live(
+                                        &encoded_qso_ids,
+                                        &active_tx_qsos,
+                                    ) {
                                         info!(
                                             target: "pancetta::tx.policy",
-                                            "dropping stale multi-TX bundle: all {} item(s) belong to ended QSOs",
-                                            items.len()
+                                            "dropping stale multi-TX bundle: {} item(s), not all still live",
+                                            encoded_qso_ids.len()
                                         );
                                         emit_diagnostic(
                                             &message_bus,
                                             "tx.policy",
                                             pancetta_core::DiagnosticLevel::Info,
                                             format!(
-                                                "dropping stale multi-TX bundle: all {} item(s) belong to ended QSOs",
-                                                items.len()
+                                                "dropping stale multi-TX bundle: {} item(s), not all still live",
+                                                encoded_qso_ids.len()
                                             ),
                                             None,
                                         )
@@ -2827,6 +2864,55 @@ mod schedule_tx_tests {
         assert!(set.is_poisoned());
         // Even for a qso_id that would otherwise be "ended", fail-open → true.
         assert!(super::tx_qso_is_live(Some("qso-ended"), &set));
+    }
+
+    /// 2026-07-17 fix: the multi-TX key-time gate must require EVERY bundled
+    /// item to still be live, not just one — a single still-live item must
+    /// NOT be enough to carry a cancelled bundle-mate's stale call onto the
+    /// air, since the summed waveform can't be partially re-filtered.
+    #[test]
+    fn multi_tx_bundle_requires_every_item_live() {
+        use std::collections::HashSet;
+        use std::sync::{Arc, RwLock};
+        let set: Arc<RwLock<HashSet<String>>> = Arc::new(RwLock::new(HashSet::new()));
+        set.write()
+            .unwrap()
+            .insert(super::super::active_tx_qso_key("qso-peru"));
+
+        // All live → transmit.
+        assert!(super::multi_tx_bundle_still_fully_live(
+            &[Some("qso-peru".to_string())],
+            &set
+        ));
+
+        // One live (Peru), one stale (Kenya, cancelled — not in the set):
+        // the operator's exact reported scenario. Must now DROP the whole
+        // bundle instead of transmitting Kenya's stale call alongside
+        // Peru's live one.
+        assert!(!super::multi_tx_bundle_still_fully_live(
+            &[Some("qso-kenya".to_string()), Some("qso-peru".to_string())],
+            &set
+        ));
+
+        // All stale → drop (matches the pre-fix "all ended" case).
+        assert!(!super::multi_tx_bundle_still_fully_live(
+            &[Some("qso-kenya".to_string())],
+            &set
+        ));
+
+        // A `None` qso_id (manual/tune item) never gates — mixed with a
+        // still-live item, the bundle stays fully live.
+        assert!(super::multi_tx_bundle_still_fully_live(
+            &[None, Some("qso-peru".to_string())],
+            &set
+        ));
+
+        // A `None` qso_id mixed with a STALE item: the stale item still
+        // fails the gate for the whole bundle.
+        assert!(!super::multi_tx_bundle_still_fully_live(
+            &[None, Some("qso-kenya".to_string())],
+            &set
+        ));
     }
 }
 
