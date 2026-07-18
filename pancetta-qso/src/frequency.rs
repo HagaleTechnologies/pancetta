@@ -274,9 +274,13 @@ impl SmartFrequencyAllocator {
             score += 30.0;
         } else {
             // Partially clear (only our TX slot is free) gets some credit
-            // We don't know our slot here — caller should filter if needed
+            // We don't know our slot here — caller should filter if needed.
+            // FQ-F7: floor this term at 0, not 15 — `15.0_f64.max(...)`
+            // previously clamped UP, so any bin with activity >= 2 scored
+            // an identical flat 15 regardless of how busy it actually was,
+            // defeating the whole point of penalizing busy bins.
             let activity = history.activity_near(freq, 50.0);
-            score += 15.0_f64.max(25.0 - activity as f64 * 5.0);
+            score += (25.0 - activity as f64 * 5.0).max(0.0);
         }
 
         // 2. Low noise floor (lower = better, scale 0–20)
@@ -498,6 +502,55 @@ mod tests {
         );
     }
 
+    /// FQ-F7 regression: the "partially clear" occupancy term must floor at
+    /// 0, not 15 — a heavily-active bin should score far worse than a
+    /// lightly-active one, not get clamped up to the same flat partial
+    /// credit.
+    #[test]
+    fn partially_clear_score_floors_at_zero_not_fifteen() {
+        let allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+        let spectral = empty_spectral();
+
+        // Lightly busy: 1 decode near 1500 Hz, only in the First slot, so
+        // the Second slot remains clear -> "partially clear" branch with
+        // activity=1: (25 - 1*5).max(0) = 20.
+        let mut light_history = empty_history();
+        light_history.push_cycle(vec![DecodeRecord {
+            frequency_hz: 1500.0,
+            time_slot: TimeSlot::First,
+        }]);
+
+        // Heavily busy: 10 decodes clustered near 1500 Hz in the First
+        // slot -> activity=10, so (25 - 10*5).max(0) should floor at 0,
+        // not clamp back up to 15.
+        let mut heavy_history = empty_history();
+        let mut heavy_records = Vec::new();
+        for i in 0..10 {
+            heavy_records.push(DecodeRecord {
+                frequency_hz: 1500.0 + i as f64, // all within the 50 Hz radius
+                time_slot: TimeSlot::First,
+            });
+        }
+        heavy_history.push_cycle(heavy_records);
+
+        let light_score = allocator.score_candidate(1500.0, &spectral, &light_history, &[], None);
+        let heavy_score = allocator.score_candidate(1500.0, &spectral, &heavy_history, &[], None);
+
+        // Isolate the effect: only the occupancy-related terms (#1 and #4)
+        // differ between light and heavy history; everything else (noise,
+        // neighbor peak, center bias, DX proximity, own-freq) is identical
+        // since both histories are otherwise empty. Term #1 alone should
+        // account for a 20-point swing (20 -> 0), not the pre-fix 5-point
+        // swing (20 -> 15, since `.max(15.0)` used to clamp the heavy case
+        // back up).
+        assert!(
+            heavy_score < light_score - 15.0,
+            "heavy occupancy (score={heavy_score}) should score much worse \
+             than light occupancy (score={light_score}); pre-fix the gap \
+             was clamped to only ~5 points"
+        );
+    }
+
     #[test]
     fn test_decode_history_rolling_buffer() {
         // max-2 buffer: push 3 cycles, oldest should be dropped
@@ -577,6 +630,62 @@ mod tests {
             power_at_600 < 0.01,
             "Expected quiet power near 600 Hz, got {}",
             power_at_600
+        );
+    }
+
+    /// FQ-F1 regression: the FT8 decoder's waterfall bins start at 0 Hz
+    /// (`pancetta-ft8/src/decoder.rs`'s `bin_start = 0usize`, spanning
+    /// ~0-3000 Hz), so a `SpectralSnapshot` built from real waterfall data
+    /// must be labeled `freq_min_hz: 0.0` to match — NOT 200.0, which used
+    /// to mislabel the axis and make `power_near`/`peak_near` read a bin
+    /// ~100-200 Hz away from the frequency actually being scored. This
+    /// proves the bin-index math in this file is correct for the corrected
+    /// (0-3000 Hz) axis: a synthetic peak placed at a known real-world
+    /// offset must be read back from exactly that offset, not a shifted one.
+    #[test]
+    fn power_near_reads_correct_bin_on_corrected_zero_hz_axis() {
+        let num_bins = 150; // matches the ~150-bin waterfall used in production
+        let mut power_bins = vec![0.0f32; num_bins];
+        let freq_min_hz = 0.0;
+        let freq_max_hz = 3000.0;
+        let bin_width = (freq_max_hz - freq_min_hz) / num_bins as f64;
+
+        // Place a synthetic peak at a known real-world offset: 1500 Hz.
+        let peak_offset_hz = 1500.0;
+        let peak_bin = (peak_offset_hz / bin_width) as usize;
+        power_bins[peak_bin] = 0.9;
+
+        let spectral = SpectralSnapshot {
+            power_bins,
+            freq_min_hz,
+            freq_max_hz,
+        };
+
+        // Reading AT the real offset must see the peak (radius 0 pins the
+        // lookup to exactly the center bin, avoiding averaging dilution).
+        let at_peak = spectral.power_near(peak_offset_hz, 0.0);
+        assert!(
+            (at_peak - 0.9).abs() < 1e-6,
+            "Expected to find the peak at its real 1500 Hz offset, got {}",
+            at_peak
+        );
+        let peak_val = spectral.peak_near(peak_offset_hz, 20.0);
+        assert!(
+            (peak_val - 0.9).abs() < 1e-6,
+            "Expected peak_near to read the exact peak value at 1500 Hz, got {}",
+            peak_val
+        );
+
+        // Reading at the OLD (mislabeled) 200-Hz-shifted interpretation of
+        // this offset (i.e. what a caller using freq_min_hz=200.0 would
+        // have actually landed on, roughly 200 Hz away) must NOT see it —
+        // this is what the bug looked like: scoring code asking for 1500 Hz
+        // actually read data belonging to a different real frequency.
+        let shifted = spectral.power_near(peak_offset_hz - 200.0, 20.0);
+        assert!(
+            shifted < 0.1,
+            "Expected no peak 200 Hz away from the real peak location, got {}",
+            shifted
         );
     }
 }

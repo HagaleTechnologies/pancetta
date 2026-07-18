@@ -562,6 +562,15 @@ impl super::ApplicationCoordinator {
         // now driving (autonomous Auto QSOs land here once created), and so we
         // don't open a second pounce while one is already in progress.
         let active_tx_qsos = self.active_tx_qsos.clone();
+        // FQ-F3: active QSO id -> TX offset (Hz), maintained by
+        // `coordinator/qso.rs`'s event-forwarding task at the same
+        // insert/remove points as `active_tx_qsos` above. Synced each tick
+        // into the operator's own-frequency registry (see the
+        // `set_own_frequencies` call below) so the smart frequency
+        // allocator's own-frequency-separation criterion can actually fire —
+        // before this wiring, `register_qso_frequency`/
+        // `release_qso_frequency` were only ever called from unit tests.
+        let active_tx_offsets = self.active_tx_offsets.clone();
         // Task 15: the operator's parked TX-offset atomic (0 = unparked),
         // cloned into the task so the per-slot tick can read it alongside
         // the placement snapshot it already computes (Task 9) and detect a
@@ -640,7 +649,13 @@ impl super::ApplicationCoordinator {
                                     }
                                     op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
                                         power_bins: avg,
-                                        freq_min_hz: 200.0,
+                                        // The waterfall's bins start at 0 Hz
+                                        // (see `pancetta-ft8/src/decoder.rs`'s
+                                        // `bin_start = 0usize`); this label
+                                        // must match that real axis so
+                                        // `power_near`/`peak_near`'s bin-index
+                                        // math reads the correct bin (FQ-F1).
+                                        freq_min_hz: 0.0,
                                         freq_max_hz: 3000.0,
                                     });
                                 }
@@ -740,6 +755,24 @@ impl super::ApplicationCoordinator {
                                 .map(|s| s.len() as u32)
                                 .unwrap_or(0);
                             op.set_active_qso_count(active_now);
+
+                            // FQ-F3: sync the own-frequency registry from the
+                            // coordinator-level snapshot each tick. Bulk
+                            // replace (not diff-based register/release) —
+                            // see `FrequencyAllocator::set_own_frequencies`'s
+                            // doc comment for why: it can never leak a
+                            // stale entry, since every tick's wholesale
+                            // replace self-heals any drift. Fail-open to an
+                            // empty map on a poisoned lock, matching
+                            // `active_now`'s own fail-open convention just
+                            // above (this is the same non-safety-critical
+                            // scoring input, not the TX-safety gate below).
+                            let own_freqs = active_tx_offsets
+                                .read()
+                                .map(|m| m.clone())
+                                .unwrap_or_default();
+                            op.frequency_allocator_mut()
+                                .set_own_frequencies(own_freqs);
 
                             // Task 16: opt-in auto-repark (default OFF —
                             // `auto_repark_enabled` is inert unless the
@@ -1172,6 +1205,49 @@ impl super::ApplicationCoordinator {
                                         bundled.push((item, p));
                                     }
                                 }
+
+                                // FQ-F4/TX-F6 defense-in-depth: pairwise
+                                // frequency-separation check, mirroring the
+                                // TX-worker coalescer's belt-and-suspenders
+                                // check (see `coalesce_transmit_requests` in
+                                // tx.rs). `modulate_multi_tx` fails the WHOLE
+                                // bundle — not just the colliding pair — if
+                                // any two folded streams' offsets are closer
+                                // than its minimum separation (bandwidth + 25
+                                // Hz guard). Fix 5's own de-confliction at
+                                // QSO-open time should make this rare; this
+                                // is cheap insurance. Exclude (don't coerce)
+                                // a later item too close to an
+                                // already-bundled one — it still transmits,
+                                // individually, via the same single-TX path
+                                // below, alongside any parity-excluded items.
+                                let mut freq_checked: Vec<(
+                                    crate::message_bus::TransmitRequestItem,
+                                    Option<pancetta_core::slot::SlotParity>,
+                                )> = Vec::with_capacity(bundled.len());
+                                for (item, p) in bundled.into_iter() {
+                                    let too_close = freq_checked.iter().any(|(kept, _)| {
+                                        (kept.frequency_offset - item.frequency_offset).abs()
+                                            < pancetta_qso::MIN_TX_SEPARATION_HZ
+                                    });
+                                    if too_close {
+                                        warn!(
+                                            target: "pancetta::tx.policy",
+                                            "Multi-TX item (qso_id={:?}) at {:.0} Hz is within \
+                                             {:.0} Hz of an already-bundled item; excluding it \
+                                             from this bundle instead of letting \
+                                             modulate_multi_tx fail the whole bundle — it will \
+                                             be sent individually",
+                                            item.qso_id,
+                                            item.frequency_offset,
+                                            pancetta_qso::MIN_TX_SEPARATION_HZ
+                                        );
+                                        excluded.push((item, p));
+                                    } else {
+                                        freq_checked.push((item, p));
+                                    }
+                                }
+                                let bundled = freq_checked;
 
                                 // Excluded items still transmit — individually, each on
                                 // its own (disagreeing) parity — via the same single-TX

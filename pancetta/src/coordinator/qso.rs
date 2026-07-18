@@ -954,15 +954,34 @@ async fn maybe_answer_caller(
         answer.their_call, answer.step, frequency_hz
     );
 
+    // FQ-F4/TX-F6: de-conflict the raw Tx=Rx candidate (the caller's own
+    // decoded frequency) against our OTHER active streams before latching
+    // it — exactly mirroring `compute_manual_tx_offset`'s pattern (the
+    // manual-call path already does this). Without this, two concurrent
+    // QSOs can collide within MIN_TX_SEPARATION_HZ, which can make
+    // `modulate_multi_tx`'s pairwise-separation check fail the ENTIRE
+    // multi-TX bundle when the coalescer folds them together. A genuine
+    // no-op (byte-identical) when nothing is within MIN_TX_SEPARATION_HZ —
+    // `deconflict_offset` returns the input unchanged in that case.
+    let active = qso_manager.active_tx_offsets().await;
+    let (tx_off, partner_freq) = compute_manual_tx_offset(frequency_hz, false, 0, &active);
+    if tx_off != frequency_hz {
+        info!(
+            target: "qso",
+            "Auto-answer TX offset de-conflicted: caller_freq={:.0} → tx_off={:.0} Hz ({} active)",
+            frequency_hz, tx_off, active.len()
+        );
+    }
+
     match qso_manager
         .respond_to_caller(
             answer.their_call.clone(),
-            frequency_hz,
+            tx_off,
             their_parity,
             answer.step,
             Some(snr),
             answer.their_report,
-            None,  // classify_caller_answer: always Tx=Rx (answering a caller, no held-offset)
+            partner_freq,
             false, // local decode-loop auto-answer, never remote
         )
         .await
@@ -1102,6 +1121,11 @@ impl super::ApplicationCoordinator {
         // gate. The QSO component keeps it in sync from the QsoEvent stream
         // below.
         let active_tx_qsos = self.active_tx_qsos.clone();
+        // FQ-F3: active QSO id -> TX offset (Hz), mirroring `active_tx_qsos`'s
+        // exact insert/remove points (including the 45s completed-grace
+        // window) so the autonomous frequency allocator's own-frequency
+        // registry can be kept in sync each tick.
+        let active_tx_offsets = self.active_tx_offsets.clone();
         // Newest-TX-intent map — written as we forward each MessageToSend so
         // the TX worker can pivot to the freshest message at key-time.
         let latest_tx_intent = self.latest_tx_intent.clone();
@@ -1452,6 +1476,7 @@ impl super::ApplicationCoordinator {
                 let ap_state = active_qso_ap;
                 let qso_freq_state = active_qso_freq_hz;
                 let active_tx_qsos = active_tx_qsos.clone();
+                let active_tx_offsets = active_tx_offsets.clone();
                 let latest_tx_intent = latest_tx_intent.clone();
                 let snapshot_qso_manager = qso_manager.clone();
                 let snapshot_bus = tx_bus.clone();
@@ -1481,7 +1506,15 @@ impl super::ApplicationCoordinator {
                                     let key = super::active_tx_qso_key(&qso_id.to_string());
                                     if new_state.is_active() {
                                         if let Ok(mut set) = active_tx_qsos.write() {
-                                            set.insert(key);
+                                            set.insert(key.clone());
+                                        }
+                                        // FQ-F3: keep the own-frequency
+                                        // registry's source map in sync
+                                        // alongside `active_tx_qsos`.
+                                        if let Some(freq) = new_state.frequency() {
+                                            if let Ok(mut offsets) = active_tx_offsets.write() {
+                                                offsets.insert(key, freq);
+                                            }
                                         }
                                     } else if matches!(
                                         new_state,
@@ -1492,6 +1525,9 @@ impl super::ApplicationCoordinator {
                                         }
                                         if let Ok(mut m) = latest_tx_intent.write() {
                                             m.remove(&key);
+                                        }
+                                        if let Ok(mut offsets) = active_tx_offsets.write() {
+                                            offsets.remove(&key);
                                         }
                                         info!(
                                             target: "tx.policy",
@@ -1813,8 +1849,15 @@ impl super::ApplicationCoordinator {
                                     if let Ok(mut s) = active_tx_qsos.write() {
                                         s.insert(key.clone());
                                     }
+                                    // FQ-F3: same idempotent insert for the
+                                    // offset registry, mirroring the
+                                    // active_tx_qsos insert immediately above.
+                                    if let Ok(mut offsets) = active_tx_offsets.write() {
+                                        offsets.insert(key.clone(), metadata.frequency);
+                                    }
                                     let set = active_tx_qsos.clone();
                                     let intent_map = latest_tx_intent.clone();
+                                    let offsets_map = active_tx_offsets.clone();
                                     let qid = qso_id;
                                     // #40: promote any operator-deferred
                                     // cross-parity manual call once THIS QSO's
@@ -1832,6 +1875,9 @@ impl super::ApplicationCoordinator {
                                         }
                                         if let Ok(mut m) = intent_map.write() {
                                             m.remove(&key);
+                                        }
+                                        if let Ok(mut offsets) = offsets_map.write() {
+                                            offsets.remove(&key);
                                         }
                                         info!(
                                             target: "tx.policy",
@@ -1984,6 +2030,9 @@ impl super::ApplicationCoordinator {
                                     }
                                     if let Ok(mut m) = latest_tx_intent.write() {
                                         m.remove(&key);
+                                    }
+                                    if let Ok(mut offsets) = active_tx_offsets.write() {
+                                        offsets.remove(&key);
                                     }
                                 }
                                 // #40: window freed — promote a deferred call.
@@ -2472,11 +2521,38 @@ impl super::ApplicationCoordinator {
                                             }
                                             let result = match &callsign {
                                                 Some(dx) => {
+                                                    // FQ-F4/TX-F6: de-conflict the
+                                                    // raw Tx=Rx candidate (the DX's
+                                                    // own decoded frequency) against
+                                                    // our OTHER active streams before
+                                                    // latching it, mirroring the
+                                                    // manual-call path's
+                                                    // `compute_manual_tx_offset`
+                                                    // pattern. Byte-identical no-op
+                                                    // when nothing collides.
+                                                    let active =
+                                                        qso_manager.active_tx_offsets().await;
+                                                    let (tx_off, partner) =
+                                                        compute_manual_tx_offset(
+                                                            frequency, false, 0, &active,
+                                                        );
+                                                    if tx_off != frequency {
+                                                        info!(
+                                                            target: "qso.autonomous",
+                                                            "Autonomous pounce TX offset \
+                                                             de-conflicted: dx_freq={:.0} \
+                                                             → tx_off={:.0} Hz ({} active)",
+                                                            frequency, tx_off, active.len()
+                                                        );
+                                                    }
                                                     qso_manager
-                                                        .respond_to_cq(
+                                                        .respond_to_cq_with(
                                                             dx.clone(),
-                                                            frequency,
+                                                            tx_off,
                                                             parity,
+                                                            pancetta_qso::CallInitiation::Auto,
+                                                            partner,
+                                                            false,
                                                         )
                                                         .await
                                                 }

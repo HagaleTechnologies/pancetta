@@ -742,6 +742,19 @@ pub struct CoalesceOutcome {
     /// produce a fresh request for it next slot, sent individually on its own
     /// parity.
     pub parity_excluded: usize,
+    /// FQ-F4/TX-F6 defense-in-depth: how many retained streams were excluded
+    /// from THIS cycle's bundle because their `frequency_offset` fell within
+    /// [`pancetta_qso::MIN_TX_SEPARATION_HZ`] of an already-retained stream.
+    /// `modulate_multi_tx`'s pairwise separation check (bandwidth + 25 Hz
+    /// guard) fails the ENTIRE bundle — not just the colliding pair — if two
+    /// folded streams are too close, so this excludes the later one instead
+    /// of letting the whole bundle's TX silently vanish. Fix 5's own
+    /// de-confliction at QSO-open time (`compute_manual_tx_offset` in
+    /// `coordinator/qso.rs`) should make this rare in practice; this is
+    /// cheap insurance against any other path that still produces
+    /// close-together streams. Same "exclude, don't coerce, it retries
+    /// individually next cycle" semantics as `parity_excluded` above.
+    pub freq_excluded: usize,
 }
 
 impl CoalesceOutcome {
@@ -753,6 +766,7 @@ impl CoalesceOutcome {
             && self.dropped_terminal == 0
             && self.truncated == 0
             && self.parity_excluded == 0
+            && self.freq_excluded == 0
     }
 }
 
@@ -878,6 +892,41 @@ pub fn coalesce_transmit_requests(
         retained = kept;
     }
 
+    // FQ-F4/TX-F6 defense-in-depth: pairwise frequency-separation check.
+    // `modulate_multi_tx` fails the WHOLE bundle (not just the colliding
+    // pair) if any two folded streams' `frequency_offset`s are closer than
+    // its minimum separation (signal bandwidth + 25 Hz guard). Fix 5's own
+    // de-confliction at QSO-open time should make a collision here rare,
+    // but this is cheap insurance against any other path that still
+    // produces close-together streams. Greedy, order-preserving: the
+    // earliest-seen (already-kept) stream at a given offset wins; a later
+    // stream too close to ANY already-kept stream is excluded from this
+    // cycle's bundle only — not coerced onto a different offset, and not
+    // gone permanently (its own TX cadence produces a fresh request next
+    // cycle, which will then coalesce/bundle normally).
+    if retained.len() > 1 {
+        let mut kept: Vec<CoalesceEntry> = Vec::with_capacity(retained.len());
+        for entry in retained.into_iter() {
+            let too_close = kept.iter().any(|k: &CoalesceEntry| {
+                (k.frequency_offset - entry.frequency_offset).abs()
+                    < pancetta_qso::MIN_TX_SEPARATION_HZ
+            });
+            if too_close {
+                warn!(
+                    target: "pancetta::tx.policy",
+                    "TX bundle frequency conflict: stream qso_id={:?} at {:.0} Hz is within \
+                     {:.0} Hz of an already-retained stream this cycle; excluding it from \
+                     this bundle — it will be retried individually on its own offset next cycle",
+                    entry.qso_id, entry.frequency_offset, pancetta_qso::MIN_TX_SEPARATION_HZ
+                );
+                outcome.freq_excluded += 1;
+            } else {
+                kept.push(entry);
+            }
+        }
+        retained = kept;
+    }
+
     outcome.retained = retained;
     outcome
 }
@@ -990,7 +1039,8 @@ async fn coalesce_backlog_into(
         let text = format!(
             "TX backlog coalesced: drained {} request(s) → {} retained; \
              coalesced {} stale (newest-per-QSO wins), dropped {} for ended QSOs, \
-             truncated {} over the {}-stream cap, excluded {} for a bundle-parity conflict",
+             truncated {} over the {}-stream cap, excluded {} for a bundle-parity conflict, \
+             excluded {} for a bundle-frequency conflict",
             backlog_total,
             outcome.retained.len(),
             outcome.coalesced,
@@ -998,6 +1048,7 @@ async fn coalesce_backlog_into(
             outcome.truncated,
             MAX_RETAINED_TX_STREAMS,
             outcome.parity_excluded,
+            outcome.freq_excluded,
         );
         warn!(target: "pancetta::tx.policy", "{}", text);
         emit_diagnostic(
@@ -3589,6 +3640,22 @@ mod coalesce_tests {
         }
     }
 
+    /// Like [`entry`] but with an explicit `frequency_offset` — used by tests
+    /// that expect ≥2 entries to survive together in `retained` (the
+    /// FQ-F4/TX-F6 frequency-separation exclusion pass would otherwise treat
+    /// same-frequency retained entries as a bundle-frequency conflict, since
+    /// `entry`'s default 1000.0 Hz is shared by every plain `entry(...)`
+    /// call in this module).
+    fn entry_freq(text: &str, qso_id: Option<&str>, freq: f64) -> CoalesceEntry {
+        CoalesceEntry {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            qso_id: qso_id.map(|s| s.to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        }
+    }
+
     /// Predicate over a fixed live-set (uppercased+trimmed to match the
     /// production canonicalization). `None` is always live.
     fn live_in(set: &HashSet<String>) -> impl FnMut(Option<&str>) -> bool + '_ {
@@ -3669,9 +3736,14 @@ mod coalesce_tests {
     fn manual_none_entries_preserved_and_never_coalesced() {
         // Two distinct manual sends (qso_id == None) must BOTH survive — they
         // are never coalesced into each other, and never gated by liveness.
+        // Distinct, well-separated frequencies so the FQ-F4/TX-F6 bundle-
+        // frequency check (a SEPARATE reduction) doesn't also fire here.
         let live = liveset(&[]); // empty: no QSO is "live"
         let out = coalesce_transmit_requests(
-            vec![entry("MANUAL-1", None), entry("MANUAL-2", None)],
+            vec![
+                entry_freq("MANUAL-1", None, 1000.0),
+                entry_freq("MANUAL-2", None, 3000.0),
+            ],
             live_in(&live),
         );
         assert_eq!(out.retained.len(), 2);
@@ -3685,12 +3757,14 @@ mod coalesce_tests {
     fn manual_send_survives_keepcall_flood() {
         // A flood of keep-calls for one QSO plus an operator manual send: the
         // QSO collapses to its newest frame, and the manual send is retained.
+        // MANUAL is on a well-separated frequency so the FQ-F4/TX-F6 bundle-
+        // frequency check (a SEPARATE reduction) doesn't also fire here.
         let live = liveset(&["qso-a"]);
         let out = coalesce_transmit_requests(
             vec![
                 entry("KC-1", Some("qso-a")),
                 entry("KC-2", Some("qso-a")),
-                entry("MANUAL", None),
+                entry_freq("MANUAL", None, 3000.0),
                 entry("KC-3", Some("qso-a")),
             ],
             live_in(&live),
@@ -3705,7 +3779,10 @@ mod coalesce_tests {
     #[test]
     fn cap_enforced_with_truncation_count() {
         // More distinct live streams than the cap → truncated to the cap,
-        // first-seen streams kept, overflow counted.
+        // first-seen streams kept, overflow counted. Distinct, well-separated
+        // frequencies (100 Hz apart) so the FQ-F4/TX-F6 bundle-frequency
+        // check (a SEPARATE reduction from the cap) doesn't also fire here —
+        // this test is purely about the cap/truncation count.
         let ids: Vec<String> = (0..MAX_RETAINED_TX_STREAMS + 3)
             .map(|i| format!("qso-{i}"))
             .collect();
@@ -3713,7 +3790,11 @@ mod coalesce_tests {
             .iter()
             .map(|s| super::super::active_tx_qso_key(s))
             .collect();
-        let drained: Vec<CoalesceEntry> = ids.iter().map(|id| entry(id, Some(id))).collect();
+        let drained: Vec<CoalesceEntry> = ids
+            .iter()
+            .enumerate()
+            .map(|(i, id)| entry_freq(id, Some(id), 1000.0 + i as f64 * 100.0))
+            .collect();
         let out = coalesce_transmit_requests(drained, live_in(&live));
         assert_eq!(out.retained.len(), MAX_RETAINED_TX_STREAMS);
         assert_eq!(out.truncated, 3);
@@ -3728,10 +3809,14 @@ mod coalesce_tests {
     #[test]
     fn distinct_live_qsos_all_retained_under_cap() {
         // Two distinct live QSOs, one frame each, under cap → both retained,
-        // nothing reduced (is_noop).
+        // nothing reduced (is_noop). Distinct, well-separated frequencies so
+        // the FQ-F4/TX-F6 bundle-frequency check doesn't also fire.
         let live = liveset(&["qso-a", "qso-b"]);
         let out = coalesce_transmit_requests(
-            vec![entry("A", Some("qso-a")), entry("B", Some("qso-b"))],
+            vec![
+                entry("A", Some("qso-a")),
+                entry_freq("B", Some("qso-b"), 3000.0),
+            ],
             live_in(&live),
         );
         assert_eq!(out.retained.len(), 2);
@@ -3774,6 +3859,25 @@ mod coalesce_tests {
         }
     }
 
+    /// Like [`entry_with_parity`] but with an explicit `frequency_offset` —
+    /// see [`entry_freq`]'s doc comment for why some multi-entry tests need
+    /// distinct frequencies now that the FQ-F4/TX-F6 bundle-frequency
+    /// exclusion pass is a separate reduction alongside the parity one.
+    fn entry_with_parity_freq(
+        text: &str,
+        qso_id: Option<&str>,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+        freq: f64,
+    ) -> CoalesceEntry {
+        CoalesceEntry {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            qso_id: qso_id.map(|s| s.to_string()),
+            tx_parity,
+            origin: crate::message_bus::TxOrigin::Local,
+        }
+    }
+
     /// Three distinct-QSO streams survive coalescing: two share `Some(Even)`
     /// and one is `Some(Odd)`. The bundle must NOT silently coerce the Odd
     /// outlier onto the Even anchor (that would put it in the wrong slot
@@ -3784,11 +3888,16 @@ mod coalesce_tests {
     fn disagreeing_parity_stream_is_excluded_not_coerced() {
         use pancetta_core::slot::SlotParity;
 
+        // A and B (both Even, both expected to survive together) get
+        // distinct, well-separated frequencies so the FQ-F4/TX-F6
+        // bundle-frequency check (a separate reduction) doesn't also fire.
+        // C's frequency doesn't matter — it's excluded by the parity check
+        // before the frequency pass ever sees it.
         let live = liveset(&["qso-a", "qso-b", "qso-c"]);
         let out = coalesce_transmit_requests(
             vec![
                 entry_with_parity("A", Some("qso-a"), Some(SlotParity::Even)),
-                entry_with_parity("B", Some("qso-b"), Some(SlotParity::Even)),
+                entry_with_parity_freq("B", Some("qso-b"), Some(SlotParity::Even), 3000.0),
                 entry_with_parity("C", Some("qso-c"), Some(SlotParity::Odd)),
             ],
             live_in(&live),
@@ -3823,11 +3932,14 @@ mod coalesce_tests {
     fn none_parity_stream_is_not_treated_as_a_conflict() {
         use pancetta_core::slot::SlotParity;
 
+        // Distinct, well-separated frequencies so the FQ-F4/TX-F6
+        // bundle-frequency check doesn't also fire — this test is purely
+        // about parity, and both entries are expected to survive together.
         let live = liveset(&["qso-a", "qso-b"]);
         let out = coalesce_transmit_requests(
             vec![
                 entry_with_parity("A", Some("qso-a"), Some(SlotParity::Even)),
-                entry_with_parity("B", Some("qso-b"), None),
+                entry_with_parity_freq("B", Some("qso-b"), None, 3000.0),
             ],
             live_in(&live),
         );

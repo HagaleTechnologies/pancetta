@@ -895,6 +895,21 @@ pub struct ApplicationCoordinator {
     /// closes that gap. Requests with `qso_id == None` (manual free-text,
     /// tune, test-TX) are never gated by this set.
     pub(crate) active_tx_qsos: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// FQ-F3: active QSO id -> its current TX audio-offset frequency (Hz).
+    /// Maintained by the SAME QSO-event-forwarding task, at the SAME
+    /// insert/remove points (including the 45s completed-grace window), as
+    /// `active_tx_qsos` above — so the two stay consistent. Read each tick
+    /// by the autonomous component's slot loop and synced (bulk-replace)
+    /// into `AutonomousOperator`'s own-frequency registry via
+    /// `set_own_frequencies`, so the smart frequency allocator's
+    /// own-frequency-separation criterion (-50 penalty near an active QSO's
+    /// real offset) can actually fire — before this field existed, that
+    /// registry was permanently empty because `register_qso_frequency` /
+    /// `release_qso_frequency` were only ever called from unit tests, never
+    /// from production wiring (the `AutonomousOperator` instance lives
+    /// entirely inside `coordinator/autonomous.rs`'s own task and was never
+    /// reachable from this file's QSO-event task).
+    pub(crate) active_tx_offsets: Arc<std::sync::RwLock<HashMap<String, f64>>>,
     /// Newest transmit intent per QSO (see [`LatestTxIntent`]). Written by
     /// the QSO component as it forwards each `MessageToSend`; read by the TX
     /// worker at key-time to pivot to the freshest message for the QSO.
@@ -1271,6 +1286,7 @@ impl ApplicationCoordinator {
             waterfall_to_auto_rx: Some(waterfall_to_auto_rx),
             active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
             active_qso_freq_hz: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            active_tx_offsets: Arc::new(std::sync::RwLock::new(HashMap::new())),
             fp_filter: std::sync::Arc::new(std::sync::RwLock::new(None)),
             cross_time_state: std::sync::Arc::new(pancetta_qso::CrossTimeState::empty()),
             cross_sequence_cache: std::sync::Arc::new(std::sync::RwLock::new(
