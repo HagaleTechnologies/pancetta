@@ -442,9 +442,24 @@ struct MultiTxEncodeOutcome {
     /// is non-empty — encode failures are already reported via
     /// `encode_failed`).
     samples: Result<Vec<f32>, String>,
+    /// The original `TransmitRequestItem`s that encoded successfully —
+    /// parallel to `item_texts`/`encoded_qso_ids`, in the same order
+    /// they were summed into `samples`.
+    ///
+    /// 2026-07-17: added after an independent review of an earlier
+    /// version of this fix found that the CALLER was zipping the
+    /// unfiltered input `items` list against this function's (possibly
+    /// shorter, when any item failed to encode) `encoded_qso_ids` —
+    /// silently misaligning positions and reintroducing the exact class
+    /// of bug this feature exists to prevent (in the worst case,
+    /// transmitting a cancelled QSO's call while dropping the genuinely
+    /// still-live one). Callers MUST rebind their `items` to this field
+    /// immediately after calling this function, rather than continuing
+    /// to use their original input list.
+    encoded_items: Vec<crate::message_bus::TransmitRequestItem>,
     /// Message texts of items that encoded successfully — parallel to
-    /// `encoded_qso_ids`, in the same order they were summed into
-    /// `samples`.
+    /// `encoded_items`/`encoded_qso_ids`, in the same order they were
+    /// summed into `samples`.
     item_texts: Vec<String>,
     /// QSO ids of items that encoded successfully — parallel to
     /// `item_texts`. `None` for manual/tune items (never gated by
@@ -488,6 +503,7 @@ fn encode_and_modulate_multi_tx(
     const MULTI_TX_BASE_HZ: f64 = 200.0;
 
     let mut symbol_sets: Vec<Vec<u8>> = Vec::new();
+    let mut encoded_items: Vec<crate::message_bus::TransmitRequestItem> = Vec::new();
     let mut item_texts: Vec<String> = Vec::new();
     let mut encoded_qso_ids: Vec<Option<String>> = Vec::new();
     let mut freq_offsets: Vec<f64> = Vec::new();
@@ -496,6 +512,7 @@ fn encode_and_modulate_multi_tx(
     for item in items {
         match encode_for_protocol(encoder, active_protocol, &item.message_text) {
             Ok(symbols) => {
+                encoded_items.push(item.clone());
                 item_texts.push(item.message_text.clone());
                 encoded_qso_ids.push(item.qso_id.clone());
                 freq_offsets.push(item.frequency_offset - MULTI_TX_BASE_HZ);
@@ -511,6 +528,7 @@ fn encode_and_modulate_multi_tx(
     if symbol_sets.is_empty() {
         return MultiTxEncodeOutcome {
             samples: Err("no items to modulate".to_string()),
+            encoded_items,
             item_texts,
             encoded_qso_ids,
             encode_failed,
@@ -546,6 +564,7 @@ fn encode_and_modulate_multi_tx(
 
     MultiTxEncodeOutcome {
         samples,
+        encoded_items,
         item_texts,
         encoded_qso_ids,
         encode_failed,
@@ -2045,6 +2064,28 @@ impl super::ApplicationCoordinator {
                                         let _ = message_bus.send_message(complete_msg).await;
                                     }
 
+                                    // 2026-07-17 (post-review): rebind `items` itself to
+                                    // ONLY the successfully-encoded subset, right here,
+                                    // before ANY downstream code (Step 4b's liveness zip,
+                                    // Step 5's "now sending" display, the failure-cleanup
+                                    // loops) reads `items` again. An earlier version of
+                                    // this fix left `items` as the full, unfiltered input
+                                    // list while `item_texts`/`encoded_qso_ids` only
+                                    // covered the successfully-encoded subset — so whenever
+                                    // a Step-1 encode failure occurred anywhere in the
+                                    // bundle, `items.iter().zip(encoded_qso_ids.iter())` (or
+                                    // anything zipped against it) silently paired each item
+                                    // with an UNRELATED item's liveness verdict for every
+                                    // index after the failure. In the worst case this could
+                                    // transmit a call the operator had just cancelled while
+                                    // silently dropping the genuinely still-live one — the
+                                    // exact bug class this whole feature exists to prevent,
+                                    // reintroduced one layer up. `encoded_items` is built in
+                                    // the SAME loop iteration as `item_texts`/
+                                    // `encoded_qso_ids` inside `encode_and_modulate_multi_tx`,
+                                    // so positional correspondence is guaranteed by
+                                    // construction from this point on.
+                                    let items = outcome.encoded_items;
                                     let item_texts = outcome.item_texts;
                                     let encoded_qso_ids = outcome.encoded_qso_ids;
 
@@ -2339,6 +2380,20 @@ impl super::ApplicationCoordinator {
                                                         "Key-time re-modulation failed: {}",
                                                         reason
                                                     );
+                                                    for (text, qso_id) in rebuilt_texts
+                                                        .iter()
+                                                        .zip(rebuilt_qso_ids.iter())
+                                                    {
+                                                        emit_tx_failure_diagnostic(
+                                                            &message_bus,
+                                                            qso_id.as_deref(),
+                                                            text,
+                                                            &format!(
+                                                                "key-time re-modulation error ({reason})"
+                                                            ),
+                                                        )
+                                                        .await;
+                                                    }
                                                 }
                                                 send_tx_queue_status(
                                                     &message_bus,
@@ -2367,6 +2422,17 @@ impl super::ApplicationCoordinator {
 
                                         if schedule.cursor_offset_samples >= new_samples.len() {
                                             warn!("schedule_tx cursor exceeded rebuilt multi-TX waveform at key-time; dropping");
+                                            for (text, qso_id) in
+                                                rebuilt_texts.iter().zip(rebuilt_qso_ids.iter())
+                                            {
+                                                emit_tx_failure_diagnostic(
+                                                    &message_bus,
+                                                    qso_id.as_deref(),
+                                                    text,
+                                                    "internal scheduling error (cursor exceeded rebuilt multi-TX waveform)",
+                                                )
+                                                .await;
+                                            }
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
                                             for text in rebuilt_texts {
@@ -3657,6 +3723,92 @@ mod protocol_tx_tests {
         assert!(
             outcome.samples.is_ok(),
             "the two good items should still modulate"
+        );
+        // `encoded_items` (2026-07-17, post-review) must ALSO stay
+        // positionally aligned with item_texts/encoded_qso_ids, skipping
+        // exactly the failed item — this is what the caller rebinds
+        // `items` to, so downstream code (Step 4b's liveness zip) can
+        // never see a stale, unfiltered `items` list again.
+        assert_eq!(outcome.encoded_items.len(), 2);
+        assert_eq!(
+            outcome.encoded_items[0].qso_id.as_deref(),
+            Some("qso-good-1")
+        );
+        assert_eq!(
+            outcome.encoded_items[1].qso_id.as_deref(),
+            Some("qso-good-2")
+        );
+    }
+
+    /// 2026-07-17 (post-review) critical regression lock: an independent
+    /// review of an earlier version of this fix found that the CALLER was
+    /// zipping the unfiltered input `items` list against `encoded_qso_ids`
+    /// (shorter, whenever any item failed to encode) — silently misaligning
+    /// every item after the first encode failure. In the worst case this
+    /// could pair a genuinely-cancelled QSO with a "still live" verdict
+    /// belonging to an unrelated item, transmitting a call the operator had
+    /// just killed. This test proves the FIX PATTERN Step 1/Step 4b now
+    /// use — rebind `items = outcome.encoded_items` immediately, THEN zip
+    /// against a liveness set derived from `encoded_qso_ids` — keeps every
+    /// item paired with its OWN, correct verdict, even with an encode
+    /// failure in the middle of the bundle.
+    #[test]
+    fn multi_tx_items_rebind_keeps_correct_pairing_after_encode_failure() {
+        use std::collections::HashSet;
+
+        let mut enc = Ft8Encoder::new();
+        let params = ProtocolParams::from_protocol(Protocol::Ft8);
+        let bad_text = "THIS FREE TEXT MESSAGE IS WAY TOO LONG FOR FT8 TO EVER ENCODE";
+        let original_items = vec![
+            tx_item("CQ K5ARH EM12", 800.0, Some("qso-kenya")),
+            tx_item(bad_text, 1000.0, Some("qso-bad-encode")),
+            tx_item("W1AW K5ARH EM12", 1200.0, Some("qso-peru")),
+        ];
+        let outcome =
+            encode_and_modulate_multi_tx(&mut enc, Protocol::Ft8, &params, &original_items);
+        assert_eq!(outcome.encode_failed.len(), 1);
+
+        // The fix: rebind `items` to the encoded subset BEFORE any liveness
+        // check, exactly as the real Step 1 call site now does.
+        let items = outcome.encoded_items;
+        let encoded_qso_ids = outcome.encoded_qso_ids;
+        assert_eq!(items.len(), encoded_qso_ids.len());
+
+        // Simulate: Kenya was cancelled during the pre-PTT wait; Peru is
+        // still live. Only Peru is in the "active" set.
+        let mut active: HashSet<String> = HashSet::new();
+        active.insert(super::super::active_tx_qso_key("qso-peru"));
+
+        let live_mask: Vec<bool> = encoded_qso_ids
+            .iter()
+            .map(|id| super::super::tx_qso_is_live(id.as_deref(), &active))
+            .collect();
+
+        // Zipping the REBOUND `items` (not the original 3-item list) against
+        // `live_mask` must pair each item with ITS OWN verdict.
+        let live_items: Vec<_> = items
+            .iter()
+            .zip(live_mask.iter())
+            .filter(|(_, &live)| live)
+            .map(|(item, _)| item.qso_id.clone())
+            .collect();
+
+        assert_eq!(
+            live_items,
+            vec![Some("qso-peru".to_string())],
+            "only Peru must survive — Kenya must be excluded, not swapped in via index drift"
+        );
+
+        let dropped: Vec<_> = items
+            .iter()
+            .zip(live_mask.iter())
+            .filter(|(_, &live)| !live)
+            .map(|(item, _)| item.qso_id.clone())
+            .collect();
+        assert_eq!(
+            dropped,
+            vec![Some("qso-kenya".to_string())],
+            "Kenya must be the one reported as dropped, not silently kept alive"
         );
     }
 
