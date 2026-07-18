@@ -402,25 +402,28 @@ fn tx_qso_is_live(
     }
 }
 
-/// Multi-TX key-time drop decision (Step 4b).
+/// Multi-TX key-time liveness check (Step 4b fast-path gate).
 ///
 /// 2026-07-17 operator finding: a multi-TX bundle's waveform is summed
 /// once, up front (Step 1), from whichever items survived Step 0b's
 /// per-item liveness filter. The bundle then waits (Step 4) for the PTT
 /// engage instant, and that wait CAN span an operator abort ('k') of one
 /// of the bundled QSOs. Because the waveform is already a single summed
-/// buffer at that point, it can't be partially re-filtered — so the OLD
-/// key-time gate only checked "did EVERY item go stale" and, if even one
-/// item was still live, transmitted the WHOLE pre-summed audio, including
-/// the now-cancelled item's already-baked-in call. Operator-observed
-/// symptom: killing a QSO to one DX station while a second, still-live
-/// QSO shared the same bundle still transmitted a call to the killed one.
+/// buffer at that point, it can't be partially re-filtered in place — so
+/// the OLD key-time gate only checked "did EVERY item go stale" and, if
+/// even one item was still live, transmitted the WHOLE pre-summed audio,
+/// including the now-cancelled item's already-baked-in call.
+/// Operator-observed symptom: killing a QSO to one DX station while a
+/// second, still-live QSO shared the same bundle still transmitted a
+/// call to the killed one.
 ///
-/// Fix: require EVERY bundled item to still be live at key-time, not just
-/// one. If anything went stale during the wait, the whole bundle is
-/// dropped — the still-live item(s) lose one 15s TX cycle (they'll be
-/// re-planned into the next slot normally), which is a far smaller cost
-/// than transmitting a call to a station the operator explicitly killed.
+/// This function answers only "did NOTHING go stale" (the common-case
+/// fast path — reuse the already-built audio unchanged). When something
+/// DID go stale, the caller re-encodes just the still-live subset via
+/// [`encode_and_modulate_multi_tx`] and re-applies the already-computed
+/// `TxSchedule` (timing doesn't depend on which items are in the bundle)
+/// instead of either transmitting the stale audio or dropping the whole
+/// bundle outright.
 fn multi_tx_bundle_still_fully_live(
     qso_ids: &[Option<String>],
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
@@ -428,6 +431,125 @@ fn multi_tx_bundle_still_fully_live(
     qso_ids
         .iter()
         .all(|id| tx_qso_is_live(id.as_deref(), active_tx_qsos))
+}
+
+/// Result of [`encode_and_modulate_multi_tx`].
+struct MultiTxEncodeOutcome {
+    /// `Ok(samples)` — the summed waveform — when at least one item
+    /// encoded and `modulate_multi_tx` succeeded. `Err(reason)` covers
+    /// both "nothing encoded" and "modulation of the survivors failed";
+    /// the caller only needs to diagnose the latter (when `item_texts`
+    /// is non-empty — encode failures are already reported via
+    /// `encode_failed`).
+    samples: Result<Vec<f32>, String>,
+    /// Message texts of items that encoded successfully — parallel to
+    /// `encoded_qso_ids`, in the same order they were summed into
+    /// `samples`.
+    item_texts: Vec<String>,
+    /// QSO ids of items that encoded successfully — parallel to
+    /// `item_texts`. `None` for manual/tune items (never gated by
+    /// liveness), matching `tx_qso_is_live`'s contract.
+    encoded_qso_ids: Vec<Option<String>>,
+    /// Items whose `encode_for_protocol` call itself failed (never
+    /// reached modulation) — the caller reports each of these
+    /// individually via `emit_tx_failure_diagnostic` + `TransmitComplete`.
+    encode_failed: Vec<crate::message_bus::TransmitRequestItem>,
+}
+
+/// Encode + modulate a set of multi-TX items into one summed waveform.
+///
+/// 2026-07-17: extracted from the original Step 1 inline block so the
+/// SAME encode/modulate logic can run twice — once normally (the full
+/// bundle), and again at Step 4b's key-time gate for just the
+/// still-live subset when the bundle's item set shrank during the
+/// pre-PTT wait — instead of either transmitting stale audio for a
+/// cancelled QSO baked into an already-summed waveform, or unconditionally
+/// dropping a still-live item's cycle for no reason.
+///
+/// This extraction also fixes a pre-existing index-misalignment bug in
+/// the original inline version: it built each `MultiTxItem`'s frequency
+/// via `items[i].frequency_offset` AFTER the encode loop had already
+/// skipped failed items from `symbol_sets` — so if any item other than
+/// the last failed to encode, every later surviving item was summed at
+/// the WRONG (unrelated, earlier-indexed) frequency. Here, each item's
+/// frequency offset is pushed in the SAME loop iteration as its
+/// successful encode, so nothing can misalign.
+fn encode_and_modulate_multi_tx(
+    encoder: &mut Ft8Encoder,
+    active_protocol: pancetta_ft8::Protocol,
+    tx_params: &pancetta_ft8::ProtocolParams,
+    items: &[crate::message_bus::TransmitRequestItem],
+) -> MultiTxEncodeOutcome {
+    // TransmitRequestItem.frequency_offset is the ABSOLUTE audio
+    // frequency (matching TransmitRequest semantics). modulate_multi_tx
+    // wants per-item OFFSETS from a shared base. Use base=200 (lowest
+    // valid) so any audio frequency in the 200-2500 Hz FT8 passband maps
+    // to a non-negative per-item offset.
+    const MULTI_TX_BASE_HZ: f64 = 200.0;
+
+    let mut symbol_sets: Vec<Vec<u8>> = Vec::new();
+    let mut item_texts: Vec<String> = Vec::new();
+    let mut encoded_qso_ids: Vec<Option<String>> = Vec::new();
+    let mut freq_offsets: Vec<f64> = Vec::new();
+    let mut encode_failed: Vec<crate::message_bus::TransmitRequestItem> = Vec::new();
+
+    for item in items {
+        match encode_for_protocol(encoder, active_protocol, &item.message_text) {
+            Ok(symbols) => {
+                item_texts.push(item.message_text.clone());
+                encoded_qso_ids.push(item.qso_id.clone());
+                freq_offsets.push(item.frequency_offset - MULTI_TX_BASE_HZ);
+                symbol_sets.push(symbols);
+            }
+            Err(e) => {
+                warn!("Encoding failed for '{}': {}", item.message_text, e);
+                encode_failed.push(item.clone());
+            }
+        }
+    }
+
+    if symbol_sets.is_empty() {
+        return MultiTxEncodeOutcome {
+            samples: Err("no items to modulate".to_string()),
+            item_texts,
+            encoded_qso_ids,
+            encode_failed,
+        };
+    }
+
+    let multi_items: Vec<_> = symbol_sets
+        .iter()
+        .zip(freq_offsets.iter())
+        .map(|(symbols, &frequency_offset)| pancetta_ft8::MultiTxItem {
+            symbols: symbols.as_slice(),
+            frequency_offset,
+            params: tx_params,
+        })
+        .collect();
+
+    let samples = match pancetta_ft8::modulate_multi_tx(&multi_items, 12000, MULTI_TX_BASE_HZ, 0.5)
+    {
+        Ok(samples) => {
+            info!(
+                "Multi-TX: {} messages -> {} samples ({:.2}s)",
+                multi_items.len(),
+                samples.len(),
+                samples.len() as f64 / 12000.0
+            );
+            Ok(samples)
+        }
+        Err(e) => {
+            warn!("Multi-TX modulation failed: {}", e);
+            Err(format!("{e}"))
+        }
+    };
+
+    MultiTxEncodeOutcome {
+        samples,
+        item_texts,
+        encoded_qso_ids,
+        encode_failed,
+    }
 }
 
 /// Whether a **remote-originated** TX request is permitted to key PTT right now,
@@ -1879,102 +2001,62 @@ impl super::ApplicationCoordinator {
                                     // `Ft4`/`Ft2` → the mode's params (correct on-air
                                     // shaping, e.g. FT4 GFSK BT=1.0), and encoding
                                     // via `encode_message_protocol` (105 FT4 symbols).
+                                    //
+                                    // 2026-07-17: delegates to `encode_and_modulate_multi_tx`
+                                    // (shared with Step 4b's key-time re-encode) instead of an
+                                    // inline loop — also fixes a pre-existing index-misalignment
+                                    // bug where a partial encode failure caused later items to
+                                    // inherit an unrelated, earlier item's frequency offset.
                                     let tx_params = pancetta_ft8::ProtocolParams::from_protocol(
                                         active_protocol,
                                     );
-                                    let mut symbol_sets: Vec<Vec<u8>> = Vec::new();
-                                    let mut item_texts: Vec<String> = Vec::new();
-                                    // Parallel to item_texts/symbol_sets (same order,
-                                    // same filter) — needed so a later whole-bundle
-                                    // modulation failure can emit a per-item diagnostic
-                                    // with the right qso_id, without re-diagnosing items
-                                    // that already failed at the encode step above.
-                                    let mut encoded_qso_ids: Vec<Option<String>> = Vec::new();
+                                    let outcome = encode_and_modulate_multi_tx(
+                                        &mut encoder,
+                                        active_protocol,
+                                        &tx_params,
+                                        &items,
+                                    );
 
-                                    for item in &items {
-                                        match encode_for_protocol(
-                                            &mut encoder,
-                                            active_protocol,
+                                    for item in &outcome.encode_failed {
+                                        warn!(
+                                            "Encoding failed for '{}' (multi-TX)",
+                                            item.message_text
+                                        );
+                                        // This item would otherwise get NO TransmitComplete
+                                        // at all, ever — worse than the delayed-watchdog
+                                        // case, since even that path eventually sends one.
+                                        emit_tx_failure_diagnostic(
+                                            &message_bus,
+                                            item.qso_id.as_deref(),
                                             &item.message_text,
-                                        ) {
-                                            Ok(symbols) => {
-                                                item_texts.push(item.message_text.clone());
-                                                encoded_qso_ids.push(item.qso_id.clone());
-                                                symbol_sets.push(symbols);
-                                            }
-                                            Err(e) => {
-                                                warn!(
-                                                    "Encoding failed for '{}': {}",
-                                                    item.message_text, e
-                                                );
-                                                // This item is dropped from item_texts/
-                                                // symbol_sets, so unlike the other failure
-                                                // sites in this file it would otherwise get
-                                                // NO TransmitComplete at all, ever — worse
-                                                // than the delayed-watchdog case, since even
-                                                // that path eventually sends one.
-                                                emit_tx_failure_diagnostic(
-                                                    &message_bus,
-                                                    item.qso_id.as_deref(),
-                                                    &item.message_text,
-                                                    &format!("encoding error ({e})"),
-                                                )
-                                                .await;
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: item.message_text.clone(),
-                                                        duration_ms: 0,
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
-                                            }
-                                        }
+                                            "encoding error",
+                                        )
+                                        .await;
+                                        let complete_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Autonomous,
+                                            MessageType::TransmitComplete {
+                                                success: false,
+                                                message_text: item.message_text.clone(),
+                                                duration_ms: 0,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(complete_msg).await;
                                     }
 
-                                    // TransmitRequestItem.frequency_offset is the ABSOLUTE
-                                    // audio frequency (matching TransmitRequest semantics).
-                                    // modulate_multi_tx wants per-item OFFSETS from a shared
-                                    // base. Use base=200 (lowest valid) so any audio frequency
-                                    // in the 200-2500 Hz FT8 passband maps to a non-negative
-                                    // per-item offset.
-                                    const MULTI_TX_BASE_HZ: f64 = 200.0;
-                                    let mut multi_items = Vec::new();
-                                    for (i, symbols) in symbol_sets.iter().enumerate() {
-                                        multi_items.push(pancetta_ft8::MultiTxItem {
-                                            symbols: symbols.as_slice(),
-                                            frequency_offset: items[i].frequency_offset
-                                                - MULTI_TX_BASE_HZ,
-                                            params: &tx_params,
-                                        });
-                                    }
+                                    let item_texts = outcome.item_texts;
+                                    let encoded_qso_ids = outcome.encoded_qso_ids;
 
-                                    let (samples_opt, _duration_ms_encode) = if !multi_items
-                                        .is_empty()
-                                    {
-                                        match pancetta_ft8::modulate_multi_tx(
-                                            &multi_items,
-                                            12000,
-                                            MULTI_TX_BASE_HZ,
-                                            0.5,
-                                        ) {
-                                            Ok(samples) => {
-                                                let dur = (samples.len() as f64 / 12000.0 * 1000.0)
-                                                    as u64;
-                                                info!(
-                                                    "Multi-TX: {} messages -> {} samples ({:.2}s)",
-                                                    multi_items.len(),
-                                                    samples.len(),
-                                                    dur as f64 / 1000.0
-                                                );
-                                                (Some(samples), dur)
-                                            }
-                                            Err(e) => {
-                                                warn!("Multi-TX modulation failed: {}", e);
+                                    let samples = match outcome.samples {
+                                        Ok(s) => s,
+                                        Err(reason) => {
+                                            // Only diagnose "modulation of the survivors
+                                            // failed" (item_texts non-empty) — the
+                                            // "nothing encoded" case has nothing left to
+                                            // diagnose beyond the per-item encode_failed
+                                            // reports already sent above.
+                                            if !item_texts.is_empty() {
                                                 for (text, qso_id) in
                                                     item_texts.iter().zip(encoded_qso_ids.iter())
                                                 {
@@ -1982,20 +2064,13 @@ impl super::ApplicationCoordinator {
                                                         &message_bus,
                                                         qso_id.as_deref(),
                                                         text,
-                                                        &format!("multi-TX modulation error ({e})"),
+                                                        &format!(
+                                                            "multi-TX modulation error ({reason})"
+                                                        ),
                                                     )
                                                     .await;
                                                 }
-                                                (None, 0)
                                             }
-                                        }
-                                    } else {
-                                        (None, 0)
-                                    };
-
-                                    let samples = match samples_opt {
-                                        Some(s) => s,
-                                        None => {
                                             for text in item_texts {
                                                 let complete_msg = ComponentMessage::new(
                                                     ComponentId::Ft8Transmitter,
@@ -2101,25 +2176,35 @@ impl super::ApplicationCoordinator {
 
                                     // --- Step 4b: Drop-stale-TX gate (key-time) ---
                                     // The slot wait can span the moment a QSO ends.
-                                    // The summed waveform can't be partially
-                                    // re-filtered now, so this is all-or-nothing:
-                                    // if ANY encoded item's QSO went terminal
-                                    // during the wait, drop the WHOLE bundle
-                                    // rather than transmit a cancelled QSO's call
-                                    // baked into the same audio as a still-live
-                                    // one (2026-07-17 fix — was `.any(..)`, which
-                                    // let a single still-live item carry a
-                                    // cancelled bundle-mate's stale call onto the
-                                    // air). Checked against `encoded_qso_ids`
-                                    // (what actually made it into the summed
-                                    // waveform), not the pre-encode `items` list.
-                                    if !multi_tx_bundle_still_fully_live(
-                                        &encoded_qso_ids,
-                                        &active_tx_qsos,
-                                    ) {
+                                    // The audio built at Step 3 can't be partially
+                                    // re-filtered in place, so: if EVERYTHING went
+                                    // stale, drop the bundle outright. If NOTHING
+                                    // went stale, transmit the already-built audio
+                                    // unchanged (fast path). If SOME items went
+                                    // stale, re-encode + re-modulate just the
+                                    // still-live subset via
+                                    // `encode_and_modulate_multi_tx` and re-apply the
+                                    // ALREADY-COMPUTED `schedule` — timing (target
+                                    // slot / padding / cursor) doesn't depend on
+                                    // which items are in the bundle, only Step 1's
+                                    // encode/modulate needs redoing — instead of
+                                    // either transmitting a cancelled QSO's call
+                                    // baked into the same audio as a still-live one
+                                    // (the original bug), or unconditionally losing
+                                    // the still-live item's cycle for no reason
+                                    // (2026-07-17's first, more conservative fix).
+                                    // Checked against `encoded_qso_ids` (what
+                                    // actually made it into the summed waveform),
+                                    // not the pre-encode `items` list.
+                                    let live_mask: Vec<bool> = encoded_qso_ids
+                                        .iter()
+                                        .map(|id| tx_qso_is_live(id.as_deref(), &active_tx_qsos))
+                                        .collect();
+
+                                    if !live_mask.iter().any(|&live| live) {
                                         info!(
                                             target: "pancetta::tx.policy",
-                                            "dropping stale multi-TX bundle: {} item(s), not all still live",
+                                            "dropping stale multi-TX bundle: all {} item(s) ended during the pre-PTT wait",
                                             encoded_qso_ids.len()
                                         );
                                         emit_diagnostic(
@@ -2127,7 +2212,7 @@ impl super::ApplicationCoordinator {
                                             "tx.policy",
                                             pancetta_core::DiagnosticLevel::Info,
                                             format!(
-                                                "dropping stale multi-TX bundle: {} item(s), not all still live",
+                                                "dropping stale multi-TX bundle: all {} item(s) ended during the pre-PTT wait",
                                                 encoded_qso_ids.len()
                                             ),
                                             None,
@@ -2149,6 +2234,185 @@ impl super::ApplicationCoordinator {
                                         }
                                         continue;
                                     }
+
+                                    // `encoded_qso_ids` isn't consulted again after this
+                                    // point (Step 5+ only needs `items`/`item_texts`), but
+                                    // it's rebound alongside the rest for symmetry with the
+                                    // pre-Step-4b bindings.
+                                    let (
+                                        items,
+                                        audio_out,
+                                        item_texts,
+                                        _encoded_qso_ids,
+                                        audio_duration_ms,
+                                    ) = if live_mask.iter().all(|&live| live) {
+                                        // Fast path: nothing went stale.
+                                        (
+                                            items,
+                                            audio_out,
+                                            item_texts,
+                                            encoded_qso_ids,
+                                            audio_duration_ms,
+                                        )
+                                    } else {
+                                        // Partial staleness: report the dropped item(s), then
+                                        // re-encode just the still-live subset.
+                                        for (item, &live) in items.iter().zip(live_mask.iter()) {
+                                            if !live {
+                                                info!(
+                                                    target: "pancetta::tx.policy",
+                                                    "dropping stale multi-TX item at key-time for ended QSO {}: '{}'",
+                                                    item.qso_id.as_deref().unwrap_or("?"),
+                                                    item.message_text
+                                                );
+                                                emit_diagnostic(
+                                                        &message_bus,
+                                                        "tx.policy",
+                                                        pancetta_core::DiagnosticLevel::Info,
+                                                        format!(
+                                                            "dropping stale multi-TX item at key-time for ended QSO: '{}'",
+                                                            item.message_text
+                                                        ),
+                                                        item.qso_id.as_deref(),
+                                                    )
+                                                    .await;
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
+                                            }
+                                        }
+
+                                        let live_items: Vec<
+                                            crate::message_bus::TransmitRequestItem,
+                                        > = items
+                                            .iter()
+                                            .zip(live_mask.iter())
+                                            .filter(|(_, &live)| live)
+                                            .map(|(item, _)| item.clone())
+                                            .collect();
+
+                                        let rebuild = encode_and_modulate_multi_tx(
+                                            &mut encoder,
+                                            active_protocol,
+                                            &tx_params,
+                                            &live_items,
+                                        );
+
+                                        for item in &rebuild.encode_failed {
+                                            emit_tx_failure_diagnostic(
+                                                &message_bus,
+                                                item.qso_id.as_deref(),
+                                                &item.message_text,
+                                                "key-time re-encode error",
+                                            )
+                                            .await;
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+
+                                        let rebuilt_texts = rebuild.item_texts;
+                                        let rebuilt_qso_ids = rebuild.encoded_qso_ids;
+
+                                        let new_samples = match rebuild.samples {
+                                            Ok(s) => s,
+                                            Err(reason) => {
+                                                if !rebuilt_texts.is_empty() {
+                                                    warn!(
+                                                        "Key-time re-modulation failed: {}",
+                                                        reason
+                                                    );
+                                                }
+                                                send_tx_queue_status(
+                                                    &message_bus,
+                                                    None,
+                                                    Vec::new(),
+                                                )
+                                                .await;
+                                                for text in rebuilt_texts {
+                                                    let complete_msg = ComponentMessage::new(
+                                                        ComponentId::Ft8Transmitter,
+                                                        ComponentId::Autonomous,
+                                                        MessageType::TransmitComplete {
+                                                            success: false,
+                                                            message_text: text,
+                                                            duration_ms: 0,
+                                                        },
+                                                        Instant::now(),
+                                                    );
+                                                    let _ = message_bus
+                                                        .send_message(complete_msg)
+                                                        .await;
+                                                }
+                                                continue;
+                                            }
+                                        };
+
+                                        if schedule.cursor_offset_samples >= new_samples.len() {
+                                            warn!("schedule_tx cursor exceeded rebuilt multi-TX waveform at key-time; dropping");
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            for text in rebuilt_texts {
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: text,
+                                                        duration_ms: 0,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
+                                            }
+                                            continue;
+                                        }
+
+                                        let mut new_audio_out = Vec::with_capacity(
+                                            schedule.silent_pad_samples + new_samples.len(),
+                                        );
+                                        new_audio_out.resize(schedule.silent_pad_samples, 0.0f32);
+                                        new_audio_out.extend_from_slice(
+                                            &new_samples[schedule.cursor_offset_samples..],
+                                        );
+                                        let new_audio_duration_ms = (new_audio_out.len() as f64
+                                            / sample_rate as f64
+                                            * 1000.0)
+                                            as u64;
+
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "multi-TX bundle re-encoded at key-time: {} of {} item(s) still live",
+                                            rebuilt_texts.len(),
+                                            items.len()
+                                        );
+
+                                        (
+                                            live_items,
+                                            new_audio_out,
+                                            rebuilt_texts,
+                                            rebuilt_qso_ids,
+                                            new_audio_duration_ms,
+                                        )
+                                    };
 
                                     // --- Step 4b-arm: re-check the remote-TX arm at the
                                     // last instant before keying (mirrors the single-TX
@@ -3312,6 +3576,141 @@ mod protocol_tx_tests {
         assert_eq!(
             legacy, split,
             "split FT8 encode/modulate helpers must equal the legacy combined call"
+        );
+    }
+
+    fn tx_item(
+        text: &str,
+        freq: f64,
+        qso_id: Option<&str>,
+    ) -> crate::message_bus::TransmitRequestItem {
+        crate::message_bus::TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            qso_id: qso_id.map(|s| s.to_string()),
+        }
+    }
+
+    #[test]
+    fn multi_tx_encode_all_items_succeed_in_order() {
+        let mut enc = Ft8Encoder::new();
+        let params = ProtocolParams::from_protocol(Protocol::Ft8);
+        let items = vec![
+            tx_item("CQ K5ARH EM12", 800.0, None),
+            tx_item("W1AW K5ARH EM12", 1200.0, Some("qso-1")),
+        ];
+        let outcome = encode_and_modulate_multi_tx(&mut enc, Protocol::Ft8, &params, &items);
+        assert!(outcome.encode_failed.is_empty());
+        assert_eq!(outcome.item_texts, vec!["CQ K5ARH EM12", "W1AW K5ARH EM12"]);
+        assert_eq!(
+            outcome.encoded_qso_ids,
+            vec![None, Some("qso-1".to_string())]
+        );
+        let samples = outcome.samples.expect("both items should modulate fine");
+        assert_eq!(
+            samples.len(),
+            151_680,
+            "FT8 multi-TX waveform is one fixed-duration 12.64s slot regardless of item count"
+        );
+    }
+
+    /// 2026-07-17 regression lock: the original inline Step 1 code built each
+    /// `MultiTxItem`'s frequency via `items[i].frequency_offset` AFTER the
+    /// encode loop had already skipped a failed item from `symbol_sets` — so
+    /// a partial encode failure silently misaligned every LATER item's
+    /// frequency with an unrelated, earlier item's. This proves the
+    /// extracted helper keeps frequency/text/qso_id/symbols correctly
+    /// paired per-item even when a middle item fails to encode.
+    #[test]
+    fn multi_tx_encode_partial_failure_does_not_misalign_frequencies() {
+        let mut enc = Ft8Encoder::new();
+        let params = ProtocolParams::from_protocol(Protocol::Ft8);
+        // A free-text message far too long for FT8's charset/length limit —
+        // guaranteed to fail `encode_for_protocol`, unlike the two valid
+        // standard-callsign messages bracketing it.
+        let bad_text = "THIS FREE TEXT MESSAGE IS WAY TOO LONG FOR FT8 TO EVER ENCODE";
+        let items = vec![
+            tx_item("CQ K5ARH EM12", 800.0, Some("qso-good-1")),
+            tx_item(bad_text, 1000.0, Some("qso-bad")),
+            tx_item("W1AW K5ARH EM12", 1200.0, Some("qso-good-2")),
+        ];
+        let outcome = encode_and_modulate_multi_tx(&mut enc, Protocol::Ft8, &params, &items);
+
+        assert_eq!(
+            outcome.encode_failed.len(),
+            1,
+            "exactly the bad middle item should fail to encode"
+        );
+        assert_eq!(outcome.encode_failed[0].message_text, bad_text);
+        assert_eq!(outcome.encode_failed[0].qso_id.as_deref(), Some("qso-bad"));
+
+        // The two GOOD items must keep their OWN frequencies and qso_ids —
+        // not silently inherit each other's via index drift.
+        assert_eq!(outcome.item_texts, vec!["CQ K5ARH EM12", "W1AW K5ARH EM12"]);
+        assert_eq!(
+            outcome.encoded_qso_ids,
+            vec![
+                Some("qso-good-1".to_string()),
+                Some("qso-good-2".to_string())
+            ]
+        );
+        assert!(
+            outcome.samples.is_ok(),
+            "the two good items should still modulate"
+        );
+    }
+
+    #[test]
+    fn multi_tx_encode_empty_input_yields_no_samples() {
+        let mut enc = Ft8Encoder::new();
+        let params = ProtocolParams::from_protocol(Protocol::Ft8);
+        let outcome = encode_and_modulate_multi_tx(&mut enc, Protocol::Ft8, &params, &[]);
+        assert!(outcome.samples.is_err());
+        assert!(outcome.item_texts.is_empty());
+        assert!(outcome.encode_failed.is_empty());
+    }
+
+    /// 2026-07-17: proves the key-time re-encode path (Step 4b, when only
+    /// SOME bundle items are still live) reuses the encode helper correctly
+    /// on just a subset, producing a shorter but still-valid, correctly
+    /// frequency-aligned output — the core building block the Step 4b
+    /// rebuild relies on instead of dropping a still-live station's cycle.
+    #[test]
+    fn multi_tx_encode_subset_reencode_matches_full_encode_of_that_subset() {
+        let params = ProtocolParams::from_protocol(Protocol::Ft8);
+        let all_items = vec![
+            tx_item("CQ K5ARH EM12", 800.0, Some("qso-kenya")),
+            tx_item("W1AW K5ARH EM12", 1200.0, Some("qso-peru")),
+        ];
+        // "Full" bundle result.
+        let mut enc_full = Ft8Encoder::new();
+        let full = encode_and_modulate_multi_tx(&mut enc_full, Protocol::Ft8, &params, &all_items);
+        assert!(full.samples.is_ok());
+
+        // "Rebuilt" result for just the still-live subset (as Step 4b does
+        // when qso-kenya went stale during the pre-PTT wait).
+        let live_subset: Vec<_> = all_items
+            .iter()
+            .filter(|it| it.qso_id.as_deref() == Some("qso-peru"))
+            .cloned()
+            .collect();
+        let mut enc_rebuild = Ft8Encoder::new();
+        let rebuilt =
+            encode_and_modulate_multi_tx(&mut enc_rebuild, Protocol::Ft8, &params, &live_subset);
+
+        assert_eq!(rebuilt.item_texts, vec!["W1AW K5ARH EM12"]);
+        assert_eq!(rebuilt.encoded_qso_ids, vec![Some("qso-peru".to_string())]);
+        assert!(
+            rebuilt.samples.is_ok(),
+            "the surviving item alone must still modulate"
+        );
+        // Same fixed protocol duration regardless of how many items are summed.
+        assert_eq!(
+            rebuilt.samples.unwrap().len(),
+            full.samples.unwrap().len(),
+            "re-encoding a subset must not change the waveform's fixed slot duration \
+             (the Step 4b rebuild reuses the ALREADY-COMPUTED TxSchedule padding/cursor, \
+             which assumes this)"
         );
     }
 }
