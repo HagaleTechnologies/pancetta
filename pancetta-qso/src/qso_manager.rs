@@ -1753,11 +1753,19 @@ impl QsoManager {
     /// uses (carrying the QSO's frequency and latched `tx_parity`). Returns
     /// `QsoNotFound` for an unknown id; returns `Ok(())` (a benign no-op) when
     /// the QSO has no prior outbound message to resend.
+    ///
+    /// Stamps `last_call_at` (and bumps `call_count`) exactly like the
+    /// keep-call rearm (`rearm_manual_calls_at`) does on every re-emission,
+    /// so an operator-triggered resend is accounted the same way a
+    /// rearm-driven send is for watchdog/cap purposes, and so an operator
+    /// re-pressing Space/resend near a slot boundary can't produce a
+    /// same-text emission the rearm/coalescer machinery doesn't know about.
     pub async fn resend_last_tx(&self, qso_id: QsoId) -> Result<(), QsoManagerError> {
+        let now = Utc::now();
         let (message, frequency) = {
-            let qsos = self.qsos.read().await;
+            let mut qsos = self.qsos.write().await;
             let progress = qsos
-                .get(&qso_id)
+                .get_mut(&qso_id)
                 .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
             match progress
                 .messages
@@ -1765,7 +1773,13 @@ impl QsoManager {
                 .rev()
                 .find(|m| m.direction == MessageDirection::Sent)
             {
-                Some(m) => (m.message_type.clone(), progress.metadata.frequency),
+                Some(m) => {
+                    let message = m.message_type.clone();
+                    let frequency = progress.metadata.frequency;
+                    progress.metadata.call_count += 1;
+                    progress.metadata.last_call_at = Some(now);
+                    (message, frequency)
+                }
                 None => {
                     info!("resend_last_tx: no prior Sent message for QSO {}", qso_id);
                     return Ok(());
@@ -4798,6 +4812,43 @@ mod tests {
         assert_eq!(resends.len(), 1, "exactly one resend event");
         assert_eq!(resends[0].0, qso_id);
         assert!(matches!(resends[0].1, MessageType::CqResponse { .. }));
+    }
+
+    /// resend_last_tx stamps `last_call_at` and bumps `call_count` exactly
+    /// like the keep-call rearm does, so an operator-triggered resend is
+    /// accounted for watchdog/cap purposes and the rearm/coalescer
+    /// machinery is aware of it (double-PTT hardening,
+    /// docs/qso-tx-deep-review-2026-07-18.md).
+    #[tokio::test]
+    async fn resend_last_tx_stamps_last_call_at_and_call_count() {
+        let manager = QsoManager::new(test_config());
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        let before = manager.get_qso(qso_id).await.unwrap().metadata;
+        assert_eq!(before.call_count, 1);
+        let last_call_before = before.last_call_at;
+
+        // Ensure the clock actually advances so last_call_at is observably
+        // different, mirroring the rearm test's own timing discipline.
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        manager.resend_last_tx(qso_id).await.unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap().metadata;
+        assert_eq!(
+            after.call_count, 2,
+            "resend must bump call_count exactly like a rearm re-send"
+        );
+        assert!(
+            after.last_call_at.is_some() && after.last_call_at != last_call_before,
+            "resend must stamp last_call_at to now, like rearm_manual_calls_at does"
+        );
     }
 
     /// resend_last_tx on an unknown QSO id returns QsoNotFound.

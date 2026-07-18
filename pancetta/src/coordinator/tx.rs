@@ -1132,6 +1132,23 @@ impl super::ApplicationCoordinator {
                     }
                 };
 
+                // Double-PTT fix (docs/qso-tx-deep-review-2026-07-18.md):
+                // pivot consume-once tombstone. Step 4c below (the late
+                // pivot) can swap the in-flight frame's text for a fresher
+                // `LatestTxIntent` and key PTT with it — but the newer
+                // `MessageToSend` that produced that fresher intent ALSO
+                // already enqueued its own separate `TransmitRequest`, still
+                // sitting behind the pivoted one in this worker's channel.
+                // Record every successful pivot here (qso_key -> text) so
+                // that request, once dequeued, is recognized as an
+                // already-sent duplicate and dropped instead of keying PTT
+                // a second time. Worker-local (this loop is the single
+                // consumer; no concurrent access), so a plain `HashMap`
+                // suffices — no new `Arc`/lock. See `is_pivot_duplicate`
+                // (coordinator/mod.rs) for the pure membership check.
+                let mut pivoted_once: std::collections::HashMap<String, String> =
+                    std::collections::HashMap::new();
+
                 while !shutdown.load(Ordering::Acquire) {
                     // Reset the per-message abort flag at the start of every
                     // try_recv cycle. Keeps a stale F8 from earlier (when no
@@ -1297,6 +1314,57 @@ impl super::ApplicationCoordinator {
                                         message_text, frequency_offset, qso_id
                                     );
                                     TX_ATTEMPTS_COUNT.fetch_add(1, Ordering::Relaxed);
+
+                                    // --- Step 0-dup: pivot-tombstone duplicate gate ---
+                                    // Double-PTT fix (docs/qso-tx-deep-review-2026-07-18.md).
+                                    // A prior TransmitRequest for this SAME qso_id may
+                                    // already have been pivoted (Step 4c below) to this
+                                    // exact text and physically keyed, while THIS request
+                                    // — the one that produced that newer text in the first
+                                    // place — was still sitting behind it in the channel.
+                                    // If so, this is a stale duplicate of an already-sent
+                                    // frame: drop it exactly like the Step 4b stale-QSO
+                                    // drop (no PTT, no schedule), and clear the tombstone so
+                                    // a genuinely later legitimate re-send of the same text
+                                    // (e.g. a keep-call rearm) is never wrongly suppressed.
+                                    if super::is_pivot_duplicate(
+                                        qso_id.as_deref(),
+                                        &message_text,
+                                        &pivoted_once,
+                                    ) {
+                                        info!(
+                                            target: "pancetta::tx.policy",
+                                            "dropping stale TX for {}: '{}' — already sent via pivot",
+                                            qso_id.as_deref().unwrap_or("?"),
+                                            message_text
+                                        );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "dropping stale TX for '{message_text}' — already sent via pivot"
+                                            ),
+                                            qso_id.as_deref(),
+                                        )
+                                        .await;
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        if let Some(id) = qso_id.as_deref() {
+                                            pivoted_once.remove(&super::active_tx_qso_key(id));
+                                        }
+                                        let complete_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Autonomous,
+                                            MessageType::TransmitComplete {
+                                                success: false,
+                                                message_text,
+                                                duration_ms: 0,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(complete_msg).await;
+                                        continue;
+                                    }
 
                                     // --- Step 0: TX-policy hard mute ---
                                     // If the global policy is Disabled (RX-only),
@@ -1655,6 +1723,14 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        // Bound `pivoted_once`: a QSO ending via normal
+                                        // drop-stale cleanup also clears its own
+                                        // pivot-tombstone entry so the worker-local map
+                                        // can't grow unboundedly across a long-running
+                                        // process.
+                                        if let Some(id) = qso_id.as_deref() {
+                                            pivoted_once.remove(&super::active_tx_qso_key(id));
+                                        }
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Autonomous,
@@ -1749,7 +1825,7 @@ impl super::ApplicationCoordinator {
                                                     &new_samples[schedule.cursor_offset_samples..],
                                                 );
                                                 info!(
-                                                    target: "tx.pivot",
+                                                    target: "pancetta::tx.pivot",
                                                     "TX pivot: '{}' -> '{}' @{:.0}Hz for qso {} (fresher message arrived during pre-PTT wait)",
                                                     message_text,
                                                     new_text,
@@ -1759,6 +1835,24 @@ impl super::ApplicationCoordinator {
                                                 message_text = new_text;
                                                 frequency_offset = new_freq;
                                                 audio_out = rebuilt;
+                                                // Double-PTT fix: record this pivot so the
+                                                // newer request that PRODUCED `message_text`
+                                                // — still queued behind this one — is
+                                                // recognized as an already-sent duplicate
+                                                // (Step 0-dup above) instead of keying PTT a
+                                                // second time for the same text. `qso_id` is
+                                                // guaranteed `Some` here: `tx_pivot_target`
+                                                // (mod.rs) only returns `Some` when the
+                                                // `qso_id` argument is `Some` (manual/tune/
+                                                // test-TX with `qso_id == None` are never
+                                                // pivoted), so this `if let` always matches
+                                                // for a `None` id; guarded defensively anyway.
+                                                if let Some(id) = qso_id.as_deref() {
+                                                    pivoted_once.insert(
+                                                        super::active_tx_qso_key(id),
+                                                        message_text.clone(),
+                                                    );
+                                                }
                                             }
                                             _ => {
                                                 warn!(

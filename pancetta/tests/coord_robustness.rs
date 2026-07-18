@@ -34,8 +34,8 @@ use pancetta_config::Config;
 use pancetta_core::slot::SlotParity;
 use pancetta_lib::coordinator::{
     active_tx_qso_key, band_change_attributable_to_command, classify_config_reload, is_band_change,
-    tx_pivot_target, tx_qso_is_live, ConfigReloadApplicability, LatestTxIntent, RfNoDecodeMonitor,
-    FREQ_COMMAND_SETTLE_MS,
+    is_pivot_duplicate, tx_pivot_target, tx_qso_is_live, ConfigReloadApplicability, LatestTxIntent,
+    RfNoDecodeMonitor, FREQ_COMMAND_SETTLE_MS,
 };
 use pancetta_qso::{CallInitiation, QsoEvent, QsoManager, QsoManagerConfig};
 
@@ -608,6 +608,62 @@ fn tx_pivot_target_swaps_only_on_a_fresher_message() {
 
     // Unknown qso_id → no pivot.
     assert!(tx_pivot_target(Some("other"), "X Y RR73", &latest).is_none());
+}
+
+/// Double-PTT fix regression: a `TransmitRequest` whose qso_id + text
+/// exactly match an already-recorded pivot is a stale duplicate of a frame
+/// that was already physically keyed via the Step-4c late pivot, and must
+/// be recognized so the TX worker can drop it instead of keying PTT a
+/// second time for the same "73" (docs/qso-tx-deep-review-2026-07-18.md).
+#[test]
+fn is_pivot_duplicate_flags_only_the_exact_already_sent_frame() {
+    use std::collections::HashMap;
+    let qid = "abc-123";
+    let mut pivoted_once: HashMap<String, String> = HashMap::new();
+
+    // Nothing pivoted yet → never a duplicate.
+    assert!(!is_pivot_duplicate(
+        Some(qid),
+        "KF9UG K5ARH 73",
+        &pivoted_once
+    ));
+
+    // A prior Step-4c pivot swapped in "73" and physically keyed it.
+    pivoted_once.insert(active_tx_qso_key(qid), "KF9UG K5ARH 73".to_string());
+
+    // The second, genuinely-newer TransmitRequest that PRODUCED that "73"
+    // text dequeues next — same qso_id, identical text: flag as duplicate.
+    assert!(is_pivot_duplicate(
+        Some(qid),
+        "KF9UG K5ARH 73",
+        &pivoted_once
+    ));
+
+    // A different qso_id with the same text is unaffected (no cross-QSO
+    // suppression).
+    assert!(!is_pivot_duplicate(
+        Some("other-qso"),
+        "KF9UG K5ARH 73",
+        &pivoted_once
+    ));
+
+    // A genuinely different message for the SAME qso_id (a real ladder
+    // advance, not a duplicate) is never suppressed.
+    assert!(!is_pivot_duplicate(
+        Some(qid),
+        "KF9UG K5ARH RR73",
+        &pivoted_once
+    ));
+
+    // Manual / tune (qso_id == None) is never pivoted, so never flagged.
+    assert!(!is_pivot_duplicate(None, "KF9UG K5ARH 73", &pivoted_once));
+
+    // Once the tombstone is cleared (as the drop-gate itself does after
+    // firing, and as the Step-4b stale-QSO drop does on QSO end), a later
+    // legitimate re-send of the identical text is no longer suppressed.
+    let mut cleared = pivoted_once.clone();
+    cleared.remove(&active_tx_qso_key(qid));
+    assert!(!is_pivot_duplicate(Some(qid), "KF9UG K5ARH 73", &cleared));
 }
 
 #[test]
