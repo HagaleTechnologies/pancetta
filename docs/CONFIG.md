@@ -255,14 +255,14 @@ reputation as "the default-on spotter" — it is **off by default**
 (`PskReporterConfig::default().enabled == false`, verified by
 `test_default_network_config`). Set `enabled = true` to have your local
 copy contribute spots back to the global PSKReporter database, which
-makes you reciprocally visible for spot lookups. **Don't write a
-`[network.psk_reporter]` block at all unless you need to change
-something** — unlike every other section here, `PskReporterConfig` has
-no per-field defaults, so a *partial* override (e.g. just `enabled =
-true`) fails to parse with a "missing field" error instead of falling
-back to defaults for the rest. If you do need to override it, see
-"Customizing PSKReporter" below for a verified-complete block to start
-from.
+makes you reciprocally visible for spot lookups. A partial block — just
+```toml
+[network.psk_reporter]
+enabled = true
+```
+— is enough; every field falls back to `PskReporterConfig::default()`
+(`#[serde(default)]` at the struct level, #151). See "Customizing
+PSKReporter" below if you want to see or change the other defaults.
 
 LoTW has no username/password/`base_url` fields — unlike the other
 integrations, pancetta never talks to LoTW's servers directly. It shells
@@ -307,12 +307,11 @@ base_url           = "https://cqdx.io"   # not actually optional to omit — see
 poll_interval_secs = 30      # how often to poll for new priority spots
 ```
 
-> `cqdx.base_url` and `poll_interval_secs` must both be present if you
-> write a `[network.cqdx]` block at all — like `psk_reporter`,
-> `CqdxConfig` has no per-field defaults, so a partial table (e.g. just
-> `enabled`/`token`) fails to parse rather than falling back to
-> defaults for the rest. The values shown above ARE the real defaults,
-> so copying this block verbatim and only changing `token` is safe.
+> Like `psk_reporter`, `CqdxConfig` falls back to
+> `CqdxConfig::default()` for any field you omit (#151) — a partial
+> table (just `enabled`/`token`) works fine. The values shown above ARE
+> the real defaults, so copying this block verbatim and only changing
+> `token` is equally safe if you'd rather see everything explicitly.
 
 | Key | Service | Notes |
 |---|---|---|
@@ -362,11 +361,11 @@ poll_interval_secs = 30      # how often to poll for new priority spots
 ### Customizing PSKReporter
 
 `psk_reporter` ships off (`enabled = false`) with otherwise-sane
-defaults — most operators only need to flip `enabled` to `true`, but
-since `PskReporterConfig` has no per-field defaults (see the note
-above), turning it on means supplying every field, not just `enabled`.
-This block is the verified-complete set of current defaults; copy it,
-flip `enabled`, and change anything else you need:
+defaults — most operators only need to flip `enabled` to `true` and
+nothing else (see the note above). This block is the verified-complete
+set of current defaults, shown here so you can see and tweak any of
+them; nothing here needs to be copied verbatim unless you're changing
+it:
 
 ```toml
 [network.psk_reporter]
