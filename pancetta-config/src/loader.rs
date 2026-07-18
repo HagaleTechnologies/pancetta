@@ -1053,8 +1053,16 @@ great_circle = true
     fn docs_cqdx_full_example_parses_and_matches_defaults() {
         // The exact [network.cqdx] block from CONFIG.md -- CqdxConfig also
         // has no per-field defaults (see the doc's note), so every field
-        // must be present, and the doc claims these values ARE the real
-        // defaults.
+        // must be present.
+        //
+        // `token` is the one field that's deliberately NOT byte-identical
+        // to CqdxConfig::default() (which is `token: None`): TOML has no
+        // way to write `None` for an Option<String>, so the doc shows
+        // `token = ""` as a copy-paste-and-fill-in placeholder instead.
+        // This is safe because the app's own gating treats them
+        // identically -- qso.rs's cqdx-upload-client construction does
+        // `cqdx_cfg.token.as_ref().filter(|t| !t.is_empty())`, so
+        // `None` and `Some("")` both result in no client being built.
         let loader = ConfigLoader::new().unwrap();
         let toml_content = r#"
 [network.cqdx]
@@ -1064,16 +1072,20 @@ base_url            = "https://cqdx.io"
 poll_interval_secs  = 30
 "#;
         let parsed = loader.parse_toml(toml_content).unwrap();
-        assert!(!parsed.network.cqdx.enabled);
-        assert_eq!(parsed.network.cqdx.base_url, "https://cqdx.io");
-        assert_eq!(parsed.network.cqdx.poll_interval_secs, 30);
+        assert_eq!(parsed.network.cqdx.token.as_deref(), Some(""));
+
+        // Every other field must match Default::default() exactly -- do a
+        // full struct comparison (not per-field assertions, which is how
+        // the previous version of this test missed that `token` doesn't
+        // literally match) with `token` normalized to the same
+        // representation on both sides first.
+        let mut normalized = parsed.network.cqdx.clone();
+        normalized.token = None;
         assert_eq!(
-            parsed.network.cqdx.base_url,
-            crate::network::CqdxConfig::default().base_url
-        );
-        assert_eq!(
-            parsed.network.cqdx.poll_interval_secs,
-            crate::network::CqdxConfig::default().poll_interval_secs
+            toml::to_string(&normalized).unwrap(),
+            toml::to_string(&crate::network::CqdxConfig::default()).unwrap(),
+            "CONFIG.md's cqdx block (aside from the documented token placeholder) \
+             has drifted from CqdxConfig::default()"
         );
     }
 
@@ -1115,6 +1127,35 @@ password = "secret"
             .unwrap();
         assert!(right_section.network.qrz_xml.enabled);
         assert_eq!(right_section.network.qrz_xml.username, "N0CALL");
+    }
+
+    #[test]
+    fn docs_eqsl_example_parses_and_matches_defaults() {
+        // The exact [network.eqsl] block from CONFIG.md. EqslConfig's
+        // fields all carry #[serde(default)], so this isn't a
+        // parse-failure regression guard like psk_reporter/cqdx -- it's a
+        // guard against the section name or field names silently
+        // typo'ing into an unrecognized-section warning (the same failure
+        // class as the old [network.qrz] bug), which a partial-table-
+        // tolerant struct wouldn't surface as a parse error.
+        let loader = ConfigLoader::new().unwrap();
+        let toml_content = r#"
+[network.eqsl]
+enabled      = false
+username     = ""
+password     = ""
+qth_nickname = ""
+"#;
+        let parsed = loader.parse_toml(toml_content).unwrap();
+        assert!(
+            loader.load_warnings().is_empty(),
+            "eqsl section name/fields must be recognized, not warned-about"
+        );
+        assert_eq!(
+            toml::to_string(&parsed.network.eqsl).unwrap(),
+            toml::to_string(&crate::network::EqslConfig::default()).unwrap(),
+            "CONFIG.md's eqsl block has drifted from EqslConfig::default()"
+        );
     }
 
     #[test]
