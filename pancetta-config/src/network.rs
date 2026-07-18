@@ -376,7 +376,16 @@ pub struct StationAgentConfig {
 }
 
 /// PSKReporter service configuration
+///
+/// `#[serde(default)]` is at the CONTAINER level (not per-field): a missing
+/// field falls back to the value in THIS struct's own `Default::default()`
+/// (which has real, non-trivial values — the real server URL, a 300s
+/// interval, etc.) — not to the field's bare type default (`""`, `0`).
+/// Field-level `#[serde(default)]` would silently produce the latter,
+/// wrong, behavior for any field whose sensible default isn't its type's
+/// zero value.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PskReporterConfig {
     /// Enable PSKReporter uploads
     pub enabled: bool,
@@ -414,6 +423,7 @@ pub struct PskReporterConfig {
 
 /// Reporter identification information
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ReporterInfo {
     /// Software name
     pub software_name: String,
@@ -428,8 +438,20 @@ pub struct ReporterInfo {
     pub comments: Option<String>,
 }
 
+impl Default for ReporterInfo {
+    fn default() -> Self {
+        Self {
+            software_name: "Pancetta".to_string(),
+            software_version: env!("CARGO_PKG_VERSION").to_string(),
+            antenna_info: None,
+            comments: None,
+        }
+    }
+}
+
 /// PSKReporter filtering configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct PskReporterFilters {
     /// Enabled modes for reporting
     pub enabled_modes: Vec<String>,
@@ -448,7 +470,13 @@ pub struct PskReporterFilters {
 }
 
 /// Geographic filtering configuration
+///
+/// Every field's sensible default IS its bare type default (empty
+/// `Vec`), so container-level `#[serde(default)]` + `#[derive(Default)]`
+/// agree here — unlike `PskReporterConfig`/`CqdxConfig`, which have
+/// non-trivial custom defaults.
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct GeographicFilters {
     /// Include specific DXCC entities
     pub include_dxcc: Vec<u16>,
@@ -474,6 +502,7 @@ pub struct GeographicFilters {
 
 /// Distance-based filtering
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct DistanceFilters {
     /// Minimum distance in kilometers
     pub min_distance_km: Option<f64>,
@@ -1088,12 +1117,7 @@ impl Default for PskReporterConfig {
             include_transmits: true,
             min_snr_db: -20.0,
             max_age_hours: 24,
-            reporter_info: ReporterInfo {
-                software_name: "Pancetta".to_string(),
-                software_version: env!("CARGO_PKG_VERSION").to_string(),
-                antenna_info: None,
-                comments: None,
-            },
+            reporter_info: ReporterInfo::default(),
             frequency_accuracy_hz: 1,
             filters: PskReporterFilters::default(),
         }
@@ -1138,7 +1162,12 @@ impl Default for DistanceFilters {
 }
 
 /// cqdx.io integration configuration
+///
+/// `#[serde(default)]` at the container level (see `PskReporterConfig`'s
+/// doc comment for why): a missing field falls back to this struct's own
+/// `Default::default()` (e.g. `poll_interval_secs: 30`), not to `0`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct CqdxConfig {
     /// Enable cqdx.io integration
     pub enabled: bool,

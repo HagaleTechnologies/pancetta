@@ -978,23 +978,59 @@ mod tests {
     }
 
     #[test]
-    fn docs_psk_reporter_minimal_example_fails_without_full_fields() {
-        // Regression guard for the exact bug CONFIG.md's old example shipped:
-        // PskReporterConfig has no per-field defaults, so a partial table
-        // (just enabled + a nonexistent `report_decodes` key) does NOT fall
-        // back to defaults -- it's a hard parse error. If this ever starts
-        // parsing OK, PskReporterConfig gained #[serde(default)] support and
-        // CONFIG.md's "don't write a partial block" warning is stale.
+    fn docs_psk_reporter_minimal_example_now_parses_with_defaults() {
+        // Was `docs_psk_reporter_minimal_example_fails_without_full_fields`
+        // -- a regression guard for the bug fixed in #151:
+        // PskReporterConfig (and its nested ReporterInfo/PskReporterFilters/
+        // GeographicFilters/DistanceFilters) had no per-field #[serde(default)],
+        // so a partial table was a hard parse error instead of falling back
+        // to defaults. Now that every field carries #[serde(default)],
+        // a minimal table (just `enabled`, plus a nonexistent
+        // `report_decodes` key -- silently ignored, this crate doesn't use
+        // deny_unknown_fields) must parse, with everything else defaulted.
         let loader = ConfigLoader::new().unwrap();
         let toml_content = r#"
 [network.psk_reporter]
 enabled        = true
 report_decodes = true
 "#;
-        assert!(
-            loader.parse_toml(toml_content).is_err(),
-            "PskReporterConfig unexpectedly accepted a partial table -- \
-             update CONFIG.md's \"don't write a partial block\" warning"
+        let parsed = loader
+            .parse_toml(toml_content)
+            .expect("partial [network.psk_reporter] table must now parse");
+        let mut expected = crate::network::PskReporterConfig::default();
+        expected.enabled = true;
+        assert_eq!(
+            parsed.network.psk_reporter.enabled, expected.enabled,
+            "the one field present in the table must be honored"
+        );
+        assert_eq!(
+            toml::to_string(&parsed.network.psk_reporter).unwrap(),
+            toml::to_string(&expected).unwrap(),
+            "every field absent from the table must fall back to PskReporterConfig::default()"
+        );
+    }
+
+    #[test]
+    fn docs_cqdx_minimal_example_parses_with_defaults() {
+        // Regression guard for #151's CqdxConfig half of the fix: a partial
+        // table (just enabled + token) must parse, with base_url/
+        // poll_interval_secs falling back to CqdxConfig::default().
+        let loader = ConfigLoader::new().unwrap();
+        let toml_content = r#"
+[network.cqdx]
+enabled = true
+token   = "pat_xxx"
+"#;
+        let parsed = loader
+            .parse_toml(toml_content)
+            .expect("partial [network.cqdx] table must parse");
+        let mut expected = crate::network::CqdxConfig::default();
+        expected.enabled = true;
+        expected.token = Some("pat_xxx".to_string());
+        assert_eq!(
+            toml::to_string(&parsed.network.cqdx).unwrap(),
+            toml::to_string(&expected).unwrap(),
+            "fields absent from the table must fall back to CqdxConfig::default()"
         );
     }
 
