@@ -122,6 +122,115 @@ fn sanitize_decoded_message(decoded_msg: &mut pancetta_ft8::DecodedMessage) {
     }
 }
 
+/// `[decoder].ap_eval_mode` (2026-07-17 operator finding): split decoded
+/// messages into (delivered, suppressed) by whether AP (a priori) injection
+/// produced them (`ap_level > 0`).
+///
+/// AP decoding deliberately biases the LDPC solver toward finding the
+/// operator's own callsign in a signal, so weak genuine calls decode — but
+/// the same bias can converge on pure noise into a phantom "someone is
+/// calling us" message (`pancetta-ft8::decoder`'s own comment: "AP
+/// injection biases the LDPC solver toward our callsign, producing phantom
+/// messages... from noise"). Observed live: other stations decoded calling
+/// a `/P`-suffixed variant of the operator's callsign at very weak SNR
+/// (-15 to -17 dB), which the always-answer-callers path (#39) then replied
+/// to mid-QSO — calls that most likely were never actually made.
+///
+/// When `eval_mode` is `false`, this is a no-op: `(all messages, empty)`,
+/// preserving behavior from before this flag existed. When `true`, AP
+/// decodes (`ap_level > 0`) are pulled out of the delivered set entirely —
+/// callers must still log the suppressed set (with `ap_level`) themselves,
+/// but must NOT forward it to the TUI, QSO engine, cross-slot state, or any
+/// other consumer, so a phantom AP decode can never trigger a reply or be
+/// pounced on by the autonomous operator. Non-AP decodes (`ap_level == 0`)
+/// are always delivered, in both modes.
+fn partition_ap_eval_decodes(
+    decoded_messages: Vec<pancetta_ft8::DecodedMessage>,
+    eval_mode: bool,
+) -> (
+    Vec<pancetta_ft8::DecodedMessage>,
+    Vec<pancetta_ft8::DecodedMessage>,
+) {
+    if !eval_mode {
+        return (decoded_messages, Vec::new());
+    }
+    decoded_messages.into_iter().partition(|m| m.ap_level == 0)
+}
+
+#[cfg(test)]
+mod ap_eval_mode_tests {
+    use super::partition_ap_eval_decodes;
+    use pancetta_ft8::{DecodedMessage, Ft8Message};
+
+    fn decoded_with_ap(ap_level: u8, text: &str) -> DecodedMessage {
+        let mut d = DecodedMessage::new(Ft8Message::default(), -10.0, 0.5, 1300.0, 0.1);
+        d.ap_level = ap_level;
+        d.text = text.to_string();
+        d
+    }
+
+    #[test]
+    fn eval_mode_off_is_a_no_op_regardless_of_ap_level() {
+        let messages = vec![
+            decoded_with_ap(0, "CQ K1ABC FN42"),
+            decoded_with_ap(2, "K5ARH/P VA3TS PO59"),
+            decoded_with_ap(4, "K5ARH/P NW2M R OE18"),
+        ];
+        let (delivered, suppressed) = partition_ap_eval_decodes(messages.clone(), false);
+        assert_eq!(
+            delivered.len(),
+            3,
+            "eval_mode=false must deliver everything"
+        );
+        assert!(
+            suppressed.is_empty(),
+            "eval_mode=false must suppress nothing"
+        );
+        // Order and content preserved, not just count.
+        assert_eq!(delivered[0].text, messages[0].text);
+        assert_eq!(delivered[1].text, messages[1].text);
+        assert_eq!(delivered[2].text, messages[2].text);
+    }
+
+    #[test]
+    fn eval_mode_on_suppresses_only_ap_decodes() {
+        let messages = vec![
+            decoded_with_ap(0, "CQ K1ABC FN42"),
+            decoded_with_ap(2, "K5ARH/P VA3TS PO59"),
+            decoded_with_ap(0, "W2XYZ K3DEF -05"),
+            decoded_with_ap(4, "K5ARH/P NW2M R OE18"),
+        ];
+        let (delivered, suppressed) = partition_ap_eval_decodes(messages, true);
+        assert_eq!(delivered.len(), 2, "only ap_level==0 decodes are delivered");
+        assert!(delivered.iter().all(|m| m.ap_level == 0));
+        assert_eq!(delivered[0].text, "CQ K1ABC FN42");
+        assert_eq!(delivered[1].text, "W2XYZ K3DEF -05");
+
+        assert_eq!(suppressed.len(), 2, "all ap_level>0 decodes are suppressed");
+        assert!(suppressed.iter().all(|m| m.ap_level > 0));
+        assert_eq!(suppressed[0].text, "K5ARH/P VA3TS PO59");
+        assert_eq!(suppressed[0].ap_level, 2);
+        assert_eq!(suppressed[1].text, "K5ARH/P NW2M R OE18");
+        assert_eq!(suppressed[1].ap_level, 4);
+    }
+
+    #[test]
+    fn eval_mode_on_all_non_ap_delivers_everything() {
+        let messages = vec![decoded_with_ap(0, "A"), decoded_with_ap(0, "B")];
+        let (delivered, suppressed) = partition_ap_eval_decodes(messages, true);
+        assert_eq!(delivered.len(), 2);
+        assert!(suppressed.is_empty());
+    }
+
+    #[test]
+    fn eval_mode_on_all_ap_suppresses_everything() {
+        let messages = vec![decoded_with_ap(1, "A"), decoded_with_ap(3, "B")];
+        let (delivered, suppressed) = partition_ap_eval_decodes(messages, true);
+        assert!(delivered.is_empty());
+        assert_eq!(suppressed.len(), 2);
+    }
+}
+
 /// How many recent TX-clear ("quiet") windows feed the rolling decode-count
 /// baseline for [`maybe_flag_tx_desense`].
 const DESENSE_BASELINE_WINDOWS: usize = 20;
@@ -316,11 +425,15 @@ impl super::ApplicationCoordinator {
         // Also resolve the Task W5.3 window lead-in from the SAME config read
         // dsp.rs uses (`resolve_window_lead_secs`) so the DT correction below
         // always matches the lead dsp.rs actually anchored the window to.
-        let (station_callsign, window_lead_secs) = {
+        // `ap_eval_mode` is read once here too — like the lead-in, it's a
+        // static-for-the-session decode-pipeline knob, not hot-reloaded
+        // per-window (see `partition_ap_eval_decodes`).
+        let (station_callsign, window_lead_secs, ap_eval_mode) = {
             let config = self.config.read().await;
             (
                 config.station.callsign.clone(),
                 super::resolve_window_lead_secs(&config.decoder),
+                config.decoder.ap_eval_mode,
             )
         };
 
@@ -640,6 +753,20 @@ impl super::ApplicationCoordinator {
                         // the authoritative result; the QSO state machine
                         // deduplicates by verifying from_station ==
                         // expected DX callsign per is_message_relevant.
+                        //
+                        // `[decoder].ap_eval_mode` does NOT gate this path:
+                        // it dispatches straight to the QSO component below,
+                        // before `partition_ap_eval_decodes` runs on the
+                        // standard pipeline's output. This is safe today
+                        // only because it always calls with
+                        // `ApContext::default()` (`my_call: None`), which
+                        // structurally disables the own-callsign AP hypotheses
+                        // (AP1-4) that the eval mode exists to gate — see
+                        // `decode_window_with_ap_scoped_partner_budgeted`'s
+                        // `my_call.is_some()` guard. If this path ever starts
+                        // passing a real `ApContext`, it must also route
+                        // through `partition_ap_eval_decodes` (or be dropped
+                        // when `ap_eval_mode` is on).
                         const SCOPED_HALF_WIDTH: usize = 5;
                         let scoped_fast_path_enabled = scoped_fast_path.load(Ordering::Relaxed);
                         let scoped_decodes: Vec<pancetta_ft8::DecodedMessage> =
@@ -1010,6 +1137,24 @@ impl super::ApplicationCoordinator {
                             }
                         }
 
+                        // `[decoder].ap_eval_mode`: pull AP-derived decodes
+                        // (ap_level > 0) out of the delivered set entirely —
+                        // before ANY downstream consumer (cross-slot state,
+                        // TUI, QSO engine, autonomous) can see them, so a
+                        // phantom AP decode can never trigger a reply. Every
+                        // suppressed decode is still logged with its
+                        // ap_level so the false-positive rate stays visible
+                        // while this is under investigation. No-op (and
+                        // zero suppressed) when ap_eval_mode is off.
+                        let (decoded_messages, suppressed_ap_decodes) =
+                            partition_ap_eval_decodes(decoded_messages, ap_eval_mode);
+                        for msg in &suppressed_ap_decodes {
+                            info!(
+                                "AP eval-mode: decode suppressed (ap_level={}, text='{}', SNR: {:.0}, freq: {:.1})",
+                                msg.ap_level, msg.text, msg.snr_db, msg.frequency_offset
+                            );
+                        }
+
                         // Update shared cross-slot state (hb-048 / hb-057 /
                         // hb-173 substrate). Runs post-FP-filter so the three
                         // downstream tables never ingest decodes the continuity
@@ -1085,8 +1230,11 @@ impl super::ApplicationCoordinator {
 
                         for decoded_msg in &decoded_messages {
                             info!(
-                                "FT8 decoded: {} (SNR: {:.0}, freq: {:.1})",
-                                decoded_msg.text, decoded_msg.snr_db, decoded_msg.frequency_offset
+                                "FT8 decoded: {} (SNR: {:.0}, freq: {:.1}, ap={})",
+                                decoded_msg.text,
+                                decoded_msg.snr_db,
+                                decoded_msg.frequency_offset,
+                                decoded_msg.ap_level
                             );
 
                             // Send to TUI via point-to-point channel
