@@ -318,3 +318,34 @@ crate: neither `pancetta-research`'s eval harness nor `pancetta`'s `loopback_qso
 `pancetta-dsp`'s resampler at all (`pancetta-research` doesn't depend on `pancetta-dsp`;
 `loopback_qso` runs entirely at a fixed 12000 Hz), so a dedicated resampler-level regression test
 is the only thing that actually catches a resampling regression in this codebase today.
+
+## General auto-merge for trusted-author PRs (2026-07-18)
+
+Operator asked why a green-CI PR (#155) didn't merge itself — the repo only had auto-merge wired
+up for `dependabot[bot]` (`.github/workflows/dependabot-auto-merge.yml`), and `main` had **no
+branch protection at all**: no required status checks, no required reviews. That gap matters more
+than it looks — `gh pr merge --auto` only waits for whatever branch protection formally marks
+"required"; with nothing required, auto-merge can complete before CI even finishes. (The
+dependabot workflow's own `classify_breaking_updates` comment blames exactly this for a past
+incident, though a dedicated docs entry for it was never actually written here — grep found
+nothing under "PR #125" before this entry.)
+
+Two changes, so "auto-merge when checks pass" is actually true, not just intended:
+1. **Branch protection added to `main`**: `required_status_checks.contexts = ["CI"]` (the existing
+   aggregate job in `ci.yml`, purpose-built as "a single check branch-protection only needs to
+   require one name of" per its own comment), `strict: false` (a PR doesn't need to be re-based on
+   the latest `main` to merge — this is a low-traffic solo-maintainer repo, not worth the extra
+   friction), `enforce_admins: false` (the repo owner can still bypass in an emergency without
+   first disabling protection), no required reviews (this repo has no third-party reviewers on the
+   normal path; gating happens via the trusted-author check below instead).
+2. **New workflow `.github/workflows/auto-merge.yml`**: on `pull_request_target`
+   (opened/reopened/synchronize/ready_for_review), calls `gh pr merge --auto --squash` — but ONLY
+   when `github.event.pull_request.author_association` is `OWNER`, `MEMBER`, or `COLLABORATOR`
+   (mirrors the dependabot workflow's own `github.actor == 'dependabot[bot]'` author-gate pattern).
+   This repo is **public**: without the gate, any external contributor's PR would merge itself the
+   instant CI turned green, with zero human in the loop. A first-time/outside contributor's PR
+   still needs a manual merge even after CI passes. Squash merge matches the repo's actual practice
+   (checked via `git show --no-patch --format=%P` on a recent merge commit — single parent, not a
+   2-parent merge commit) and the repo's `allow_auto_merge`/`allow_squash_merge` settings were
+   already `true` before this change, so no repo-settings change was needed beyond branch
+   protection.
