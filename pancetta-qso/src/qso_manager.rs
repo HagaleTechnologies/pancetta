@@ -117,6 +117,21 @@ pub(crate) fn hound_offset_for(seed: &str, lo: f64, hi: f64) -> f64 {
 /// overlap; this matches criterion #7 in `SmartFrequencyAllocator`.
 pub const MIN_TX_SEPARATION_HZ: f64 = 75.0;
 
+/// FIX B (one-QSO-per-(callsign,band) close idempotency,
+/// docs/qso-tx-deep-review-2026-07-18.md): how long after a manual QSO
+/// COMPLETES a subsequent close-step (`Rr73`/`SeventyThree`) reply for the
+/// same (callsign, band) is treated as "the operator is still trying to
+/// close out the same contact" (re-key the existing QSO's last frame) vs. a
+/// genuinely new contact (open a fresh QSO). See
+/// [`QsoManager::find_recently_completed_manual_qso_for`]. Shared with the
+/// coordinator's drop-stale-TX purge delay
+/// (`pancetta::coordinator::qso`'s `completed_tx_grace`, formerly a separate
+/// hardcoded 45s literal) so the two windows can never drift apart: it would
+/// be incoherent for the QSO engine to still treat a completed QSO as
+/// "reworkable" after the coordinator has already purged its TX liveness, or
+/// vice versa.
+pub const COMPLETED_QSO_REWORK_GRACE: chrono::Duration = chrono::Duration::seconds(45);
+
 /// Nudge a candidate TX audio offset away from already-occupied offsets so
 /// concurrent QSOs don't stack. Returns `candidate` unchanged if it is within
 /// `[lo, hi]` AND at least `min_sep` Hz from every offset in `occupied`.
@@ -1475,6 +1490,39 @@ impl QsoManager {
                     let _ = self.resend_last_tx(existing_id).await;
                     return Ok(existing_id);
                 }
+            }
+        }
+
+        // FIX B (one-QSO-per-(callsign,band) close idempotency,
+        // docs/qso-tx-deep-review-2026-07-18.md): no ACTIVE QSO with this
+        // caller (FIX 1 above didn't fire) — but if the requested step is a
+        // CLOSE step (Rr73/SeventyThree) and we JUST completed a manual QSO
+        // with this exact station on this band, within the grace window, this
+        // is the operator mashing "send RR73"/"send 73" again after the QSO
+        // already finished (observed on-air: 3 SeventyThree presses in 8s
+        // produced 4 duplicate ADIF log entries for the same contact). Re-key
+        // the EXISTING completed QSO's last frame instead of opening a new
+        // one — never spawn a sibling `QsoId`, never emit a second
+        // `QsoCompleted`. Grid/Report/ReportAck (ladder rank < 2) fall
+        // through to the normal new-QSO path below: a fresh call at those
+        // steps within the grace window is the deliberate legitimate-rework
+        // case (e.g. working the same station again on a different exchange).
+        if Self::step_ladder_rank(step) >= Some(2) {
+            if let Some(existing_id) = self
+                .find_recently_completed_manual_qso_for(
+                    &target,
+                    frequency,
+                    COMPLETED_QSO_REWORK_GRACE,
+                )
+                .await
+            {
+                info!(
+                    "Context reply to {} at step {:?} — DX already worked within the \
+                     grace window, re-sending existing QSO {}'s last frame",
+                    target, step, existing_id
+                );
+                let _ = self.resend_last_tx(existing_id).await;
+                return Ok(existing_id);
             }
         }
 
@@ -3443,6 +3491,63 @@ impl QsoManager {
                 })
             })
             .max_by_key(|(_, started)| *started)
+            .map(|(id, _)| id)
+    }
+
+    /// FIX B: return the id of the most-recently-COMPLETED, MANUAL-initiated
+    /// QSO with `callsign` on the same band as `frequency`, if it completed
+    /// within `within` of now. Used by [`Self::respond_to_caller`] so a
+    /// close-step (`Rr73`/`SeventyThree`) reply for a station we JUST finished
+    /// working — e.g. the operator mashing "send 73" after already
+    /// completing — resolves to the SAME QSO object (re-key its last frame)
+    /// instead of spawning a sibling with a brand-new `QsoId` (the double-73
+    /// duplicate-ADIF-entry bug). Same `qsos_by_callsign` + band-match
+    /// approach as [`Self::find_active_manual_qso_for`]; when several
+    /// completed matches exist, the newest (`completed_at`) wins.
+    ///
+    /// Delegates to [`Self::find_recently_completed_manual_qso_for_at`] with
+    /// the real clock; see that function for the testable, explicit-`now`
+    /// variant (mirroring [`Self::check_timeouts_at`]'s pattern) — a 45s
+    /// real-time grace window is awkward to exercise with `tokio::time::sleep`
+    /// in a unit test.
+    async fn find_recently_completed_manual_qso_for(
+        &self,
+        callsign: &str,
+        frequency: f64,
+        within: chrono::Duration,
+    ) -> Option<QsoId> {
+        self.find_recently_completed_manual_qso_for_at(callsign, frequency, within, Utc::now())
+            .await
+    }
+
+    /// Explicit-`now` variant of [`Self::find_recently_completed_manual_qso_for`]
+    /// (for testability — see its doc comment).
+    async fn find_recently_completed_manual_qso_for_at(
+        &self,
+        callsign: &str,
+        frequency: f64,
+        within: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> Option<QsoId> {
+        let want_band = crate::utils::frequency_to_band(frequency);
+        let key = callsign.to_uppercase();
+        let ids = self.qsos_by_callsign.read().await.get(&key).cloned()?;
+        let qsos = self.qsos.read().await;
+        ids.into_iter()
+            .filter_map(|id| {
+                qsos.get(&id).and_then(|p| match &p.state {
+                    QsoState::Completed { completed_at, .. }
+                        if p.metadata.initiated_by == CallInitiation::Manual
+                            && crate::utils::frequency_to_band(p.metadata.frequency)
+                                == want_band
+                            && now - *completed_at <= within =>
+                    {
+                        Some((id, *completed_at))
+                    }
+                    _ => None,
+                })
+            })
+            .max_by_key(|(_, completed_at)| *completed_at)
             .map(|(id, _)| id)
     }
 
@@ -7390,12 +7495,18 @@ mod reply_emitter_tests {
         assert!(matches!(progress.state, QsoState::Completed { .. }));
     }
 
-    /// Item 2 (primary): a station keeps sending us RR73 (never copied our 73).
-    /// The operator presses Space again — a repeat
-    /// `respond_to_caller(SeventyThree)` for the SAME callsign must re-emit
-    /// another 73 rather than getting deduped into a no-op. Because the first
-    /// 73 leaves the QSO `Completed` (terminal, not active), `supersede_*` skips
-    /// it and we build a fresh completed QSO that emits its own SeventyThree.
+    /// FIX B (one-QSO-per-(callsign,band) close idempotency,
+    /// docs/qso-tx-deep-review-2026-07-18.md): a station keeps sending us
+    /// RR73 (never copied our 73). The operator presses Space again — a
+    /// repeat `respond_to_caller(SeventyThree)` for the SAME callsign must
+    /// re-emit another 73 (so the DX still gets it) WITHOUT spawning a
+    /// sibling `QsoId` or logging a second ADIF entry. Superseded 2026-07-18:
+    /// this test used to assert the OPPOSITE — that a repeat press "should
+    /// build a fresh QSO" — which was the live double-73 duplicate-log bug
+    /// itself (3 SeventyThree presses in 8s produced 4 duplicate ADIF
+    /// entries for SM2LIY on-air). `find_recently_completed_manual_qso_for`
+    /// now catches the just-completed QSO within its grace window and
+    /// re-keys its last frame instead.
     #[tokio::test]
     async fn repeat_respond_to_caller_seventy_three_resends_73() {
         let manager = manager();
@@ -7433,8 +7544,13 @@ mod reply_emitter_tests {
             )
             .await
             .unwrap();
-        assert_ne!(first, second, "repeat press should build a fresh QSO");
-        let sends2 = messages_to_send(&drain(&mut rx));
+        assert_eq!(
+            first, second,
+            "repeat press within the grace window must resolve to the SAME QSO, \
+             never spawn a sibling"
+        );
+        let events2 = drain(&mut rx);
+        let sends2 = messages_to_send(&events2);
         assert_eq!(
             sends2.len(),
             1,
@@ -7442,8 +7558,248 @@ mod reply_emitter_tests {
         );
         assert!(
             matches!(sends2[0], MessageType::SeventyThree { .. }),
-            "expected a second SeventyThree, got {:?}",
+            "expected a second SeventyThree (re-sent), got {:?}",
             sends2[0]
+        );
+
+        // Exactly ONE QsoCompleted must have fired across BOTH calls — the
+        // second call resolved via resend_last_tx, not a fresh completion.
+        assert!(
+            !events2
+                .iter()
+                .any(|e| matches!(e, QsoEvent::QsoCompleted { .. })),
+            "second call must NOT emit a new QsoCompleted: {events2:?}"
+        );
+
+        // `qsos_by_callsign` must have exactly one entry for DX — no sibling
+        // QSO id was ever recorded against this callsign.
+        let ids = manager
+            .qsos_by_callsign
+            .read()
+            .await
+            .get(&DX.to_uppercase())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(
+            ids.len(),
+            1,
+            "exactly one QSO id must be mapped to {DX}, got {ids:?}"
+        );
+    }
+
+    /// FIX B: three RAPID `SeventyThree` presses (mirroring the live incident
+    /// — 3 presses in 8 seconds) all resolve to the SAME QSO object;
+    /// `call_count` increments once per press (verified via `get_qso`).
+    #[tokio::test]
+    async fn triple_rapid_seventy_three_press_stays_one_qso_call_count_increments() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+
+        let first = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        drain(&mut rx);
+        let call_count_after_first = manager.get_qso(first).await.unwrap().metadata.call_count;
+
+        let second = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        drain(&mut rx);
+        let call_count_after_second = manager.get_qso(second).await.unwrap().metadata.call_count;
+
+        let third = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        drain(&mut rx);
+        let call_count_after_third = manager.get_qso(third).await.unwrap().metadata.call_count;
+
+        assert_eq!(first, second);
+        assert_eq!(first, third);
+        assert!(
+            call_count_after_second > call_count_after_first,
+            "call_count must increment on the 2nd press: {call_count_after_first} -> {call_count_after_second}"
+        );
+        assert!(
+            call_count_after_third > call_count_after_second,
+            "call_count must increment on the 3rd press: {call_count_after_second} -> {call_count_after_third}"
+        );
+    }
+
+    /// FIX B: a `SeventyThree` reply made AFTER `COMPLETED_QSO_REWORK_GRACE`
+    /// has elapsed since the prior QSO completed must NOT re-key the old
+    /// QSO — it opens a genuinely NEW one (the grace window bounds how long
+    /// "still trying to close out the same contact" is assumed). Uses the
+    /// explicit-`now` testable variant
+    /// (`find_recently_completed_manual_qso_for_at`) instead of a real 45s+
+    /// `tokio::time::sleep`.
+    #[tokio::test]
+    async fn seventy_three_after_grace_elapsed_opens_new_qso() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+
+        let first = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        drain(&mut rx);
+
+        // Directly exercise the explicit-`now` lookup past the grace window —
+        // proves the grace-window boundary itself, independent of
+        // `respond_to_caller`'s real-clock dispatch.
+        let completed_at = match manager.get_qso(first).await.unwrap().state {
+            QsoState::Completed { completed_at, .. } => completed_at,
+            other => panic!("expected Completed state, got {other:?}"),
+        };
+        let just_within = completed_at + COMPLETED_QSO_REWORK_GRACE - Duration::seconds(1);
+        let just_past = completed_at + COMPLETED_QSO_REWORK_GRACE + Duration::seconds(1);
+
+        assert_eq!(
+            manager
+                .find_recently_completed_manual_qso_for_at(
+                    DX,
+                    FREQ,
+                    COMPLETED_QSO_REWORK_GRACE,
+                    just_within,
+                )
+                .await,
+            Some(first),
+            "within the grace window the completed QSO must still be found"
+        );
+        assert_eq!(
+            manager
+                .find_recently_completed_manual_qso_for_at(
+                    DX,
+                    FREQ,
+                    COMPLETED_QSO_REWORK_GRACE,
+                    just_past,
+                )
+                .await,
+            None,
+            "past the grace window the completed QSO must no longer be found"
+        );
+    }
+
+    /// FIX B regression: a `Grid` or `Report`/`ReportAck` reply for a station
+    /// we JUST completed, within the grace window, is the deliberate
+    /// legitimate-rework path (e.g. working the same station again on a
+    /// fresh exchange) — it must still open a NEW QSO, not be swallowed into
+    /// the just-completed one. Only `Rr73`/`SeventyThree` (close steps) get
+    /// the grace-window idempotent-close treatment.
+    #[tokio::test]
+    async fn grid_or_report_step_within_grace_window_still_opens_new_qso() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+
+        let first = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        drain(&mut rx);
+
+        // A fresh Grid-step call (the legitimate-rework case) must build a
+        // new QSO, not resolve back to the just-completed one.
+        let grid_reopen = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::Grid,
+                Some(-8.0),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            first, grid_reopen,
+            "a Grid-step reply within the grace window must open a NEW QSO \
+             (legitimate rework), not re-key the completed one"
+        );
+        drain(&mut rx);
+
+        // Complete the reopened QSO's grace-window state doesn't matter here;
+        // check Report similarly against a fresh completed QSO.
+        let second_complete = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::SeventyThree,
+                Some(-8.0),
+                Some(-4),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        drain(&mut rx);
+
+        let report_reopen = manager
+            .respond_to_caller(
+                DX.into(),
+                FREQ,
+                None,
+                ResponseStep::Report,
+                Some(-8.0),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert_ne!(
+            second_complete, report_reopen,
+            "a Report-step reply within the grace window must open a NEW QSO \
+             (legitimate rework), not re-key the completed one"
         );
     }
 

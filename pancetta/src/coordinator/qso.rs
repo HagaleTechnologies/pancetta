@@ -1866,7 +1866,20 @@ impl super::ApplicationCoordinator {
                                 // single 73 is pending post-completion (the
                                 // coalescer keeps newest-per-QSO), so a longer
                                 // grace cannot leak stale report frames.
-                                const COMPLETED_TX_GRACE: Duration = Duration::from_secs(45);
+                                // Shares its value with
+                                // `pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE`
+                                // (the grace window `respond_to_caller`'s FIX-B
+                                // idempotent-close dispatch uses to find a
+                                // just-completed manual QSO to re-key instead of
+                                // spawning a duplicate) so the two windows can
+                                // never drift apart. A positive 45s chrono
+                                // literal never overflows `to_std`.
+                                let completed_tx_grace: Duration =
+                                    pancetta_qso::qso_manager::COMPLETED_QSO_REWORK_GRACE
+                                        .to_std()
+                                        .expect(
+                                            "COMPLETED_QSO_REWORK_GRACE is a positive literal duration",
+                                        );
                                 {
                                     let key = super::active_tx_qso_key(&qso_id.to_string());
                                     // Ensure the key is present for the grace
@@ -1902,7 +1915,7 @@ impl super::ApplicationCoordinator {
                                     let promote_pending = pending_for_events.clone();
                                     let promote_bus = snapshot_bus.clone();
                                     tokio::spawn(async move {
-                                        tokio::time::sleep(COMPLETED_TX_GRACE).await;
+                                        tokio::time::sleep(completed_tx_grace).await;
                                         if let Ok(mut s) = set.write() {
                                             s.remove(&key);
                                         }
