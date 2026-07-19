@@ -412,6 +412,26 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
     }
 }
 
+/// Print the station's fingerprint words for `agent_key_id` (dispensa
+/// Q-0039) — the TOFU-ceremony comparison an operator reads against panino's
+/// "Station identity" panel before clicking "Words match — trust this
+/// station." Falls back to a plain warning (never panics/aborts the pair
+/// flow) if the keyId is somehow malformed, since this is a display nicety
+/// layered on top of an already-completed pairing, not load-bearing for it.
+fn print_fingerprint_words(agent_key_id: &str) {
+    match pancetta_agent::fingerprint::fingerprint_words(agent_key_id, 12) {
+        Ok(words) => {
+            println!("Fingerprint words: {}", words.join(" "));
+            println!(
+                "  Compare these against panino's \"Station identity\" panel before trusting."
+            );
+        }
+        Err(e) => {
+            eprintln!("  (could not render fingerprint words: {e})");
+        }
+    }
+}
+
 /// Run the agent enrollment (pairing) flow against cqdx: `enroll` (POST
 /// `/pair/agent`) → PoP-sign the challenge → `complete` (POST
 /// `/pair/agent/complete`), then persist the resulting `PairedState` (pinned
@@ -457,6 +477,7 @@ async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
                 "This station is already paired (agent_key_id = {}).",
                 existing.agent_key_id
             );
+            print_fingerprint_words(&existing.agent_key_id);
             eprintln!(
                 "Re-run with --force to overwrite {}/paired.json with a new pairing.",
                 key_dir.display()
@@ -514,6 +535,7 @@ async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
     println!();
     println!("Paired. agent_key_id = {}", paired.agent_key_id);
     println!("Pinned {} IdP key(s).", paired.idp_keys.len());
+    print_fingerprint_words(&paired.agent_key_id);
     println!();
     println!("Next steps:");
     println!("  1. Set network.station_agent.enabled = true in your config.");
