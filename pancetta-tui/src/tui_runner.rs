@@ -157,6 +157,15 @@ pub enum TuiMessage {
         qsos: Vec<crate::app::ActiveQsoBanner>,
         pending_calls: Vec<crate::app::PendingCallBanner>,
     },
+    /// Pushed once per QSO reaching a terminal state — #165's last-10-QSOs
+    /// history panel.
+    QsoHistoryEntry {
+        call_sign: String,
+        band: String,
+        success: bool,
+        reason: Option<String>,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    },
     /// Structured autonomous-operator status, forwarded by the
     /// coordinator's relay from the autonomous loop (one per 15s
     /// slot). Replaces the old flattened status-bar-text-only path —
@@ -734,6 +743,14 @@ impl TuiRunner {
                 pending_calls,
             } => {
                 app.apply_active_qsos(qsos, pending_calls);
+            }
+            TuiMessage::QsoHistoryEntry {
+                call_sign,
+                success,
+                completed_at,
+                ..
+            } => {
+                app.push_qso_history(call_sign, success, completed_at);
             }
             TuiMessage::AutonomousStatusUpdate(status) => {
                 app.update_autonomous_status(status);
