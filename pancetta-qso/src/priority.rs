@@ -38,6 +38,62 @@ impl Default for PriorityWeights {
     }
 }
 
+/// Lexicographic priority tier (#164 redesign). Declaration order below is
+/// ascending priority — Rust's derived `Ord` on a fieldless enum ranks by
+/// declaration order, so `Atno > PerBandDxccNew > SpecialStation >
+/// PerBandGridNew > Standard` falls out for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PriorityTier {
+    /// Tier 5 (lowest): everything else, varying only by rarity/signal quality.
+    Standard,
+    /// Tier 4: per-band grid-square new-one.
+    PerBandGridNew,
+    /// Tier 3: special stations (event/gov/research/UN).
+    SpecialStation,
+    /// Tier 2: per-band DXCC new-one (never worked this entity on this band).
+    PerBandDxccNew,
+    /// Tier 1 (highest): all-time new one — never worked on any band.
+    Atno,
+}
+
+/// A tier plus a continuous tiebreaker within that tier. `secondary` is
+/// deliberately NOT the full `score_cq_detailed` total — it excludes the
+/// `needed_dxcc`/`atno_bonus`/`notable_bonus` terms, since those signals
+/// now drive tier classification instead (see `PriorityScorer::secondary_score`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TieredScore {
+    pub tier: PriorityTier,
+    pub secondary: f64,
+}
+
+impl TieredScore {
+    /// Encode as a single sortable u32 for display: tier dominates via a
+    /// 1000-wide band per tier, secondary breaks ties within a tier.
+    /// Ranges: Standard 0-999, PerBandGridNew 1000-1999, SpecialStation
+    /// 2000-2999, PerBandDxccNew 3000-3999, Atno 4000-4999.
+    pub fn as_display_u32(&self) -> u32 {
+        (self.tier as u32) * 1000 + (self.secondary.clamp(0.0, 1.0) * 999.0).round() as u32
+    }
+}
+
+impl Eq for TieredScore {}
+
+impl PartialOrd for TieredScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TieredScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.tier.cmp(&other.tier).then_with(|| {
+            self.secondary
+                .partial_cmp(&other.secondary)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+}
+
 /// Breakdown of how a CQ was scored.
 #[derive(Debug, Clone)]
 pub struct ScoreBreakdown {
@@ -658,5 +714,53 @@ mod tests {
             "Rarity-only score should be ~0.98, got {}",
             score_rare
         );
+    }
+
+    #[test]
+    fn priority_tier_ordering_is_strictly_atno_gt_dxcc_gt_special_gt_grid_gt_standard() {
+        use PriorityTier::*;
+        assert!(Atno > PerBandDxccNew);
+        assert!(PerBandDxccNew > SpecialStation);
+        assert!(SpecialStation > PerBandGridNew);
+        assert!(PerBandGridNew > Standard);
+    }
+
+    #[test]
+    fn tiered_score_orders_by_tier_first_secondary_second() {
+        let low_tier_high_secondary = TieredScore {
+            tier: PriorityTier::Standard,
+            secondary: 0.99,
+        };
+        let high_tier_low_secondary = TieredScore {
+            tier: PriorityTier::Atno,
+            secondary: 0.01,
+        };
+        assert!(
+            high_tier_low_secondary > low_tier_high_secondary,
+            "tier must dominate regardless of secondary"
+        );
+
+        let a = TieredScore {
+            tier: PriorityTier::Standard,
+            secondary: 0.3,
+        };
+        let b = TieredScore {
+            tier: PriorityTier::Standard,
+            secondary: 0.7,
+        };
+        assert!(b > a, "within the same tier, secondary breaks the tie");
+    }
+
+    #[test]
+    fn tiered_score_display_u32_never_lets_secondary_bleed_into_the_next_tier() {
+        let top_of_standard = TieredScore {
+            tier: PriorityTier::Standard,
+            secondary: 1.0,
+        };
+        let bottom_of_grid_new = TieredScore {
+            tier: PriorityTier::PerBandGridNew,
+            secondary: 0.0,
+        };
+        assert!(top_of_standard.as_display_u32() < bottom_of_grid_new.as_display_u32());
     }
 }
