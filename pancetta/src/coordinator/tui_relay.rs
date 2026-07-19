@@ -438,6 +438,23 @@ impl super::ApplicationCoordinator {
                                 },
                             );
                         }
+                        MessageType::QsoHistoryEntry {
+                            call_sign,
+                            band,
+                            success,
+                            reason,
+                            completed_at,
+                        } => {
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::QsoHistoryEntry {
+                                    call_sign,
+                                    band,
+                                    success,
+                                    reason,
+                                    completed_at,
+                                },
+                            );
+                        }
                         MessageType::RigControl(
                             crate::message_bus::RigControlMessage::FrequencyResponse {
                                 vfo,

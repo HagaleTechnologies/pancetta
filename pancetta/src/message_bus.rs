@@ -370,6 +370,18 @@ pub enum MessageType {
         pending: Vec<PendingCallSnapshotItem>,
     },
 
+    /// Pushed once per QSO reaching a terminal state (Completed or Failed) —
+    /// #165's last-10-QSOs history panel. Additive; existing
+    /// `ActiveQsosSnapshot` handling is untouched.
+    QsoHistoryEntry {
+        call_sign: String,
+        band: String,
+        success: bool,
+        /// Populated only when `success` is false (e.g. "Timeout").
+        reason: Option<String>,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    },
+
     /// Waterfall spectrogram data for TUI display
     WaterfallData {
         /// Power values in dB, one row per time step

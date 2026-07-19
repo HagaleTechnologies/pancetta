@@ -1987,6 +1987,22 @@ impl super::ApplicationCoordinator {
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO completed with {}, marking as worked", their_call);
 
+                                    let history_band =
+                                        pancetta_qso::utils::frequency_to_band(metadata.frequency);
+                                    let history_msg = ComponentMessage::new(
+                                        ComponentId::Qso,
+                                        ComponentId::Tui,
+                                        MessageType::QsoHistoryEntry {
+                                            call_sign: their_call.clone(),
+                                            band: history_band,
+                                            success: true,
+                                            reason: None,
+                                            completed_at: chrono::Utc::now(),
+                                        },
+                                        Instant::now(),
+                                    );
+                                    let _ = snapshot_bus.send_message(history_msg).await;
+
                                     // Batch 2 #4: completed QSOs are filtered out
                                     // of the active snapshot, so the operator never
                                     // saw success. Surface a one-line confirmation
@@ -2137,6 +2153,23 @@ impl super::ApplicationCoordinator {
                                 // WHY the QSO failed instead of letting it silently
                                 // vanish from the banner — `reason` was previously
                                 // destructured away (`..`) and never read anywhere.
+                                if let Some(ref their_call) = metadata.their_callsign {
+                                    let history_band =
+                                        pancetta_qso::utils::frequency_to_band(metadata.frequency);
+                                    let history_msg = ComponentMessage::new(
+                                        ComponentId::Qso,
+                                        ComponentId::Tui,
+                                        MessageType::QsoHistoryEntry {
+                                            call_sign: their_call.clone(),
+                                            band: history_band,
+                                            success: false,
+                                            reason: Some(failure_reason_text(&reason)),
+                                            completed_at: chrono::Utc::now(),
+                                        },
+                                        Instant::now(),
+                                    );
+                                    let _ = snapshot_bus.send_message(history_msg).await;
+                                }
                                 let reason_text = failure_reason_text(&reason);
                                 let diag_msg = ComponentMessage::new(
                                     ComponentId::Qso,
