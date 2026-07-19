@@ -366,6 +366,11 @@ pub struct StationInfo {
     pub rig: String,
     pub operating_frequency: f64,
     pub mode: String,
+    /// Our own station's DXCC entity name (e.g. "United States"), resolved
+    /// once from `call_sign` at construction — the home callsign is fixed
+    /// for the process lifetime, unlike a QSO partner's. `None` if the
+    /// callsign doesn't match any known prefix.
+    pub entity_name: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1125,6 +1130,8 @@ impl App {
             // (carried on StationConfig); backs the title-bar mode chip
             // (rendered only when != FT8).
             mode: config.station.mode.clone(),
+            entity_name: crate::dxcc::entity_for_callsign(&config.station.call_sign)
+                .map(str::to_string),
         };
 
         // Find the band index matching the default frequency
@@ -6622,5 +6629,25 @@ mod tests {
         // The oldest (CALL0) was evicted; the most recent (CALL10) is at the front.
         assert_eq!(app.qso_history[0].call_sign, "CALL10");
         assert!(!app.qso_history.iter().any(|item| item.call_sign == "CALL0"));
+    }
+
+    #[tokio::test]
+    async fn station_info_resolves_own_entity_from_call_sign() {
+        let mut config = crate::config::Config::default();
+        config.station.call_sign = "K5ARH".to_string();
+        let app = App::new(config, None).await.unwrap();
+        assert_eq!(
+            app.station_info.entity_name.as_deref(),
+            Some("United States")
+        );
+    }
+
+    #[tokio::test]
+    async fn station_info_entity_none_for_unresolvable_call_sign() {
+        // Use a fictional callsign that doesn't match any DXCC prefix.
+        let mut config = crate::config::Config::default();
+        config.station.call_sign = "QZ9ZZ".to_string();
+        let app = App::new(config, None).await.unwrap();
+        assert_eq!(app.station_info.entity_name, None);
     }
 }
