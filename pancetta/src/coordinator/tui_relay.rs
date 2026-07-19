@@ -290,6 +290,7 @@ impl super::ApplicationCoordinator {
                                 atno,
                                 band_needed,
                                 priority_score,
+                                is_own_tx: false,
                             };
 
                             match tui_msg_tx_relay.send(
