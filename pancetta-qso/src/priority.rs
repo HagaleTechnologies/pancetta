@@ -217,6 +217,32 @@ pub fn is_pota_sota_candidate(callsign: &str) -> bool {
         || upper.ends_with("/PORT")
 }
 
+/// US 1x1 format (letter-digit-letter, e.g. `W1A`, `N4B`, `K9Z`) is FCC's
+/// dedicated special-event format — never issued as a regular license (the
+/// shortest regular US callsign is 4 characters), so this is a
+/// zero-false-positive pattern. UK's GB-prefix convention (`GB` + digit +
+/// suffix, e.g. `GB2RS`) is the equivalent in the UK. A small static list
+/// covers well-known permanent international special-service stations
+/// (UN/ITU HQ stations).
+pub fn is_special_event_callsign(callsign: &str) -> bool {
+    let upper = callsign.to_uppercase();
+    if is_us_1x1_format(&upper) {
+        return true;
+    }
+    if upper.starts_with("GB") && upper.chars().nth(2).is_some_and(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    matches!(upper.as_str(), "4U1UN" | "4U1ITU")
+}
+
+fn is_us_1x1_format(upper: &str) -> bool {
+    let chars: Vec<char> = upper.chars().collect();
+    chars.len() == 3
+        && chars[0].is_ascii_alphabetic()
+        && chars[1].is_ascii_digit()
+        && chars[2].is_ascii_alphabetic()
+}
+
 /// Normalize SNR from typical FT8 range (-24 to +10) to 0.0–1.0.
 fn normalize_snr(snr: i8) -> f64 {
     let clamped = (snr as f64).clamp(-24.0, 10.0);
@@ -762,5 +788,40 @@ mod tests {
             secondary: 0.0,
         };
         assert!(top_of_standard.as_display_u32() < bottom_of_grid_new.as_display_u32());
+    }
+
+    #[test]
+    fn is_special_event_callsign_detects_us_1x1_format() {
+        assert!(is_special_event_callsign("W1A"));
+        assert!(is_special_event_callsign("N4B"));
+        assert!(is_special_event_callsign("K9Z"));
+        assert!(is_special_event_callsign("w1a")); // case-insensitive
+    }
+
+    #[test]
+    fn is_special_event_callsign_rejects_regular_us_calls() {
+        // Shortest real US callsign is 4 characters (1x2 format) — never 3.
+        assert!(!is_special_event_callsign("W1AW"));
+        assert!(!is_special_event_callsign("K5ARH"));
+    }
+
+    #[test]
+    fn is_special_event_callsign_detects_uk_gb_convention() {
+        assert!(is_special_event_callsign("GB2RS"));
+        assert!(is_special_event_callsign("gb2rs")); // case-insensitive
+        assert!(is_special_event_callsign("GB0ABC"));
+    }
+
+    #[test]
+    fn is_special_event_callsign_rejects_gb_prefix_without_a_digit() {
+        assert!(!is_special_event_callsign("GBABC"));
+        assert!(!is_special_event_callsign("GB"));
+    }
+
+    #[test]
+    fn is_special_event_callsign_detects_curated_international_list() {
+        assert!(is_special_event_callsign("4U1UN"));
+        assert!(is_special_event_callsign("4U1ITU"));
+        assert!(!is_special_event_callsign("4U1XYZ")); // not in the curated list
     }
 }
