@@ -290,6 +290,7 @@ impl super::ApplicationCoordinator {
                                 atno,
                                 band_needed,
                                 priority_score,
+                                is_own_tx: false,
                             };
 
                             match tui_msg_tx_relay.send(
@@ -363,6 +364,23 @@ impl super::ApplicationCoordinator {
                                 pancetta_tui::tui_runner::TuiMessage::TxQueueUpdate {
                                     sending: sending.as_ref().map(map),
                                     queued: queued.iter().map(map).collect(),
+                                },
+                            );
+                        }
+                        MessageType::TxFrameLogged {
+                            text,
+                            freq_hz,
+                            qso_id,
+                            timestamp,
+                        } => {
+                            // #172: pass-through relay for Band Activity's
+                            // own-TX history, same shape as QsoHistoryEntry.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxFrameLogged {
+                                    text,
+                                    freq_hz,
+                                    qso_id,
+                                    timestamp,
                                 },
                             );
                         }

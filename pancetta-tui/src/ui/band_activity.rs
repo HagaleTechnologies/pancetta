@@ -190,7 +190,14 @@ fn create_message_row<'a>(
     // Always show HH:MM:SS in UTC — FT8 timing needs seconds granularity
     let time_short = msg.timestamp.format("%H:%M:%S").to_string();
 
-    let snr_str = format!("{:+}", msg.snr);
+    // #172: own-TX rows have no meaningful RX SNR (snr is a 0 sentinel);
+    // render "TX" instead so it's never mistaken for a real 0 dB decode —
+    // same not-color-only precedent as dx_hunter.rs::format_dx_snr's "---".
+    let snr_str = if msg.is_own_tx {
+        "TX".to_string()
+    } else {
+        format!("{:+}", msg.snr)
+    };
     let dt_str = format!("{:+.1}", msg.delta_time);
     let df_str = format!("{:+.0}", msg.delta_freq);
 
@@ -200,13 +207,19 @@ fn create_message_row<'a>(
         !msg.is_directed_at_us && msg.call_sign.as_deref().is_some_and(|c| app.is_engaged(c));
 
     // Lead the call column with "→" for directed-at-us decodes so even
-    // colorblind / monochrome terminals can spot them at a glance, or "● "
-    // for an engaged (active-QSO) station.
-    let call_str = match msg.call_sign.as_deref() {
-        Some(c) if msg.is_directed_at_us => format!("→ {}", c),
-        Some(c) if is_engaged => format!("● {}", c),
-        Some(c) => c.to_string(),
-        None => "---".to_string(),
+    // colorblind / monochrome terminals can spot them at a glance, "● "
+    // for an engaged (active-QSO) station, or "» TX" for a frame WE
+    // transmitted (#172) — call_sign is always None for these rows, the
+    // full exchange text is in the Msg column.
+    let call_str = if msg.is_own_tx {
+        "» TX".to_string()
+    } else {
+        match msg.call_sign.as_deref() {
+            Some(c) if msg.is_directed_at_us => format!("→ {}", c),
+            Some(c) if is_engaged => format!("● {}", c),
+            Some(c) => c.to_string(),
+            None => "---".to_string(),
+        }
     };
     let grid_str = msg.grid_square.as_deref().unwrap_or("---");
     let dist_str = format_distance(msg.distance);
@@ -236,13 +249,26 @@ fn create_message_row<'a>(
         .fg(app.theme.selected_color())
         .add_modifier(Modifier::BOLD);
 
-    let snr_style = if msg.is_directed_at_us {
+    // #172: distinct style for own-TX rows so they read as ours at a
+    // glance, checked before the existing is_directed_at_us styling
+    // (own-TX rows are always is_directed_at_us: true too, but the "»"/
+    // "TX" text markers already carry the meaning independent of color —
+    // this is additional, not the only, signal).
+    let own_tx_style = Style::default()
+        .fg(ratatui::style::Color::Red)
+        .add_modifier(Modifier::BOLD);
+
+    let snr_style = if msg.is_own_tx {
+        own_tx_style
+    } else if msg.is_directed_at_us {
         directed_style
     } else {
         Style::default().fg(get_snr_color(msg.snr, &app.theme))
     };
 
-    let call_style = if msg.is_directed_at_us {
+    let call_style = if msg.is_own_tx {
+        own_tx_style
+    } else if msg.is_directed_at_us {
         directed_style
     } else if is_globally_focused {
         Style::default()
@@ -270,7 +296,9 @@ fn create_message_row<'a>(
         call_style
     };
 
-    let msg_style = if msg.is_directed_at_us {
+    let msg_style = if msg.is_own_tx {
+        own_tx_style
+    } else if msg.is_directed_at_us {
         directed_style
     } else if msg.message.contains("CQ") {
         Style::default()
@@ -481,6 +509,7 @@ mod tests {
             atno: false,
             band_needed: false,
             priority_score: None,
+            is_own_tx: false,
         }
     }
 
@@ -502,10 +531,66 @@ mod tests {
         term.backend().buffer().clone()
     }
 
-    fn header_row_text(buf: &ratatui::buffer::Buffer) -> String {
+    fn row_text(buf: &ratatui::buffer::Buffer, y: u16) -> String {
         (0..buf.area.width)
-            .map(|x| buf[(x, 1)].symbol().chars().next().unwrap_or(' '))
+            .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
             .collect()
+    }
+
+    fn header_row_text(buf: &ratatui::buffer::Buffer) -> String {
+        row_text(buf, 1)
+    }
+
+    #[tokio::test]
+    async fn own_tx_row_renders_marker_and_tx_snr() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        let mut tx_row = fixture_message("K5ARH");
+        tx_row.is_own_tx = true;
+        tx_row.is_directed_at_us = true;
+        tx_row.call_sign = None;
+        tx_row.message = "K5ARH JA1ABC RR73".to_string();
+        app.decoded_messages.push_back(tx_row);
+
+        let backend = ratatui::backend::TestBackend::new(120, 20);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_band_activity(f, area, &app).unwrap();
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        // Row 0 = block border/title, row 1 = header, row 2 = first data row.
+        let data_row = row_text(&buf, 2);
+        assert!(data_row.contains("» TX"), "marker missing: {data_row:?}");
+        assert!(
+            data_row.contains("RR73"),
+            "message text missing: {data_row:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rx_row_unaffected_by_own_tx_marker() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.decoded_messages.push_back(fixture_message("K1ABC"));
+
+        let backend = ratatui::backend::TestBackend::new(120, 20);
+        let mut term = ratatui::Terminal::new(backend).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            render_band_activity(f, area, &app).unwrap();
+        })
+        .unwrap();
+        let buf = term.backend().buffer().clone();
+        let data_row = row_text(&buf, 2);
+        assert!(
+            !data_row.contains("» TX"),
+            "unexpected TX marker: {data_row:?}"
+        );
+        assert!(data_row.contains("K1ABC"), "callsign missing: {data_row:?}");
     }
 
     #[tokio::test]

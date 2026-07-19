@@ -249,6 +249,20 @@ pub enum MessageType {
         queued: Vec<TxItem>,
     },
 
+    /// Pushed once per keyed TX frame (#172) — Band Activity's own-TX
+    /// history. Emitted from `send_tx_queue_status` alongside (not instead
+    /// of) `TxQueueStatus`, whenever `sending` is `Some`; additive, no
+    /// change to the existing NOW-SENDING/QUEUED snapshot. `qso_id: None`
+    /// means a CQ/manual frame, matching `TxItem`'s existing convention —
+    /// every keyed frame is logged regardless of origin (#172 scope: all
+    /// TX, not just QSO-related).
+    TxFrameLogged {
+        text: String,
+        freq_hz: f64,
+        qso_id: Option<String>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
+
     /// TX-policy state echo for the TUI banner. Sent by the coordinator's
     /// command relay whenever the operator changes the global TX policy
     /// (cycle key) or triggers an emergency stop (Shift+Q → Disabled).

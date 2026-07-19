@@ -186,6 +186,7 @@ mod tests {
             atno: false,
             band_needed: false,
             priority_score: None,
+            is_own_tx: false,
         }
     }
 

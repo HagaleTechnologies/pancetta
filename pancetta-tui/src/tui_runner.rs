@@ -166,6 +166,15 @@ pub enum TuiMessage {
         reason: Option<String>,
         completed_at: chrono::DateTime<chrono::Utc>,
     },
+    /// Pushed once per keyed TX frame (#172) — Band Activity's own-TX
+    /// history. Forwarded by the coordinator relay from the TX worker's
+    /// `TxFrameLogged`, fired alongside (not instead of) `TxQueueUpdate`.
+    TxFrameLogged {
+        text: String,
+        freq_hz: f64,
+        qso_id: Option<String>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
     /// Structured autonomous-operator status, forwarded by the
     /// coordinator's relay from the autonomous loop (one per 15s
     /// slot). Replaces the old flattened status-bar-text-only path —
@@ -751,6 +760,14 @@ impl TuiRunner {
                 ..
             } => {
                 app.push_qso_history(call_sign, success, completed_at);
+            }
+            TuiMessage::TxFrameLogged {
+                text,
+                freq_hz,
+                timestamp,
+                ..
+            } => {
+                app.add_tx_frame(text, freq_hz, timestamp);
             }
             TuiMessage::AutonomousStatusUpdate(status) => {
                 app.update_autonomous_status(status);
@@ -3206,6 +3223,26 @@ mod key_tests {
         assert_eq!(app.tx_queued[0].freq_hz, 1200.0);
     }
 
+    #[tokio::test]
+    async fn tx_frame_logged_appends_to_band_activity() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        let ts = chrono::Utc::now();
+        r.handle_message(TuiMessage::TxFrameLogged {
+            text: "K5ARH JA1ABC RR73".to_string(),
+            freq_hz: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            timestamp: ts,
+        })
+        .await
+        .unwrap();
+        let app = app.read().await;
+        assert_eq!(app.decoded_messages.len(), 1);
+        let row = app.decoded_messages.back().unwrap();
+        assert!(row.is_own_tx);
+        assert_eq!(row.message, "K5ARH JA1ABC RR73");
+        assert_eq!(row.timestamp, ts);
+    }
+
     // === UX audit Batch 3 ===========================================
 
     /// The TX offset clamp matches the modulator/passband (200–2900 Hz):
@@ -4060,6 +4097,7 @@ mod key_tests {
             atno: false,
             band_needed: false,
             priority_score: None,
+            is_own_tx: false,
         };
         app.write().await.add_decoded_message(stale).await.unwrap();
         assert!(!app.read().await.decoded_messages.is_empty());
@@ -4331,6 +4369,7 @@ mod key_tests {
                     atno: false,
                     band_needed: false,
                     priority_score: None,
+                    is_own_tx: false,
                 });
             assert_eq!(a.focused_callsign().as_deref(), Some("G8KHF"));
             assert!(a.is_engaged("G8KHF"));
