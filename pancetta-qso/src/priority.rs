@@ -186,7 +186,17 @@ impl PriorityScorer {
         snr: i8,
         freq_hz: f64,
     ) -> ScoreBreakdown {
-        let needed_dxcc = if self.lookup.is_needed_dxcc(callsign) {
+        // BUG #163: `is_needed_dxcc` alone only reflects cqdx's needed set for
+        // whichever band the operator's last cqdx sync happened to be tuned
+        // to — not this row's own band. OR in the local, per-band-aware
+        // `is_dxcc_needed_on_band` (added 2026-07-18) so a genuinely-new
+        // entity on THIS band still boosts the score even when cqdx's
+        // coarser signal disagrees or is stale. Previously computed
+        // (`tui_relay.rs`'s `band_needed`) but only ever fed into the
+        // display DTO, never the score itself — dead wiring.
+        let needed_dxcc = if self.lookup.is_needed_dxcc(callsign)
+            || self.lookup.is_dxcc_needed_on_band(callsign, freq_hz)
+        {
             1.0
         } else {
             0.0
@@ -299,6 +309,7 @@ mod tests {
         recent_failures: HashSet<String>,
         needed_dxcc: HashSet<String>,
         needed_grids: HashSet<String>,
+        dxcc_needed_on_band: HashSet<String>,
     }
 
     impl TestLookup {
@@ -308,6 +319,7 @@ mod tests {
                 recent_failures: HashSet::new(),
                 needed_dxcc: HashSet::new(),
                 needed_grids: HashSet::new(),
+                dxcc_needed_on_band: HashSet::new(),
             }
         }
     }
@@ -321,6 +333,9 @@ mod tests {
         }
         fn is_needed_dxcc(&self, callsign: &str) -> bool {
             self.needed_dxcc.contains(callsign)
+        }
+        fn is_dxcc_needed_on_band(&self, callsign: &str, _freq_hz: f64) -> bool {
+            self.dxcc_needed_on_band.contains(callsign)
         }
         fn is_needed_grid(&self, grid: &str) -> bool {
             self.needed_grids.contains(grid)
@@ -413,6 +428,34 @@ mod tests {
             "Needed DXCC should boost score: {} vs {}",
             score_needed,
             score_not_needed
+        );
+    }
+
+    /// BUG #163 regression: cqdx's `is_needed_dxcc` reflects whatever band
+    /// the operator's last cqdx sync happened to be tuned to, not this row's
+    /// own band. A row that cqdx doesn't currently flag as needed must still
+    /// get the needed_dxcc boost when the LOCAL, per-band-aware
+    /// `is_dxcc_needed_on_band` says this entity is genuinely new on this
+    /// row's actual band — this signal was computed (`tui_relay.rs`'s
+    /// `band_needed`) but, before this fix, only ever reached the display
+    /// DTO, never `score_cq_detailed`.
+    #[test]
+    fn dxcc_needed_on_band_boosts_score_even_when_cqdx_needed_set_disagrees() {
+        let mut lookup = TestLookup::new();
+        // cqdx's needed set does NOT include this callsign (e.g. it reflects
+        // a different band than 20m), but the local per-band history says
+        // this entity IS new on 20m specifically.
+        lookup.dxcc_needed_on_band.insert("JA1ABC".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score_band_needed = scorer.evaluate_cq("JA1ABC", Some("PM95"), -10, 14_074_000.0);
+
+        let scorer_null = PriorityScorer::new(PriorityWeights::default(), Box::new(NullLookup));
+        let score_neither = scorer_null.evaluate_cq("JA1ABC", Some("PM95"), -10, 14_074_000.0);
+
+        assert!(
+            score_band_needed > score_neither,
+            "is_dxcc_needed_on_band alone (cqdx needed_dxcc false) should still boost the \
+             score: {score_band_needed} vs {score_neither}"
         );
     }
 
