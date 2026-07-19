@@ -114,6 +114,16 @@ pub struct CachedStationLookup {
     needed_grids: Arc<RwLock<HashSet<String>>>,
     /// Rarity scores from cqdx.io, keyed by uppercase callsign.
     rarity_scores: Arc<RwLock<HashMap<String, f64>>>,
+    /// Rarity scores from cqdx.io, re-indexed by resolved DXCC entity name
+    /// (derived from `rarity_scores` — see `update_rarity_scores`). BUG
+    /// #163: cqdx's live-spots feed only reports rarity for whatever exact
+    /// callsigns it happened to see recently, so most locally-decoded calls
+    /// never get an exact match and silently fall through to `rarity()`'s
+    /// neutral 0.5 default — collapsing the DX Hunter's priority score into
+    /// two flat buckets regardless of true rarity. This entity-keyed cache
+    /// lets a callsign that was never itself spotted still inherit real
+    /// rarity data reported for ANY other callsign from the same entity.
+    rarity_by_entity: Arc<RwLock<HashMap<String, f64>>>,
     /// Notable callsigns from cqdx.io spot groups.
     notable_callsigns: Arc<RwLock<HashSet<String>>>,
     /// Network SNR data: callsign -> (reporter_count, best_snr).
@@ -152,6 +162,7 @@ impl CachedStationLookup {
             needed_atno: Arc::new(RwLock::new(HashSet::new())),
             needed_grids: Arc::new(RwLock::new(HashSet::new())),
             rarity_scores: Arc::new(RwLock::new(HashMap::new())),
+            rarity_by_entity: Arc::new(RwLock::new(HashMap::new())),
             notable_callsigns: Arc::new(RwLock::new(HashSet::new())),
             network_snr: Arc::new(RwLock::new(HashMap::new())),
             network_last_seen: Arc::new(RwLock::new(HashMap::new())),
@@ -245,6 +256,17 @@ impl CachedStationLookup {
     }
 
     pub fn update_rarity_scores(&self, scores: HashMap<String, f64>) {
+        // Re-index by resolved DXCC entity (offline prefix resolver, same one
+        // `worked_dxcc_on_band` uses) so `rarity()` can fall back to another
+        // callsign's rarity from the same entity — see the field doc on
+        // `rarity_by_entity` for why this matters.
+        let mut by_entity: HashMap<String, f64> = HashMap::new();
+        for (callsign, rarity) in &scores {
+            if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(callsign) {
+                by_entity.insert(entity.to_string(), *rarity);
+            }
+        }
+        *self.rarity_by_entity.write() = by_entity;
         *self.rarity_scores.write() = scores;
     }
 
@@ -261,11 +283,20 @@ impl CachedStationLookup {
     }
 
     pub fn rarity(&self, callsign: &str) -> f64 {
-        self.rarity_scores
-            .read()
-            .get(&callsign.to_uppercase())
-            .copied()
-            .unwrap_or(0.5)
+        let upper = callsign.to_uppercase();
+        if let Some(r) = self.rarity_scores.read().get(&upper).copied() {
+            return r;
+        }
+        // Entity-keyed fallback (BUG #163): this exact callsign was never
+        // itself seen in a cqdx live-spot poll, but another callsign from the
+        // same DXCC entity may have been — reuse that rarity rather than the
+        // flat neutral default.
+        if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(callsign) {
+            if let Some(r) = self.rarity_by_entity.read().get(entity).copied() {
+                return r;
+            }
+        }
+        0.5
     }
 
     pub fn record_failure(&self, callsign: &str) {
@@ -345,6 +376,22 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_dxcc_needed_on_band(&self, callsign: &str, freq_hz: f64) -> bool {
+        // BUG #163 follow-up: this signal is purely "never worked this
+        // entity on this band per local history" — with no concept of home
+        // exclusion, a fresh session (nothing worked on ANY band yet) would
+        // trivially claim the operator's OWN callsign is "needed" too.
+        // Mirror is_needed_dxcc's home-exclusion semantics so a home-country
+        // station is never "needed," regardless of local worked history.
+        let upper = callsign.to_uppercase();
+        let excluded = self.excluded_dxcc_prefixes.read();
+        if excluded
+            .iter()
+            .any(|prefix| upper.starts_with(prefix.as_str()))
+        {
+            return false;
+        }
+        drop(excluded);
+
         // Unresolvable callsign (no matching prefix in the offline table):
         // never claim "needed" for an entity we can't even identify.
         let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(callsign) else {
@@ -374,11 +421,9 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn rarity(&self, callsign: &str) -> f64 {
-        self.rarity_scores
-            .read()
-            .get(&callsign.to_uppercase())
-            .copied()
-            .unwrap_or(0.5)
+        // Delegates to the inherent method above (single source of truth —
+        // avoids the two copies silently diverging).
+        CachedStationLookup::rarity(self, callsign)
     }
 
     fn is_notable(&self, callsign: &str) -> bool {
@@ -497,6 +542,23 @@ mod tests {
     }
 
     #[test]
+    fn dxcc_needed_on_band_excludes_home_prefix_even_when_nothing_worked_yet() {
+        // BUG #163 follow-up: a fresh session (no QSOs on ANY band yet) must
+        // NOT report the operator's own excluded (home) callsign as "needed
+        // on this band" just because nothing has been worked there — that
+        // would incorrectly boost the home station's own score once this
+        // signal feeds into PriorityScorer.
+        let lookup = CachedStationLookup::new();
+        let mut excluded = HashSet::new();
+        excluded.insert("K".to_string());
+        lookup.set_excluded_dxcc_prefixes(excluded);
+
+        assert!(!lookup.is_dxcc_needed_on_band("K5ARH", 14_074_000.0));
+        // Non-excluded (foreign) entity is unaffected.
+        assert!(lookup.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
+    }
+
+    #[test]
     fn seed_worked_dxcc_from_list_matches_record_worked() {
         let seeded = CachedStationLookup::new();
         seeded.seed_worked_dxcc_from_list(vec![("20m".to_string(), "JA1ABC".to_string())]);
@@ -518,6 +580,62 @@ mod tests {
             ("20m".to_string(), "JA1ABC".to_string()),
         ]);
         assert!(!lookup.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
+    }
+
+    // --- BUG #163: rarity entity-keyed fallback ---
+
+    #[test]
+    fn rarity_exact_callsign_match_wins_over_entity_fallback() {
+        let lookup = CachedStationLookup::new();
+        let mut scores = HashMap::new();
+        scores.insert("JA1ABC".to_string(), 0.9);
+        lookup.update_rarity_scores(scores);
+        assert!((lookup.rarity("JA1ABC") - 0.9).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rarity_falls_back_to_entity_when_exact_callsign_never_spotted() {
+        // JA1ABC and JA2XYZ resolve to the same DXCC entity (Japan), per
+        // `dxcc_needed_on_band_is_entity_scoped_not_callsign_scoped` above.
+        // cqdx's live-spots feed only ever reported JA1ABC's rarity; JA2XYZ
+        // was never itself spotted but should still inherit real data
+        // instead of the flat 0.5 default.
+        let lookup = CachedStationLookup::new();
+        let mut scores = HashMap::new();
+        scores.insert("JA1ABC".to_string(), 0.9);
+        lookup.update_rarity_scores(scores);
+
+        assert!(
+            (lookup.rarity("JA2XYZ") - 0.9).abs() < f64::EPSILON,
+            "expected JA2XYZ to inherit JA1ABC's entity rarity, got {}",
+            lookup.rarity("JA2XYZ")
+        );
+    }
+
+    #[test]
+    fn rarity_defaults_to_neutral_when_entity_never_reported_either() {
+        let lookup = CachedStationLookup::new();
+        let mut scores = HashMap::new();
+        scores.insert("JA1ABC".to_string(), 0.9);
+        lookup.update_rarity_scores(scores);
+
+        // W1ABC is a different (US) entity, never reported at all.
+        assert!((lookup.rarity("W1ABC") - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn rarity_via_trait_object_matches_inherent_method() {
+        // Guards against the inherent method and the WorkedStationLookup
+        // trait impl silently diverging (the trait impl delegates to the
+        // inherent one) — exercise through the trait object, as
+        // PriorityScorer actually does.
+        let lookup = CachedStationLookup::new();
+        let mut scores = HashMap::new();
+        scores.insert("JA1ABC".to_string(), 0.9);
+        lookup.update_rarity_scores(scores);
+
+        let boxed: Box<dyn WorkedStationLookup> = Box::new(lookup.clone());
+        assert!((boxed.rarity("JA2XYZ") - lookup.rarity("JA2XYZ")).abs() < f64::EPSILON);
     }
 
     #[test]
