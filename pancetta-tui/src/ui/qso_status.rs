@@ -10,6 +10,19 @@ use ratatui::{
 use super::{create_panel_block, format_time_ago};
 use crate::app::{ActivePanel, App};
 
+/// Resolve a DX station's DXCC entity name for display: prefer cqdx's
+/// authoritative `DxStation.entity_name` (already known for anyone who's
+/// appeared in DX Hunter as a network/Both spot) and fall back to the
+/// offline prefix table for locally-decoded-only stations, matching the
+/// pattern `dx_hunter.rs::create_dx_row` and `station_card.rs::render_line1`
+/// already use. `None` when neither resolves.
+fn resolve_entity(app: &App, call_sign: &str) -> Option<String> {
+    app.dx_stations
+        .get(call_sign)
+        .and_then(|d| d.entity_name.clone())
+        .or_else(|| crate::dxcc::entity_for_callsign(call_sign).map(str::to_string))
+}
+
 pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()> {
     let is_active = matches!(app.active_panel, ActivePanel::QsoStatus);
     let active_count = app.qso_statuses.iter().filter(|q| q.active).count();
@@ -250,6 +263,17 @@ fn render_qso_info(f: &mut Frame<'_>, area: Rect, app: &App) {
             .fg(app.theme.accent_color())
             .add_modifier(Modifier::BOLD),
     ));
+    // #171: DXCC entity of the station we're in QSO with, when resolvable.
+    // Omitted entirely (not "(---)") when unresolved — this panel has less
+    // room than DX Hunter's dedicated column.
+    if let Some(call) = qso.call_sign.as_deref() {
+        if let Some(entity) = resolve_entity(app, call) {
+            status_line.push(Span::styled(
+                format!(" ({entity})"),
+                Style::default().fg(app.theme.muted_color()),
+            ));
+        }
+    }
 
     let lines = vec![
         Line::from(status_line),
@@ -895,5 +919,85 @@ mod tests {
         ); // ✗
         assert!(rendered.contains("K5ARH"));
         assert!(rendered.contains("JA1ABC"));
+    }
+
+    fn test_dx_station(call: &str) -> crate::app::DxStation {
+        crate::app::DxStation {
+            call_sign: call.to_string(),
+            grid_square: None,
+            frequency: 14_074_000.0,
+            mode: "FT8".to_string(),
+            last_seen: chrono::Utc::now(),
+            snr: -10,
+            distance: None,
+            bearing: None,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score: 0,
+            source: crate::app::SpotSource::Local,
+            entity_name: None,
+            rarity_tier: None,
+            reporter_count: None,
+            is_notable: false,
+            notable_type: None,
+            confidence: None,
+            best_snr_network: None,
+            last_seen_network: None,
+            audio_offset_hz: None,
+            slot_parity: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_entity_prefers_cqdx_over_offline_table() {
+        use crate::app::DxStation;
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.dx_stations.insert(
+            "JA1ABC".to_string(),
+            DxStation {
+                entity_name: Some("Nippon (cqdx)".to_string()),
+                ..test_dx_station("JA1ABC")
+            },
+        );
+        assert_eq!(
+            resolve_entity(&app, "JA1ABC").as_deref(),
+            Some("Nippon (cqdx)")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_entity_falls_back_to_offline_table() {
+        use crate::app::DxStation;
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        // In dx_stations (e.g. from a local decode) but cqdx never set entity_name.
+        app.dx_stations
+            .insert("JA1ABC".to_string(), test_dx_station("JA1ABC"));
+        assert_eq!(resolve_entity(&app, "JA1ABC").as_deref(), Some("Japan"));
+    }
+
+    #[tokio::test]
+    async fn resolve_entity_falls_back_to_offline_table_when_never_seen() {
+        let app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        // Not in dx_stations at all (e.g. QSO partner never appeared in DX Hunter).
+        assert_eq!(
+            resolve_entity(&app, "DL1ABC").as_deref(),
+            Some("Fed. Rep. of Germany")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_entity_none_when_unresolvable() {
+        let app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        assert_eq!(resolve_entity(&app, "QZ9ZZ"), None);
     }
 }

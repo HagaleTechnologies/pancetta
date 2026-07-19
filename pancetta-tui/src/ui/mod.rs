@@ -617,6 +617,14 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
             &app.station_info.grid_square,
             Style::default().fg(app.theme.foreground_color()),
         ),
+    ];
+    // #171: our own DXCC entity is inserted retroactively, right after this
+    // index, only if it fits — see the width check near the padding
+    // calculation below (the title bar has no wrap/overflow handling, so an
+    // unconditional entity span can silently clip a later chip, e.g. the
+    // QSOs counter, once several other chips are already active).
+    let entity_insert_idx = left_spans.len();
+    left_spans.extend([
         Span::raw(" | "),
         Span::styled(
             format!("{:.3} MHz", app.station_info.operating_frequency),
@@ -639,7 +647,7 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
                 .fg(app.theme.accent_color())
                 .add_modifier(Modifier::BOLD),
         ),
-    ];
+    ]);
 
     // Bold, color-coded global TX-policy banner chip. Always visible so
     // the operator can tell at a glance which of the three states is
@@ -819,8 +827,25 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     // Calculate padding to right-align the UTC clock
-    let left_len: usize = left_spans.iter().map(|s| s.width()).sum();
+    let mut left_len: usize = left_spans.iter().map(|s| s.width()).sum();
     let clock_len = utc_clock.len();
+
+    // #171: only insert our own entity if it actually fits alongside every
+    // other chip already committed to this row — inserted here (not up
+    // front) because whether it fits depends on which OTHER chips ended up
+    // active (TX policy, FREQ, DECODE, QSOs counter, ...), known only now.
+    if let Some(entity) = app.station_info.entity_name.as_deref() {
+        let entity_span = Span::styled(
+            format!(" ({entity})"),
+            Style::default().fg(app.theme.muted_color()),
+        );
+        let entity_width = entity_span.width();
+        if left_len + entity_width + clock_len <= area.width as usize {
+            left_spans.insert(entity_insert_idx, entity_span);
+            left_len += entity_width;
+        }
+    }
+
     let padding = (area.width as usize).saturating_sub(left_len + clock_len);
 
     left_spans.push(Span::raw(" ".repeat(padding)));
@@ -2029,6 +2054,56 @@ mod view_render_tests {
             term.draw(|f| render_health_panel(f, f.area(), &app))
                 .unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn title_bar_shows_own_station_entity_when_resolvable() {
+        let mut config = crate::config::Config::default();
+        config.station.call_sign = "K5ARH".to_string();
+        let mut app = crate::app::App::new(config, None).await.unwrap();
+        app.active_view = crate::view::ActiveView::Operate;
+        // 140, not the file's usual 120: at 120 columns this exact scenario's
+        // baseline chips (title/call/grid/freq/band/mode/TX-policy/FREQ/
+        // DECODE + clock) sum to 121 — one character over the width the
+        // entity-omit-if-overflowing logic (see render_title_bar) allows,
+        // which would suppress the very thing this test verifies. This test
+        // proves the entity CAN render; the omit-when-tight behavior itself
+        // is covered by a separate test at the standard 120-column width.
+        let backend = TestBackend::new(140, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(
+            buffer_contains(&buf, "(United States)"),
+            "title bar missing own-station entity"
+        );
+    }
+
+    /// #171: the title bar has no wrap/overflow handling (a plain unwrapped
+    /// `Paragraph`) — an unconditional entity span can silently clip a later
+    /// chip once several others are active. At the standard 120-column width,
+    /// this exact scenario (K5ARH + a completed-QSO counter chip) has no room
+    /// left for the entity, so `render_title_bar` must omit it rather than
+    /// clip the QSOs counter that comes after it.
+    #[tokio::test]
+    async fn title_bar_omits_entity_when_row_has_no_room() {
+        let mut config = crate::config::Config::default();
+        config.station.call_sign = "K5ARH".to_string();
+        let mut app = crate::app::App::new(config, None).await.unwrap();
+        app.active_view = crate::view::ActiveView::Operate;
+        app.session_completed = 3;
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| draw(f, &app).unwrap()).unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(
+            !buffer_contains(&buf, "(United States)"),
+            "entity should be omitted when there's no room for it"
+        );
+        assert!(
+            buffer_contains(&buf, "QSOs: 3"),
+            "omitting the entity must free up room for the QSOs counter"
+        );
     }
 }
 
