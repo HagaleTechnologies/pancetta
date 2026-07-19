@@ -162,6 +162,60 @@ pub fn is_pivot_duplicate(
     }
 }
 
+/// Bundle-arm analogue of [`tx_pivot_target`] (double-PTT fix,
+/// docs/qso-tx-deep-review-2026-07-18.md).
+///
+/// The single-TX arm's Step 4c late pivot swaps ONE in-flight frame's text
+/// for a fresher [`LatestTxIntent`] at key-time. The multi-TX arm has no
+/// equivalent: a bundle's items are encoded once (Step 1) and, absent this
+/// function, transmitted verbatim even if one of them advances (e.g. the DX
+/// sends RR73 and the QSO emits its closing 73) while its frame sits bundled
+/// alongside a different concurrent QSO during the pre-PTT wait. This walks
+/// every item in a bundle and applies the same "differs → pivot" rule
+/// [`tx_pivot_target`] uses, per item, instead of for a single frame.
+///
+/// For each item with `qso_id: Some(id)`: if `latest` has an entry for
+/// [`active_tx_qso_key`]`(id)` whose `message_text` differs from the item's
+/// current `message_text`, the item's `message_text` AND `frequency_offset`
+/// are replaced with the intent's values, and `(active_tx_qso_key(id),
+/// new_text)` is recorded in the returned pivot list. An item with `qso_id:
+/// None` (manual / tune / test-TX), an item whose intent text MATCHES its
+/// current text (not a genuine advance), or an item with no intent entry at
+/// all passes through completely unchanged and is never reported as a
+/// pivot — mirroring `tx_pivot_target`'s exact "differs → `Some`" semantics.
+///
+/// Returns `(all_items_with_pivots_applied, list_of_what_was_pivoted)`.
+pub fn pivot_bundle_items(
+    items: Vec<crate::message_bus::TransmitRequestItem>,
+    latest: &HashMap<String, LatestTxIntent>,
+) -> (
+    Vec<crate::message_bus::TransmitRequestItem>,
+    Vec<(String, String)>,
+) {
+    let mut pivots = Vec::new();
+    let pivoted_items = items
+        .into_iter()
+        .map(|mut item| {
+            if let Some(intent) =
+                tx_pivot_target(item.qso_id.as_deref(), &item.message_text, latest)
+            {
+                // `tx_pivot_target` only returns `Some` when `qso_id` is
+                // `Some`, so this unwrap is safe.
+                let key = active_tx_qso_key(
+                    item.qso_id
+                        .as_deref()
+                        .expect("tx_pivot_target returned Some(_) only for a Some(qso_id) item"),
+                );
+                item.message_text = intent.message_text;
+                item.frequency_offset = intent.frequency_offset;
+                pivots.push((key, item.message_text.clone()));
+            }
+            item
+        })
+        .collect();
+    (pivoted_items, pivots)
+}
+
 /// Threshold (Hz) for treating a same-band (or out-of-band) dial move as a
 /// "band change" for the C9 active-QSO teardown. Sized to ride over normal
 /// fine-tuning / passband nudges within an FT8 sub-band (a few kHz) while
@@ -1879,6 +1933,156 @@ mod pivot_duplicate_tests {
             "KF9UG K5ARH 73",
             &pivoted_once
         ));
+    }
+
+    /// Bundle-arm "Step 0-dup (bundle)" gate: the multi-TX arm applies
+    /// `is_pivot_duplicate` per item in a bundle (see `tx.rs`'s
+    /// `MessageType::MultiTransmitRequest` arm) rather than to a single
+    /// request. Simulates that per-item filter directly: a `pivoted_once`
+    /// map pre-populated from a prior bundle-arm pivot (SM2LIY's key ->
+    /// its already-sent "73" text), and a subsequent bundle containing an
+    /// item with that exact (qso_id, text) alongside an unrelated item —
+    /// the filter must drop only the duplicate and keep the other item.
+    #[test]
+    fn bundle_filter_drops_only_the_matching_duplicate_item() {
+        let mut pivoted_once: HashMap<String, String> = HashMap::new();
+        pivoted_once.insert(
+            active_tx_qso_key("sm2liy-qso"),
+            "SM2LIY K5ARH 73".to_string(),
+        );
+
+        // (qso_id, message_text) pairs standing in for a bundle's items.
+        let bundle: Vec<(Option<&str>, &str)> = vec![
+            (Some("sm2liy-qso"), "SM2LIY K5ARH 73"),
+            (Some("c6avd-qso"), "C6AVD K5ARH EM10"),
+        ];
+
+        let kept: Vec<_> = bundle
+            .into_iter()
+            .filter(|(qso_id, text)| !is_pivot_duplicate(*qso_id, text, &pivoted_once))
+            .collect();
+
+        assert_eq!(kept, vec![(Some("c6avd-qso"), "C6AVD K5ARH EM10")]);
+    }
+}
+
+#[cfg(test)]
+mod pivot_bundle_tests {
+    use super::{active_tx_qso_key, pivot_bundle_items, LatestTxIntent};
+    use crate::message_bus::TransmitRequestItem;
+    use std::collections::HashMap;
+
+    fn item(qso_id: Option<&str>, text: &str, freq: f64) -> TransmitRequestItem {
+        TransmitRequestItem {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            qso_id: qso_id.map(|s| s.to_string()),
+        }
+    }
+
+    fn intent(text: &str, freq: f64) -> LatestTxIntent {
+        LatestTxIntent {
+            message_text: text.to_string(),
+            frequency_offset: freq,
+            tx_parity: None,
+        }
+    }
+
+    /// An item whose recorded intent differs from its current text gets both
+    /// `message_text` and `frequency_offset` swapped, and is reported as a
+    /// pivot.
+    #[test]
+    fn differing_intent_pivots_text_and_freq() {
+        let mut latest = HashMap::new();
+        latest.insert(active_tx_qso_key("qso-a"), intent("SM2LIY K5ARH 73", 693.0));
+        let items = vec![item(Some("qso-a"), "SM2LIY K5ARH R-14", 690.0)];
+
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+
+        assert_eq!(pivoted[0].message_text, "SM2LIY K5ARH 73");
+        assert_eq!(pivoted[0].frequency_offset, 693.0);
+        assert_eq!(
+            pivots,
+            vec![(active_tx_qso_key("qso-a"), "SM2LIY K5ARH 73".to_string())]
+        );
+    }
+
+    /// An item with `qso_id: None` (manual / tune / test-TX) is never
+    /// touched, even if a matching-key intent entry happens to exist
+    /// (shouldn't occur in practice, but defensive).
+    #[test]
+    fn no_qso_id_never_touched() {
+        let mut latest = HashMap::new();
+        latest.insert(active_tx_qso_key("qso-a"), intent("CQ K5ARH EM10", 700.0));
+        let items = vec![item(None, "CQ K5ARH EM10 ORIGINAL", 690.0)];
+
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+
+        assert_eq!(pivoted[0].message_text, "CQ K5ARH EM10 ORIGINAL");
+        assert_eq!(pivoted[0].frequency_offset, 690.0);
+        assert!(pivots.is_empty());
+    }
+
+    /// An item whose intent text MATCHES its current text is not pivoted
+    /// (not a genuine advance) and is not reported as a pivot.
+    #[test]
+    fn matching_intent_text_is_not_a_pivot() {
+        let mut latest = HashMap::new();
+        latest.insert(
+            active_tx_qso_key("qso-a"),
+            intent("C6AVD K5ARH EM10", 1728.0),
+        );
+        let items = vec![item(Some("qso-a"), "C6AVD K5ARH EM10", 1728.0)];
+
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+
+        assert_eq!(pivoted[0].message_text, "C6AVD K5ARH EM10");
+        assert_eq!(pivoted[0].frequency_offset, 1728.0);
+        assert!(pivots.is_empty());
+    }
+
+    /// An item with no intent entry at all passes through unchanged.
+    #[test]
+    fn no_intent_entry_passes_through_unchanged() {
+        let latest = HashMap::new();
+        let items = vec![item(Some("qso-a"), "C6AVD K5ARH EM10", 1728.0)];
+
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+
+        assert_eq!(pivoted[0].message_text, "C6AVD K5ARH EM10");
+        assert_eq!(pivoted[0].frequency_offset, 1728.0);
+        assert!(pivots.is_empty());
+    }
+
+    /// Regression test shaped exactly like the SM2LIY/C6AVD live incident:
+    /// SM2LIY's bundled frame still holds the pre-advance "R-14" report text
+    /// while the QSO has since emitted its closing 73; C6AVD's frame in the
+    /// SAME bundle is untouched (no intent recorded for it).
+    #[test]
+    fn sm2liy_c6avd_incident_shape() {
+        let mut latest = HashMap::new();
+        latest.insert(
+            active_tx_qso_key("sm2liy-qso"),
+            intent("SM2LIY K5ARH 73", 693.0),
+        );
+        let items = vec![
+            item(Some("sm2liy-qso"), "SM2LIY K5ARH R-14", 693.0),
+            item(Some("c6avd-qso"), "C6AVD K5ARH EM10", 1728.0),
+        ];
+
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+
+        assert_eq!(pivoted[0].message_text, "SM2LIY K5ARH 73");
+        assert_eq!(pivoted[0].frequency_offset, 693.0);
+        assert_eq!(pivoted[1].message_text, "C6AVD K5ARH EM10");
+        assert_eq!(pivoted[1].frequency_offset, 1728.0);
+        assert_eq!(
+            pivots,
+            vec![(
+                active_tx_qso_key("sm2liy-qso"),
+                "SM2LIY K5ARH 73".to_string()
+            )]
+        );
     }
 }
 

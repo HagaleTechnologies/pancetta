@@ -916,3 +916,50 @@ and per TX-F7 silently converts into on-air DT on late starts.
 8. CLAUDE.md drop-stale invariant — true, with the multi-arm caveat (check via
    `encoded_qso_ids`/rebuild) and the wording eliding deliberate fail-open
    (tx-scheduling.md:24 documents it correctly).
+
+---
+
+## Post-remediation live finding — SM2LIY/C6AVD multi-TX incident (same day)
+
+A live on-air incident surfaced the same evening the 5-batch remediation above
+landed, exercising two gaps the remediation explicitly didn't cover (neither
+is a regression of Batch 1-5). The operator was mid-QSO with SM2LIY (manual,
+single-TX) and added C6AVD as a second same-parity manual QSO (multi-TX). When
+SM2LIY's QSO advanced (received RR73, emitted its closing 73) WHILE its frame
+was already bundled into a `MultiTransmitRequest` alongside C6AVD's frame, the
+bundle transmitted the STALE pre-advance text verbatim — twice, once per
+bundle cycle, re-sending the DX a stale "R-14" report after they'd already
+sent RR73. Separately, the operator invoked the manual "send 73"
+(`respond_to_caller(SeventyThree)`) 3 times in 8 seconds trying to recover;
+each invocation built a BRAND NEW `QsoId`, independently completed and
+logged its own ADIF entry, and emitted its own real 73 — 4 duplicate SM2LIY
+log entries across the incident.
+
+**Root cause 1 — no bundle-arm pivot.** Batch 1's Step-4c late pivot
+(TX-F1/SM-F... mechanism above) only exists in the single-`TransmitRequest`
+arm; the `MultiTransmitRequest` arm never consulted `latest_tx_intent` at
+key-time, so a bundle's items were transmitted exactly as encoded at Step 1
+regardless of how stale they'd become during the pre-PTT wait.
+
+**Root cause 2 — no grace-window idempotency on manual close.**
+`respond_to_caller`'s FIX 1 dedup (SM-F... "if we already have an ACTIVE
+manual QSO...") only matches a still-ACTIVE QSO; once a QSO reaches terminal
+`Completed`, a subsequent `SeventyThree` reply for the same station fell
+straight through to "build a new QSO" with no idempotency guard at all.
+
+**Fix (this batch — same session, landing right after the 5-batch
+remediation above):** (A) new `pivot_bundle_items` (`coordinator/mod.rs`) is
+the bundle-arm analogue of `tx_pivot_target`; `tx.rs`'s multi-TX arm's Step
+4b now pivots the still-live subset before deciding fast-path vs. rebuild (a
+pivot alone now forces the rebuild path), plus a bundle-side
+"Step 0-dup" tombstone gate mirroring Batch 1's `is_pivot_duplicate`. (B) new
+`find_recently_completed_manual_qso_for` in `pancetta-qso/src/qso_manager.rs`
+gives `respond_to_caller` a grace-window (`COMPLETED_QSO_REWORK_GRACE`, 45s,
+shared with the coordinator's drop-stale-TX `completed_tx_grace`) idempotent
+close: a close-step (`Rr73`/`SeventyThree`) reply for a station just
+completed within the grace window re-keys the existing QSO instead of
+spawning a sibling; Grid/Report-step replies are left as the deliberate
+legitimate-rework path. See `docs/DECISIONS/tx-scheduling.md` ("Multi-TX
+bundle-arm pivot + tombstone") and `docs/DECISIONS/qso-engine.md`
+("Grace-window idempotent close") for the landed design; the fix commit(s)
+land in this same session.

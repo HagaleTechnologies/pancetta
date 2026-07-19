@@ -2175,6 +2175,87 @@ impl super::ApplicationCoordinator {
                                     TX_ATTEMPTS_COUNT
                                         .fetch_add(items.len() as u64, Ordering::Relaxed);
 
+                                    // --- Step 0-dup (bundle): pivot-tombstone duplicate
+                                    // gate ---
+                                    // Double-PTT fix (docs/qso-tx-deep-review-2026-07-18.md).
+                                    // Mirrors the single-TX arm's Step 0-dup gate above: an
+                                    // item in THIS bundle may be a stale duplicate of a
+                                    // frame that was ALREADY physically transmitted via a
+                                    // previous cycle's bundle-arm pivot (Step 4b-pivot
+                                    // below) — the newer request that produced that
+                                    // pivoted text is the one bundled here, still behind
+                                    // the frame that already carried it out over the air.
+                                    // Drop any such item now, before Step 0's TX-policy
+                                    // mute or Step 1's encode; if every item in the bundle
+                                    // turns out to be such a duplicate, skip the whole
+                                    // message exactly like the other "all dropped" paths
+                                    // in this arm.
+                                    {
+                                        let mut kept = Vec::with_capacity(items.len());
+                                        for item in items.into_iter() {
+                                            if super::is_pivot_duplicate(
+                                                item.qso_id.as_deref(),
+                                                &item.message_text,
+                                                &pivoted_once,
+                                            ) {
+                                                info!(
+                                                    target: "pancetta::tx.policy",
+                                                    "dropping stale multi-TX item for {}: '{}' — already sent via pivot",
+                                                    item.qso_id.as_deref().unwrap_or("?"),
+                                                    item.message_text
+                                                );
+                                                emit_diagnostic(
+                                                    &message_bus,
+                                                    "tx.policy",
+                                                    pancetta_core::DiagnosticLevel::Info,
+                                                    format!(
+                                                        "dropping stale multi-TX item for '{}' — already sent via pivot",
+                                                        item.message_text
+                                                    ),
+                                                    item.qso_id.as_deref(),
+                                                )
+                                                .await;
+                                                if let Some(id) = item.qso_id.as_deref() {
+                                                    pivoted_once
+                                                        .remove(&super::active_tx_qso_key(id));
+                                                }
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
+                                            } else {
+                                                kept.push(item);
+                                            }
+                                        }
+                                        items = kept;
+                                        if items.is_empty() {
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "multi-TX bundle empty after dropping pivot-duplicate items — skipping"
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                "multi-TX bundle empty after dropping pivot-duplicate items — skipping"
+                                                    .to_string(),
+                                                None,
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            continue;
+                                        }
+                                    }
+
                                     // --- Step 0: TX-policy hard mute ---
                                     // Disabled (RX-only): never key PTT / play audio /
                                     // modulate. Consume the bundle, clear the TUI TX
@@ -2811,6 +2892,63 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
+                                    // --- Step 4b-pivot: bundle-arm late pivot ---
+                                    // Double-PTT fix (docs/qso-tx-deep-review-2026-07-18.md),
+                                    // bundle-arm analogue of the single-TX arm's Step 4c
+                                    // (see `pivot_bundle_items` in `coordinator/mod.rs`).
+                                    // The same pre-PTT wait that can leave a bundle item's
+                                    // QSO ENDED (handled just above) can also leave a
+                                    // still-LIVE item's TEXT stale: e.g. the DX sent RR73
+                                    // and this QSO advanced to its closing 73 while its
+                                    // frame was already bundled alongside a different,
+                                    // still-in-progress QSO. Swap in the freshest
+                                    // `LatestTxIntent` for every still-live item before
+                                    // deciding whether a rebuild is needed — a pivot alone
+                                    // (even with every item otherwise still live) must
+                                    // force the rebuild path below, since the item list
+                                    // now holds different text than what Step 1 encoded.
+                                    let latest_snapshot: std::collections::HashMap<
+                                        String,
+                                        super::LatestTxIntent,
+                                    > = latest_tx_intent
+                                        .read()
+                                        .ok()
+                                        .map(|guard| guard.clone())
+                                        .unwrap_or_default();
+                                    let live_items_pre: Vec<
+                                        crate::message_bus::TransmitRequestItem,
+                                    > = items
+                                        .iter()
+                                        .zip(live_mask.iter())
+                                        .filter(|(_, &live)| live)
+                                        .map(|(item, _)| item.clone())
+                                        .collect();
+                                    let (pivoted_live_items, pivots) =
+                                        super::pivot_bundle_items(live_items_pre, &latest_snapshot);
+                                    for (qso_key, new_text) in &pivots {
+                                        info!(
+                                            target: "pancetta::tx.pivot",
+                                            "TX pivot (bundle): qso {} -> '{}' (fresher message arrived during pre-PTT wait)",
+                                            qso_key,
+                                            new_text
+                                        );
+                                    }
+                                    let mut piv_iter = pivoted_live_items.into_iter();
+                                    let items: Vec<crate::message_bus::TransmitRequestItem> = items
+                                        .into_iter()
+                                        .zip(live_mask.iter())
+                                        .map(|(item, &live)| {
+                                            if live {
+                                                piv_iter.next().expect(
+                                                    "pivoted_live_items has exactly one \
+                                                         entry per live item, in order",
+                                                )
+                                            } else {
+                                                item
+                                            }
+                                        })
+                                        .collect();
+
                                     // `encoded_qso_ids` isn't consulted again after this
                                     // point (Step 5+ only needs `items`/`item_texts`), but
                                     // it's rebound alongside the rest for symmetry with the
@@ -2821,7 +2959,7 @@ impl super::ApplicationCoordinator {
                                         item_texts,
                                         _encoded_qso_ids,
                                         audio_duration_ms,
-                                    ) = if live_mask.iter().all(|&live| live) {
+                                    ) = if live_mask.iter().all(|&live| live) && pivots.is_empty() {
                                         // Fast path: nothing went stale.
                                         (
                                             items,
@@ -3048,6 +3186,18 @@ impl super::ApplicationCoordinator {
                                             let _ = message_bus.send_message(complete_msg).await;
                                         }
                                         continue;
+                                    }
+
+                                    // Double-PTT fix: record every pivot from Step
+                                    // 4b-pivot now that we're actually about to key this
+                                    // bundle, so the newer request that PRODUCED each
+                                    // pivoted text — still queued behind this bundle in
+                                    // the worker's channel — is recognized as an
+                                    // already-sent duplicate (Step 0-dup (bundle) above)
+                                    // instead of keying PTT a second time for the same
+                                    // text.
+                                    for (qso_key, new_text) in pivots {
+                                        pivoted_once.insert(qso_key, new_text);
                                     }
 
                                     // --- Step 5: Assert PTT ---

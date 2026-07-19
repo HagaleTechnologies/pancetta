@@ -63,6 +63,8 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - Drop-stale-TX: the worker re-checks QSO liveness at the last instant before PTT.
 - `mode=FT8` paths must remain byte-identical when FT4/FT2 features are untouched.
 - `merge_with` must carry every config field (see the §5 config-merge guardrail).
+- Every transmitted frame (single or multi-TX bundle item) reflects the freshest `MessageToSend` the QSO engine emitted for that qso_id at key-time.
+- At most one QSO object exists per (callsign, band) among active-or-recently-completed QSOs; repeated manual actions resolve to it, never spawn a sibling.
 
 ## Where Things Live
 
