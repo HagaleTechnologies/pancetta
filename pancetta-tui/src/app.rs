@@ -1702,23 +1702,33 @@ impl App {
 
     fn calculate_dx_priority(&self, message: &DecodedMessageView) -> u32 {
         // If the coordinator pre-computed a nuanced score from the real
-        // `PriorityScorer` (continuous f64 mapped to [0, 1000]), use it
-        // directly — it incorporates rarity, SNR, staleness, ATNO, and
-        // needed-DXCC/grid with configured weights, matching the autonomous
-        // scorer exactly. Fall back to the coarse bucket function only for
-        // legacy/test paths where no pre-computed score is available.
+        // `PriorityScorer` (#164 tiered encoding), use it directly.
         if let Some(pre_computed) = message.priority_score {
             return pre_computed;
         }
-        // Fallback: coarse bucket function (ATNO > needed-DXCC > rarity > distance > SNR).
-        crate::ui::dx_hunter::dx_priority_score(
-            message.atno,
-            message.needed,
-            None,
-            message.call_sign.as_deref().unwrap_or(""),
-            message.distance,
-            message.snr,
-        )
+        // Fallback: no precomputed score (legacy/test paths). Same
+        // reduced-signal adapter as merge_spot_groups's network-spot path.
+        let adapter = DxStationLookupAdapter {
+            needed: message.needed,
+            atno: message.atno,
+            band_needed: message.band_needed,
+            worked_before: message.worked_before,
+            rarity_tier: None,
+            is_notable: false,
+        };
+        let scorer = pancetta_qso::priority::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(adapter),
+        );
+        let freq_hz = message.frequency * 1_000_000.0;
+        scorer
+            .score_tiered(
+                message.call_sign.as_deref().unwrap_or(""),
+                message.grid_square.as_deref(),
+                message.snr.clamp(-128, 127) as i8,
+                freq_hz,
+            )
+            .as_display_u32()
     }
 
     fn scroll_up(&mut self) {
@@ -3788,6 +3798,40 @@ mod tests {
         assert!((adapter.rarity("JA1ABC") - 0.65).abs() < f64::EPSILON);
         assert!(!adapter.is_recent_failure("JA1ABC"));
         assert!(!adapter.is_needed_grid("PM95"));
+    }
+
+    #[tokio::test]
+    async fn calculate_dx_priority_fallback_uses_tiered_scorer_when_no_precomputed_score() {
+        let app = App::new(Config::default(), None).await.unwrap();
+        let message = DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14.074,
+            mode: "FT8".to_string(),
+            snr: -10,
+            delta_time: 0.0,
+            delta_freq: 0.0,
+            call_sign: Some("JA1ABC".to_string()),
+            grid_square: Some("PM95".to_string()),
+            message: "CQ JA1ABC PM95".to_string(),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: true,
+            atno: true,
+            band_needed: false,
+            priority_score: None,
+        };
+        let score = app.calculate_dx_priority(&message);
+        // ATNO + needed -> PriorityTier::Atno -> display range 4000-4999.
+        // The old coarse dx_priority_score function would have scored this
+        // input (atno=true, distance=None, snr=-10, non-rare-prefix call)
+        // at only 1014 (1000 ATNO + 0 rarity + 0 distance + 14 SNR
+        // tiebreak), so `>= 4000` alone already distinguishes new from old
+        // behavior; `< 5000` further pins it to the Atno band specifically.
+        assert!(score >= 4000, "expected ATNO tier range, got {score}");
+        assert!(score < 5000, "expected ATNO tier range, got {score}");
     }
 
     #[test]
