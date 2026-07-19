@@ -46,6 +46,7 @@ dirs = "5.0"
 # ft8-lib = { path = "../ft8-lib" }
 pancetta-core = { path = "../pancetta-core" }
 pancetta-config = { path = "../pancetta-config" }
+pancetta-qso = { path = "../pancetta-qso" }
 
 [dev-dependencies]
 tokio-test = "0.4"

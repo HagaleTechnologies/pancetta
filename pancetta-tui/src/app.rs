@@ -46,6 +46,63 @@ impl ColorCapability {
     }
 }
 
+/// Adapts a `DxStation`'s already-known fields into a `WorkedStationLookup`
+/// so the TUI can score local-decode-fallback and network-only rows through
+/// the SAME tiered `PriorityScorer` the coordinator's `tui_relay` uses for
+/// live decodes (#164 unification). The TUI has no access to the
+/// coordinator's `CachedStationLookup` (recent-failure history, per-band
+/// worked-grid history), so those two signals are always `false` here —
+/// an existing limitation carried forward from the coarse function this
+/// replaces, not a regression.
+struct DxStationLookupAdapter {
+    needed: bool,
+    atno: bool,
+    band_needed: bool,
+    worked_before: bool,
+    rarity_tier: Option<String>,
+    is_notable: bool,
+}
+
+impl pancetta_qso::priority::WorkedStationLookup for DxStationLookupAdapter {
+    fn is_duplicate(&self, _callsign: &str, _freq_hz: f64) -> bool {
+        self.worked_before
+    }
+    fn is_recent_failure(&self, _callsign: &str) -> bool {
+        false
+    }
+    fn is_needed_dxcc(&self, _callsign: &str) -> bool {
+        self.needed
+    }
+    fn is_atno(&self, _callsign: &str) -> bool {
+        self.atno
+    }
+    fn is_dxcc_needed_on_band(&self, _callsign: &str, _freq_hz: f64) -> bool {
+        self.band_needed
+    }
+    fn is_needed_grid(&self, _grid: &str) -> bool {
+        false
+    }
+    fn rarity(&self, _callsign: &str) -> f64 {
+        rarity_tier_to_f64(self.rarity_tier.as_deref())
+    }
+    fn is_notable(&self, _callsign: &str) -> bool {
+        self.is_notable
+    }
+}
+
+/// Map cqdx's string rarity tier to the `[0,1]` numeric scale
+/// `WorkedStationLookup::rarity` expects. `None`/unrecognized -> neutral
+/// 0.5, matching the trait's own default.
+fn rarity_tier_to_f64(tier: Option<&str>) -> f64 {
+    match tier {
+        Some("legendary") => 0.98,
+        Some("very_rare") => 0.85,
+        Some("rare") => 0.65,
+        Some("uncommon") => 0.4,
+        _ => 0.5,
+    }
+}
+
 /// View model for decoded messages in the TUI.
 /// This is NOT the domain type from pancetta-ft8; it is a display-oriented
 /// struct tailored for the UI layer.  If pancetta-ft8 is added as a dependency
@@ -3701,6 +3758,37 @@ mod tests {
     /// (a separate module, so its own private static isn't visible here).
     static TEST_STATE_PATH_COUNTER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
+
+    #[test]
+    fn rarity_tier_to_f64_maps_known_tiers_and_defaults_to_neutral() {
+        assert!((rarity_tier_to_f64(Some("legendary")) - 0.98).abs() < f64::EPSILON);
+        assert!((rarity_tier_to_f64(Some("very_rare")) - 0.85).abs() < f64::EPSILON);
+        assert!((rarity_tier_to_f64(Some("rare")) - 0.65).abs() < f64::EPSILON);
+        assert!((rarity_tier_to_f64(Some("uncommon")) - 0.4).abs() < f64::EPSILON);
+        assert!((rarity_tier_to_f64(Some("unknown_tier")) - 0.5).abs() < f64::EPSILON);
+        assert!((rarity_tier_to_f64(None) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dx_station_lookup_adapter_reflects_its_fields_through_the_trait() {
+        use pancetta_qso::priority::WorkedStationLookup;
+        let adapter = DxStationLookupAdapter {
+            needed: true,
+            atno: true,
+            band_needed: false,
+            worked_before: true,
+            rarity_tier: Some("rare".to_string()),
+            is_notable: true,
+        };
+        assert!(adapter.is_needed_dxcc("JA1ABC"));
+        assert!(adapter.is_atno("JA1ABC"));
+        assert!(!adapter.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
+        assert!(adapter.is_duplicate("JA1ABC", 14_074_000.0));
+        assert!(adapter.is_notable("JA1ABC"));
+        assert!((adapter.rarity("JA1ABC") - 0.65).abs() < f64::EPSILON);
+        assert!(!adapter.is_recent_failure("JA1ABC"));
+        assert!(!adapter.is_needed_grid("PM95"));
+    }
 
     #[test]
     fn freq_modal_default_is_hidden_rxdial() {
