@@ -74,3 +74,13 @@ all four existing failure sites (suspicious `[rig.interface].port`, `rigctld` sp
 unknown rig model, connect failure). The `rig_enabled` guard on the connect-failure site keeps a
 disabled/mock rig silent — a missing guard there would have made every disabled-rig (the
 default) station show a spurious rig error.
+
+## Last-10-QSOs history panel (issue #165), landed 2026-07-19
+
+The QSO Status panel's single-QSO-detail layout gained a compact history line
+("✓K5ARH ✗JA1ABC ..."), most recent first, capped at 10. Wired via a new
+`MessageType::QsoHistoryEntry` bus push (emitted from the coordinator's existing
+`QsoEvent::QsoCompleted`/`QsoFailed` handlers, alongside the existing `ActiveQsosSnapshot` push)
+relayed to a new `TuiMessage::QsoHistoryEntry`. "Successful" = `QsoCompleted`; any `QsoFailed`
+reason renders the ✗ glyph (not color-only, for accessibility). The multi-QSO table view does not
+get this line — only the single-QSO-detail layout.
