@@ -31,7 +31,7 @@ mod qso;
 mod qso_filter;
 mod remote_gateway;
 mod shutdown;
-mod station_agent;
+pub mod station_agent;
 mod tier;
 mod tui_relay;
 mod tx;

@@ -147,6 +147,8 @@ enum Commands {
     TestRig(TestRigArgs),
     /// Export logged QSOs to ADIF
     Export(ExportArgs),
+    /// Pair this station's agent with cqdx (remote-rig-control device enrollment)
+    Pair(PairArgs),
 }
 
 #[derive(Clone, Args)]
@@ -154,6 +156,31 @@ struct TestRigArgs {
     /// Test PTT by keying TX for 1 second (use with caution!)
     #[arg(long)]
     ptt: bool,
+}
+
+#[derive(Clone, Args)]
+struct PairArgs {
+    /// Single-use pairing code from the cqdx web UI
+    #[arg(required = true)]
+    code: String,
+
+    /// Human-readable name for this agent shown in cqdx's device list
+    #[arg(long)]
+    name: Option<String>,
+
+    /// Platform identifier sent during enrollment (default: this OS)
+    #[arg(long)]
+    platform: Option<String>,
+
+    /// Override the pairing API base URL (default: config's
+    /// network.station_agent.pairing_api_url, e.g. "https://cqdx.io/api/v1")
+    #[arg(long)]
+    pairing_api_url: Option<String>,
+
+    /// Re-pair even if this station already has a paired identity (overwrites
+    /// the existing paired.json)
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Clone, Args)]
@@ -381,7 +408,121 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::Doctor => doctor_command(cli).await,
         Commands::TestRig(args) => test_rig_command(args, cli).await,
         Commands::Export(args) => export_command(args).await,
+        Commands::Pair(args) => pair_command(args, cli).await,
     }
+}
+
+/// Run the agent enrollment (pairing) flow against cqdx: `enroll` (POST
+/// `/pair/agent`) → PoP-sign the challenge → `complete` (POST
+/// `/pair/agent/complete`), then persist the resulting `PairedState` (pinned
+/// IdP keys) to the agent's key directory so `station_agent` picks it up on
+/// next start. Thin CLI wrapper around already-tested `pancetta_agent`
+/// library calls — no new protocol logic here.
+async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
+    use pancetta_agent::keys::AgentIdentity;
+    use pancetta_agent::pairing::{PairedState, PairingClient};
+    use pancetta_lib::coordinator::station_agent::net::ReqwestPairingHttp;
+
+    println!();
+    println!("=== Pancetta Station-Agent Pairing ===");
+    println!();
+
+    let config = load_configuration(cli).await?;
+    let sa_cfg = &config.network.station_agent;
+
+    let pairing_api_url = args
+        .pairing_api_url
+        .clone()
+        .or_else(|| sa_cfg.pairing_api_url.clone())
+        .filter(|s| !s.is_empty());
+    let Some(pairing_api_url) = pairing_api_url else {
+        eprintln!("No pairing API URL configured.");
+        eprintln!(
+            "Set network.station_agent.pairing_api_url in your config (e.g. \
+             \"https://cqdx.io/api/v1\"), or pass --pairing-api-url."
+        );
+        std::process::exit(1);
+    };
+    let origin = sa_cfg.pairing_origin.clone();
+
+    let key_dir = sa_cfg
+        .key_dir
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(pancetta_lib::coordinator::station_agent::default_key_dir);
+
+    if !args.force {
+        if let Ok(existing) = PairedState::load(&key_dir) {
+            eprintln!(
+                "This station is already paired (agent_key_id = {}).",
+                existing.agent_key_id
+            );
+            eprintln!(
+                "Re-run with --force to overwrite {}/paired.json with a new pairing.",
+                key_dir.display()
+            );
+            std::process::exit(1);
+        }
+    }
+
+    println!("Pairing API:  {pairing_api_url}");
+    println!("Key dir:      {}", key_dir.display());
+    println!();
+
+    print!("[1/3] Loading (or generating) agent identity... ");
+    let identity = AgentIdentity::load_or_generate(&key_dir)
+        .context("failed to load/generate agent identity")?;
+    let key_id = identity.key_id();
+    println!("OK (keyId = {key_id})");
+
+    let platform = args
+        .platform
+        .clone()
+        .unwrap_or_else(|| format!("pancetta-{}", std::env::consts::OS));
+
+    print!("[2/3] Enrolling with cqdx... ");
+    let http = ReqwestPairingHttp::new(pairing_api_url, origin);
+    let client = PairingClient::new(http, identity);
+    let code = args.code.clone();
+    let name = args.name.clone();
+    // `enroll` synchronously blocks on HTTP via `Handle::block_on` internally
+    // (see net.rs's doc) — that's only safe off the async worker threads, so
+    // it runs on the blocking-thread pool rather than being awaited directly.
+    let enroll_result =
+        tokio::task::spawn_blocking(move || client.enroll(&code, name, Some(platform)))
+            .await
+            .context("pairing task panicked")?;
+    let paired = match enroll_result {
+        Ok(p) => {
+            println!("OK");
+            p
+        }
+        Err(e) => {
+            println!("FAILED");
+            eprintln!();
+            eprintln!("  {e}");
+            std::process::exit(1);
+        }
+    };
+
+    print!("[3/3] Persisting paired state... ");
+    paired
+        .persist(&key_dir)
+        .context("failed to persist paired state")?;
+    println!("OK");
+
+    println!();
+    println!("Paired. agent_key_id = {}", paired.agent_key_id);
+    println!("Pinned {} IdP key(s).", paired.idp_keys.len());
+    println!();
+    println!("Next steps:");
+    println!("  1. Set network.station_agent.enabled = true in your config.");
+    println!(
+        "  2. Add the client's keyId to network.station_agent.tx_allow_list \
+         once the client (panino) has paired."
+    );
+    println!("  3. Restart pancetta to connect to the relay.");
+    Ok(())
 }
 
 async fn export_command(args: ExportArgs) -> Result<()> {
