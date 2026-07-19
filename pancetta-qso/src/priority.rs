@@ -141,6 +141,14 @@ pub trait WorkedStationLookup: Send + Sync {
         false
     }
 
+    /// Is this grid square needed specifically on THIS band — never worked
+    /// there before, per the local QSO database (mirrors
+    /// `is_dxcc_needed_on_band`'s per-band-not-all-time semantics, one tier
+    /// down). Defaults to `false` for lookups that don't track this.
+    fn is_grid_needed_on_band(&self, _grid: &str, _freq_hz: f64) -> bool {
+        false
+    }
+
     /// Is this grid square needed for award tracking?
     fn is_needed_grid(&self, grid: &str) -> bool;
 
@@ -373,6 +381,107 @@ impl PriorityScorer {
             total,
         }
     }
+
+    /// Classify into one of the 5 lexicographic tiers (#164). ATNO always
+    /// wins when the entity is also needed (mirrors `score_cq_detailed`'s
+    /// existing "ATNO premium only meaningful when needed" rule); needed
+    /// alone (not ATNO) is tier 2; special-station patterns/cqdx-notable is
+    /// tier 3; per-band grid-new is tier 4; everything else is Standard.
+    fn classify_tier(&self, callsign: &str, grid: Option<&str>, freq_hz: f64) -> PriorityTier {
+        let needed = self.lookup.is_needed_dxcc(callsign)
+            || self.lookup.is_dxcc_needed_on_band(callsign, freq_hz);
+        if needed && self.lookup.is_atno(callsign) {
+            return PriorityTier::Atno;
+        }
+        if needed {
+            return PriorityTier::PerBandDxccNew;
+        }
+        if self.lookup.is_notable(callsign) || is_special_event_callsign(callsign) {
+            return PriorityTier::SpecialStation;
+        }
+        if let Some(g) = grid {
+            if self.lookup.is_grid_needed_on_band(g, freq_hz) {
+                return PriorityTier::PerBandGridNew;
+            }
+        }
+        PriorityTier::Standard
+    }
+
+    /// Continuous tiebreaker within a tier. Deliberately excludes
+    /// `needed_dxcc`/`atno_bonus`/`notable_bonus` — those signals now drive
+    /// `classify_tier` instead, and re-including them here would be a
+    /// redundant (if harmless, since they're constant within a tier) false
+    /// economy. Reuses the `rarity`/`pota_sota`/`signal_strength`/penalty/
+    /// staleness weights from `score_cq_detailed`'s formula.
+    fn secondary_score(&self, callsign: &str, snr: i8, freq_hz: f64) -> f64 {
+        let pota_sota = if is_pota_sota_candidate(callsign) {
+            1.0
+        } else {
+            0.0
+        };
+        let rarity = self.lookup.rarity(callsign);
+        let signal_strength = normalize_snr(snr);
+        let duplicate_penalty = if self.lookup.is_duplicate(callsign, freq_hz) {
+            1.0
+        } else {
+            0.0
+        };
+        let recent_failure_penalty = if self.lookup.is_recent_failure(callsign) {
+            1.0
+        } else {
+            0.0
+        };
+        let staleness = if let Some(last_seen) = self.lookup.network_last_seen(callsign) {
+            let now = chrono::Utc::now().timestamp();
+            let age_secs = (now - last_seen).max(0);
+            match age_secs {
+                0..=300 => 1.0,
+                301..=600 => 0.7,
+                601..=900 => 0.4,
+                _ => 0.2,
+            }
+        } else {
+            1.0
+        };
+        let snr_bonus = if let Some((reporter_count, best_snr)) = self.lookup.network_snr(callsign)
+        {
+            if reporter_count >= 5 && best_snr >= -20 {
+                0.1
+            } else if reporter_count == 1 && best_snr < -25 {
+                -0.1
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let raw = (rarity * self.weights.rarity
+            + pota_sota * self.weights.pota_sota
+            + signal_strength * self.weights.signal_strength
+            + duplicate_penalty * self.weights.duplicate_penalty
+            + recent_failure_penalty * self.weights.recent_failure_penalty
+            + snr_bonus)
+            * staleness;
+        raw.clamp(0.0, 1.0)
+    }
+
+    /// Tiered score (#164): combines `classify_tier` (dominant) with
+    /// `secondary_score` (tiebreak within a tier). This is what the DX
+    /// Hunter display should use; `evaluate_cq`/`score_cq_detailed` stay
+    /// unchanged for the autonomous operator's continuous-threshold
+    /// decision logic, which this redesign doesn't touch.
+    pub fn score_tiered(
+        &self,
+        callsign: &str,
+        grid: Option<&str>,
+        snr: i8,
+        freq_hz: f64,
+    ) -> TieredScore {
+        TieredScore {
+            tier: self.classify_tier(callsign, grid, freq_hz),
+            secondary: self.secondary_score(callsign, snr, freq_hz),
+        }
+    }
 }
 
 impl DxEvaluator for PriorityScorer {
@@ -392,6 +501,9 @@ mod tests {
         needed_dxcc: HashSet<String>,
         needed_grids: HashSet<String>,
         dxcc_needed_on_band: HashSet<String>,
+        grid_needed_on_band: HashSet<String>,
+        atno: HashSet<String>,
+        notable: HashSet<String>,
     }
 
     impl TestLookup {
@@ -402,6 +514,9 @@ mod tests {
                 needed_dxcc: HashSet::new(),
                 needed_grids: HashSet::new(),
                 dxcc_needed_on_band: HashSet::new(),
+                grid_needed_on_band: HashSet::new(),
+                atno: HashSet::new(),
+                notable: HashSet::new(),
             }
         }
     }
@@ -421,6 +536,15 @@ mod tests {
         }
         fn is_needed_grid(&self, grid: &str) -> bool {
             self.needed_grids.contains(grid)
+        }
+        fn is_grid_needed_on_band(&self, grid: &str, _freq_hz: f64) -> bool {
+            self.grid_needed_on_band.contains(grid)
+        }
+        fn is_atno(&self, callsign: &str) -> bool {
+            self.atno.contains(callsign)
+        }
+        fn is_notable(&self, callsign: &str) -> bool {
+            self.notable.contains(callsign)
         }
     }
 
@@ -823,5 +947,106 @@ mod tests {
         assert!(is_special_event_callsign("4U1UN"));
         assert!(is_special_event_callsign("4U1ITU"));
         assert!(!is_special_event_callsign("4U1XYZ")); // not in the curated list
+    }
+
+    #[test]
+    fn classify_tier_atno_beats_everything_even_with_weak_signal() {
+        let mut lookup = TestLookup::new();
+        lookup.needed_dxcc.insert("JA1ABC".to_string());
+        lookup.atno.insert("JA1ABC".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("JA1ABC", Some("PM95"), -24, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::Atno);
+    }
+
+    #[test]
+    fn classify_tier_needed_without_atno_is_per_band_dxcc_new() {
+        let mut lookup = TestLookup::new();
+        lookup.needed_dxcc.insert("JA1ABC".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("JA1ABC", Some("PM95"), -10, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::PerBandDxccNew);
+    }
+
+    #[test]
+    fn classify_tier_notable_non_needed_is_special_station() {
+        let mut lookup = TestLookup::new();
+        lookup.notable.insert("VP8STI".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("VP8STI", None, -10, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::SpecialStation);
+    }
+
+    #[test]
+    fn classify_tier_special_event_pattern_is_special_station_even_without_cqdx_notable() {
+        let lookup = TestLookup::new();
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("W1A", None, -10, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::SpecialStation);
+    }
+
+    #[test]
+    fn classify_tier_grid_needed_is_per_band_grid_new() {
+        let mut lookup = TestLookup::new();
+        lookup.grid_needed_on_band.insert("PM95".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("W1XYZ", Some("PM95"), -10, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::PerBandGridNew);
+    }
+
+    #[test]
+    fn classify_tier_plain_station_is_standard() {
+        let lookup = TestLookup::new();
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("W1XYZ", Some("FN42"), -10, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::Standard);
+    }
+
+    #[test]
+    fn secondary_score_varies_by_rarity_within_standard_tier() {
+        let mut rarity_map = HashMap::new();
+        rarity_map.insert("3Y0J".to_string(), 0.95);
+        struct RarityOnlyLookup {
+            map: HashMap<String, f64>,
+        }
+        impl WorkedStationLookup for RarityOnlyLookup {
+            fn is_duplicate(&self, _c: &str, _f: f64) -> bool {
+                false
+            }
+            fn is_recent_failure(&self, _c: &str) -> bool {
+                false
+            }
+            fn is_needed_dxcc(&self, _c: &str) -> bool {
+                false
+            }
+            fn is_needed_grid(&self, _g: &str) -> bool {
+                false
+            }
+            fn rarity(&self, c: &str) -> f64 {
+                self.map.get(c).copied().unwrap_or(0.5)
+            }
+        }
+        let rare_scorer = PriorityScorer::new(
+            PriorityWeights::default(),
+            Box::new(RarityOnlyLookup {
+                map: rarity_map.clone(),
+            }),
+        );
+        let common_scorer = PriorityScorer::new(
+            PriorityWeights::default(),
+            Box::new(RarityOnlyLookup {
+                map: HashMap::new(),
+            }),
+        );
+        let rare = rare_scorer.score_tiered("3Y0J", None, -10, 14_074_000.0);
+        let common = common_scorer.score_tiered("W1XYZ", None, -10, 14_074_000.0);
+        assert_eq!(rare.tier, PriorityTier::Standard);
+        assert_eq!(common.tier, PriorityTier::Standard);
+        assert!(
+            rare.secondary > common.secondary,
+            "rarer station must rank higher within the same (Standard) tier: {} vs {}",
+            rare.secondary,
+            common.secondary
+        );
     }
 }
