@@ -3276,11 +3276,11 @@ impl App {
     ///
     /// Network spots used to land with `priority_score: 0`, so they always
     /// sorted to the bottom of the DX Hunter list regardless of how rare
-    /// they were. We now run the richer `dx_hunter::calculate_dx_priority`
-    /// scorer — which weights rarity_tier, distance, SNR and recency — so a
-    /// "legendary"/"very_rare" cluster spot ranks where it belongs.
+    /// they were. We now run the same #164 tiered `PriorityScorer` the
+    /// live-decode path uses (via `DxStationLookupAdapter`), so a
+    /// needed/ATNO/notable cluster spot ranks in the tier it actually
+    /// belongs to, not just a coarse bucket.
     pub fn merge_spot_groups(&mut self, spots: &[crate::tui_runner::CqdxSpotInfo]) {
-        let our_grid = self.station_info.grid_square.clone();
         for spot in spots {
             // Never insert our own callsign into the DX Hunter via network
             // spots (e.g. a PSKReporter/cqdx monitor reporting our own TX).
@@ -3358,13 +3358,27 @@ impl App {
             // anyway. Keep the higher of any pre-existing local score and
             // the network score so a station heard both ways doesn't lose
             // rank on a merge tick.
-            let net_score = crate::ui::dx_hunter::calculate_dx_priority(
-                entry,
-                &our_grid,
-                entry.worked_before,
-                false,
-                false,
+            let adapter = DxStationLookupAdapter {
+                needed: entry.needed,
+                atno: entry.atno,
+                band_needed: entry.band_needed,
+                worked_before: entry.worked_before,
+                rarity_tier: entry.rarity_tier.clone(),
+                is_notable: entry.is_notable,
+            };
+            let scorer = pancetta_qso::priority::PriorityScorer::new(
+                pancetta_qso::priority::PriorityWeights::default(),
+                Box::new(adapter),
             );
+            let freq_hz = entry.frequency * 1_000_000.0;
+            let net_score = scorer
+                .score_tiered(
+                    &entry.call_sign,
+                    entry.grid_square.as_deref(),
+                    entry.snr.clamp(-128, 127) as i8,
+                    freq_hz,
+                )
+                .as_display_u32();
             entry.priority_score = entry.priority_score.max(net_score);
         }
 
@@ -4959,6 +4973,36 @@ mod tests {
         assert!(
             app.dx_stations.contains_key("JA1ABC"),
             "merge_spot_groups must still insert other stations"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_spot_groups_scores_atno_spot_into_the_atno_display_range() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "JA1ABC".to_string(),
+            band: "20m".to_string(),
+            mode: "FT8".to_string(),
+            frequency_hz: 14_074_000,
+            grid: Some("PM95".to_string()),
+            rarity_tier: "rare".to_string(),
+            reporter_count: 3,
+            best_snr: Some(-10),
+            confidence: 0.9,
+            first_seen: chrono::Utc::now().timestamp(),
+            last_seen: chrono::Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "Japan".to_string(),
+            needed: true,
+            atno: true,
+        };
+        app.merge_spot_groups(&[spot]);
+        let entry = app.dx_stations.get("JA1ABC").expect("spot merged");
+        assert!(
+            entry.priority_score >= 4000,
+            "expected ATNO tier range, got {}",
+            entry.priority_score
         );
     }
 
