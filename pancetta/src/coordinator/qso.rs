@@ -1442,6 +1442,9 @@ impl super::ApplicationCoordinator {
                         if !band_callsign_pairs.is_empty() {
                             qso_lookup.seed_worked_dxcc_from_list(band_callsign_pairs);
                         }
+
+                        let band_grid_pairs = db.get_worked_bands_and_grids().await;
+                        qso_lookup.seed_worked_grids_from_list(band_grid_pairs);
                     } else {
                         warn!(
                             "Could not open QSO database for startup seed ({}) — \
@@ -2020,6 +2023,9 @@ impl super::ApplicationCoordinator {
                                     let band =
                                         pancetta_qso::utils::frequency_to_band(metadata.frequency);
                                     qso_lookup.record_worked(their_call, &band);
+                                    if let Some(grid) = metadata.grids.theirs.as_deref() {
+                                        qso_lookup.record_worked_grid(grid, &band);
+                                    }
 
                                     // item-2-auto-73: stash MANUAL completions so
                                     // that if this DX keeps re-sending RR73/RRR (they
