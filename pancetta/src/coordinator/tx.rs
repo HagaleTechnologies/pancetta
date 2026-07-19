@@ -312,6 +312,26 @@ async fn send_tx_queue_status(
     sending: Option<crate::message_bus::TxItem>,
     queued: Vec<crate::message_bus::TxItem>,
 ) {
+    // #172: log every actually-keyed frame for Band Activity's own-TX
+    // history, before the existing NOW-SENDING snapshot below. Idle-clear
+    // calls (sending: None) emit nothing here — only real key events.
+    if let Some(item) = sending.as_ref() {
+        let log_msg = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Tui,
+            MessageType::TxFrameLogged {
+                text: item.text.clone(),
+                freq_hz: item.freq_hz,
+                qso_id: item.qso_id.clone(),
+                timestamp: chrono::Utc::now(),
+            },
+            Instant::now(),
+        );
+        if let Err(e) = message_bus.send_message(log_msg).await {
+            tracing::debug!("TxFrameLogged relay failed (no TUI?): {}", e);
+        }
+    }
+
     let msg = ComponentMessage::new(
         ComponentId::Ft8Transmitter,
         ComponentId::Tui,
@@ -4028,6 +4048,99 @@ mod tx_failure_diagnostic_tests {
             }
             other => panic!("expected DiagnosticEvent, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tx_frame_logged_tests {
+    use super::*;
+    use crate::message_bus::{ComponentId, MessageBus, MessageType};
+
+    #[tokio::test]
+    async fn keying_a_frame_emits_tx_frame_logged_before_tx_queue_status() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+
+        send_tx_queue_status(
+            &bus,
+            Some(crate::message_bus::TxItem {
+                text: "K5ARH JA1ABC -12".to_string(),
+                freq_hz: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+                deferred: false,
+            }),
+            Vec::new(),
+        )
+        .await;
+
+        let msg = receiver
+            .try_recv()
+            .expect("a TxFrameLogged message should have been sent");
+        match msg.message_type {
+            MessageType::TxFrameLogged {
+                text,
+                freq_hz,
+                qso_id,
+                ..
+            } => {
+                assert_eq!(text, "K5ARH JA1ABC -12");
+                assert_eq!(freq_hz, 1500.0);
+                assert_eq!(qso_id.as_deref(), Some("qso-1"));
+            }
+            other => panic!("expected TxFrameLogged, got {other:?}"),
+        }
+
+        let msg2 = receiver.try_recv().expect("TxQueueStatus should follow");
+        assert!(matches!(
+            msg2.message_type,
+            MessageType::TxQueueStatus { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cq_frame_qso_id_is_none() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+
+        send_tx_queue_status(
+            &bus,
+            Some(crate::message_bus::TxItem {
+                text: "CQ K5ARH EM10".to_string(),
+                freq_hz: 1200.0,
+                qso_id: None,
+                deferred: false,
+            }),
+            Vec::new(),
+        )
+        .await;
+
+        let msg = receiver
+            .try_recv()
+            .expect("TxFrameLogged should send for CQ too");
+        match msg.message_type {
+            MessageType::TxFrameLogged { qso_id, .. } => assert_eq!(qso_id, None),
+            other => panic!("expected TxFrameLogged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_clear_does_not_emit_tx_frame_logged() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+
+        send_tx_queue_status(&bus, None, Vec::new()).await;
+
+        let msg = receiver
+            .try_recv()
+            .expect("TxQueueStatus should still send");
+        assert!(matches!(
+            msg.message_type,
+            MessageType::TxQueueStatus { sending: None, .. }
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "no TxFrameLogged when sending is None"
+        );
     }
 }
 
