@@ -102,6 +102,10 @@ pub struct CachedStationLookup {
     /// "needed"). Powers `is_dxcc_needed_on_band` (2026-07-18, DX Hunter
     /// per-band-needed gap — see docs/DECISIONS/2026-07-development-phases-and-gaps.md).
     worked_dxcc_on_band: Arc<RwLock<HashMap<String, HashSet<String>>>>,
+    /// Grid squares worked per band, local history only (mirrors
+    /// `worked_dxcc_on_band` one tier down — #164 tier 4). Key = uppercase
+    /// band name, value = set of 4-char uppercase Maidenhead fields.
+    worked_grids_on_band: Arc<RwLock<HashMap<String, HashSet<String>>>>,
     /// Callsigns where a recent QSO attempt failed.
     recent_failures: Arc<RwLock<HashSet<String>>>,
     /// DXCC entities still needed.
@@ -157,6 +161,7 @@ impl CachedStationLookup {
         Self {
             worked_on_band: Arc::new(RwLock::new(HashMap::new())),
             worked_dxcc_on_band: Arc::new(RwLock::new(HashMap::new())),
+            worked_grids_on_band: Arc::new(RwLock::new(HashMap::new())),
             recent_failures: Arc::new(RwLock::new(HashSet::new())),
             needed_dxcc: Arc::new(RwLock::new(HashSet::new())),
             needed_atno: Arc::new(RwLock::new(HashSet::new())),
@@ -232,6 +237,28 @@ impl CachedStationLookup {
             resolved,
             map.len(),
             skipped
+        );
+    }
+
+    /// Seed `worked_grids_on_band` from (band, grid) pairs loaded at startup
+    /// (`QsoDatabase::get_worked_bands_and_grids`). Grids shorter than 4
+    /// chars are skipped (not a valid Maidenhead field).
+    pub fn seed_worked_grids_from_list(&self, pairs: Vec<(String, String)>) {
+        let mut map = self.worked_grids_on_band.write();
+        let mut inserted = 0usize;
+        for (band, grid) in pairs {
+            let trimmed = grid.trim();
+            if trimmed.len() < 4 {
+                continue;
+            }
+            let field = trimmed[..4].to_uppercase();
+            map.entry(band.to_uppercase()).or_default().insert(field);
+            inserted += 1;
+        }
+        tracing::info!(
+            "CachedStationLookup: seeded {} worked grid(s) across {} band(s)",
+            inserted,
+            map.len()
         );
     }
 
@@ -320,6 +347,21 @@ impl CachedStationLookup {
                 .insert(entity.to_string());
         }
     }
+
+    /// Record a worked grid square for #164 tier 4, called alongside
+    /// `record_worked` on live QSO completion when the DX's grid is known.
+    pub fn record_worked_grid(&self, grid: &str, band: &str) {
+        let trimmed = grid.trim();
+        if trimmed.len() < 4 {
+            return;
+        }
+        let field = trimmed[..4].to_uppercase();
+        self.worked_grids_on_band
+            .write()
+            .entry(band.to_uppercase())
+            .or_default()
+            .insert(field);
+    }
 }
 
 impl WorkedStationLookup for CachedStationLookup {
@@ -400,6 +442,20 @@ impl WorkedStationLookup for CachedStationLookup {
         let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
         let worked = self.worked_dxcc_on_band.read();
         !worked.get(&band).is_some_and(|set| set.contains(entity))
+    }
+
+    fn is_grid_needed_on_band(&self, grid: &str, freq_hz: f64) -> bool {
+        let trimmed = grid.trim();
+        if trimmed.len() < 4 {
+            return false;
+        }
+        let field = trimmed[..4].to_uppercase();
+        let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
+        !self
+            .worked_grids_on_band
+            .read()
+            .get(&band)
+            .is_some_and(|s| s.contains(&field))
     }
 
     fn is_needed_grid(&self, grid: &str) -> bool {
@@ -580,6 +636,55 @@ mod tests {
             ("20m".to_string(), "JA1ABC".to_string()),
         ]);
         assert!(!lookup.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
+    }
+
+    // --- DX Hunter per-band grid tracking (#164 tier 4) ---
+
+    #[test]
+    fn grid_needed_on_band_true_before_ever_worked() {
+        let lookup = CachedStationLookup::new();
+        assert!(lookup.is_grid_needed_on_band("PM95", 14_074_000.0));
+    }
+
+    #[test]
+    fn grid_needed_on_band_false_after_working_that_band() {
+        let lookup = CachedStationLookup::new();
+        lookup.record_worked_grid("PM95", "20m");
+        assert!(!lookup.is_grid_needed_on_band("PM95", 14_074_000.0));
+    }
+
+    #[test]
+    fn grid_needed_on_band_true_on_a_different_band() {
+        let lookup = CachedStationLookup::new();
+        lookup.record_worked_grid("PM95", "20m");
+        assert!(lookup.is_grid_needed_on_band("PM95", 7_074_000.0));
+    }
+
+    #[test]
+    fn grid_needed_on_band_case_insensitive_and_4_char_field() {
+        let lookup = CachedStationLookup::new();
+        lookup.record_worked_grid("pm95xx", "20m"); // 6-char, lowercase
+        assert!(!lookup.is_grid_needed_on_band("PM95", 14_074_000.0));
+    }
+
+    #[test]
+    fn grid_needed_on_band_false_for_too_short_grid() {
+        let lookup = CachedStationLookup::new();
+        assert!(!lookup.is_grid_needed_on_band("PM", 14_074_000.0));
+    }
+
+    #[test]
+    fn seed_worked_grids_from_list_matches_record_worked_grid() {
+        let seeded = CachedStationLookup::new();
+        seeded.seed_worked_grids_from_list(vec![("20m".to_string(), "PM95".to_string())]);
+
+        let recorded = CachedStationLookup::new();
+        recorded.record_worked_grid("PM95", "20m");
+
+        for lookup in [&seeded, &recorded] {
+            assert!(!lookup.is_grid_needed_on_band("PM95", 14_074_000.0));
+            assert!(lookup.is_grid_needed_on_band("PM95", 7_074_000.0));
+        }
     }
 
     // --- BUG #163: rarity entity-keyed fallback ---
