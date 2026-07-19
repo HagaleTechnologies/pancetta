@@ -840,6 +840,34 @@ impl QsoDatabase {
         }
     }
 
+    /// Mirrors `get_worked_bands_and_callsigns` but for the DX's grid square
+    /// instead of callsign — feeds `CachedStationLookup::seed_worked_grids_from_list`
+    /// for #164's per-band-grid-new tier. Rows with no grid on the QSO are
+    /// simply absent (`json_extract` on a missing/null field filters them via
+    /// the `IS NOT NULL` clause), not an error.
+    pub async fn get_worked_bands_and_grids(&self) -> Vec<(String, String)> {
+        let result: Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
+            "SELECT DISTINCT json_extract(adif_data, '$.band'), \
+                             json_extract(metadata, '$.grids.theirs') \
+             FROM qsos \
+             WHERE json_extract(adif_data, '$.band') IS NOT NULL \
+               AND json_extract(metadata, '$.grids.theirs') IS NOT NULL",
+        )
+        .fetch_all(&self.pool)
+        .await;
+
+        match result {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                tracing::warn!(
+                    "get_worked_bands_and_grids: query failed: {} — treating as empty",
+                    e
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Build a fresh index at `db_path` by replaying every record in `adif_path`.
     ///
     /// If `db_path` exists, it is deleted first — caller should only invoke this
@@ -1144,6 +1172,46 @@ mod tests {
     async fn get_worked_bands_and_callsigns_empty_db_returns_empty() {
         let db = QsoDatabase::new_in_memory().await.unwrap();
         assert!(db.get_worked_bands_and_callsigns().await.is_empty());
+    }
+
+    // --- DX Hunter per-band-needed (2026-07-18): get_worked_bands_and_grids ---
+
+    #[tokio::test]
+    async fn get_worked_bands_and_grids_returns_every_band_in_one_query() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        db.insert_qso(&duplicate_check_test_progress("JA1ABC", 14_074_000.0))
+            .await
+            .unwrap();
+        db.insert_qso(&duplicate_check_test_progress("VK2XYZ", 7_074_000.0))
+            .await
+            .unwrap();
+
+        let mut pairs = db.get_worked_bands_and_grids().await;
+        pairs.sort();
+
+        // duplicate_check_test_progress doesn't set a grid, so with the default
+        // fixture this should be empty (grids.theirs is None) — this pins the
+        // "no grid on the QSO -> no pair emitted" behavior, not a false-positive.
+        assert!(pairs.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_worked_bands_and_grids_includes_grid_when_present() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        let mut progress = duplicate_check_test_progress("JA1ABC", 14_074_000.0);
+        progress.metadata.grids.theirs = Some("PM95".to_string());
+        db.insert_qso(&progress).await.unwrap();
+
+        let pairs = db.get_worked_bands_and_grids().await;
+        assert_eq!(pairs.len(), 1);
+        assert!(pairs[0].0.eq_ignore_ascii_case("20m"));
+        assert_eq!(pairs[0].1, "PM95");
+    }
+
+    #[tokio::test]
+    async fn get_worked_bands_and_grids_empty_db_returns_empty() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        assert!(db.get_worked_bands_and_grids().await.is_empty());
     }
 
     fn duplicate_check_test_progress(callsign: &str, frequency: f64) -> QsoProgress {

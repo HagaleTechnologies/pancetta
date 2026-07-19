@@ -46,6 +46,63 @@ impl ColorCapability {
     }
 }
 
+/// Adapts a `DxStation`'s already-known fields into a `WorkedStationLookup`
+/// so the TUI can score local-decode-fallback and network-only rows through
+/// the SAME tiered `PriorityScorer` the coordinator's `tui_relay` uses for
+/// live decodes (#164 unification). The TUI has no access to the
+/// coordinator's `CachedStationLookup` (recent-failure history, per-band
+/// worked-grid history), so those two signals are always `false` here —
+/// an existing limitation carried forward from the coarse function this
+/// replaces, not a regression.
+struct DxStationLookupAdapter {
+    needed: bool,
+    atno: bool,
+    band_needed: bool,
+    worked_before: bool,
+    rarity_tier: Option<String>,
+    is_notable: bool,
+}
+
+impl pancetta_qso::priority::WorkedStationLookup for DxStationLookupAdapter {
+    fn is_duplicate(&self, _callsign: &str, _freq_hz: f64) -> bool {
+        self.worked_before
+    }
+    fn is_recent_failure(&self, _callsign: &str) -> bool {
+        false
+    }
+    fn is_needed_dxcc(&self, _callsign: &str) -> bool {
+        self.needed
+    }
+    fn is_atno(&self, _callsign: &str) -> bool {
+        self.atno
+    }
+    fn is_dxcc_needed_on_band(&self, _callsign: &str, _freq_hz: f64) -> bool {
+        self.band_needed
+    }
+    fn is_needed_grid(&self, _grid: &str) -> bool {
+        false
+    }
+    fn rarity(&self, _callsign: &str) -> f64 {
+        rarity_tier_to_f64(self.rarity_tier.as_deref())
+    }
+    fn is_notable(&self, _callsign: &str) -> bool {
+        self.is_notable
+    }
+}
+
+/// Map cqdx's string rarity tier to the `[0,1]` numeric scale
+/// `WorkedStationLookup::rarity` expects. `None`/unrecognized -> neutral
+/// 0.5, matching the trait's own default.
+fn rarity_tier_to_f64(tier: Option<&str>) -> f64 {
+    match tier {
+        Some("legendary") => 0.98,
+        Some("very_rare") => 0.85,
+        Some("rare") => 0.65,
+        Some("uncommon") => 0.4,
+        _ => 0.5,
+    }
+}
+
 /// View model for decoded messages in the TUI.
 /// This is NOT the domain type from pancetta-ft8; it is a display-oriented
 /// struct tailored for the UI layer.  If pancetta-ft8 is added as a dependency
@@ -1645,23 +1702,33 @@ impl App {
 
     fn calculate_dx_priority(&self, message: &DecodedMessageView) -> u32 {
         // If the coordinator pre-computed a nuanced score from the real
-        // `PriorityScorer` (continuous f64 mapped to [0, 1000]), use it
-        // directly — it incorporates rarity, SNR, staleness, ATNO, and
-        // needed-DXCC/grid with configured weights, matching the autonomous
-        // scorer exactly. Fall back to the coarse bucket function only for
-        // legacy/test paths where no pre-computed score is available.
+        // `PriorityScorer` (#164 tiered encoding), use it directly.
         if let Some(pre_computed) = message.priority_score {
             return pre_computed;
         }
-        // Fallback: coarse bucket function (ATNO > needed-DXCC > rarity > distance > SNR).
-        crate::ui::dx_hunter::dx_priority_score(
-            message.atno,
-            message.needed,
-            None,
-            message.call_sign.as_deref().unwrap_or(""),
-            message.distance,
-            message.snr,
-        )
+        // Fallback: no precomputed score (legacy/test paths). Same
+        // reduced-signal adapter as merge_spot_groups's network-spot path.
+        let adapter = DxStationLookupAdapter {
+            needed: message.needed,
+            atno: message.atno,
+            band_needed: message.band_needed,
+            worked_before: message.worked_before,
+            rarity_tier: None,
+            is_notable: false,
+        };
+        let scorer = pancetta_qso::priority::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(adapter),
+        );
+        let freq_hz = message.frequency * 1_000_000.0;
+        scorer
+            .score_tiered(
+                message.call_sign.as_deref().unwrap_or(""),
+                message.grid_square.as_deref(),
+                message.snr.clamp(-128, 127) as i8,
+                freq_hz,
+            )
+            .as_display_u32()
     }
 
     fn scroll_up(&mut self) {
@@ -3209,11 +3276,11 @@ impl App {
     ///
     /// Network spots used to land with `priority_score: 0`, so they always
     /// sorted to the bottom of the DX Hunter list regardless of how rare
-    /// they were. We now run the richer `dx_hunter::calculate_dx_priority`
-    /// scorer — which weights rarity_tier, distance, SNR and recency — so a
-    /// "legendary"/"very_rare" cluster spot ranks where it belongs.
+    /// they were. We now run the same #164 tiered `PriorityScorer` the
+    /// live-decode path uses (via `DxStationLookupAdapter`), so a
+    /// needed/ATNO/notable cluster spot ranks in the tier it actually
+    /// belongs to, not just a coarse bucket.
     pub fn merge_spot_groups(&mut self, spots: &[crate::tui_runner::CqdxSpotInfo]) {
-        let our_grid = self.station_info.grid_square.clone();
         for spot in spots {
             // Never insert our own callsign into the DX Hunter via network
             // spots (e.g. a PSKReporter/cqdx monitor reporting our own TX).
@@ -3291,13 +3358,27 @@ impl App {
             // anyway. Keep the higher of any pre-existing local score and
             // the network score so a station heard both ways doesn't lose
             // rank on a merge tick.
-            let net_score = crate::ui::dx_hunter::calculate_dx_priority(
-                entry,
-                &our_grid,
-                entry.worked_before,
-                false,
-                false,
+            let adapter = DxStationLookupAdapter {
+                needed: entry.needed,
+                atno: entry.atno,
+                band_needed: entry.band_needed,
+                worked_before: entry.worked_before,
+                rarity_tier: entry.rarity_tier.clone(),
+                is_notable: entry.is_notable,
+            };
+            let scorer = pancetta_qso::priority::PriorityScorer::new(
+                pancetta_qso::priority::PriorityWeights::default(),
+                Box::new(adapter),
             );
+            let freq_hz = entry.frequency * 1_000_000.0;
+            let net_score = scorer
+                .score_tiered(
+                    &entry.call_sign,
+                    entry.grid_square.as_deref(),
+                    entry.snr.clamp(-128, 127) as i8,
+                    freq_hz,
+                )
+                .as_display_u32();
             entry.priority_score = entry.priority_score.max(net_score);
         }
 
@@ -3701,6 +3782,71 @@ mod tests {
     /// (a separate module, so its own private static isn't visible here).
     static TEST_STATE_PATH_COUNTER: std::sync::atomic::AtomicU64 =
         std::sync::atomic::AtomicU64::new(0);
+
+    #[test]
+    fn rarity_tier_to_f64_maps_known_tiers_and_defaults_to_neutral() {
+        assert!((rarity_tier_to_f64(Some("legendary")) - 0.98).abs() < f64::EPSILON);
+        assert!((rarity_tier_to_f64(Some("very_rare")) - 0.85).abs() < f64::EPSILON);
+        assert!((rarity_tier_to_f64(Some("rare")) - 0.65).abs() < f64::EPSILON);
+        assert!((rarity_tier_to_f64(Some("uncommon")) - 0.4).abs() < f64::EPSILON);
+        assert!((rarity_tier_to_f64(Some("unknown_tier")) - 0.5).abs() < f64::EPSILON);
+        assert!((rarity_tier_to_f64(None) - 0.5).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn dx_station_lookup_adapter_reflects_its_fields_through_the_trait() {
+        use pancetta_qso::priority::WorkedStationLookup;
+        let adapter = DxStationLookupAdapter {
+            needed: true,
+            atno: true,
+            band_needed: false,
+            worked_before: true,
+            rarity_tier: Some("rare".to_string()),
+            is_notable: true,
+        };
+        assert!(adapter.is_needed_dxcc("JA1ABC"));
+        assert!(adapter.is_atno("JA1ABC"));
+        assert!(!adapter.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
+        assert!(adapter.is_duplicate("JA1ABC", 14_074_000.0));
+        assert!(adapter.is_notable("JA1ABC"));
+        assert!((adapter.rarity("JA1ABC") - 0.65).abs() < f64::EPSILON);
+        assert!(!adapter.is_recent_failure("JA1ABC"));
+        assert!(!adapter.is_needed_grid("PM95"));
+    }
+
+    #[tokio::test]
+    async fn calculate_dx_priority_fallback_uses_tiered_scorer_when_no_precomputed_score() {
+        let app = App::new(Config::default(), None).await.unwrap();
+        let message = DecodedMessageView {
+            timestamp: chrono::Utc::now(),
+            frequency: 14.074,
+            mode: "FT8".to_string(),
+            snr: -10,
+            delta_time: 0.0,
+            delta_freq: 0.0,
+            call_sign: Some("JA1ABC".to_string()),
+            grid_square: Some("PM95".to_string()),
+            message: "CQ JA1ABC PM95".to_string(),
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: false,
+            worked_before: false,
+            needed: true,
+            atno: true,
+            band_needed: false,
+            priority_score: None,
+        };
+        let score = app.calculate_dx_priority(&message);
+        // ATNO + needed -> PriorityTier::Atno -> display range 4000-4999.
+        // The old coarse dx_priority_score function would have scored this
+        // input (atno=true, distance=None, snr=-10, non-rare-prefix call)
+        // at only 1014 (1000 ATNO + 0 rarity + 0 distance + 14 SNR
+        // tiebreak), so `>= 4000` alone already distinguishes new from old
+        // behavior; `< 5000` further pins it to the Atno band specifically.
+        assert!(score >= 4000, "expected ATNO tier range, got {score}");
+        assert!(score < 5000, "expected ATNO tier range, got {score}");
+    }
 
     #[test]
     fn freq_modal_default_is_hidden_rxdial() {
@@ -4827,6 +4973,36 @@ mod tests {
         assert!(
             app.dx_stations.contains_key("JA1ABC"),
             "merge_spot_groups must still insert other stations"
+        );
+    }
+
+    #[tokio::test]
+    async fn merge_spot_groups_scores_atno_spot_into_the_atno_display_range() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let spot = crate::tui_runner::CqdxSpotInfo {
+            dx_call: "JA1ABC".to_string(),
+            band: "20m".to_string(),
+            mode: "FT8".to_string(),
+            frequency_hz: 14_074_000,
+            grid: Some("PM95".to_string()),
+            rarity_tier: "rare".to_string(),
+            reporter_count: 3,
+            best_snr: Some(-10),
+            confidence: 0.9,
+            first_seen: chrono::Utc::now().timestamp(),
+            last_seen: chrono::Utc::now().timestamp(),
+            is_notable: false,
+            notable_type: None,
+            entity_name: "Japan".to_string(),
+            needed: true,
+            atno: true,
+        };
+        app.merge_spot_groups(&[spot]);
+        let entry = app.dx_stations.get("JA1ABC").expect("spot merged");
+        assert!(
+            entry.priority_score >= 4000,
+            "expected ATNO tier range, got {}",
+            entry.priority_score
         );
     }
 

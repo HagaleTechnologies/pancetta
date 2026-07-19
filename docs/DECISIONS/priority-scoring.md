@@ -40,3 +40,28 @@ now do.
 
 `docs/qso-tx-deep-review-2026-07-18.md` and the issue itself (#163) have the full investigation
 trail and on-air symptom description.
+
+## 5-tier lexicographic redesign (issue #164), landed 2026-07-19
+
+Replaces the flat weighted-sum with a strict tier ordering — ATNO > per-band-DXCC-new >
+special-station > per-band-grid-new > everything-else — where a higher tier always outranks
+every station in a lower tier regardless of any other factor. `PriorityTier`/`TieredScore` live in
+`pancetta-qso::priority`; `PriorityScorer::score_tiered` combines tier classification with a
+reduced continuous `secondary_score` (rarity/POTA-SOTA/signal/penalties/staleness — deliberately
+excluding the needed/ATNO/notable signals now captured by tier) as the within-tier tiebreaker.
+
+Tier 3 (special stations) detects US 1x1-format callsigns (`W1A`) and the UK `GB`-prefix
+convention, plus a small curated international list (`4U1UN`, `4U1ITU`), layered on cqdx's
+existing `is_notable` hook. Tier 4 (per-band grid-new) mirrors tier 2's per-band-DXCC tracking
+exactly, via a new `CachedStationLookup::worked_grids_on_band` local-history cache — independent
+of cqdx's still-unbuilt `needed-grids` server endpoint.
+
+The two previously-divergent DX Hunter scorers (the real `PriorityScorer` for live decodes, and a
+coarse `dx_priority_score` bucket function for network-only spots) are now unified: `pancetta-tui`
+took on a new `pancetta-qso` dependency (confirmed non-cyclic — `pancetta-qso` has no dependency
+back on `pancetta-tui`) so every DX Hunter row, regardless of source, is scored by the same
+`PriorityScorer::score_tiered`. Display encoding is a single `u32`
+(`TieredScore::as_display_u32`): `tier_rank * 1000 + secondary*999`, giving five clean 1000-wide
+bands (Standard 0-999 through Atno 4000-4999) that can never bleed into each other.
+
+Full design: `docs/superpowers/specs/2026-07-19-dx-hunter-priority-tiers-and-history-panel-design.md`.

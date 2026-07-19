@@ -15,7 +15,6 @@ Layer 0 — no internal deps:
   pancetta-audio   — real-time audio I/O (cpal + ringbuf)
   pancetta-ft8     — FT8 encoder/decoder/modulator/OSD
   pancetta-dsp     — DSP pipeline (FFT, filtering, resampling)
-  pancetta-tui     — terminal UI (ratatui)
   pancetta-config  — configuration with hot-reload
 
 Layer 1 — depends on core/ft8:
@@ -23,6 +22,11 @@ Layer 1 — depends on core/ft8:
   pancetta-hamlib  — Hamlib CAT control FFI
   pancetta-dx      — DX cluster + PSKReporter + scaffolded LoTW
   pancetta-cqdx    — cqdx.io HTTP client, cache, types
+  pancetta-tui     — terminal UI (ratatui); depends on pancetta-core and, as of
+                      #164, also pancetta-qso (read-only use of PriorityScorer/
+                      WorkedStationLookup to score DX Hunter rows — confirmed
+                      non-cyclic, pancetta-qso has no dependency back on
+                      pancetta-tui)
 
 Layer 2 — orchestrator:
   pancetta         — coordinator, message bus, runtime (depends on all above)

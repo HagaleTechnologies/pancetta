@@ -38,6 +38,62 @@ impl Default for PriorityWeights {
     }
 }
 
+/// Lexicographic priority tier (#164 redesign). Declaration order below is
+/// ascending priority — Rust's derived `Ord` on a fieldless enum ranks by
+/// declaration order, so `Atno > PerBandDxccNew > SpecialStation >
+/// PerBandGridNew > Standard` falls out for free.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum PriorityTier {
+    /// Tier 5 (lowest): everything else, varying only by rarity/signal quality.
+    Standard,
+    /// Tier 4: per-band grid-square new-one.
+    PerBandGridNew,
+    /// Tier 3: special stations (event/gov/research/UN).
+    SpecialStation,
+    /// Tier 2: per-band DXCC new-one (never worked this entity on this band).
+    PerBandDxccNew,
+    /// Tier 1 (highest): all-time new one — never worked on any band.
+    Atno,
+}
+
+/// A tier plus a continuous tiebreaker within that tier. `secondary` is
+/// deliberately NOT the full `score_cq_detailed` total — it excludes the
+/// `needed_dxcc`/`atno_bonus`/`notable_bonus` terms, since those signals
+/// now drive tier classification instead (see `PriorityScorer::secondary_score`).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TieredScore {
+    pub tier: PriorityTier,
+    pub secondary: f64,
+}
+
+impl TieredScore {
+    /// Encode as a single sortable u32 for display: tier dominates via a
+    /// 1000-wide band per tier, secondary breaks ties within a tier.
+    /// Ranges: Standard 0-999, PerBandGridNew 1000-1999, SpecialStation
+    /// 2000-2999, PerBandDxccNew 3000-3999, Atno 4000-4999.
+    pub fn as_display_u32(&self) -> u32 {
+        (self.tier as u32) * 1000 + (self.secondary.clamp(0.0, 1.0) * 999.0).round() as u32
+    }
+}
+
+impl Eq for TieredScore {}
+
+impl PartialOrd for TieredScore {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for TieredScore {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.tier.cmp(&other.tier).then_with(|| {
+            self.secondary
+                .partial_cmp(&other.secondary)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        })
+    }
+}
+
 /// Breakdown of how a CQ was scored.
 #[derive(Debug, Clone)]
 pub struct ScoreBreakdown {
@@ -82,6 +138,14 @@ pub trait WorkedStationLookup: Send + Sync {
     /// cqdx-independent signal (2026-07-18, DX Hunter per-band-needed gap).
     /// Defaults to `false` for lookups that don't track this.
     fn is_dxcc_needed_on_band(&self, _callsign: &str, _freq_hz: f64) -> bool {
+        false
+    }
+
+    /// Is this grid square needed specifically on THIS band — never worked
+    /// there before, per the local QSO database (mirrors
+    /// `is_dxcc_needed_on_band`'s per-band-not-all-time semantics, one tier
+    /// down). Defaults to `false` for lookups that don't track this.
+    fn is_grid_needed_on_band(&self, _grid: &str, _freq_hz: f64) -> bool {
         false
     }
 
@@ -159,6 +223,32 @@ pub fn is_pota_sota_candidate(callsign: &str) -> bool {
         || upper.ends_with("/S")
         || upper.ends_with("/SOTA")
         || upper.ends_with("/PORT")
+}
+
+/// US 1x1 format (letter-digit-letter, e.g. `W1A`, `N4B`, `K9Z`) is FCC's
+/// dedicated special-event format — never issued as a regular license (the
+/// shortest regular US callsign is 4 characters), so this is a
+/// zero-false-positive pattern. UK's GB-prefix convention (`GB` + digit +
+/// suffix, e.g. `GB2RS`) is the equivalent in the UK. A small static list
+/// covers well-known permanent international special-service stations
+/// (UN/ITU HQ stations).
+pub fn is_special_event_callsign(callsign: &str) -> bool {
+    let upper = callsign.to_uppercase();
+    if is_us_1x1_format(&upper) {
+        return true;
+    }
+    if upper.starts_with("GB") && upper.chars().nth(2).is_some_and(|c| c.is_ascii_digit()) {
+        return true;
+    }
+    matches!(upper.as_str(), "4U1UN" | "4U1ITU")
+}
+
+fn is_us_1x1_format(upper: &str) -> bool {
+    let chars: Vec<char> = upper.chars().collect();
+    chars.len() == 3
+        && chars[0].is_ascii_alphabetic()
+        && chars[1].is_ascii_digit()
+        && chars[2].is_ascii_alphabetic()
 }
 
 /// Normalize SNR from typical FT8 range (-24 to +10) to 0.0–1.0.
@@ -291,6 +381,107 @@ impl PriorityScorer {
             total,
         }
     }
+
+    /// Classify into one of the 5 lexicographic tiers (#164). ATNO always
+    /// wins when the entity is also needed (mirrors `score_cq_detailed`'s
+    /// existing "ATNO premium only meaningful when needed" rule); needed
+    /// alone (not ATNO) is tier 2; special-station patterns/cqdx-notable is
+    /// tier 3; per-band grid-new is tier 4; everything else is Standard.
+    fn classify_tier(&self, callsign: &str, grid: Option<&str>, freq_hz: f64) -> PriorityTier {
+        let needed = self.lookup.is_needed_dxcc(callsign)
+            || self.lookup.is_dxcc_needed_on_band(callsign, freq_hz);
+        if needed && self.lookup.is_atno(callsign) {
+            return PriorityTier::Atno;
+        }
+        if needed {
+            return PriorityTier::PerBandDxccNew;
+        }
+        if self.lookup.is_notable(callsign) || is_special_event_callsign(callsign) {
+            return PriorityTier::SpecialStation;
+        }
+        if let Some(g) = grid {
+            if self.lookup.is_grid_needed_on_band(g, freq_hz) {
+                return PriorityTier::PerBandGridNew;
+            }
+        }
+        PriorityTier::Standard
+    }
+
+    /// Continuous tiebreaker within a tier. Deliberately excludes
+    /// `needed_dxcc`/`atno_bonus`/`notable_bonus` — those signals now drive
+    /// `classify_tier` instead, and re-including them here would be a
+    /// redundant (if harmless, since they're constant within a tier) false
+    /// economy. Reuses the `rarity`/`pota_sota`/`signal_strength`/penalty/
+    /// staleness weights from `score_cq_detailed`'s formula.
+    fn secondary_score(&self, callsign: &str, snr: i8, freq_hz: f64) -> f64 {
+        let pota_sota = if is_pota_sota_candidate(callsign) {
+            1.0
+        } else {
+            0.0
+        };
+        let rarity = self.lookup.rarity(callsign);
+        let signal_strength = normalize_snr(snr);
+        let duplicate_penalty = if self.lookup.is_duplicate(callsign, freq_hz) {
+            1.0
+        } else {
+            0.0
+        };
+        let recent_failure_penalty = if self.lookup.is_recent_failure(callsign) {
+            1.0
+        } else {
+            0.0
+        };
+        let staleness = if let Some(last_seen) = self.lookup.network_last_seen(callsign) {
+            let now = chrono::Utc::now().timestamp();
+            let age_secs = (now - last_seen).max(0);
+            match age_secs {
+                0..=300 => 1.0,
+                301..=600 => 0.7,
+                601..=900 => 0.4,
+                _ => 0.2,
+            }
+        } else {
+            1.0
+        };
+        let snr_bonus = if let Some((reporter_count, best_snr)) = self.lookup.network_snr(callsign)
+        {
+            if reporter_count >= 5 && best_snr >= -20 {
+                0.1
+            } else if reporter_count == 1 && best_snr < -25 {
+                -0.1
+            } else {
+                0.0
+            }
+        } else {
+            0.0
+        };
+        let raw = (rarity * self.weights.rarity
+            + pota_sota * self.weights.pota_sota
+            + signal_strength * self.weights.signal_strength
+            + duplicate_penalty * self.weights.duplicate_penalty
+            + recent_failure_penalty * self.weights.recent_failure_penalty
+            + snr_bonus)
+            * staleness;
+        raw.clamp(0.0, 1.0)
+    }
+
+    /// Tiered score (#164): combines `classify_tier` (dominant) with
+    /// `secondary_score` (tiebreak within a tier). This is what the DX
+    /// Hunter display should use; `evaluate_cq`/`score_cq_detailed` stay
+    /// unchanged for the autonomous operator's continuous-threshold
+    /// decision logic, which this redesign doesn't touch.
+    pub fn score_tiered(
+        &self,
+        callsign: &str,
+        grid: Option<&str>,
+        snr: i8,
+        freq_hz: f64,
+    ) -> TieredScore {
+        TieredScore {
+            tier: self.classify_tier(callsign, grid, freq_hz),
+            secondary: self.secondary_score(callsign, snr, freq_hz),
+        }
+    }
 }
 
 impl DxEvaluator for PriorityScorer {
@@ -310,6 +501,9 @@ mod tests {
         needed_dxcc: HashSet<String>,
         needed_grids: HashSet<String>,
         dxcc_needed_on_band: HashSet<String>,
+        grid_needed_on_band: HashSet<String>,
+        atno: HashSet<String>,
+        notable: HashSet<String>,
     }
 
     impl TestLookup {
@@ -320,6 +514,9 @@ mod tests {
                 needed_dxcc: HashSet::new(),
                 needed_grids: HashSet::new(),
                 dxcc_needed_on_band: HashSet::new(),
+                grid_needed_on_band: HashSet::new(),
+                atno: HashSet::new(),
+                notable: HashSet::new(),
             }
         }
     }
@@ -339,6 +536,15 @@ mod tests {
         }
         fn is_needed_grid(&self, grid: &str) -> bool {
             self.needed_grids.contains(grid)
+        }
+        fn is_grid_needed_on_band(&self, grid: &str, _freq_hz: f64) -> bool {
+            self.grid_needed_on_band.contains(grid)
+        }
+        fn is_atno(&self, callsign: &str) -> bool {
+            self.atno.contains(callsign)
+        }
+        fn is_notable(&self, callsign: &str) -> bool {
+            self.notable.contains(callsign)
         }
     }
 
@@ -657,6 +863,190 @@ mod tests {
             (score_rare - 0.98).abs() < 0.01,
             "Rarity-only score should be ~0.98, got {}",
             score_rare
+        );
+    }
+
+    #[test]
+    fn priority_tier_ordering_is_strictly_atno_gt_dxcc_gt_special_gt_grid_gt_standard() {
+        use PriorityTier::*;
+        assert!(Atno > PerBandDxccNew);
+        assert!(PerBandDxccNew > SpecialStation);
+        assert!(SpecialStation > PerBandGridNew);
+        assert!(PerBandGridNew > Standard);
+    }
+
+    #[test]
+    fn tiered_score_orders_by_tier_first_secondary_second() {
+        let low_tier_high_secondary = TieredScore {
+            tier: PriorityTier::Standard,
+            secondary: 0.99,
+        };
+        let high_tier_low_secondary = TieredScore {
+            tier: PriorityTier::Atno,
+            secondary: 0.01,
+        };
+        assert!(
+            high_tier_low_secondary > low_tier_high_secondary,
+            "tier must dominate regardless of secondary"
+        );
+
+        let a = TieredScore {
+            tier: PriorityTier::Standard,
+            secondary: 0.3,
+        };
+        let b = TieredScore {
+            tier: PriorityTier::Standard,
+            secondary: 0.7,
+        };
+        assert!(b > a, "within the same tier, secondary breaks the tie");
+    }
+
+    #[test]
+    fn tiered_score_display_u32_never_lets_secondary_bleed_into_the_next_tier() {
+        let top_of_standard = TieredScore {
+            tier: PriorityTier::Standard,
+            secondary: 1.0,
+        };
+        let bottom_of_grid_new = TieredScore {
+            tier: PriorityTier::PerBandGridNew,
+            secondary: 0.0,
+        };
+        assert!(top_of_standard.as_display_u32() < bottom_of_grid_new.as_display_u32());
+    }
+
+    #[test]
+    fn is_special_event_callsign_detects_us_1x1_format() {
+        assert!(is_special_event_callsign("W1A"));
+        assert!(is_special_event_callsign("N4B"));
+        assert!(is_special_event_callsign("K9Z"));
+        assert!(is_special_event_callsign("w1a")); // case-insensitive
+    }
+
+    #[test]
+    fn is_special_event_callsign_rejects_regular_us_calls() {
+        // Shortest real US callsign is 4 characters (1x2 format) — never 3.
+        assert!(!is_special_event_callsign("W1AW"));
+        assert!(!is_special_event_callsign("K5ARH"));
+    }
+
+    #[test]
+    fn is_special_event_callsign_detects_uk_gb_convention() {
+        assert!(is_special_event_callsign("GB2RS"));
+        assert!(is_special_event_callsign("gb2rs")); // case-insensitive
+        assert!(is_special_event_callsign("GB0ABC"));
+    }
+
+    #[test]
+    fn is_special_event_callsign_rejects_gb_prefix_without_a_digit() {
+        assert!(!is_special_event_callsign("GBABC"));
+        assert!(!is_special_event_callsign("GB"));
+    }
+
+    #[test]
+    fn is_special_event_callsign_detects_curated_international_list() {
+        assert!(is_special_event_callsign("4U1UN"));
+        assert!(is_special_event_callsign("4U1ITU"));
+        assert!(!is_special_event_callsign("4U1XYZ")); // not in the curated list
+    }
+
+    #[test]
+    fn classify_tier_atno_beats_everything_even_with_weak_signal() {
+        let mut lookup = TestLookup::new();
+        lookup.needed_dxcc.insert("JA1ABC".to_string());
+        lookup.atno.insert("JA1ABC".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("JA1ABC", Some("PM95"), -24, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::Atno);
+    }
+
+    #[test]
+    fn classify_tier_needed_without_atno_is_per_band_dxcc_new() {
+        let mut lookup = TestLookup::new();
+        lookup.needed_dxcc.insert("JA1ABC".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("JA1ABC", Some("PM95"), -10, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::PerBandDxccNew);
+    }
+
+    #[test]
+    fn classify_tier_notable_non_needed_is_special_station() {
+        let mut lookup = TestLookup::new();
+        lookup.notable.insert("VP8STI".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("VP8STI", None, -10, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::SpecialStation);
+    }
+
+    #[test]
+    fn classify_tier_special_event_pattern_is_special_station_even_without_cqdx_notable() {
+        let lookup = TestLookup::new();
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("W1A", None, -10, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::SpecialStation);
+    }
+
+    #[test]
+    fn classify_tier_grid_needed_is_per_band_grid_new() {
+        let mut lookup = TestLookup::new();
+        lookup.grid_needed_on_band.insert("PM95".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("W1XYZ", Some("PM95"), -10, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::PerBandGridNew);
+    }
+
+    #[test]
+    fn classify_tier_plain_station_is_standard() {
+        let lookup = TestLookup::new();
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("W1XYZ", Some("FN42"), -10, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::Standard);
+    }
+
+    #[test]
+    fn secondary_score_varies_by_rarity_within_standard_tier() {
+        let mut rarity_map = HashMap::new();
+        rarity_map.insert("3Y0J".to_string(), 0.95);
+        struct RarityOnlyLookup {
+            map: HashMap<String, f64>,
+        }
+        impl WorkedStationLookup for RarityOnlyLookup {
+            fn is_duplicate(&self, _c: &str, _f: f64) -> bool {
+                false
+            }
+            fn is_recent_failure(&self, _c: &str) -> bool {
+                false
+            }
+            fn is_needed_dxcc(&self, _c: &str) -> bool {
+                false
+            }
+            fn is_needed_grid(&self, _g: &str) -> bool {
+                false
+            }
+            fn rarity(&self, c: &str) -> f64 {
+                self.map.get(c).copied().unwrap_or(0.5)
+            }
+        }
+        let rare_scorer = PriorityScorer::new(
+            PriorityWeights::default(),
+            Box::new(RarityOnlyLookup {
+                map: rarity_map.clone(),
+            }),
+        );
+        let common_scorer = PriorityScorer::new(
+            PriorityWeights::default(),
+            Box::new(RarityOnlyLookup {
+                map: HashMap::new(),
+            }),
+        );
+        let rare = rare_scorer.score_tiered("3Y0J", None, -10, 14_074_000.0);
+        let common = common_scorer.score_tiered("W1XYZ", None, -10, 14_074_000.0);
+        assert_eq!(rare.tier, PriorityTier::Standard);
+        assert_eq!(common.tier, PriorityTier::Standard);
+        assert!(
+            rare.secondary > common.secondary,
+            "rarer station must rank higher within the same (Standard) tier: {} vs {}",
+            rare.secondary,
+            common.secondary
         );
     }
 }

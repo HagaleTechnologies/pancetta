@@ -3431,6 +3431,7 @@ dependencies = [
  "dirs 5.0.1",
  "pancetta-config",
  "pancetta-core",
+ "pancetta-qso",
  "ratatui",
  "serde",
  "serde_json",
