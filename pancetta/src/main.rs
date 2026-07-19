@@ -149,6 +149,18 @@ enum Commands {
     Export(ExportArgs),
     /// Pair this station's agent with cqdx (remote-rig-control device enrollment)
     Pair(PairArgs),
+    /// Show this station's agent identity and fingerprint words, for TOFU
+    /// comparison against a client (e.g. panino) — read-only, no network
+    /// calls. Safe to re-run anytime, including before ever pairing.
+    Identity(IdentityArgs),
+}
+
+#[derive(Clone, Args)]
+struct IdentityArgs {
+    /// Number of fingerprint words to print (default: 12, the ceremony's
+    /// standard count).
+    #[arg(long, default_value = "12")]
+    words: usize,
 }
 
 #[derive(Clone, Args)]
@@ -409,6 +421,7 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
         Commands::TestRig(args) => test_rig_command(args, cli).await,
         Commands::Export(args) => export_command(args).await,
         Commands::Pair(args) => pair_command(args, cli).await,
+        Commands::Identity(args) => identity_command(args, cli).await,
     }
 }
 
@@ -418,8 +431,8 @@ async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
 /// station." Falls back to a plain warning (never panics/aborts the pair
 /// flow) if the keyId is somehow malformed, since this is a display nicety
 /// layered on top of an already-completed pairing, not load-bearing for it.
-fn print_fingerprint_words(agent_key_id: &str) {
-    match pancetta_agent::fingerprint::fingerprint_words(agent_key_id, 12) {
+fn print_fingerprint_words(agent_key_id: &str, count: usize) {
+    match pancetta_agent::fingerprint::fingerprint_words(agent_key_id, count) {
         Ok(words) => {
             println!("Fingerprint words: {}", words.join(" "));
             println!(
@@ -430,6 +443,57 @@ fn print_fingerprint_words(agent_key_id: &str) {
             eprintln!("  (could not render fingerprint words: {e})");
         }
     }
+}
+
+/// Resolve the agent key directory: explicit config override, else the
+/// platform default (`~/.pancetta/agent-keys` or similar — see
+/// `default_key_dir`). Shared by `pair` and `identity` so both commands
+/// agree on where the station's identity lives.
+fn resolve_key_dir(sa_cfg: &pancetta_config::network::StationAgentConfig) -> PathBuf {
+    sa_cfg
+        .key_dir
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(pancetta_lib::coordinator::station_agent::default_key_dir)
+}
+
+/// Show this station's agent identity and fingerprint words (dispensa
+/// Q-0039 follow-up): read-only, no network calls, safe to re-run anytime.
+/// Loads (or, on first run, generates + persists) the local `AgentIdentity`
+/// — the same identity `pancetta pair` would use — so an operator can check
+/// their station's words before ever pairing, or re-check them later
+/// without needing a pairing code or `--force`.
+async fn identity_command(args: IdentityArgs, cli: &Cli) -> Result<()> {
+    use pancetta_agent::keys::AgentIdentity;
+    use pancetta_agent::pairing::PairedState;
+
+    let config = load_configuration(cli).await?;
+    let sa_cfg = &config.network.station_agent;
+    let key_dir = resolve_key_dir(sa_cfg);
+
+    let identity = AgentIdentity::load_or_generate(&key_dir)
+        .context("failed to load/generate agent identity")?;
+    let key_id = identity.key_id();
+
+    println!();
+    println!("=== Pancetta Station Identity ===");
+    println!();
+    println!("Key dir:   {}", key_dir.display());
+    println!("Key ID:    {key_id}");
+    print_fingerprint_words(&key_id, args.words);
+    println!();
+
+    match PairedState::load(&key_dir) {
+        Ok(paired) => {
+            println!("Paired: yes ({} pinned IdP key(s)).", paired.idp_keys.len());
+        }
+        Err(_) => {
+            println!("Paired: no — run `pancetta pair <code>` to enroll with cqdx.");
+        }
+    }
+    println!();
+
+    Ok(())
 }
 
 /// Run the agent enrollment (pairing) flow against cqdx: `enroll` (POST
@@ -465,11 +529,7 @@ async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
     };
     let origin = sa_cfg.pairing_origin.clone();
 
-    let key_dir = sa_cfg
-        .key_dir
-        .clone()
-        .map(PathBuf::from)
-        .unwrap_or_else(pancetta_lib::coordinator::station_agent::default_key_dir);
+    let key_dir = resolve_key_dir(sa_cfg);
 
     if !args.force {
         if let Ok(existing) = PairedState::load(&key_dir) {
@@ -477,7 +537,7 @@ async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
                 "This station is already paired (agent_key_id = {}).",
                 existing.agent_key_id
             );
-            print_fingerprint_words(&existing.agent_key_id);
+            print_fingerprint_words(&existing.agent_key_id, 12);
             eprintln!(
                 "Re-run with --force to overwrite {}/paired.json with a new pairing.",
                 key_dir.display()
@@ -535,7 +595,7 @@ async fn pair_command(args: PairArgs, cli: &Cli) -> Result<()> {
     println!();
     println!("Paired. agent_key_id = {}", paired.agent_key_id);
     println!("Pinned {} IdP key(s).", paired.idp_keys.len());
-    print_fingerprint_words(&paired.agent_key_id);
+    print_fingerprint_words(&paired.agent_key_id, 12);
     println!();
     println!("Next steps:");
     println!("  1. Set network.station_agent.enabled = true in your config.");
