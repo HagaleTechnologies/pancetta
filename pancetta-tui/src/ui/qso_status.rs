@@ -39,6 +39,7 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
                 Constraint::Length(2),             // TX/RX status
                 Constraint::Length(2),             // SNR meters
                 Constraint::Min(1),                // Progress/timing
+                Constraint::Length(1),             // Last-10-QSOs history (#165)
                 Constraint::Length(queued_height), // Queued calls (0 when empty)
                 Constraint::Length(1),             // Control hint
             ])
@@ -51,10 +52,11 @@ pub fn render_qso_status(f: &mut Frame<'_>, area: Rect, app: &App) -> Result<()>
         render_tx_rx_status(f, chunks[2], app);
         render_snr_meters(f, chunks[3], app);
         render_timing_progress(f, chunks[4], app);
+        render_qso_history(f, chunks[5], app);
         if !app.pending_calls.is_empty() {
-            render_queued_calls(f, chunks[5], app);
+            render_queued_calls(f, chunks[6], app);
         }
-        render_control_hint(f, chunks[6], app);
+        render_control_hint(f, chunks[7], app);
     }
 
     Ok(())
@@ -471,6 +473,21 @@ fn render_queued_calls(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(line), area);
 }
 
+/// Render the last-10-QSOs history line (#165).
+fn render_qso_history(f: &mut Frame<'_>, area: Rect, app: &App) {
+    let items: Vec<_> = app.qso_history.iter().cloned().collect();
+    let spans = format_qso_history_line(&items);
+    let line = if spans.is_empty() {
+        Line::from(Span::styled(
+            "No QSOs yet",
+            Style::default().fg(app.theme.muted_color()),
+        ))
+    } else {
+        Line::from(spans)
+    };
+    f.render_widget(Paragraph::new(line), area);
+}
+
 /// Build the compact text for the "Queued:" line from the pending-call list.
 /// Each entry is rendered as "CALLSIGN (waiting Even, 1:30)" separated by
 /// "  •  ". Pure function so it is directly unit-testable.
@@ -496,6 +513,30 @@ pub(crate) fn format_queued_line(pending: &[crate::app::PendingCallBanner]) -> S
 /// Format elapsed seconds as "M:SS" (e.g. "0:45", "3:02").
 fn format_elapsed(secs: u64) -> String {
     format!("{}:{:02}", secs / 60, secs % 60)
+}
+
+/// Build the last-10-QSOs history line (#165): "✓K5ARH ✗JA1ABC ✓DL5XYZ ...",
+/// most recent first (the slice is already ordered that way by
+/// `App::push_qso_history`). Not color-only — the ✓/✗ glyph itself carries
+/// the meaning. Pure so it's directly unit-testable, following the same
+/// pattern as `format_queued_line`.
+pub(crate) fn format_qso_history_line(items: &[crate::app::QsoHistoryItem]) -> Vec<Span<'static>> {
+    let mut spans = Vec::new();
+    for (i, item) in items.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::raw(" "));
+        }
+        let (glyph, color) = if item.success {
+            ("\u{2713}", Color::Green)
+        } else {
+            ("\u{2717}", Color::Red)
+        };
+        spans.push(Span::styled(
+            format!("{glyph}{}", item.call_sign),
+            Style::default().fg(color),
+        ));
+    }
+    spans
 }
 
 fn render_tx_rx_status(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -820,5 +861,39 @@ mod tests {
         assert_eq!(format_elapsed(45), "0:45");
         assert_eq!(format_elapsed(90), "1:30");
         assert_eq!(format_elapsed(3 * 60 + 5), "3:05");
+    }
+
+    #[test]
+    fn format_qso_history_line_empty_is_empty() {
+        assert!(format_qso_history_line(&[]).is_empty());
+    }
+
+    #[test]
+    fn format_qso_history_line_renders_glyph_per_outcome() {
+        use crate::app::QsoHistoryItem;
+        let items = vec![
+            QsoHistoryItem {
+                call_sign: "K5ARH".to_string(),
+                success: true,
+                completed_at: chrono::Utc::now(),
+            },
+            QsoHistoryItem {
+                call_sign: "JA1ABC".to_string(),
+                success: false,
+                completed_at: chrono::Utc::now(),
+            },
+        ];
+        let spans = format_qso_history_line(&items);
+        let rendered: String = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            rendered.contains('\u{2713}'),
+            "expected a ✓ glyph: {rendered}"
+        ); // ✓
+        assert!(
+            rendered.contains('\u{2717}'),
+            "expected a ✗ glyph: {rendered}"
+        ); // ✗
+        assert!(rendered.contains("K5ARH"));
+        assert!(rendered.contains("JA1ABC"));
     }
 }
