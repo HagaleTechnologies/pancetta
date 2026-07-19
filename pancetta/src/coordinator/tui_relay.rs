@@ -367,6 +367,23 @@ impl super::ApplicationCoordinator {
                                 },
                             );
                         }
+                        MessageType::TxFrameLogged {
+                            text,
+                            freq_hz,
+                            qso_id,
+                            timestamp,
+                        } => {
+                            // #172: pass-through relay for Band Activity's
+                            // own-TX history, same shape as QsoHistoryEntry.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::TxFrameLogged {
+                                    text,
+                                    freq_hz,
+                                    qso_id,
+                                    timestamp,
+                                },
+                            );
+                        }
                         MessageType::TxPolicyStatus { policy } => {
                             // Echo the global TX policy to the bold banner.
                             let _ = tui_msg_tx_relay.send(
