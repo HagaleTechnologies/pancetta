@@ -171,6 +171,14 @@ pub struct DecodedMessageView {
     pub priority_score: Option<u32>,
 }
 
+/// One entry in the last-10-QSOs history panel (#165).
+#[derive(Debug, Clone)]
+pub struct QsoHistoryItem {
+    pub call_sign: String,
+    pub success: bool,
+    pub completed_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// One in-progress QSO surfaced to the operator. Coordinator-side QSO
 /// state machine is the source of truth; this struct is a flattened
 /// snapshot pushed to the TUI whenever the state changes (QsoEvent
@@ -835,6 +843,9 @@ pub struct App {
 
     // Data
     pub decoded_messages: VecDeque<DecodedMessageView>,
+    /// Last 10 QSO outcomes, most recent first (#165). Capped in
+    /// `push_qso_history`.
+    pub qso_history: VecDeque<QsoHistoryItem>,
     /// Active QSOs (supports multiple concurrent QSOs).
     pub qso_statuses: Vec<QsoStatus>,
     /// Snapshot of in-progress QSOs pushed by the coordinator on every
@@ -1143,6 +1154,7 @@ impl App {
             session_tx_drops: 0,
             clear_armed_at: None,
             decoded_messages: VecDeque::with_capacity(1000),
+            qso_history: VecDeque::with_capacity(10),
             qso_statuses: Vec::new(),
             active_qsos: Vec::new(),
             pending_calls: Vec::new(),
@@ -2289,6 +2301,22 @@ impl App {
         // selection tracks the SAME QSO across snapshots (the emit order is now
         // stable, but a QSO can still appear/disappear, shifting positions).
         self.clamp_qso_selection();
+    }
+
+    /// Record a QSO's terminal outcome for the last-10 history panel (#165).
+    /// Most-recent-first; capped at 10, evicting the oldest.
+    pub fn push_qso_history(
+        &mut self,
+        call_sign: String,
+        success: bool,
+        completed_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.qso_history.push_front(QsoHistoryItem {
+            call_sign,
+            success,
+            completed_at,
+        });
+        self.qso_history.truncate(10);
     }
 
     /// Re-derive `qso_cursor` from `qso_pinned_id` so the selection follows the
@@ -6563,5 +6591,36 @@ mod tests {
             "status: {}",
             app.status_message
         );
+    }
+
+    #[tokio::test]
+    async fn push_qso_history_prepends_most_recent_first() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let t1 = chrono::Utc::now();
+        let t2 = t1 + chrono::Duration::seconds(15);
+        app.push_qso_history("K5ARH".to_string(), true, t1);
+        app.push_qso_history("JA1ABC".to_string(), false, t2);
+        assert_eq!(app.qso_history.len(), 2);
+        assert_eq!(app.qso_history[0].call_sign, "JA1ABC");
+        assert!(!app.qso_history[0].success);
+        assert_eq!(app.qso_history[1].call_sign, "K5ARH");
+        assert!(app.qso_history[1].success);
+    }
+
+    #[tokio::test]
+    async fn push_qso_history_caps_at_ten_evicting_oldest() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let base = chrono::Utc::now();
+        for i in 0i64..11i64 {
+            app.push_qso_history(
+                format!("CALL{i}"),
+                true,
+                base + chrono::Duration::seconds(i),
+            );
+        }
+        assert_eq!(app.qso_history.len(), 10);
+        // The oldest (CALL0) was evicted; the most recent (CALL10) is at the front.
+        assert_eq!(app.qso_history[0].call_sign, "CALL10");
+        assert!(!app.qso_history.iter().any(|item| item.call_sign == "CALL0"));
     }
 }
