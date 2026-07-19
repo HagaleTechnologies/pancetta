@@ -337,10 +337,13 @@ async fn title_bar_shows_own_station_entity_when_resolvable() {
 
 #[tokio::test]
 async fn title_bar_omits_entity_when_unresolvable() {
-    // Config::default()'s call_sign ("N0CALL") resolves to no entity.
-    let mut app = crate::app::App::new(crate::config::Config::default(), None)
-        .await
-        .unwrap();
+    // NOTE: Config::default()'s call_sign ("N0CALL") is NOT unresolvable —
+    // dxcc.rs's 'N' prefix fallback resolves it to "United States" (caught
+    // during Task 1's implementation). Use a genuinely unresolvable
+    // callsign instead, matching dxcc.rs's own unknown_returns_none test.
+    let mut config = crate::config::Config::default();
+    config.station.call_sign = "QZ9ZZ".to_string();
+    let mut app = crate::app::App::new(config, None).await.unwrap();
     app.active_view = crate::view::ActiveView::Operate;
     let backend = TestBackend::new(120, 40);
     let mut term = Terminal::new(backend).unwrap();
