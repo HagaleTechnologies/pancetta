@@ -164,8 +164,10 @@ impl super::ApplicationCoordinator {
             let mut last_health_send = std::time::Instant::now();
             // Build the display priority scorer once per relay thread.
             // Uses the same weights and lookup (via Arc-shared internals)
-            // as the autonomous scorer so the DX Hunter's "Pri" column
-            // reflects the real continuous score in [0,1] mapped to [0,1000].
+            // as the autonomous scorer, but the DX Hunter's "Pri" column now
+            // reflects the #164 tiered score (0-4999, strict tier dominance
+            // — see TieredScore::as_display_u32) rather than the old
+            // continuous [0,1] mapped to [0,1000].
             let relay_scorer = pancetta_qso::PriorityScorer::new(
                 relay_priority_weights,
                 Box::new(relay_scorer_lookup),
@@ -248,32 +250,22 @@ impl super::ApplicationCoordinator {
                                 dial_mhz * 1_000_000.0,
                             );
 
-                            // Compute nuanced priority score via the real
-                            // PriorityScorer (continuous f64 in [0,1] mapped
-                            // to [0,1000]). This is the same scorer the
-                            // autonomous operator uses for call/no-call
-                            // decisions, so the DX Hunter's "Pri" column now
-                            // reflects the full weighted signal (rarity,
-                            // ATNO, needed-DXCC/grid, SNR, staleness, etc.)
-                            // rather than the coarse 0/500/1000 buckets.
-                            // Only meaningful for CQ frames that carry a
-                            // callsign; non-CQ decodes (RR73/73/reports) get
-                            // the same score but it won't influence the DX
-                            // Hunter because only CQ frames are listed there.
+                            // Compute the #164 tiered priority score via the
+                            // real PriorityScorer's classification (ATNO >
+                            // per-band-DXCC-new > special-station >
+                            // per-band-grid-new > everything else, encoded
+                            // to a single sortable u32 — see
+                            // TieredScore::as_display_u32). Only meaningful
+                            // for CQ frames that carry a callsign; non-CQ
+                            // decodes (RR73/73/reports) get the same score
+                            // but it won't influence the DX Hunter because
+                            // only CQ frames are listed there.
                             let priority_score = call_sign.as_deref().map(|cs| {
-                                use pancetta_qso::DxEvaluator;
                                 let freq_hz = dial_mhz * 1_000_000.0;
                                 let snr_i8 = decoded_msg.snr_db.round().clamp(-128.0, 127.0) as i8;
-                                let score = relay_scorer.evaluate_cq(
-                                    cs,
-                                    grid_square.as_deref(),
-                                    snr_i8,
-                                    freq_hz,
-                                );
-                                // Map [0.0, 1.0] → [0, 1000] for the u32
-                                // display field. Values outside [0,1] are
-                                // clamped by PriorityScorer before we get here.
-                                (score * 1000.0).round() as u32
+                                relay_scorer
+                                    .score_tiered(cs, grid_square.as_deref(), snr_i8, freq_hz)
+                                    .as_display_u32()
                             });
 
                             let tui_decoded = pancetta_tui::DecodedMessageView {
