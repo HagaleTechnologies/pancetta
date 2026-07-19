@@ -169,6 +169,11 @@ pub struct DecodedMessageView {
     /// fixtures and legacy paths.
     #[serde(default)]
     pub priority_score: Option<u32>,
+    /// `true` when this row is a frame WE transmitted, not a decoded RX
+    /// message (#172). `call_sign` is always `None` for these rows — the
+    /// full exchange text is already in `message`. Test-default false.
+    #[serde(default)]
+    pub is_own_tx: bool,
 }
 
 /// One entry in the last-10-QSOs history panel (#165).
@@ -2326,6 +2331,52 @@ impl App {
         self.qso_history.truncate(10);
     }
 
+    /// Append a keyed TX frame to Band Activity's history (#172) — reuses
+    /// the same `decoded_messages` deque, cap, and prune logic RX rows
+    /// already go through, so Band Activity shows a chronologically
+    /// interleaved view of everything we heard AND everything we sent.
+    /// `is_directed_at_us: true` unconditionally pins TX rows into the same
+    /// top tier `App::displayed_messages()` already reserves for RX frames
+    /// addressed to us — a QSO's full back-and-forth reads as one block.
+    pub fn add_tx_frame(
+        &mut self,
+        text: String,
+        freq_hz: f64,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.decoded_messages.push_back(DecodedMessageView {
+            timestamp,
+            frequency: self.station_info.operating_frequency,
+            mode: self.station_info.mode.clone(),
+            snr: 0,
+            delta_time: 0.0,
+            delta_freq: freq_hz as f32,
+            call_sign: None,
+            grid_square: None,
+            message: text,
+            distance: None,
+            bearing: None,
+            slot_parity: None,
+            is_directed_at_us: true,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score: None,
+            is_own_tx: true,
+        });
+        // Same highlight-preservation bump `add_decoded_message` does
+        // (app.rs:1598-1600) — a push_back makes a new row-0, so a
+        // manually-scrolled highlight must shift by one to keep pointing
+        // at the same logical row.
+        if self.band_activity_scroll > 0 {
+            self.band_activity_scroll += 1;
+        }
+        while self.decoded_messages.len() > 1000 {
+            self.decoded_messages.pop_front();
+        }
+    }
+
     /// Re-derive `qso_cursor` from `qso_pinned_id` so the selection follows the
     /// same QSO across snapshots. Falls back to a positional clamp (and re-pins)
     /// when the pinned QSO is gone or nothing is pinned yet.
@@ -3871,6 +3922,7 @@ mod tests {
             atno: true,
             band_needed: false,
             priority_score: None,
+            is_own_tx: false,
         };
         let score = app.calculate_dx_priority(&message);
         // ATNO + needed -> PriorityTier::Atno -> display range 4000-4999.
@@ -3967,6 +4019,7 @@ mod tests {
             atno: false,
             band_needed: false,
             priority_score: None,
+            is_own_tx: false,
         }
     }
 
@@ -6649,5 +6702,39 @@ mod tests {
         config.station.call_sign = "QZ9ZZ".to_string();
         let app = App::new(config, None).await.unwrap();
         assert_eq!(app.station_info.entity_name, None);
+    }
+
+    #[tokio::test]
+    async fn add_tx_frame_produces_own_tx_row_with_correct_fields() {
+        let mut config = crate::config::Config::default();
+        config.station.call_sign = "K5ARH".to_string();
+        config.station.default_frequency = 14.074;
+        let mut app = App::new(config, None).await.unwrap();
+        let ts = chrono::Utc::now();
+
+        app.add_tx_frame("K5ARH JA1ABC RR73".to_string(), 1500.0, ts);
+
+        assert_eq!(app.decoded_messages.len(), 1);
+        let row = &app.decoded_messages[0];
+        assert!(row.is_own_tx);
+        assert_eq!(row.message, "K5ARH JA1ABC RR73");
+        assert_eq!(row.call_sign, None);
+        assert_eq!(row.delta_freq, 1500.0);
+        assert_eq!(row.frequency, 14.074);
+        assert!(row.is_directed_at_us);
+        assert_eq!(row.timestamp, ts);
+    }
+
+    #[tokio::test]
+    async fn add_tx_frame_respects_the_1000_row_cap() {
+        let mut app = App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        for i in 0..1005 {
+            app.add_tx_frame(format!("frame {i}"), 1500.0, chrono::Utc::now());
+        }
+        assert_eq!(app.decoded_messages.len(), 1000);
+        // Oldest evicted first (pop_front), newest retained.
+        assert_eq!(app.decoded_messages.back().unwrap().message, "frame 1004");
     }
 }

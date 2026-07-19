@@ -4060,6 +4060,7 @@ mod key_tests {
             atno: false,
             band_needed: false,
             priority_score: None,
+            is_own_tx: false,
         };
         app.write().await.add_decoded_message(stale).await.unwrap();
         assert!(!app.read().await.decoded_messages.is_empty());
@@ -4331,6 +4332,7 @@ mod key_tests {
                     atno: false,
                     band_needed: false,
                     priority_score: None,
+                    is_own_tx: false,
                 });
             assert_eq!(a.focused_callsign().as_deref(), Some("G8KHF"));
             assert!(a.is_engaged("G8KHF"));
