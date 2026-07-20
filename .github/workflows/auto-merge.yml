@@ -17,6 +17,13 @@ on:
 permissions:
   contents: write
   pull-requests: write
+  # A squash-merge performed by this token is what triggers GitHub's
+  # auto-close of any "Closes #N" issue the PR links — that close is done
+  # AS this token, and is silently skipped (no error) without issues:
+  # write. Confirmed missing 2026-07-20: PRs #175/#176 both correctly
+  # linked Closes #171/#172 (closingIssuesReferences populated) but
+  # neither issue auto-closed on merge.
+  issues: write
 
 jobs:
   auto-merge:

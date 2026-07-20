@@ -5,6 +5,9 @@ on: pull_request_target
 permissions:
   contents: write
   pull-requests: write
+  # See auto-merge.yml: without issues: write, a squash-merge done by this
+  # token silently fails to auto-close any "Closes #N" issue the PR links.
+  issues: write
 
 jobs:
   auto-merge:
