@@ -111,6 +111,14 @@ struct ArmContext {
     /// carries across a reconnect, so a different set of allow-listed clients
     /// can connect next time.
     peers: std::collections::HashMap<String, PeerCtx>,
+    /// The single peer (by keyId) currently allowed to DRIVE the radio (arm TX,
+    /// change frequency, initiate a QSO). At most one at a time (Task 5). `None`
+    /// = nobody holds control yet — the first control-mutating action implicitly
+    /// grabs it (rule 3). A peer that is not the controller is refused any
+    /// control-mutating action (rule 4), but `Disarm`/`Heartbeat` are accepted
+    /// from ANY established peer regardless (fail-safe TX-OFF, rule 5). Cleared
+    /// when the controller leaves (rule 6) or on any session teardown.
+    controller: Option<String>,
 }
 
 /// Per-established-peer session state (Task 4: one entry per demuxed peer,
@@ -180,6 +188,126 @@ enum Dispatch {
     Teardown,
 }
 
+/// Who a [`PeerSend`] is addressed to.
+#[derive(Debug)]
+enum SendTarget {
+    /// Exactly one established peer (by keyId).
+    One(String),
+    /// Every currently-established peer (identical frame each). Read-stream
+    /// broadcast seam (Task 6); control/arm frames are always per-receiver
+    /// [`SendTarget::One`] because `controlHeldByMe` differs per peer.
+    #[allow(dead_code)]
+    AllPeers,
+}
+
+/// A server→client frame the dispatch decided to emit, plus its routing. The
+/// dispatch stays PURE with respect to the websocket — it only *describes* the
+/// sends; [`run_one_session`] performs them (serialize + `send_to`).
+#[derive(Debug)]
+struct PeerSend {
+    to: SendTarget,
+    frame: pancetta_protocol::ServerFrame,
+}
+
+/// The full result of dispatching one control action: the arm/rig side effects
+/// already applied, the flow decision (`Continue`/`Teardown`), and the set of
+/// per-peer frames the caller must deliver.
+#[derive(Debug)]
+struct DispatchOutcome {
+    flow: Dispatch,
+    sends: Vec<PeerSend>,
+}
+
+impl DispatchOutcome {
+    /// `Continue` with no frames to send (the common no-op path).
+    fn cont() -> Self {
+        DispatchOutcome {
+            flow: Dispatch::Continue,
+            sends: Vec::new(),
+        }
+    }
+    /// `Continue` carrying `sends`.
+    fn cont_with(sends: Vec<PeerSend>) -> Self {
+        DispatchOutcome {
+            flow: Dispatch::Continue,
+            sends,
+        }
+    }
+}
+
+/// Per-receiver control/arm state frames (rig-api.v1 `controlState`). Emitted on
+/// every controller transition, every successful arm, every disarm, and as a
+/// greeting to each newly-established peer. `only = Some(p)` targets just peer
+/// `p` (the greeting case); `None` fans out one tailored frame per established
+/// peer (each with its own `controlHeldByMe`).
+fn control_state_sends(ctx: &ArmContext, now: i64, only: Option<&str>) -> Vec<PeerSend> {
+    let armed = ctx.arm.lock().map(|s| s.tx_permitted(now)).unwrap_or(false);
+    ctx.peers
+        .keys()
+        .filter(|p| only.is_none_or(|o| o == p.as_str()))
+        .map(|p| PeerSend {
+            to: SendTarget::One(p.clone()),
+            frame: pancetta_protocol::ServerFrame::Event {
+                event: pancetta_protocol::ServerEvent::ControlState {
+                    control_held_by_me: ctx.controller.as_deref() == Some(p.as_str()),
+                    transmit_armed: armed,
+                },
+            },
+        })
+        .collect()
+}
+
+/// The outcome of the one-controller-at-a-time gate for a control-mutating
+/// action (`Arm`/`Qsy`/`SetSplit`/`TxRequest`/`StopCq`).
+enum ControllerGate {
+    /// The peer may proceed. Carries any `controlState` frames from an implicit
+    /// grab (empty when the peer was already the controller).
+    Proceed(Vec<PeerSend>),
+    /// The peer is NOT the controller — the action is refused; carries the
+    /// `Error` frame to send back to just that peer.
+    Refused(Vec<PeerSend>),
+}
+
+/// Apply rules 3 (implicit grab) + 4 (exclusivity) for a control-mutating
+/// action from `peer`:
+/// - no controller yet → `peer` implicitly grabs control (+ `controlState`),
+///   then proceeds;
+/// - `peer` already holds control → proceed with no extra frames;
+/// - a DIFFERENT peer holds control → refuse (audit `TxDenied` + `Error` frame
+///   to `peer`), do NOT execute and do NOT grab.
+fn controller_gate(ctx: &mut ArmContext, peer: &str, now: i64) -> ControllerGate {
+    match ctx.controller.as_deref() {
+        None => {
+            // Rule 3 — implicit grab keeps a single connected client (today's
+            // only real-world case, which never sends takeControl) working with
+            // zero behavior change.
+            ctx.controller = Some(peer.to_string());
+            debug!(target: "agent.control", peer = %peer, "implicit control grab (no controller set)");
+            ControllerGate::Proceed(control_state_sends(ctx, now, None))
+        }
+        Some(p) if p == peer => ControllerGate::Proceed(Vec::new()),
+        Some(_) => {
+            // Rule 4 — exclusivity.
+            warn!(target: "agent.control", peer = %peer, "control action refused — another client holds control");
+            ctx.audit.append(&AuditEvent {
+                ts_unix_ms: now,
+                kind: AuditKind::TxDenied,
+                operator_callsign: None,
+                detail: "refused: not controller".to_string(),
+            });
+            ControllerGate::Refused(vec![PeerSend {
+                to: SendTarget::One(peer.to_string()),
+                frame: pancetta_protocol::ServerFrame::Event {
+                    event: pancetta_protocol::ServerEvent::Error {
+                        component: "stationAgent".into(),
+                        message: "another client holds control — takeControl first".into(),
+                    },
+                },
+            }])
+        }
+    }
+}
+
 /// Dispatch one decrypted control action against the arm + coordinator bus.
 ///
 /// Pure with respect to timing (takes `now_ms`); side effects are the arm
@@ -216,16 +344,30 @@ async fn dispatch_action(
     bus: &MessageBus,
     session_id: &str,
     now: i64,
-) -> Dispatch {
+) -> DispatchOutcome {
     match action {
         ControlAction::Arm {
             capability_token,
             grant,
         } => {
+            // Rule 3/4: arming is a control-mutating action — gate on the
+            // controller first (implicit grab if unset; refuse a non-controller).
+            let grab = match controller_gate(ctx, peer, now) {
+                ControllerGate::Proceed(sends) => sends,
+                ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
+            };
             match verify_and_arm(&capability_token, &grant, peer, ctx, session_id, now) {
-                Ok(()) => {}
+                Ok(()) => {
+                    // Rule 7: a successful arm emits controlState (transmit_armed
+                    // now reflects the live arm) to every peer, appended after any
+                    // implicit-grab frames.
+                    let mut sends = grab;
+                    sends.extend(control_state_sends(ctx, now, None));
+                    DispatchOutcome::cont_with(sends)
+                }
                 Err(reason) => {
-                    // Fail-closed: audit the denial, do NOT arm.
+                    // Fail-closed: audit the denial, do NOT arm. Any implicit-grab
+                    // controlState still stands (the grab itself succeeded).
                     ctx.audit.append(&AuditEvent {
                         ts_unix_ms: now,
                         kind: AuditKind::TxDenied,
@@ -233,11 +375,17 @@ async fn dispatch_action(
                         detail: format!("arm rejected: {reason}"),
                     });
                     warn!(target: "agent.tx", reason = %reason, "remote arm grant rejected");
+                    DispatchOutcome::cont_with(grab)
                 }
             }
-            Dispatch::Continue
         }
         ControlAction::Heartbeat { arm_jti, seq } => {
+            // Rule 5: heartbeats are accepted from ANY established peer — NO
+            // controller check. `ArmState`'s arm_jti + monotonic-seq binding
+            // already scopes a heartbeat to whoever holds the matching jti, and
+            // cross-peer Noise isolation (Task 3) means another peer can't learn
+            // that jti by eavesdropping.
+            //
             // Bind the heartbeat to the armed grant it names (arm_jti) and enforce
             // per-arm `seq` monotonicity (contract $defs.txHeartbeat): a replayed
             // or wrong-arm heartbeat is rejected and does NOT slide the dead-man
@@ -247,7 +395,7 @@ async fn dispatch_action(
                 Err(_) => Vec::new(),
             };
             apply_arm_effects(&ctx.audit, &effects);
-            Dispatch::Continue
+            DispatchOutcome::cont()
         }
         ControlAction::Disarm { arm_jti } => {
             // Disarm is fail-safe TX-OFF: it ALWAYS proceeds. The frozen
@@ -269,18 +417,28 @@ async fn dispatch_action(
                     );
                 }
             }
+            // Rule 5: disarm is accepted from ANY established peer — NO
+            // controller check (fail-safe TX-OFF beats exclusivity). Does not
+            // change who holds control.
             let effects = match ctx.arm.lock() {
                 Ok(mut st) => st.disarm(now),
                 Err(_) => Vec::new(),
             };
             apply_arm_effects(&ctx.audit, &effects);
-            Dispatch::Continue
+            // Rule 7: every disarm emits controlState (transmit_armed now false).
+            DispatchOutcome::cont_with(control_state_sends(ctx, now, None))
         }
         ControlAction::Hello { capability_token } => {
+            // Rule 8: Hello scope verification is per-peer and unchanged from
+            // Task 4 — it is NOT a control-mutating action and never grabs.
             dispatch_hello(capability_token, peer, ctx, now);
-            Dispatch::Continue
+            DispatchOutcome::cont()
         }
         ControlAction::Qsy { vfo, frequency_hz } => {
+            let grab = match controller_gate(ctx, peer, now) {
+                ControllerGate::Proceed(sends) => sends,
+                ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
+            };
             if !ctx
                 .peers
                 .get(peer)
@@ -288,19 +446,23 @@ async fn dispatch_action(
                 .is_some_and(|s| scope_at_least(s, "qsy"))
             {
                 warn!(target: "agent.control", peer = %peer, "setFrequency refused — no qsy-scoped hello token this session for this peer");
-                return Dispatch::Continue;
+                return DispatchOutcome::cont_with(grab);
             }
             let msg = RigControlMessage::SetFrequency {
                 vfo: vfo.clamp(0, u8::MAX as i64) as u8,
                 frequency: frequency_hz.max(0.0) as u64,
             };
             send_rig(bus, msg).await;
-            Dispatch::Continue
+            DispatchOutcome::cont_with(grab)
         }
         ControlAction::SetSplit {
             enabled,
             tx_frequency_hz,
         } => {
+            let grab = match controller_gate(ctx, peer, now) {
+                ControllerGate::Proceed(sends) => sends,
+                ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
+            };
             if !ctx
                 .peers
                 .get(peer)
@@ -308,16 +470,20 @@ async fn dispatch_action(
                 .is_some_and(|s| scope_at_least(s, "qsy"))
             {
                 warn!(target: "agent.control", peer = %peer, "setSplit refused — no qsy-scoped hello token this session for this peer");
-                return Dispatch::Continue;
+                return DispatchOutcome::cont_with(grab);
             }
             let msg = RigControlMessage::SetSplit {
                 enabled,
                 tx_frequency: tx_frequency_hz.max(0.0) as u64,
             };
             send_rig(bus, msg).await;
-            Dispatch::Continue
+            DispatchOutcome::cont_with(grab)
         }
         ControlAction::TxRequest(kind) => {
+            let grab = match controller_gate(ctx, peer, now) {
+                ControllerGate::Proceed(sends) => sends,
+                ControllerGate::Refused(sends) => return DispatchOutcome::cont_with(sends),
+            };
             // P3.4c: route the remote operator's TX-initiation through the REAL
             // QSO engine, tagged `remote_origin = true` so every TransmitRequest
             // the QSO emits is `TxOrigin::Remote` and therefore gated by the
@@ -353,26 +519,61 @@ async fn dispatch_action(
                 request = %detail,
                 "routed remote TX-initiation to the QSO engine (remote_origin=true, arm-gated)"
             );
-            Dispatch::Continue
+            DispatchOutcome::cont_with(grab)
         }
-        ControlAction::StopCq | ControlAction::TakeControl | ControlAction::ReleaseControl => {
-            debug!(target: "agent.control", action = action_name(&action), "control action not wired in v1");
-            Dispatch::Continue
+        ControlAction::StopCq => {
+            // A control-mutating action (rules 3/4) that is otherwise a no-op in
+            // v1: still gate on the controller (implicit grab / refuse) so it
+            // can't be driven by a non-controller.
+            match controller_gate(ctx, peer, now) {
+                ControllerGate::Proceed(sends) => {
+                    debug!(target: "agent.control", "stopCq accepted (not wired in v1)");
+                    DispatchOutcome::cont_with(sends)
+                }
+                ControllerGate::Refused(sends) => DispatchOutcome::cont_with(sends),
+            }
+        }
+        ControlAction::TakeControl => {
+            // Rule 1: free grab from ANY established peer always succeeds. If it
+            // displaces a DIFFERENT controller, disarm that controller's arm
+            // FIRST (arms never transfer — the new controller must arm fresh).
+            let displacing_other =
+                ctx.controller.is_some() && ctx.controller.as_deref() != Some(peer);
+            if displacing_other {
+                let effects = match ctx.arm.lock() {
+                    Ok(mut st) => st.disarm(now),
+                    Err(_) => Vec::new(),
+                };
+                if !effects.is_empty() {
+                    debug!(target: "agent.control", peer = %peer, "takeControl displaced a controller with a live arm — disarming first");
+                }
+                apply_arm_effects(&ctx.audit, &effects);
+            }
+            ctx.controller = Some(peer.to_string());
+            info!(target: "agent.control", peer = %peer, "control taken (free grab)");
+            DispatchOutcome::cont_with(control_state_sends(ctx, now, None))
+        }
+        ControlAction::ReleaseControl => {
+            // Rule 2: from the current controller → disarm if armed + clear
+            // controller. From anyone else → debug no-op, no state change.
+            if ctx.controller.as_deref() == Some(peer) {
+                let effects = match ctx.arm.lock() {
+                    Ok(mut st) => st.disarm(now),
+                    Err(_) => Vec::new(),
+                };
+                apply_arm_effects(&ctx.audit, &effects);
+                ctx.controller = None;
+                info!(target: "agent.control", peer = %peer, "control released");
+                DispatchOutcome::cont_with(control_state_sends(ctx, now, None))
+            } else {
+                debug!(target: "agent.control", peer = %peer, "releaseControl from a non-controller — no-op");
+                DispatchOutcome::cont()
+            }
         }
         ControlAction::Unsupported => {
             debug!(target: "agent.control", "ignoring unsupported control frame");
-            Dispatch::Continue
+            DispatchOutcome::cont()
         }
-    }
-}
-
-/// A short static name for the no-op control actions (diagnostics only).
-fn action_name(a: &ControlAction) -> &'static str {
-    match a {
-        ControlAction::StopCq => "stopCq",
-        ControlAction::TakeControl => "takeControl",
-        ControlAction::ReleaseControl => "releaseControl",
-        _ => "other",
     }
 }
 
@@ -883,6 +1084,8 @@ async fn run_session_loop(cfg: RunConfig) {
         // `run_one_session`), so a different set of allow-listed clients can
         // connect on the next reconnect.
         peers: std::collections::HashMap::new(),
+        // No controller until a peer grabs it (explicitly or implicitly).
+        controller: None,
     };
 
     while !cfg.shutdown.load(Ordering::Acquire) {
@@ -908,7 +1111,9 @@ async fn run_session_loop(cfg: RunConfig) {
     disarm_on_loss(&mut ctx);
 }
 
-/// Disarm the shared arm on any control-channel loss and audit it.
+/// Disarm the shared arm on any control-channel loss and audit it. Also clears
+/// the controller — a fresh session (or the next connecting peer) must grab
+/// control again; control never carries across a session teardown.
 fn disarm_on_loss(ctx: &mut ArmContext) {
     let effects = match ctx.arm.lock() {
         Ok(mut st) => st.disarm(now_ms()),
@@ -918,6 +1123,43 @@ fn disarm_on_loss(ctx: &mut ArmContext) {
         debug!(target: "agent.tx", "control channel lost — disarming remote TX");
     }
     apply_arm_effects(&ctx.audit, &effects);
+    ctx.controller = None;
+}
+
+/// Serialize and deliver each [`PeerSend`]. Pure-side-effect helper the session
+/// loop calls after every dispatch (and on peer-establish/-down). A failed
+/// serialize or send is `debug!`-logged and skipped (best-effort — a control
+/// frame that can't reach one peer never tears down the session).
+fn deliver_sends<W: pancetta_agent::relay::WsConn>(
+    sess: &mut MultiPeerSession<'_, W>,
+    sends: &[PeerSend],
+) {
+    for send in sends {
+        let bytes = match serde_json::to_vec(&send.frame) {
+            Ok(b) => b,
+            Err(e) => {
+                debug!(target: "agent.control", "controlState serialize failed: {e}");
+                continue;
+            }
+        };
+        match &send.to {
+            SendTarget::One(peer) => {
+                if let Err(e) = sess.send_to(peer, &bytes) {
+                    debug!(target: "agent.control", peer = %peer, "peer send failed: {e}");
+                }
+            }
+            SendTarget::AllPeers => {
+                // Collect the peer keys first so the immutable borrow of `sess`
+                // is released before the mutable `send_to` calls.
+                let peers: Vec<String> = sess.established_peers().map(str::to_string).collect();
+                for peer in peers {
+                    if let Err(e) = sess.send_to(&peer, &bytes) {
+                        debug!(target: "agent.control", peer = %peer, "peer send failed: {e}");
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Drive one session to completion: auth → demux → dispatch control frames.
@@ -966,22 +1208,44 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                 // block a grant captured on one peer's session from being
                 // replayed into another peer's.
                 let sid = sess.session_id(&peer).unwrap_or_default().to_string();
-                if dispatch_action(action, &peer, ctx, bus, &sid, now_ms()).await
-                    == Dispatch::Teardown
-                {
+                let outcome = dispatch_action(action, &peer, ctx, bus, &sid, now_ms()).await;
+                deliver_sends(&mut sess, &outcome.sends);
+                if outcome.flow == Dispatch::Teardown {
                     return;
                 }
             }
             Ok(Poll::PeerEstablished { peer, .. }) => {
-                ctx.peers.insert(peer, PeerCtx { hello_scopes: None });
+                ctx.peers
+                    .insert(peer.clone(), PeerCtx { hello_scopes: None });
+                // Rule 7: greet the newly-established peer with its current
+                // control/arm state (targeted at just that peer).
+                let sends = control_state_sends(ctx, now_ms(), Some(&peer));
+                deliver_sends(&mut sess, &sends);
             }
             Ok(Poll::PeerRefused { peer }) => {
                 warn!(target: "agent", peer = %peer,
                     "relay-admitted peer refused (not allow-listed or at capacity)");
             }
             Ok(Poll::PeerDown { peer }) => {
+                // Rule 6: controller loss ⇒ disarm. Remove the peer first, then —
+                // if it WAS the controller — disarm, clear the controller, and
+                // broadcast the updated controlState to the remaining peers. A
+                // non-controller leaving disarms nothing.
+                let was_controller = ctx.controller.as_deref() == Some(peer.as_str());
                 ctx.peers.remove(&peer);
-                // Task 5 adds controller-loss disarm here.
+                if was_controller {
+                    let effects = match ctx.arm.lock() {
+                        Ok(mut st) => st.disarm(now_ms()),
+                        Err(_) => Vec::new(),
+                    };
+                    if !effects.is_empty() {
+                        debug!(target: "agent.tx", peer = %peer, "controller left with a live arm — disarming");
+                    }
+                    apply_arm_effects(&ctx.audit, &effects);
+                    ctx.controller = None;
+                    let sends = control_state_sends(ctx, now_ms(), None);
+                    deliver_sends(&mut sess, &sends);
+                }
             }
             Ok(Poll::Idle) | Ok(Poll::Quiet) => {
                 // Task 6 drains the read-stream feed here on Quiet.
@@ -1159,6 +1423,7 @@ mod tests {
             // default `expected_client_key_id: CLIENT_KEY_ID`) — an
             // already-established peer with no granted scope yet.
             peers: peers_with(CLIENT_KEY_ID, None),
+            controller: None,
         }
     }
 
@@ -1188,7 +1453,7 @@ mod tests {
             NOW,
         )
         .await;
-        assert_eq!(d, Dispatch::Continue);
+        assert_eq!(d.flow, Dispatch::Continue);
         assert!(
             ctx.arm.lock().unwrap().tx_permitted(NOW),
             "a valid arm + consent must permit remote TX"
@@ -1216,7 +1481,7 @@ mod tests {
             NOW,
         )
         .await;
-        assert_eq!(d, Dispatch::Continue);
+        assert_eq!(d.flow, Dispatch::Continue);
         assert!(
             !ctx.arm.lock().unwrap().tx_permitted(NOW),
             "a grant signed for a different session must never arm this one"
@@ -1244,7 +1509,7 @@ mod tests {
             NOW,
         )
         .await;
-        assert_eq!(d, Dispatch::Continue);
+        assert_eq!(d.flow, Dispatch::Continue);
         assert!(
             hamlib_rx.try_recv().is_err(),
             "setFrequency must be refused with no verified hello token this session"
@@ -1269,7 +1534,7 @@ mod tests {
             NOW,
         )
         .await;
-        assert_eq!(d1, Dispatch::Continue);
+        assert_eq!(d1.flow, Dispatch::Continue);
         let d2 = dispatch_action(
             ControlAction::Qsy {
                 vfo: 0,
@@ -1282,7 +1547,7 @@ mod tests {
             NOW,
         )
         .await;
-        assert_eq!(d2, Dispatch::Continue);
+        assert_eq!(d2.flow, Dispatch::Continue);
         let msg = hamlib_rx
             .try_recv()
             .expect("setFrequency must be forwarded after a valid qsy-scoped hello");
@@ -1370,7 +1635,7 @@ mod tests {
             NOW,
         )
         .await;
-        assert_eq!(d, Dispatch::Continue);
+        assert_eq!(d.flow, Dispatch::Continue);
         assert!(
             hamlib_rx.try_recv().is_err(),
             "a hello token whose clientKeyId != the E2E-connected identity must grant no scope"
@@ -1408,7 +1673,7 @@ mod tests {
             NOW,
         )
         .await;
-        assert_eq!(d, Dispatch::Continue);
+        assert_eq!(d.flow, Dispatch::Continue);
         assert!(
             hamlib_rx.try_recv().is_ok(),
             "a non-tx-enabled token with qsy scope must still permit setFrequency"
@@ -1450,7 +1715,7 @@ mod tests {
             NOW,
         )
         .await;
-        assert_eq!(d, Dispatch::Continue);
+        assert_eq!(d.flow, Dispatch::Continue);
         assert!(
             hamlib_rx.try_recv().is_err(),
             "a reset session must not inherit a prior session's granted scope"
@@ -1869,7 +2134,7 @@ mod tests {
             NOW,
         )
         .await;
-        assert_eq!(d, Dispatch::Continue);
+        assert_eq!(d.flow, Dispatch::Continue);
         // The arm is UNTOUCHED — routing a TxRequest is never an arm/bypass.
         assert!(
             !ctx.arm.lock().unwrap().is_armed(),
@@ -1936,6 +2201,392 @@ mod tests {
             }
             other => panic!("expected StartCq, got {other:?}"),
         }
+    }
+
+    // ========================================================================
+    // Task 5: one-controller-at-a-time (free grab, exclusivity, controlState).
+    // ========================================================================
+
+    /// A second established peer keyId used by the controller tests (distinct
+    /// from `CLIENT_KEY_ID`).
+    const PEER_B: &str = "peerBkeyId000000";
+
+    /// Rule 3: a single connected client that NEVER sends `takeControl` arms
+    /// exactly as before — the first control-mutating action (here `Arm`)
+    /// implicitly grabs control. This is the zero-behavior-change back-compat
+    /// path for today's only real-world case.
+    #[tokio::test]
+    async fn implicit_grab_on_first_arm_single_client_compat() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        let out = dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert_eq!(out.flow, Dispatch::Continue);
+        assert!(
+            ctx.arm.lock().unwrap().tx_permitted(NOW),
+            "implicit-grab arm must permit TX exactly like the pre-controller path"
+        );
+        assert_eq!(
+            ctx.controller.as_deref(),
+            Some(CLIENT_KEY_ID),
+            "the first control-mutating action implicitly grabs control"
+        );
+    }
+
+    /// Rule 4: a control-mutating action from a peer that is NOT the controller
+    /// is refused — it never reaches the rig, never implicitly grabs, and the
+    /// refused peer receives an `Error` frame (targeted at just it). B is given
+    /// qsy scope so the refusal is proven at the CONTROLLER layer, not the scope
+    /// layer.
+    #[tokio::test]
+    async fn non_controller_qsy_refused_with_error_frame() {
+        let mut ctx = ctx_with(true, true);
+        ctx.peers.insert(
+            PEER_B.to_string(),
+            PeerCtx {
+                hello_scopes: Some(vec!["qsy".to_string()]),
+            },
+        );
+        let bus = MessageBus::new(64).unwrap();
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        // A (CLIENT_KEY_ID) takes control.
+        dispatch_action(
+            ControlAction::TakeControl,
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        // Qsy from B must be refused.
+        let out = dispatch_action(
+            ControlAction::Qsy {
+                vfo: 0,
+                frequency_hz: 14_074_000.0,
+            },
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert_eq!(out.flow, Dispatch::Continue);
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "a non-controller Qsy must NOT reach the rig"
+        );
+        assert_eq!(
+            ctx.controller.as_deref(),
+            Some(CLIENT_KEY_ID),
+            "a refused action must NOT implicitly grab control"
+        );
+        let err_to_b = out.sends.iter().any(|s| {
+            matches!(
+                (&s.to, &s.frame),
+                (
+                    SendTarget::One(p),
+                    pancetta_protocol::ServerFrame::Event {
+                        event: pancetta_protocol::ServerEvent::Error { .. }
+                    }
+                ) if p == PEER_B
+            )
+        });
+        assert!(
+            err_to_b,
+            "the refused peer must receive an Error frame targeted at just it"
+        );
+    }
+
+    /// Rule 1: `takeControl` is a free grab from any established peer. When it
+    /// displaces a DIFFERENT controller whose arm is live, that arm is disarmed
+    /// FIRST (arms never transfer), THEN control moves — and a per-receiver
+    /// `controlState` goes to every peer (new controller held=true, old
+    /// held=false; transmit_armed=false for both).
+    #[tokio::test]
+    async fn take_control_disarms_previous_controllers_arm() {
+        let mut ctx = ctx_with(true, true);
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx { hello_scopes: None });
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        // A arms (implicit grab → controller=A, armed).
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().is_armed());
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        // B takes control.
+        let out = dispatch_action(
+            ControlAction::TakeControl,
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert_eq!(out.flow, Dispatch::Continue);
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "takeControl must disarm the displaced controller's live arm first"
+        );
+        assert_eq!(ctx.controller.as_deref(), Some(PEER_B));
+        // A per-receiver controlState to BOTH peers.
+        let held = |peer: &str| {
+            out.sends.iter().find_map(|s| match (&s.to, &s.frame) {
+                (
+                    SendTarget::One(p),
+                    pancetta_protocol::ServerFrame::Event {
+                        event:
+                            pancetta_protocol::ServerEvent::ControlState {
+                                control_held_by_me,
+                                transmit_armed,
+                            },
+                    },
+                ) if p == peer => Some((*control_held_by_me, *transmit_armed)),
+                _ => None,
+            })
+        };
+        assert_eq!(
+            held(PEER_B),
+            Some((true, false)),
+            "new controller B: holds control, not armed"
+        );
+        assert_eq!(
+            held(CLIENT_KEY_ID),
+            Some((false, false)),
+            "displaced controller A: no longer holds control, not armed"
+        );
+    }
+
+    /// Rule 5: `Disarm` is accepted from ANY established peer — even one that is
+    /// not the controller. Fail-safe TX-OFF beats exclusivity.
+    #[tokio::test]
+    async fn disarm_accepted_from_non_controller() {
+        let mut ctx = ctx_with(true, true);
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx { hello_scopes: None });
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().is_armed());
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        // Disarm from B (NOT the controller) is accepted.
+        let out = dispatch_action(
+            ControlAction::Disarm {
+                arm_jti: String::new(),
+            },
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert_eq!(out.flow, Dispatch::Continue);
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "Disarm from any established peer must disarm (rule 5, fail-safe)"
+        );
+    }
+
+    /// Rule 2: `releaseControl` from the current controller disarms (if armed)
+    /// and clears the controller; from anyone else it is a silent no-op.
+    #[tokio::test]
+    async fn release_control_clears_and_disarms() {
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(ctx.arm.lock().unwrap().is_armed());
+        assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+        // The controller releases → disarm + clear controller.
+        let out = dispatch_action(
+            ControlAction::ReleaseControl,
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert_eq!(out.flow, Dispatch::Continue);
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "releaseControl from the controller must disarm"
+        );
+        assert!(
+            ctx.controller.is_none(),
+            "releaseControl from the controller must clear the controller"
+        );
+        // releaseControl from a non-controller (here: nobody holds control) is a
+        // silent no-op — no frames, no state change.
+        let out2 = dispatch_action(
+            ControlAction::ReleaseControl,
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert!(
+            out2.sends.is_empty(),
+            "releaseControl from a non-controller emits nothing"
+        );
+        assert!(ctx.controller.is_none());
+    }
+
+    /// Rule 6: in `run_one_session`, a controller leaving disarms + clears the
+    /// controller; a non-controller (listener) leaving disarms nothing. Driven
+    /// through the real `MultiPeerSession` with scripted relay frames. The arm
+    /// is pre-armed (with the controller implicitly grabbed) before the run; the
+    /// in-session `presence:down` is what exercises the `PeerDown` arm.
+    #[tokio::test]
+    async fn controller_peer_down_disarms_listener_down_does_not() {
+        // --- Scenario 1: the CONTROLLER (A = CLIENT_KEY_ID) goes down. --------
+        {
+            let identity = AgentIdentity::generate();
+            let mut ctx = ctx_with(true, true);
+            with_consent(&ctx, true);
+            let bus = MessageBus::new(64).unwrap();
+            // Pre-arm: implicit grab makes CLIENT_KEY_ID the controller.
+            dispatch_action(
+                arm_action("arm-jti-1"),
+                CLIENT_KEY_ID,
+                &mut ctx,
+                &bus,
+                SESSION_ID,
+                NOW,
+            )
+            .await;
+            assert!(ctx.arm.lock().unwrap().is_armed());
+            assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+
+            let ws = scripted_ws_for_peer_down(&identity, CLIENT_KEY_ID);
+            run_one_session(ws, &identity, &mut ctx, &bus).await;
+
+            assert!(
+                !ctx.arm.lock().unwrap().is_armed(),
+                "the controller leaving must disarm"
+            );
+            assert!(
+                ctx.controller.is_none(),
+                "the controller leaving must clear the controller"
+            );
+        }
+
+        // --- Scenario 2: a LISTENER (B) goes down; A stays controller+armed. --
+        {
+            let identity = AgentIdentity::generate();
+            let mut ctx = ctx_with(true, true);
+            // B must be allow-listed so MultiPeerSession admits it.
+            ctx.tx_allow_list.insert(PEER_B.to_string());
+            with_consent(&ctx, true);
+            let bus = MessageBus::new(64).unwrap();
+            dispatch_action(
+                arm_action("arm-jti-1"),
+                CLIENT_KEY_ID,
+                &mut ctx,
+                &bus,
+                SESSION_ID,
+                NOW,
+            )
+            .await;
+            assert!(ctx.arm.lock().unwrap().is_armed());
+            assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
+
+            let ws = scripted_ws_for_peer_down(&identity, PEER_B);
+            run_one_session(ws, &identity, &mut ctx, &bus).await;
+
+            assert!(
+                ctx.arm.lock().unwrap().is_armed(),
+                "a non-controller (listener) leaving must NOT disarm"
+            );
+            assert_eq!(
+                ctx.controller.as_deref(),
+                Some(CLIENT_KEY_ID),
+                "a listener leaving must NOT change the controller"
+            );
+        }
+    }
+
+    /// Build a scripted `MockWs` that establishes `connecting_client` over a real
+    /// Noise IK handshake against `identity`, then sends a `presence:down` for
+    /// that peer (draining the inbound queue ends the session). Used to drive
+    /// `run_one_session`'s `PeerDown` arm.
+    fn scripted_ws_for_peer_down(identity: &AgentIdentity, connecting_client: &str) -> MockWs {
+        let agent_static_pub = identity.agreement_public_raw();
+        let client_kp = {
+            let params: snow::params::NoiseParams =
+                "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+            snow::Builder::new(params).generate_keypair().unwrap()
+        };
+        let mut initiator = TestInitiator::new(&client_kp.private, &agent_static_pub);
+        let msg1 = initiator.write_msg1(b"");
+
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[7u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let ready = RelayFrame::Ready {
+            key_id: identity.key_id(),
+            peer_present: true,
+        }
+        .to_json()
+        .unwrap();
+        let env_msg1 = RelayFrame::Env {
+            dst: identity.key_id(),
+            payload: b64url(&msg1),
+            src: Some(connecting_client.to_string()),
+        }
+        .to_json()
+        .unwrap();
+        let presence_down = RelayFrame::Presence {
+            peer: connecting_client.to_string(),
+            state: "down".to_string(),
+        }
+        .to_json()
+        .unwrap();
+
+        MockWs::new(
+            vec![hello, ready, env_msg1, presence_down],
+            Arc::new(Mutex::new(Vec::new())),
+        )
     }
 
     // ========================================================================
@@ -2162,7 +2813,7 @@ mod tests {
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
         let d = dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, agent_session_id, NOW).await;
-        assert_eq!(d, Dispatch::Continue);
+        assert_eq!(d.flow, Dispatch::Continue);
         assert!(
             ctx.arm.lock().unwrap().tx_permitted(NOW),
             "end-to-end: a verified Arm over Noise must permit remote TX"
@@ -2248,6 +2899,7 @@ mod tests {
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
             peers: std::collections::HashMap::new(),
+            controller: None,
         };
         let bus = MessageBus::new(64).unwrap();
         run_one_session(ws, identity, &mut ctx, &bus).await;
@@ -2331,6 +2983,7 @@ mod tests {
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
             peers: peers_with(CLIENT_KEY_ID, None),
+            controller: None,
         }
     }
 }
