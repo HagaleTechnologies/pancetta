@@ -627,9 +627,9 @@ impl super::ApplicationCoordinator {
         let paired = match PairedState::load(&key_dir) {
             Ok(p) => p,
             Err(_) => {
-                info!(
+                warn!(
                     target: "agent",
-                    "station agent enabled but not paired — run pairing (operator action); staying idle"
+                    "station agent enabled but not paired — run pairing (operator action); staying idle, relay connection never attempted"
                 );
                 return self.spawn_station_agent_drain().await;
             }
@@ -679,9 +679,9 @@ impl super::ApplicationCoordinator {
                     c
                 }
                 None => {
-                    info!(
+                    warn!(
                         target: "agent",
-                        "station agent paired but tx_allow_list is empty — no client to admit; idle"
+                        "station agent paired but tx_allow_list is empty — no client to admit; idle, relay connection never attempted"
                     );
                     return self.spawn_station_agent_drain().await;
                 }
