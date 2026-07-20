@@ -6,6 +6,7 @@ pub mod capability;
 pub mod control;
 pub mod fingerprint;
 pub mod keys;
+pub mod multi_session;
 pub mod noise;
 pub mod pairing;
 pub mod relay;
