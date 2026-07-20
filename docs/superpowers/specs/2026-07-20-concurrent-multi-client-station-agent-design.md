@@ -106,22 +106,29 @@ only in the localhost `remote_gateway` component, which already has the `transla
 (bus `MessageType` → `pancetta_protocol` `ServerEvent`) and an additive bus seam
 (`relay_to_gateway`, placed after every existing `→Tui` send — additive-only invariant).
 
-This design adds the relay-side read stream by **reusing that exact pattern**:
+This design adds the relay-side read stream by **sharing the gateway's translation pump rather
+than duplicating it** (planning-time refinement of the approved "single fan-out seam" idea —
+same property, less duplication):
 
-- The station-agent component gains an additive bus feed by **generalizing the existing
-  `relay_to_gateway` helper into a single fan-out seam** that delivers each display event to
-  every enabled recipient (localhost gateway, station-agent) — one call per emit site, no new
-  call sites, each recipient behind its own enable-flag so neither component's on/off state
-  couples to the other's. The TUI path is not touched.
-- The session loop drains pending `ServerEvent`s between control-frame reads and `broadcast()`s
-  each as JSON plaintext inside per-peer-encrypted `env` frames. Same wire types panino already
-  speaks over the localhost gateway.
-- **New additive `controllerChanged` event** broadcast on every controller transition (and to
-  each newly-established peer as part of its greeting), carrying the controller's keyId or null.
-  Unknown event types are ignored by clients, so this is non-breaking — but it needs a dispensa
-  note so panino can render "you're driving / another device is driving / nobody is."
-- Backpressure: bounded per-session queue, drop-oldest with a counter (read stream is lossy by
-  design; control frames are never queued behind it).
+- The pump (`handle_bus_msg`: bus → `ServerEvent` incl. decode enrichment with dial frequency /
+  station-lookup / snapshot folding) is hoisted out of the gateway-enabled path into a shared
+  **display feed** started when *either* the localhost gateway *or* the station agent is active.
+  The coordinator's `gateway_enabled` emit-site flag generalizes to `display_feed_enabled`
+  (same `Arc<AtomicBool>`, set by either component) — emit sites keep exactly one call, the TUI
+  path is untouched, and the gateway's HTTP server stays gated on its own config flag.
+- The station agent subscribes a `broadcast::Receiver<ServerEvent>` to the feed's existing
+  `evt_tx` and, between (timeout-bounded) control-frame reads, drains it and `broadcast()`s each
+  event as `ServerFrame::Event` JSON inside per-peer-encrypted `env` frames — the same rig-api.v1
+  wire types panino already speaks over the localhost gateway. (The `WsConn` seam gains a
+  timeout-bounded receive so the loop can interleave; today's `recv_text` blocks indefinitely.)
+- **Control-state visibility needs NO new protocol event**: rig-api.v1 already defines
+  `ServerEvent::ControlState { controlHeldByMe, transmitArmed }` (receiver-relative). The agent
+  sends each peer its own `ControlState` on every controller/arm transition and on session
+  establishment; refusals ride the existing `ServerEvent::Error`. Nothing additive on the wire —
+  the dispensa note becomes purely informational.
+- Backpressure: the tokio `broadcast` channel's bounded ring is the drop-oldest queue (`Lagged`
+  = events skipped, logged); the read stream is lossy by design and control frames are never
+  queued behind it.
 
 ## Component 4: `CAPACITY` terminal-code fix (bundled)
 
@@ -177,7 +184,8 @@ New invariants (added to the tested set):
 
 ## Cross-repo coordination (dispensa)
 
-One additive protocol event (`controllerChanged`) plus now-defined semantics for the previously
-reserved `takeControl`/`releaseControl` verbs. File a dispensa note to panino/cqdx when
-implementation lands (or at spec time, for lead time): no relay changes, no breaking changes,
-panino may optionally render controller state and a take-control button.
+No wire changes at all: `controlState`, `error`, `takeControl`, and `releaseControl` all already
+exist in rig-api.v1 — this work *defines semantics* for the previously no-op verbs and starts
+emitting `controlState`/read-stream events over the relay leg. File an informational dispensa
+note to panino/cqdx when implementation lands: no relay changes, no breaking changes, panino may
+optionally render controller state and a take-control button.
