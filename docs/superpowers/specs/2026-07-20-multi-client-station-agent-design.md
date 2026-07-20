@@ -6,6 +6,9 @@
 "dynamic single-client selection" fix (same session) that solves the immediate operator pain
 without needing this design.
 **Author:** Claude Sonnet 5 (under K5ARH supervision)
+**Superseded (in part):** the "Proposed shape" section below is superseded by the approved
+`2026-07-20-concurrent-multi-client-station-agent-design.md`; the relay-side confirmation and
+what's-single-peer inventory in this doc remain the reference.
 **Related:** dispensa Q-0043 (client pairing friction), Q-0035 (client keyId visibility)
 
 ## Why this is separate from the dynamic-selection fix
