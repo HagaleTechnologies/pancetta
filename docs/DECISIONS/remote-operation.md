@@ -98,3 +98,61 @@ station hardware is available:
    (the default), have a LAN host replay a previously-captured valid `Reply` packet at
    pancetta and confirm it produces **zero TX** and an audit trail entry (refused, not
    silently dropped) in `Shift+D`.
+
+## Concurrent multi-client station agent (2026-07-20)
+
+`pancetta-agent/src/multi_session.rs` (new), `pancetta-agent/src/relay.rs`,
+`pancetta/src/coordinator/station_agent/{mod.rs,net.rs}`,
+`pancetta/src/coordinator/{mod.rs,remote_gateway/mod.rs}`: the station agent now admits up to
+`MAX_PEERS` (8 — the relay's own `MAX_CLIENTS` cap) concurrent, independently-Noise-sessioned
+clients over the one relay websocket, instead of exactly one. Six implementation tasks landed,
+all with clean reviews (no Critical/Important findings):
+
+1. **`CAPACITY` terminal-code fix** — `relay.rs` was missing the 12th relay.v1 terminal code
+   (sent by the relay on a 9th-client attempt); now handled like the other 11.
+2. **Timeout-bounded websocket receive** — `WsConn::recv_text` (and `RealWsConn`) gained a
+   bounded-wait variant so the session loop can interleave control-frame reads with other
+   per-tick work instead of blocking indefinitely.
+3. **`MultiPeerSession`** (`pancetta-agent`, new module beside `session.rs`) — demuxes the
+   single relay leg's `env` frames by DO-authenticated `src` into per-peer Noise state
+   (`HashMap<String, PeerState>`), admission-checks an unknown `src` against the station-local
+   `tx_allow_list` *before* allocating any handshake state, and reports `Plaintext`/
+   `PeerEstablished`/`PeerDown`/`Idle`/`Closed` to the caller. `AgentSession` is kept untouched
+   as the tested single-peer reference.
+4. **Coordinator switch to `MultiPeerSession`** with per-peer identity binding — `ArmContext`
+   gained a `peers: HashMap<String, PeerCtx>` (each peer's own `hello_scopes`, rooted in the
+   actual demuxed `src` of the frame that carried its capability token, never a session-global
+   value or another peer's identity).
+5. **One-controller-at-a-time, free grab** — `ArmContext::controller: Option<String>`. Rules:
+   `takeControl` from any admitted peer always succeeds, disarming a displaced controller's live
+   arm first (arms never transfer — the new controller must re-arm through the full grant
+   verification); `releaseControl` from the controller clears it (disarms if armed); a
+   control-mutating action from `controller == None` implicitly grabs it (so a legacy client that
+   never sends `takeControl` still arms exactly as it always has); the same action from a
+   non-controller while someone else holds control is refused with an audited error frame, never
+   an implicit grab; controller `down`/session teardown/shutdown clears `controller` and disarms,
+   a listener disconnecting disarms nothing.
+6. **Shared display feed / relay read stream** — the gateway's bus→`ServerEvent` translation
+   pump (`handle_bus_msg`) was hoisted into `remote_gateway::DisplayFeed`, started when *either*
+   the localhost gateway or the station agent is enabled (`display_feed_enabled` generalizes the
+   old `gateway_enabled` flag; TUI emit sites are untouched, additive-only). The station agent
+   subscribes a `broadcast::Receiver<ServerEvent>` and, between control-frame reads, drains it
+   and fans each event out as an encrypted `env` per established peer — the module doc's old
+   "read stream (minimal v1)" aspiration is now real. `ServerEvent::ControlState` (already
+   defined in rig-api.v1, no wire change) is sent per-peer on every controller/arm transition and
+   on session establishment.
+
+**Two deliberate safety asymmetries** (reviewed and intentional, not gaps):
+
+- **`Disarm` is accepted from ANY established peer**, controller or not — fail-safe TX-OFF beats
+  exclusivity, consistent with disarm-any's pre-existing posture.
+- **`Heartbeat` is accepted from any peer** — `ArmState`'s existing `arm_jti` + monotonic-`seq`
+  binding already guarantees only the armer's heartbeats can slide the dead-man window, so
+  restricting heartbeat acceptance to the controller would add no safety and would risk
+  spurious disarms if control changes hands mid-session.
+
+No relay or cqdx-side wire changes: `controlState`, `error`, `takeControl`, and `releaseControl`
+all already existed in rig-api.v1 — this work defines semantics for the previously no-op verbs.
+Spec: `docs/superpowers/specs/2026-07-20-concurrent-multi-client-station-agent-design.md`
+(Status: Implemented). Plan:
+`docs/superpowers/plans/2026-07-20-concurrent-multi-client-station-agent.md`.

@@ -15,8 +15,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   real `ft8_lib` C decoder.
 - `pancetta info` now reports the decode engine: `ft8_lib C decoder: native-C`
   or a loud `STUB` line with the fix command.
+- Station agent: concurrent multi-client relay sessions (up to 8, the relay's
+  own client cap), each with an independent Noise session over the one relay
+  websocket. One-controller-at-a-time semantics — `takeControl` free-grabs
+  control (disarming a displaced controller's live arm), `releaseControl`
+  gives it up, and a single legacy client that never sends either still arms
+  exactly as before (implicit grab). `Disarm` and `Heartbeat` remain accepted
+  from any connected peer regardless of controller state (fail-safe TX-OFF).
+  Connected clients also now get a live read stream (decodes/QSO
+  progress/status) over the relay, sharing the same translation pump the
+  localhost remote gateway uses.
 
 ### Fixed
+
+- Station agent: the relay's `CAPACITY` terminal code (sent on a 9th-client
+  connection attempt) is now handled like the other 11 relay.v1 terminal
+  codes instead of being silently unrecognized.
 
 - `LICENSE-APACHE` restored to the canonical Apache-2.0 text — the previous
   file paraphrased §6 and §9 and carried a corrupted appendix, which is both

@@ -7,11 +7,36 @@
 //! pairing — a stock station is byte-identical to one built before this
 //! component existed.
 //!
-//! ## What this component does (P3.4b)
+//! ## What this component does (P3.4b + concurrent multi-client, 2026-07-20)
 //!
 //! - **Connect + authenticate + Noise handshake** to the relay, demuxing up to
-//!   8 concurrent peers over that one socket, each with an INDEPENDENT Noise
-//!   session ([`net::RealWsConn`] → [`MultiPeerSession`]).
+//!   `multi_session::MAX_PEERS` (8 — the relay's own `MAX_CLIENTS` cap)
+//!   CONCURRENT peers over that one socket, each with an INDEPENDENT Noise
+//!   session ([`net::RealWsConn`] → [`MultiPeerSession`]). An unknown `src` is
+//!   checked against the station-local `tx_allow_list` *before* any handshake
+//!   state is created — an unlisted peer never costs a handshake, and a full
+//!   peer map is dropped defensively (the relay's own 9th-client `CAPACITY`
+//!   terminal code is the first line of defense).
+//! - **Controller model — one controller at a time, free grab:** at most one
+//!   established peer holds `controller` (arm/QSY/split/TX-initiation)
+//!   at a time; every other connected peer is a live read-only viewer.
+//!   `takeControl` from any admitted peer always succeeds (single-operator
+//!   assumption) — if it displaces a different controller whose arm is live,
+//!   that arm is **disarmed first** (audited); arms never transfer, the new
+//!   controller must arm fresh through the full capabilityToken + clientSig
+//!   grant. `releaseControl` from the current controller clears it (and
+//!   disarms if armed). A control-mutating action from `controller == None`
+//!   **implicitly grabs** control (rule kept for backward compatibility — a
+//!   single legacy client that never sends `takeControl` arms exactly as it
+//!   always has). A control-mutating action from a non-controller while
+//!   someone else holds control is refused (`warn!` + audited + an error
+//!   frame back to that peer), never an implicit grab. Two **deliberate
+//!   safety asymmetries**: `Disarm` and `Heartbeat` are accepted from ANY
+//!   established peer regardless of controller state (fail-safe TX-OFF beats
+//!   exclusivity; a heartbeat's existing `arm_jti` + monotonic-`seq` binding
+//!   already prevents anyone but the armer from sliding the dead-man window).
+//!   Controller `down`, whole-session teardown, or component shutdown clears
+//!   `controller` and disarms; a mere listener disconnecting disarms nothing.
 //! - **Verify + arm** on a `txArmGrant`: the two-stage crown-jewel verification
 //!   ([`CapabilityVerifier`]) mints a [`VerifiedArmGrant`] which is fed into the
 //!   coordinator's shared `remote_tx_arm` [`ArmState`]. Once armed (AND the
@@ -24,13 +49,23 @@
 //!   `down` presence, a session teardown, or any terminal error **disarms**
 //!   (fail TX-off on control-channel loss, Part-97).
 //! - **Non-TX rig control** (`Qsy`, `SetSplit`) is forwarded onto the existing
-//!   coordinator bus (`RigControlMessage`) — read/QSY/split only.
+//!   coordinator bus (`RigControlMessage`) — read/QSY/split only — and is
+//!   gated behind the controller rules above.
 //! - **TX-initiation** (`callStation` / `answerCaller` / `startCq`) is
 //!   **audited but deferred to P3.4c** — v1 does NOT route these through the QSO
 //!   engine; each is logged "not-yet-supported in v1" and does NOT key TX.
-//! - **Read stream (minimal v1)**: decoded frames + scalar status are
-//!   translated (`remote_gateway::translate`) and sent back as encrypted `env`
-//!   frames, drained opportunistically between control-frame reads.
+//! - **Read stream (now real, over the relay):** the station agent subscribes
+//!   to the shared [`super::remote_gateway::DisplayFeed`] — the same
+//!   bus-to-`ServerEvent` translation pump the localhost `remote_gateway`
+//!   uses — and, between (timeout-bounded) control-frame reads, drains it and
+//!   `broadcast()`s each event as `ServerFrame::Event` JSON inside per-peer
+//!   encrypted `env` frames to every established peer. The feed is started
+//!   when *either* the localhost gateway or the station agent is enabled
+//!   (`display_feed_enabled`); the tokio `broadcast` ring is a drop-oldest
+//!   queue (lossy by design — control frames are never queued behind it).
+//!   Per-peer `ControlState` (`controlHeldByMe`, `transmitArmed`) is sent on
+//!   every controller/arm transition and on session establishment — no new
+//!   wire event was needed; rig-api.v1 already defined it.
 //!
 //! ## Inert-when-off invariant
 //!

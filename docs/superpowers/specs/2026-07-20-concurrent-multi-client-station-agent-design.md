@@ -1,7 +1,7 @@
 # Concurrent Multi-Client Station Agent — Design Spec
 
 **Date:** 2026-07-20
-**Status:** Approved (design reviewed and accepted by K5ARH 2026-07-20). Supersedes the
+**Status:** Implemented (2026-07-20). Supersedes the
 "Proposed shape" section of `2026-07-20-multi-client-station-agent-design.md` (the earlier
 scoping doc); everything else in that doc — the relay-side confirmation, the what's-single-peer
 inventory — still stands and is not repeated here.
