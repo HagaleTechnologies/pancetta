@@ -113,8 +113,6 @@ pub struct MultiPeerSession<'a, W: WsConn> {
     /// Established (or in-transport) peers, keyed by their relay-authenticated
     /// keyId. Each entry owns an INDEPENDENT Noise transport.
     peers: HashMap<String, PeerState>,
-    /// Whether the relay leg has admitted us (`ready` seen). Informational.
-    admitted: bool,
 }
 
 impl<'a, W: WsConn> MultiPeerSession<'a, W> {
@@ -126,7 +124,6 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
             identity,
             allowed,
             peers: HashMap::new(),
-            admitted: false,
         }
     }
 
@@ -171,10 +168,7 @@ impl<'a, W: WsConn> MultiPeerSession<'a, W> {
         };
         let frame = parse_frame(&text)?;
         match frame {
-            RelayFrame::Ready { .. } => {
-                self.admitted = true;
-                Ok(Poll::Idle)
-            }
+            RelayFrame::Ready { .. } => Ok(Poll::Idle),
             RelayFrame::Presence { peer, state } => {
                 if state == "down" && self.peers.remove(&peer).is_some() {
                     Ok(Poll::PeerDown { peer })

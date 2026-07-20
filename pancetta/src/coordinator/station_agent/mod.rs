@@ -28,7 +28,13 @@
 //!   disarms if armed). A control-mutating action from `controller == None`
 //!   **implicitly grabs** control (rule kept for backward compatibility — a
 //!   single legacy client that never sends `takeControl` arms exactly as it
-//!   always has). A control-mutating action from a non-controller while
+//!   always has). *Precision note:* "byte-identical" here means a single
+//!   connected client's **dispatch/arm/control** behavior is byte-for-byte
+//!   what it was before this branch — NOT that every byte sent to the client is
+//!   unchanged. Its INBOUND relay stream is now a strict *superset*: it also
+//!   receives a `ControlState` greeting on session establishment plus any
+//!   read-stream events, both carried by pre-existing rig-api.v1 types (no new
+//!   wire event). A control-mutating action from a non-controller while
 //!   someone else holds control is refused (`warn!` + audited + an error
 //!   frame back to that peer), never an implicit grab. Two **deliberate
 //!   safety asymmetries**: `Disarm` and `Heartbeat` are accepted from ANY
@@ -66,6 +72,13 @@
 //!   Per-peer `ControlState` (`controlHeldByMe`, `transmitArmed`) is sent on
 //!   every controller/arm transition and on session establishment — no new
 //!   wire event was needed; rig-api.v1 already defined it.
+//! - **Boot-gated, not hot-started:** the shared display feed is started ONCE
+//!   at coordinator startup, from the config as it stands at that instant. If
+//!   the station-agent component is turned on via a config *hot-reload* after
+//!   boot (rather than at startup), its read stream stays inert until the next
+//!   restart — the feed is never hot-started mid-run. This matches the
+//!   station-agent component's own boot-only start gating and is not a new
+//!   limitation this branch introduces; it was simply previously undocumented.
 //!
 //! ## Inert-when-off invariant
 //!
@@ -223,16 +236,14 @@ enum Dispatch {
     Teardown,
 }
 
-/// Who a [`PeerSend`] is addressed to.
+/// Who a [`PeerSend`] is addressed to. Every dispatch-emitted frame is
+/// per-receiver ([`SendTarget::One`]) because `controlHeldByMe` differs per
+/// peer; the read-stream fan-out does NOT go through `PeerSend` — it calls
+/// [`MultiPeerSession::broadcast`] directly (see [`drain_read_stream`]).
 #[derive(Debug)]
 enum SendTarget {
     /// Exactly one established peer (by keyId).
     One(String),
-    /// Every currently-established peer (identical frame each). Read-stream
-    /// broadcast seam (Task 6); control/arm frames are always per-receiver
-    /// [`SendTarget::One`] because `controlHeldByMe` differs per peer.
-    #[allow(dead_code)]
-    AllPeers,
 }
 
 /// A server→client frame the dispatch decided to emit, plus its routing. The
@@ -1221,22 +1232,9 @@ fn deliver_sends<W: pancetta_agent::relay::WsConn>(
                 continue;
             }
         };
-        match &send.to {
-            SendTarget::One(peer) => {
-                if let Err(e) = sess.send_to(peer, &bytes) {
-                    debug!(target: "agent.control", peer = %peer, "peer send failed: {e}");
-                }
-            }
-            SendTarget::AllPeers => {
-                // Collect the peer keys first so the immutable borrow of `sess`
-                // is released before the mutable `send_to` calls.
-                let peers: Vec<String> = sess.established_peers().map(str::to_string).collect();
-                for peer in peers {
-                    if let Err(e) = sess.send_to(&peer, &bytes) {
-                        debug!(target: "agent.control", peer = %peer, "peer send failed: {e}");
-                    }
-                }
-            }
+        let SendTarget::One(peer) = &send.to;
+        if let Err(e) = sess.send_to(peer, &bytes) {
+            debug!(target: "agent.control", peer = %peer, "peer send failed: {e}");
         }
     }
 }
@@ -2419,6 +2417,72 @@ mod tests {
         assert!(
             err_to_b,
             "the refused peer must receive an Error frame targeted at just it"
+        );
+    }
+
+    /// Important (final whole-branch review): the ARM-path cross-peer-replay
+    /// blocker. This pins the single most security-critical line on the branch —
+    /// `verify_and_arm`'s `client_key_id != peer` check, which binds the grant's
+    /// claimed identity to the ACTUAL demuxed sender of the frame, never to any
+    /// session-global `ctx` state.
+    ///
+    /// Peer B is a fully-established, allow-listed peer with its OWN device key
+    /// registered, but the `txArmGrant` it sends names peer A's `clientKeyId`
+    /// (`CLIENT_KEY_ID`) — a grant that WOULD arm if A had sent it (identical to
+    /// `arm_from_allowlisted_client_permits_tx`: valid token, valid clientSig,
+    /// matching sessionId, consent ON). The ONLY thing standing between it and a
+    /// live arm is the sender-binding check. It must be rejected: the arm never
+    /// becomes armed, `tx_permitted()` stays false, and a `TxDenied` is audited.
+    ///
+    /// RED evidence: deleting the `client_key_id != peer` guard makes this arm
+    /// succeed (verified by commenting the check out locally — `is_armed()` then
+    /// flips true), so this test genuinely pins that line, not incidental setup.
+    #[tokio::test]
+    async fn arm_grant_naming_a_different_peer_than_the_sender_is_rejected() {
+        // A (CLIENT_KEY_ID) is allow-listed with its device key (ctx_with). Add
+        // B (PEER_B) as a SECOND allow-listed, established peer with its OWN
+        // device key — a genuinely admitted second client, not a bare claim.
+        let mut ctx = ctx_with(true, true);
+        ctx.tx_allow_list.insert(PEER_B.to_string());
+        ctx.client_keys
+            .insert(PEER_B.to_string(), key(0x33).verifying_key());
+        ctx.peers
+            .insert(PEER_B.to_string(), PeerCtx { hello_scopes: None });
+        // Consent ON: nothing but the sender-binding check gates this arm.
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+
+        // `arm_action` names A (CLIENT_KEY_ID) and is signed by A's device key —
+        // but the ACTUAL demuxed sender of this frame is B (the `peer` argument).
+        let out = dispatch_action(
+            arm_action("arm-jti-1"),
+            PEER_B,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+
+        assert_eq!(out.flow, Dispatch::Continue);
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "a grant naming a DIFFERENT peer than the demuxed sender must never arm"
+        );
+        assert!(
+            !ctx.arm.lock().unwrap().tx_permitted(NOW),
+            "tx must stay not-permitted after a rejected cross-peer arm grant"
+        );
+
+        // The denial is on the audit trail as a TxDenied ("arm rejected: ...").
+        let log = std::fs::read_to_string(ctx.audit.path()).unwrap_or_default();
+        let denied = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<AuditEvent>(l).ok())
+            .any(|ev| ev.kind == AuditKind::TxDenied && ev.detail.contains("arm rejected"));
+        assert!(
+            denied,
+            "a rejected cross-peer arm grant must record a TxDenied audit event"
         );
     }
 
