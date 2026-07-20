@@ -827,7 +827,7 @@ impl super::ApplicationCoordinator {
         // Remote-gateway relay gate (dispensa Q-0027 mode event) — the
         // CycleOperatingMode success arm relays the new mode to already-
         // connected remote clients, same additive pattern as Frequency/Split.
-        let cmd_gateway_enabled = self.gateway_enabled.clone();
+        let cmd_display_feed_enabled = self.display_feed_enabled.clone();
         // Whether the autonomous component is running at all (config
         // gate). If it's config-disabled there is no decision loop to
         // re-enable — `a` should say so honestly instead of flipping a
@@ -1550,7 +1550,7 @@ impl super::ApplicationCoordinator {
                                     // gateway is disabled).
                                     super::remote_gateway::relay_to_gateway(
                                         &cmd_message_bus,
-                                        &cmd_gateway_enabled,
+                                        &cmd_display_feed_enabled,
                                         ComponentId::Tui,
                                         MessageType::ModeStatus {
                                             mode: mode_str.clone(),

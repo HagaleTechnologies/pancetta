@@ -1066,7 +1066,7 @@ impl super::ApplicationCoordinator {
 
         let (_qso_tx, qso_rx) = self.message_bus.create_channel(ComponentId::Qso).await?;
         let message_bus = self.message_bus.clone();
-        let gateway_enabled = self.gateway_enabled.clone();
+        let display_feed_enabled = self.display_feed_enabled.clone();
 
         // Read station config for callsign/grid
         let config = self.config.read().await;
@@ -1519,7 +1519,7 @@ impl super::ApplicationCoordinator {
                 let completions_for_events = recent_manual_completions.clone();
                 let pending_for_events = pending_manual_calls.clone();
                 let dx_activity_for_events = dx_activity.clone();
-                let gateway_enabled = gateway_enabled.clone();
+                let display_feed_enabled = display_feed_enabled.clone();
                 tokio::spawn(async move {
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
@@ -1702,7 +1702,7 @@ impl super::ApplicationCoordinator {
                                 // Additive: clone the snapshot for the read-only
                                 // gateway BEFORE it is moved into the →Tui send
                                 // (only when the gateway is enabled).
-                                let gw_snap = if gateway_enabled.load(Ordering::Relaxed) {
+                                let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
                                     Some(MessageType::ActiveQsosSnapshot {
                                         qsos: snapshot.clone(),
                                         pending: pending_snap.clone(),
@@ -1725,7 +1725,7 @@ impl super::ApplicationCoordinator {
                                 if let Some(m) = gw_snap {
                                     super::remote_gateway::relay_to_gateway(
                                         &snapshot_bus,
-                                        &gateway_enabled,
+                                        &display_feed_enabled,
                                         ComponentId::Qso,
                                         m,
                                     )
@@ -1957,7 +1957,7 @@ impl super::ApplicationCoordinator {
                                     &pending_for_events,
                                 )
                                 .await;
-                                let gw_snap = if gateway_enabled.load(Ordering::Relaxed) {
+                                let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
                                     Some(MessageType::ActiveQsosSnapshot {
                                         qsos: snapshot.clone(),
                                         pending: pending_snap.clone(),
@@ -1978,7 +1978,7 @@ impl super::ApplicationCoordinator {
                                 if let Some(m) = gw_snap {
                                     super::remote_gateway::relay_to_gateway(
                                         &snapshot_bus,
-                                        &gateway_enabled,
+                                        &display_feed_enabled,
                                         ComponentId::Qso,
                                         m,
                                     )
@@ -2122,7 +2122,7 @@ impl super::ApplicationCoordinator {
                                     &pending_for_events,
                                 )
                                 .await;
-                                let gw_snap = if gateway_enabled.load(Ordering::Relaxed) {
+                                let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
                                     Some(MessageType::ActiveQsosSnapshot {
                                         qsos: snapshot.clone(),
                                         pending: pending_snap.clone(),
@@ -2143,7 +2143,7 @@ impl super::ApplicationCoordinator {
                                 if let Some(m) = gw_snap {
                                     super::remote_gateway::relay_to_gateway(
                                         &snapshot_bus,
-                                        &gateway_enabled,
+                                        &display_feed_enabled,
                                         ComponentId::Qso,
                                         m,
                                     )

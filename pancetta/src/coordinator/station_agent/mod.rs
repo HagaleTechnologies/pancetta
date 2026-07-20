@@ -830,6 +830,38 @@ fn tx_kind_to_qso_message(kind: TxKind) -> crate::message_bus::QsoMessage {
     }
 }
 
+/// Whether the station agent is configured to attempt a relay connection at
+/// all: enabled, with both `relay_url`/`pairing_api_url` present and
+/// non-empty. A config-only, filesystem-free check — it does NOT prove the
+/// station is actually *paired* (that needs `PairedState::load`, a
+/// filesystem read `start_station_agent_component` performs later) or that
+/// identity keys load successfully. Factored out so
+/// [`station_agent_active`] (which adds the allow-list check) shares this
+/// exact condition with `start_station_agent_component`'s own gating,
+/// instead of two copies of the same boolean drifting apart.
+fn has_relay_config(cfg: &pancetta_config::network::StationAgentConfig) -> bool {
+    cfg.enabled
+        && cfg.relay_url.as_deref().is_some_and(|s| !s.is_empty())
+        && cfg
+            .pairing_api_url
+            .as_deref()
+            .is_some_and(|s| !s.is_empty())
+}
+
+/// Whether the station agent WILL (config permitting) want the shared
+/// [`display feed`](super::remote_gateway::DisplayFeed): [`has_relay_config`]
+/// AND a non-empty station-local TX-allow-list — the same two gates
+/// `start_station_agent_component` itself checks before ever attempting a
+/// relay connection. Deliberately does NOT check pairing state (filesystem)
+/// — an over-approximation (starting the feed for a config that turns out
+/// unpaired at runtime) is harmless; the failure mode this predicate exists
+/// to prevent is the opposite one, a station agent that needs the feed
+/// finding it was never started. `start_display_feed` calls this SAME
+/// function for its own gating so the two can never drift apart.
+pub(crate) fn station_agent_active(cfg: &pancetta_config::network::StationAgentConfig) -> bool {
+    has_relay_config(cfg) && !cfg.tx_allow_list.is_empty()
+}
+
 impl super::ApplicationCoordinator {
     /// Start the station-agent component (default-OFF, inert unless enabled +
     /// paired). Mirrors [`start_remote_gateway_component`](super::ApplicationCoordinator::start_remote_gateway_component):
@@ -867,9 +899,7 @@ impl super::ApplicationCoordinator {
 
         // --- Inert paths: disabled or missing required config ---------------
         let (relay_url, pairing_api_url) = match (&cfg.relay_url, &cfg.pairing_api_url) {
-            (Some(r), Some(p)) if cfg.enabled && !r.is_empty() && !p.is_empty() => {
-                (r.clone(), p.clone())
-            }
+            (Some(r), Some(p)) if has_relay_config(&cfg) => (r.clone(), p.clone()),
             _ => {
                 if cfg.enabled {
                     info!("station_agent enabled but relay_url/pairing_api_url missing — inert");
@@ -954,6 +984,13 @@ impl super::ApplicationCoordinator {
         let shutdown = self.shutdown_signal.clone();
         let arm = self.remote_tx_arm.clone();
 
+        // Task 6: subscribe to the shared display feed (if the localhost
+        // gateway or this component's own gating started it — see
+        // `start_display_feed`/`station_agent_active`) so the read stream has
+        // something to drain. `None` when the feed never started (inert —
+        // `drain_read_stream` is a no-op on `None`).
+        let events = self.display_feed.as_ref().map(|f| f.evt_tx.subscribe());
+
         // Drain channel so additive bus sends addressed to StationAgent never
         // flood (parity with the gateway).
         let (_sa_tx, _sa_rx) = self
@@ -970,6 +1007,7 @@ impl super::ApplicationCoordinator {
                 tx_allow_list,
                 audit,
                 bus,
+                events,
                 arm,
                 shutdown,
             })
@@ -1058,6 +1096,12 @@ struct RunConfig {
     tx_allow_list: HashSet<String>,
     audit: AuditLog,
     bus: MessageBus,
+    /// The shared display-feed subscription (Task 6), if the feed was
+    /// started. `None` when neither the localhost gateway nor this
+    /// component's own gating (`station_agent_active`) needed it — in which
+    /// case the read stream is permanently inert for this run
+    /// (`drain_read_stream` no-ops on `None`).
+    events: Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
     arm: Arc<Mutex<ArmState>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -1066,7 +1110,7 @@ struct RunConfig {
 ///
 /// On any session teardown the arm is disarmed (fail TX-off on control-channel
 /// loss, Part-97), then the loop reconnects with capped backoff until shutdown.
-async fn run_session_loop(cfg: RunConfig) {
+async fn run_session_loop(mut cfg: RunConfig) {
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut ctx = ArmContext {
         arm: cfg.arm.clone(),
@@ -1092,7 +1136,7 @@ async fn run_session_loop(cfg: RunConfig) {
         match net::RealWsConn::connect(&cfg.relay_url).await {
             Ok(ws) => {
                 backoff = RECONNECT_BACKOFF_MIN;
-                run_one_session(ws, &cfg.identity, &mut ctx, &cfg.bus).await;
+                run_one_session(ws, &cfg.identity, &mut ctx, &cfg.bus, &mut cfg.events).await;
                 // Session ended (teardown / drained): fail TX-off.
                 disarm_on_loss(&mut ctx);
             }
@@ -1162,6 +1206,32 @@ fn deliver_sends<W: pancetta_agent::relay::WsConn>(
     }
 }
 
+/// Fan pending display events out to every established peer. Lossy by design:
+/// Lagged means the bounded broadcast ring dropped old events — log and continue.
+fn drain_read_stream<W: pancetta_agent::relay::WsConn>(
+    events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
+    sess: &mut MultiPeerSession<'_, W>,
+) {
+    let Some(rx) = events.as_mut() else { return };
+    loop {
+        match rx.try_recv() {
+            Ok(ev) => {
+                let frame = pancetta_protocol::ServerFrame::Event { event: ev };
+                match serde_json::to_vec(&frame) {
+                    Ok(bytes) => {
+                        let _ = sess.broadcast(&bytes);
+                    }
+                    Err(e) => debug!(target: "agent", "read-stream serialize failed: {e}"),
+                }
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(n)) => {
+                debug!(target: "agent", skipped = n, "read stream lagged — events dropped");
+            }
+            Err(_) => break, // Empty or Closed
+        }
+    }
+}
+
 /// Drive one session to completion: auth → demux → dispatch control frames.
 /// Returns when the session tears down (drain, teardown action, or error).
 ///
@@ -1185,6 +1255,7 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
     identity: &AgentIdentity,
     ctx: &mut ArmContext,
     bus: &MessageBus,
+    events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
 ) {
     ctx.peers.clear();
     let mut sess = MultiPeerSession::new(ws, identity, ctx.tx_allow_list.clone());
@@ -1210,6 +1281,11 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                 let sid = sess.session_id(&peer).unwrap_or_default().to_string();
                 let outcome = dispatch_action(action, &peer, ctx, bus, &sid, now_ms()).await;
                 deliver_sends(&mut sess, &outcome.sends);
+                // Task 6: drain the read stream after every successful dispatch
+                // too, not just on Quiet/Idle — a chatty control session
+                // (frequent Arm/Heartbeat/Qsy traffic) must never starve the
+                // display feed of a chance to fan out.
+                drain_read_stream(events, &mut sess);
                 if outcome.flow == Dispatch::Teardown {
                     return;
                 }
@@ -1248,7 +1324,10 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                 }
             }
             Ok(Poll::Idle) | Ok(Poll::Quiet) => {
-                // Task 6 drains the read-stream feed here on Quiet.
+                // Task 6: the common case — no control traffic this tick, so
+                // this is where the read stream gets most of its chances to
+                // fan out pending display events to established peers.
+                drain_read_stream(events, &mut sess);
             }
             Ok(Poll::Closed) => return,
             Err(e) => {
@@ -2497,7 +2576,7 @@ mod tests {
             assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
 
             let ws = scripted_ws_for_peer_down(&identity, CLIENT_KEY_ID);
-            run_one_session(ws, &identity, &mut ctx, &bus).await;
+            run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
 
             assert!(
                 !ctx.arm.lock().unwrap().is_armed(),
@@ -2530,7 +2609,7 @@ mod tests {
             assert_eq!(ctx.controller.as_deref(), Some(CLIENT_KEY_ID));
 
             let ws = scripted_ws_for_peer_down(&identity, PEER_B);
-            run_one_session(ws, &identity, &mut ctx, &bus).await;
+            run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
 
             assert!(
                 ctx.arm.lock().unwrap().is_armed(),
@@ -2902,7 +2981,7 @@ mod tests {
             controller: None,
         };
         let bus = MessageBus::new(64).unwrap();
-        run_one_session(ws, identity, &mut ctx, &bus).await;
+        run_one_session(ws, identity, &mut ctx, &bus, &mut None).await;
         ctx
     }
 
@@ -2955,6 +3034,240 @@ mod tests {
         assert!(
             ctx.peers.is_empty(),
             "the refused peer must be served no scope at all — no PeerCtx anywhere in this session"
+        );
+    }
+
+    /// A fresh `ArmContext` admitting exactly `allow` over a fresh
+    /// `AgentIdentity`. No fixed IDP/agent-key constants tied to it (unlike
+    /// `ctx_with`) — used by the Task 6 read-stream tests, which only care
+    /// about peer establishment + the display feed, never about arming.
+    fn fresh_ctx(agent_kid: &str, allow: HashSet<String>) -> ArmContext {
+        ArmContext {
+            arm: Arc::new(Mutex::new(ArmState::new())),
+            verifier: CapabilityVerifier {
+                agent_key_id: agent_kid.to_string(),
+                pinned_idp_keys: vec![IdpKey {
+                    kid: IDP_KID.to_string(),
+                    public_key: idp_key().verifying_key().to_bytes(),
+                }],
+            },
+            client_keys: std::collections::HashMap::new(),
+            tx_allow_list: allow,
+            revoked_jtis: HashSet::new(),
+            seen_jtis: HashSet::new(),
+            audit: AuditLog::new(audit_tmp()),
+            peers: std::collections::HashMap::new(),
+            controller: None,
+        }
+    }
+
+    /// A client-side Noise IK initiator with a freshly generated keypair,
+    /// against `agent_pub`. Mirrors the inline pattern used throughout this
+    /// module's other scripted tests.
+    fn fresh_initiator(agent_pub: &[u8]) -> TestInitiator {
+        let params: snow::params::NoiseParams =
+            "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+        let kp = snow::Builder::new(params).generate_keypair().unwrap();
+        TestInitiator::new(&kp.private, agent_pub)
+    }
+
+    /// Task 6: a `ServerEvent` broadcast into the shared display feed BEFORE
+    /// the session runs must reach EVERY established peer, each decrypted
+    /// under its OWN independent Noise transport — proven at the
+    /// `run_one_session` level (not just `MultiPeerSession::broadcast`'s own
+    /// unit coverage in `pancetta-agent`).
+    ///
+    /// No `ready`/heartbeat frame is scripted: peer establishment does not
+    /// require the relay's `ready` first (mirrors `process_env`, which has no
+    /// `admitted` gate), and inserting a `ready` step would trigger an early
+    /// `Poll::Idle` — and therefore an early `drain_read_stream` — BEFORE any
+    /// peer is established, permanently consuming the one buffered event
+    /// with zero recipients (draining is a plain `try_recv`, oblivious to
+    /// whether anyone is listening). The trailing `presence:up` frame is inert
+    /// on its own (informational only — `state != "down"` never touches
+    /// `ctx.peers`) and exists solely to produce the `Poll::Idle` tick that
+    /// exercises the drain AFTER both peers are established.
+    #[tokio::test]
+    async fn read_stream_events_reach_every_established_peer() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let agent_pub = identity.agreement_public_raw();
+        const PEER_A: &str = CLIENT_KEY_ID;
+
+        let mut allow = HashSet::new();
+        allow.insert(PEER_A.to_string());
+        allow.insert(PEER_B.to_string());
+        let mut ctx = fresh_ctx(&agent_kid, allow);
+        let bus = MessageBus::new(64).unwrap();
+
+        let mut init_a = fresh_initiator(&agent_pub);
+        let mut init_b = fresh_initiator(&agent_pub);
+        let msg1_a = init_a.write_msg1(b"");
+        let msg1_b = init_b.write_msg1(b"");
+
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[11u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let env_a = RelayFrame::Env {
+            dst: agent_kid.clone(),
+            payload: b64url(&msg1_a),
+            src: Some(PEER_A.to_string()),
+        }
+        .to_json()
+        .unwrap();
+        let env_b = RelayFrame::Env {
+            dst: agent_kid.clone(),
+            payload: b64url(&msg1_b),
+            src: Some(PEER_B.to_string()),
+        }
+        .to_json()
+        .unwrap();
+        // A benign relay frame that yields Poll::Idle without touching
+        // ctx.peers (see the doc comment above) — the tick that lets
+        // `drain_read_stream` run with both peers already established.
+        let idle_tick = RelayFrame::Presence {
+            peer: "irrelevant-peer".to_string(),
+            state: "up".to_string(),
+        }
+        .to_json()
+        .unwrap();
+
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let ws = MockWs::new(vec![hello, env_a, env_b, idle_tick], outbound.clone());
+
+        // Subscribe BEFORE sending so this receiver is guaranteed the event.
+        let (evt_tx, _keepalive) =
+            tokio::sync::broadcast::channel::<pancetta_protocol::ServerEvent>(16);
+        let mut events = Some(evt_tx.subscribe());
+        evt_tx
+            .send(pancetta_protocol::ServerEvent::TxStatus { active: true })
+            .unwrap();
+
+        run_one_session(ws, &identity, &mut ctx, &bus, &mut events).await;
+
+        assert!(ctx.peers.contains_key(PEER_A), "peer A must be established");
+        assert!(ctx.peers.contains_key(PEER_B), "peer B must be established");
+
+        // Collect, in wire order, every env addressed to each peer: msg2,
+        // then the PeerEstablished greet, then (from the drain) the event.
+        let out = outbound.lock().unwrap().clone();
+        let envs_for = |peer: &str| -> Vec<Vec<u8>> {
+            out.iter()
+                .filter_map(|s| match parse_frame(s).unwrap() {
+                    RelayFrame::Env { dst, payload, .. } if dst == peer => Some(
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(&payload)
+                            .unwrap(),
+                    ),
+                    _ => None,
+                })
+                .collect()
+        };
+        let envs_a = envs_for(PEER_A);
+        let envs_b = envs_for(PEER_B);
+        assert_eq!(
+            envs_a.len(),
+            3,
+            "A: msg2 + PeerEstablished greet + the drained event"
+        );
+        assert_eq!(
+            envs_b.len(),
+            3,
+            "B: msg2 + PeerEstablished greet + the drained event"
+        );
+
+        // Complete each initiator's client transport from its own msg2 (the
+        // first env addressed to it), then decrypt the rest IN ORDER (Noise
+        // transport nonces are sequential — skipping one desyncs the rest).
+        init_a.read_msg2(&envs_a[0]);
+        init_b.read_msg2(&envs_b[0]);
+        let mut ta = init_a.into_transport();
+        let mut tb = init_b.into_transport();
+
+        let decrypt_all = |t: &mut snow::TransportState, cts: &[Vec<u8>]| -> Vec<Vec<u8>> {
+            cts.iter()
+                .map(|ct| {
+                    let mut buf = vec![0u8; ct.len().max(1)];
+                    let n = t.read_message(ct, &mut buf).unwrap();
+                    buf.truncate(n);
+                    buf
+                })
+                .collect()
+        };
+        let plain_a = decrypt_all(&mut ta, &envs_a[1..]);
+        let plain_b = decrypt_all(&mut tb, &envs_b[1..]);
+
+        // The LAST decrypted frame for each peer must be our event, matching
+        // the wire contract exactly (parsed JSON, not string equality).
+        for plaintext in [plain_a.last().unwrap(), plain_b.last().unwrap()] {
+            let v: serde_json::Value = serde_json::from_slice(plaintext).unwrap();
+            assert_eq!(v["frame"], "event");
+            assert_eq!(v["event"]["event"], "txStatus");
+            assert_eq!(v["event"]["active"], true);
+        }
+    }
+
+    /// Task 6: with no display feed subscribed (`events: None` — the inert
+    /// path when neither the localhost gateway nor `station_agent_active`
+    /// started one), `drain_read_stream` must be a strict no-op: a
+    /// `Poll::Idle` tick after a peer establishes sends nothing beyond the
+    /// ordinary handshake + greet traffic that peer establishment always
+    /// produces.
+    #[tokio::test]
+    async fn read_stream_absent_feed_is_inert() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let agent_pub = identity.agreement_public_raw();
+
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        let mut ctx = fresh_ctx(&agent_kid, allow);
+        let bus = MessageBus::new(64).unwrap();
+
+        let mut init = fresh_initiator(&agent_pub);
+        let msg1 = init.write_msg1(b"");
+
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[12u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let env = RelayFrame::Env {
+            dst: agent_kid.clone(),
+            payload: b64url(&msg1),
+            src: Some(CLIENT_KEY_ID.to_string()),
+        }
+        .to_json()
+        .unwrap();
+        let idle_tick = RelayFrame::Presence {
+            peer: "irrelevant-peer".to_string(),
+            state: "up".to_string(),
+        }
+        .to_json()
+        .unwrap();
+
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let ws = MockWs::new(vec![hello, env, idle_tick], outbound.clone());
+
+        let mut events: Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>> =
+            None;
+        run_one_session(ws, &identity, &mut ctx, &bus, &mut events).await;
+
+        assert!(
+            ctx.peers.contains_key(CLIENT_KEY_ID),
+            "peer must still establish normally"
+        );
+
+        // auth (relay leg) + msg2 (handshake) + the PeerEstablished greet —
+        // and NOTHING else. The trailing Idle tick (from `presence:up`) must
+        // not have added a single outbound frame.
+        let out = outbound.lock().unwrap().clone();
+        assert_eq!(
+            out.len(),
+            3,
+            "an absent feed must add zero outbound frames beyond ordinary handshake traffic: {out:?}"
         );
     }
 
