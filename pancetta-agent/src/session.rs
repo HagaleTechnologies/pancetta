@@ -139,6 +139,15 @@ impl<'a, W: WsConn> AgentSession<'a, W> {
         self.session_id.as_deref()
     }
 
+    /// The client peer's keyId: either the value pinned at construction, or
+    /// (once learned) the DO-authenticated `src` of the first inbound `env`.
+    /// Empty until either is established — callers that construct with an
+    /// empty `client_key_id` (dynamic peer learning) should treat an empty
+    /// return as "not yet known."
+    pub fn client_key_id(&self) -> &str {
+        &self.client_key_id
+    }
+
     /// Whether the session has been admitted (received `ready`).
     pub fn is_admitted(&self) -> bool {
         matches!(

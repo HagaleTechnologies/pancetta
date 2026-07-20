@@ -92,12 +92,18 @@ struct ArmContext {
     revoked_jtis: HashSet<String>,
     seen_jtis: HashSet<String>,
     audit: AuditLog,
-    /// The clientKeyId this session is Noise-connected to (config-pinned at
-    /// component start from the station-local TX-allow-list — NOT learned from
-    /// the relay-stamped `env.src`, which is relay-forgeable). A `hello`'s
+    /// The clientKeyId this session is Noise-connected to. `AgentSession`
+    /// learns the raw peer identity from the relay-stamped `env.src` of its
+    /// first frame (relay-forgeable in isolation), but `run_one_session` only
+    /// ever copies that learned value in here AFTER checking it against the
+    /// station-local `tx_allow_list` — so by the time this field is non-empty
+    /// it names a vetted, allow-listed peer, not a bare relay claim. Empty
+    /// until that check passes; reset to empty at the start of every new
+    /// session (a fresh peer is learned — and re-vetted — on every reconnect,
+    /// so a different allow-listed client can connect next time). A `hello`'s
     /// `capabilityToken.clientKeyId` MUST equal this before its scopes are
     /// honored (Q-0019 #5) — this is what roots read/qsy authorization in the
-    /// E2E-connected identity rather than relay admission.
+    /// E2E-connected, allow-listed identity rather than relay admission alone.
     expected_client_key_id: String,
     /// Scopes granted by the most recent verified `hello.capabilityToken` THIS
     /// session (`None` = no scoped action served — v1 back-compat default, and
@@ -657,36 +663,24 @@ impl super::ApplicationCoordinator {
                 .unwrap_or_else(pancetta_agent::audit::default_audit_path),
         );
 
-        // Learn the client peer keyId for env addressing. v1 admits a SINGLE
-        // client peer. The allow-list may hold more than one keyId (e.g. staged
-        // for future multi-client), so pick DETERMINISTICALLY — the
-        // lexicographically smallest keyId — rather than relying on HashSet
-        // iteration order, which would silently vary the admitted peer across
-        // restarts and drop every other client's frames at the src guard.
-        let client_key_id = {
-            let mut ids: Vec<&String> = tx_allow_list.iter().collect();
-            ids.sort_unstable();
-            match ids.first().map(|s| (*s).clone()) {
-                Some(c) => {
-                    if ids.len() > 1 {
-                        warn!(
-                            target: "agent",
-                            admitted = %c,
-                            count = ids.len(),
-                            "tx_allow_list has multiple clients; v1 admits only the first (lexicographic) — other clients will not connect"
-                        );
-                    }
-                    c
-                }
-                None => {
-                    warn!(
-                        target: "agent",
-                        "station agent paired but tx_allow_list is empty — no client to admit; idle, relay connection never attempted"
-                    );
-                    return self.spawn_station_agent_drain().await;
-                }
-            }
-        };
+        // v1 still admits only ONE client peer per connected session (no
+        // concurrent multi-client — that's a separate, larger piece of work;
+        // see docs/superpowers/specs/2026-07-20-multi-client-station-agent.md),
+        // but no longer pins a single fixed keyId chosen at startup. Whichever
+        // allow-listed client actually connects is accepted:
+        // `run_session_loop`/`run_one_session` lets `AgentSession` learn the
+        // peer from the relay-authenticated `env.src` of its first frame, then
+        // validates that learned peer against `tx_allow_list` before granting
+        // anything (the station-local list — not relay admission — remains
+        // the authoritative gate, mirroring `verify_and_arm`'s TX-time check).
+        // An empty allow-list still means no client can ever be admitted.
+        if tx_allow_list.is_empty() {
+            warn!(
+                target: "agent",
+                "station agent paired but tx_allow_list is empty — no client to admit; idle, relay connection never attempted"
+            );
+            return self.spawn_station_agent_drain().await;
+        }
 
         let bus = self.message_bus.clone();
         let shutdown = self.shutdown_signal.clone();
@@ -703,7 +697,6 @@ impl super::ApplicationCoordinator {
             run_session_loop(RunConfig {
                 relay_url,
                 identity,
-                client_key_id,
                 verifier,
                 client_keys,
                 tx_allow_list,
@@ -792,7 +785,6 @@ fn load_client_device_keys(
 struct RunConfig {
     relay_url: String,
     identity: AgentIdentity,
-    client_key_id: String,
     verifier: CapabilityVerifier,
     client_keys: std::collections::HashMap<String, VerifyingKey>,
     tx_allow_list: HashSet<String>,
@@ -819,7 +811,10 @@ async fn run_session_loop(cfg: RunConfig) {
         revoked_jtis: HashSet::new(),
         seen_jtis: HashSet::new(),
         audit: cfg.audit,
-        expected_client_key_id: cfg.client_key_id.clone(),
+        // Not pinned to a fixed peer — the peer is learned and validated
+        // fresh each session (see `run_one_session`), so a different
+        // allow-listed client can connect on the next reconnect.
+        expected_client_key_id: String::new(),
         hello_scopes: None,
     };
 
@@ -827,7 +822,7 @@ async fn run_session_loop(cfg: RunConfig) {
         match net::RealWsConn::connect(&cfg.relay_url).await {
             Ok(ws) => {
                 backoff = RECONNECT_BACKOFF_MIN;
-                run_one_session(ws, &cfg.identity, &cfg.client_key_id, &mut ctx, &cfg.bus).await;
+                run_one_session(ws, &cfg.identity, &mut ctx, &cfg.bus).await;
                 // Session ended (teardown / drained): fail TX-off.
                 disarm_on_loss(&mut ctx);
             }
@@ -877,17 +872,30 @@ fn disarm_on_loss(ctx: &mut ArmContext) {
 ///
 /// This runs on a blocking-capable task because the [`WsConn`] seam is
 /// synchronous (`RealWsConn` bridges via `block_on`).
+///
+/// v1 admits ONE client peer per session (no concurrent multi-client), but
+/// does not pin a fixed keyId: `AgentSession` is constructed with an empty
+/// `client_key_id` so it learns the peer from the relay-authenticated
+/// `env.src` of its first frame (whichever allow-listed device happens to
+/// connect). The instant the Noise transport completes, the learned peer is
+/// checked against `ctx.tx_allow_list` — the station-local list, not relay
+/// admission, remains the authoritative gate (mirroring `verify_and_arm`'s
+/// TX-time check) — and the session is refused before any scope is granted
+/// if it isn't a member. A fresh peer is learned (and re-checked) every
+/// session, so a different allow-listed client can connect on the next
+/// reconnect.
 async fn run_one_session<W: pancetta_agent::relay::WsConn>(
     ws: W,
     identity: &AgentIdentity,
-    client_key_id: &str,
     ctx: &mut ArmContext,
     bus: &MessageBus,
 ) {
-    // A new session starts with zero granted read/qsy scope — a prior
-    // session's verified hello never carries across a reconnect (Q-0019 #5).
+    // A new session starts with zero granted read/qsy scope and no bound peer
+    // identity — neither a prior session's verified hello nor its learned
+    // peer carries across a reconnect (Q-0019 #5; dynamic client selection).
     ctx.hello_scopes = None;
-    let mut sess = AgentSession::new(ws, identity, client_key_id.to_string());
+    ctx.expected_client_key_id.clear();
+    let mut sess = AgentSession::new(ws, identity, String::new());
     if let Err(e) = sess.authenticate() {
         debug!(target: "agent", "relay authenticate failed: {e}");
         return;
@@ -927,6 +935,23 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                     return;
                 }
                 last_phase = phase;
+                // The Noise transport just completed for the first time this
+                // session: the peer is learned but not yet vetted. Gate it
+                // against the station-local allow-list before any control
+                // frame can reach dispatch_hello/verify_and_arm.
+                if sess.is_transport_established() && ctx.expected_client_key_id.is_empty() {
+                    let learned = sess.client_key_id();
+                    if ctx.tx_allow_list.contains(learned) {
+                        ctx.expected_client_key_id = learned.to_string();
+                    } else {
+                        warn!(
+                            target: "agent",
+                            peer = %learned,
+                            "relay-admitted peer not in station-local tx_allow_list — refusing session"
+                        );
+                        return;
+                    }
+                }
             }
             Err(e) => {
                 debug!(target: "agent", "session error: {e}");
@@ -1979,6 +2004,112 @@ mod tests {
         assert!(
             !ctx_off.arm.lock().unwrap().tx_permitted(NOW),
             "consent OFF must deny even after a verified Arm over Noise"
+        );
+    }
+
+    /// Drive a real Noise handshake (via `run_one_session`, not `AgentSession`
+    /// directly) from `connecting_client`, against a station whose
+    /// `tx_allow_list` is `allow`. Returns the resulting `ArmContext` so the
+    /// caller can inspect `expected_client_key_id`.
+    async fn run_session_with_connecting_peer(
+        identity: &AgentIdentity,
+        connecting_client: &str,
+        allow: HashSet<String>,
+    ) -> ArmContext {
+        let agent_static_pub = identity.agreement_public_raw();
+        let client_kp = {
+            let params: snow::params::NoiseParams =
+                "Noise_IK_25519_ChaChaPoly_BLAKE2s".parse().unwrap();
+            snow::Builder::new(params).generate_keypair().unwrap()
+        };
+        let mut initiator = TestInitiator::new(&client_kp.private, &agent_static_pub);
+        let msg1 = initiator.write_msg1(b"");
+
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[5u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let ready = RelayFrame::Ready {
+            key_id: identity.key_id(),
+            peer_present: true,
+        }
+        .to_json()
+        .unwrap();
+        let env_msg1 = RelayFrame::Env {
+            dst: identity.key_id(),
+            payload: b64url(&msg1),
+            src: Some(connecting_client.to_string()),
+        }
+        .to_json()
+        .unwrap();
+
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let ws = MockWs::new(vec![hello, ready, env_msg1], outbound);
+
+        let mut client_keys = std::collections::HashMap::new();
+        if allow.contains(connecting_client) {
+            client_keys.insert(connecting_client.to_string(), client_key().verifying_key());
+        }
+        let mut ctx = ArmContext {
+            arm: Arc::new(Mutex::new(ArmState::new())),
+            verifier: CapabilityVerifier {
+                agent_key_id: identity.key_id(),
+                pinned_idp_keys: vec![IdpKey {
+                    kid: IDP_KID.to_string(),
+                    public_key: idp_key().verifying_key().to_bytes(),
+                }],
+            },
+            client_keys,
+            tx_allow_list: allow,
+            revoked_jtis: HashSet::new(),
+            seen_jtis: HashSet::new(),
+            audit: AuditLog::new(audit_tmp()),
+            expected_client_key_id: String::new(),
+            hello_scopes: None,
+        };
+        let bus = MessageBus::new(64).unwrap();
+        run_one_session(ws, identity, &mut ctx, &bus).await;
+        ctx
+    }
+
+    /// Dynamic client selection (Q-0043 quick fix): the peer that actually
+    /// connects is learned and vetted — it does NOT need to be the
+    /// lexicographically-first entry in `tx_allow_list` (the old, now-removed
+    /// pre-pick-at-startup behavior).
+    #[tokio::test]
+    async fn dynamic_selection_accepts_whichever_allowlisted_peer_connects() {
+        let identity = AgentIdentity::generate();
+        let connecting_client = "zzzLastAlphabetically".to_string();
+        let mut allow = HashSet::new();
+        allow.insert("aaaFirstAlphabetically".to_string());
+        allow.insert(connecting_client.clone());
+
+        let ctx = run_session_with_connecting_peer(&identity, &connecting_client, allow).await;
+
+        assert_eq!(
+            ctx.expected_client_key_id, connecting_client,
+            "whichever allow-listed client actually connects must be admitted, \
+             regardless of allow-list ordering"
+        );
+    }
+
+    /// A peer the relay admits (it completed the Noise handshake — the relay
+    /// authenticated its `src`) but that is NOT in the station-local
+    /// `tx_allow_list` must be refused before any scope is granted. The
+    /// station-local list, not relay admission, is the authoritative gate.
+    #[tokio::test]
+    async fn relay_admitted_peer_not_in_allow_list_is_refused() {
+        let identity = AgentIdentity::generate();
+        let connecting_client = "notAllowlistedClientKeyId".to_string();
+        let mut allow = HashSet::new();
+        allow.insert("someOtherAllowlistedClient".to_string());
+
+        let ctx = run_session_with_connecting_peer(&identity, &connecting_client, allow).await;
+
+        assert!(
+            ctx.expected_client_key_id.is_empty(),
+            "a relay-admitted peer absent from tx_allow_list must never be vetted in"
         );
     }
 
