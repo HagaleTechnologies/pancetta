@@ -22,7 +22,7 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::Message;
 
 use pancetta_agent::pairing::{PairingError, PairingHttp};
-use pancetta_agent::relay::{RelayError, WsConn, MAX_FRAME_BYTES};
+use pancetta_agent::relay::{RecvOutcome, RelayError, WsConn, MAX_FRAME_BYTES};
 
 /// A real relay WebSocket connection adapting an async [`tokio_tungstenite`]
 /// stream to the synchronous [`WsConn`] seam.
@@ -124,6 +124,21 @@ impl WsConn for RealWsConn {
             Some(Some(text)) => Ok(Some(text)),
             Some(None) | None => Ok(None),
         }
+    }
+
+    fn recv_text_within(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<RecvOutcome, RelayError> {
+        let rx = &mut self.rx;
+        let out = self.handle.block_on(async move {
+            match tokio::time::timeout(timeout, rx.recv()).await {
+                Err(_elapsed) => RecvOutcome::Quiet,
+                Ok(Some(Some(text))) => RecvOutcome::Frame(text),
+                Ok(Some(None)) | Ok(None) => RecvOutcome::Closed,
+            }
+        });
+        Ok(out)
     }
 }
 
