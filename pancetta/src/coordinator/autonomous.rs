@@ -525,7 +525,7 @@ impl super::ApplicationCoordinator {
             .create_channel(ComponentId::Autonomous)
             .await?;
         let message_bus = self.message_bus.clone();
-        let gateway_enabled = self.gateway_enabled.clone();
+        let display_feed_enabled = self.display_feed_enabled.clone();
 
         let cqdx_bridge_for_auto = self.cqdx_bridge.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
@@ -988,7 +988,7 @@ impl super::ApplicationCoordinator {
                                                 let _ = message_bus.send_message(split_clr_tui).await;
                                                 super::remote_gateway::relay_to_gateway(
                                                     &message_bus,
-                                                    &gateway_enabled,
+                                                    &display_feed_enabled,
                                                     ComponentId::Autonomous,
                                                     MessageType::SplitStatus { tx_hz: 0 },
                                                 )

@@ -817,18 +817,27 @@ pub struct ApplicationCoordinator {
     /// resolves the correct tier-derived budget without re-probing.
     resolved_hardware_tier: Arc<std::sync::atomic::AtomicU8>,
 
-    /// `true` when the read-only `remote_gateway` component is enabled
-    /// (`[network.remote_gateway].enabled`). Cached from config at construction
-    /// so the display-event emit sites (decode fan-out, QSO snapshot, freq,
-    /// s-meter, TX status, split) can cheaply gate their **additive**
-    /// dual-destination send to `ComponentId::RemoteGateway` — when the gateway
-    /// is off, the emit sites skip the extra clone+send entirely (the existing
+    /// `true` when the shared [`remote_gateway::DisplayFeed`] bus pump is
+    /// wanted by SOMEONE — the read-only `remote_gateway` component
+    /// (`[network.remote_gateway].enabled`) OR the station-agent read stream
+    /// (`station_agent::station_agent_active`). Cached from config at
+    /// construction and re-asserted by `start_display_feed` so the
+    /// display-event emit sites (decode fan-out, QSO snapshot, freq, s-meter,
+    /// TX status, split) can cheaply gate their **additive** dual-destination
+    /// send to `ComponentId::RemoteGateway` — when nobody needs the feed, the
+    /// emit sites skip the extra clone+send entirely (the existing
     /// `→Tui`/`→Qso` sends are never touched). See `remote_gateway::relay_to_gateway`.
-    gateway_enabled: Arc<AtomicBool>,
+    display_feed_enabled: Arc<AtomicBool>,
+
+    /// The shared bus→`ServerEvent` pump (evt_tx + rolling snapshot), started
+    /// by `start_display_feed` when EITHER the localhost gateway or the
+    /// station-agent read stream needs it. `None` until started (or when
+    /// neither consumer is active — see `display_feed_enabled`).
+    display_feed: Option<remote_gateway::DisplayFeed>,
 
     /// `true` when the `wsjtx_udp` companion-protocol component is enabled
     /// (`[network.wsjtx_udp].enabled`). Cached from config at construction,
-    /// mirroring `gateway_enabled`, so future additive emit sites (the
+    /// mirroring `display_feed_enabled`, so future additive emit sites (the
     /// decoder fan-out, QSO-logged taps) can cheaply gate their extra send
     /// to `ComponentId::WsjtxUdp` without an async config read.
     wsjtx_enabled: Arc<AtomicBool>,
@@ -1148,12 +1157,17 @@ impl ApplicationCoordinator {
         let coordinator_config = CoordinatorConfig::default();
         let message_bus = MessageBus::new(coordinator_config.message_buffer_size)?;
 
-        // Cache the remote-gateway enabled flag before `config` is moved into
-        // the Arc<RwLock> — the additive dual-destination emit sites read this
-        // atomic to gate their (cheap, additive) sends to the gateway.
-        let gateway_enabled_init = config.network.remote_gateway.enabled;
+        // Cache the display-feed-wanted flag before `config` is moved into the
+        // Arc<RwLock> — the additive dual-destination emit sites read this
+        // atomic to gate their (cheap, additive) sends to the shared display
+        // feed. Computed with the SAME `station_agent::station_agent_active`
+        // predicate `start_display_feed` uses, so this early snapshot (read by
+        // components started before `start_display_feed` runs, e.g. hamlib/qso)
+        // already agrees with the value `start_display_feed` re-asserts later.
+        let display_feed_enabled_init = config.network.remote_gateway.enabled
+            || station_agent::station_agent_active(&config.network.station_agent);
         // Snapshot the wsjtx_udp enabled flag before `config` is moved into
-        // the Arc<RwLock> — mirrors `gateway_enabled_init` above.
+        // the Arc<RwLock> — mirrors `display_feed_enabled_init` above.
         let wsjtx_enabled_init = config.network.wsjtx_udp.enabled;
         // Snapshot the LOCAL remote-TX consent before config is moved into the
         // Arc<RwLock>. Seeds the shared remote-TX arm's local-consent gate.
@@ -1377,7 +1391,8 @@ impl ApplicationCoordinator {
             decode_last_budget_exhausted: Arc::new(AtomicBool::new(false)),
             current_decode_effort,
             resolved_hardware_tier,
-            gateway_enabled: Arc::new(AtomicBool::new(gateway_enabled_init)),
+            display_feed_enabled: Arc::new(AtomicBool::new(display_feed_enabled_init)),
+            display_feed: None,
             wsjtx_enabled: Arc::new(AtomicBool::new(wsjtx_enabled_init)),
             fox_mode: Arc::new(AtomicBool::new(false)),
             fox_max_streams: Arc::new(AtomicUsize::new(fox_max_streams_init)),
@@ -1644,6 +1659,7 @@ impl ApplicationCoordinator {
         self.start_autonomous_component().await?;
         self.start_dx_cluster_component().await?;
         self.start_pskreporter_component().await?;
+        self.start_display_feed().await?;
         self.start_remote_gateway_component().await?;
         self.start_station_agent_component().await?;
         self.start_wsjtx_udp_component().await?;

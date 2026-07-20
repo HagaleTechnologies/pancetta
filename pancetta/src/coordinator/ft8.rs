@@ -417,7 +417,7 @@ impl super::ApplicationCoordinator {
         let message_bus = self.message_bus.clone();
         // TX-adjacent desense diagnostic input (see `maybe_flag_tx_desense`).
         let last_ptt_on_ms = self.last_ptt_on_ms.clone();
-        let gateway_enabled = self.gateway_enabled.clone();
+        let display_feed_enabled = self.display_feed_enabled.clone();
         let wsjtx_enabled = self.wsjtx_enabled.clone();
         let self_waterfall_to_auto_tx = self.waterfall_to_auto_tx.clone();
 
@@ -1334,7 +1334,7 @@ impl super::ApplicationCoordinator {
                             // gateway when enabled (gated — no clone/send when
                             // off). The existing →Tui/→Qso/→PskReporter sends
                             // above are untouched.
-                            if gateway_enabled.load(Ordering::Relaxed) {
+                            if display_feed_enabled.load(Ordering::Relaxed) {
                                 let gw_msg = ComponentMessage::new(
                                     ComponentId::Ft8Decoder,
                                     ComponentId::RemoteGateway,

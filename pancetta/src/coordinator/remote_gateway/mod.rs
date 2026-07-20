@@ -27,29 +27,44 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType}
 /// Maximum number of recent decodes to keep in the snapshot.
 const RECENT_DECODES_CAP: usize = 100;
 
-/// Additively relay a display event to the read-only gateway, **only** when the
-/// gateway is enabled. Centralizes the gate so each emit site (decode fan-out,
-/// QSO snapshot, frequency, s-meter, TX status, split) is a single additive
-/// call placed *after* the existing `→Tui`/`→Qso` send — those sends are never
-/// modified, preserving the TUI's behavior exactly (additive-only invariant).
+/// Additively relay a display event to the shared display feed, **only** when
+/// someone needs it (the localhost gateway is enabled OR the station-agent
+/// read stream is active). Centralizes the gate so each emit site (decode
+/// fan-out, QSO snapshot, frequency, s-meter, TX status, split) is a single
+/// additive call placed *after* the existing `→Tui`/`→Qso` send — those sends
+/// are never modified, preserving the TUI's behavior exactly (additive-only
+/// invariant).
 ///
-/// Best-effort and fire-and-forget: a send error (no gateway reader yet, channel
-/// full) is logged at debug and never affects the caller's pipeline. When the
-/// gateway is disabled this is a single relaxed atomic load and immediate return
-/// — no clone, no send.
+/// Best-effort and fire-and-forget: a send error (no reader yet, channel
+/// full) is logged at debug and never affects the caller's pipeline. When
+/// nobody needs the feed this is a single relaxed atomic load and immediate
+/// return — no clone, no send.
 pub(crate) async fn relay_to_gateway(
     bus: &MessageBus,
-    gw_enabled: &AtomicBool,
+    display_feed_enabled: &AtomicBool,
     source: ComponentId,
     msg: MessageType,
 ) {
-    if !gw_enabled.load(Ordering::Relaxed) {
+    if !display_feed_enabled.load(Ordering::Relaxed) {
         return;
     }
     let m = ComponentMessage::new(source, ComponentId::RemoteGateway, msg, Instant::now());
     if let Err(e) = bus.send_message(m).await {
         debug!(target: "gateway", "relay to gateway failed: {e}");
     }
+}
+
+/// Shared bus→`ServerEvent` pump, started when EITHER the localhost gateway OR
+/// the station agent read stream needs it. Owns the translation + rolling
+/// snapshot so neither consumer duplicates `handle_bus_msg`.
+pub(crate) struct DisplayFeed {
+    /// Broadcast channel — the pump writes events here; each consumer
+    /// (localhost websocket clients, the relay-connected station agent) holds
+    /// its own `broadcast::Receiver<ServerEvent>` subscription.
+    pub evt_tx: broadcast::Sender<ServerEvent>,
+    /// Latest full station state, kept up to date by the bus pump. Sent as
+    /// the `Welcome` snapshot to each new localhost client.
+    pub snapshot: Arc<RwLock<StateSnapshot>>,
 }
 
 /// Shared state threaded through each axum handler.
@@ -218,29 +233,46 @@ async fn handle_bus_msg(
 }
 
 impl super::ApplicationCoordinator {
-    /// Start the read-only remote-view gateway (default-OFF, localhost-bound).
+    /// Start the shared bus→`ServerEvent` pump (translation + rolling
+    /// snapshot) when EITHER the localhost `remote_gateway` is enabled OR the
+    /// station agent's read stream will need it
+    /// ([`super::station_agent::station_agent_active`] — kept as a single
+    /// predicate so the two gates never drift apart: a mismatch would either
+    /// start the feed nobody reads, or leave a consumer wanting a feed that
+    /// was never started).
     ///
-    /// When disabled, a no-op drain task is spawned so additive dual-target
-    /// bus sends (which include `ComponentId::RemoteGateway`) never fill the
-    /// channel and spam "Channel full" warnings.
-    pub(crate) async fn start_remote_gateway_component(&mut self) -> Result<()> {
+    /// When neither consumer needs the feed, a no-op drain task is spawned so
+    /// additive dual-target bus sends (which include
+    /// `ComponentId::RemoteGateway`) never fill the channel and spam "Channel
+    /// full" warnings — this mirrors today's disabled-gateway behavior
+    /// exactly. `display_feed_enabled` is set to match the computed gate
+    /// either way, so `relay_to_gateway`'s emit sites reflect reality.
+    pub(crate) async fn start_display_feed(&mut self) -> Result<()> {
         let config = self.config.read().await;
-        let gw_cfg = config.network.remote_gateway.clone();
+        let gateway_wants_feed = config.network.remote_gateway.enabled;
+        let station_agent_wants_feed =
+            super::station_agent::station_agent_active(&config.network.station_agent);
+        let our_callsign = config.station.callsign.clone();
+        drop(config);
 
-        if !gw_cfg.enabled {
-            info!("remote_gateway disabled in configuration");
-            drop(config);
+        let wants_feed = gateway_wants_feed || station_agent_wants_feed;
+        self.display_feed_enabled
+            .store(wants_feed, Ordering::Relaxed);
 
-            // Drain the channel so the bus never floods.
-            let (_drain_tx, drain_rx) = self
-                .message_bus
-                .create_channel(ComponentId::RemoteGateway)
-                .await?;
+        let (_gw_tx, gw_rx) = self
+            .message_bus
+            .create_channel(ComponentId::RemoteGateway)
+            .await?;
+
+        if !wants_feed {
+            info!(
+                "display_feed: no consumer enabled (gateway off, station agent inert) — draining"
+            );
             let shutdown = self.shutdown_signal.clone();
             let drain_handle = tokio::spawn(async move {
                 while !shutdown.load(Ordering::Acquire) {
                     loop {
-                        match drain_rx.try_recv() {
+                        match gw_rx.try_recv() {
                             Ok(_) => {}
                             Err(crossbeam_channel::TryRecvError::Empty) => break,
                             Err(crossbeam_channel::TryRecvError::Disconnected) => {
@@ -254,19 +286,12 @@ impl super::ApplicationCoordinator {
             });
             self.named_task_handles
                 .push((ComponentId::RemoteGateway, drain_handle));
+            self.display_feed = None;
             return Ok(());
         }
 
-        let bind_addr = gw_cfg.bind_addr.clone();
-        let our_callsign = config.station.callsign.clone();
-        drop(config);
-
-        let (_gw_tx, gw_rx) = self
-            .message_bus
-            .create_channel(ComponentId::RemoteGateway)
-            .await?;
-
-        // Broadcast channel: pump → all connected clients.
+        // Broadcast channel: pump → all consumers (localhost clients AND/OR
+        // the station agent's established relay peers).
         let (evt_tx, _evt_rx0) = broadcast::channel::<ServerEvent>(1024);
 
         // Snapshot: seeded from current atomics; kept live by the pump.
@@ -320,14 +345,51 @@ impl super::ApplicationCoordinator {
             })
         };
 
+        self.named_task_handles
+            .push((ComponentId::RemoteGateway, pump));
+        self.display_feed = Some(DisplayFeed { evt_tx, snapshot });
+        info!(
+            gateway = gateway_wants_feed,
+            station_agent = station_agent_wants_feed,
+            "display_feed started"
+        );
+        Ok(())
+    }
+
+    /// Start the read-only remote-view gateway's localhost axum server
+    /// (default-OFF, localhost-bound). Consumes the shared `DisplayFeed`
+    /// started by [`Self::start_display_feed`] — this component itself only
+    /// ever gates on its OWN `[network.remote_gateway].enabled` flag, exactly
+    /// as before the pump was hoisted out: the localhost server never starts
+    /// just because the station agent wants a feed.
+    pub(crate) async fn start_remote_gateway_component(&mut self) -> Result<()> {
+        let config = self.config.read().await;
+        let gw_cfg = config.network.remote_gateway.clone();
+        drop(config);
+
+        if !gw_cfg.enabled {
+            info!("remote_gateway disabled in configuration");
+            return Ok(());
+        }
+
+        let Some(feed) = self.display_feed.as_ref() else {
+            // Defensive only: `start_display_feed`'s gate ORs in this exact
+            // `enabled` flag, so this branch should be unreachable in
+            // practice. Fail soft (no localhost server) rather than panic.
+            warn!("remote_gateway enabled but display_feed unavailable — localhost server not started");
+            return Ok(());
+        };
+
+        let bind_addr = gw_cfg.bind_addr.clone();
+        let state = GatewayState {
+            evt_tx: feed.evt_tx.clone(),
+            snapshot: feed.snapshot.clone(),
+            server_version: env!("CARGO_PKG_VERSION").to_string(),
+        };
+
         // ── axum WebSocket server ─────────────────────────────────────────────
         let server = {
             let shutdown = self.shutdown_signal.clone();
-            let state = GatewayState {
-                evt_tx,
-                snapshot,
-                server_version: env!("CARGO_PKG_VERSION").to_string(),
-            };
 
             tokio::spawn(async move {
                 let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
@@ -347,8 +409,6 @@ impl super::ApplicationCoordinator {
             })
         };
 
-        self.named_task_handles
-            .push((ComponentId::RemoteGateway, pump));
         self.named_task_handles
             .push((ComponentId::RemoteGateway, server));
         info!("remote_gateway component started");

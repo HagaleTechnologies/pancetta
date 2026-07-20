@@ -163,6 +163,7 @@ const TERMINAL_CODES: &[&str] = &[
     "AUD_MISMATCH",
     "SCOPE_EMPTY",
     "AGENT_OCCUPIED",
+    "CAPACITY",
     "NOT_ADMITTED",
     "FRAME_TOO_LARGE",
     "BAD_FRAME",
@@ -223,6 +224,17 @@ pub fn encode_env_payload(bytes: &[u8]) -> String {
     base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
 }
 
+/// Outcome of a timeout-bounded receive.
+#[derive(Debug)]
+pub enum RecvOutcome {
+    /// A text frame arrived.
+    Frame(String),
+    /// Nothing arrived within the timeout; the connection is still open.
+    Quiet,
+    /// The connection is closed/drained.
+    Closed,
+}
+
 /// A synchronous WebSocket seam so the session driver can be tested with a
 /// scripted mock. The production async implementation lands in P3.4.
 pub trait WsConn {
@@ -230,6 +242,21 @@ pub trait WsConn {
     fn send_text(&mut self, s: String) -> Result<(), RelayError>;
     /// Receive the next text frame, or `None` if the connection is closed.
     fn recv_text(&mut self) -> Result<Option<String>, RelayError>;
+
+    /// Receive the next text frame, waiting at most `timeout`. The default
+    /// implementation delegates to [`WsConn::recv_text`] (blocking, never
+    /// `Quiet`) so scripted test mocks need no changes; real socket
+    /// implementations override it with a genuine bounded wait.
+    fn recv_text_within(
+        &mut self,
+        timeout: std::time::Duration,
+    ) -> Result<RecvOutcome, RelayError> {
+        let _ = timeout;
+        Ok(match self.recv_text()? {
+            Some(t) => RecvOutcome::Frame(t),
+            None => RecvOutcome::Closed,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -369,9 +396,30 @@ mod tests {
     }
 
     #[test]
+    fn recv_text_within_default_maps_recv_text() {
+        struct M(Vec<Option<String>>); // reversed script
+        impl WsConn for M {
+            fn send_text(&mut self, _s: String) -> Result<(), RelayError> {
+                Ok(())
+            }
+            fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
+                Ok(self.0.pop().flatten())
+            }
+        }
+        let mut m = M(vec![None, Some("x".into())]);
+        let d = std::time::Duration::from_millis(1);
+        assert!(matches!(m.recv_text_within(d).unwrap(), RecvOutcome::Frame(f) if f == "x"));
+        assert!(matches!(
+            m.recv_text_within(d).unwrap(),
+            RecvOutcome::Closed
+        ));
+    }
+
+    #[test]
     fn is_terminal_classification() {
         assert!(is_terminal("BAD_AUTH"));
         assert!(is_terminal("AGENT_OCCUPIED"));
+        assert!(is_terminal("CAPACITY"));
         assert!(is_terminal("FRAME_TOO_LARGE"));
         assert!(!is_terminal("NO_PEER"));
         assert!(!is_terminal("UNKNOWN_DST"));
