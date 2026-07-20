@@ -9,8 +9,9 @@
 //!
 //! ## What this component does (P3.4b)
 //!
-//! - **Connect + authenticate + Noise handshake** to the relay
-//!   ([`net::RealWsConn`] → [`AgentSession`]).
+//! - **Connect + authenticate + Noise handshake** to the relay, demuxing up to
+//!   8 concurrent peers over that one socket, each with an INDEPENDENT Noise
+//!   session ([`net::RealWsConn`] → [`MultiPeerSession`]).
 //! - **Verify + arm** on a `txArmGrant`: the two-stage crown-jewel verification
 //!   ([`CapabilityVerifier`]) mints a [`VerifiedArmGrant`] which is fed into the
 //!   coordinator's shared `remote_tx_arm` [`ArmState`]. Once armed (AND the
@@ -56,8 +57,8 @@ use pancetta_agent::audit::{AuditEvent, AuditKind, AuditLog};
 use pancetta_agent::capability::CapabilityVerifier;
 use pancetta_agent::control::{map_client_frame, ControlAction, TxKind};
 use pancetta_agent::keys::AgentIdentity;
+use pancetta_agent::multi_session::{MultiPeerSession, Poll};
 use pancetta_agent::pairing::{IdpKey, PairedState};
-use pancetta_agent::session::AgentSession;
 
 use crate::message_bus::{
     ComponentId, ComponentMessage, MessageBus, MessageType, RigControlMessage,
@@ -67,6 +68,11 @@ use crate::message_bus::{
 const RECONNECT_BACKOFF_MIN: Duration = Duration::from_secs(2);
 /// Cap on the reconnect backoff.
 const RECONNECT_BACKOFF_MAX: Duration = Duration::from_secs(60);
+/// Bounded poll tick for `MultiPeerSession::process_next` — the demux is
+/// driven in a loop rather than an unbounded blocking recv (Task 4), so a
+/// `Quiet` tick is a normal, frequent event (not an error) that lets the loop
+/// also service future per-tick work (Task 6's read-stream drain).
+const RECV_TICK: Duration = Duration::from_millis(200);
 
 /// Everything the dispatch loop needs to act on a decrypted control action:
 /// the shared arm, the capability verifier, the client's device verifying key,
@@ -92,24 +98,34 @@ struct ArmContext {
     revoked_jtis: HashSet<String>,
     seen_jtis: HashSet<String>,
     audit: AuditLog,
-    /// The clientKeyId this session is Noise-connected to. `AgentSession`
-    /// learns the raw peer identity from the relay-stamped `env.src` of its
-    /// first frame (relay-forgeable in isolation), but `run_one_session` only
-    /// ever copies that learned value in here AFTER checking it against the
-    /// station-local `tx_allow_list` — so by the time this field is non-empty
-    /// it names a vetted, allow-listed peer, not a bare relay claim. Empty
-    /// until that check passes; reset to empty at the start of every new
-    /// session (a fresh peer is learned — and re-vetted — on every reconnect,
-    /// so a different allow-listed client can connect next time). A `hello`'s
-    /// `capabilityToken.clientKeyId` MUST equal this before its scopes are
-    /// honored (Q-0019 #5) — this is what roots read/qsy authorization in the
-    /// E2E-connected, allow-listed identity rather than relay admission alone.
-    expected_client_key_id: String,
-    /// Scopes granted by the most recent verified `hello.capabilityToken` THIS
-    /// session (`None` = no scoped action served — v1 back-compat default, and
-    /// the fail-closed state after any invalid/mismatched token). Reset to
-    /// `None` at the start of every new session (`run_one_session`) — a stale
-    /// session's authorization never carries into a reconnect.
+    /// Per-established-peer session context, keyed by the peer's
+    /// relay-DO-authenticated, station-locally-vetted client keyId.
+    ///
+    /// An entry exists here ONLY for a peer `MultiPeerSession` reported as
+    /// `PeerEstablished` — that variant fires only AFTER `MultiPeerSession`'s
+    /// own admission check (station-local `tx_allow_list` membership + the
+    /// `MAX_PEERS` capacity gate) ran BEFORE any handshake state was
+    /// allocated, so a key in this map always names a vetted, allow-listed
+    /// peer, never a bare relay claim. Cleared at the start of every new
+    /// session (`run_one_session`) — no established peer or granted scope
+    /// carries across a reconnect, so a different set of allow-listed clients
+    /// can connect next time.
+    peers: std::collections::HashMap<String, PeerCtx>,
+}
+
+/// Per-established-peer session state (Task 4: one entry per demuxed peer,
+/// replacing the single-peer-era `ArmContext::hello_scopes` scalar).
+struct PeerCtx {
+    /// Scopes granted by THIS peer's most recent verified
+    /// `hello.capabilityToken` (`None` = no scoped action served — v1
+    /// back-compat default, and the fail-closed state after any
+    /// invalid/mismatched token). A `hello`'s `capabilityToken.clientKeyId`
+    /// MUST equal the ACTUAL sending peer (the `peer` parameter threaded from
+    /// `MultiPeerSession`'s demux, never a session-global value) before its
+    /// scopes are honored (Q-0019 #5) — this is what roots read/qsy
+    /// authorization in the E2E-connected, allow-listed identity of the frame
+    /// that carried the token, rather than relay admission alone or any OTHER
+    /// peer's identity in a multi-peer session.
     hello_scopes: Option<Vec<String>>,
 }
 
@@ -195,6 +211,7 @@ enum Dispatch {
 ///   in v1.
 async fn dispatch_action(
     action: ControlAction,
+    peer: &str,
     ctx: &mut ArmContext,
     bus: &MessageBus,
     session_id: &str,
@@ -205,7 +222,7 @@ async fn dispatch_action(
             capability_token,
             grant,
         } => {
-            match verify_and_arm(&capability_token, &grant, ctx, session_id, now) {
+            match verify_and_arm(&capability_token, &grant, peer, ctx, session_id, now) {
                 Ok(()) => {}
                 Err(reason) => {
                     // Fail-closed: audit the denial, do NOT arm.
@@ -260,16 +277,17 @@ async fn dispatch_action(
             Dispatch::Continue
         }
         ControlAction::Hello { capability_token } => {
-            dispatch_hello(capability_token, ctx, now);
+            dispatch_hello(capability_token, peer, ctx, now);
             Dispatch::Continue
         }
         ControlAction::Qsy { vfo, frequency_hz } => {
             if !ctx
-                .hello_scopes
-                .as_deref()
+                .peers
+                .get(peer)
+                .and_then(|p| p.hello_scopes.as_deref())
                 .is_some_and(|s| scope_at_least(s, "qsy"))
             {
-                warn!(target: "agent.control", "setFrequency refused — no qsy-scoped hello token this session");
+                warn!(target: "agent.control", peer = %peer, "setFrequency refused — no qsy-scoped hello token this session for this peer");
                 return Dispatch::Continue;
             }
             let msg = RigControlMessage::SetFrequency {
@@ -284,11 +302,12 @@ async fn dispatch_action(
             tx_frequency_hz,
         } => {
             if !ctx
-                .hello_scopes
-                .as_deref()
+                .peers
+                .get(peer)
+                .and_then(|p| p.hello_scopes.as_deref())
                 .is_some_and(|s| scope_at_least(s, "qsy"))
             {
-                warn!(target: "agent.control", "setSplit refused — no qsy-scoped hello token this session");
+                warn!(target: "agent.control", peer = %peer, "setSplit refused — no qsy-scoped hello token this session for this peer");
                 return Dispatch::Continue;
             }
             let msg = RigControlMessage::SetSplit {
@@ -358,39 +377,66 @@ fn action_name(a: &ControlAction) -> &'static str {
 }
 
 /// Handle a `hello.capabilityToken` (Q-0019 #5): verify it against the pinned
-/// IdP keys, bind it to THIS session's E2E-connected client identity, and set
-/// `ctx.hello_scopes` accordingly. Fail-closed: any missing/invalid/mismatched
-/// token clears scopes (served nothing scoped), never partially trusts one.
+/// IdP keys, bind it to the ACTUAL SENDING PEER's E2E-connected client
+/// identity (`peer` — the value `MultiPeerSession`'s demux reported alongside
+/// this specific frame, never a session-global value), and set that peer's
+/// `PeerCtx::hello_scopes` accordingly. Fail-closed: any missing/invalid/
+/// mismatched token clears scopes (served nothing scoped), never partially
+/// trusts one.
 ///
 /// `capability_token: None` (a legacy hello, v1 back-compat) also clears
 /// scopes — the token is optional on the wire but required at runtime for any
 /// scoped action.
-fn dispatch_hello(capability_token: Option<String>, ctx: &mut ArmContext, now: i64) {
+///
+/// SECURITY (multi-peer rebinding): the comparison is `cap.client_key_id ==
+/// peer`, NOT against any field stored on `ctx` — `ctx` is shared across every
+/// concurrently-connected peer, so a check against session-global state would
+/// let peer B's hello (correctly Noise-authenticated as B by the demux) be
+/// accepted under a capabilityToken that claims to be peer A, if A happened to
+/// be the value some stale/shared field held. Binding to the per-frame `peer`
+/// parameter is what keeps each peer's authorization strictly its own.
+fn dispatch_hello(capability_token: Option<String>, peer: &str, ctx: &mut ArmContext, now: i64) {
     let Some(token) = capability_token else {
-        ctx.hello_scopes = None;
+        if let Some(p) = ctx.peers.get_mut(peer) {
+            p.hello_scopes = None;
+        }
         return;
     };
     match ctx.verifier.verify_capability_token(&token, now) {
-        Ok(cap) if cap.client_key_id == ctx.expected_client_key_id => {
+        Ok(cap) if cap.client_key_id == peer => {
             debug!(
                 target: "agent.control",
+                peer = %peer,
                 scopes = ?cap.scopes,
-                "hello capabilityToken verified — scopes granted for this session"
+                "hello capabilityToken verified — scopes granted for this peer"
             );
-            ctx.hello_scopes = Some(cap.scopes);
+            match ctx.peers.get_mut(peer) {
+                Some(p) => p.hello_scopes = Some(cap.scopes),
+                None => {
+                    // Defensive: cannot happen via the demux (a Plaintext poll
+                    // is only ever emitted for an established peer, and every
+                    // established peer gets a PeerCtx on PeerEstablished), but
+                    // fail closed rather than panic if it ever did.
+                    warn!(target: "agent.control", peer = %peer, "hello verified for a peer with no PeerCtx — refusing");
+                }
+            }
         }
         Ok(cap) => {
             warn!(
                 target: "agent.control",
                 token_client = %cap.client_key_id,
-                expected_client = %ctx.expected_client_key_id,
-                "hello capabilityToken clientKeyId does not match the E2E-connected identity — no scope granted"
+                peer = %peer,
+                "hello capabilityToken clientKeyId does not match the sending peer's E2E-connected identity — no scope granted"
             );
-            ctx.hello_scopes = None;
+            if let Some(p) = ctx.peers.get_mut(peer) {
+                p.hello_scopes = None;
+            }
         }
         Err(e) => {
-            warn!(target: "agent.control", reason = %e, "hello capabilityToken invalid — no scope granted");
-            ctx.hello_scopes = None;
+            warn!(target: "agent.control", peer = %peer, reason = %e, "hello capabilityToken invalid — no scope granted");
+            if let Some(p) = ctx.peers.get_mut(peer) {
+                p.hello_scopes = None;
+            }
         }
     }
 }
@@ -409,14 +455,24 @@ fn dispatch_hello(capability_token: Option<String>, ctx: &mut ArmContext, now: i
 /// then `verify_arm_grant` enforces the `txEnabledUntil` clock-2 gate, the
 /// arm-time best-effort deny-list (`ctx.revoked_jtis`, empty/inert in v1), the
 /// `clientSig`, the station-local TX-allow-list, the `sessionId` bind against
-/// `session_id` (dispensa Q-0022 — the caller's `AgentSession::session_id()`,
-/// the live Noise channel binding, so a captured grant can't be replayed into
-/// a different session), and the window/heartbeat/scope bounds. The grant
-/// must carry a `clientKeyId` present in the allow-list AND for
-/// which we hold a device verifying key.
+/// `session_id` (dispensa Q-0022 — the SENDING PEER's own channel-binding
+/// session id, so a captured grant can't be replayed into a different session
+/// OR a different peer's session), and the window/heartbeat/scope bounds. The
+/// grant must carry a `clientKeyId` present in the allow-list AND for which we
+/// hold a device verifying key.
+///
+/// SECURITY (multi-peer rebinding, the cross-peer-replay blocker): the grant's
+/// claimed `clientKeyId` is checked against `peer` — the ACTUAL DEMUXED SENDER
+/// of this specific `txArm` frame, as reported by `MultiPeerSession` — NOT
+/// against any field stored on `ctx`. `ctx` is shared across every
+/// concurrently-connected peer, so a grant naming peer A's `clientKeyId` must
+/// be refused unless THIS frame was demuxed as coming from A; a check against
+/// session-global state instead could let peer B's frame be honored under
+/// peer A's identity, defeating per-peer isolation.
 fn verify_and_arm(
     capability_token: &str,
     grant: &serde_json::Value,
+    peer: &str,
     ctx: &mut ArmContext,
     session_id: &str,
     now: i64,
@@ -429,6 +485,15 @@ fn verify_and_arm(
         .get("clientKeyId")
         .and_then(|v| v.as_str())
         .ok_or("grant missing clientKeyId")?;
+    // CRITICAL: the grant's claimed identity MUST equal the actual demuxed
+    // sender of this frame — never trust the peer's own claim in isolation,
+    // and never compare against any ctx-level/session-global value (which
+    // would be shared across every peer in this multiplexed session).
+    if client_key_id != peer {
+        return Err(format!(
+            "grant clientKeyId {client_key_id} does not match the sending peer {peer}"
+        ));
+    }
     if !ctx.tx_allow_list.contains(client_key_id) {
         return Err(format!(
             "client {client_key_id} not in station-local TX-allow-list"
@@ -663,17 +728,19 @@ impl super::ApplicationCoordinator {
                 .unwrap_or_else(pancetta_agent::audit::default_audit_path),
         );
 
-        // v1 still admits only ONE client peer per connected session (no
-        // concurrent multi-client — that's a separate, larger piece of work;
-        // see docs/superpowers/specs/2026-07-20-multi-client-station-agent.md),
-        // but no longer pins a single fixed keyId chosen at startup. Whichever
-        // allow-listed client actually connects is accepted:
-        // `run_session_loop`/`run_one_session` lets `AgentSession` learn the
-        // peer from the relay-authenticated `env.src` of its first frame, then
-        // validates that learned peer against `tx_allow_list` before granting
-        // anything (the station-local list — not relay admission — remains
-        // the authoritative gate, mirroring `verify_and_arm`'s TX-time check).
-        // An empty allow-list still means no client can ever be admitted.
+        // Task 4: `run_session_loop`/`run_one_session` now drives a
+        // `MultiPeerSession`, which can demux up to `multi_session::MAX_PEERS`
+        // (8) concurrently-connected allow-listed clients over the one relay
+        // socket, each with its own independent Noise transport and its own
+        // `PeerCtx` (granted scopes). `MultiPeerSession`'s own admission check
+        // — station-local `tx_allow_list` membership + the capacity gate, run
+        // BEFORE any handshake state is allocated — remains the authoritative
+        // gate (mirroring `verify_and_arm`'s TX-time check); relay admission
+        // alone never grants anything. N=1 parity: v1 still admits only one
+        // ARMED controller at a time (Task 5 adds that arbitration) — but
+        // several allow-listed peers may now hold independent read/qsy scope
+        // concurrently. An empty allow-list still means no client can ever be
+        // admitted.
         if tx_allow_list.is_empty() {
             warn!(
                 target: "agent",
@@ -811,11 +878,11 @@ async fn run_session_loop(cfg: RunConfig) {
         revoked_jtis: HashSet::new(),
         seen_jtis: HashSet::new(),
         audit: cfg.audit,
-        // Not pinned to a fixed peer — the peer is learned and validated
-        // fresh each session (see `run_one_session`), so a different
-        // allow-listed client can connect on the next reconnect.
-        expected_client_key_id: String::new(),
-        hello_scopes: None,
+        // Not pinned to any fixed peer — established peers are learned and
+        // vetted fresh each session by `MultiPeerSession` itself (see
+        // `run_one_session`), so a different set of allow-listed clients can
+        // connect on the next reconnect.
+        peers: std::collections::HashMap::new(),
     };
 
     while !cfg.shutdown.load(Ordering::Acquire) {
@@ -841,20 +908,6 @@ async fn run_session_loop(cfg: RunConfig) {
     disarm_on_loss(&mut ctx);
 }
 
-/// A monotonic ordinal for the session's handshake progress, used to tell a
-/// benign frame (phase advanced) from a drained socket (phase unchanged) when
-/// `process_next` returns `Ok(None)`. Only ever increases as the leg advances:
-/// pre-admit (0) → admitted (1) → transport (2).
-fn session_phase<W: pancetta_agent::relay::WsConn>(sess: &AgentSession<'_, W>) -> u8 {
-    if sess.is_transport_established() {
-        2
-    } else if sess.is_admitted() {
-        1
-    } else {
-        0
-    }
-}
-
 /// Disarm the shared arm on any control-channel loss and audit it.
 fn disarm_on_loss(ctx: &mut ArmContext) {
     let effects = match ctx.arm.lock() {
@@ -867,46 +920,39 @@ fn disarm_on_loss(ctx: &mut ArmContext) {
     apply_arm_effects(&ctx.audit, &effects);
 }
 
-/// Drive one session to completion: auth → handshake → dispatch control frames.
+/// Drive one session to completion: auth → demux → dispatch control frames.
 /// Returns when the session tears down (drain, teardown action, or error).
 ///
-/// This runs on a blocking-capable task because the [`WsConn`] seam is
-/// synchronous (`RealWsConn` bridges via `block_on`).
+/// This runs on a blocking-capable task because the [`pancetta_agent::relay::WsConn`]
+/// seam is synchronous (`RealWsConn` bridges via `block_on`).
 ///
-/// v1 admits ONE client peer per session (no concurrent multi-client), but
-/// does not pin a fixed keyId: `AgentSession` is constructed with an empty
-/// `client_key_id` so it learns the peer from the relay-authenticated
-/// `env.src` of its first frame (whichever allow-listed device happens to
-/// connect). The instant the Noise transport completes, the learned peer is
-/// checked against `ctx.tx_allow_list` — the station-local list, not relay
-/// admission, remains the authoritative gate (mirroring `verify_and_arm`'s
-/// TX-time check) — and the session is refused before any scope is granted
-/// if it isn't a member. A fresh peer is learned (and re-checked) every
-/// session, so a different allow-listed client can connect on the next
-/// reconnect.
+/// Task 4: drives a [`MultiPeerSession`] rather than the single-peer
+/// `AgentSession` — up to `multi_session::MAX_PEERS` allow-listed clients may
+/// be concurrently established over the one relay socket, each with its own
+/// independent Noise transport and its own [`PeerCtx`]. `MultiPeerSession`'s
+/// own admission check (station-local `tx_allow_list` membership + capacity,
+/// run BEFORE any handshake state is allocated) is what makes a `PeerEstablished`
+/// peer already vetted — the station-local list, not relay admission, remains
+/// the authoritative gate (mirroring `verify_and_arm`'s TX-time check). A
+/// refused peer (`PeerRefused`) is isolated to itself: it never tears down the
+/// whole session, so other already-established peers are unaffected. `ctx.peers`
+/// is cleared at the start of every new session — no established peer or
+/// granted scope carries across a reconnect.
 async fn run_one_session<W: pancetta_agent::relay::WsConn>(
     ws: W,
     identity: &AgentIdentity,
     ctx: &mut ArmContext,
     bus: &MessageBus,
 ) {
-    // A new session starts with zero granted read/qsy scope and no bound peer
-    // identity — neither a prior session's verified hello nor its learned
-    // peer carries across a reconnect (Q-0019 #5; dynamic client selection).
-    ctx.hello_scopes = None;
-    ctx.expected_client_key_id.clear();
-    let mut sess = AgentSession::new(ws, identity, String::new());
+    ctx.peers.clear();
+    let mut sess = MultiPeerSession::new(ws, identity, ctx.tx_allow_list.clone());
     if let Err(e) = sess.authenticate() {
         debug!(target: "agent", "relay authenticate failed: {e}");
         return;
     }
-    // Distinguish a benign frame (ready/presence/msg1 → `Ok(None)`, session phase
-    // advances) from a drained/closed socket (`recv_text` → `None` → `Ok(None)`,
-    // no phase change). A `None` with no forward progress is a close: tear down.
-    let mut last_phase = session_phase(&sess);
     loop {
-        match sess.process_next() {
-            Ok(Some(plaintext)) => {
+        match sess.process_next(RECV_TICK) {
+            Ok(Poll::Plaintext { peer, plaintext }) => {
                 let action = match map_client_frame(&plaintext) {
                     Ok(a) => a,
                     Err(e) => {
@@ -914,45 +960,33 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                         continue;
                     }
                 };
-                if dispatch_action(
-                    action,
-                    ctx,
-                    bus,
-                    sess.session_id().unwrap_or_default(),
-                    now_ms(),
-                )
-                .await
+                // `sid` is THIS SPECIFIC PEER's own channel-binding session id
+                // (never a session-global value) — the exact input
+                // `verify_and_arm`/`verify_arm_grant`'s sessionId bind needs to
+                // block a grant captured on one peer's session from being
+                // replayed into another peer's.
+                let sid = sess.session_id(&peer).unwrap_or_default().to_string();
+                if dispatch_action(action, &peer, ctx, bus, &sid, now_ms()).await
                     == Dispatch::Teardown
                 {
                     return;
                 }
-                last_phase = session_phase(&sess);
             }
-            Ok(None) => {
-                let phase = session_phase(&sess);
-                if phase == last_phase {
-                    // No forward progress → `recv_text` drained/closed the socket.
-                    return;
-                }
-                last_phase = phase;
-                // The Noise transport just completed for the first time this
-                // session: the peer is learned but not yet vetted. Gate it
-                // against the station-local allow-list before any control
-                // frame can reach dispatch_hello/verify_and_arm.
-                if sess.is_transport_established() && ctx.expected_client_key_id.is_empty() {
-                    let learned = sess.client_key_id();
-                    if ctx.tx_allow_list.contains(learned) {
-                        ctx.expected_client_key_id = learned.to_string();
-                    } else {
-                        warn!(
-                            target: "agent",
-                            peer = %learned,
-                            "relay-admitted peer not in station-local tx_allow_list — refusing session"
-                        );
-                        return;
-                    }
-                }
+            Ok(Poll::PeerEstablished { peer, .. }) => {
+                ctx.peers.insert(peer, PeerCtx { hello_scopes: None });
             }
+            Ok(Poll::PeerRefused { peer }) => {
+                warn!(target: "agent", peer = %peer,
+                    "relay-admitted peer refused (not allow-listed or at capacity)");
+            }
+            Ok(Poll::PeerDown { peer }) => {
+                ctx.peers.remove(&peer);
+                // Task 5 adds controller-loss disarm here.
+            }
+            Ok(Poll::Idle) | Ok(Poll::Quiet) => {
+                // Task 6 drains the read-stream feed here on Quiet.
+            }
+            Ok(Poll::Closed) => return,
             Err(e) => {
                 debug!(target: "agent", "session error: {e}");
                 return;
@@ -967,6 +1001,11 @@ mod tests {
     use base64::Engine as _;
     use ed25519_dalek::{Signer, SigningKey};
     use pancetta_agent::arm::HEARTBEAT_TIMEOUT_MS;
+    // Only the full end-to-end proof below still drives the single-peer
+    // `AgentSession` directly (to exercise the real Noise/relay wiring at the
+    // crypto layer); production code (`run_one_session`) now drives
+    // `MultiPeerSession` instead (see the module-level import).
+    use pancetta_agent::session::AgentSession;
     use serde_json::{json, Value};
     use std::collections::BTreeMap;
 
@@ -1081,6 +1120,18 @@ mod tests {
         }
     }
 
+    /// A `peers` map with a single established entry for `peer`, carrying
+    /// `hello_scopes` — the Task-4 replacement for the old single-scalar
+    /// `expected_client_key_id`/`hello_scopes` test setup.
+    fn peers_with(
+        peer: &str,
+        hello_scopes: Option<Vec<String>>,
+    ) -> std::collections::HashMap<String, PeerCtx> {
+        let mut m = std::collections::HashMap::new();
+        m.insert(peer.to_string(), PeerCtx { hello_scopes });
+        m
+    }
+
     fn ctx_with(allow_client: bool, have_device_key: bool) -> ArmContext {
         let mut allow = HashSet::new();
         if allow_client {
@@ -1104,8 +1155,10 @@ mod tests {
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
-            expected_client_key_id: CLIENT_KEY_ID.to_string(),
-            hello_scopes: None,
+            // The peer this session is Noise-connected to (mirrors the old
+            // default `expected_client_key_id: CLIENT_KEY_ID`) — an
+            // already-established peer with no granted scope yet.
+            peers: peers_with(CLIENT_KEY_ID, None),
         }
     }
 
@@ -1126,7 +1179,15 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        let d = dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
+        let d = dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
         assert_eq!(d, Dispatch::Continue);
         assert!(
             ctx.arm.lock().unwrap().tx_permitted(NOW),
@@ -1148,6 +1209,7 @@ mod tests {
         // dispatch it against a DIFFERENT live session id.
         let d = dispatch_action(
             arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             "a-completely-different-session",
@@ -1175,6 +1237,7 @@ mod tests {
                 vfo: 0,
                 frequency_hz: 14_074_000.0,
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1199,6 +1262,7 @@ mod tests {
             ControlAction::Hello {
                 capability_token: Some(valid_token()),
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1211,6 +1275,7 @@ mod tests {
                 vfo: 0,
                 frequency_hz: 14_074_000.0,
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1240,6 +1305,7 @@ mod tests {
             ControlAction::Hello {
                 capability_token: Some(valid_token()),
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1251,6 +1317,7 @@ mod tests {
                 vfo: 0,
                 frequency_hz: 7_074_000.0,
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1266,17 +1333,25 @@ mod tests {
     #[tokio::test]
     async fn qsy_refused_when_hello_token_client_key_id_mismatches_session() {
         // A token that verifies (valid IdP signature, unexpired) but whose
-        // clientKeyId does NOT match the session's E2E-connected identity must
-        // grant NOTHING — this is the exact "relay-admission-rooted" gap
-        // Q-0019 #5 closes: a mismatched token must not silently authorize.
+        // clientKeyId does NOT match the ACTUAL SENDING PEER's E2E-connected
+        // identity must grant NOTHING — this is the exact "relay-admission-
+        // rooted" gap Q-0019 #5 closes: a mismatched token must not silently
+        // authorize. `ANOTHER_PEER` models the physically-connected/demuxed
+        // sender of this frame; `valid_token()`'s clientKeyId (CLIENT_KEY_ID)
+        // does NOT equal it — the rebound check (`cap.client_key_id == peer`)
+        // must refuse this exactly as the old `== ctx.expected_client_key_id`
+        // check did in the single-peer world.
+        const ANOTHER_PEER: &str = "someOtherClientKeyId0";
         let mut ctx = ctx_with(true, true);
-        ctx.expected_client_key_id = "someOtherClientKeyId0".to_string();
+        ctx.peers
+            .insert(ANOTHER_PEER.to_string(), PeerCtx { hello_scopes: None });
         let bus = MessageBus::new(64).unwrap();
         let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
         dispatch_action(
             ControlAction::Hello {
                 capability_token: Some(valid_token()), // clientKeyId == CLIENT_KEY_ID
             },
+            ANOTHER_PEER,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1288,6 +1363,7 @@ mod tests {
                 vfo: 0,
                 frequency_hz: 14_074_000.0,
             },
+            ANOTHER_PEER,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1313,6 +1389,7 @@ mod tests {
             ControlAction::Hello {
                 capability_token: Some(non_enabled_token()),
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1324,6 +1401,7 @@ mod tests {
                 vfo: 0,
                 frequency_hz: 21_074_000.0,
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1339,22 +1417,33 @@ mod tests {
 
     #[tokio::test]
     async fn new_session_clears_stale_hello_scope() {
-        // The per-session reset in run_one_session ("ctx.hello_scopes = None")
-        // is exercised indirectly here: simulate a stale prior grant by setting
-        // hello_scopes directly, then confirm the field is what gates dispatch
-        // (i.e. an explicit reset to None — the reconnect boundary — really
-        // does deny qsy, proving the gate reads hello_scopes and nothing else).
+        // The per-session reset in run_one_session ("ctx.peers.clear()", with a
+        // fresh `PeerCtx { hello_scopes: None }` inserted on the next
+        // `PeerEstablished`) is exercised indirectly here: simulate a stale
+        // prior grant by setting the peer's hello_scopes directly, then confirm
+        // the field is what gates dispatch (i.e. a reconnect-boundary reset to
+        // a fresh `PeerCtx` really does deny qsy, proving the gate reads
+        // `PeerCtx::hello_scopes` and nothing else).
         let mut ctx = ctx_with(true, true);
-        ctx.hello_scopes = Some(vec!["qsy".to_string()]);
+        ctx.peers.insert(
+            CLIENT_KEY_ID.to_string(),
+            PeerCtx {
+                hello_scopes: Some(vec!["qsy".to_string()]),
+            },
+        );
         let bus = MessageBus::new(64).unwrap();
         let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
-        // Simulate the reconnect-boundary reset a fresh run_one_session performs.
-        ctx.hello_scopes = None;
+        // Simulate the reconnect-boundary reset a fresh `run_one_session`
+        // performs: `ctx.peers.clear()` then a brand-new `PeerCtx` on the next
+        // `PeerEstablished` — same peer keyId, but no scope carried over.
+        ctx.peers
+            .insert(CLIENT_KEY_ID.to_string(), PeerCtx { hello_scopes: None });
         let d = dispatch_action(
             ControlAction::Qsy {
                 vfo: 0,
                 frequency_hz: 14_074_000.0,
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1374,7 +1463,15 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
         // No further heartbeats: at the dead-man deadline, tx_permitted is false.
         let dead = NOW + HEARTBEAT_TIMEOUT_MS;
@@ -1385,12 +1482,21 @@ mod tests {
         // A heartbeat *before* the deadline slides the window.
         let mut ctx2 = ctx_with(true, true);
         with_consent(&ctx2, true);
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx2, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx2,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
         dispatch_action(
             ControlAction::Heartbeat {
                 arm_jti: "arm-jti-1".into(),
                 seq: 1,
             },
+            CLIENT_KEY_ID,
             &mut ctx2,
             &bus,
             SESSION_ID,
@@ -1413,7 +1519,15 @@ mod tests {
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
         // Arm at NOW; the grant's jti is "arm-jti-1" (signed_grant uses it).
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
 
         // Accept seq 5 at NOW+5000 (slides the window to there).
@@ -1423,6 +1537,7 @@ mod tests {
                 arm_jti: "arm-jti-1".into(),
                 seq: 5,
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1437,6 +1552,7 @@ mod tests {
                 arm_jti: "arm-jti-1".into(),
                 seq: 5,
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1448,6 +1564,7 @@ mod tests {
                 arm_jti: "arm-jti-1".into(),
                 seq: 3,
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1469,13 +1586,22 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
         // A heartbeat naming a different arm must not slide the window.
         dispatch_action(
             ControlAction::Heartbeat {
                 arm_jti: "some-other-arm".into(),
                 seq: 1,
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1501,7 +1627,15 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         // remote_tx_enabled is OFF (default): do NOT set consent on.
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
         assert!(
             !ctx.arm.lock().unwrap().tx_permitted(NOW),
             "consent OFF must deny TX even after a valid arm"
@@ -1515,7 +1649,15 @@ mod tests {
         let mut ctx = ctx_with(false, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
         assert!(
             !ctx.arm.lock().unwrap().is_armed(),
             "a grant from a non-allow-listed client must NOT arm"
@@ -1529,12 +1671,21 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
         dispatch_action(
             ControlAction::Disarm {
                 arm_jti: "arm-jti-1".into(),
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1559,6 +1710,7 @@ mod tests {
                 capability_token: valid_token(),
                 grant: grant.clone(),
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1570,6 +1722,7 @@ mod tests {
             ControlAction::Disarm {
                 arm_jti: String::new(),
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1581,6 +1734,7 @@ mod tests {
                 capability_token: valid_token(),
                 grant,
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1606,6 +1760,7 @@ mod tests {
                 capability_token: non_enabled_token(),
                 grant: signed_grant("arm-jti-1"),
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1625,13 +1780,22 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
         // A txDisarm naming the live arm disarms it.
         dispatch_action(
             ControlAction::Disarm {
                 arm_jti: "arm-jti-1".into(),
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1650,7 +1814,15 @@ mod tests {
         let mut ctx = ctx_with(true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        dispatch_action(arm_action("arm-jti-1"), &mut ctx, &bus, SESSION_ID, NOW).await;
+        dispatch_action(
+            arm_action("arm-jti-1"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
         assert!(ctx.arm.lock().unwrap().tx_permitted(NOW));
         // A txDisarm naming a DIFFERENT arm still disarms (armJti is a sanity
         // match, not a gate — disarm-any is fail-safe TX-OFF).
@@ -1658,6 +1830,7 @@ mod tests {
             ControlAction::Disarm {
                 arm_jti: "some-other-arm".into(),
             },
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1689,6 +1862,7 @@ mod tests {
                 frequency_hz: 1500.0,
                 dx_parity: Some("odd".into()),
             }),
+            CLIENT_KEY_ID,
             &mut ctx,
             &bus,
             SESSION_ID,
@@ -1987,7 +2161,7 @@ mod tests {
         let mut ctx = ctx_with_agent(&agent_kid, true, true);
         with_consent(&ctx, true);
         let bus = MessageBus::new(64).unwrap();
-        let d = dispatch_action(action, &mut ctx, &bus, agent_session_id, NOW).await;
+        let d = dispatch_action(action, CLIENT_KEY_ID, &mut ctx, &bus, agent_session_id, NOW).await;
         assert_eq!(d, Dispatch::Continue);
         assert!(
             ctx.arm.lock().unwrap().tx_permitted(NOW),
@@ -1998,7 +2172,15 @@ mod tests {
         let mut ctx_off = ctx_with_agent(&agent_kid, true, true);
         // (consent left OFF)
         let action2 = map_client_frame(&decrypted).unwrap();
-        dispatch_action(action2, &mut ctx_off, &bus, agent_session_id, NOW).await;
+        dispatch_action(
+            action2,
+            CLIENT_KEY_ID,
+            &mut ctx_off,
+            &bus,
+            agent_session_id,
+            NOW,
+        )
+        .await;
         // jti replay guard is per-ctx (fresh seen set), so this arms the state
         // machine but consent-off denies at the gate.
         assert!(
@@ -2007,10 +2189,10 @@ mod tests {
         );
     }
 
-    /// Drive a real Noise handshake (via `run_one_session`, not `AgentSession`
-    /// directly) from `connecting_client`, against a station whose
-    /// `tx_allow_list` is `allow`. Returns the resulting `ArmContext` so the
-    /// caller can inspect `expected_client_key_id`.
+    /// Drive a real Noise handshake (via `run_one_session`'s `MultiPeerSession`,
+    /// not `AgentSession` directly) from `connecting_client`, against a station
+    /// whose `tx_allow_list` is `allow`. Returns the resulting `ArmContext` so
+    /// the caller can inspect `ctx.peers`.
     async fn run_session_with_connecting_peer(
         identity: &AgentIdentity,
         connecting_client: &str,
@@ -2065,8 +2247,7 @@ mod tests {
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
-            expected_client_key_id: String::new(),
-            hello_scopes: None,
+            peers: std::collections::HashMap::new(),
         };
         let bus = MessageBus::new(64).unwrap();
         run_one_session(ws, identity, &mut ctx, &bus).await;
@@ -2087,8 +2268,8 @@ mod tests {
 
         let ctx = run_session_with_connecting_peer(&identity, &connecting_client, allow).await;
 
-        assert_eq!(
-            ctx.expected_client_key_id, connecting_client,
+        assert!(
+            ctx.peers.contains_key(&connecting_client),
             "whichever allow-listed client actually connects must be admitted, \
              regardless of allow-list ordering"
         );
@@ -2098,6 +2279,14 @@ mod tests {
     /// authenticated its `src`) but that is NOT in the station-local
     /// `tx_allow_list` must be refused before any scope is granted. The
     /// station-local list, not relay admission, is the authoritative gate.
+    ///
+    /// Task 4: with `MultiPeerSession`, a refused peer is isolated to itself —
+    /// `PeerRefused` never tears down the whole session (unlike the old
+    /// single-peer `AgentSession`, where refusing the one connected peer ended
+    /// the session outright). So the assertion here is no longer "the session
+    /// tore down" but "no `PeerCtx` was ever created for the refused peer / it
+    /// was served no scope" — `MAX_PEERS` admission runs BEFORE any handshake
+    /// state is allocated, so a refused peer never gets a `PeerEstablished`.
     #[tokio::test]
     async fn relay_admitted_peer_not_in_allow_list_is_refused() {
         let identity = AgentIdentity::generate();
@@ -2108,8 +2297,12 @@ mod tests {
         let ctx = run_session_with_connecting_peer(&identity, &connecting_client, allow).await;
 
         assert!(
-            ctx.expected_client_key_id.is_empty(),
-            "a relay-admitted peer absent from tx_allow_list must never be vetted in"
+            !ctx.peers.contains_key(&connecting_client),
+            "a relay-admitted peer absent from tx_allow_list must never get a PeerCtx / be vetted in"
+        );
+        assert!(
+            ctx.peers.is_empty(),
+            "the refused peer must be served no scope at all — no PeerCtx anywhere in this session"
         );
     }
 
@@ -2137,8 +2330,7 @@ mod tests {
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
-            expected_client_key_id: CLIENT_KEY_ID.to_string(),
-            hello_scopes: None,
+            peers: peers_with(CLIENT_KEY_ID, None),
         }
     }
 }
