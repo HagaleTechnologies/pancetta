@@ -163,6 +163,7 @@ const TERMINAL_CODES: &[&str] = &[
     "AUD_MISMATCH",
     "SCOPE_EMPTY",
     "AGENT_OCCUPIED",
+    "CAPACITY",
     "NOT_ADMITTED",
     "FRAME_TOO_LARGE",
     "BAD_FRAME",
@@ -372,6 +373,7 @@ mod tests {
     fn is_terminal_classification() {
         assert!(is_terminal("BAD_AUTH"));
         assert!(is_terminal("AGENT_OCCUPIED"));
+        assert!(is_terminal("CAPACITY"));
         assert!(is_terminal("FRAME_TOO_LARGE"));
         assert!(!is_terminal("NO_PEER"));
         assert!(!is_terminal("UNKNOWN_DST"));
