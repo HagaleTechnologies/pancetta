@@ -1580,15 +1580,28 @@ impl ConfigSection for NetworkConfig {
             }
         }
 
-        // `remote_tx_enabled` with an empty `tx_allow_list` is NOT a hard error
-        // (the operator may add client keyIds after pairing), but no remote TX
-        // can occur until the allow-list is populated — surface it clearly.
-        if self.station_agent.remote_tx_enabled && self.station_agent.tx_allow_list.is_empty() {
-            tracing::warn!(
-                target: "config.station_agent",
-                "remote_tx_enabled = true but tx_allow_list is empty — NO remote TX can occur until \
-                 client keyIds are added to station_agent.tx_allow_list (fail-closed)"
-            );
+        // An empty `tx_allow_list` is NOT a hard error (the operator may add
+        // client keyIds after pairing), but it has two distinct consequences
+        // worth surfacing clearly: no remote TX can occur (remote_tx_enabled
+        // path), AND — since the runtime station-agent component also uses
+        // tx_allow_list to pick the single client keyId it addresses — if the
+        // transport itself is enabled, the relay connection is never even
+        // attempted at all, not merely TX-gated.
+        if self.station_agent.tx_allow_list.is_empty() {
+            if self.station_agent.enabled {
+                tracing::warn!(
+                    target: "config.station_agent",
+                    "station_agent.enabled = true but tx_allow_list is empty — no client keyId to \
+                     admit, so the relay connection itself is never attempted (not just TX-gated); \
+                     add the client's keyId to station_agent.tx_allow_list"
+                );
+            } else if self.station_agent.remote_tx_enabled {
+                tracing::warn!(
+                    target: "config.station_agent",
+                    "remote_tx_enabled = true but tx_allow_list is empty — NO remote TX can occur until \
+                     client keyIds are added to station_agent.tx_allow_list (fail-closed)"
+                );
+            }
         }
 
         // WSJT-X UDP validation
