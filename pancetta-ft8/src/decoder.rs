@@ -18024,7 +18024,7 @@ mod hb226_gaussian_ramp_tests {
 mod w42_time_varying_subtraction_tests {
     use super::*;
     use crate::WINDOW_SAMPLES;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
 
     const FREQ_A: f64 = 1200.0;
     const FREQ_B: f64 = FREQ_A + 30.0; // 30 Hz apart, per the task brief

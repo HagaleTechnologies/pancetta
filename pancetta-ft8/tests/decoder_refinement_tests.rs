@@ -252,7 +252,7 @@ mod w33_matched_demod {
     use super::*;
     use pancetta_ft8::encoder::Ft8Encoder;
     use pancetta_ft8::modulator::Ft8Modulator;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
 
     const TEST_MESSAGE: &str = "CQ K5ARH EM10";
     const OFF_GRID_DF_HZ: f64 = 1.4; // beyond the 3.125 Hz coarse sync grid
@@ -425,7 +425,7 @@ mod w34_nsym_combining {
     use super::*;
     use pancetta_ft8::encoder::Ft8Encoder;
     use pancetta_ft8::modulator::Ft8Modulator;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
 
     const TEST_MESSAGE: &str = "CQ K5ARH EM10";
     // Seed-searched (see the Task W3.4 report for the full sweep): a plain
@@ -659,7 +659,7 @@ mod w42_time_varying_subtraction {
     use super::*;
     use pancetta_ft8::encoder::Ft8Encoder;
     use pancetta_ft8::modulator::{Ft8Modulator, PulseShape};
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
 
     const MSG_A: &str = "CQ K5ARH EM10";
     const MSG_B: &str = "CQ W1ABC FN42";
