@@ -1,20 +1,16 @@
 name: CI
 
 on:
+  # No `paths:` filter here — branch protection requires the `CI` job below,
+  # and a required check that never triggers for a given diff (e.g. a
+  # docs-only PR) permanently blocks that PR's merge (GitHub does not treat
+  # "workflow never ran" as "check passed"). Path-based skipping happens
+  # per-job below instead, via the `changes` job, so the required `CI`
+  # aggregator always runs and always reports.
   push:
     branches: [main]
-    paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '.github/workflows/ci.yml'
   pull_request:
     branches: [main]
-    paths:
-      - '**/*.rs'
-      - '**/Cargo.toml'
-      - '**/Cargo.lock'
-      - '.github/workflows/ci.yml'
   schedule:
     # Weekly drift check (Mondays 12:00 UTC). Catches toolchain bumps,
     # advisory drops, and platform regressions even when no human pushes
@@ -26,7 +22,7 @@ on:
 env:
   CARGO_TERM_COLOR: always
 
-# Job gating policy (revised 2026-06-28):
+# Job gating policy (revised 2026-07-21):
 #
 # CI is the AUTHORITATIVE gate. The heavy lanes now run on every PR AND every
 # push to main, so `main` is comprehensively gated regardless of how a change
@@ -35,17 +31,49 @@ env:
 # local pre-push hook (scripts/check.sh) is now a FAST pre-flight (~5 min) and
 # defers the full test run + examples build to CI here. See scripts/check.sh.
 #
-#   - clippy + fmt: every event (push, PR, schedule). Cheap and fast.
-#   - heavy lanes (ft8-tests, workspace-check, deny): every PR + every push to
-#     main + schedule (weekly drift) + manual dispatch. (Path-filtered to code
-#     changes via `on.push.paths`, so docs-only pushes don't spend CI.)
+#   - clippy + fmt + ft8-tests + workspace-check + deny: every PR + every push
+#     to main + schedule (weekly drift) + manual dispatch — but SKIPPED (not
+#     unfiltered) on docs/report-only diffs via the `changes` job below, so
+#     that traffic doesn't spend CI minutes while the required `CI` check
+#     still always runs and reports (see the `on:` comment above for why this
+#     replaced top-level `paths:` filtering).
 #   - cross-platform-check: PR + schedule + dispatch only (macos runners ~10x
-#     cost; not worth gating every main push).
+#     cost; not worth gating every main push), same code-changed gate.
 
 jobs:
+  # Detects whether this push/PR touches anything the heavy lanes below care
+  # about. Deliberately has no `paths:`/`if:` restriction of its own — it must
+  # always run so its output is always available to gate the other jobs.
+  changes:
+    name: Detect Code Changes
+    runs-on: ubuntu-latest
+    outputs:
+      code: ${{ steps.filter.outputs.code }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      # Only meaningful for push/pull_request (a real base ref to diff
+      # against exists). schedule/workflow_dispatch have no natural base;
+      # those events already force every downstream job to run regardless
+      # of this output (see each job's `if:`), so skipping here is safe —
+      # `steps.filter.outputs.code` is just empty, not a failure.
+      - uses: dorny/paths-filter@v3
+        id: filter
+        if: github.event_name == 'push' || github.event_name == 'pull_request'
+        with:
+          filters: |
+            code:
+              - '**/*.rs'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '.github/workflows/ci.yml'
+
   # Fast checks — run on every push and PR (~2 min)
   clippy:
     name: Clippy
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -71,6 +99,8 @@ jobs:
 
   fmt:
     name: Format
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -86,6 +116,8 @@ jobs:
   # (plus weekly schedule + manual dispatch). Part of the authoritative gate.
   ft8-tests:
     name: FT8 Tests
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -112,6 +144,8 @@ jobs:
 
   workspace-check:
     name: Workspace Check
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     env:
       # This lane links the whole workspace THREE times (check, examples,
@@ -166,7 +200,8 @@ jobs:
   # (skipped on direct human push to main; macos minutes are 10x cost).
   cross-platform-check:
     name: Cross-Platform Check (${{ matrix.os }})
-    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: changes
+    if: (github.event_name == 'pull_request' && needs.changes.outputs.code == 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     strategy:
       fail-fast: false
       matrix:
@@ -205,6 +240,8 @@ jobs:
   # every push to main (part of the authoritative gate).
   deny:
     name: Cargo Deny
+    needs: changes
+    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
