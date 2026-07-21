@@ -8,7 +8,10 @@ fn main() {
     println!("=== All devices ===");
     if let Ok(devices) = host.devices() {
         for device in devices {
-            let name = device.name().unwrap_or_else(|_| "???".to_string());
+            let name = device
+                .description()
+                .map(|d| d.to_string())
+                .unwrap_or_else(|_| "???".to_string());
             let in_cfgs = device
                 .supported_input_configs()
                 .map(|c| c.count())
@@ -27,13 +30,23 @@ fn main() {
     println!();
     println!("=== Default input device ===");
     match host.default_input_device() {
-        Some(d) => println!("  {}", d.name().unwrap_or_else(|_| "???".to_string())),
+        Some(d) => println!(
+            "  {}",
+            d.description()
+                .map(|d| d.to_string())
+                .unwrap_or_else(|_| "???".to_string())
+        ),
         None => println!("  (none)"),
     }
 
     println!("=== Default output device ===");
     match host.default_output_device() {
-        Some(d) => println!("  {}", d.name().unwrap_or_else(|_| "???".to_string())),
+        Some(d) => println!(
+            "  {}",
+            d.description()
+                .map(|d| d.to_string())
+                .unwrap_or_else(|_| "???".to_string())
+        ),
         None => println!("  (none)"),
     }
 }

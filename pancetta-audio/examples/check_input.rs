@@ -12,10 +12,13 @@ fn main() {
     println!("=== Input Devices ===");
     if let Ok(devices) = host.input_devices() {
         for d in devices {
-            let name = d.name().unwrap_or_else(|_| "??".into());
+            let name = d
+                .description()
+                .map(|desc| desc.to_string())
+                .unwrap_or_else(|_| "??".into());
             let is_default = host
                 .default_input_device()
-                .map(|dd| dd.name().ok() == d.name().ok())
+                .map(|dd| dd.description().ok().map(|d| d.to_string()) == Some(name.clone()))
                 .unwrap_or(false);
             println!(
                 "  {} {}",
@@ -28,12 +31,15 @@ fn main() {
     let device = host
         .default_input_device()
         .expect("No default input device");
-    let name = device.name().unwrap_or_else(|_| "unknown".into());
+    let name = device
+        .description()
+        .map(|d| d.to_string())
+        .unwrap_or_else(|_| "unknown".into());
     println!("\nUsing: {}", name);
 
     let config = cpal::StreamConfig {
         channels: 2,
-        sample_rate: cpal::SampleRate(48000),
+        sample_rate: 48000,
         buffer_size: cpal::BufferSize::Default,
     };
 
@@ -43,7 +49,7 @@ fn main() {
 
     let stream = device
         .build_input_stream(
-            &config,
+            config,
             move |data: &[f32], _: &cpal::InputCallbackInfo| {
                 if start.elapsed() < Duration::from_secs(3) {
                     samples_clone.lock().unwrap().extend_from_slice(data);

@@ -818,7 +818,7 @@ impl AudioOutput {
         let device = if let Some(ref name) = self.config.device_name {
             host.output_devices()
                 .map_err(|e| Ft8Error::ConfigError(format!("failed to enumerate devices: {}", e)))?
-                .find(|d| d.name().is_ok_and(|n| &n == name))
+                .find(|d| d.description().is_ok_and(|desc| &desc.to_string() == name))
                 .ok_or_else(|| {
                     Ft8Error::ConfigError(format!("output device '{}' not found", name))
                 })?
@@ -827,7 +827,10 @@ impl AudioOutput {
                 .ok_or_else(|| Ft8Error::ConfigError("no default output device".to_string()))?
         };
 
-        let device_name = device.name().unwrap_or_else(|_| "unknown".to_string());
+        let device_name = device
+            .description()
+            .map(|d| d.to_string())
+            .unwrap_or_else(|_| "unknown".to_string());
         info!("Starting audio transmission on device: {}", device_name);
 
         // Convert bytes to f32 samples
@@ -842,7 +845,7 @@ impl AudioOutput {
 
         let stream_config = cpal::StreamConfig {
             channels: 1,
-            sample_rate: cpal::SampleRate(sample_rate),
+            sample_rate,
             buffer_size: cpal::BufferSize::Default,
         };
 
@@ -851,7 +854,7 @@ impl AudioOutput {
 
         let stream = device
             .build_output_stream(
-                &stream_config,
+                stream_config,
                 move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                     let samples = buf.lock().unwrap();
                     let mut idx = pos.load(Ordering::Relaxed) as usize;

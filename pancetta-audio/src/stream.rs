@@ -335,7 +335,8 @@ impl AudioStreamManager {
             self.device_manager.get_best_ft8_input_device()?
         };
         let resolved_input_name = input_device
-            .name()
+            .description()
+            .map(|d| d.to_string())
             .unwrap_or_else(|_| "<unknown>".to_string());
         self.input_fallback = fallback_from.map(|req| (req, resolved_input_name));
 
@@ -368,7 +369,7 @@ impl AudioStreamManager {
 
         let stream = match sample_format {
             cpal::SampleFormat::F32 => input_device.build_input_stream(
-                &config,
+                config,
                 move |data: &[f32], _info: &InputCallbackInfo| {
                     producer.push_audio_slice(data);
                     let timer = CallbackTimer::start();
@@ -381,7 +382,7 @@ impl AudioStreamManager {
                 None,
             )?,
             cpal::SampleFormat::I16 => input_device.build_input_stream(
-                &config,
+                config,
                 move |data: &[i16], _info: &InputCallbackInfo| {
                     let float_data: Vec<f32> =
                         data.iter().map(|&s| s as f32 / i16::MAX as f32).collect();
@@ -396,7 +397,7 @@ impl AudioStreamManager {
                 None,
             )?,
             cpal::SampleFormat::I32 => input_device.build_input_stream(
-                &config,
+                config,
                 move |data: &[i32], _info: &InputCallbackInfo| {
                     let float_data: Vec<f32> =
                         data.iter().map(|&s| s as f32 / i32::MAX as f32).collect();
@@ -447,8 +448,8 @@ fn find_output_device_by_cpal(pattern: &str) -> AudioResult<cpal::Device> {
         .devices()
         .map_err(|e| AudioError::device(format!("Failed to enumerate cpal devices: {}", e)))?
         .filter(|d| {
-            d.name()
-                .map(|n| normalize(&n).contains(&needle))
+            d.description()
+                .map(|n| normalize(&n.to_string()).contains(&needle))
                 .unwrap_or(false)
         })
         .collect();
@@ -466,7 +467,10 @@ fn find_output_device_by_cpal(pattern: &str) -> AudioResult<cpal::Device> {
     });
 
     let chosen = matches.remove(0);
-    let chosen_name = chosen.name().unwrap_or_else(|_| "unknown".into());
+    let chosen_name = chosen
+        .description()
+        .map(|d| d.to_string())
+        .unwrap_or_else(|_| "unknown".into());
     tracing::info!(
         "find_output_device_by_cpal: matched '{}' for pattern '{}'",
         chosen_name,
@@ -518,7 +522,8 @@ impl AudioStreamManager {
         // on every path, and warn when we fell back to the system default
         // without an explicit rig CODEC match.
         let resolved_output_name = output_device
-            .name()
+            .description()
+            .map(|d| d.to_string())
             .unwrap_or_else(|_| "<unknown>".to_string());
         let explicit_match = self
             .config
@@ -546,7 +551,7 @@ impl AudioStreamManager {
         let target_rate = self.config.sample_rate;
         let stream_config = cpal::StreamConfig {
             channels: 1,
-            sample_rate: cpal::SampleRate(target_rate),
+            sample_rate: target_rate,
             buffer_size: cpal::BufferSize::Default,
         };
         // Probe the device for log visibility — failures here are non-fatal
@@ -559,7 +564,7 @@ impl AudioStreamManager {
         ) {
             Ok(probed) => tracing::info!(
                 "Output device probe: {}Hz/{}ch (forcing mono/{}Hz for TX stream)",
-                probed.sample_rate().0,
+                probed.sample_rate(),
                 probed.channels(),
                 target_rate
             ),
@@ -588,7 +593,7 @@ impl AudioStreamManager {
 
         // Create the output stream — drain TX samples from the ring buffer
         let stream = output_device.build_output_stream(
-            &stream_config,
+            stream_config,
             move |data: &mut [f32], _info: &OutputCallbackInfo| {
                 let read = output_consumer.pop_audio_slice(data);
                 // Fill any remaining samples with silence (underrun is normal when not transmitting)

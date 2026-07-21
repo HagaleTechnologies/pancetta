@@ -67,8 +67,8 @@ impl RealtimeAudioProcessor {
             .default_output_device()
             .ok_or("No output device available")?;
 
-        println!("Input device: {}", input_device.name()?);
-        println!("Output device: {}", output_device.name()?);
+        println!("Input device: {}", input_device.description()?);
+        println!("Output device: {}", output_device.description()?);
 
         Ok(Self {
             _host: host,
@@ -93,7 +93,7 @@ impl RealtimeAudioProcessor {
 
         println!(
             "Using config - Sample Rate: {}Hz, Buffer Size: {} frames",
-            output_config.sample_rate().0,
+            output_config.sample_rate(),
             self.config.buffer_size
         );
 
@@ -108,7 +108,7 @@ impl RealtimeAudioProcessor {
         let mut phase: f32 = 0.0;
 
         let stream = self.output_device.build_output_stream(
-            &output_config.into(),
+            output_config.into(),
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 // Start latency measurement
                 let timer = CallbackTimer::start();
@@ -159,10 +159,10 @@ impl RealtimeAudioProcessor {
         // Find configuration matching our requirements
         for config in supported_configs {
             if config.channels() == self.config.input_channels
-                && config.min_sample_rate().0 <= self.config.sample_rate
-                && config.max_sample_rate().0 >= self.config.sample_rate
+                && config.min_sample_rate() <= self.config.sample_rate
+                && config.max_sample_rate() >= self.config.sample_rate
             {
-                return Ok(config.with_sample_rate(cpal::SampleRate(self.config.sample_rate)));
+                return Ok(config.with_sample_rate(self.config.sample_rate));
             }
         }
 
@@ -176,10 +176,10 @@ impl RealtimeAudioProcessor {
         // Find configuration matching our requirements
         for config in supported_configs {
             if config.channels() == self.config.output_channels
-                && config.min_sample_rate().0 <= self.config.sample_rate
-                && config.max_sample_rate().0 >= self.config.sample_rate
+                && config.min_sample_rate() <= self.config.sample_rate
+                && config.max_sample_rate() >= self.config.sample_rate
             {
-                return Ok(config.with_sample_rate(cpal::SampleRate(self.config.sample_rate)));
+                return Ok(config.with_sample_rate(self.config.sample_rate));
             }
         }
 

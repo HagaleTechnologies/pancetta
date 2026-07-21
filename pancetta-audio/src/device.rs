@@ -6,7 +6,7 @@
 use crate::error::{AudioError, AudioResult};
 use cpal::{
     traits::{DeviceTrait, HostTrait},
-    Device, Host, SampleFormat, SampleRate, SupportedStreamConfig,
+    Device, Host, SampleFormat, SupportedStreamConfig,
 };
 use serde::{Deserialize, Serialize};
 use std::fmt;
@@ -348,8 +348,8 @@ impl AudioDeviceManager {
                 "  config[{}]: {}ch, {}–{}Hz, {:?}",
                 i,
                 config.channels(),
-                config.min_sample_rate().0,
-                config.max_sample_rate().0,
+                config.min_sample_rate(),
+                config.max_sample_rate(),
                 config.sample_format(),
             );
         }
@@ -362,11 +362,11 @@ impl AudioDeviceManager {
             let mut score: i32 = 1;
 
             // Prefer exact sample rate match
-            if config.min_sample_rate().0 <= target_sample_rate
-                && config.max_sample_rate().0 >= target_sample_rate
+            if config.min_sample_rate() <= target_sample_rate
+                && config.max_sample_rate() >= target_sample_rate
             {
                 score += 100;
-            } else if config.max_sample_rate().0 > target_sample_rate {
+            } else if config.max_sample_rate() > target_sample_rate {
                 score += 50;
             } else {
                 score += 10; // Still usable, DSP can resample
@@ -392,26 +392,26 @@ impl AudioDeviceManager {
             if score > best_score {
                 best_score = score;
                 // Use a sample rate that's within the supported range
-                let sample_rate = if target_sample_rate >= config.min_sample_rate().0
-                    && target_sample_rate <= config.max_sample_rate().0
+                let sample_rate = if target_sample_rate >= config.min_sample_rate()
+                    && target_sample_rate <= config.max_sample_rate()
                 {
                     target_sample_rate
-                } else if config.max_sample_rate().0 >= 48000 {
+                } else if config.max_sample_rate() >= 48000 {
                     48000
-                } else if config.max_sample_rate().0 >= 44100 {
+                } else if config.max_sample_rate() >= 44100 {
                     44100
                 } else {
-                    config.max_sample_rate().0
+                    config.max_sample_rate()
                 };
-                best_config = Some(config.with_sample_rate(SampleRate(sample_rate)));
+                best_config = Some(config.with_sample_rate(sample_rate));
             }
         }
 
         if let Some(cfg) = best_config {
-            if cfg.channels() != target_channels || cfg.sample_rate().0 != target_sample_rate {
+            if cfg.channels() != target_channels || cfg.sample_rate() != target_sample_rate {
                 tracing::info!(
                     "Input device config: {}Hz/{}ch (requested {}Hz/{}ch)",
-                    cfg.sample_rate().0,
+                    cfg.sample_rate(),
                     cfg.channels(),
                     target_sample_rate,
                     target_channels,
@@ -424,7 +424,7 @@ impl AudioDeviceManager {
         if let Ok(default_cfg) = device.default_input_config() {
             tracing::warn!(
                 "No scored input config — using device default ({}Hz/{}ch)",
-                default_cfg.sample_rate().0,
+                default_cfg.sample_rate(),
                 default_cfg.channels(),
             );
             return Ok(default_cfg);
@@ -453,11 +453,11 @@ impl AudioDeviceManager {
         for config in configs {
             let mut score: i32 = 1;
 
-            if config.min_sample_rate().0 <= target_sample_rate
-                && config.max_sample_rate().0 >= target_sample_rate
+            if config.min_sample_rate() <= target_sample_rate
+                && config.max_sample_rate() >= target_sample_rate
             {
                 score += 100;
-            } else if config.max_sample_rate().0 > target_sample_rate {
+            } else if config.max_sample_rate() > target_sample_rate {
                 score += 50;
             } else {
                 score += 10;
@@ -480,26 +480,26 @@ impl AudioDeviceManager {
 
             if score > best_score {
                 best_score = score;
-                let sample_rate = if target_sample_rate >= config.min_sample_rate().0
-                    && target_sample_rate <= config.max_sample_rate().0
+                let sample_rate = if target_sample_rate >= config.min_sample_rate()
+                    && target_sample_rate <= config.max_sample_rate()
                 {
                     target_sample_rate
-                } else if config.max_sample_rate().0 >= 48000 {
+                } else if config.max_sample_rate() >= 48000 {
                     48000
-                } else if config.max_sample_rate().0 >= 44100 {
+                } else if config.max_sample_rate() >= 44100 {
                     44100
                 } else {
-                    config.max_sample_rate().0
+                    config.max_sample_rate()
                 };
-                best_config = Some(config.with_sample_rate(SampleRate(sample_rate)));
+                best_config = Some(config.with_sample_rate(sample_rate));
             }
         }
 
         if let Some(cfg) = best_config {
-            if cfg.channels() != target_channels || cfg.sample_rate().0 != target_sample_rate {
+            if cfg.channels() != target_channels || cfg.sample_rate() != target_sample_rate {
                 tracing::info!(
                     "Output device config: {}Hz/{}ch (requested {}Hz/{}ch)",
-                    cfg.sample_rate().0,
+                    cfg.sample_rate(),
                     cfg.channels(),
                     target_sample_rate,
                     target_channels,
@@ -512,7 +512,7 @@ impl AudioDeviceManager {
         if let Ok(default_cfg) = device.default_output_config() {
             tracing::warn!(
                 "No scored output config — using device default ({}Hz/{}ch)",
-                default_cfg.sample_rate().0,
+                default_cfg.sample_rate(),
                 default_cfg.channels(),
             );
             return Ok(default_cfg);
@@ -532,7 +532,7 @@ impl AudioDeviceManager {
         );
         Ok(SupportedStreamConfig::new(
             1,
-            SampleRate(48_000),
+            48_000,
             cpal::SupportedBufferSize::Unknown,
             SampleFormat::F32,
         ))
@@ -546,18 +546,19 @@ impl AudioDeviceManager {
         default_output: &Option<Device>,
     ) -> AudioResult<AudioDeviceInfo> {
         let name = device
-            .name()
+            .description()
+            .map(|d| d.to_string())
             .unwrap_or_else(|_| "Unknown Device".to_string());
 
         // Check if this is a default device
         let is_default_input = default_input
             .as_ref()
-            .map(|d| d.name().unwrap_or_default() == name)
+            .map(|d| d.description().map(|d| d.to_string()).unwrap_or_default() == name)
             .unwrap_or(false);
 
         let is_default_output = default_output
             .as_ref()
-            .map(|d| d.name().unwrap_or_default() == name)
+            .map(|d| d.description().map(|d| d.to_string()).unwrap_or_default() == name)
             .unwrap_or(false);
 
         // Check input capabilities
@@ -570,8 +571,8 @@ impl AudioDeviceManager {
 
                 for config in configs {
                     // Collect sample rate range
-                    let min_rate = config.min_sample_rate().0;
-                    let max_rate = config.max_sample_rate().0;
+                    let min_rate = config.min_sample_rate();
+                    let max_rate = config.max_sample_rate();
 
                     // Add common sample rates within range
                     for &rate in &[8000, 12000, 16000, 22050, 44100, 48000, 96000, 192000] {
@@ -599,8 +600,8 @@ impl AudioDeviceManager {
                 let mut channels = Vec::new();
 
                 for config in configs {
-                    let min_rate = config.min_sample_rate().0;
-                    let max_rate = config.max_sample_rate().0;
+                    let min_rate = config.min_sample_rate();
+                    let max_rate = config.max_sample_rate();
 
                     for &rate in &[8000, 12000, 16000, 22050, 44100, 48000, 96000, 192000] {
                         if rate >= min_rate && rate <= max_rate && !sample_rates.contains(&rate) {
@@ -744,12 +745,12 @@ mod tests {
         let inputs: Vec<String> = host
             .input_devices()
             .expect("cpal input_devices() should not error")
-            .filter_map(|d| d.name().ok())
+            .filter_map(|d| d.description().ok().map(|d| d.to_string()))
             .collect();
         let outputs: Vec<String> = host
             .output_devices()
             .expect("cpal output_devices() should not error")
-            .filter_map(|d| d.name().ok())
+            .filter_map(|d| d.description().ok().map(|d| d.to_string()))
             .collect();
         println!("Input devices: {:?}", inputs);
         println!("Output devices: {:?}", outputs);
