@@ -249,7 +249,7 @@ mod w32_fine_sync_tests {
     use super::*;
     use crate::baseband::{extract_candidate_baseband, DECIM, FS, FS_BB};
     use crate::{Ft8Encoder, Ft8Modulator};
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
 
     /// Build a real FT8 tx signal (encoder + modulator, not a hand-rolled
     /// tone) at `carrier_hz`, then place it into an audio buffer such that
