@@ -166,46 +166,26 @@ impl std::fmt::Display for ErrorSeverity {
 /// Audio processing result type
 pub type AudioResult<T> = Result<T, AudioError>;
 
-/// Convert CPAL device name errors to AudioError
-impl From<cpal::DeviceNameError> for AudioError {
-    fn from(err: cpal::DeviceNameError) -> Self {
-        AudioError::device(format!("Device name error: {}", err))
-    }
-}
-
-/// Convert CPAL supported configs errors to AudioError
-impl From<cpal::SupportedStreamConfigsError> for AudioError {
-    fn from(err: cpal::SupportedStreamConfigsError) -> Self {
-        AudioError::device(format!("Supported configs error: {}", err))
-    }
-}
-
-/// Convert CPAL build stream errors to AudioError
-impl From<cpal::BuildStreamError> for AudioError {
-    fn from(err: cpal::BuildStreamError) -> Self {
-        AudioError::stream(format!("Build stream error: {}", err))
-    }
-}
-
-/// Convert CPAL stream errors to AudioError
-impl From<cpal::StreamError> for AudioError {
-    fn from(err: cpal::StreamError) -> Self {
-        AudioError::CpalStream {
-            message: format!("{}", err),
+/// Convert CPAL's unified error type to AudioError.
+///
+/// cpal 0.18 collapsed the old per-operation error types (`DeviceNameError`,
+/// `BuildStreamError`, `StreamError`, `PlayStreamError`, `PauseStreamError`, ...)
+/// into a single `cpal::Error` with an `ErrorKind`. Route by kind to preserve the
+/// prior device-vs-stream-vs-transient classification `is_recoverable`/`severity` rely on.
+impl From<cpal::Error> for AudioError {
+    fn from(err: cpal::Error) -> Self {
+        use cpal::ErrorKind;
+        match err.kind() {
+            ErrorKind::DeviceNotAvailable | ErrorKind::DeviceBusy | ErrorKind::DeviceChanged => {
+                AudioError::device(format!("{}", err))
+            }
+            ErrorKind::UnsupportedConfig | ErrorKind::InvalidInput => {
+                AudioError::configuration(format!("{}", err))
+            }
+            ErrorKind::StreamInvalidated | ErrorKind::Xrun => AudioError::CpalStream {
+                message: format!("{}", err),
+            },
+            _ => AudioError::stream(format!("{}", err)),
         }
-    }
-}
-
-/// Convert CPAL play stream errors to AudioError
-impl From<cpal::PlayStreamError> for AudioError {
-    fn from(err: cpal::PlayStreamError) -> Self {
-        AudioError::stream(format!("Play stream error: {}", err))
-    }
-}
-
-/// Convert CPAL pause stream errors to AudioError
-impl From<cpal::PauseStreamError> for AudioError {
-    fn from(err: cpal::PauseStreamError) -> Self {
-        AudioError::stream(format!("Pause stream error: {}", err))
     }
 }

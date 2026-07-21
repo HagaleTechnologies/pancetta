@@ -165,12 +165,18 @@ fn main() {
 
     // --- Open output device ---
     let host = cpal::default_host();
-    let default_out_name = host.default_output_device().and_then(|d| d.name().ok());
+    let default_out_name = host
+        .default_output_device()
+        .and_then(|d| d.description().ok())
+        .map(|d| d.to_string());
 
     println!("\nAll devices (cpal sees):");
     if let Ok(devices) = host.devices() {
         for d in devices {
-            let name = d.name().unwrap_or_else(|_| "??".into());
+            let name = d
+                .description()
+                .map(|desc| desc.to_string())
+                .unwrap_or_else(|_| "??".into());
             let in_count = d.supported_input_configs().map(|c| c.count()).unwrap_or(0);
             let out_count = d.supported_output_configs().map(|c| c.count()).unwrap_or(0);
             let is_default_out =
@@ -199,7 +205,14 @@ fn main() {
         let mut matches: Vec<_> = host
             .devices()
             .expect("Failed to enumerate devices")
-            .filter(|d| normalize(&d.name().unwrap_or_default()).contains(&needle))
+            .filter(|d| {
+                normalize(
+                    &d.description()
+                        .map(|desc| desc.to_string())
+                        .unwrap_or_default(),
+                )
+                .contains(&needle)
+            })
             .collect();
         if matches.is_empty() {
             eprintln!("No device matching '{}'", name);
@@ -215,12 +228,15 @@ fn main() {
         host.default_output_device()
             .expect("No default output device")
     };
-    let dev_name = device.name().unwrap_or_else(|_| "unknown".into());
+    let dev_name = device
+        .description()
+        .map(|d| d.to_string())
+        .unwrap_or_else(|_| "unknown".into());
     println!("\nUsing output: {}", dev_name);
 
     let stream_config = cpal::StreamConfig {
         channels: 1,
-        sample_rate: cpal::SampleRate(output_rate),
+        sample_rate: output_rate,
         buffer_size: cpal::BufferSize::Default,
     };
 
@@ -242,7 +258,7 @@ fn main() {
 
     let stream = device
         .build_output_stream(
-            &stream_config,
+            stream_config,
             move |data: &mut [f32], _: &cpal::OutputCallbackInfo| {
                 if !started_cb.load(Ordering::Relaxed) {
                     for sample in data.iter_mut() {
