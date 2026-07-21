@@ -12,9 +12,18 @@
 //! The `pancetta_agent` seams ([`WsConn`], [`PairingHttp`]) are **synchronous**
 //! by design (so the session/pairing logic is testable without an async
 //! runtime). These adapters bridge sync→async by owning a Tokio [`Handle`] and
-//! `block_on`-ing the async socket/HTTP calls. The station-agent component runs
-//! its session loop on a `spawn_blocking` thread precisely so these blocking
-//! bridge calls never stall the async executor.
+//! `block_on`-ing the async socket/HTTP calls.
+//!
+//! [`RealWsConn`]'s driver (the station-agent's session loop) runs as a normal
+//! `tokio::spawn`ed async task, not a bare OS thread — so a bare `block_on`
+//! inside [`WsConn::recv_text`]/[`send_text`](WsConn::send_text) would nest
+//! inside that task's own poll and panic ("Cannot start a runtime from within
+//! a runtime"). [`RealWsConn`] wraps each `block_on` in
+//! [`tokio::task::block_in_place`], Tokio's documented escape hatch for a
+//! blocking call inside an async task on a multi-thread runtime. This
+//! doesn't apply to [`ReqwestPairingHttp`]: its one caller
+//! (`pancetta pair`) already runs it via `tokio::task::spawn_blocking`, a
+//! genuine OS thread with no outer `block_on` to nest inside.
 
 use futures_util::{SinkExt, StreamExt};
 use tokio::runtime::Handle;
@@ -111,8 +120,16 @@ impl WsConn for RealWsConn {
             });
         }
         let tx = self.tx.clone();
-        self.handle
-            .block_on(async move { tx.send(s).await })
+        let handle = &self.handle;
+        // See the module doc: the session loop that drives this seam runs as
+        // a normal async task (`tokio::spawn`), not a bare OS thread, so a
+        // bare `handle.block_on` here would nest inside the task's own poll
+        // and panic ("Cannot start a runtime from within a runtime").
+        // `block_in_place` is Tokio's documented escape hatch for exactly
+        // this: it hands this worker's other tasks off to the rest of the
+        // multi-thread pool for the closure's duration, making a nested
+        // `block_on` legal again.
+        tokio::task::block_in_place(|| handle.block_on(async move { tx.send(s).await }))
             .map_err(|_| RelayError::Transport("relay send channel closed".to_string()))
     }
 
@@ -120,7 +137,9 @@ impl WsConn for RealWsConn {
         // `None` from the pump (channel closed OR explicit close sentinel) maps
         // to a closed connection — the session driver treats `Ok(None)` as
         // drained and the component reconnects.
-        match self.handle.block_on(self.rx.recv()) {
+        let handle = &self.handle;
+        let rx = &mut self.rx;
+        match tokio::task::block_in_place(|| handle.block_on(rx.recv())) {
             Some(Some(text)) => Ok(Some(text)),
             Some(None) | None => Ok(None),
         }
@@ -130,13 +149,16 @@ impl WsConn for RealWsConn {
         &mut self,
         timeout: std::time::Duration,
     ) -> Result<RecvOutcome, RelayError> {
+        let handle = &self.handle;
         let rx = &mut self.rx;
-        let out = self.handle.block_on(async move {
-            match tokio::time::timeout(timeout, rx.recv()).await {
-                Err(_elapsed) => RecvOutcome::Quiet,
-                Ok(Some(Some(text))) => RecvOutcome::Frame(text),
-                Ok(Some(None)) | Ok(None) => RecvOutcome::Closed,
-            }
+        let out = tokio::task::block_in_place(|| {
+            handle.block_on(async move {
+                match tokio::time::timeout(timeout, rx.recv()).await {
+                    Err(_elapsed) => RecvOutcome::Quiet,
+                    Ok(Some(Some(text))) => RecvOutcome::Frame(text),
+                    Ok(Some(None)) | Ok(None) => RecvOutcome::Closed,
+                }
+            })
         });
         Ok(out)
     }
@@ -218,5 +240,46 @@ mod tests {
             Some("https://cqdx.io".to_string()),
         );
         assert_eq!(http.origin.as_deref(), Some("https://cqdx.io"));
+    }
+
+    /// Regression test for the 2026-07-21 live incident: `RealWsConn::send_text`/
+    /// `recv_text` panicked ("Cannot start a runtime from within a runtime") the
+    /// first time they ran inside the station-agent's real `tokio::spawn`ed
+    /// session-loop task, because they nested a bare `handle.block_on` inside
+    /// that task's own poll. Reproduces the exact condition — a real WebSocket,
+    /// driven from inside a spawned async task on a multi-thread runtime, not
+    /// the test's own root task — and would panic without the `block_in_place`
+    /// fix. Needs `worker_threads > 1`: `block_in_place` itself panics on a
+    /// single-worker multi-thread runtime.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn real_ws_conn_send_and_recv_from_within_a_spawned_task() {
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        // Server: accept one connection, echo exactly one text frame back.
+        tokio::spawn(async move {
+            let (tcp, _) = listener.accept().await.unwrap();
+            let ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+            let (mut sink, mut source) = ws.split();
+            if let Some(Ok(Message::Text(t))) = source.next().await {
+                sink.send(Message::Text(t)).await.unwrap();
+            }
+        });
+
+        // Client: exactly the production shape — connect, then drive
+        // send_text/recv_text from *inside* a spawned task, not the test's
+        // own root task.
+        let client = tokio::spawn(async move {
+            let mut conn = RealWsConn::connect(&format!("ws://{addr}"))
+                .await
+                .expect("connect");
+            conn.send_text("hello".to_string()).expect("send_text");
+            conn.recv_text().expect("recv_text")
+        });
+
+        let received = client.await.expect("client task panicked");
+        assert_eq!(received, Some("hello".to_string()));
     }
 }
