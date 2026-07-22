@@ -149,9 +149,36 @@ pub fn schedule_tx(
     };
     let deferred = !use_current;
 
-    // mstr relative to the chosen target. When target is in the future,
+    let (silent_pad_samples, cursor_offset_samples) =
+        pad_and_cursor_for_target(now, target, sample_rate);
+
+    TxSchedule {
+        target_slot: target,
+        silent_pad_samples,
+        cursor_offset_samples,
+        deferred,
+    }
+}
+
+/// Silent-pad / cursor-skip math for a FIXED target slot boundary, given the
+/// instant audio is about to actually ship. Split out of `schedule_tx` so a
+/// later, more accurate clock read can refresh the pad/cursor WITHOUT
+/// re-deciding which slot to target — that decision (the `use_current` check
+/// above) must only ever be made once, off the frozen pre-coalesce
+/// `request_received_at` timestamp (see
+/// docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md
+/// §2). Re-running the full slot-selection logic with a later timestamp
+/// risks flipping `deferred` after downstream gates/pivots already assumed
+/// the original decision; this function can't do that — it only computes
+/// how far into (or before) an already-chosen `target_slot` `now` falls.
+fn pad_and_cursor_for_target(
+    now: chrono::DateTime<chrono::Utc>,
+    target_slot: chrono::DateTime<chrono::Utc>,
+    sample_rate: u32,
+) -> (usize, usize) {
+    // mstr relative to the target. When target is in the future,
     // (now - target) is negative; clamp so we hit the early branch.
-    let mstr_signed = (now - target).num_milliseconds();
+    let mstr_signed = (now - target_slot).num_milliseconds();
     let mstr_unsigned = mstr_signed.max(0) as u64;
 
     let (silent_pad_ms, cursor_ms) = if mstr_unsigned < DELAY_MS {
@@ -160,12 +187,10 @@ pub fn schedule_tx(
         (0, mstr_unsigned - DELAY_MS)
     };
 
-    TxSchedule {
-        target_slot: target,
-        silent_pad_samples: (silent_pad_ms as usize) * (sample_rate as usize) / 1000,
-        cursor_offset_samples: (cursor_ms as usize) * (sample_rate as usize) / 1000,
-        deferred,
-    }
+    (
+        (silent_pad_ms as usize) * (sample_rate as usize) / 1000,
+        (cursor_ms as usize) * (sample_rate as usize) / 1000,
+    )
 }
 
 /// Sleep for `total` duration, but wake early (return `true`) if EITHER
@@ -3948,6 +3973,44 @@ mod schedule_tx_tests {
             &[None, Some("qso-kenya".to_string())],
             &set
         ));
+    }
+
+    #[test]
+    fn pad_and_cursor_for_target_matches_schedule_tx_for_same_now() {
+        // Sanity: calling the extracted helper with schedule_tx's own chosen
+        // target and "now" must reproduce schedule_tx's own pad/cursor exactly
+        // — this is what makes the Task 1 extraction provably behavior-neutral.
+        let now = at(5.0);
+        let s = schedule_tx(now, SlotParity::Odd, 8000, 12_000, SLOT_NS);
+        let (pad, cursor) = pad_and_cursor_for_target(now, s.target_slot, 12_000);
+        assert_eq!(pad, s.silent_pad_samples);
+        assert_eq!(cursor, s.cursor_offset_samples);
+    }
+
+    #[test]
+    fn pad_and_cursor_for_target_refreshes_against_a_later_now() {
+        // The key new behavior Tasks 3/4 rely on: given the SAME target_slot,
+        // a later "now" produces a LARGER cursor (more of the waveform's front
+        // trimmed) — because more real time has passed relative to the slot
+        // boundary, independent of when target_slot was originally decided.
+        let target = at(0.0); // slot boundary itself
+        let (pad_early, cursor_early) = pad_and_cursor_for_target(at(0.2), target, 12_000);
+        let (pad_late, cursor_late) = pad_and_cursor_for_target(at(3.0), target, 12_000);
+        assert!(pad_early > 0, "200ms in: still inside the DELAY_MS pre-roll, expect padding");
+        assert_eq!(pad_late, 0, "3s in: past DELAY_MS, expect no padding");
+        assert!(cursor_late > cursor_early, "later refresh must trim more of the waveform's front");
+    }
+
+    #[test]
+    fn pad_and_cursor_for_target_stable_within_delay_ms_window() {
+        // Two "now" reads a few ms apart, both still inside the DELAY_MS
+        // pre-roll, should both land in the padding branch (cursor == 0) —
+        // confirms there's no discontinuity right at the DELAY_MS boundary.
+        let target = at(10.0);
+        let (_, cursor_a) = pad_and_cursor_for_target(at(10.1), target, 12_000);
+        let (_, cursor_b) = pad_and_cursor_for_target(at(10.3), target, 12_000);
+        assert_eq!(cursor_a, 0);
+        assert_eq!(cursor_b, 0);
     }
 }
 
