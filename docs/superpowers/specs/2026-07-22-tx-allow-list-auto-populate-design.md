@@ -46,11 +46,22 @@ shape isn't yet contractually pinned.
 1. **Cold start:** `station_agent` no longer permanently bails when `tx_allow_list` starts empty.
    It always attempts the relay connection; an empty list just means zero peers are admitted until
    the first successful poll populates it.
-2. **Live updates:** once cqdx integration is enabled, `tx_allow_list` becomes a live, shared,
-   periodically-refreshed set — a revoked or newly-authorized client takes effect within one poll
-   interval, not just on the next reconnect. This requires `tx_allow_list` to change from an owned
-   value cloned once into `MultiPeerSession` at construction, to a shared reference
-   (`Arc<RwLock<HashSet<String>>>`) the admission check reads live.
+2. **Live revocation:** once cqdx integration is enabled, the station-local `ArmContext` (in
+   `pancetta/src/coordinator/station_agent/mod.rs` — `verify_and_arm`'s admission check, run on
+   every arm-grant, not just at connect time) reads a live, shared, periodically-refreshed
+   allow-list instead of a value cloned once at session construction. A client whose authorization
+   is revoked can no longer arm remote TX on its next attempt, within one poll interval — this is
+   the safety-critical half of "live," since it's the actual gate on the dangerous action.
+   Traced and confirmed during planning: `client_keys` (the allow-listed clients' verifying keys,
+   currently loaded once via `load_client_device_keys`) has the same staleness problem and must be
+   refreshed alongside `tx_allow_list` on every poll tick, or a newly-authorized client's signature
+   would fail to verify even once their keyId is allow-listed.
+   **Explicitly deferred, named non-goal:** `pancetta-agent`'s `MultiPeerSession::new` still takes
+   an owned `HashSet<String>` snapshot at construction (once per relay reconnect) for its own
+   peer-admission gate — a brand-new client authorized mid-session still can't establish as a peer
+   until the next reconnect. Fixing that needs a separate change to a third crate's admission
+   internals and is out of scope for this pass (matches cqdx's own "bounded by poll interval, not
+   instant" framing for the general case).
 3. **Source of truth:** when cqdx integration is enabled (`network.cqdx.token` configured), cqdx's
    authorization data is authoritative — the static config `tx_allow_list` is used only as the
    fallback/seed when cqdx integration is disabled or the token is missing (today's existing
@@ -65,14 +76,19 @@ shape of `fetch_live_spots`/`fetch_needed_grids` (`pancetta-cqdx/src/client.rs`)
 {base_url}/api/v1/authorizations`, `.bearer_auth(self.token.expose_secret())`, `check_status` +
 `checked_json`. New type in `pancetta-cqdx/src/types.rs`:
 
+Field-by-field `#[serde(rename = "...")]` (matching `SpotGroup`'s existing style in this file,
+rather than a struct-level `rename_all`):
+
 ```rust
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
 pub struct AuthorizationEdge {
     pub id: String,
+    #[serde(rename = "agentKeyId")]
     pub agent_key_id: String,
+    #[serde(rename = "clientKeyId")]
     pub client_key_id: String,
     pub scopes: Vec<String>,
+    #[serde(rename = "createdAt")]
     pub created_at: String,
 }
 
