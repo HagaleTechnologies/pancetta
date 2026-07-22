@@ -4255,9 +4255,15 @@ mod schedule_tx_tests {
     fn adaptive_cap_has_room_for_an_early_arriving_head() {
         // Arrives 1s into the slot: 7000ms of raw headroom before tx_late_max_ms,
         // well above the protocol ceiling — cap should be the full FT8 ceiling
-        // (3000ms), not the raw headroom.
+        // (3000ms), not the raw headroom. at(1.0) falls inside slot 0, which is
+        // Even (base timestamp 1767225600 / 15 % 2 == 0, per `at()`'s own doc
+        // comment) — so the request must target Even parity for this to be a
+        // same-slot early arrival (`use_current = true`, `deferred = false`)
+        // and actually exercise `headroom.min(protocol_ceiling)`, rather than
+        // parity-mismatch deferring to the next Odd slot and short-circuiting
+        // at `if probe.deferred { return protocol_ceiling; }` before that line.
         use pancetta_config::station::TxSelfParity;
-        let head = tx_request(Some(SlotParity::Odd));
+        let head = tx_request(Some(SlotParity::Even));
         let cap = adaptive_coalesce_cap_ms(
             &head,
             at(1.0),
@@ -4274,8 +4280,14 @@ mod schedule_tx_tests {
     fn adaptive_cap_uses_protocol_ceiling_for_ft4() {
         // Same early-arrival case, but FT4's cycle is half FT8's — the ceiling
         // should scale down proportionally (1500ms), not stay at FT8's 3000ms.
+        // at(0.5) on FT4's 7.5s slot grid is also slot 0 = Even, so — same
+        // reasoning as adaptive_cap_has_room_for_an_early_arriving_head above
+        // — the request must target Even parity to hit `use_current = true`
+        // / `deferred = false` and actually exercise
+        // `headroom.min(protocol_ceiling)`, instead of deferring to the next
+        // Odd slot and short-circuiting before that line.
         use pancetta_config::station::TxSelfParity;
-        let head = tx_request(Some(SlotParity::Odd));
+        let head = tx_request(Some(SlotParity::Even));
         let cap = adaptive_coalesce_cap_ms(
             &head,
             at(0.5),
