@@ -250,8 +250,10 @@ impl super::ApplicationCoordinator {
     pub(crate) async fn start_display_feed(&mut self) -> Result<()> {
         let config = self.config.read().await;
         let gateway_wants_feed = config.network.remote_gateway.enabled;
-        let station_agent_wants_feed =
-            super::station_agent::station_agent_active(&config.network.station_agent);
+        let station_agent_wants_feed = super::station_agent::station_agent_active(
+            &config.network.station_agent,
+            &config.network.cqdx,
+        );
         let our_callsign = config.station.callsign.clone();
         drop(config);
 

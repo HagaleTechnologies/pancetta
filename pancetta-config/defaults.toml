@@ -199,6 +199,7 @@ enabled = false
 password = ""
 
 [network.cqdx]
+authorizations_poll_interval_secs = 45
 base_url = "https://cqdx.io"
 enabled = false
 poll_interval_secs = 30

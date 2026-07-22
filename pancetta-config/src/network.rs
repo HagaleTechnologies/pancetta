@@ -1180,6 +1180,11 @@ pub struct CqdxConfig {
 
     /// Priority spot poll interval in seconds
     pub poll_interval_secs: u64,
+
+    /// TX-allow-list auto-populate poll interval, in seconds (dispensa
+    /// Q-0043). Separate from `poll_interval_secs` (the priority-spot poll) —
+    /// different concern, potentially different cadence.
+    pub authorizations_poll_interval_secs: u64,
 }
 
 impl Default for CqdxConfig {
@@ -1189,6 +1194,7 @@ impl Default for CqdxConfig {
             base_url: "https://cqdx.io".to_string(),
             token: None,
             poll_interval_secs: 30,
+            authorizations_poll_interval_secs: 45,
         }
     }
 }
@@ -1453,6 +1459,11 @@ impl ConfigSection for NetworkConfig {
                     "cqdx.io poll interval must be at least 10 seconds".to_string(),
                 ));
             }
+            if self.cqdx.authorizations_poll_interval_secs < 10 {
+                return Err(ConfigError::Validation(
+                    "cqdx.io authorizations poll interval must be at least 10 seconds".to_string(),
+                ));
+            }
         }
 
         // ClubLog upload validation — enabling requires the credentials the
@@ -1588,12 +1599,13 @@ impl ConfigSection for NetworkConfig {
         // transport itself is enabled, the relay connection is never even
         // attempted at all, not merely TX-gated.
         if self.station_agent.tx_allow_list.is_empty() {
-            if self.station_agent.enabled {
+            if self.station_agent.enabled && !self.cqdx.enabled {
                 tracing::warn!(
                     target: "config.station_agent",
-                    "station_agent.enabled = true but tx_allow_list is empty — no client keyId to \
-                     admit, so the relay connection itself is never attempted (not just TX-gated); \
-                     add the client's keyId to station_agent.tx_allow_list"
+                    "station_agent.enabled = true but tx_allow_list is empty and cqdx auto-populate \
+                     is disabled — no client keyId to admit; add the client's keyId to \
+                     station_agent.tx_allow_list, or enable cqdx.io integration (dispensa Q-0043) \
+                     so it populates automatically"
                 );
             } else if self.station_agent.remote_tx_enabled {
                 tracing::warn!(
@@ -1857,6 +1869,24 @@ mod tests {
         assert!(config.validate_section().is_err());
 
         config.cqdx.poll_interval_secs = 30;
+        assert!(config.validate_section().is_ok());
+    }
+
+    #[test]
+    fn test_cqdx_validation_authorizations_poll_interval_too_low() {
+        let mut config = NetworkConfig::default();
+        config.cqdx.enabled = true;
+        config.cqdx.token = Some("pat_abc123".to_string());
+        config.cqdx.authorizations_poll_interval_secs = 5; // too low
+        assert!(config.validate_section().is_err());
+    }
+
+    #[test]
+    fn test_cqdx_validation_authorizations_poll_interval_ok() {
+        let mut config = NetworkConfig::default();
+        config.cqdx.enabled = true;
+        config.cqdx.token = Some("pat_abc123".to_string());
+        config.cqdx.authorizations_poll_interval_secs = 45;
         assert!(config.validate_section().is_ok());
     }
 
