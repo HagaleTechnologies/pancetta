@@ -403,6 +403,23 @@ pub enum MessageType {
         /// Frequency range in Hz (min, max)
         freq_range: (f32, f32),
     },
+
+    /// One raw (native-resolution, pre-normalization) waterfall row for the
+    /// remote gateway's `spectrum` serverEvent (dispensa Q-0024). Distinct
+    /// from `WaterfallData` above (0-1 normalized, TUI-only, never bus-sent):
+    /// `mags_db` carries real dB values straight from the decoder, matching
+    /// what dispensa's concurred answer described as "natively available
+    /// before the 0-1 color-mapping step." `audio_bin_start_hz` is baseband
+    /// (0-3000 Hz FT8 passband); the remote gateway adds the current dial
+    /// frequency to produce the wire event's RF-absolute `binStartHz`,
+    /// mirroring how `DecodedMessage` is enriched with dial frequency in
+    /// `remote_gateway::handle_bus_msg`.
+    SpectrumRow {
+        audio_bin_start_hz: f64,
+        bin_width_hz: f64,
+        mags_db: Vec<f32>,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
 }
 
 /// A single transmit request item for multi-TX bundles.

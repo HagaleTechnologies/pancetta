@@ -10,7 +10,7 @@
 //! that enriched context and emits `ServerEvent::decoded(view)` itself.
 
 use pancetta_ft8::DecodedMessage;
-use pancetta_protocol::{DecodedView, PendingCall, QsoProgress, ServerEvent};
+use pancetta_protocol::{DecodedView, PendingCall, QsoProgress, ServerEvent, Spectrum};
 
 use crate::message_bus::{
     ActiveQsoSnapshotItem, MessageType, PendingCallSnapshotItem, RigControlMessage,
@@ -100,6 +100,50 @@ pub(crate) fn decoded_to_view(
         needed,
         atno,
         priority_score: None,
+    }
+}
+
+/// Bin pair-averaging factor applied when downsampling a native-resolution
+/// waterfall row into the wire `spectrum` event. Takes the decoder's native
+/// ~2.93 Hz/bin resolution down to ~5.86 Hz/bin, matching panino's originally
+/// proposed fixture default (dispensa Q-0024) with the least client-side
+/// rework — the concurred answer left the exact bin count as "sender's
+/// choice, no strong preference."
+const SPECTRUM_DOWNSAMPLE: usize = 2;
+
+/// Convert one native-resolution waterfall row into the wire `spectrum`
+/// server event (dispensa Q-0024).
+///
+/// - Pair-averages adjacent bins down by [`SPECTRUM_DOWNSAMPLE`] (simple
+///   mean of the dB values — a display-only decimation, not a power-domain
+///   average; accuracy beyond "looks right on a waterfall" isn't needed
+///   here).
+/// - Converts `audio_bin_start_hz` (baseband, 0–3000 Hz FT8 passband) to
+///   RF-absolute by adding `dial_hz`, mirroring [`decoded_to_view`]'s
+///   frequency enrichment.
+/// - `seq` and `timestamp` are caller-assigned; this function only shapes
+///   the payload.
+pub(crate) fn spectrum_row_to_event(
+    audio_bin_start_hz: f64,
+    bin_width_hz: f64,
+    mags_db: &[f32],
+    timestamp: chrono::DateTime<chrono::Utc>,
+    dial_hz: f64,
+    seq: u64,
+) -> ServerEvent {
+    let downsampled: Vec<f32> = mags_db
+        .chunks(SPECTRUM_DOWNSAMPLE)
+        .map(|chunk| chunk.iter().sum::<f32>() / chunk.len() as f32)
+        .collect();
+
+    ServerEvent::Spectrum {
+        spectrum: Spectrum {
+            bin_start_hz: dial_hz + audio_bin_start_hz,
+            bin_width_hz: bin_width_hz * SPECTRUM_DOWNSAMPLE as f64,
+            mags_db: downsampled,
+            seq,
+            timestamp,
+        },
     }
 }
 
@@ -317,6 +361,51 @@ mod tests {
         match server_event_from_bus(&msg) {
             Some(ServerEvent::Mode { mode }) => assert_eq!(mode, "FT4"),
             other => panic!("expected Mode, got {:?}", other),
+        }
+    }
+
+    // ── spectrum_row_to_event ────────────────────────────────────────────────
+
+    #[test]
+    fn spectrum_row_downsamples_and_converts_to_rf_absolute() {
+        let mags: Vec<f32> = vec![-100.0, -90.0, -80.0, -70.0];
+        let ts = Utc::now();
+        let event = spectrum_row_to_event(0.0, 2.9296875, &mags, ts, 14_074_000.0, 7);
+
+        match event {
+            ServerEvent::Spectrum { spectrum } => {
+                assert_eq!(spectrum.bin_start_hz, 14_074_000.0);
+                assert!((spectrum.bin_width_hz - 5.859375).abs() < 1e-9);
+                assert_eq!(spectrum.mags_db, vec![-95.0, -75.0]);
+                assert_eq!(spectrum.seq, 7);
+                assert_eq!(spectrum.timestamp, ts);
+            }
+            other => panic!("expected Spectrum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn spectrum_row_handles_odd_bin_count() {
+        let mags: Vec<f32> = vec![-100.0, -90.0, -80.0];
+        let event = spectrum_row_to_event(0.0, 2.93, &mags, Utc::now(), 14_074_000.0, 0);
+
+        match event {
+            ServerEvent::Spectrum { spectrum } => {
+                // Last unpaired bin averages with itself.
+                assert_eq!(spectrum.mags_db, vec![-95.0, -80.0]);
+            }
+            other => panic!("expected Spectrum, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn spectrum_row_adds_dial_to_nonzero_audio_offset() {
+        let event = spectrum_row_to_event(1500.0, 2.93, &[-100.0], Utc::now(), 7_074_000.0, 0);
+        match event {
+            ServerEvent::Spectrum { spectrum } => {
+                assert_eq!(spectrum.bin_start_hz, 7_074_000.0 + 1500.0);
+            }
+            other => panic!("expected Spectrum, got {:?}", other),
         }
     }
 

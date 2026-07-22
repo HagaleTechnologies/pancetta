@@ -20,6 +20,6 @@ pub mod session;
 pub(crate) mod wire_serde;
 
 pub use command::ClientCommand;
-pub use dto::{DecodedView, DxRow, PendingCall, QsoProgress};
+pub use dto::{DecodedView, DxRow, PendingCall, QsoProgress, Spectrum};
 pub use event::ServerEvent;
 pub use session::{ClientFrame, Hello, ServerFrame, StateSnapshot, Welcome};

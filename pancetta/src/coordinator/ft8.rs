@@ -733,6 +733,56 @@ impl super::ApplicationCoordinator {
                                 if let Some(ref auto_wf_tx) = self_waterfall_to_auto_tx {
                                     let _ = auto_wf_tx.try_send(rows);
                                 }
+
+                                // Additive: also forward the RAW (pre-
+                                // normalization) rows to the read-only remote
+                                // gateway for the `spectrum` serverEvent
+                                // (dispensa Q-0024), gated exactly like the
+                                // DecodedMessage relay below — no clone/send
+                                // when off. The →Tui `waterfall_tx`/
+                                // `self_waterfall_to_auto_tx` sends above
+                                // (0-1 normalized) are untouched.
+                                if display_feed_enabled.load(Ordering::Relaxed) {
+                                    let bin_width_hz = if wf.frequency_bins.len() >= 2 {
+                                        wf.frequency_bins[1] - wf.frequency_bins[0]
+                                    } else {
+                                        0.0
+                                    };
+                                    let audio_bin_start_hz =
+                                        wf.frequency_bins.first().copied().unwrap_or(0.0);
+                                    for (row, &t_offset) in
+                                        wf.power_matrix.iter().zip(wf.time_bins.iter())
+                                    {
+                                        let mags_db: Vec<f32> =
+                                            row.iter().map(|&v| v as f32).collect();
+                                        let timestamp = window_received_utc
+                                            + chrono::Duration::milliseconds(
+                                                (t_offset * 1000.0) as i64,
+                                            );
+                                        let gw_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Decoder,
+                                            ComponentId::RemoteGateway,
+                                            MessageType::SpectrumRow {
+                                                audio_bin_start_hz,
+                                                bin_width_hz,
+                                                mags_db,
+                                                timestamp,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let bus_spectrum = message_bus.clone();
+                                        rt.spawn(async move {
+                                            if let Err(e) =
+                                                bus_spectrum.send_message(gw_msg).await
+                                            {
+                                                debug!(
+                                                    "Failed to forward spectrum row to RemoteGateway: {}",
+                                                    e
+                                                );
+                                            }
+                                        });
+                                    }
+                                }
                             }
                             Err(e) => {
                                 warn!("Waterfall generation error: {}", e);

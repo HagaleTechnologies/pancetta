@@ -10,7 +10,7 @@
 //! Note: serde's `rename_all = "camelCase"` on an internally-tagged enum only
 //! renames the variant tag values, NOT struct-variant field names. Each
 //! multi-word field therefore carries an explicit `#[serde(rename = "...")]`.
-use crate::dto::{DecodedView, DxRow, PendingCall, QsoProgress};
+use crate::dto::{DecodedView, DxRow, PendingCall, QsoProgress, Spectrum};
 use crate::wire_serde;
 use serde::{Deserialize, Serialize};
 
@@ -45,6 +45,11 @@ pub enum ServerEvent {
     SignalStrength {
         #[serde(rename = "dbOverS9")]
         db_over_s9: i32,
+    },
+    /// Waterfall/spectrum magnitude snapshot — nested as
+    /// `{"event":"spectrum","spectrum":{…}}`. Additive, dispensa Q-0024.
+    Spectrum {
+        spectrum: Spectrum,
     },
     TxStatus {
         active: bool,
@@ -159,6 +164,18 @@ mod tests {
             (
                 "signalStrength",
                 ServerEvent::SignalStrength { db_over_s9: 5 },
+            ),
+            (
+                "spectrum",
+                ServerEvent::Spectrum {
+                    spectrum: Spectrum {
+                        bin_start_hz: 14_074_000.0,
+                        bin_width_hz: 5.86,
+                        mags_db: vec![-104.2, -98.1],
+                        seq: 1,
+                        timestamp: Utc::now(),
+                    },
+                },
             ),
             ("txStatus", ServerEvent::TxStatus { active: true }),
             (

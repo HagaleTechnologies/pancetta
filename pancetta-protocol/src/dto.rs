@@ -67,6 +67,20 @@ pub struct PendingCall {
     pub waited_secs: u64,
 }
 
+/// A single spectrum/waterfall row for the `spectrum` server event
+/// (dispensa Q-0024). `bin_start_hz` is RF-absolute (dial + audio bin
+/// offset, converted by the remote gateway); `mags_db` is raw,
+/// pre-normalization dB, one value per bin.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Spectrum {
+    pub bin_start_hz: f64,
+    pub bin_width_hz: f64,
+    pub mags_db: Vec<f32>,
+    pub seq: u64,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// A single decoded FT8 frame (the live decode feed).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -218,5 +232,22 @@ mod tests {
             "expected slotParity:even in: {dj}"
         );
         assert_eq!(serde_json::from_str::<DecodedView>(&dj).unwrap(), d);
+    }
+
+    #[test]
+    fn spectrum_roundtrips_and_is_camel_case() {
+        let s = Spectrum {
+            bin_start_hz: 14_074_000.0,
+            bin_width_hz: 5.86,
+            mags_db: vec![-104.2, -98.1, -110.0],
+            seq: 1234,
+            timestamp: Utc::now(),
+        };
+        let j = serde_json::to_string(&s).unwrap();
+        assert!(j.contains(r#""binStartHz""#), "expected binStartHz in: {j}");
+        assert!(j.contains(r#""binWidthHz""#), "expected binWidthHz in: {j}");
+        assert!(j.contains(r#""magsDb""#), "expected magsDb in: {j}");
+        assert!(j.contains(r#""seq":1234"#), "expected seq in: {j}");
+        assert_eq!(serde_json::from_str::<Spectrum>(&j).unwrap(), s);
     }
 }

@@ -40,3 +40,16 @@ overhead when off is also part of the contract; a non-gated send breaks it.
   itself; it only reads the bus.
 
 Full digest: `docs/DECISIONS/remote-operation.md`; see [[remote-operation]].
+
+## Gotcha: RF-absolute conversion uses the RX dial, never split TX
+
+When enriching an audio-baseband bus payload to an RF-absolute wire value
+(`DecodedMessage.frequency_offset`, `SpectrumRow.audio_bin_start_hz`), the
+gateway always adds the **RX dial** (`operating_frequency_hz`), never
+`split_tx_frequency_hz`. The audio the decoder/waterfall actually samples is
+the RX passband — split only changes what gets *transmitted*, not what's
+heard/displayed. A 2026-07-22 build request (dispensa Q-0024, the `spectrum`
+serverEvent) worded this as "convert using dial + split TX frequency," which
+is imprecise; `translate::spectrum_row_to_event` (and the pre-existing
+`decoded_to_view`) both only use the RX dial. See `pancetta-protocol`'s
+`Spectrum` DTO / `pancetta/src/coordinator/remote_gateway/translate.rs`.

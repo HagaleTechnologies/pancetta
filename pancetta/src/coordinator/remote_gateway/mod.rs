@@ -162,6 +162,7 @@ async fn handle_bus_msg(
     our_callsign: &str,
     evt_tx: &broadcast::Sender<ServerEvent>,
     snapshot: &RwLock<StateSnapshot>,
+    spectrum_seq: &AtomicU64,
 ) {
     use pancetta_qso::priority::WorkedStationLookup as _;
 
@@ -197,6 +198,24 @@ async fn handle_bus_msg(
                 }
             }
             ServerEvent::decoded(view)
+        }
+
+        MessageType::SpectrumRow {
+            audio_bin_start_hz,
+            bin_width_hz,
+            mags_db,
+            timestamp,
+        } => {
+            let dial_hz = op_freq.load(Ordering::Relaxed) as f64;
+            let seq = spectrum_seq.fetch_add(1, Ordering::Relaxed);
+            translate::spectrum_row_to_event(
+                *audio_bin_start_hz,
+                *bin_width_hz,
+                mags_db,
+                *timestamp,
+                dial_hz,
+                seq,
+            )
         }
 
         other => match translate::server_event_from_bus(other) {
@@ -312,6 +331,10 @@ impl super::ApplicationCoordinator {
         }));
 
         // ── Bus pump: translate bus messages → broadcast + snapshot ──────────
+        // `spectrum_seq` is monotone for the lifetime of this pump (i.e. per
+        // display-feed session) — dispensa Q-0024's `seq`, used by consumers
+        // to detect dropped spectrum frames.
+        let spectrum_seq = Arc::new(AtomicU64::new(0));
         let pump = {
             let shutdown = self.shutdown_signal.clone();
             let op_freq = self.operating_frequency_hz.clone();
@@ -319,6 +342,7 @@ impl super::ApplicationCoordinator {
             let evt_tx_pump = evt_tx.clone();
             let snapshot_pump = snapshot.clone();
             let our_callsign_pump = our_callsign.clone();
+            let spectrum_seq_pump = spectrum_seq.clone();
 
             tokio::spawn(async move {
                 while !shutdown.load(Ordering::Acquire) {
@@ -332,6 +356,7 @@ impl super::ApplicationCoordinator {
                                     &our_callsign_pump,
                                     &evt_tx_pump,
                                     &snapshot_pump,
+                                    &spectrum_seq_pump,
                                 )
                                 .await;
                             }
@@ -538,6 +563,56 @@ mod server_tests {
                 assert_eq!(welcome.protocol_version, PROTOCOL_VERSION);
             }
             other => panic!("expected Welcome, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn spectrum_row_bus_message_increments_seq_and_uses_dial_freq() {
+        let (evt_tx, mut rx) = broadcast::channel::<ServerEvent>(16);
+        let snapshot = RwLock::new(empty_snapshot());
+        let op_freq = AtomicU64::new(14_074_000);
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        let spectrum_seq = AtomicU64::new(0);
+
+        let msg = MessageType::SpectrumRow {
+            audio_bin_start_hz: 0.0,
+            bin_width_hz: 2.93,
+            mags_db: vec![-100.0, -90.0],
+            timestamp: chrono::Utc::now(),
+        };
+
+        // Two bus messages through the same pump state should get distinct,
+        // increasing seq values (dispensa Q-0024's drop-detection contract).
+        handle_bus_msg(
+            &msg,
+            &op_freq,
+            &lookup,
+            "K5ARH",
+            &evt_tx,
+            &snapshot,
+            &spectrum_seq,
+        )
+        .await;
+        handle_bus_msg(
+            &msg,
+            &op_freq,
+            &lookup,
+            "K5ARH",
+            &evt_tx,
+            &snapshot,
+            &spectrum_seq,
+        )
+        .await;
+
+        let e1 = rx.recv().await.unwrap();
+        let e2 = rx.recv().await.unwrap();
+        match (e1, e2) {
+            (ServerEvent::Spectrum { spectrum: s1 }, ServerEvent::Spectrum { spectrum: s2 }) => {
+                assert_eq!(s1.bin_start_hz, 14_074_000.0, "RF-absolute from dial freq");
+                assert_eq!(s1.seq, 0);
+                assert_eq!(s2.seq, 1);
+            }
+            other => panic!("expected two Spectrum events, got {other:?}"),
         }
     }
 }
