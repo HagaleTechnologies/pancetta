@@ -1941,7 +1941,7 @@ impl super::ApplicationCoordinator {
                                         slot_ns,
                                     );
 
-                                    let schedule = schedule_tx(
+                                    let mut schedule = schedule_tx(
                                         request_received_at,
                                         required_parity,
                                         tx_late_max_ms,
@@ -2013,46 +2013,6 @@ impl super::ApplicationCoordinator {
                                         )
                                         .await;
                                     }
-
-                                    // --- Step 3: Build the audio buffer to ship ---
-                                    // Pad zeros in front (early branch); skip cursor into
-                                    // waveform (late branch); never both at the same time.
-                                    let mut audio_out: Vec<f32> = Vec::with_capacity(
-                                        schedule.silent_pad_samples + samples.len(),
-                                    );
-                                    audio_out.resize(schedule.silent_pad_samples, 0.0f32);
-                                    if schedule.cursor_offset_samples < samples.len() {
-                                        audio_out.extend_from_slice(
-                                            &samples[schedule.cursor_offset_samples..],
-                                        );
-                                    } else {
-                                        // Defensive: if cursor outran the waveform (shouldn't
-                                        // happen because too-late defers), emit nothing and
-                                        // skip TX.
-                                        warn!("schedule_tx cursor exceeded waveform length; skipping TX");
-                                        emit_tx_failure_diagnostic(
-                                            &message_bus,
-                                            qso_id.as_deref(),
-                                            &message_text,
-                                            "internal scheduling error (cursor exceeded waveform)",
-                                        )
-                                        .await;
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text,
-                                                duration_ms: 0,
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
-                                        continue;
-                                    }
-                                    let audio_duration_ms =
-                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
-                                            as u64;
 
                                     // --- Step 4: Sleep until PTT engage instant ---
                                     let ptt_target_utc = schedule.target_slot
@@ -2162,6 +2122,72 @@ impl super::ApplicationCoordinator {
                                         let _ = message_bus.send_message(complete_msg).await;
                                         continue;
                                     }
+
+                                    // --- Step 3 (moved): build the audio buffer,
+                                    // refreshed against real time ---
+                                    // request_received_at (Step 2) already decided WHICH
+                                    // slot to target and whether to defer — that decision
+                                    // is never re-made here (Symptom-B's protection, see
+                                    // Global Constraints in the implementation plan). But
+                                    // real time has moved on since Step 2 (through the
+                                    // Symptom-C adaptive coalesce window, encoding, and the
+                                    // gates above), and Step 6 below is a no-op for the
+                                    // common current-slot case (target_slot is already in
+                                    // the past), so audio actually ships at whatever "now"
+                                    // is by the time we reach Step 7 — not at the "now"
+                                    // schedule_tx originally saw. Refresh just the pad/cursor
+                                    // math against the SAME schedule.target_slot so the
+                                    // transmitted waveform stays correctly aligned to the
+                                    // real FT8 slot grid regardless of how long the steps
+                                    // above took. See
+                                    // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §2.
+                                    let (fresh_pad_samples, fresh_cursor_samples) =
+                                        pad_and_cursor_for_target(
+                                            chrono::Utc::now(),
+                                            schedule.target_slot,
+                                            sample_rate,
+                                        );
+                                    schedule.silent_pad_samples = fresh_pad_samples;
+                                    schedule.cursor_offset_samples = fresh_cursor_samples;
+
+                                    // Pad zeros in front (early branch); skip cursor into
+                                    // waveform (late branch); never both at the same time.
+                                    let mut audio_out: Vec<f32> = Vec::with_capacity(
+                                        schedule.silent_pad_samples + samples.len(),
+                                    );
+                                    audio_out.resize(schedule.silent_pad_samples, 0.0f32);
+                                    if schedule.cursor_offset_samples < samples.len() {
+                                        audio_out.extend_from_slice(
+                                            &samples[schedule.cursor_offset_samples..],
+                                        );
+                                    } else {
+                                        // Defensive: if cursor outran the waveform (shouldn't
+                                        // happen because too-late defers), emit nothing and
+                                        // skip TX.
+                                        warn!("schedule_tx cursor exceeded waveform length at key-time; skipping TX");
+                                        emit_tx_failure_diagnostic(
+                                            &message_bus,
+                                            qso_id.as_deref(),
+                                            &message_text,
+                                            "internal scheduling error (cursor exceeded waveform at key-time)",
+                                        )
+                                        .await;
+                                        let complete_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Autonomous,
+                                            MessageType::TransmitComplete {
+                                                success: false,
+                                                message_text,
+                                                duration_ms: 0,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        let _ = message_bus.send_message(complete_msg).await;
+                                        continue;
+                                    }
+                                    let audio_duration_ms =
+                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
+                                            as u64;
 
                                     // --- Step 4c: late pivot to the freshest message ---
                                     // Our decoder finishes ~1.8s BEFORE the slot
