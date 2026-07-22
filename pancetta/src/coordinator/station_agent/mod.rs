@@ -131,10 +131,19 @@ const RECV_TICK: Duration = Duration::from_millis(200);
 struct ArmContext {
     arm: Arc<Mutex<ArmState>>,
     verifier: CapabilityVerifier,
-    /// Verifying keys for allow-listed clients, keyed by client keyId. The
-    /// grant's `clientSig` is checked against the key matching its `clientKeyId`.
-    client_keys: std::collections::HashMap<String, VerifyingKey>,
-    tx_allow_list: HashSet<String>,
+    /// Verifying keys for allow-listed clients, keyed by client keyId. Shared
+    /// and periodically refreshed by the Q-0043 auto-populate poll task
+    /// (Task 4) in lockstep with `tx_allow_list` — a keyId appearing in the
+    /// allow-list without its verifying key loaded here fails signature
+    /// verification, so the two must never update independently.
+    client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
+    /// Station-local TX-allow-list. Shared and periodically refreshed by the
+    /// Q-0043 auto-populate poll task (Task 4) when cqdx integration is
+    /// enabled — a fail-closed poll failure never clears this, only a
+    /// successful poll replaces its contents. When cqdx integration is
+    /// disabled, this is seeded once from config and never changes (today's
+    /// original behavior, preserved).
+    tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
     /// Arm-time **best-effort** revocation deny-list, keyed by the
     /// capabilityToken's `jti` (frozen e2e-auth.v1 §6-revocation). **EMPTY in
     /// v1** — the station-local TX-allow-list is the authoritative revoke, and
@@ -741,13 +750,14 @@ fn verify_and_arm(
             "grant clientKeyId {client_key_id} does not match the sending peer {peer}"
         ));
     }
-    if !ctx.tx_allow_list.contains(client_key_id) {
+    let allow_list = ctx.tx_allow_list.read().unwrap();
+    if !allow_list.contains(client_key_id) {
         return Err(format!(
             "client {client_key_id} not in station-local TX-allow-list"
         ));
     }
-    let client_vk = *ctx
-        .client_keys
+    let client_keys = ctx.client_keys.read().unwrap();
+    let client_vk = *client_keys
         .get(client_key_id)
         .ok_or_else(|| format!("no device key for client {client_key_id}"))?;
 
@@ -765,7 +775,7 @@ fn verify_and_arm(
             grant,
             &cap,
             &client_vk,
-            &ctx.tx_allow_list,
+            &allow_list,
             &ctx.revoked_jtis,
             session_id,
             now,
@@ -997,6 +1007,8 @@ impl super::ApplicationCoordinator {
         // checked, so an un-registered client fails closed at verify time.
         let tx_allow_list: HashSet<String> = cfg.tx_allow_list.iter().cloned().collect();
         let client_keys = load_client_device_keys(&key_dir, &tx_allow_list);
+        let tx_allow_list = Arc::new(std::sync::RwLock::new(tx_allow_list));
+        let client_keys = Arc::new(std::sync::RwLock::new(client_keys));
 
         let audit = AuditLog::new(
             cfg.audit_log_path
@@ -1018,7 +1030,7 @@ impl super::ApplicationCoordinator {
         // several allow-listed peers may now hold independent read/qsy scope
         // concurrently. An empty allow-list still means no client can ever be
         // admitted.
-        if tx_allow_list.is_empty() {
+        if tx_allow_list.read().unwrap().is_empty() {
             warn!(
                 target: "agent",
                 "station agent paired but tx_allow_list is empty — no client to admit; idle, relay connection never attempted"
@@ -1138,8 +1150,8 @@ struct RunConfig {
     relay_url: String,
     identity: AgentIdentity,
     verifier: CapabilityVerifier,
-    client_keys: std::collections::HashMap<String, VerifyingKey>,
-    tx_allow_list: HashSet<String>,
+    client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
+    tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
     audit: AuditLog,
     bus: MessageBus,
     /// The shared display-feed subscription (Task 6), if the feed was
@@ -1291,7 +1303,8 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
     events: &mut Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
 ) {
     ctx.peers.clear();
-    let mut sess = MultiPeerSession::new(ws, identity, ctx.tx_allow_list.clone());
+    let allow_snapshot = ctx.tx_allow_list.read().unwrap().clone();
+    let mut sess = MultiPeerSession::new(ws, identity, allow_snapshot);
     if let Err(e) = sess.authenticate() {
         debug!(target: "agent", "relay authenticate failed: {e}");
         return;
@@ -1526,8 +1539,8 @@ mod tests {
                     public_key: idp_key().verifying_key().to_bytes(),
                 }],
             },
-            client_keys,
-            tx_allow_list: allow,
+            client_keys: Arc::new(std::sync::RwLock::new(client_keys)),
+            tx_allow_list: Arc::new(std::sync::RwLock::new(allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
@@ -2443,8 +2456,10 @@ mod tests {
         // B (PEER_B) as a SECOND allow-listed, established peer with its OWN
         // device key — a genuinely admitted second client, not a bare claim.
         let mut ctx = ctx_with(true, true);
-        ctx.tx_allow_list.insert(PEER_B.to_string());
+        ctx.tx_allow_list.write().unwrap().insert(PEER_B.to_string());
         ctx.client_keys
+            .write()
+            .unwrap()
             .insert(PEER_B.to_string(), key(0x33).verifying_key());
         ctx.peers
             .insert(PEER_B.to_string(), PeerCtx { hello_scopes: None });
@@ -2692,7 +2707,7 @@ mod tests {
             let identity = AgentIdentity::generate();
             let mut ctx = ctx_with(true, true);
             // B must be allow-listed so MultiPeerSession admits it.
-            ctx.tx_allow_list.insert(PEER_B.to_string());
+            ctx.tx_allow_list.write().unwrap().insert(PEER_B.to_string());
             with_consent(&ctx, true);
             let bus = MessageBus::new(64).unwrap();
             dispatch_action(
@@ -3071,8 +3086,8 @@ mod tests {
                     public_key: idp_key().verifying_key().to_bytes(),
                 }],
             },
-            client_keys,
-            tx_allow_list: allow,
+            client_keys: Arc::new(std::sync::RwLock::new(client_keys)),
+            tx_allow_list: Arc::new(std::sync::RwLock::new(allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
@@ -3150,8 +3165,8 @@ mod tests {
                     public_key: idp_key().verifying_key().to_bytes(),
                 }],
             },
-            client_keys: std::collections::HashMap::new(),
-            tx_allow_list: allow,
+            client_keys: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
+            tx_allow_list: Arc::new(std::sync::RwLock::new(allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
@@ -3389,8 +3404,8 @@ mod tests {
                     public_key: idp_key().verifying_key().to_bytes(),
                 }],
             },
-            client_keys,
-            tx_allow_list: allow,
+            client_keys: Arc::new(std::sync::RwLock::new(client_keys)),
+            tx_allow_list: Arc::new(std::sync::RwLock::new(allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
