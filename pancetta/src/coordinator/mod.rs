@@ -1165,7 +1165,10 @@ impl ApplicationCoordinator {
         // components started before `start_display_feed` runs, e.g. hamlib/qso)
         // already agrees with the value `start_display_feed` re-asserts later.
         let display_feed_enabled_init = config.network.remote_gateway.enabled
-            || station_agent::station_agent_active(&config.network.station_agent);
+            || station_agent::station_agent_active(
+                &config.network.station_agent,
+                &config.network.cqdx,
+            );
         // Snapshot the wsjtx_udp enabled flag before `config` is moved into
         // the Arc<RwLock> — mirrors `display_feed_enabled_init` above.
         let wsjtx_enabled_init = config.network.wsjtx_udp.enabled;

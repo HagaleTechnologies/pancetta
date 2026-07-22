@@ -906,7 +906,8 @@ fn has_relay_config(cfg: &pancetta_config::network::StationAgentConfig) -> bool 
 
 /// Whether the station agent WILL (config permitting) want the shared
 /// [`display feed`](super::remote_gateway::DisplayFeed): [`has_relay_config`]
-/// AND a non-empty station-local TX-allow-list — the same two gates
+/// AND (a non-empty station-local TX-allow-list OR cqdx auto-populate
+/// enabled with a token, dispensa Q-0043) — the same gates
 /// `start_station_agent_component` itself checks before ever attempting a
 /// relay connection. Deliberately does NOT check pairing state (filesystem)
 /// — an over-approximation (starting the feed for a config that turns out
@@ -914,8 +915,20 @@ fn has_relay_config(cfg: &pancetta_config::network::StationAgentConfig) -> bool 
 /// to prevent is the opposite one, a station agent that needs the feed
 /// finding it was never started. `start_display_feed` calls this SAME
 /// function for its own gating so the two can never drift apart.
-pub(crate) fn station_agent_active(cfg: &pancetta_config::network::StationAgentConfig) -> bool {
-    has_relay_config(cfg) && !cfg.tx_allow_list.is_empty()
+///
+/// The cqdx branch matters for Q-0043's steady state: with auto-populate
+/// enabled, the operator deliberately leaves `tx_allow_list` empty in
+/// config (cqdx is the source of truth) — without this branch, this
+/// predicate would (wrongly) say "inactive" even though the poll task will
+/// populate the allow-list moments after the component starts, and the
+/// display feed would never start for the whole process lifetime.
+pub(crate) fn station_agent_active(
+    cfg: &pancetta_config::network::StationAgentConfig,
+    cqdx_cfg: &pancetta_config::network::CqdxConfig,
+) -> bool {
+    let cqdx_will_populate =
+        cqdx_cfg.enabled && cqdx_cfg.token.as_ref().is_some_and(|t| !t.is_empty());
+    has_relay_config(cfg) && (!cfg.tx_allow_list.is_empty() || cqdx_will_populate)
 }
 
 impl super::ApplicationCoordinator {
@@ -1010,6 +1023,15 @@ impl super::ApplicationCoordinator {
         let client_keys = load_client_device_keys(&key_dir, &tx_allow_list);
         let tx_allow_list = Arc::new(std::sync::RwLock::new(tx_allow_list));
         let client_keys = Arc::new(std::sync::RwLock::new(client_keys));
+
+        if !station_agent_active(&cfg, &cqdx_cfg) {
+            warn!(
+                target: "agent",
+                "station agent paired but tx_allow_list is empty and cqdx auto-populate is \
+                 disabled — no client to admit; idle, relay connection never attempted"
+            );
+            return self.spawn_station_agent_drain().await;
+        }
 
         let audit = AuditLog::new(
             cfg.audit_log_path
@@ -3550,5 +3572,44 @@ mod tests {
             HashSet::from(["seed".to_string()]),
             "a failing poll must never clear the pre-seeded allow-list"
         );
+    }
+
+    // --- station_agent_active: cqdx auto-populate OR-branch (Q-0043 review fix) ---
+
+    fn relay_configured_station_agent_cfg() -> pancetta_config::network::StationAgentConfig {
+        pancetta_config::network::StationAgentConfig {
+            enabled: true,
+            relay_url: Some("wss://relay.example.com".to_string()),
+            pairing_api_url: Some("https://relay.example.com/api/v1".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn station_agent_active_true_when_cqdx_will_populate_even_with_empty_static_list() {
+        let mut cfg = relay_configured_station_agent_cfg();
+        cfg.tx_allow_list = vec![];
+        let cqdx_cfg = pancetta_config::network::CqdxConfig {
+            enabled: true,
+            token: Some("pat_test_token_0000000000".to_string()),
+            ..Default::default()
+        };
+        assert!(station_agent_active(&cfg, &cqdx_cfg));
+    }
+
+    #[test]
+    fn station_agent_active_false_when_cqdx_disabled_and_static_list_empty() {
+        let mut cfg = relay_configured_station_agent_cfg();
+        cfg.tx_allow_list = vec![];
+        let cqdx_cfg = pancetta_config::network::CqdxConfig::default(); // disabled by default
+        assert!(!station_agent_active(&cfg, &cqdx_cfg));
+    }
+
+    #[test]
+    fn station_agent_active_true_when_static_list_non_empty_cqdx_disabled() {
+        let mut cfg = relay_configured_station_agent_cfg();
+        cfg.tx_allow_list = vec!["some_client_key".to_string()];
+        let cqdx_cfg = pancetta_config::network::CqdxConfig::default();
+        assert!(station_agent_active(&cfg, &cqdx_cfg));
     }
 }

@@ -144,9 +144,12 @@ second task alongside it:
   edges and this agent's own key, returns the right client-key-id set), the fail-safe
   keep-last-known-good behavior (mocked poll failure), and the cold-start-no-longer-bails change
   (empty initial list still reaches `run_session_loop`).
-- An integration-style test confirming a live update to the shared set is visible to a connected
-  `MultiPeerSession`'s admission check without a reconnect (extends the existing multi-client test
-  scaffolding from the concurrent-multi-client-station-agent work, PR #188).
+- Unit tests for the extended `station_agent_active` predicate (added during final-review follow-up):
+  true when cqdx auto-populate is enabled with a token even though the static `tx_allow_list` is
+  empty, false when cqdx is disabled and the static list is empty, and true when the static list is
+  non-empty regardless of cqdx — this is the actual "does a live cqdx-driven update make the feature
+  visible" coverage this feature ended up needing, since `MultiPeerSession` itself stays out of scope
+  (see §2's "Explicitly deferred" note above).
 
 ### 5. Documentation
 
