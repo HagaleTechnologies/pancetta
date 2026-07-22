@@ -6,9 +6,9 @@
 > findings are historical: Symptom A (rearm coordination), Symptom B (collection-window
 > timestamp), BUG 1 (CQ parity latch), and the GAP-1/GAP-2 early-close/rearm-rung arms
 > were all fixed at the time this analysis was written (PRs #80/#81/#82, referenced
-> below). Symptom C (multi-TX slow-start) is still open — see
-> `project_symptom_c_multi_tx_deferred` in the assistant's memory or the code comment at
-> `coordinator/tx.rs`'s `COALESCE_COLLECT_WINDOW_MS`. For anything else, trust the newer
+> below). Symptom C (multi-TX slow-start) was resolved 2026-07-21 — see
+> `project_symptom_c_multi_tx_deferred` in the assistant's memory (historical) or
+> `docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md` for the fix. For anything else, trust the newer
 > review; this file is kept for historical context only.
 
 A deep pass over pancetta's autonomous QSO handling: (A) state-machine correctness for
@@ -196,6 +196,15 @@ collection window to the **slot boundary** (drain everything queued up to `slot_
 ptt_lead`) rather than first-pickup + 800 ms, so any pick made during the current slot
 batches into the upcoming TX. Option (a)/(b) also removes the unconditional 800 ms sleep
 driving Symptom B.
+
+**Resolved 2026-07-21** — see
+`docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md` and
+`docs/superpowers/plans/2026-07-21-symptom-c-adaptive-coalesce-window.md`. Implemented option
+closest to (b) above: the fixed 800ms collection window now extends adaptively while the queue
+keeps growing, capped by remaining `tx_late_max_ms` headroom and a protocol-scaled ceiling, instead
+of a single fixed sleep. A folded-in timing-accuracy fix (refreshing the audio pad/cursor math
+against real time immediately before PTT, rather than the frozen pre-coalesce timestamp) prevents
+the wider window from growing an existing, previously-unaddressed audio-alignment drift.
 
 ---
 

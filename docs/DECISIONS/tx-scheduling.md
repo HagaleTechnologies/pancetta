@@ -48,6 +48,41 @@ Full findings + rationale: `docs/qso-tx-deep-review-2026-07-18.md`. Scheduling/a
 - **Batch 3** (frequency allocator correctness): the spectral snapshot fed to `SmartFrequencyAllocator` was mislabeled `freq_min_hz: 200.0` while the real waterfall bins start at 0 Hz, so every score read spectral data from the wrong bin by ~100-200 Hz — fixed to `0.0`. Decode-history occupancy was stamped with the wall clock at feed time instead of each message's own decoded `slot_parity`, inverting per-slot occupancy near a tick boundary — fixed to use the message's own parity. The "partially clear" scoring term used `15.0_f64.max(25.0 - activity*5.0)`, which clamps UP so a heavily-busy bin scored the same as a lightly-busy one — fixed to floor at 0. `register_qso_frequency`/`release_qso_frequency` were only ever called from unit tests, so the own-frequency-separation criterion could never fire in production — a new coordinator-level `active_tx_offsets` snapshot (mirroring `active_tx_qsos`'s own insert/remove points) is now synced into the allocator every autonomous tick via a bulk-replace `set_own_frequencies`. The autonomous pounce path and the always-on `maybe_answer_caller` path both latched a raw Tx=Rx candidate with no de-confliction against other active streams — both now run through the same `compute_manual_tx_offset`/`deconflict_offset` the manual path already used (a no-op when nothing collides).
 - **Batch 5** (`6927e02c`/`41a8d8da`): frequency scoring gained parity-awareness — `rank_candidates_with_parity` weights clearness in the slot we'd actually transmit in far more heavily than the DX's own (irrelevant) listening window, wired end-to-end from the pounce path's known DX parity (`target_parity: None` degrades byte-identically for the self-CQ path, which can't commit to one slot at scoring time). The previously-dead `TuiCommand::FindClearOffset` (`t` key) now actually commits a real held offset via the same path the `o` modal uses, preferring the authoritative placement snapshot.
 
+## Symptom C — adaptive coalesce window + timing-accuracy fix (2026-07-21)
+
+`coordinator/tx.rs`: closes the residual gap left by the 2026-06-27 fix above (see "Multi-TX
+slow-start fix" section) — the fixed `COALESCE_COLLECT_WINDOW_MS` (800ms) window still couldn't
+batch serial manual keypresses realistically spaced 1-3s apart, so a pileup's siblings still
+trickled in one-per-cycle via keep-call rearm instead of joining the first window. Confirmed still
+open as of the 2026-07-18 deep review. Fix: the collection window now takes the same 800ms base
+wait once, unconditionally (byte-identical to before for the common lone-request case), then
+extends in further base-length increments only while the channel's queued-message count keeps
+growing, capped by remaining `tx_late_max_ms` headroom (so a request already late in its slot
+extends little or not at all) and a protocol-scaled ceiling (`COALESCE_MAX_EXTENSION_MS = 3000`ms
+FT8-baseline, scaled like `coalesce_collect_window_ms`). Does not modify
+`coalesce_backlog_into`/`coalesce_transmit_requests` — only how long the worker waits before that
+existing drain runs once.
+
+**Folded-in timing-accuracy fix:** tracing what happens downstream of `schedule_tx` found that its
+`cursor_offset_samples`/`silent_pad_samples` (computed once, at Step 2, from the frozen
+`request_received_at`) implicitly assumed audio ships immediately relative to that timestamp — but
+for the common current-slot case, `target_slot` is already in the past, so the Step-6 slot-wait is a
+no-op and audio actually ships whenever the worker reaches Step 7, i.e. `request_received_at` plus
+however long the collection window, encoding, and gate checks actually took. That gap was small
+(~800ms) and already-tolerated in production before this fix, but the wider adaptive window would
+have grown it proportionally. Fix: `schedule_tx`'s pad/cursor math was split into a standalone
+`pad_and_cursor_for_target(now, target_slot, sample_rate)` helper; both TX-worker arms now refresh
+just the pad/cursor (never `target_slot`/`deferred` — that decision is made exactly once, per
+Symptom B's existing protection) against a freshly-read clock immediately before PTT (Step 5),
+using the already-decided `target_slot`. The single-TX arm's existing late-pivot logic (Step 4c)
+needed no changes — it already reused `schedule`'s pad/cursor fields, so refreshing them in place
+was sufficient. The multi-TX arm's fast-path/rebuild branching (from the double-73/SM2LIY-C6AVD
+incident fix, PR #167) is unchanged in its own logic — only where the final audio trim happens
+moved, from inside that branching to a single point right before Step 5.
+
+Spec: `docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md`. Plan:
+`docs/superpowers/plans/2026-07-21-symptom-c-adaptive-coalesce-window.md`.
+
 ## Coordinator-level QSO sim harness
 
 `pancetta/tests/coord_sim.rs`: a durable, reusable `CoordSim` fixture that exercises the *coordinator's* TX gate + mock-rig PTT + multi-stream path, complementing the engine-level state-machine harness in `pancetta-qso/src/sim.rs`. It stands up a real `MessageBus`, a real `QsoManager`, a real `MockRig` behind a hamlib consumer (mirror of `coordinator/hamlib.rs`'s `SetPtt` handling), and the *real* shared `active_tx_qsos` set + `tx_policy` atomic. A scenario starts/advances QSOs via the manager's real entry points (`respond_to_cq_with` / `respond_to_caller` / `start_cq`), calls `pump_qso_events()` (a faithful mirror of `coordinator/qso.rs`'s populater — insert on `StateChanged→active`/`QsoCompleted`, remove on `Failed`/`QsoFailed`, forward `MessageToSend`→`TransmitRequest`), then `drive_slot(pending)` which replicates the worker's keying-decision chain — **policy hard-mute → coalesce (real `coalesce_transmit_requests`) → Step-4b gate (real `tx_qso_is_live` over the real set) → key/audio/unkey** — sending real `RigControl(SetPtt)` over the bus to the mock rig and **asserting at the rig level** (`mock.get_ptt() == On`, offset, release). **Determinism**: no `schedule_tx` UTC math and no slot sleep (that's unit-tested in `tx.rs::schedule_tx_tests`); only bounded ms `await`s — pass/fail never depends on wall-clock slot phase. A `Timeline` (keyed / dropped / per-slot offsets, mirroring `sim::Timeline`'s style + Display) carries the readable assertion helpers. Permanent scenarios: PTT-keys-for-scheduled-QSO (StateChanged-at-start fix), stale-TX-dropped-after-supersede (no PTT), coalesce-backlog (newest wins, older not keyed), two-simultaneous-QSOs on distinct freqs, TX-policy Disabled=silent / RespondOnly=in-progress-keys-but-initiation-suppressed / Full=keys, requested-offset-honored, manual-send-never-gated. Made testable by re-exporting `coalesce_transmit_requests` / `CoalesceEntry` / `resolve_required_parity` and widening `active_tx_qso_key` / `tx_qso_is_live` to `pub` from `coordinator/mod.rs` (visibility-only, behavior-preserving).
