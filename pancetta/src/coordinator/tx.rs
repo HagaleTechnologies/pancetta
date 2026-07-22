@@ -2801,7 +2801,7 @@ impl super::ApplicationCoordinator {
                                         slot_ns,
                                     );
 
-                                    let schedule = schedule_tx(
+                                    let mut schedule = schedule_tx(
                                         request_received_at,
                                         required_parity,
                                         tx_late_max_ms,
@@ -3040,46 +3040,18 @@ impl super::ApplicationCoordinator {
                                         (items, samples, item_texts, encoded_qso_ids)
                                     };
 
-                                    // --- Step 3: Build the audio buffer ---
-                                    let mut audio_out: Vec<f32> = Vec::with_capacity(
-                                        schedule.silent_pad_samples + samples.len(),
-                                    );
-                                    audio_out.resize(schedule.silent_pad_samples, 0.0f32);
-                                    if schedule.cursor_offset_samples < samples.len() {
-                                        audio_out.extend_from_slice(
-                                            &samples[schedule.cursor_offset_samples..],
-                                        );
-                                    } else {
-                                        warn!("schedule_tx cursor exceeded multi-TX waveform; skipping");
-                                        for (text, qso_id) in
-                                            item_texts.iter().zip(encoded_qso_ids.iter())
-                                        {
-                                            emit_tx_failure_diagnostic(
-                                                &message_bus,
-                                                qso_id.as_deref(),
-                                                text,
-                                                "internal scheduling error (cursor exceeded multi-TX waveform)",
-                                            )
-                                            .await;
-                                        }
-                                        for text in item_texts {
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: text,
-                                                    duration_ms: 0,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
-                                        }
-                                        continue;
-                                    }
-                                    let audio_duration_ms =
-                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
-                                            as u64;
+                                    // --- Step 3 (deferred): the audio buffer is now
+                                    // built once, fresh, immediately before Step 5 —
+                                    // see the new block right before "--- Step 5:
+                                    // Assert PTT ---" below. `samples` (Step 1's raw,
+                                    // untrimmed multi-tone waveform) is carried forward
+                                    // as `raw_samples` for the fast path in the
+                                    // Step 4b/4b-pivot resolution below; the "cursor
+                                    // exceeded waveform" defensive check now happens
+                                    // once, at the final trim point, against whichever
+                                    // buffer (fast-path or rebuilt) is actually about
+                                    // to be sent.
+                                    let raw_samples = samples;
 
                                     // --- Step 4: Sleep until PTT engage instant ---
                                     let ptt_target_utc = schedule.target_slot
@@ -3217,37 +3189,32 @@ impl super::ApplicationCoordinator {
                                         })
                                         .collect();
 
-                                    // `encoded_qso_ids` isn't consulted again after this
-                                    // point (Step 5+ only needs `items`/`item_texts`), but
-                                    // it's rebound alongside the rest for symmetry with the
-                                    // pre-Step-4b bindings.
-                                    let (
-                                        items,
-                                        audio_out,
-                                        item_texts,
-                                        _encoded_qso_ids,
-                                        audio_duration_ms,
-                                    ) = if live_mask.iter().all(|&live| live) && pivots.is_empty() {
-                                        // Fast path: nothing went stale.
-                                        (
-                                            items,
-                                            audio_out,
-                                            item_texts,
-                                            encoded_qso_ids,
-                                            audio_duration_ms,
-                                        )
-                                    } else {
-                                        // Partial staleness: report the dropped item(s), then
-                                        // re-encode just the still-live subset.
-                                        for (item, &live) in items.iter().zip(live_mask.iter()) {
-                                            if !live {
-                                                info!(
-                                                    target: "pancetta::tx.policy",
-                                                    "dropping stale multi-TX item at key-time for ended QSO {}: '{}'",
-                                                    item.qso_id.as_deref().unwrap_or("?"),
-                                                    item.message_text
-                                                );
-                                                emit_diagnostic(
+                                    // `encoded_qso_ids` is rebound alongside the rest as
+                                    // `encoded_qso_ids_final`; it IS consulted again — the
+                                    // final trim's defensive "cursor exceeded waveform"
+                                    // check (right before Step 5) emits per-item failure
+                                    // diagnostics keyed by these ids.
+                                    let (items, raw_samples, item_texts, encoded_qso_ids_final) =
+                                        if live_mask.iter().all(|&live| live) && pivots.is_empty() {
+                                            // Fast path: nothing went stale, nothing
+                                            // pivoted — carry the ORIGINAL Step-1
+                                            // waveform forward untrimmed; the final
+                                            // trim happens once, fresh, right before
+                                            // Step 5 below.
+                                            (items, raw_samples, item_texts, encoded_qso_ids)
+                                        } else {
+                                            // Partial staleness: report the dropped item(s), then
+                                            // re-encode just the still-live subset.
+                                            for (item, &live) in items.iter().zip(live_mask.iter())
+                                            {
+                                                if !live {
+                                                    info!(
+                                                        target: "pancetta::tx.policy",
+                                                        "dropping stale multi-TX item at key-time for ended QSO {}: '{}'",
+                                                        item.qso_id.as_deref().unwrap_or("?"),
+                                                        item.message_text
+                                                    );
+                                                    emit_diagnostic(
                                                         &message_bus,
                                                         "tx.policy",
                                                         pancetta_core::DiagnosticLevel::Info,
@@ -3258,6 +3225,46 @@ impl super::ApplicationCoordinator {
                                                         item.qso_id.as_deref(),
                                                     )
                                                     .await;
+                                                    let complete_msg = ComponentMessage::new(
+                                                        ComponentId::Ft8Transmitter,
+                                                        ComponentId::Autonomous,
+                                                        MessageType::TransmitComplete {
+                                                            success: false,
+                                                            message_text: item.message_text.clone(),
+                                                            duration_ms: 0,
+                                                        },
+                                                        Instant::now(),
+                                                    );
+                                                    let _ = message_bus
+                                                        .send_message(complete_msg)
+                                                        .await;
+                                                }
+                                            }
+
+                                            let live_items: Vec<
+                                                crate::message_bus::TransmitRequestItem,
+                                            > = items
+                                                .iter()
+                                                .zip(live_mask.iter())
+                                                .filter(|(_, &live)| live)
+                                                .map(|(item, _)| item.clone())
+                                                .collect();
+
+                                            let rebuild = encode_and_modulate_multi_tx(
+                                                &mut encoder,
+                                                active_protocol,
+                                                &tx_params,
+                                                &live_items,
+                                            );
+
+                                            for item in &rebuild.encode_failed {
+                                                emit_tx_failure_diagnostic(
+                                                    &message_bus,
+                                                    item.qso_id.as_deref(),
+                                                    &item.message_text,
+                                                    "key-time re-encode error",
+                                                )
+                                                .await;
                                                 let complete_msg = ComponentMessage::new(
                                                     ComponentId::Ft8Transmitter,
                                                     ComponentId::Autonomous,
@@ -3271,61 +3278,23 @@ impl super::ApplicationCoordinator {
                                                 let _ =
                                                     message_bus.send_message(complete_msg).await;
                                             }
-                                        }
 
-                                        let live_items: Vec<
-                                            crate::message_bus::TransmitRequestItem,
-                                        > = items
-                                            .iter()
-                                            .zip(live_mask.iter())
-                                            .filter(|(_, &live)| live)
-                                            .map(|(item, _)| item.clone())
-                                            .collect();
+                                            let rebuilt_texts = rebuild.item_texts;
+                                            let rebuilt_qso_ids = rebuild.encoded_qso_ids;
 
-                                        let rebuild = encode_and_modulate_multi_tx(
-                                            &mut encoder,
-                                            active_protocol,
-                                            &tx_params,
-                                            &live_items,
-                                        );
-
-                                        for item in &rebuild.encode_failed {
-                                            emit_tx_failure_diagnostic(
-                                                &message_bus,
-                                                item.qso_id.as_deref(),
-                                                &item.message_text,
-                                                "key-time re-encode error",
-                                            )
-                                            .await;
-                                            let complete_msg = ComponentMessage::new(
-                                                ComponentId::Ft8Transmitter,
-                                                ComponentId::Autonomous,
-                                                MessageType::TransmitComplete {
-                                                    success: false,
-                                                    message_text: item.message_text.clone(),
-                                                    duration_ms: 0,
-                                                },
-                                                Instant::now(),
-                                            );
-                                            let _ = message_bus.send_message(complete_msg).await;
-                                        }
-
-                                        let rebuilt_texts = rebuild.item_texts;
-                                        let rebuilt_qso_ids = rebuild.encoded_qso_ids;
-
-                                        let new_samples = match rebuild.samples {
-                                            Ok(s) => s,
-                                            Err(reason) => {
-                                                if !rebuilt_texts.is_empty() {
-                                                    warn!(
-                                                        "Key-time re-modulation failed: {}",
-                                                        reason
-                                                    );
-                                                    for (text, qso_id) in rebuilt_texts
-                                                        .iter()
-                                                        .zip(rebuilt_qso_ids.iter())
-                                                    {
-                                                        emit_tx_failure_diagnostic(
+                                            let new_samples = match rebuild.samples {
+                                                Ok(s) => s,
+                                                Err(reason) => {
+                                                    if !rebuilt_texts.is_empty() {
+                                                        warn!(
+                                                            "Key-time re-modulation failed: {}",
+                                                            reason
+                                                        );
+                                                        for (text, qso_id) in rebuilt_texts
+                                                            .iter()
+                                                            .zip(rebuilt_qso_ids.iter())
+                                                        {
+                                                            emit_tx_failure_diagnostic(
                                                             &message_bus,
                                                             qso_id.as_deref(),
                                                             text,
@@ -3334,92 +3303,47 @@ impl super::ApplicationCoordinator {
                                                             ),
                                                         )
                                                         .await;
+                                                        }
                                                     }
+                                                    send_tx_queue_status(
+                                                        &message_bus,
+                                                        None,
+                                                        Vec::new(),
+                                                    )
+                                                    .await;
+                                                    for text in rebuilt_texts {
+                                                        let complete_msg = ComponentMessage::new(
+                                                            ComponentId::Ft8Transmitter,
+                                                            ComponentId::Autonomous,
+                                                            MessageType::TransmitComplete {
+                                                                success: false,
+                                                                message_text: text,
+                                                                duration_ms: 0,
+                                                            },
+                                                            Instant::now(),
+                                                        );
+                                                        let _ = message_bus
+                                                            .send_message(complete_msg)
+                                                            .await;
+                                                    }
+                                                    continue;
                                                 }
-                                                send_tx_queue_status(
-                                                    &message_bus,
-                                                    None,
-                                                    Vec::new(),
-                                                )
-                                                .await;
-                                                for text in rebuilt_texts {
-                                                    let complete_msg = ComponentMessage::new(
-                                                        ComponentId::Ft8Transmitter,
-                                                        ComponentId::Autonomous,
-                                                        MessageType::TransmitComplete {
-                                                            success: false,
-                                                            message_text: text,
-                                                            duration_ms: 0,
-                                                        },
-                                                        Instant::now(),
-                                                    );
-                                                    let _ = message_bus
-                                                        .send_message(complete_msg)
-                                                        .await;
-                                                }
-                                                continue;
-                                            }
+                                            };
+
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "multi-TX bundle re-encoded at key-time: {} of {} item(s) still live",
+                                                rebuilt_texts.len(),
+                                                items.len()
+                                            );
+
+                                            (
+                                                live_items,
+                                                new_samples,
+                                                rebuilt_texts,
+                                                rebuilt_qso_ids,
+                                            )
                                         };
-
-                                        if schedule.cursor_offset_samples >= new_samples.len() {
-                                            warn!("schedule_tx cursor exceeded rebuilt multi-TX waveform at key-time; dropping");
-                                            for (text, qso_id) in
-                                                rebuilt_texts.iter().zip(rebuilt_qso_ids.iter())
-                                            {
-                                                emit_tx_failure_diagnostic(
-                                                    &message_bus,
-                                                    qso_id.as_deref(),
-                                                    text,
-                                                    "internal scheduling error (cursor exceeded rebuilt multi-TX waveform)",
-                                                )
-                                                .await;
-                                            }
-                                            send_tx_queue_status(&message_bus, None, Vec::new())
-                                                .await;
-                                            for text in rebuilt_texts {
-                                                let complete_msg = ComponentMessage::new(
-                                                    ComponentId::Ft8Transmitter,
-                                                    ComponentId::Autonomous,
-                                                    MessageType::TransmitComplete {
-                                                        success: false,
-                                                        message_text: text,
-                                                        duration_ms: 0,
-                                                    },
-                                                    Instant::now(),
-                                                );
-                                                let _ =
-                                                    message_bus.send_message(complete_msg).await;
-                                            }
-                                            continue;
-                                        }
-
-                                        let mut new_audio_out = Vec::with_capacity(
-                                            schedule.silent_pad_samples + new_samples.len(),
-                                        );
-                                        new_audio_out.resize(schedule.silent_pad_samples, 0.0f32);
-                                        new_audio_out.extend_from_slice(
-                                            &new_samples[schedule.cursor_offset_samples..],
-                                        );
-                                        let new_audio_duration_ms = (new_audio_out.len() as f64
-                                            / sample_rate as f64
-                                            * 1000.0)
-                                            as u64;
-
-                                        info!(
-                                            target: "pancetta::tx.policy",
-                                            "multi-TX bundle re-encoded at key-time: {} of {} item(s) still live",
-                                            rebuilt_texts.len(),
-                                            items.len()
-                                        );
-
-                                        (
-                                            live_items,
-                                            new_audio_out,
-                                            rebuilt_texts,
-                                            rebuilt_qso_ids,
-                                            new_audio_duration_ms,
-                                        )
-                                    };
 
                                     // --- Step 4b-arm: re-check the remote-TX arm at the
                                     // last instant before keying (mirrors the single-TX
@@ -3467,6 +3391,72 @@ impl super::ApplicationCoordinator {
                                     for (qso_key, new_text) in pivots {
                                         pivoted_once.insert(qso_key, new_text);
                                     }
+
+                                    // --- Step 3 (final): build the audio buffer,
+                                    // refreshed against real time ---
+                                    // Mirrors the single-TX arm's equivalent block
+                                    // (tx.rs Task 3). request_received_at (Step 2)
+                                    // already decided WHICH slot to target and
+                                    // whether to defer — never re-derived here.
+                                    // raw_samples is whatever the fast-path/rebuild
+                                    // resolution above produced (untrimmed); trim it
+                                    // ONCE here, against a freshly-read clock and the
+                                    // already-decided schedule.target_slot, so the
+                                    // transmitted waveform stays aligned to the real
+                                    // FT8 slot grid regardless of how long the steps
+                                    // above (adaptive coalesce window, encoding,
+                                    // possible key-time re-encode) took. See
+                                    // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §2.
+                                    let (fresh_pad_samples, fresh_cursor_samples) =
+                                        pad_and_cursor_for_target(
+                                            chrono::Utc::now(),
+                                            schedule.target_slot,
+                                            sample_rate,
+                                        );
+                                    schedule.silent_pad_samples = fresh_pad_samples;
+                                    schedule.cursor_offset_samples = fresh_cursor_samples;
+
+                                    if schedule.cursor_offset_samples >= raw_samples.len() {
+                                        warn!("schedule_tx cursor exceeded multi-TX waveform at key-time; dropping");
+                                        for (text, qso_id) in
+                                            item_texts.iter().zip(encoded_qso_ids_final.iter())
+                                        {
+                                            emit_tx_failure_diagnostic(
+                                                &message_bus,
+                                                qso_id.as_deref(),
+                                                text,
+                                                "internal scheduling error (cursor exceeded multi-TX waveform at key-time)",
+                                            )
+                                            .await;
+                                        }
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for text in item_texts {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: text,
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+
+                                    let mut audio_out = Vec::with_capacity(
+                                        schedule.silent_pad_samples + raw_samples.len()
+                                            - schedule.cursor_offset_samples,
+                                    );
+                                    audio_out.resize(schedule.silent_pad_samples, 0.0f32);
+                                    audio_out.extend_from_slice(
+                                        &raw_samples[schedule.cursor_offset_samples..],
+                                    );
+                                    let audio_duration_ms =
+                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
+                                            as u64;
 
                                     // --- Step 5: Assert PTT ---
                                     let mut ptt_guard = PttGuard::new(
