@@ -200,6 +200,26 @@ impl CqdxClient {
         Ok(body.groups)
     }
 
+    /// Fetch this operator's live authorization edges (dispensa Q-0043 —
+    /// feeds pancetta's station-agent `tx_allow_list` auto-populate). Unlike
+    /// `fetch_needed_grids`, a 404 is NOT treated as "empty is fine" — it
+    /// propagates as a genuine error via `check_status`, since an
+    /// accidentally-empty allow-list here would revoke every connected
+    /// client rather than being a harmless missing-feature default.
+    pub async fn fetch_authorizations(&self) -> Result<Vec<AuthorizationEdge>> {
+        let url = format!("{}/api/v1/authorizations", self.base_url);
+        debug!("Fetching authorizations from {}", url);
+        let resp = self
+            .http
+            .get(&url)
+            .bearer_auth(self.token.expose_secret())
+            .send()
+            .await?;
+        let resp = self.check_status(resp).await?;
+        let body: AuthorizationsResponse = self.checked_json(resp).await?;
+        Ok(body.authorization_edges)
+    }
+
     pub async fn report_spots(&self, spots: Vec<SpotReport>) -> Result<()> {
         let url = format!("{}/api/v1/spots/report", self.base_url);
         debug!("Reporting {} spots to {}", spots.len(), url);
@@ -624,6 +644,81 @@ mod tests {
         assert_eq!(groups[0].rarity_rank, Some(1));
         assert_eq!(groups[0].reporter_count, 5);
         assert_eq!(groups[0].best_snr, Some(-12));
+    }
+
+    #[tokio::test]
+    async fn test_fetch_authorizations() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/authorizations"))
+            .and(header("Authorization", "Bearer pat_test_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorization_edges": [{
+                    "id": "auth_1",
+                    "agentKeyId": "agent_abc",
+                    "clientKeyId": "client_xyz",
+                    "scopes": ["status", "qsy"],
+                    "createdAt": "2026-07-20T00:00:00Z"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let edges = client.fetch_authorizations().await.unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].agent_key_id, "agent_abc");
+        assert_eq!(edges[0].client_key_id, "client_xyz");
+        assert_eq!(edges[0].scopes, vec!["status", "qsy"]);
+    }
+
+    #[tokio::test]
+    async fn test_fetch_authorizations_empty() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/authorizations"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(serde_json::json!({ "authorization_edges": [] })),
+            )
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let edges = client.fetch_authorizations().await.unwrap();
+        assert!(edges.is_empty());
+    }
+
+    /// A 404 is a genuine error here, NOT treated as "empty is fine" the way
+    /// `fetch_needed_grids` treats a missing endpoint — see this file's
+    /// Global Constraints note on why that distinction matters for an
+    /// allow-list-feeding endpoint.
+    #[tokio::test]
+    async fn test_fetch_authorizations_404_is_an_error() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/authorizations"))
+            .respond_with(ResponseTemplate::new(404))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let result = client.fetch_authorizations().await;
+        assert!(result.is_err(), "404 must propagate as an error, not Ok(vec![])");
+    }
+
+    #[tokio::test]
+    async fn test_fetch_authorizations_401_is_unauthorized() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/authorizations"))
+            .respond_with(ResponseTemplate::new(401))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let result = client.fetch_authorizations().await;
+        assert!(matches!(result, Err(CqdxError::Unauthorized)));
     }
 
     #[tokio::test]
