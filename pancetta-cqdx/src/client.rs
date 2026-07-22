@@ -704,7 +704,10 @@ mod tests {
 
         let client = test_client(&server.uri());
         let result = client.fetch_authorizations().await;
-        assert!(result.is_err(), "404 must propagate as an error, not Ok(vec![])");
+        assert!(
+            result.is_err(),
+            "404 must propagate as an error, not Ok(vec![])"
+        );
     }
 
     #[tokio::test]

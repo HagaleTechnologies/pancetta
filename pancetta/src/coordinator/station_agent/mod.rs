@@ -2555,7 +2555,10 @@ mod tests {
         // B (PEER_B) as a SECOND allow-listed, established peer with its OWN
         // device key — a genuinely admitted second client, not a bare claim.
         let mut ctx = ctx_with(true, true);
-        ctx.tx_allow_list.write().unwrap().insert(PEER_B.to_string());
+        ctx.tx_allow_list
+            .write()
+            .unwrap()
+            .insert(PEER_B.to_string());
         ctx.client_keys
             .write()
             .unwrap()
@@ -2806,7 +2809,10 @@ mod tests {
             let identity = AgentIdentity::generate();
             let mut ctx = ctx_with(true, true);
             // B must be allow-listed so MultiPeerSession admits it.
-            ctx.tx_allow_list.write().unwrap().insert(PEER_B.to_string());
+            ctx.tx_allow_list
+                .write()
+                .unwrap()
+                .insert(PEER_B.to_string());
             with_consent(&ctx, true);
             let bus = MessageBus::new(64).unwrap();
             dispatch_action(
