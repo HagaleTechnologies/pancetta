@@ -90,6 +90,78 @@ fn coalesce_collect_window_ms(protocol: pancetta_ft8::Protocol) -> u64 {
     ((COALESCE_COLLECT_WINDOW_MS as f64) * (cycle / FT8_CYCLE_SECS)).round() as u64
 }
 
+/// FT8-baseline cap on total EXTENSION time (beyond the mandatory base
+/// `COALESCE_COLLECT_WINDOW_MS` wait) the Symptom-C adaptive coalesce window
+/// may add. Scaled by the same cycle-ratio as `coalesce_collect_window_ms`
+/// for FT4/FT2. Independent of `tx_late_max_ms` — the remaining-headroom cap
+/// computed in `adaptive_coalesce_cap_ms` already bounds against that; this
+/// is a second, protocol-proportionate ceiling so a busy pileup can't
+/// monopolize an outsized fraction of a short FT4/FT2 slot even when
+/// tx_late_max_ms headroom alone would allow it (tx_late_max_ms itself isn't
+/// mode-scaled today — a separately tracked open question, not addressed by
+/// this change). See
+/// docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §1.
+const COALESCE_MAX_EXTENSION_MS: u64 = 3000;
+
+/// Safety margin subtracted from remaining `tx_late_max_ms` headroom before
+/// it's used as the adaptive window's extension cap. Covers Step 1's
+/// encode/modulate time and other fixed per-message overhead between
+/// `request_received_at` and the actual coalesce point, none of which is
+/// otherwise accounted for in the headroom math — without this margin, a
+/// request that arrives with headroom just barely covering the extension
+/// alone could still get pushed past the `tx_late_max_ms` cliff by that
+/// extra overhead.
+const COALESCE_CAP_SAFETY_MARGIN_MS: u64 = 500;
+
+/// Protocol-scaled `COALESCE_MAX_EXTENSION_MS` — see that constant's doc.
+fn coalesce_max_extension_ms(protocol: pancetta_ft8::Protocol) -> u64 {
+    const FT8_CYCLE_SECS: f64 = 15.0;
+    let cycle = pancetta_ft8::ProtocolParams::from_protocol(protocol).cycle_duration;
+    ((COALESCE_MAX_EXTENSION_MS as f64) * (cycle / FT8_CYCLE_SECS)).round() as u64
+}
+
+/// Remaining `tx_late_max_ms` headroom, in ms, available to extend the
+/// Symptom-C adaptive coalesce window for the given head request — bounds
+/// the window so it can never push a request past the late-skip cliff.
+/// Returns the full (protocol-scaled) `COALESCE_MAX_EXTENSION_MS` when the
+/// head has already resolved to a DEFERRED (next-slot) target, since
+/// there's no current-slot cliff to protect in that case, and `0` if `head`
+/// isn't a `TransmitRequest` (defensive — the only caller checks this
+/// first).
+fn adaptive_coalesce_cap_ms(
+    head: &MessageType,
+    request_received_at: chrono::DateTime<chrono::Utc>,
+    tx_self_parity: pancetta_config::station::TxSelfParity,
+    tx_late_max_ms: u64,
+    sample_rate: u32,
+    slot_ns: i64,
+    protocol: pancetta_ft8::Protocol,
+) -> u64 {
+    let MessageType::TransmitRequest { tx_parity, .. } = head else {
+        return 0;
+    };
+    let required_parity =
+        resolve_required_parity(*tx_parity, tx_self_parity, request_received_at, slot_ns);
+    let probe = schedule_tx(
+        request_received_at,
+        required_parity,
+        tx_late_max_ms,
+        sample_rate,
+        slot_ns,
+    );
+    let protocol_ceiling = coalesce_max_extension_ms(protocol);
+    if probe.deferred {
+        return protocol_ceiling;
+    }
+    let elapsed_in_slot_ms = (request_received_at - probe.target_slot)
+        .num_milliseconds()
+        .max(0) as u64;
+    let headroom = tx_late_max_ms
+        .saturating_sub(elapsed_in_slot_ms)
+        .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS);
+    headroom.min(protocol_ceiling)
+}
+
 /// Output of `schedule_tx`: where to TX, how much silence to pad in
 /// front, and how far into the modulated waveform to start emitting.
 #[derive(Debug, Clone, Copy)]
@@ -226,6 +298,55 @@ async fn interruptible_sleep(
         sleep(remaining.min(chunk)).await;
     }
     false
+}
+
+#[cfg(test)]
+mod interruptible_sleep_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn returns_false_and_waits_full_duration_when_not_aborted() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let start = tokio::time::Instant::now();
+        let aborted = interruptible_sleep(Duration::from_millis(100), &shutdown, &abort).await;
+        assert!(!aborted);
+        assert!(start.elapsed() >= Duration::from_millis(100));
+    }
+
+    #[tokio::test]
+    async fn returns_true_promptly_when_abort_flips_mid_sleep() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let abort_clone = abort.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            abort_clone.store(true, Ordering::Release);
+        });
+        let start = tokio::time::Instant::now();
+        let aborted = interruptible_sleep(Duration::from_secs(5), &shutdown, &abort).await;
+        assert!(aborted);
+        // Should wake within the ~50ms poll granularity of when the flag flipped
+        // (flag flips at ~20ms), not wait out the full 5s sleep.
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    #[tokio::test]
+    async fn returns_true_promptly_when_shutdown_flips_mid_sleep() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            shutdown_clone.store(true, Ordering::Release);
+        });
+        let start = tokio::time::Instant::now();
+        let aborted = interruptible_sleep(Duration::from_secs(5), &shutdown, &abort).await;
+        assert!(aborted);
+        assert!(start.elapsed() < Duration::from_millis(200));
+    }
 }
 
 /// Guard that sends PTT-off when dropped, ensuring PTT is released
@@ -1437,19 +1558,95 @@ impl super::ApplicationCoordinator {
                             // back to exactly that one request — normal path
                             // unchanged.
                             if matches!(message.message_type, MessageType::TransmitRequest { .. }) {
-                                // Brief collection window so same-parity openings
-                                // started in quick succession (serial manual
-                                // keypresses, each crossing async hops) all arrive
-                                // before we coalesce — otherwise the first opening
-                                // commits the slot alone and siblings trickle in
-                                // one-per-cycle (the "slow-start" bug). Absorbed by
-                                // the Step-6 slot-wait, so no real added latency.
-                                // See COALESCE_COLLECT_WINDOW_MS /
-                                // coalesce_collect_window_ms (FT4/FT2-scaled).
-                                tokio::time::sleep(Duration::from_millis(
-                                    coalesce_collect_window_ms(active_protocol),
-                                ))
-                                .await;
+                                // Adaptive collection window (Symptom C fix): take
+                                // the base wait once, unconditionally (same as
+                                // before — this is the byte-identical baseline for
+                                // the common lone-request case), then extend in
+                                // further base-length increments ONLY while the
+                                // channel's queued-message count keeps growing,
+                                // capped by remaining tx_late_max_ms headroom and a
+                                // protocol-scaled ceiling. Never modifies
+                                // coalesce_backlog_into/coalesce_transmit_requests
+                                // — this only decides how long to wait before that
+                                // existing, unmodified drain runs once. See
+                                // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §1.
+                                let base_wait_ms = coalesce_collect_window_ms(active_protocol);
+                                let queue_len_before_base = tx_rx.len();
+                                if interruptible_sleep(
+                                    Duration::from_millis(base_wait_ms),
+                                    &shutdown,
+                                    &abort_current_tx,
+                                )
+                                .await
+                                {
+                                    if shutdown.load(Ordering::Acquire) {
+                                        info!("TX aborted during collection window by shutdown");
+                                        break;
+                                    }
+                                    info!("TX aborted during collection window by operator (F8)");
+                                    send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                    continue;
+                                }
+
+                                let extension_cap_ms = adaptive_coalesce_cap_ms(
+                                    &message.message_type,
+                                    request_received_at,
+                                    tx_self_parity,
+                                    tx_late_max_ms,
+                                    sample_rate,
+                                    active_slot_ns.load(Ordering::Relaxed),
+                                    active_protocol,
+                                );
+                                let mut extended_ms: u64 = 0;
+                                let mut prev_len = tx_rx.len();
+                                // `aborted` is set instead of `continue`/`break`-ing
+                                // directly inside the loop: an unlabeled `continue`
+                                // here would target this `while`, not the outer
+                                // worker loop, which would wrongly resume
+                                // extending after an operator abort instead of
+                                // abandoning this TX attempt. Checking the flag
+                                // once after the loop, exactly as done for every
+                                // other single-sleep abort site in this worker,
+                                // avoids that.
+                                let mut aborted = false;
+                                while prev_len > queue_len_before_base
+                                    && extended_ms < extension_cap_ms
+                                {
+                                    let this_wait =
+                                        base_wait_ms.min(extension_cap_ms - extended_ms);
+                                    if interruptible_sleep(
+                                        Duration::from_millis(this_wait),
+                                        &shutdown,
+                                        &abort_current_tx,
+                                    )
+                                    .await
+                                    {
+                                        aborted = true;
+                                        break;
+                                    }
+                                    extended_ms += this_wait;
+                                    let new_len = tx_rx.len();
+                                    if new_len <= prev_len {
+                                        // Nothing new arrived this increment — stop
+                                        // extending, nothing left to wait for.
+                                        break;
+                                    }
+                                    prev_len = new_len;
+                                }
+                                if aborted {
+                                    if shutdown.load(Ordering::Acquire) {
+                                        info!(
+                                            "TX aborted during collection window extension by shutdown"
+                                        );
+                                        break;
+                                    }
+                                    info!(
+                                        "TX aborted during collection window extension by operator (F8)"
+                                    );
+                                    send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                    continue;
+                                }
+
                                 message.message_type = coalesce_backlog_into(
                                     message.message_type,
                                     &tx_rx,
@@ -3996,9 +4193,15 @@ mod schedule_tx_tests {
         let target = at(0.0); // slot boundary itself
         let (pad_early, cursor_early) = pad_and_cursor_for_target(at(0.2), target, 12_000);
         let (pad_late, cursor_late) = pad_and_cursor_for_target(at(3.0), target, 12_000);
-        assert!(pad_early > 0, "200ms in: still inside the DELAY_MS pre-roll, expect padding");
+        assert!(
+            pad_early > 0,
+            "200ms in: still inside the DELAY_MS pre-roll, expect padding"
+        );
         assert_eq!(pad_late, 0, "3s in: past DELAY_MS, expect no padding");
-        assert!(cursor_late > cursor_early, "later refresh must trim more of the waveform's front");
+        assert!(
+            cursor_late > cursor_early,
+            "later refresh must trim more of the waveform's front"
+        );
     }
 
     #[test]
@@ -4011,6 +4214,117 @@ mod schedule_tx_tests {
         let (_, cursor_b) = pad_and_cursor_for_target(at(10.3), target, 12_000);
         assert_eq!(cursor_a, 0);
         assert_eq!(cursor_b, 0);
+    }
+
+    fn tx_request(tx_parity: Option<SlotParity>) -> MessageType {
+        MessageType::TransmitRequest {
+            message_text: "CQ TEST".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: None,
+            tx_parity,
+            origin: crate::message_bus::TxOrigin::Local,
+        }
+    }
+
+    #[test]
+    fn adaptive_cap_shrinks_for_a_late_arriving_head() {
+        // Arrives 7.5s into an 8000ms tx_late_max_ms budget: only 500ms of
+        // headroom remains before the safety margin (500ms) eats the rest —
+        // cap should be at or near zero. at(7.5) falls inside slot 0, which
+        // is Even (base timestamp 1767225600 / 15 % 2 == 0, per `at()`'s own
+        // doc comment) — so the request must target Even parity for this to
+        // be a same-slot late arrival (`use_current = true`) rather than a
+        // parity-mismatch defer to the next Odd slot, which would exercise
+        // the unrelated `probe.deferred` branch instead of the headroom math
+        // this test is for.
+        use pancetta_config::station::TxSelfParity;
+        let head = tx_request(Some(SlotParity::Even));
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(7.5),
+            TxSelfParity::Auto,
+            8000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 0);
+    }
+
+    #[test]
+    fn adaptive_cap_has_room_for_an_early_arriving_head() {
+        // Arrives 1s into the slot: 7000ms of raw headroom before tx_late_max_ms,
+        // well above the protocol ceiling — cap should be the full FT8 ceiling
+        // (3000ms), not the raw headroom.
+        use pancetta_config::station::TxSelfParity;
+        let head = tx_request(Some(SlotParity::Odd));
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(1.0),
+            TxSelfParity::Auto,
+            8000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 3000);
+    }
+
+    #[test]
+    fn adaptive_cap_uses_protocol_ceiling_for_ft4() {
+        // Same early-arrival case, but FT4's cycle is half FT8's — the ceiling
+        // should scale down proportionally (1500ms), not stay at FT8's 3000ms.
+        use pancetta_config::station::TxSelfParity;
+        let head = tx_request(Some(SlotParity::Odd));
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(0.5),
+            TxSelfParity::Auto,
+            8000,
+            12_000,
+            FT4_SLOT_NS,
+            pancetta_ft8::Protocol::Ft4,
+        );
+        assert_eq!(cap, 1500);
+    }
+
+    #[test]
+    fn adaptive_cap_full_ceiling_when_already_deferred() {
+        // A head that's already past tx_late_max_ms for the current slot
+        // (deferred to the next one) has no current-slot cliff to protect —
+        // cap is the full protocol ceiling.
+        use pancetta_config::station::TxSelfParity;
+        let head = tx_request(Some(SlotParity::Odd));
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(29.0), // >8000ms into slot 1 (Odd), forces defer
+            TxSelfParity::Auto,
+            8000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 3000);
+    }
+
+    #[test]
+    fn adaptive_cap_zero_for_non_transmit_request() {
+        use pancetta_config::station::TxSelfParity;
+        let head = MessageType::MultiTransmitRequest {
+            items: Vec::new(),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+        let cap = adaptive_coalesce_cap_ms(
+            &head,
+            at(1.0),
+            TxSelfParity::Auto,
+            8000,
+            12_000,
+            SLOT_NS,
+            pancetta_ft8::Protocol::Ft8,
+        );
+        assert_eq!(cap, 0);
     }
 }
 
