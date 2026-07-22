@@ -82,10 +82,15 @@ pub struct AuthorizationsResponse {
 }
 ```
 
-Given the contract gap above: `fetch_authorizations` treats a `404` the same way
-`fetch_needed_grids` treats a missing endpoint (empty result, not an error — the caller's
-fail-safe logic below already treats "nothing new" as "keep last known good," so this composes
-safely), and any JSON deserialization failure is caught and logged as a poll failure rather than
+Given the contract gap above: unlike `fetch_needed_grids` (where a 404 is treated as "endpoint not
+live yet, empty is harmless"), `fetch_authorizations` treats a `404` as a genuine **error**, not an
+empty result — a 404 here plausibly means the wrong path/URL, and silently returning `Ok(vec![])`
+would let the poll loop treat "empty because the request failed" as a legitimate "this agent
+really has zero authorized clients" state and revoke everyone connected. Only a `200` with a
+genuinely empty `authorization_edges: []` body counts as "zero clients," a real and normal state
+(e.g. right after first pairing, before any client is added). A 404 propagates as an error like any
+other non-2xx status, letting the poll loop's fail-safe (§3 below) keep the last known good set.
+Any JSON deserialization failure is likewise caught and logged as a poll failure rather than
 propagated as a panic.
 
 ### 2. Shared, live `tx_allow_list`
