@@ -925,6 +925,7 @@ impl super::ApplicationCoordinator {
     pub(crate) async fn start_station_agent_component(&mut self) -> Result<()> {
         let config = self.config.read().await;
         let cfg = config.network.station_agent.clone();
+        let cqdx_cfg = config.network.cqdx.clone();
         // WSJT-X-UDP design spec Option A: the shared remote-TX arm is seeded by
         // EITHER channel's operator consent. `set_local_consent` OVERWRITES, so
         // this later seed must carry the combined value — otherwise it would
@@ -1030,14 +1031,6 @@ impl super::ApplicationCoordinator {
         // several allow-listed peers may now hold independent read/qsy scope
         // concurrently. An empty allow-list still means no client can ever be
         // admitted.
-        if tx_allow_list.read().unwrap().is_empty() {
-            warn!(
-                target: "agent",
-                "station agent paired but tx_allow_list is empty — no client to admit; idle, relay connection never attempted"
-            );
-            return self.spawn_station_agent_drain().await;
-        }
-
         let bus = self.message_bus.clone();
         let shutdown = self.shutdown_signal.clone();
         let arm = self.remote_tx_arm.clone();
@@ -1055,6 +1048,27 @@ impl super::ApplicationCoordinator {
             .message_bus
             .create_channel(ComponentId::StationAgent)
             .await?;
+
+        if cqdx_cfg.enabled && cqdx_cfg.token.as_ref().is_some_and(|t| !t.is_empty()) {
+            let poll_tx_allow_list = tx_allow_list.clone();
+            let poll_client_keys = client_keys.clone();
+            let poll_key_dir = key_dir.clone();
+            let poll_agent_key_id = paired.agent_key_id.clone();
+            let poll_shutdown = self.shutdown_signal.clone();
+            let poll_interval = Duration::from_secs(cqdx_cfg.authorizations_poll_interval_secs);
+            tokio::spawn(async move {
+                poll_authorizations_loop(
+                    cqdx_cfg,
+                    poll_agent_key_id,
+                    poll_key_dir,
+                    poll_tx_allow_list,
+                    poll_client_keys,
+                    poll_shutdown,
+                    poll_interval,
+                )
+                .await;
+            });
+        }
 
         let handle = tokio::spawn(async move {
             run_session_loop(RunConfig {
@@ -1143,6 +1157,69 @@ fn load_client_device_keys(
         }
     }
     out
+}
+
+/// Periodically refresh the shared `tx_allow_list`/`client_keys` from cqdx's
+/// live authorization data (dispensa Q-0043 auto-populate). Runs for the
+/// lifetime of the station-agent component; only spawned when cqdx
+/// integration is enabled with a token configured (see
+/// `start_station_agent_component`).
+///
+/// Fail-safe: any poll failure (network error, non-2xx status including a
+/// 404, malformed JSON) is logged at WARN and the shared state is left
+/// UNTOUCHED — a transient cqdx outage (relevant right now: cqdx.io's
+/// production deploy is currently down) must never spuriously revoke an
+/// already-admitted, connected client. Only a successful poll (a 200 with a
+/// parseable body, even if `authorization_edges` is genuinely empty) replaces
+/// the shared contents.
+async fn poll_authorizations_loop(
+    cqdx_cfg: pancetta_config::network::CqdxConfig,
+    agent_key_id: String,
+    key_dir: std::path::PathBuf,
+    tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
+    client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
+    interval: Duration,
+) {
+    let Some(token) = cqdx_cfg.token.clone() else {
+        return; // Defensive — caller already checked this before spawning.
+    };
+    let client = match pancetta_cqdx::CqdxClient::new(cqdx_cfg.base_url.clone(), token) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(target: "agent", "authorizations poll: failed to construct cqdx client: {e}; poll task exiting");
+            return;
+        }
+    };
+
+    while !shutdown.load(Ordering::Acquire) {
+        match client.fetch_authorizations().await {
+            Ok(edges) => {
+                let new_allow: HashSet<String> = edges
+                    .iter()
+                    .filter(|e| e.agent_key_id == agent_key_id)
+                    .map(|e| e.client_key_id.clone())
+                    .collect();
+                let new_keys = load_client_device_keys(&key_dir, &new_allow);
+                let allow_len = new_allow.len();
+                *tx_allow_list.write().unwrap() = new_allow;
+                *client_keys.write().unwrap() = new_keys;
+                debug!(
+                    target: "agent",
+                    "authorizations poll: refreshed tx_allow_list ({} client(s) authorized for this agent)",
+                    allow_len
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: "agent",
+                    "authorizations poll failed: {e} — keeping last-known-good tx_allow_list, retrying in {:?}",
+                    interval
+                );
+            }
+        }
+        tokio::time::sleep(interval).await;
+    }
 }
 
 /// Everything the session loop owns.
@@ -3412,5 +3489,66 @@ mod tests {
             peers: peers_with(CLIENT_KEY_ID, None),
             controller: None,
         }
+    }
+
+    #[test]
+    fn authorizations_filter_matches_only_this_agents_edges() {
+        let edges = vec![
+            pancetta_cqdx::AuthorizationEdge {
+                id: "1".to_string(),
+                agent_key_id: "agent_this".to_string(),
+                client_key_id: "client_a".to_string(),
+                scopes: vec!["status".to_string()],
+                created_at: "2026-07-20T00:00:00Z".to_string(),
+            },
+            pancetta_cqdx::AuthorizationEdge {
+                id: "2".to_string(),
+                agent_key_id: "agent_other".to_string(),
+                client_key_id: "client_b".to_string(),
+                scopes: vec!["status".to_string()],
+                created_at: "2026-07-20T00:00:00Z".to_string(),
+            },
+        ];
+        let filtered: HashSet<String> = edges
+            .iter()
+            .filter(|e| e.agent_key_id == "agent_this")
+            .map(|e| e.client_key_id.clone())
+            .collect();
+        assert_eq!(filtered, HashSet::from(["client_a".to_string()]));
+    }
+
+    #[tokio::test]
+    async fn poll_authorizations_loop_keeps_last_known_good_on_failure() {
+        // A cqdx client pointed at a URL with nothing listening fails every
+        // request — confirms the poll loop's fail-safe leaves a pre-seeded
+        // allow-list untouched rather than clearing it.
+        let tx_allow_list = Arc::new(std::sync::RwLock::new(HashSet::from(["seed".to_string()])));
+        let client_keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cqdx_cfg = pancetta_config::network::CqdxConfig {
+            enabled: true,
+            base_url: "http://127.0.0.1:1".to_string(), // nothing listening — every request fails
+            token: Some("pat_test_token_0000000000".to_string()),
+            poll_interval_secs: 30,
+            authorizations_poll_interval_secs: 45,
+        };
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(poll_authorizations_loop(
+            cqdx_cfg,
+            "agent_this".to_string(),
+            std::env::temp_dir(),
+            tx_allow_list.clone(),
+            client_keys.clone(),
+            shutdown_clone,
+            Duration::from_millis(50),
+        ));
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+        assert_eq!(
+            *tx_allow_list.read().unwrap(),
+            HashSet::from(["seed".to_string()]),
+            "a failing poll must never clear the pre-seeded allow-list"
+        );
     }
 }

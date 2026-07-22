@@ -1599,12 +1599,13 @@ impl ConfigSection for NetworkConfig {
         // transport itself is enabled, the relay connection is never even
         // attempted at all, not merely TX-gated.
         if self.station_agent.tx_allow_list.is_empty() {
-            if self.station_agent.enabled {
+            if self.station_agent.enabled && !self.cqdx.enabled {
                 tracing::warn!(
                     target: "config.station_agent",
-                    "station_agent.enabled = true but tx_allow_list is empty — no client keyId to \
-                     admit, so the relay connection itself is never attempted (not just TX-gated); \
-                     add the client's keyId to station_agent.tx_allow_list"
+                    "station_agent.enabled = true but tx_allow_list is empty and cqdx auto-populate \
+                     is disabled — no client keyId to admit; add the client's keyId to \
+                     station_agent.tx_allow_list, or enable cqdx.io integration (dispensa Q-0043) \
+                     so it populates automatically"
                 );
             } else if self.station_agent.remote_tx_enabled {
                 tracing::warn!(
