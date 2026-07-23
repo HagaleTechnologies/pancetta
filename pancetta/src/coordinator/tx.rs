@@ -1641,6 +1641,101 @@ impl Drop for PttGuard {
     }
 }
 
+/// Recompute scheduling for a superseding request against *now* and, if
+/// still viable within `tx_late_max_ms_eff`, deassert PTT (clean stop of the
+/// aborted transmission), and mutate `message_text`/`frequency_offset`/
+/// `schedule` in place so the caller's retry loop re-runs Steps 1-10 with the
+/// new content (the caller re-encodes at Step 1, and requests an audio-buffer
+/// flush at Step 7 via the `is_rekey` flag so no stale samples from the
+/// aborted transmission bleed into the re-key).
+///
+/// Returns `true` if the caller should retry with the mutated state, `false`
+/// if re-keying isn't viable this slot (already deasserted PTT; caller
+/// should stop and let the request flow through the worker's next natural
+/// dequeue cycle for the next slot — this function does NOT re-enqueue it;
+/// see the design spec's "Error handling" section for why there's nothing
+/// to re-enqueue for a `TransmitRequest`, since dropping it here means it's
+/// simply gone — a real gap the design spec accepted for Phase 1, matching
+/// today's F8-abort behavior of not resending either).
+///
+/// Note: only `message_text`/`frequency_offset`/`schedule` are mutated —
+/// `qso_id` and `origin` intentionally track the ORIGINAL in-flight request
+/// (Phase 1 manual override; a cross-QSO supersede re-keys the new text but
+/// keeps the original request's identity for liveness/tombstone bookkeeping).
+#[allow(clippy::too_many_arguments)]
+async fn supersede_and_rekey(
+    new_request: MessageType,
+    message_text: &mut String,
+    frequency_offset: &mut f64,
+    schedule: &mut TxSchedule,
+    message_bus: &crate::message_bus::MessageBus,
+    ptt_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    tx_late_max_ms_eff: u64,
+    sample_rate: u32,
+    slot_ns: i64,
+    tx_self_parity: pancetta_config::station::TxSelfParity,
+    _request_received_at: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    let MessageType::TransmitRequest {
+        message_text: new_text,
+        frequency_offset: new_freq,
+        tx_parity: new_tx_parity,
+        ..
+    } = new_request
+    else {
+        // MultiTransmitRequest supersede is handled by Task 7 — for now,
+        // treat as not viable so the bundle path (once built) takes over.
+        return false;
+    };
+
+    // Deassert PTT immediately — the aborted transmission's audio may still
+    // be draining from the ring buffer; PTT-off means it doesn't matter that
+    // it hasn't been flushed YET (that happens next, before we push new
+    // audio in Step 7 of the retried loop iteration).
+    let ptt_off_msg = ComponentMessage::new(
+        ComponentId::Ft8Transmitter,
+        ComponentId::Hamlib,
+        MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state: false }),
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(ptt_off_msg).await {
+        warn!("supersede: PTT OFF failed: {}", e);
+    }
+    ptt_active.store(false, Ordering::Release);
+
+    let now = chrono::Utc::now();
+    let required_parity = resolve_required_parity(new_tx_parity, tx_self_parity, now, slot_ns);
+    let new_schedule = schedule_tx(
+        now,
+        required_parity,
+        tx_late_max_ms_eff,
+        sample_rate,
+        slot_ns,
+    );
+
+    if new_schedule.deferred {
+        info!(
+            target: "pancetta::tx.pivot",
+            "supersede: '{}' arrived too late to re-key this slot — deferring to next slot via normal scheduling",
+            new_text
+        );
+        return false;
+    }
+
+    info!(
+        target: "pancetta::tx.pivot",
+        "supersede: aborting in-flight TX, re-keying with '{}' @{:.0}Hz",
+        new_text, new_freq
+    );
+
+    *message_text = new_text;
+    *frequency_offset = new_freq;
+    *schedule = new_schedule;
+    let _ = last_ptt_on_ms; // re-stamped by PttGuard when Step 5 re-asserts PTT
+    true
+}
+
 impl super::ApplicationCoordinator {
     /// Start FT8 transmitter component
     pub(crate) async fn start_transmitter_component(&mut self) -> Result<()> {
@@ -1754,10 +1849,12 @@ impl super::ApplicationCoordinator {
                 let mut pivoted_once: std::collections::HashMap<String, String> =
                     std::collections::HashMap::new();
 
-                while !shutdown.load(Ordering::Acquire) {
+                'worker: while !shutdown.load(Ordering::Acquire) {
                     // Reset the per-message abort flag at the start of every
                     // try_recv cycle. Keeps a stale F8 from earlier (when no
                     // TX was in flight) from killing the next legitimate TX.
+                    // (A mid-TX supersede sets this flag too; the 'key_and_send
+                    // retry re-clears it before re-keying — see Steps 6/8.)
                     abort_current_tx.store(false, Ordering::Release);
 
                     // Re-check the live mode atomic every cycle. Encoder
@@ -2137,83 +2234,49 @@ impl super::ApplicationCoordinator {
                                     )
                                     .await;
 
-                                    // --- Step 1: Encode + modulate up front ---
-                                    // Do this BEFORE any timing-critical work so encoding
-                                    // latency can't push us past the slot boundary.
-                                    //
-                                    // TransmitRequest.frequency_offset is the ABSOLUTE audio
-                                    // frequency in Hz (200-4000), not a delta. The modulator
-                                    // adds its base_frequency to whatever we pass to
-                                    // modulate_symbols, so to honor the request we set the
-                                    // base to the requested frequency and pass 0 as the
-                                    // additional offset.
-                                    if let Err(e) = modulator.set_base_frequency(frequency_offset) {
-                                        warn!(
-                                            "Invalid TX frequency {} Hz for '{}': {}",
-                                            frequency_offset, message_text, e
-                                        );
-                                        emit_tx_failure_diagnostic(
-                                            &message_bus,
-                                            qso_id.as_deref(),
-                                            &message_text,
-                                            &format!(
-                                                "invalid frequency {frequency_offset} Hz ({e})"
-                                            ),
-                                        )
-                                        .await;
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text,
-                                                duration_ms: 0,
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
-                                        continue;
-                                    }
-                                    // Encode + modulate under the active protocol.
-                                    // For FT8 this dispatches to the exact legacy
-                                    // `encode_message` + `modulate_symbols` calls
-                                    // (byte-identical); for FT4/FT2 it uses the
-                                    // protocol-aware `encode_message_protocol` +
-                                    // `modulate_symbols_protocol` so the on-air
-                                    // waveform matches the mode.
-                                    let (samples, _duration_ms) = match encode_for_protocol(
-                                        &mut encoder,
-                                        active_protocol,
-                                        &message_text,
-                                    )
-                                    .and_then(|symbols| {
-                                        modulate_for_protocol(
-                                            &mut modulator,
-                                            active_protocol,
-                                            &symbols,
-                                            0.0,
-                                        )
-                                    }) {
-                                        Ok(s) => {
-                                            let dur = (s.len() as f64 / 12000.0 * 1000.0) as u64;
-                                            info!(
-                                                "TX: '{}' -> {} samples ({:.2}s)",
-                                                message_text,
-                                                s.len(),
-                                                dur as f64 / 1000.0
-                                            );
-                                            (s, dur)
-                                        }
-                                        Err(e) => {
+                                    // Mid-TX supersede state (Phase 1 abort/restart).
+                                    // On a qualifying request arriving mid-TX (Steps 6/8
+                                    // below), `supersede_and_rekey` recomputes the schedule
+                                    // against *now*; `rekey_schedule` carries it across the
+                                    // 'key_and_send retry, and `is_rekey` drives Step 7's
+                                    // flush-stale-audio flag. Both stay inert (None/false)
+                                    // on the normal first pass, keeping it byte-identical.
+                                    let mut rekey_schedule: Option<TxSchedule> = None;
+                                    let mut is_rekey = false;
+
+                                    // 'key_and_send wraps Steps 1-10 so a mid-TX supersede
+                                    // can abort the in-flight frame and re-drive these steps
+                                    // with the new content (re-encoding at Step 1) instead
+                                    // of dropping the request. A normal transmission runs the
+                                    // body exactly once and `break 'key_and_send`s at the end.
+                                    // Every pre-existing "abandon this message" continue/break
+                                    // inside the body now targets 'worker explicitly, since
+                                    // 'key_and_send is the innermost loop.
+                                    'key_and_send: loop {
+                                        // --- Step 1: Encode + modulate up front ---
+                                        // Do this BEFORE any timing-critical work so encoding
+                                        // latency can't push us past the slot boundary.
+                                        //
+                                        // TransmitRequest.frequency_offset is the ABSOLUTE audio
+                                        // frequency in Hz (200-4000), not a delta. The modulator
+                                        // adds its base_frequency to whatever we pass to
+                                        // modulate_symbols, so to honor the request we set the
+                                        // base to the requested frequency and pass 0 as the
+                                        // additional offset.
+                                        if let Err(e) =
+                                            modulator.set_base_frequency(frequency_offset)
+                                        {
                                             warn!(
-                                                "Encode/modulate failed for '{}': {}",
-                                                message_text, e
+                                                "Invalid TX frequency {} Hz for '{}': {}",
+                                                frequency_offset, message_text, e
                                             );
                                             emit_tx_failure_diagnostic(
                                                 &message_bus,
                                                 qso_id.as_deref(),
                                                 &message_text,
-                                                &format!("encode/modulate error ({e})"),
+                                                &format!(
+                                                    "invalid frequency {frequency_offset} Hz ({e})"
+                                                ),
                                             )
                                             .await;
                                             let complete_msg = ComponentMessage::new(
@@ -2227,28 +2290,100 @@ impl super::ApplicationCoordinator {
                                                 Instant::now(),
                                             );
                                             let _ = message_bus.send_message(complete_msg).await;
-                                            continue;
+                                            continue 'worker;
                                         }
-                                    };
+                                        // Encode + modulate under the active protocol.
+                                        // For FT8 this dispatches to the exact legacy
+                                        // `encode_message` + `modulate_symbols` calls
+                                        // (byte-identical); for FT4/FT2 it uses the
+                                        // protocol-aware `encode_message_protocol` +
+                                        // `modulate_symbols_protocol` so the on-air
+                                        // waveform matches the mode.
+                                        let (samples, _duration_ms) = match encode_for_protocol(
+                                            &mut encoder,
+                                            active_protocol,
+                                            &message_text,
+                                        )
+                                        .and_then(|symbols| {
+                                            modulate_for_protocol(
+                                                &mut modulator,
+                                                active_protocol,
+                                                &symbols,
+                                                0.0,
+                                            )
+                                        }) {
+                                            Ok(s) => {
+                                                let dur =
+                                                    (s.len() as f64 / 12000.0 * 1000.0) as u64;
+                                                info!(
+                                                    "TX: '{}' -> {} samples ({:.2}s)",
+                                                    message_text,
+                                                    s.len(),
+                                                    dur as f64 / 1000.0
+                                                );
+                                                (s, dur)
+                                            }
+                                            Err(e) => {
+                                                warn!(
+                                                    "Encode/modulate failed for '{}': {}",
+                                                    message_text, e
+                                                );
+                                                emit_tx_failure_diagnostic(
+                                                    &message_bus,
+                                                    qso_id.as_deref(),
+                                                    &message_text,
+                                                    &format!("encode/modulate error ({e})"),
+                                                )
+                                                .await;
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text,
+                                                        duration_ms: 0,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
+                                                continue 'worker;
+                                            }
+                                        };
 
-                                    // --- Step 2: Resolve required parity ---
-                                    let slot_ns = active_slot_ns.load(Ordering::Relaxed);
-                                    let required_parity = resolve_required_parity(
-                                        tx_parity,
-                                        tx_self_parity,
-                                        request_received_at,
-                                        slot_ns,
-                                    );
+                                        // --- Step 2: Resolve required parity ---
+                                        let slot_ns = active_slot_ns.load(Ordering::Relaxed);
+                                        let required_parity = resolve_required_parity(
+                                            tx_parity,
+                                            tx_self_parity,
+                                            request_received_at,
+                                            slot_ns,
+                                        );
 
-                                    let mut schedule = schedule_tx(
-                                        request_received_at,
-                                        required_parity,
-                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms),
-                                        sample_rate,
-                                        slot_ns,
-                                    );
+                                        let mut schedule = schedule_tx(
+                                            request_received_at,
+                                            required_parity,
+                                            tx_late_max_ms_effective(
+                                                active_protocol,
+                                                tx_late_max_ms,
+                                            ),
+                                            sample_rate,
+                                            slot_ns,
+                                        );
+                                        // On a mid-TX re-key, discard the first-pass schedule
+                                        // recomputed above (keyed to the frozen
+                                        // `request_received_at` and the original parity) and use
+                                        // the schedule `supersede_and_rekey` computed against
+                                        // *now* for the superseding request. Never deferred here:
+                                        // supersede_and_rekey returns false (breaks the loop) if
+                                        // the re-key can't make this slot, so a retry never
+                                        // carries a deferred schedule. `None` on the first pass
+                                        // leaves the normal path byte-identical.
+                                        if let Some(s) = rekey_schedule {
+                                            schedule = s;
+                                        }
 
-                                    info!(
+                                        info!(
                                         "TX scheduled: parity={:?} target_slot={} pad={} samples cursor={} samples deferred={}",
                                         required_parity,
                                         schedule.target_slot.format("%H:%M:%S%.3f UTC"),
@@ -2257,25 +2392,25 @@ impl super::ApplicationCoordinator {
                                         schedule.deferred,
                                     );
 
-                                    // If we missed the current slot and deferred to a
-                                    // later one (~30s), refresh the QUEUED strip with
-                                    // the deferred flag so it shows "deferred 30s"
-                                    // instead of looking dead during the long wait.
-                                    if schedule.deferred {
-                                        TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
-                                        // Re-check active-status at defer time: a
-                                        // terminal QSO's request must not be re-
-                                        // deferred 30s into the future (that is
-                                        // exactly the "stale frames every cycle"
-                                        // loop the operator hit).
-                                        if !tx_qso_is_live(qso_id.as_deref(), &active_tx_qsos) {
-                                            info!(
-                                                target: "pancetta::tx.policy",
-                                                "dropping stale TX for ended QSO {} at defer time: '{}'",
-                                                qso_id.as_deref().unwrap_or("?"),
-                                                message_text
-                                            );
-                                            emit_diagnostic(
+                                        // If we missed the current slot and deferred to a
+                                        // later one (~30s), refresh the QUEUED strip with
+                                        // the deferred flag so it shows "deferred 30s"
+                                        // instead of looking dead during the long wait.
+                                        if schedule.deferred {
+                                            TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
+                                            // Re-check active-status at defer time: a
+                                            // terminal QSO's request must not be re-
+                                            // deferred 30s into the future (that is
+                                            // exactly the "stale frames every cycle"
+                                            // loop the operator hit).
+                                            if !tx_qso_is_live(qso_id.as_deref(), &active_tx_qsos) {
+                                                info!(
+                                                    target: "pancetta::tx.policy",
+                                                    "dropping stale TX for ended QSO {} at defer time: '{}'",
+                                                    qso_id.as_deref().unwrap_or("?"),
+                                                    message_text
+                                                );
+                                                emit_diagnostic(
                                                 &message_bus,
                                                 "tx.policy",
                                                 pancetta_core::DiagnosticLevel::Info,
@@ -2285,6 +2420,135 @@ impl super::ApplicationCoordinator {
                                                 qso_id.as_deref(),
                                             )
                                             .await;
+                                                send_tx_queue_status(
+                                                    &message_bus,
+                                                    None,
+                                                    Vec::new(),
+                                                )
+                                                .await;
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text,
+                                                        duration_ms: 0,
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                let _ =
+                                                    message_bus.send_message(complete_msg).await;
+                                                continue 'worker;
+                                            }
+                                            send_tx_queue_status(
+                                                &message_bus,
+                                                None,
+                                                vec![crate::message_bus::TxItem {
+                                                    text: message_text.clone(),
+                                                    freq_hz: frequency_offset,
+                                                    qso_id: qso_id.clone(),
+                                                    deferred: true,
+                                                }],
+                                            )
+                                            .await;
+                                        }
+
+                                        // --- Step 4: Sleep until PTT engage instant ---
+                                        let ptt_target_utc = schedule.target_slot
+                                            - chrono::Duration::milliseconds(ptt_lead_ms as i64);
+                                        let to_ptt = pancetta_core::slot::duration_until(
+                                            ptt_target_utc,
+                                            chrono::Utc::now(),
+                                        );
+                                        if interruptible_sleep(to_ptt, &shutdown, &abort_current_tx)
+                                            .await
+                                        {
+                                            if shutdown.load(Ordering::Acquire) {
+                                                info!("TX aborted before PTT engage by shutdown");
+                                                break 'worker;
+                                            }
+                                            info!("TX aborted before PTT engage by operator (F8)");
+                                            // This abort happens BEFORE the TxStatusGuard is
+                                            // constructed, so its Drop-based clear never runs.
+                                            // Clear the strip explicitly so the QUEUED row
+                                            // doesn't sit stale until the next status push.
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            continue 'worker;
+                                        }
+
+                                        // --- Step 4b: Drop-stale-TX gate ---
+                                        // The slot wait above can span the moment a QSO
+                                        // ends (superseded by a newer call, cancelled,
+                                        // or completed-past-grace). Re-check active
+                                        // status at the last instant before keying:
+                                        // if this request's QSO is no longer live, do
+                                        // NOT key PTT / build+send audio — clear the
+                                        // strip, report a failed TransmitComplete, and
+                                        // skip. Requests with no qso_id (manual / tune)
+                                        // are never gated.
+                                        if !tx_qso_is_live(qso_id.as_deref(), &active_tx_qsos) {
+                                            info!(
+                                                target: "pancetta::tx.policy",
+                                                "dropping stale TX for ended QSO {}: '{}'",
+                                                qso_id.as_deref().unwrap_or("?"),
+                                                message_text
+                                            );
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!(
+                                                "dropping stale TX for ended QSO: '{message_text}'"
+                                            ),
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            // Bound `pivoted_once`: a QSO ending via normal
+                                            // drop-stale cleanup also clears its own
+                                            // pivot-tombstone entry so the worker-local map
+                                            // can't grow unboundedly across a long-running
+                                            // process.
+                                            if let Some(id) = qso_id.as_deref() {
+                                                pivoted_once.remove(&super::active_tx_qso_key(id));
+                                            }
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+
+                                        // --- Step 4b-arm: re-check the remote-TX arm at
+                                        // the last instant before keying. The slot wait
+                                        // above can span up to ~30s — the dead-man
+                                        // heartbeat window. A Remote request admitted with
+                                        // a valid arm at pickup must NOT key PTT if, during
+                                        // the wait, the heartbeat lapsed, the TTL expired,
+                                        // local consent was revoked, or the local kill was
+                                        // engaged. Mirrors Step-4b's stale-QSO re-check so
+                                        // the dead-man/TTL/local-kill guarantees hold across
+                                        // the pre-PTT sleep. Local requests are never gated.
+                                        if origin == crate::message_bus::TxOrigin::Remote
+                                            && !remote_tx_permitted(
+                                                &remote_tx_arm,
+                                                chrono::Utc::now().timestamp_millis(),
+                                            )
+                                        {
+                                            info!(
+                                                target: "agent.tx",
+                                                "dropping remote TX at key-time — arm went stale during slot wait: '{}' (qso: {:?})",
+                                                message_text, qso_id
+                                            );
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
                                             let complete_msg = ComponentMessage::new(
@@ -2298,440 +2562,441 @@ impl super::ApplicationCoordinator {
                                                 Instant::now(),
                                             );
                                             let _ = message_bus.send_message(complete_msg).await;
-                                            continue;
+                                            continue 'worker;
                                         }
-                                        send_tx_queue_status(
-                                            &message_bus,
-                                            None,
-                                            vec![crate::message_bus::TxItem {
-                                                text: message_text.clone(),
-                                                freq_hz: frequency_offset,
-                                                qso_id: qso_id.clone(),
-                                                deferred: true,
-                                            }],
-                                        )
-                                        .await;
-                                    }
 
-                                    // --- Step 4: Sleep until PTT engage instant ---
-                                    let ptt_target_utc = schedule.target_slot
-                                        - chrono::Duration::milliseconds(ptt_lead_ms as i64);
-                                    let to_ptt = pancetta_core::slot::duration_until(
-                                        ptt_target_utc,
-                                        chrono::Utc::now(),
-                                    );
-                                    if interruptible_sleep(to_ptt, &shutdown, &abort_current_tx)
-                                        .await
-                                    {
-                                        if shutdown.load(Ordering::Acquire) {
-                                            info!("TX aborted before PTT engage by shutdown");
-                                            break;
-                                        }
-                                        info!("TX aborted before PTT engage by operator (F8)");
-                                        // This abort happens BEFORE the TxStatusGuard is
-                                        // constructed, so its Drop-based clear never runs.
-                                        // Clear the strip explicitly so the QUEUED row
-                                        // doesn't sit stale until the next status push.
-                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        continue;
-                                    }
+                                        // --- Step 3 (moved): build the audio buffer,
+                                        // refreshed against real time ---
+                                        // request_received_at (Step 2) already decided WHICH
+                                        // slot to target and whether to defer — that decision
+                                        // is never re-made here (Symptom-B's protection, see
+                                        // Global Constraints in the implementation plan). But
+                                        // real time has moved on since Step 2 (through the
+                                        // Symptom-C adaptive coalesce window, encoding, and the
+                                        // gates above), and Step 6 below is a no-op for the
+                                        // common current-slot case (target_slot is already in
+                                        // the past), so audio actually ships at whatever "now"
+                                        // is by the time we reach Step 7 — not at the "now"
+                                        // schedule_tx originally saw. Refresh just the pad/cursor
+                                        // math against the SAME schedule.target_slot so the
+                                        // transmitted waveform stays correctly aligned to the
+                                        // real FT8 slot grid regardless of how long the steps
+                                        // above took. See
+                                        // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §2.
+                                        let (fresh_pad_samples, fresh_cursor_samples) =
+                                            pad_and_cursor_for_target(
+                                                chrono::Utc::now(),
+                                                schedule.target_slot,
+                                                sample_rate,
+                                            );
+                                        schedule.silent_pad_samples = fresh_pad_samples;
+                                        schedule.cursor_offset_samples = fresh_cursor_samples;
 
-                                    // --- Step 4b: Drop-stale-TX gate ---
-                                    // The slot wait above can span the moment a QSO
-                                    // ends (superseded by a newer call, cancelled,
-                                    // or completed-past-grace). Re-check active
-                                    // status at the last instant before keying:
-                                    // if this request's QSO is no longer live, do
-                                    // NOT key PTT / build+send audio — clear the
-                                    // strip, report a failed TransmitComplete, and
-                                    // skip. Requests with no qso_id (manual / tune)
-                                    // are never gated.
-                                    if !tx_qso_is_live(qso_id.as_deref(), &active_tx_qsos) {
-                                        info!(
-                                            target: "pancetta::tx.policy",
-                                            "dropping stale TX for ended QSO {}: '{}'",
-                                            qso_id.as_deref().unwrap_or("?"),
-                                            message_text
+                                        // Pad zeros in front (early branch); skip cursor into
+                                        // waveform (late branch); never both at the same time.
+                                        let mut audio_out: Vec<f32> = Vec::with_capacity(
+                                            schedule.silent_pad_samples + samples.len(),
                                         );
-                                        emit_diagnostic(
-                                            &message_bus,
-                                            "tx.policy",
-                                            pancetta_core::DiagnosticLevel::Info,
-                                            format!(
-                                                "dropping stale TX for ended QSO: '{message_text}'"
-                                            ),
-                                            qso_id.as_deref(),
-                                        )
-                                        .await;
-                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        // Bound `pivoted_once`: a QSO ending via normal
-                                        // drop-stale cleanup also clears its own
-                                        // pivot-tombstone entry so the worker-local map
-                                        // can't grow unboundedly across a long-running
-                                        // process.
-                                        if let Some(id) = qso_id.as_deref() {
-                                            pivoted_once.remove(&super::active_tx_qso_key(id));
-                                        }
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text,
-                                                duration_ms: 0,
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
-                                        continue;
-                                    }
-
-                                    // --- Step 4b-arm: re-check the remote-TX arm at
-                                    // the last instant before keying. The slot wait
-                                    // above can span up to ~30s — the dead-man
-                                    // heartbeat window. A Remote request admitted with
-                                    // a valid arm at pickup must NOT key PTT if, during
-                                    // the wait, the heartbeat lapsed, the TTL expired,
-                                    // local consent was revoked, or the local kill was
-                                    // engaged. Mirrors Step-4b's stale-QSO re-check so
-                                    // the dead-man/TTL/local-kill guarantees hold across
-                                    // the pre-PTT sleep. Local requests are never gated.
-                                    if origin == crate::message_bus::TxOrigin::Remote
-                                        && !remote_tx_permitted(
-                                            &remote_tx_arm,
-                                            chrono::Utc::now().timestamp_millis(),
-                                        )
-                                    {
-                                        info!(
-                                            target: "agent.tx",
-                                            "dropping remote TX at key-time — arm went stale during slot wait: '{}' (qso: {:?})",
-                                            message_text, qso_id
-                                        );
-                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        let complete_msg = ComponentMessage::new(
-                                            ComponentId::Ft8Transmitter,
-                                            ComponentId::Autonomous,
-                                            MessageType::TransmitComplete {
-                                                success: false,
-                                                message_text,
-                                                duration_ms: 0,
-                                            },
-                                            Instant::now(),
-                                        );
-                                        let _ = message_bus.send_message(complete_msg).await;
-                                        continue;
-                                    }
-
-                                    // --- Step 3 (moved): build the audio buffer,
-                                    // refreshed against real time ---
-                                    // request_received_at (Step 2) already decided WHICH
-                                    // slot to target and whether to defer — that decision
-                                    // is never re-made here (Symptom-B's protection, see
-                                    // Global Constraints in the implementation plan). But
-                                    // real time has moved on since Step 2 (through the
-                                    // Symptom-C adaptive coalesce window, encoding, and the
-                                    // gates above), and Step 6 below is a no-op for the
-                                    // common current-slot case (target_slot is already in
-                                    // the past), so audio actually ships at whatever "now"
-                                    // is by the time we reach Step 7 — not at the "now"
-                                    // schedule_tx originally saw. Refresh just the pad/cursor
-                                    // math against the SAME schedule.target_slot so the
-                                    // transmitted waveform stays correctly aligned to the
-                                    // real FT8 slot grid regardless of how long the steps
-                                    // above took. See
-                                    // docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §2.
-                                    let (fresh_pad_samples, fresh_cursor_samples) =
-                                        pad_and_cursor_for_target(
-                                            chrono::Utc::now(),
-                                            schedule.target_slot,
-                                            sample_rate,
-                                        );
-                                    schedule.silent_pad_samples = fresh_pad_samples;
-                                    schedule.cursor_offset_samples = fresh_cursor_samples;
-
-                                    // Pad zeros in front (early branch); skip cursor into
-                                    // waveform (late branch); never both at the same time.
-                                    let mut audio_out: Vec<f32> = Vec::with_capacity(
-                                        schedule.silent_pad_samples + samples.len(),
-                                    );
-                                    audio_out.resize(schedule.silent_pad_samples, 0.0f32);
-                                    if schedule.cursor_offset_samples < samples.len() {
-                                        audio_out.extend_from_slice(
-                                            &samples[schedule.cursor_offset_samples..],
-                                        );
-                                    } else {
-                                        // Defensive: if cursor outran the waveform (shouldn't
-                                        // happen because too-late defers), emit nothing and
-                                        // skip TX.
-                                        warn!("schedule_tx cursor exceeded waveform length at key-time; skipping TX");
-                                        emit_tx_failure_diagnostic(
+                                        audio_out.resize(schedule.silent_pad_samples, 0.0f32);
+                                        if schedule.cursor_offset_samples < samples.len() {
+                                            audio_out.extend_from_slice(
+                                                &samples[schedule.cursor_offset_samples..],
+                                            );
+                                        } else {
+                                            // Defensive: if cursor outran the waveform (shouldn't
+                                            // happen because too-late defers), emit nothing and
+                                            // skip TX.
+                                            warn!("schedule_tx cursor exceeded waveform length at key-time; skipping TX");
+                                            emit_tx_failure_diagnostic(
                                             &message_bus,
                                             qso_id.as_deref(),
                                             &message_text,
                                             "internal scheduling error (cursor exceeded waveform at key-time)",
                                         )
                                         .await;
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+                                        let audio_duration_ms =
+                                            (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
+                                                as u64;
+
+                                        // --- Step 4c: late pivot to the freshest message ---
+                                        // Our decoder finishes ~1.8s BEFORE the slot
+                                        // boundary, but a fresher decode for THIS QSO can
+                                        // still land while this frame waited out the (up to
+                                        // ~30s) pre-PTT sleep. If the QSO component has since
+                                        // produced a newer message for this qso_id, swap to
+                                        // it now and re-modulate. We're at the slot boundary
+                                        // — comfortably inside the ~1.5s switch budget — and
+                                        // re-modulation is <100ms. tx_parity is unchanged (a
+                                        // QSO holds one parity for its whole exchange), so the
+                                        // schedule (pad/cursor) stays valid, and every FT8
+                                        // frame is the same 79-symbol length so audio_out's
+                                        // length (and audio_duration_ms) are unchanged.
+                                        if let Some(intent) =
+                                            latest_tx_intent.read().ok().and_then(|m| {
+                                                super::tx_pivot_target(
+                                                    qso_id.as_deref(),
+                                                    &message_text,
+                                                    &m,
+                                                )
+                                            })
+                                        {
+                                            let new_text = intent.message_text;
+                                            let new_freq = intent.frequency_offset;
+                                            // TX-F4: protocol-aware re-encode/re-modulate
+                                            // (mirrors Step 1's `encode_for_protocol` /
+                                            // `modulate_for_protocol` call above) — the
+                                            // legacy FT8-only `encode_message` /
+                                            // `modulate_symbols` pair used here previously
+                                            // would emit an FT8-shaped (151,680-sample)
+                                            // waveform onto the FT4/FT2 grid on a pivot in
+                                            // those modes (wrong length, wrong symbol
+                                            // timing). FT8 is unaffected: `encode_for_protocol`
+                                            // /`modulate_for_protocol` dispatch to the exact
+                                            // legacy calls for `Protocol::Ft8`.
+                                            let remod = match modulator.set_base_frequency(new_freq)
+                                            {
+                                                Ok(()) => encode_for_protocol(
+                                                    &mut encoder,
+                                                    active_protocol,
+                                                    &new_text,
+                                                )
+                                                .and_then(|s| {
+                                                    modulate_for_protocol(
+                                                        &mut modulator,
+                                                        active_protocol,
+                                                        &s,
+                                                        0.0,
+                                                    )
+                                                })
+                                                .ok(),
+                                                Err(_) => None,
+                                            };
+                                            match remod {
+                                                Some(new_samples)
+                                                    if schedule.cursor_offset_samples
+                                                        < new_samples.len() =>
+                                                {
+                                                    let mut rebuilt = Vec::with_capacity(
+                                                        schedule.silent_pad_samples
+                                                            + new_samples.len(),
+                                                    );
+                                                    rebuilt.resize(
+                                                        schedule.silent_pad_samples,
+                                                        0.0f32,
+                                                    );
+                                                    rebuilt.extend_from_slice(
+                                                        &new_samples
+                                                            [schedule.cursor_offset_samples..],
+                                                    );
+                                                    info!(
+                                                        target: "pancetta::tx.pivot",
+                                                        "TX pivot: '{}' -> '{}' @{:.0}Hz for qso {} (fresher message arrived during pre-PTT wait)",
+                                                        message_text,
+                                                        new_text,
+                                                        new_freq,
+                                                        qso_id.as_deref().unwrap_or("-")
+                                                    );
+                                                    message_text = new_text;
+                                                    frequency_offset = new_freq;
+                                                    audio_out = rebuilt;
+                                                    // Double-PTT fix: record this pivot so the
+                                                    // newer request that PRODUCED `message_text`
+                                                    // — still queued behind this one — is
+                                                    // recognized as an already-sent duplicate
+                                                    // (Step 0-dup above) instead of keying PTT a
+                                                    // second time for the same text. `qso_id` is
+                                                    // guaranteed `Some` here: `tx_pivot_target`
+                                                    // (mod.rs) only returns `Some` when the
+                                                    // `qso_id` argument is `Some` (manual/tune/
+                                                    // test-TX with `qso_id == None` are never
+                                                    // pivoted), so this `if let` always matches
+                                                    // for a `None` id; guarded defensively anyway.
+                                                    if let Some(id) = qso_id.as_deref() {
+                                                        pivoted_once.insert(
+                                                            super::active_tx_qso_key(id),
+                                                            message_text.clone(),
+                                                        );
+                                                    }
+                                                }
+                                                _ => {
+                                                    warn!(
+                                                    "TX pivot re-modulate failed for '{}' — keeping original '{}'",
+                                                    new_text, message_text
+                                                );
+                                                }
+                                            }
+                                        }
+
+                                        // --- Step 5: Assert PTT ---
+                                        let mut ptt_guard = PttGuard::new(
+                                            message_bus.clone(),
+                                            ptt_active.clone(),
+                                            &last_ptt_on_ms,
+                                        );
+                                        // TX badge on; guard drop clears it on every
+                                        // exit path (complete / abort / shutdown).
+                                        let _tx_status_guard =
+                                            TxStatusGuard::new(message_bus.clone());
+                                        send_tx_status(&message_bus, true).await;
+                                        // NOW-SENDING: this message is keyed and on the air.
+                                        send_tx_queue_status(
+                                            &message_bus,
+                                            Some(crate::message_bus::TxItem {
+                                                text: message_text.clone(),
+                                                freq_hz: frequency_offset,
+                                                qso_id: qso_id.clone(),
+                                                deferred: false,
+                                            }),
+                                            Vec::new(),
+                                        )
+                                        .await;
+                                        let ptt_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Hamlib,
+                                            MessageType::RigControl(
+                                                crate::message_bus::RigControlMessage::SetPtt {
+                                                    state: true,
+                                                },
+                                            ),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(ptt_msg).await {
+                                            warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
+                                        } else {
+                                            info!(
+                                                target: "pancetta::tx.ptt",
+                                                "PTT ON (scheduled TX) sent to rig: '{}' @{:.0}Hz qso={}",
+                                                message_text,
+                                                frequency_offset,
+                                                qso_id.as_deref().unwrap_or("-")
+                                            );
+                                        }
+
+                                        // --- Step 6: Sleep precisely until target slot start ---
+                                        // (audio_out itself includes any silent_pad needed past
+                                        // the slot boundary; we send it at the boundary.)
+                                        let to_slot = pancetta_core::slot::duration_until(
+                                            schedule.target_slot,
+                                            chrono::Utc::now(),
+                                        );
+                                        // ptt_guard in scope — drop on any loop exit fires
+                                        // PTT-off. A qualifying request arriving here supersedes
+                                        // the in-flight frame (aborts + re-keys).
+                                        match interruptible_sleep_or_supersede(
+                                            to_slot,
+                                            &shutdown,
+                                            &abort_current_tx,
+                                            &tx_rx,
+                                            qso_id.as_deref(),
+                                            &message_text,
+                                            &pivoted_once,
+                                        )
+                                        .await
+                                        {
+                                            SleepOutcome::Completed => {}
+                                            SleepOutcome::AbortedByShutdown => {
+                                                info!(
+                                                    "TX aborted between PTT and slot by shutdown"
+                                                );
+                                                break 'worker;
+                                            }
+                                            SleepOutcome::AbortedByOperator => {
+                                                info!("TX aborted between PTT and slot by operator (F8)");
+                                                continue 'worker;
+                                            }
+                                            SleepOutcome::Superseded(new_request) => {
+                                                if !supersede_and_rekey(
+                                                    new_request,
+                                                    &mut message_text,
+                                                    &mut frequency_offset,
+                                                    &mut schedule,
+                                                    &message_bus,
+                                                    &ptt_active,
+                                                    &last_ptt_on_ms,
+                                                    tx_late_max_ms_effective(
+                                                        active_protocol,
+                                                        tx_late_max_ms,
+                                                    ),
+                                                    sample_rate,
+                                                    slot_ns,
+                                                    tx_self_parity,
+                                                    request_received_at,
+                                                )
+                                                .await
+                                                {
+                                                    // Too late to re-key this slot — PTT already
+                                                    // off; abandon THIS message (not the worker):
+                                                    // leave the retry loop and fall through to the
+                                                    // next dequeue. The armed PttGuard's drop is
+                                                    // the PTT-off safety net if the explicit send
+                                                    // failed.
+                                                    break 'key_and_send;
+                                                }
+                                                // Viable re-key: carry the recomputed schedule
+                                                // into the retry, flush stale audio at Step 7,
+                                                // clear the abort flag the supersede set, and
+                                                // disarm this iteration's PttGuard (PTT-off was
+                                                // already sent; Step 5 re-asserts on the retry).
+                                                rekey_schedule = Some(schedule);
+                                                is_rekey = true;
+                                                abort_current_tx.store(false, Ordering::Release);
+                                                ptt_guard.disarm();
+                                                continue 'key_and_send;
+                                            }
+                                        }
+
+                                        // --- Step 7: Route audio to output ---
+                                        let audio_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Audio,
+                                            MessageType::AudioOutput {
+                                                samples: audio_out,
+                                                sample_rate,
+                                                // On a re-key, flush the aborted transmission's
+                                                // still-buffered samples before queuing the new
+                                                // content (Task 2/3). `false` on the normal first
+                                                // pass keeps that path byte-identical.
+                                                flush_first: is_rekey,
+                                            },
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(audio_msg).await {
+                                            debug!("Audio output routing: {}", e);
+                                        }
+
+                                        // --- Step 8: Wait for audio playback to complete ---
+                                        // Playback is now on the air; a qualifying request here
+                                        // supersedes it (aborts + re-keys), flushing the still-
+                                        // playing samples on the retry's Step 7.
+                                        match interruptible_sleep_or_supersede(
+                                            Duration::from_millis(audio_duration_ms),
+                                            &shutdown,
+                                            &abort_current_tx,
+                                            &tx_rx,
+                                            qso_id.as_deref(),
+                                            &message_text,
+                                            &pivoted_once,
+                                        )
+                                        .await
+                                        {
+                                            SleepOutcome::Completed => {}
+                                            SleepOutcome::AbortedByShutdown => {
+                                                info!("TX aborted during playback by shutdown");
+                                                break 'worker;
+                                            }
+                                            SleepOutcome::AbortedByOperator => {
+                                                info!(
+                                                    "TX aborted during playback by operator (F8)"
+                                                );
+                                                continue 'worker;
+                                            }
+                                            SleepOutcome::Superseded(new_request) => {
+                                                if !supersede_and_rekey(
+                                                    new_request,
+                                                    &mut message_text,
+                                                    &mut frequency_offset,
+                                                    &mut schedule,
+                                                    &message_bus,
+                                                    &ptt_active,
+                                                    &last_ptt_on_ms,
+                                                    tx_late_max_ms_effective(
+                                                        active_protocol,
+                                                        tx_late_max_ms,
+                                                    ),
+                                                    sample_rate,
+                                                    slot_ns,
+                                                    tx_self_parity,
+                                                    request_received_at,
+                                                )
+                                                .await
+                                                {
+                                                    // Too late to re-key this slot — abandon THIS
+                                                    // message (not the worker): leave the retry
+                                                    // loop and fall through to the next dequeue.
+                                                    break 'key_and_send;
+                                                }
+                                                rekey_schedule = Some(schedule);
+                                                is_rekey = true;
+                                                abort_current_tx.store(false, Ordering::Release);
+                                                ptt_guard.disarm();
+                                                continue 'key_and_send;
+                                            }
+                                        }
+                                        let success = true;
+                                        let duration_ms = audio_duration_ms;
+
+                                        // --- Step 9: De-assert PTT (with tail delay) ---
+                                        // Plain interruptible_sleep (not _or_supersede): the
+                                        // frame has already fully played by this point, so
+                                        // there's nothing in flight left to supersede — a
+                                        // request arriving during this 50ms tail is handled by
+                                        // the worker's next natural dequeue.
+                                        if interruptible_sleep(
+                                            Duration::from_millis(50),
+                                            &shutdown,
+                                            &abort_current_tx,
+                                        )
+                                        .await
+                                        {
+                                            if shutdown.load(Ordering::Acquire) {
+                                                info!("TX aborted during tail by shutdown");
+                                                break 'worker;
+                                            }
+                                            info!("TX aborted during tail by operator (F8)");
+                                            continue 'worker;
+                                        }
+                                        let ptt_off_msg = ComponentMessage::new(
+                                            ComponentId::Ft8Transmitter,
+                                            ComponentId::Hamlib,
+                                            MessageType::RigControl(
+                                                crate::message_bus::RigControlMessage::SetPtt {
+                                                    state: false,
+                                                },
+                                            ),
+                                            Instant::now(),
+                                        );
+                                        if let Err(e) = message_bus.send_message(ptt_off_msg).await
+                                        {
+                                            warn!(
+                                                "PTT OFF failed (rig may be stuck in TX!): {}",
+                                                e
+                                            );
+                                        }
+                                        ptt_guard.disarm();
+
+                                        // --- Step 10: Send TransmitComplete ---
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Autonomous,
                                             MessageType::TransmitComplete {
-                                                success: false,
+                                                success,
                                                 message_text,
-                                                duration_ms: 0,
+                                                duration_ms,
                                             },
                                             Instant::now(),
                                         );
-                                        let _ = message_bus.send_message(complete_msg).await;
-                                        continue;
-                                    }
-                                    let audio_duration_ms =
-                                        (audio_out.len() as f64 / sample_rate as f64 * 1000.0)
-                                            as u64;
-
-                                    // --- Step 4c: late pivot to the freshest message ---
-                                    // Our decoder finishes ~1.8s BEFORE the slot
-                                    // boundary, but a fresher decode for THIS QSO can
-                                    // still land while this frame waited out the (up to
-                                    // ~30s) pre-PTT sleep. If the QSO component has since
-                                    // produced a newer message for this qso_id, swap to
-                                    // it now and re-modulate. We're at the slot boundary
-                                    // — comfortably inside the ~1.5s switch budget — and
-                                    // re-modulation is <100ms. tx_parity is unchanged (a
-                                    // QSO holds one parity for its whole exchange), so the
-                                    // schedule (pad/cursor) stays valid, and every FT8
-                                    // frame is the same 79-symbol length so audio_out's
-                                    // length (and audio_duration_ms) are unchanged.
-                                    if let Some(intent) =
-                                        latest_tx_intent.read().ok().and_then(|m| {
-                                            super::tx_pivot_target(
-                                                qso_id.as_deref(),
-                                                &message_text,
-                                                &m,
-                                            )
-                                        })
-                                    {
-                                        let new_text = intent.message_text;
-                                        let new_freq = intent.frequency_offset;
-                                        // TX-F4: protocol-aware re-encode/re-modulate
-                                        // (mirrors Step 1's `encode_for_protocol` /
-                                        // `modulate_for_protocol` call above) — the
-                                        // legacy FT8-only `encode_message` /
-                                        // `modulate_symbols` pair used here previously
-                                        // would emit an FT8-shaped (151,680-sample)
-                                        // waveform onto the FT4/FT2 grid on a pivot in
-                                        // those modes (wrong length, wrong symbol
-                                        // timing). FT8 is unaffected: `encode_for_protocol`
-                                        // /`modulate_for_protocol` dispatch to the exact
-                                        // legacy calls for `Protocol::Ft8`.
-                                        let remod = match modulator.set_base_frequency(new_freq) {
-                                            Ok(()) => encode_for_protocol(
-                                                &mut encoder,
-                                                active_protocol,
-                                                &new_text,
-                                            )
-                                            .and_then(|s| {
-                                                modulate_for_protocol(
-                                                    &mut modulator,
-                                                    active_protocol,
-                                                    &s,
-                                                    0.0,
-                                                )
-                                            })
-                                            .ok(),
-                                            Err(_) => None,
-                                        };
-                                        match remod {
-                                            Some(new_samples)
-                                                if schedule.cursor_offset_samples
-                                                    < new_samples.len() =>
-                                            {
-                                                let mut rebuilt = Vec::with_capacity(
-                                                    schedule.silent_pad_samples + new_samples.len(),
-                                                );
-                                                rebuilt.resize(schedule.silent_pad_samples, 0.0f32);
-                                                rebuilt.extend_from_slice(
-                                                    &new_samples[schedule.cursor_offset_samples..],
-                                                );
-                                                info!(
-                                                    target: "pancetta::tx.pivot",
-                                                    "TX pivot: '{}' -> '{}' @{:.0}Hz for qso {} (fresher message arrived during pre-PTT wait)",
-                                                    message_text,
-                                                    new_text,
-                                                    new_freq,
-                                                    qso_id.as_deref().unwrap_or("-")
-                                                );
-                                                message_text = new_text;
-                                                frequency_offset = new_freq;
-                                                audio_out = rebuilt;
-                                                // Double-PTT fix: record this pivot so the
-                                                // newer request that PRODUCED `message_text`
-                                                // — still queued behind this one — is
-                                                // recognized as an already-sent duplicate
-                                                // (Step 0-dup above) instead of keying PTT a
-                                                // second time for the same text. `qso_id` is
-                                                // guaranteed `Some` here: `tx_pivot_target`
-                                                // (mod.rs) only returns `Some` when the
-                                                // `qso_id` argument is `Some` (manual/tune/
-                                                // test-TX with `qso_id == None` are never
-                                                // pivoted), so this `if let` always matches
-                                                // for a `None` id; guarded defensively anyway.
-                                                if let Some(id) = qso_id.as_deref() {
-                                                    pivoted_once.insert(
-                                                        super::active_tx_qso_key(id),
-                                                        message_text.clone(),
-                                                    );
-                                                }
-                                            }
-                                            _ => {
-                                                warn!(
-                                                    "TX pivot re-modulate failed for '{}' — keeping original '{}'",
-                                                    new_text, message_text
-                                                );
-                                            }
+                                        if let Err(e) = message_bus.send_message(complete_msg).await
+                                        {
+                                            warn!("Failed to send TransmitComplete: {}", e);
                                         }
-                                    }
 
-                                    // --- Step 5: Assert PTT ---
-                                    let mut ptt_guard = PttGuard::new(
-                                        message_bus.clone(),
-                                        ptt_active.clone(),
-                                        &last_ptt_on_ms,
-                                    );
-                                    // TX badge on; guard drop clears it on every
-                                    // exit path (complete / abort / shutdown).
-                                    let _tx_status_guard = TxStatusGuard::new(message_bus.clone());
-                                    send_tx_status(&message_bus, true).await;
-                                    // NOW-SENDING: this message is keyed and on the air.
-                                    send_tx_queue_status(
-                                        &message_bus,
-                                        Some(crate::message_bus::TxItem {
-                                            text: message_text.clone(),
-                                            freq_hz: frequency_offset,
-                                            qso_id: qso_id.clone(),
-                                            deferred: false,
-                                        }),
-                                        Vec::new(),
-                                    )
-                                    .await;
-                                    let ptt_msg = ComponentMessage::new(
-                                        ComponentId::Ft8Transmitter,
-                                        ComponentId::Hamlib,
-                                        MessageType::RigControl(
-                                            crate::message_bus::RigControlMessage::SetPtt {
-                                                state: true,
-                                            },
-                                        ),
-                                        Instant::now(),
-                                    );
-                                    if let Err(e) = message_bus.send_message(ptt_msg).await {
-                                        warn!("PTT ON failed (rig not keyed): {} — if you are transmitting, TX audio may be going to the wrong device", e);
-                                    } else {
-                                        info!(
-                                            target: "pancetta::tx.ptt",
-                                            "PTT ON (scheduled TX) sent to rig: '{}' @{:.0}Hz qso={}",
-                                            message_text,
-                                            frequency_offset,
-                                            qso_id.as_deref().unwrap_or("-")
-                                        );
-                                    }
-
-                                    // --- Step 6: Sleep precisely until target slot start ---
-                                    // (audio_out itself includes any silent_pad needed past
-                                    // the slot boundary; we send it at the boundary.)
-                                    let to_slot = pancetta_core::slot::duration_until(
-                                        schedule.target_slot,
-                                        chrono::Utc::now(),
-                                    );
-                                    if interruptible_sleep(to_slot, &shutdown, &abort_current_tx)
-                                        .await
-                                    {
-                                        // ptt_guard in scope — drop on `break`/`continue`
-                                        // fires PTT-off either way.
-                                        if shutdown.load(Ordering::Acquire) {
-                                            info!("TX aborted between PTT and slot by shutdown");
-                                            break;
-                                        }
-                                        info!("TX aborted between PTT and slot by operator (F8)");
-                                        continue;
-                                    }
-
-                                    // --- Step 7: Route audio to output ---
-                                    let audio_msg = ComponentMessage::new(
-                                        ComponentId::Ft8Transmitter,
-                                        ComponentId::Audio,
-                                        MessageType::AudioOutput {
-                                            samples: audio_out,
-                                            sample_rate,
-                                            flush_first: false,
-                                        },
-                                        Instant::now(),
-                                    );
-                                    if let Err(e) = message_bus.send_message(audio_msg).await {
-                                        debug!("Audio output routing: {}", e);
-                                    }
-
-                                    // --- Step 8: Wait for audio playback to complete ---
-                                    if interruptible_sleep(
-                                        Duration::from_millis(audio_duration_ms),
-                                        &shutdown,
-                                        &abort_current_tx,
-                                    )
-                                    .await
-                                    {
-                                        if shutdown.load(Ordering::Acquire) {
-                                            info!("TX aborted during playback by shutdown");
-                                            break;
-                                        }
-                                        info!("TX aborted during playback by operator (F8)");
-                                        continue;
-                                    }
-                                    let success = true;
-                                    let duration_ms = audio_duration_ms;
-
-                                    // --- Step 9: De-assert PTT (with tail delay) ---
-                                    if interruptible_sleep(
-                                        Duration::from_millis(50),
-                                        &shutdown,
-                                        &abort_current_tx,
-                                    )
-                                    .await
-                                    {
-                                        if shutdown.load(Ordering::Acquire) {
-                                            info!("TX aborted during tail by shutdown");
-                                            break;
-                                        }
-                                        info!("TX aborted during tail by operator (F8)");
-                                        continue;
-                                    }
-                                    let ptt_off_msg = ComponentMessage::new(
-                                        ComponentId::Ft8Transmitter,
-                                        ComponentId::Hamlib,
-                                        MessageType::RigControl(
-                                            crate::message_bus::RigControlMessage::SetPtt {
-                                                state: false,
-                                            },
-                                        ),
-                                        Instant::now(),
-                                    );
-                                    if let Err(e) = message_bus.send_message(ptt_off_msg).await {
-                                        warn!("PTT OFF failed (rig may be stuck in TX!): {}", e);
-                                    }
-                                    ptt_guard.disarm();
-
-                                    // --- Step 10: Send TransmitComplete ---
-                                    let complete_msg = ComponentMessage::new(
-                                        ComponentId::Ft8Transmitter,
-                                        ComponentId::Autonomous,
-                                        MessageType::TransmitComplete {
-                                            success,
-                                            message_text,
-                                            duration_ms,
-                                        },
-                                        Instant::now(),
-                                    );
-                                    if let Err(e) = message_bus.send_message(complete_msg).await {
-                                        warn!("Failed to send TransmitComplete: {}", e);
-                                    }
+                                        // Normal completion: leave the retry loop and let the
+                                        // worker dequeue the next message.
+                                        break 'key_and_send;
+                                    } // end 'key_and_send
                                 }
 
                                 MessageType::MultiTransmitRequest {
@@ -4782,6 +5047,135 @@ mod tx_failure_diagnostic_tests {
             }
             other => panic!("expected DiagnosticEvent, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod supersede_rekey_tests {
+    use super::*;
+    use crate::message_bus::MessageBus;
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+    use std::sync::Arc;
+
+    /// The core Phase-1 re-key decision: a genuinely different superseding
+    /// request that can still make this slot must deassert PTT and swap the
+    /// working `message_text`/`frequency_offset`/`schedule` in place so the
+    /// caller's `'key_and_send` retry re-encodes (Step 1) and re-keys with the
+    /// NEW content. Targets the current slot's parity with a >1-slot
+    /// `tx_late_max_ms` so the re-key is viable no matter when the test runs.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_and_rekey_updates_state_when_viable() {
+        let bus = MessageBus::new(16).unwrap();
+        // Hamlib channel so supersede_and_rekey's PTT-OFF send has a receiver.
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        let new_request = MessageType::TransmitRequest {
+            message_text: "NEW TEXT".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+
+        let viable = super::supersede_and_rekey(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+        )
+        .await;
+
+        assert!(
+            viable,
+            "re-key targeting the current slot parity must be viable"
+        );
+        // The state swap is what makes the retry re-encode the NEW content:
+        // Step 1 re-runs `encode_for_protocol(&message_text)` at the new freq.
+        assert_eq!(message_text, "NEW TEXT");
+        assert_eq!(frequency_offset, 1500.0);
+        assert!(
+            !ptt_active.load(Ordering::Acquire),
+            "PTT must be deasserted"
+        );
+        assert!(
+            !schedule.deferred,
+            "a viable re-key schedule is never deferred"
+        );
+    }
+
+    /// A `MultiTransmitRequest` is not re-keyable by this Phase-1 single-TX
+    /// helper (Task 7 owns bundle supersede) — it must report "not viable" and
+    /// leave the working text untouched (no PTT/schedule mutation).
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_and_rekey_declines_multi_transmit_request() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            chrono::Utc::now(),
+            pancetta_core::slot::SlotParity::Even,
+            8000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        let new_request = MessageType::MultiTransmitRequest {
+            items: Vec::new(),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+
+        let viable = super::supersede_and_rekey(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            8000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            chrono::Utc::now(),
+        )
+        .await;
+
+        assert!(!viable);
+        assert_eq!(
+            message_text, "OLD TEXT",
+            "a declined supersede leaves the working text untouched"
+        );
     }
 }
 
