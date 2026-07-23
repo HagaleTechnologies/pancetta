@@ -150,6 +150,21 @@ original audio was already torn down by the abort, unlike the pre-PTT pivot's fa
 warning, leave PTT off, and let the stashed request flow through the normal `schedule_tx` path for
 the next slot — no additional dead air beyond what the abort itself already caused.
 
+**Known side effect — cross-QSO `Replace` identity (accepted for Phase 1):** on the single-TX arm's
+in-place `Replace` re-key, `supersede_and_rekey_or_bundle` swaps only `message_text` /
+`frequency_offset` / `schedule` to the superseding request; the working `qso_id` intentionally
+continues to track the ORIGINAL in-flight QSO's identity (it drives liveness / pivot-tombstone
+bookkeeping). When the supersede is cross-QSO — the new content belongs to a different QSO than the
+one being aborted — the re-keyed frame therefore transmits the NEW `message_text` while still
+labelled with the OLD `qso_id`. Two consequences are accepted as Phase-1 characteristics: (a) a
+display/telemetry mismatch (the TX strip / logs attribute the new text to the original QSO), and (b)
+if the original QSO happens to reach a terminal state at that same instant, the drop-stale-TX gate
+keyed on the (stale) `qso_id` could suppress the operator's deliberate manual override. Neither is
+fixed here — Phase 1 keeps the original identity deliberately for bookkeeping simplicity. (Note: the
+superseding request's `origin`, unlike its `qso_id`, is NOT carried over — it is threaded through so
+the re-keyed frame is arm-gated and emitted under the new request's own origin; see the C1 note in
+`coordinator/tx.rs`'s `SupersedeOutcome`.)
+
 ## Thrashing
 
 Manual triggers are inherently operator-paced. Autonomous (Phase 2) triggers are self-limiting via

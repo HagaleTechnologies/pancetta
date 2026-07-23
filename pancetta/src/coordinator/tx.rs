@@ -233,7 +233,14 @@ pub fn classify_incoming_during_tx(
             if super::is_pivot_duplicate(qso_id.as_deref(), message_text, pivoted_once) {
                 return IncomingDuringTx::Drop;
             }
-            let same_target = qso_id.as_deref() == in_flight_qso_id;
+            // M1: normalize BOTH sides through `active_tx_qso_key` before
+            // comparing, matching every sibling qso_id comparison
+            // (`tx_pivot_target`, `is_pivot_duplicate`, `tx_qso_is_live`). QSO
+            // ids are already deterministic-lowercase Uuids today so this
+            // doesn't change behavior, but it removes a raw-`Option<&str>`
+            // comparison that would silently diverge if casing ever drifted.
+            let same_target = qso_id.as_deref().map(super::active_tx_qso_key)
+                == in_flight_qso_id.map(super::active_tx_qso_key);
             if same_target && message_text == in_flight_text {
                 return IncomingDuringTx::Drop;
             }
@@ -411,9 +418,19 @@ pub enum SleepOutcome {
 /// incoming request (Task 4's `classify_incoming_during_tx`) on every 50ms
 /// tick. A qualifying request sets `abort` itself (mirroring the operator
 /// F8 path) and is returned via `SleepOutcome::Superseded` for the caller to
-/// re-key. A non-qualifying request (exact duplicate or pivot tombstone) is
-/// silently consumed — same as it would have been had it reached the main
-/// dequeue loop naturally — and the sleep keeps waiting.
+/// re-key. A non-qualifying `TransmitRequest`/`MultiTransmitRequest` (exact
+/// duplicate or pivot tombstone) is silently consumed — same as it would have
+/// been had it reached the main dequeue loop naturally — and the sleep keeps
+/// waiting.
+///
+/// I1: a message that is NEITHER a `TransmitRequest` NOR a
+/// `MultiTransmitRequest` (e.g. an operator `TuneRequest`) is NOT a supersede
+/// candidate and must NOT be swallowed — before this feature it would sit in
+/// the channel until the worker's next dequeue and be handled by its own
+/// top-level arm. `crossbeam_channel::Receiver` has no peek, so we must consume
+/// such a message to inspect its type; it is then SIPHONED aside and
+/// re-enqueued (in arrival order) to the worker's own channel when the sleep
+/// ends, so the main loop processes it after the current TX arm returns.
 ///
 /// See docs/superpowers/specs/2026-07-22-mid-tx-abort-restart-design.md,
 /// "Abort + re-key mechanics."
@@ -423,21 +440,34 @@ async fn interruptible_sleep_or_supersede(
     shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
+    message_bus: &MessageBus,
     in_flight_qso_id: Option<&str>,
     in_flight_text: &str,
     pivoted_once: &std::collections::HashMap<String, String>,
 ) -> SleepOutcome {
     use std::sync::atomic::Ordering;
 
-    let check_once =
-        |tx_rx: &crossbeam_channel::Receiver<ComponentMessage>| -> Option<SleepOutcome> {
-            if shutdown.load(Ordering::Acquire) {
-                return Some(SleepOutcome::AbortedByShutdown);
-            }
-            if abort.load(Ordering::Acquire) {
-                return Some(SleepOutcome::AbortedByOperator);
-            }
-            if let Ok(message) = tx_rx.try_recv() {
+    // Non-supersede-candidate messages pulled off the channel during a poll
+    // (I1). Held here rather than bounced straight back so a single try_recv
+    // per tick can't keep re-reading the same one; flushed to the worker's own
+    // channel, in order, once the sleep concludes.
+    let mut siphoned: Vec<ComponentMessage> = Vec::new();
+
+    let check_once = |tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
+                      siphoned: &mut Vec<ComponentMessage>|
+     -> Option<SleepOutcome> {
+        if shutdown.load(Ordering::Acquire) {
+            return Some(SleepOutcome::AbortedByShutdown);
+        }
+        if abort.load(Ordering::Acquire) {
+            return Some(SleepOutcome::AbortedByOperator);
+        }
+        if let Ok(message) = tx_rx.try_recv() {
+            let is_supersede_candidate = matches!(
+                message.message_type,
+                MessageType::TransmitRequest { .. } | MessageType::MultiTransmitRequest { .. }
+            );
+            if is_supersede_candidate {
                 match classify_incoming_during_tx(
                     &message.message_type,
                     in_flight_qso_id,
@@ -450,24 +480,52 @@ async fn interruptible_sleep_or_supersede(
                         return Some(SleepOutcome::Superseded(message.message_type));
                     }
                 }
+            } else {
+                // Not a supersede candidate (e.g. TuneRequest). Siphon it so
+                // it is re-enqueued after the sleep instead of being lost.
+                siphoned.push(message);
             }
-            None
-        };
-
-    if let Some(outcome) = check_once(tx_rx) {
-        return outcome;
-    }
-
-    let chunk = Duration::from_millis(50);
-    let deadline = tokio::time::Instant::now() + total;
-    while tokio::time::Instant::now() < deadline {
-        if let Some(outcome) = check_once(tx_rx) {
-            return outcome;
         }
-        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
-        sleep(remaining.min(chunk)).await;
+        None
+    };
+
+    let outcome = 'sleep: {
+        if let Some(outcome) = check_once(tx_rx, &mut siphoned) {
+            break 'sleep outcome;
+        }
+
+        let chunk = Duration::from_millis(50);
+        let deadline = tokio::time::Instant::now() + total;
+        while tokio::time::Instant::now() < deadline {
+            if let Some(outcome) = check_once(tx_rx, &mut siphoned) {
+                break 'sleep outcome;
+            }
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            sleep(remaining.min(chunk)).await;
+        }
+        SleepOutcome::Completed
+    };
+
+    // Re-enqueue any siphoned non-candidate messages to the worker's own
+    // channel, in arrival order, so the main loop dequeues them normally on its
+    // next cycle (pre-feature behavior). Done for EVERY outcome — including
+    // Superseded — so nothing an operator sent is lost by the supersede path.
+    for msg in siphoned {
+        let reenqueue = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Ft8Transmitter,
+            msg.message_type,
+            Instant::now(),
+        );
+        if let Err(e) = message_bus.send_message(reenqueue).await {
+            warn!(
+                "supersede sleep: failed to re-enqueue non-candidate message: {}",
+                e
+            );
+        }
     }
-    SleepOutcome::Completed
+
+    outcome
 }
 
 #[cfg(test)]
@@ -523,12 +581,14 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_millis(80),
             &shutdown,
             &abort,
             &rx,
+            &bus,
             Some("qso-1"),
             "in flight text",
             &pivoted_once,
@@ -542,6 +602,7 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
 
         let new_request = MessageType::TransmitRequest {
@@ -564,6 +625,7 @@ mod interruptible_sleep_tests {
             &shutdown,
             &abort,
             &rx,
+            &bus,
             Some("qso-1"),
             "KA1ABC K5ARH R-15",
             &pivoted_once,
@@ -594,6 +656,7 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(false));
         let abort = Arc::new(AtomicBool::new(false));
         let (tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
 
         // Identical content to what's in flight — should be Dropped, not treated
@@ -618,6 +681,7 @@ mod interruptible_sleep_tests {
             &shutdown,
             &abort,
             &rx,
+            &bus,
             Some("qso-1"),
             "KA1ABC K5ARH R-15",
             &pivoted_once,
@@ -633,18 +697,102 @@ mod interruptible_sleep_tests {
         let shutdown = Arc::new(AtomicBool::new(true));
         let abort = Arc::new(AtomicBool::new(false));
         let (_tx, rx) = crossbeam_channel::unbounded();
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
         let pivoted_once = std::collections::HashMap::new();
         let outcome = super::interruptible_sleep_or_supersede(
             Duration::from_secs(60),
             &shutdown,
             &abort,
             &rx,
+            &bus,
             Some("qso-1"),
             "in flight text",
             &pivoted_once,
         )
         .await;
         assert!(matches!(outcome, super::SleepOutcome::AbortedByShutdown));
+    }
+
+    /// I1 REGRESSION: a message that is NOT a supersede candidate (here a
+    /// `TuneRequest` — a real top-level worker arm) arriving during a supersede
+    /// sleep must NOT be silently swallowed. Before the fix it was fed to the
+    /// classifier's catch-all `Drop` arm and consumed with no re-enqueue, so an
+    /// operator's F4 single-tone tune issued while a TX was on the air simply
+    /// vanished instead of being processed once TX finished. The sleep must
+    /// complete normally (a TuneRequest is not a supersede trigger) and the
+    /// message must be re-enqueued to the worker's own channel for the main
+    /// loop's next dequeue.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_reenqueues_non_candidate_tune_request() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        // The worker's own channel: the function polls its receiver AND
+        // re-enqueues to it (routed by ComponentId::Ft8Transmitter).
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let (tx_sender, tx_rx) = bus
+            .create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        // Operator F4 tune request lands on the TX channel mid-transmission.
+        let tune = MessageType::TuneRequest {
+            duration_secs: 5,
+            tone_offset_hz: 1500.0,
+        };
+        tx_sender
+            .send(crate::message_bus::ComponentMessage::new(
+                crate::message_bus::ComponentId::Tui,
+                crate::message_bus::ComponentId::Ft8Transmitter,
+                tune,
+                std::time::Instant::now(),
+            ))
+            .unwrap();
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(120),
+            &shutdown,
+            &abort,
+            &tx_rx,
+            &bus,
+            Some("qso-1"),
+            "KA1ABC K5ARH R-15",
+            &pivoted_once,
+        )
+        .await;
+
+        // A TuneRequest is not a supersede trigger: the sleep runs to completion
+        // and never sets the abort flag.
+        assert!(
+            matches!(outcome, super::SleepOutcome::Completed),
+            "a non-candidate TuneRequest must not supersede — got {outcome:?}"
+        );
+        assert!(
+            !abort.load(Ordering::Acquire),
+            "a TuneRequest must not set abort_current_tx"
+        );
+
+        // The TuneRequest was re-enqueued (siphoned during the sleep, flushed
+        // back after) — NOT lost.
+        let reenqueued = tx_rx
+            .try_recv()
+            .expect("the TuneRequest must be re-enqueued, not swallowed");
+        assert!(
+            matches!(
+                reenqueued.message_type,
+                MessageType::TuneRequest {
+                    duration_secs: 5,
+                    ..
+                }
+            ),
+            "expected the re-enqueued TuneRequest, got {:?}",
+            reenqueued.message_type
+        );
+        // Exactly one — no duplication.
+        assert!(
+            tx_rx.try_recv().is_err(),
+            "the TuneRequest is re-enqueued exactly once"
+        );
     }
 }
 
@@ -1659,9 +1807,19 @@ impl Drop for PttGuard {
 /// today's F8-abort behavior of not resending either).
 ///
 /// Note: only `message_text`/`frequency_offset`/`schedule` are mutated —
-/// `qso_id` and `origin` intentionally track the ORIGINAL in-flight request
-/// (Phase 1 manual override; a cross-QSO supersede re-keys the new text but
-/// keeps the original request's identity for liveness/tombstone bookkeeping).
+/// `qso_id` intentionally tracks the ORIGINAL in-flight request (Phase 1
+/// manual override; a cross-QSO supersede re-keys the new text but keeps the
+/// original request's identity for liveness/tombstone bookkeeping; see the
+/// design spec's "Known side effect" note on this cross-QSO characteristic).
+///
+/// The NEW request's `origin`, by contrast, is NOT discarded: it is returned
+/// via `SupersedeOutcome::Replace{origin}` / `Bundle{new_origin}` so the
+/// caller re-gates and emits the re-keyed frame with the superseding request's
+/// OWN origin, never the aborted transmission's (the C1 fix — an in-place
+/// re-key that reused the original `origin` would let a `Remote` supersede of a
+/// `Local` frame skip the key-time arm gate). `in_flight_origin` is the origin
+/// of the transmission being aborted, needed only to fail-safe-fold the
+/// `bundle_origin` (Remote if EITHER stream is Remote).
 #[allow(clippy::too_many_arguments)]
 /// Outcome of `supersede_and_rekey_or_bundle` — replaces Task 6's bare
 /// `bool`. A viable mid-TX supersede can now either fold the new request into
@@ -1680,7 +1838,16 @@ enum SupersedeOutcome {
     /// Single-item replace. The working `message_text`/`frequency_offset`/
     /// `schedule` have been mutated in place to the new item; the single-TX
     /// caller's `'key_and_send` retry re-encodes and re-keys with it.
-    Replace,
+    Replace {
+        /// The NEW superseding request's OWN origin. The single-TX arm's
+        /// in-place `'key_and_send` retry MUST re-gate (Step 4b-arm) and emit
+        /// the re-keyed frame with THIS origin — never the aborted in-flight
+        /// transmission's original origin. (C1: a `Remote` request superseding
+        /// a `Local` in-flight frame otherwise re-keyed under the stale `Local`
+        /// origin and skipped the key-time arm gate entirely; the reverse —
+        /// `Local` superseding `Remote` — wrongly kept gating a local frame.)
+        origin: crate::message_bus::TxOrigin,
+    },
     /// Bundle-add is viable. The caller encodes `items` via
     /// `encode_and_modulate_multi_tx`; on success it re-enqueues a
     /// `MultiTransmitRequest` for them (picked up by the unmodified multi-TX
@@ -1690,6 +1857,16 @@ enum SupersedeOutcome {
     /// replace with no extra plumbing.
     Bundle {
         items: Vec<crate::message_bus::TransmitRequestItem>,
+        /// Fail-safe FOLDED origin for the re-enqueued `MultiTransmitRequest`:
+        /// `Remote` if EITHER the in-flight stream OR the new request is
+        /// `Remote`, so a mixed-origin fold is still gated by the bundle arm
+        /// gate. Mirrors the coalescer's fail-safe origin fold.
+        bundle_origin: crate::message_bus::TxOrigin,
+        /// The NEW request's OWN origin — used when the caller falls back to a
+        /// single-item replace on a frequency collision (that fallback drops
+        /// the in-flight item and transmits ONLY the new one, so it must gate
+        /// with the new request's own origin, not the folded bundle origin).
+        new_origin: crate::message_bus::TxOrigin,
     },
 }
 
@@ -1708,6 +1885,7 @@ async fn supersede_and_rekey_or_bundle(
     tx_self_parity: pancetta_config::station::TxSelfParity,
     _request_received_at: chrono::DateTime<chrono::Utc>,
     max_concurrent_qsos: u32,
+    in_flight_origin: crate::message_bus::TxOrigin,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
 ) -> SupersedeOutcome {
     // Deassert PTT immediately and UNCONDITIONALLY — before we even inspect the
@@ -1738,7 +1916,7 @@ async fn supersede_and_rekey_or_bundle(
         frequency_offset: new_freq,
         tx_parity: new_tx_parity,
         qso_id: new_qso_id,
-        ..
+        origin: new_origin,
     } = new_request
     else {
         // A `MultiTransmitRequest` arriving as the superseding message isn't
@@ -1798,12 +1976,23 @@ async fn supersede_and_rekey_or_bundle(
             frequency_offset: new_freq,
             qso_id: new_qso_id,
         });
+        // Fail-safe origin fold: the bundle carries BOTH the in-flight stream
+        // and the new one, so it must be gated if EITHER is Remote.
+        let bundle_origin = if in_flight_origin == crate::message_bus::TxOrigin::Remote
+            || new_origin == crate::message_bus::TxOrigin::Remote
+        {
+            crate::message_bus::TxOrigin::Remote
+        } else {
+            crate::message_bus::TxOrigin::Local
+        };
         return SupersedeOutcome::Bundle {
             items: candidate_items,
+            bundle_origin,
+            new_origin,
         };
     }
 
-    SupersedeOutcome::Replace
+    SupersedeOutcome::Replace { origin: new_origin }
 }
 
 /// Multi-TX arm's mid-TX supersede handler (Task 7 Step 4).
@@ -1891,6 +2080,7 @@ async fn supersede_multi_reenqueue(
         tx_self_parity,
         request_received_at,
         max_concurrent_qsos,
+        origin,
         in_flight_items,
     )
     .await
@@ -1919,7 +2109,11 @@ async fn supersede_multi_reenqueue(
                 }
             }
         }
-        SupersedeOutcome::Bundle { items } => {
+        SupersedeOutcome::Bundle {
+            items,
+            bundle_origin,
+            new_origin,
+        } => {
             let bundle_outcome =
                 encode_and_modulate_multi_tx(encoder, active_protocol, tx_params, &items);
             let reenqueue = if bundle_outcome.samples.is_ok() {
@@ -1929,13 +2123,19 @@ async fn supersede_multi_reenqueue(
                     MessageType::MultiTransmitRequest {
                         items,
                         tx_parity: None,
-                        origin,
+                        // Fail-safe folded origin (Remote if either the in-flight
+                        // bundle or the new request was Remote), NOT the in-flight
+                        // bundle's origin — otherwise a Remote item folded onto a
+                        // Local in-flight bundle would re-enter ungated.
+                        origin: bundle_origin,
                     },
                     Instant::now(),
                 )
             } else {
                 // Frequency collision: fall back to re-enqueueing only the new
-                // item (always the last element of the candidate bundle).
+                // item (always the last element of the candidate bundle). This
+                // transmits ONLY the new stream, so it re-enters with the NEW
+                // request's own origin, not the in-flight bundle's.
                 let new_item = items
                     .last()
                     .cloned()
@@ -1948,7 +2148,7 @@ async fn supersede_multi_reenqueue(
                         frequency_offset: new_item.frequency_offset,
                         qso_id: new_item.qso_id,
                         tx_parity: None,
-                        origin,
+                        origin: new_origin,
                     },
                     Instant::now(),
                 )
@@ -1960,7 +2160,7 @@ async fn supersede_multi_reenqueue(
                 );
             }
         }
-        SupersedeOutcome::Replace => {
+        SupersedeOutcome::Replace { origin: new_origin } => {
             let reenqueue = ComponentMessage::new(
                 ComponentId::Ft8Transmitter,
                 ComponentId::Ft8Transmitter,
@@ -1969,7 +2169,10 @@ async fn supersede_multi_reenqueue(
                     frequency_offset: scratch_freq,
                     qso_id: None,
                     tx_parity: None,
-                    origin,
+                    // The re-enqueued replace carries the NEW request's origin so
+                    // the pickup-time gate re-evaluates against IT, not the
+                    // aborted in-flight bundle's origin (aligns with the C1 fix).
+                    origin: new_origin,
                 },
                 Instant::now(),
             );
@@ -2335,7 +2538,11 @@ impl super::ApplicationCoordinator {
                                     mut frequency_offset,
                                     qso_id,
                                     tx_parity,
-                                    origin,
+                                    // `mut`: a mid-TX supersede on the `Replace` path re-keys
+                                    // in place and reassigns this to the SUPERSEDING request's
+                                    // origin, so Step 4b-arm's key-time gate re-evaluates
+                                    // against the frame actually about to transmit (C1 fix).
+                                    mut origin,
                                 } => {
                                     info!(
                                         "Transmit request: '{}' at offset {:.0} Hz (qso: {:?})",
@@ -3050,6 +3257,7 @@ impl super::ApplicationCoordinator {
                                             &shutdown,
                                             &abort_current_tx,
                                             &tx_rx,
+                                            &message_bus,
                                             qso_id.as_deref(),
                                             &message_text,
                                             &pivoted_once,
@@ -3094,6 +3302,7 @@ impl super::ApplicationCoordinator {
                                                     tx_self_parity,
                                                     request_received_at,
                                                     max_concurrent_qsos,
+                                                    origin,
                                                     &in_flight_items,
                                                 )
                                                 .await
@@ -3107,13 +3316,20 @@ impl super::ApplicationCoordinator {
                                                         // explicit send failed.
                                                         break 'key_and_send;
                                                     }
-                                                    SupersedeOutcome::Replace => {
+                                                    SupersedeOutcome::Replace {
+                                                        origin: new_origin,
+                                                    } => {
                                                         // Viable single-item re-key (Task 6): carry
                                                         // the recomputed schedule into the retry,
                                                         // flush stale audio at Step 7, clear the
                                                         // abort flag the supersede set, and disarm
                                                         // this iteration's PttGuard (PTT-off was
                                                         // already sent; Step 5 re-asserts on retry).
+                                                        // Re-point `origin` at the SUPERSEDING
+                                                        // request's origin so Step 4b-arm gates the
+                                                        // frame that is actually about to transmit,
+                                                        // not the aborted one (C1 fix).
+                                                        origin = new_origin;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -3121,7 +3337,11 @@ impl super::ApplicationCoordinator {
                                                         ptt_guard.disarm();
                                                         continue 'key_and_send;
                                                     }
-                                                    SupersedeOutcome::Bundle { items } => {
+                                                    SupersedeOutcome::Bundle {
+                                                        items,
+                                                        bundle_origin,
+                                                        new_origin,
+                                                    } => {
                                                         // Prefer a multi-TX bundle: encode the
                                                         // in-flight + new item together. On success,
                                                         // hand it back to the worker as a fresh
@@ -3149,7 +3369,9 @@ impl super::ApplicationCoordinator {
                                                                 MessageType::MultiTransmitRequest {
                                                                     items,
                                                                     tx_parity: None,
-                                                                    origin,
+                                                                    // Fail-safe folded origin, not
+                                                                    // the aborted frame's origin.
+                                                                    origin: bundle_origin,
                                                                 },
                                                                 Instant::now(),
                                                             );
@@ -3162,7 +3384,10 @@ impl super::ApplicationCoordinator {
                                                             ptt_guard.disarm();
                                                             break 'key_and_send;
                                                         }
-                                                        // Frequency collision: single-item replace.
+                                                        // Frequency collision: single-item replace
+                                                        // of the NEW item only, so gate with the new
+                                                        // request's own origin (C1 fix).
+                                                        origin = new_origin;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -3202,6 +3427,7 @@ impl super::ApplicationCoordinator {
                                             &shutdown,
                                             &abort_current_tx,
                                             &tx_rx,
+                                            &message_bus,
                                             qso_id.as_deref(),
                                             &message_text,
                                             &pivoted_once,
@@ -3244,6 +3470,7 @@ impl super::ApplicationCoordinator {
                                                     tx_self_parity,
                                                     request_received_at,
                                                     max_concurrent_qsos,
+                                                    origin,
                                                     &in_flight_items,
                                                 )
                                                 .await
@@ -3255,7 +3482,13 @@ impl super::ApplicationCoordinator {
                                                         // dequeue.
                                                         break 'key_and_send;
                                                     }
-                                                    SupersedeOutcome::Replace => {
+                                                    SupersedeOutcome::Replace {
+                                                        origin: new_origin,
+                                                    } => {
+                                                        // Re-point `origin` at the superseding
+                                                        // request's origin so the retry's Step 4b-arm
+                                                        // gates the frame actually transmitting (C1).
+                                                        origin = new_origin;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -3263,7 +3496,11 @@ impl super::ApplicationCoordinator {
                                                         ptt_guard.disarm();
                                                         continue 'key_and_send;
                                                     }
-                                                    SupersedeOutcome::Bundle { items } => {
+                                                    SupersedeOutcome::Bundle {
+                                                        items,
+                                                        bundle_origin,
+                                                        new_origin,
+                                                    } => {
                                                         let tx_params =
                                                             pancetta_ft8::ProtocolParams::from_protocol(
                                                                 active_protocol,
@@ -3282,7 +3519,8 @@ impl super::ApplicationCoordinator {
                                                                 MessageType::MultiTransmitRequest {
                                                                     items,
                                                                     tx_parity: None,
-                                                                    origin,
+                                                                    // Fail-safe folded origin.
+                                                                    origin: bundle_origin,
                                                                 },
                                                                 Instant::now(),
                                                             );
@@ -3295,7 +3533,9 @@ impl super::ApplicationCoordinator {
                                                             ptt_guard.disarm();
                                                             break 'key_and_send;
                                                         }
-                                                        // Frequency collision: single-item replace.
+                                                        // Frequency collision: single-item replace
+                                                        // of the new item — gate with its own origin.
+                                                        origin = new_origin;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -4459,6 +4699,7 @@ impl super::ApplicationCoordinator {
                                         &shutdown,
                                         &abort_current_tx,
                                         &tx_rx,
+                                        &message_bus,
                                         items.first().and_then(|it| it.qso_id.as_deref()),
                                         items
                                             .first()
@@ -4530,6 +4771,7 @@ impl super::ApplicationCoordinator {
                                         &shutdown,
                                         &abort_current_tx,
                                         &tx_rx,
+                                        &message_bus,
                                         items.first().and_then(|it| it.qso_id.as_deref()),
                                         items
                                             .first()
@@ -5564,12 +5806,13 @@ mod supersede_rekey_tests {
             pancetta_config::station::TxSelfParity::Auto,
             now,
             1,
+            crate::message_bus::TxOrigin::Local,
             &[],
         )
         .await;
 
         assert!(
-            matches!(outcome, super::SupersedeOutcome::Replace),
+            matches!(outcome, super::SupersedeOutcome::Replace { .. }),
             "re-key targeting the current slot parity with max_concurrent_qsos==1 must Replace"
         );
         // The state swap is what makes the retry re-encode the NEW content:
@@ -5675,12 +5918,13 @@ mod supersede_rekey_tests {
             pancetta_config::station::TxSelfParity::Auto,
             now,
             1,
+            crate::message_bus::TxOrigin::Local,
             &[],
         )
         .await;
 
         assert!(
-            matches!(outcome, super::SupersedeOutcome::Replace),
+            matches!(outcome, super::SupersedeOutcome::Replace { .. }),
             "a viable single-TX supersede must Replace"
         );
 
@@ -5814,12 +6058,13 @@ mod supersede_rekey_tests {
             pancetta_config::station::TxSelfParity::Auto,
             now,
             2,
+            crate::message_bus::TxOrigin::Local,
             &in_flight,
         )
         .await;
 
         match outcome {
-            super::SupersedeOutcome::Bundle { items } => {
+            super::SupersedeOutcome::Bundle { items, .. } => {
                 assert_eq!(items.len(), 2, "bundle = in-flight + new item");
                 assert_eq!(items[0].message_text, "KA1ABC K5ARH R-15");
                 assert_eq!(items[0].frequency_offset, 1000.0);
@@ -5836,6 +6081,214 @@ mod supersede_rekey_tests {
         // Working state also mutated to the new item (collision fallback).
         assert_eq!(message_text, "CQ K5ARH EM12");
         assert_eq!(frequency_offset, 1400.0);
+    }
+
+    /// C1 REGRESSION: the `Replace` outcome must carry the SUPERSEDING request's
+    /// OWN `origin`, independent of the aborted in-flight transmission's origin.
+    ///
+    /// The single-TX arm re-keys a `Replace` in place (`continue 'key_and_send`)
+    /// and re-runs Step 4b-arm's key-time arm gate against its `origin` binding.
+    /// Before the fix the superseding request's origin was discarded (`..`) and
+    /// the arm reused the ORIGINAL loop origin, so:
+    ///   - a `Remote` request superseding a `Local` in-flight frame re-keyed
+    ///     under the stale `Local` origin and SKIPPED the arm gate entirely
+    ///     (remote content transmitted with zero arm gating — the C1 leak), and
+    ///   - a `Local` request superseding a `Remote` in-flight frame kept gating
+    ///     a purely local frame (wrongly droppable if the arm went stale).
+    ///
+    /// Proving `Replace{origin}` equals the NEW request's origin in BOTH
+    /// directions is exactly what closes both failures: the arm now re-gates and
+    /// emits the re-keyed frame under the origin of the frame actually going out.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_replace_carries_superseding_requests_origin() {
+        use crate::message_bus::TxOrigin;
+
+        // (in-flight origin, superseding request origin) — both directions.
+        for (in_flight_origin, new_origin) in [
+            (TxOrigin::Local, TxOrigin::Remote),
+            (TxOrigin::Remote, TxOrigin::Local),
+        ] {
+            let bus = MessageBus::new(16).unwrap();
+            let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+            let now = chrono::Utc::now();
+            let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+                pancetta_core::slot::current_slot_start_with_period(
+                    now,
+                    pancetta_core::slot::SLOT_NS,
+                ),
+                pancetta_core::slot::SLOT_NS,
+            );
+
+            let mut message_text = "OLD TEXT".to_string();
+            let mut frequency_offset = 1000.0;
+            let mut schedule = super::schedule_tx(
+                now,
+                cur_parity,
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+            );
+            let ptt_active = Arc::new(AtomicBool::new(true));
+            let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+            let new_request = MessageType::TransmitRequest {
+                message_text: "NEW TEXT".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-new".to_string()),
+                tx_parity: Some(cur_parity),
+                origin: new_origin,
+            };
+
+            // max_concurrent_qsos == 1 → the single-TX arm's Replace path.
+            let outcome = super::supersede_and_rekey_or_bundle(
+                new_request,
+                &mut message_text,
+                &mut frequency_offset,
+                &mut schedule,
+                &bus,
+                &ptt_active,
+                &last_ptt_on_ms,
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+                1,
+                in_flight_origin,
+                &[],
+            )
+            .await;
+
+            match outcome {
+                super::SupersedeOutcome::Replace { origin } => {
+                    assert_eq!(
+                        origin, new_origin,
+                        "Replace must carry the SUPERSEDING request's origin \
+                         (in_flight={in_flight_origin:?}, new={new_origin:?}), not the \
+                         aborted transmission's — otherwise the key-time arm gate is \
+                         evaluated against the wrong origin"
+                    );
+                }
+                other => panic!("expected Replace, got {other:?}"),
+            }
+        }
+    }
+
+    /// C1 CONSISTENCY: a `Bundle` fold must be gated if EITHER the in-flight
+    /// stream or the superseding request is `Remote` (fail-safe fold), while the
+    /// separately-returned `new_origin` (used by the caller's frequency-collision
+    /// fallback, which transmits ONLY the new item) tracks the new request's own
+    /// origin. Mirrors the coalescer's fail-safe origin fold so a Remote item
+    /// folded onto a Local in-flight bundle can never re-enter ungated.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_bundle_folds_origin_failsafe() {
+        use crate::message_bus::TxOrigin;
+
+        // (in_flight, new) -> (expected bundle_origin, expected new_origin)
+        let cases = [
+            (
+                TxOrigin::Local,
+                TxOrigin::Remote,
+                TxOrigin::Remote,
+                TxOrigin::Remote,
+            ),
+            (
+                TxOrigin::Remote,
+                TxOrigin::Local,
+                TxOrigin::Remote,
+                TxOrigin::Local,
+            ),
+            (
+                TxOrigin::Local,
+                TxOrigin::Local,
+                TxOrigin::Local,
+                TxOrigin::Local,
+            ),
+            (
+                TxOrigin::Remote,
+                TxOrigin::Remote,
+                TxOrigin::Remote,
+                TxOrigin::Remote,
+            ),
+        ];
+
+        for (in_flight_origin, new_origin, want_bundle, want_new) in cases {
+            let bus = MessageBus::new(16).unwrap();
+            let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+            let now = chrono::Utc::now();
+            let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+                pancetta_core::slot::current_slot_start_with_period(
+                    now,
+                    pancetta_core::slot::SLOT_NS,
+                ),
+                pancetta_core::slot::SLOT_NS,
+            );
+
+            let mut message_text = "OLD TEXT".to_string();
+            let mut frequency_offset = 1000.0;
+            let mut schedule = super::schedule_tx(
+                now,
+                cur_parity,
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+            );
+            let ptt_active = Arc::new(AtomicBool::new(true));
+            let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+            let in_flight = vec![crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-1".to_string()),
+            }];
+
+            let new_request = MessageType::TransmitRequest {
+                message_text: "CQ K5ARH EM12".to_string(),
+                frequency_offset: 1400.0,
+                qso_id: Some("qso-2".to_string()),
+                tx_parity: Some(cur_parity),
+                origin: new_origin,
+            };
+
+            let outcome = super::supersede_and_rekey_or_bundle(
+                new_request,
+                &mut message_text,
+                &mut frequency_offset,
+                &mut schedule,
+                &bus,
+                &ptt_active,
+                &last_ptt_on_ms,
+                20_000,
+                12_000,
+                pancetta_core::slot::SLOT_NS,
+                pancetta_config::station::TxSelfParity::Auto,
+                now,
+                2,
+                in_flight_origin,
+                &in_flight,
+            )
+            .await;
+
+            match outcome {
+                super::SupersedeOutcome::Bundle {
+                    bundle_origin,
+                    new_origin: got_new,
+                    ..
+                } => {
+                    assert_eq!(
+                        bundle_origin, want_bundle,
+                        "bundle_origin fail-safe fold wrong for \
+                         in_flight={in_flight_origin:?}, new={new_origin:?}"
+                    );
+                    assert_eq!(
+                        got_new, want_new,
+                        "new_origin must track the superseding request's own origin"
+                    );
+                }
+                other => panic!("expected Bundle, got {other:?}"),
+            }
+        }
     }
 
     /// A `MultiTransmitRequest` arriving AS the superseding message isn't
@@ -5878,6 +6331,7 @@ mod supersede_rekey_tests {
             pancetta_config::station::TxSelfParity::Auto,
             chrono::Utc::now(),
             2,
+            crate::message_bus::TxOrigin::Local,
             &[],
         )
         .await;
