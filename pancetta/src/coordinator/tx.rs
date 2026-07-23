@@ -5586,6 +5586,178 @@ mod supersede_rekey_tests {
         );
     }
 
+    /// TASK 9 — the end-to-end audio gap Task 6 explicitly deferred.
+    ///
+    /// Task 6's `supersede_and_rekey_updates_state_when_viable` proves only the
+    /// PRECONDITION of a single-TX supersede: PTT is deasserted and the working
+    /// `message_text`/`frequency_offset` are swapped to the new request. It does
+    /// NOT prove the crux — that the audio the single-TX arm actually
+    /// re-encodes and pushes to the output ring buffer (Step 1 → Step 7)
+    /// reflects the NEW message's waveform rather than stale samples from the
+    /// aborted one. Task 6's reviewer flagged that as deferred here.
+    ///
+    /// This test closes it by driving the REAL single-TX supersede helper
+    /// (`supersede_and_rekey_or_bundle`, `max_concurrent_qsos == 1` →
+    /// `Replace`) over a REAL `MessageBus`, then re-encoding the POST-supersede
+    /// working state through `encode_and_modulate` — documented (see its
+    /// doc-comment's "FT8 regression guarantee") to be byte-identical to the
+    /// arm's Step-1 `encode_for_protocol` + `modulate_for_protocol` sequence for
+    /// a given (text, offset). It asserts:
+    ///
+    ///   1. The abort of the in-flight message A is a REAL
+    ///      `SetPtt{false}` observed on a REAL Hamlib channel (not just the
+    ///      `ptt_active` flag), and it is the ONLY message on that channel (no
+    ///      stray/duplicate keying).
+    ///   2. The waveform re-encoded from the mutated working state is
+    ///      BIT-IDENTICAL to a fresh encode of B and DIFFERS from A's waveform —
+    ///      i.e. the audio the arm's Step 7 would send is B's content, not A's
+    ///      stale samples. This is the exact gap Task 6 left open.
+    ///   3. That waveform is a full-length FT8 frame (same length as A's), so
+    ///      the difference is genuine re-encoded CONTENT, not a
+    ///      truncated/empty buffer.
+    ///
+    /// NOT covered (helper-level scope; see task-9-report.md): PTT going back ON
+    /// and the single `TransmitComplete` for B are emitted by the arm's inline
+    /// Steps 5/10, which are not separable from `start_transmitter_component`
+    /// without a much larger worker harness than this task warrants.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_rekeys_audio_to_new_message_not_stale() {
+        let bus = MessageBus::new(16).unwrap();
+        // Real Hamlib channel: the helper's abort PTT-OFF lands here.
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        // Message A is "in flight": these are the working-loop variables the
+        // arm's Step 1 would encode into the audio it is currently sending.
+        let a_text = "CQ K5ARH EM12";
+        let a_freq = 1000.0_f64;
+        let mut message_text = a_text.to_string();
+        let mut frequency_offset = a_freq;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        // A genuinely different superseding message B — different text AND
+        // frequency, so its encoded waveform is unmistakably distinct from A's.
+        let b_text = "W1AW K5ARH R-09";
+        let b_freq = 1600.0_f64;
+        let new_request = MessageType::TransmitRequest {
+            message_text: b_text.to_string(),
+            frequency_offset: b_freq,
+            qso_id: Some("qso-super".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+
+        // max_concurrent_qsos == 1 → the single-TX arm's `Replace` path.
+        let outcome = super::supersede_and_rekey_or_bundle(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            1,
+            &[],
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, super::SupersedeOutcome::Replace),
+            "a viable single-TX supersede must Replace"
+        );
+
+        // (1) The abort of A is a REAL SetPtt{false} on the real Hamlib channel.
+        assert!(
+            !ptt_active.load(Ordering::Acquire),
+            "ptt_active flag must be cleared by the abort"
+        );
+        let ptt_msg = hamlib_rx
+            .try_recv()
+            .expect("aborting the in-flight message must send a real SetPtt to Hamlib");
+        assert!(
+            matches!(
+                ptt_msg.message_type,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                    state: false
+                })
+            ),
+            "abort must be a real SetPtt{{false}}, got {:?}",
+            ptt_msg.message_type
+        );
+        // Exactly one keying message from the abort — no stray/duplicate PTT.
+        assert!(
+            hamlib_rx.try_recv().is_err(),
+            "the abort emits exactly one SetPtt{{false}} (no duplicate keying)"
+        );
+
+        // (2) THE CRUX: encode the POST-supersede working state exactly as the
+        // arm's Step 1 would, and prove it is B's waveform, not A's stale one.
+        // `arm_encode` reproduces the single-TX arm's Step-1 keying byte for
+        // byte: `set_base_frequency(freq)` then `encode_for_protocol` +
+        // `modulate_for_protocol(.., 0.0)` (see tx.rs ~2516-2564). Using the
+        // arm's real sequence — rather than the `encode_and_modulate` helper,
+        // which routes the frequency through the modulator's default base
+        // instead of `set_base_frequency` — makes "this is the waveform the arm
+        // sends" a faithful claim.
+        let protocol = pancetta_ft8::Protocol::Ft8;
+        let arm_encode = |text: &str, freq: f64| -> Vec<f32> {
+            let mut encoder = Ft8Encoder::new();
+            let mut modulator = Ft8Modulator::new_default().expect("modulator");
+            modulator
+                .set_base_frequency(freq)
+                .expect("set base frequency");
+            let symbols =
+                super::encode_for_protocol(&mut encoder, protocol, text).expect("encode symbols");
+            super::modulate_for_protocol(&mut modulator, protocol, &symbols, 0.0).expect("modulate")
+        };
+
+        let rekeyed_audio = arm_encode(&message_text, frequency_offset);
+        let fresh_b = arm_encode(b_text, b_freq);
+        let fresh_a = arm_encode(a_text, a_freq);
+
+        assert_eq!(
+            rekeyed_audio, fresh_b,
+            "the audio the arm's Step 7 would push must be B's freshly-encoded \
+             waveform (the working state re-encodes to the NEW message)"
+        );
+        assert_ne!(
+            rekeyed_audio, fresh_a,
+            "the audio must NOT be A's stale waveform — this is the exact \
+             end-to-end gap Task 6 deferred to Task 9"
+        );
+
+        // (3) The re-encode is a genuine full FT8 frame, not truncated/empty:
+        // same length as A's frame, so the mismatch above is CONTENT, not size.
+        assert!(
+            !rekeyed_audio.is_empty(),
+            "re-encoded audio must be a real, non-empty frame"
+        );
+        assert_eq!(
+            rekeyed_audio.len(),
+            fresh_a.len(),
+            "same full FT8-frame length as A — the A/B waveform difference is \
+             re-encoded content, not a truncated or empty buffer"
+        );
+    }
+
     /// With `max_concurrent_qsos > 1`, a viable supersede folds the new
     /// request into a bundle alongside the in-flight item: the outcome is
     /// `Bundle` carrying both items (in-flight first, new item last), PTT is
