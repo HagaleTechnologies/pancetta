@@ -2376,6 +2376,7 @@ impl super::ApplicationCoordinator {
                                         MessageType::AudioOutput {
                                             samples: audio_out,
                                             sample_rate,
+                                            flush_first: false,
                                         },
                                         Instant::now(),
                                     );
@@ -3547,6 +3548,7 @@ impl super::ApplicationCoordinator {
                                         MessageType::AudioOutput {
                                             samples: audio_out,
                                             sample_rate,
+                                            flush_first: false,
                                         },
                                         Instant::now(),
                                     );
@@ -3705,6 +3707,7 @@ impl super::ApplicationCoordinator {
                                         MessageType::AudioOutput {
                                             samples: tone_samples,
                                             sample_rate,
+                                            flush_first: false,
                                         },
                                         Instant::now(),
                                     );

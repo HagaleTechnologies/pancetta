@@ -171,6 +171,17 @@ impl AudioStreamManager {
         self.output_producer.take()
     }
 
+    /// Take the output consumer half. Test-only: in production this half is
+    /// moved into the real cpal output callback by `create_output_stream`
+    /// (never exposed), which is the only thing that services a
+    /// `flush_first` request via `AudioConsumer::drain_pending_flush`. Tests
+    /// that exercise `AudioManager::queue_output`'s flush handshake without a
+    /// live device need a stand-in for that callback.
+    #[cfg(test)]
+    pub(crate) fn take_output_consumer(&mut self) -> Option<AudioConsumer> {
+        self.output_consumer.take()
+    }
+
     /// Get the shared atomic state (stop flag, counters).
     pub fn get_shared(&self) -> AudioCommShared {
         self.shared.clone()

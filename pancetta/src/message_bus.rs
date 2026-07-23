@@ -358,8 +358,16 @@ pub enum MessageType {
         origin: TxOrigin,
     },
 
-    /// Audio output samples for transmission
-    AudioOutput { samples: Vec<f32>, sample_rate: u32 },
+    /// Audio output samples for transmission. `flush_first`, when true,
+    /// discards any samples still buffered from a previous transmission
+    /// before these are queued — set for a mid-TX abort/restart re-key
+    /// (docs/superpowers/specs/2026-07-22-mid-tx-abort-restart-design.md),
+    /// `false` everywhere else (byte-identical to today).
+    AudioOutput {
+        samples: Vec<f32>,
+        sample_rate: u32,
+        flush_first: bool,
+    },
 
     /// Single-tone tune transmission (operator pressed F4). Engages PTT,
     /// emits a continuous sine wave at `tone_offset_hz` for `duration_secs`

@@ -349,19 +349,51 @@ impl AudioManager {
         &self.config
     }
 
+    /// Number of samples currently buffered in the output ring buffer.
+    /// Test-only introspection (mirrors `AudioConsumer::audio_samples_available`,
+    /// which isn't reachable from here — this crate's `AudioManager` only holds
+    /// the producer half).
+    #[cfg(test)]
+    pub(crate) fn output_producer_occupied_len(&self) -> usize {
+        self.output_producer
+            .as_ref()
+            .map(|p| p.occupied_len())
+            .unwrap_or(0)
+    }
+
     /// Queue audio samples for output playback.
     ///
     /// Pushes TX audio into the output ring buffer. The cpal output stream
     /// callback drains this buffer in real time. If `input_rate` differs from
     /// the configured output sample rate, a simple linear interpolation
-    /// resampler is applied.
-    pub fn queue_output(&mut self, samples: &[f32], input_rate: u32) -> Result<(), AudioError> {
+    /// resampler is applied. When `flush_first` is true, requests that the
+    /// output callback discard any still-buffered samples from a previous
+    /// transmission and blocks (briefly, bounded) until that's confirmed
+    /// before pushing — see `AudioCommShared::request_flush`.
+    pub fn queue_output(
+        &mut self,
+        samples: &[f32],
+        input_rate: u32,
+        flush_first: bool,
+    ) -> Result<(), AudioError> {
         let producer = self
             .output_producer
             .as_mut()
             .ok_or_else(|| AudioError::Stream {
                 message: "Output stream not initialized".to_string(),
             })?;
+
+        if flush_first {
+            let token = producer.shared.request_flush();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(20);
+            while !producer.shared.is_flush_completed(token) && std::time::Instant::now() < deadline
+            {
+                std::thread::sleep(std::time::Duration::from_micros(500));
+            }
+            if !producer.shared.is_flush_completed(token) {
+                warn!("queue_output: flush did not complete within 20ms — proceeding anyway");
+            }
+        }
 
         // Resample if input rate differs from output rate
         let output_samples = if input_rate != self.config.sample_rate {
@@ -391,8 +423,8 @@ impl AudioManager {
         }
 
         info!(
-            "Queued {} TX audio samples for output (rate {}->{}Hz)",
-            written, input_rate, self.config.sample_rate
+            "Queued {} TX audio samples for output (rate {}->{}Hz, flush_first={})",
+            written, input_rate, self.config.sample_rate, flush_first
         );
         Ok(())
     }
@@ -716,9 +748,59 @@ mod tests {
         if let Ok(mut manager) = manager {
             let samples = vec![0.5f32; 480];
             // output_producer is Some from construction
-            let result = manager.queue_output(&samples, 12000);
+            let result = manager.queue_output(&samples, 12000, false);
             // Should succeed — producer is available even without a running stream
             assert!(result.is_ok() || result.is_err());
+        }
+    }
+
+    #[test]
+    fn queue_output_flush_first_clears_buffered_samples_before_pushing() {
+        // Mirrors test_queue_output_no_crash's setup: output_producer is Some
+        // straight from AudioManager::new(), no running stream required.
+        let manager = AudioManager::new();
+        if let Ok(mut manager) = manager {
+            manager
+                .queue_output(&[0.1, 0.2, 0.3, 0.4], 48_000, false)
+                .expect("first queue_output should succeed");
+            let occupied_before = manager.output_producer_occupied_len();
+            assert!(occupied_before > 0);
+
+            // queue_output's flush_first path only *requests* the flush and
+            // waits (bounded) for the consumer side to service it — in
+            // production that's the real cpal output callback (stream.rs)
+            // calling AudioConsumer::drain_pending_flush() on the *output*
+            // ring buffer's consumer half on every poll. That half is never
+            // exposed outside stream.rs in production (it's moved into the
+            // callback), so pull it out via the test-only
+            // `take_output_consumer` and stand in for the callback with a
+            // background thread doing the same polling+draining.
+            let mut output_consumer = manager
+                .stream
+                .as_mut()
+                .expect("stream present")
+                .take_output_consumer()
+                .expect("output consumer present");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stop_bg = stop.clone();
+            let bg = std::thread::spawn(move || {
+                while !stop_bg.load(Ordering::Relaxed) {
+                    output_consumer.drain_pending_flush();
+                    std::thread::sleep(Duration::from_micros(200));
+                }
+            });
+
+            manager
+                .queue_output(&[0.9, 0.9], 48_000, true)
+                .expect("flush_first queue_output should succeed");
+
+            stop.store(true, Ordering::Relaxed);
+            bg.join().expect("drain thread should not panic");
+
+            // The flush handshake completes synchronously inside queue_output
+            // when flush_first is set, so by the time this call returns the
+            // buffer holds only the new 2 samples, not 4+2.
+            assert_eq!(manager.output_producer_occupied_len(), 2);
         }
     }
 

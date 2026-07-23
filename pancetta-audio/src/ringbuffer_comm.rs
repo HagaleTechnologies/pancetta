@@ -168,6 +168,13 @@ impl AudioProducer {
     pub fn push_latency(&mut self, latency_ns: u64) -> Result<(), u64> {
         self.latency_producer.try_push(latency_ns)
     }
+
+    /// Get the number of audio samples currently occupying the ring buffer
+    /// (i.e. pushed but not yet drained by the output callback). Mirrors
+    /// `AudioConsumer::audio_samples_available`.
+    pub fn occupied_len(&self) -> usize {
+        self.audio_producer.occupied_len()
+    }
 }
 
 /// Consumer half of the audio communication channel.
