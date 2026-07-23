@@ -5741,8 +5741,12 @@ mod classifier_tests {
     fn classify_supersedes_on_different_text_same_qso() {
         let pivoted_once = std::collections::HashMap::new();
         let candidate = transmit_request("KA1ABC K5ARH RR73", Some("qso-1"));
-        let outcome =
-            super::classify_incoming_during_tx(&candidate, Some("qso-1"), "KA1ABC K5ARH R-15", &pivoted_once);
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            Some("qso-1"),
+            "KA1ABC K5ARH R-15",
+            &pivoted_once,
+        );
         match outcome {
             super::IncomingDuringTx::Supersede { text, qso_id, .. } => {
                 assert_eq!(text, "KA1ABC K5ARH RR73");
@@ -5756,8 +5760,12 @@ mod classifier_tests {
     fn classify_supersedes_on_different_qso() {
         let pivoted_once = std::collections::HashMap::new();
         let candidate = transmit_request("CQ K5ARH EM12", None);
-        let outcome =
-            super::classify_incoming_during_tx(&candidate, Some("qso-1"), "KA1ABC K5ARH R-15", &pivoted_once);
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            Some("qso-1"),
+            "KA1ABC K5ARH R-15",
+            &pivoted_once,
+        );
         assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
     }
 
@@ -5765,18 +5773,19 @@ mod classifier_tests {
     fn classify_drops_identical_content() {
         let pivoted_once = std::collections::HashMap::new();
         let candidate = transmit_request("KA1ABC K5ARH R-15", Some("qso-1"));
-        let outcome =
-            super::classify_incoming_during_tx(&candidate, Some("qso-1"), "KA1ABC K5ARH R-15", &pivoted_once);
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            Some("qso-1"),
+            "KA1ABC K5ARH R-15",
+            &pivoted_once,
+        );
         assert!(matches!(outcome, super::IncomingDuringTx::Drop));
     }
 
     #[test]
     fn classify_drops_pivot_tombstone_duplicate() {
         let mut pivoted_once = std::collections::HashMap::new();
-        pivoted_once.insert(
-            active_tx_qso_key("qso-1"),
-            "KA1ABC K5ARH RR73".to_string(),
-        );
+        pivoted_once.insert(active_tx_qso_key("qso-1"), "KA1ABC K5ARH RR73".to_string());
         let candidate = transmit_request("KA1ABC K5ARH RR73", Some("qso-1"));
         // in_flight_text is something else — the pivot already sent RR73 via
         // Step 4c, this is the stale second copy of the request that produced it.
@@ -5797,8 +5806,12 @@ mod classifier_tests {
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
         };
-        let outcome =
-            super::classify_incoming_during_tx(&candidate, Some("qso-1"), "anything", &pivoted_once);
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            Some("qso-1"),
+            "anything",
+            &pivoted_once,
+        );
         assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
     }
 }
