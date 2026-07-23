@@ -36,6 +36,15 @@ pub struct AudioCommShared {
     pub dropped_samples: Arc<Atomic<u64>>,
     /// Atomic counter for processed samples (individual f32 values)
     pub processed_samples: Arc<Atomic<u64>>,
+    /// Monotonic flush-request token. The producer side bumps this via
+    /// `request_flush`; the consumer side (audio callback) observes
+    /// `flush_requested != flush_completed`, clears the ring buffer, then
+    /// bumps `flush_completed` to match. Never touches the ring buffer
+    /// directly from the producer thread — SPSC safety (see
+    /// docs/superpowers/specs/2026-07-22-mid-tx-abort-restart-design.md).
+    flush_requested: Arc<Atomic<u64>>,
+    /// See `flush_requested`.
+    flush_completed: Arc<Atomic<u64>>,
 }
 
 impl AudioCommShared {
@@ -45,6 +54,8 @@ impl AudioCommShared {
             stream_error: Arc::new(Atomic::new(false)),
             dropped_samples: Arc::new(Atomic::new(0)),
             processed_samples: Arc::new(Atomic::new(0)),
+            flush_requested: Arc::new(Atomic::new(0)),
+            flush_completed: Arc::new(Atomic::new(0)),
         }
     }
 
@@ -77,6 +88,19 @@ impl AudioCommShared {
     /// recovery path after a successful device reopen.
     pub fn clear_stream_error(&self) {
         self.stream_error.store(false, Ordering::Release);
+    }
+
+    /// Request that the consumer side discard all currently-buffered audio
+    /// samples before it next drains. Returns a token; pass it to
+    /// `is_flush_completed` to know when the flush has actually happened.
+    pub fn request_flush(&self) -> u64 {
+        self.flush_requested.fetch_add(1, Ordering::AcqRel) + 1
+    }
+
+    /// Whether the flush identified by `token` (the return value of a prior
+    /// `request_flush` call) has been carried out by the consumer side.
+    pub fn is_flush_completed(&self, token: u64) -> bool {
+        self.flush_completed.load(Ordering::Acquire) >= token
     }
 
     /// Get the number of dropped samples
@@ -164,6 +188,22 @@ impl AudioConsumer {
     /// Returns the number of samples actually read.
     pub fn pop_audio_slice(&mut self, buf: &mut [f32]) -> usize {
         self.audio_consumer.pop_slice(buf)
+    }
+
+    /// If a flush was requested since the last check, discard all currently
+    /// buffered samples and acknowledge completion. Called once per output
+    /// callback invocation, before draining audio for playback, so a mid-TX
+    /// re-key (docs/superpowers/specs/2026-07-22-mid-tx-abort-restart-design.md)
+    /// never plays stale samples left over from an aborted transmission.
+    pub fn drain_pending_flush(&mut self) {
+        let requested = self.shared.flush_requested.load(Ordering::Acquire);
+        let completed = self.shared.flush_completed.load(Ordering::Acquire);
+        if requested != completed {
+            self.audio_consumer.clear();
+            self.shared
+                .flush_completed
+                .store(requested, Ordering::Release);
+        }
     }
 
     /// Get the number of available audio samples (individual f32 values) in the buffer.
@@ -319,6 +359,32 @@ mod tests {
         assert_eq!(read, 4);
         assert_eq!(buf, data);
         assert_eq!(consumer.audio_samples_available(), 0);
+    }
+
+    #[test]
+    fn flush_request_drains_buffered_samples() {
+        let (mut producer, mut consumer) =
+            audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+
+        producer.push_audio_slice(&[0.1f32, 0.2, 0.3, 0.4]);
+        assert_eq!(consumer.audio_samples_available(), 4);
+
+        let token = producer.shared.request_flush();
+        assert!(!producer.shared.is_flush_completed(token));
+
+        consumer.drain_pending_flush();
+
+        assert_eq!(consumer.audio_samples_available(), 0);
+        assert!(producer.shared.is_flush_completed(token));
+    }
+
+    #[test]
+    fn drain_pending_flush_is_a_no_op_without_a_request() {
+        let (mut producer, mut consumer) =
+            audio_comm_pair(DEFAULT_AUDIO_BUFFER_SIZE, DEFAULT_LATENCY_BUFFER_SIZE);
+        producer.push_audio_slice(&[0.5f32, 0.6]);
+        consumer.drain_pending_flush();
+        assert_eq!(consumer.audio_samples_available(), 2);
     }
 
     #[test]

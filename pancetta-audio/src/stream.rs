@@ -595,6 +595,7 @@ impl AudioStreamManager {
         let stream = output_device.build_output_stream(
             stream_config,
             move |data: &mut [f32], _info: &OutputCallbackInfo| {
+                output_consumer.drain_pending_flush();
                 let read = output_consumer.pop_audio_slice(data);
                 // Fill any remaining samples with silence (underrun is normal when not transmitting)
                 for sample in data[read..].iter_mut() {
