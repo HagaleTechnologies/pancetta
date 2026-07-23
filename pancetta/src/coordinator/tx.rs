@@ -90,6 +90,20 @@ fn coalesce_collect_window_ms(protocol: pancetta_ft8::Protocol) -> u64 {
     ((COALESCE_COLLECT_WINDOW_MS as f64) * (cycle / FT8_CYCLE_SECS)).round() as u64
 }
 
+/// Mode-scaled `tx_late_max_ms` cap. Mirrors `coalesce_collect_window_ms`'s
+/// cycle-ratio scaling exactly (see docs/superpowers/specs/2026-07-22-
+/// mid-tx-abort-restart-design.md "tx_late_max_ms mode-scaling"). FT8 stays
+/// byte-identical; FT4/FT2 get a proportionally tighter late-viability cap
+/// since their slots are shorter. Closes the gap flagged in
+/// `COALESCE_MAX_EXTENSION_MS`'s doc comment: `tx_late_max_ms` itself was
+/// previously unscaled, so it exceeded FT4's whole 7.5s slot and the "too
+/// late, defer" branch of `schedule_tx` could never fire for FT4.
+fn tx_late_max_ms_effective(protocol: pancetta_ft8::Protocol, tx_late_max_ms: u64) -> u64 {
+    const FT8_CYCLE_SECS: f64 = 15.0;
+    let cycle = pancetta_ft8::ProtocolParams::from_protocol(protocol).cycle_duration;
+    ((tx_late_max_ms as f64) * (cycle / FT8_CYCLE_SECS)).round() as u64
+}
+
 /// FT8-baseline cap on total EXTENSION time (beyond the mandatory base
 /// `COALESCE_COLLECT_WINDOW_MS` wait) the Symptom-C adaptive coalesce window
 /// may add. Scaled by the same cycle-ratio as `coalesce_collect_window_ms`
@@ -97,9 +111,7 @@ fn coalesce_collect_window_ms(protocol: pancetta_ft8::Protocol) -> u64 {
 /// computed in `adaptive_coalesce_cap_ms` already bounds against that; this
 /// is a second, protocol-proportionate ceiling so a busy pileup can't
 /// monopolize an outsized fraction of a short FT4/FT2 slot even when
-/// tx_late_max_ms headroom alone would allow it (tx_late_max_ms itself isn't
-/// mode-scaled today — a separately tracked open question, not addressed by
-/// this change). See
+/// tx_late_max_ms headroom alone would allow it. See
 /// docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md §1.
 const COALESCE_MAX_EXTENSION_MS: u64 = 3000;
 
@@ -142,10 +154,11 @@ fn adaptive_coalesce_cap_ms(
     };
     let required_parity =
         resolve_required_parity(*tx_parity, tx_self_parity, request_received_at, slot_ns);
+    let tx_late_max_ms_eff = tx_late_max_ms_effective(protocol, tx_late_max_ms);
     let probe = schedule_tx(
         request_received_at,
         required_parity,
-        tx_late_max_ms,
+        tx_late_max_ms_eff,
         sample_rate,
         slot_ns,
     );
@@ -156,7 +169,7 @@ fn adaptive_coalesce_cap_ms(
     let elapsed_in_slot_ms = (request_received_at - probe.target_slot)
         .num_milliseconds()
         .max(0) as u64;
-    let headroom = tx_late_max_ms
+    let headroom = tx_late_max_ms_eff
         .saturating_sub(elapsed_in_slot_ms)
         .saturating_sub(COALESCE_CAP_SAFETY_MARGIN_MS);
     headroom.min(protocol_ceiling)
@@ -1944,7 +1957,7 @@ impl super::ApplicationCoordinator {
                                     let mut schedule = schedule_tx(
                                         request_received_at,
                                         required_parity,
-                                        tx_late_max_ms,
+                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms),
                                         sample_rate,
                                         slot_ns,
                                     );
@@ -2804,7 +2817,7 @@ impl super::ApplicationCoordinator {
                                     let mut schedule = schedule_tx(
                                         request_received_at,
                                         required_parity,
-                                        tx_late_max_ms,
+                                        tx_late_max_ms_effective(active_protocol, tx_late_max_ms),
                                         sample_rate,
                                         slot_ns,
                                     );
@@ -3957,6 +3970,33 @@ mod schedule_tx_tests {
     fn coalesce_collect_window_scales_down_for_ft2() {
         // FT2 cycle = 3.2s → 800 * 3.2 / 15 = 170.67, rounds to 171ms.
         assert_eq!(coalesce_collect_window_ms(pancetta_ft8::Protocol::Ft2), 171);
+    }
+
+    #[test]
+    fn tx_late_max_ms_effective_ft8_byte_identical() {
+        assert_eq!(
+            tx_late_max_ms_effective(pancetta_ft8::Protocol::Ft8, 8000),
+            8000
+        );
+    }
+
+    #[test]
+    fn tx_late_max_ms_effective_scales_down_for_ft4() {
+        // FT4 cycle = 7.5s, half of FT8's 15s → half the cap (4000ms).
+        assert_eq!(
+            tx_late_max_ms_effective(pancetta_ft8::Protocol::Ft4, 8000),
+            4000
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "ft2")]
+    fn tx_late_max_ms_effective_scales_down_for_ft2() {
+        // FT2 cycle = 3.2s → 8000 * 3.2 / 15 = 1706.67, rounds to 1707ms.
+        assert_eq!(
+            tx_late_max_ms_effective(pancetta_ft8::Protocol::Ft2, 8000),
+            1707
+        );
     }
 
     #[test]
