@@ -192,6 +192,72 @@ pub struct TxSchedule {
     pub deferred: bool,
 }
 
+/// Outcome of checking whether a newly-arrived request should supersede
+/// (abort + re-key) an in-flight transmission. See
+/// docs/superpowers/specs/2026-07-22-mid-tx-abort-restart-design.md.
+#[derive(Debug, Clone, PartialEq)]
+pub enum IncomingDuringTx {
+    /// Not a genuine new request — either an exact-content repeat of what's
+    /// already in flight, or a stale pivot-tombstone duplicate. Discard.
+    Drop,
+    /// A genuinely different request. Abort the in-flight transmission and
+    /// attempt to re-key with this content.
+    Supersede {
+        text: String,
+        frequency_offset: f64,
+        qso_id: Option<String>,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+    },
+}
+
+/// Phase 1 (manual trigger) classifier: any request arriving while another
+/// is in flight supersedes it UNLESS it's an exact duplicate (identical
+/// text) or a recognized pivot-tombstone (`is_pivot_duplicate`). Applies
+/// regardless of whether the candidate targets the same QSO or a different
+/// one — Phase 1 has no priority-tier gating (that's Phase 2, not built by
+/// this plan).
+pub fn classify_incoming_during_tx(
+    candidate: &MessageType,
+    in_flight_qso_id: Option<&str>,
+    in_flight_text: &str,
+    pivoted_once: &std::collections::HashMap<String, String>,
+) -> IncomingDuringTx {
+    match candidate {
+        MessageType::TransmitRequest {
+            message_text,
+            frequency_offset,
+            qso_id,
+            tx_parity,
+            ..
+        } => {
+            if super::is_pivot_duplicate(qso_id.as_deref(), message_text, pivoted_once) {
+                return IncomingDuringTx::Drop;
+            }
+            let same_target = qso_id.as_deref() == in_flight_qso_id;
+            if same_target && message_text == in_flight_text {
+                return IncomingDuringTx::Drop;
+            }
+            IncomingDuringTx::Supersede {
+                text: message_text.clone(),
+                frequency_offset: *frequency_offset,
+                qso_id: qso_id.clone(),
+                tx_parity: *tx_parity,
+            }
+        }
+        // A bundle is always new information (it carries its own set of
+        // items, not comparable 1:1 to a single in-flight text) — always
+        // supersede. Task 7 (multi-TX bundle-add) refines what happens next;
+        // this classifier only decides Drop vs Supersede.
+        MessageType::MultiTransmitRequest { .. } => IncomingDuringTx::Supersede {
+            text: String::new(),
+            frequency_offset: 0.0,
+            qso_id: None,
+            tx_parity: None,
+        },
+        _ => IncomingDuringTx::Drop,
+    }
+}
+
 /// WSJT-X-style late-start TX scheduler.
 ///
 /// Picks the slot to TX in (current slot if parity matches and we're
@@ -5433,5 +5499,86 @@ mod tx_counter_tests {
         let before = tx_defers_count();
         TX_DEFERS_COUNT.fetch_add(1, Ordering::Relaxed);
         assert_eq!(tx_defers_count(), before + 1);
+    }
+}
+
+#[cfg(test)]
+mod classifier_tests {
+    use super::*;
+    use crate::coordinator::active_tx_qso_key;
+
+    fn transmit_request(text: &str, qso_id: Option<&str>) -> MessageType {
+        MessageType::TransmitRequest {
+            message_text: text.to_string(),
+            frequency_offset: 1500.0,
+            qso_id: qso_id.map(|s| s.to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        }
+    }
+
+    #[test]
+    fn classify_supersedes_on_different_text_same_qso() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = transmit_request("KA1ABC K5ARH RR73", Some("qso-1"));
+        let outcome =
+            super::classify_incoming_during_tx(&candidate, Some("qso-1"), "KA1ABC K5ARH R-15", &pivoted_once);
+        match outcome {
+            super::IncomingDuringTx::Supersede { text, qso_id, .. } => {
+                assert_eq!(text, "KA1ABC K5ARH RR73");
+                assert_eq!(qso_id.as_deref(), Some("qso-1"));
+            }
+            super::IncomingDuringTx::Drop => panic!("expected Supersede"),
+        }
+    }
+
+    #[test]
+    fn classify_supersedes_on_different_qso() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = transmit_request("CQ K5ARH EM12", None);
+        let outcome =
+            super::classify_incoming_during_tx(&candidate, Some("qso-1"), "KA1ABC K5ARH R-15", &pivoted_once);
+        assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
+    }
+
+    #[test]
+    fn classify_drops_identical_content() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = transmit_request("KA1ABC K5ARH R-15", Some("qso-1"));
+        let outcome =
+            super::classify_incoming_during_tx(&candidate, Some("qso-1"), "KA1ABC K5ARH R-15", &pivoted_once);
+        assert!(matches!(outcome, super::IncomingDuringTx::Drop));
+    }
+
+    #[test]
+    fn classify_drops_pivot_tombstone_duplicate() {
+        let mut pivoted_once = std::collections::HashMap::new();
+        pivoted_once.insert(
+            active_tx_qso_key("qso-1"),
+            "KA1ABC K5ARH RR73".to_string(),
+        );
+        let candidate = transmit_request("KA1ABC K5ARH RR73", Some("qso-1"));
+        // in_flight_text is something else — the pivot already sent RR73 via
+        // Step 4c, this is the stale second copy of the request that produced it.
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            Some("qso-1"),
+            "KA1ABC K5ARH R-15",
+            &pivoted_once,
+        );
+        assert!(matches!(outcome, super::IncomingDuringTx::Drop));
+    }
+
+    #[test]
+    fn classify_always_supersedes_multi_transmit_request() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::MultiTransmitRequest {
+            items: vec![],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+        let outcome =
+            super::classify_incoming_during_tx(&candidate, Some("qso-1"), "anything", &pivoted_once);
+        assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
     }
 }
