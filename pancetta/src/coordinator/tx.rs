@@ -1710,24 +1710,18 @@ async fn supersede_and_rekey_or_bundle(
     max_concurrent_qsos: u32,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
 ) -> SupersedeOutcome {
-    let MessageType::TransmitRequest {
-        message_text: new_text,
-        frequency_offset: new_freq,
-        tx_parity: new_tx_parity,
-        qso_id: new_qso_id,
-        ..
-    } = new_request
-    else {
-        // A `MultiTransmitRequest` arriving as the superseding message isn't
-        // re-keyable content here (Phase 1 manual triggers are single
-        // requests) — not viable, so PTT stays off and the caller abandons.
-        return SupersedeOutcome::NotViable;
-    };
-
-    // Deassert PTT immediately — the aborted transmission's audio may still
-    // be draining from the ring buffer; PTT-off means it doesn't matter that
-    // it hasn't been flushed YET (that happens next, before we push new
-    // audio in Step 7 of the retried loop iteration).
+    // Deassert PTT immediately and UNCONDITIONALLY — before we even inspect the
+    // superseding message's type or its schedulability. EVERY return path out of
+    // this function (viable re-key, too-late defer, or a non-re-keyable
+    // `MultiTransmitRequest`) must leave PTT off, because both callers assume it:
+    // the multi-TX arm unconditionally `ptt_guard.disarm()`s (skipping the
+    // guard's own Drop PTT-off) right after this returns, and the single-TX arm
+    // relies on PTT already being off on its `NotViable`/`Replace`/`Bundle`
+    // arms. Doing this up front (rather than after the `TransmitRequest`
+    // destructure) is what fixes the stuck-PTT bug when the superseding message
+    // is a `MultiTransmitRequest`. (The aborted transmission's audio may still
+    // be draining from the ring buffer; PTT-off means that's harmless — the
+    // flush happens next, before new audio is pushed in Step 7 of the retry.)
     let ptt_off_msg = ComponentMessage::new(
         ComponentId::Ft8Transmitter,
         ComponentId::Hamlib,
@@ -1738,6 +1732,24 @@ async fn supersede_and_rekey_or_bundle(
         warn!("supersede: PTT OFF failed: {}", e);
     }
     ptt_active.store(false, Ordering::Release);
+
+    let MessageType::TransmitRequest {
+        message_text: new_text,
+        frequency_offset: new_freq,
+        tx_parity: new_tx_parity,
+        qso_id: new_qso_id,
+        ..
+    } = new_request
+    else {
+        // A `MultiTransmitRequest` arriving as the superseding message isn't
+        // re-keyable content here (Phase 1 manual triggers are single
+        // requests) — not viable. PTT was already deasserted above, so the
+        // caller can safely disarm its guard and abandon this message. The
+        // multi-TX caller re-enqueues the dropped bundle (see
+        // `supersede_multi_reenqueue`); the single-TX caller drops it (an
+        // already-accepted Phase-1 gap for single-request supersedes).
+        return SupersedeOutcome::NotViable;
+    };
 
     let now = chrono::Utc::now();
     let required_parity = resolve_required_parity(new_tx_parity, tx_self_parity, now, slot_ns);
@@ -1810,9 +1822,15 @@ async fn supersede_and_rekey_or_bundle(
 /// - `Replace` (`max_concurrent_qsos == 1`, an edge for a bundle-in-flight) →
 ///   re-enqueue the new single item; `qso_id` isn't threaded through `Replace`
 ///   so it's re-enqueued as a manual (drop-stale-ungated) send.
-/// - `NotViable` → nothing re-enqueued; the bundle is abandoned.
+/// - `NotViable` because the superseding message was itself a
+///   `MultiTransmitRequest` → re-enqueue that whole incoming bundle unchanged
+///   (it can't be folded by the single-item re-key path, but dropping a
+///   concurrent-QSO bundle would lose the slot's transmissions).
+/// - `NotViable` because a re-keyable request arrived too late for this slot →
+///   nothing re-enqueued; abandoned (a Task-6-accepted Phase-1 drop).
 ///
-/// The caller disarms its `PttGuard` and `continue`s after this returns.
+/// In every case `supersede_and_rekey_or_bundle` has already deasserted PTT, so
+/// the caller safely disarms its `PttGuard` and `continue`s after this returns.
 #[allow(clippy::too_many_arguments)]
 async fn supersede_multi_reenqueue(
     new_request: MessageType,
@@ -1843,6 +1861,22 @@ async fn supersede_multi_reenqueue(
         cursor_offset_samples: 0,
         deferred: false,
     };
+    // `supersede_and_rekey_or_bundle` returns `NotViable` for two distinct
+    // reasons: (a) the superseding message is itself a `MultiTransmitRequest`
+    // (the single-item re-key path can't fold it), or (b) a re-keyable
+    // `TransmitRequest` arrived too late to make this slot. In case (a) the
+    // incoming message is a whole concurrent-QSO bundle the autonomous engine
+    // enqueues every slot — silently dropping it (it was already consumed via
+    // `try_recv`) would lose that slot's transmissions. So keep a copy to
+    // re-enqueue on `NotViable`; case (b) leaves this `None` and remains a
+    // (Task-6-accepted) drop. The message type is decided here BEFORE the call
+    // moves `new_request`.
+    let reenqueue_on_notviable = if matches!(new_request, MessageType::MultiTransmitRequest { .. })
+    {
+        Some(new_request.clone())
+    } else {
+        None
+    };
     match supersede_and_rekey_or_bundle(
         new_request,
         &mut scratch_text,
@@ -1863,6 +1897,27 @@ async fn supersede_multi_reenqueue(
     {
         SupersedeOutcome::NotViable => {
             // PTT already off; the in-flight bundle is abandoned by the caller.
+            // If NotViable because the superseding message was itself a
+            // `MultiTransmitRequest`, re-enqueue that whole bundle back to the
+            // worker's own channel (mirroring the `Bundle` re-enqueue below) so
+            // the next dequeue transmits it via the unmodified Steps 1-10 — the
+            // newer bundle supersedes the abandoned in-flight one, so exactly
+            // one bundle stays pending (no duplicate). A `None` here is the
+            // too-late-for-slot case, which stays a drop.
+            if let Some(bundle) = reenqueue_on_notviable {
+                let reenqueue = ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    bundle,
+                    Instant::now(),
+                );
+                if let Err(e) = message_bus.send_message(reenqueue).await {
+                    warn!(
+                        "supersede (multi-TX): failed to re-enqueue superseding bundle: {}",
+                        e
+                    );
+                }
+            }
         }
         SupersedeOutcome::Bundle { items } => {
             let bundle_outcome =
@@ -5659,6 +5714,123 @@ mod supersede_rekey_tests {
         assert_eq!(
             message_text, "OLD TEXT",
             "a declined supersede leaves the working text untouched"
+        );
+        // Even on the wrong-type NotViable path, PTT must be deasserted (the
+        // stuck-PTT bug: PTT-off used to sit AFTER the destructure and never
+        // ran here). This is what makes the multi-TX arm's unconditional
+        // `ptt_guard.disarm()` safe.
+        assert!(
+            !ptt_active.load(Ordering::Acquire),
+            "PTT must be deasserted even when the supersede is declined"
+        );
+    }
+
+    /// End-to-end regression for the multi-TX arm's supersede integration and
+    /// the stuck-PTT bug it had: when a `MultiTransmitRequest` supersedes an
+    /// in-flight multi-TX bundle, `supersede_multi_reenqueue` must (1) actually
+    /// deassert PTT — both the `ptt_active` flag AND a real `SetPtt{false}`
+    /// message on the Hamlib channel (the multi-TX arm's `ptt_guard.disarm()`
+    /// otherwise leaves the rig physically keyed) — and (2) re-enqueue the
+    /// superseding bundle rather than silently dropping it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_reenqueue_deasserts_ptt_and_reenqueues_superseding_bundle() {
+        let bus = MessageBus::new(16).unwrap();
+        // Hamlib channel receives the PTT-OFF; Ft8Transmitter channel receives
+        // the worker's re-enqueue-to-self.
+        let (_hamlib_tx, hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let (_tx_tx, tx_rx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+
+        let mut encoder = super::Ft8Encoder::new();
+        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
+
+        // The bundle currently on the air.
+        let in_flight = vec![crate::message_bus::TransmitRequestItem {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-1".to_string()),
+        }];
+
+        // The superseding message is itself a MultiTransmitRequest — the routine
+        // concurrent-QSO path the autonomous engine enqueues every slot.
+        let superseding = MessageType::MultiTransmitRequest {
+            items: vec![
+                crate::message_bus::TransmitRequestItem {
+                    message_text: "JA1XYZ K5ARH 73".to_string(),
+                    frequency_offset: 1300.0,
+                    qso_id: Some("qso-2".to_string()),
+                },
+                crate::message_bus::TransmitRequestItem {
+                    message_text: "CQ K5ARH EM12".to_string(),
+                    frequency_offset: 1700.0,
+                    qso_id: None,
+                },
+            ],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        super::supersede_multi_reenqueue(
+            superseding,
+            &in_flight,
+            crate::message_bus::TxOrigin::Local,
+            &mut encoder,
+            pancetta_ft8::Protocol::Ft8,
+            &tx_params,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            chrono::Utc::now(),
+            2,
+        )
+        .await;
+
+        // (1a) The in-memory flag is cleared.
+        assert!(
+            !ptt_active.load(Ordering::Acquire),
+            "ptt_active must be cleared"
+        );
+        // (1b) A real SetPtt{false} was sent to Hamlib — this is the assertion
+        // that would have caught the stuck-PTT bug (the flag alone did not).
+        let ptt_msg = hamlib_rx
+            .try_recv()
+            .expect("a PTT-OFF message must be sent to Hamlib");
+        assert!(
+            matches!(
+                ptt_msg.message_type,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                    state: false
+                })
+            ),
+            "expected SetPtt{{false}}, got {:?}",
+            ptt_msg.message_type
+        );
+
+        // (2) The superseding bundle was re-enqueued to the worker, not dropped.
+        let reenqueued = tx_rx
+            .try_recv()
+            .expect("the superseding MultiTransmitRequest must be re-enqueued");
+        match reenqueued.message_type {
+            MessageType::MultiTransmitRequest { items, .. } => {
+                assert_eq!(items.len(), 2, "the whole superseding bundle is preserved");
+                assert_eq!(items[0].message_text, "JA1XYZ K5ARH 73");
+                assert_eq!(items[1].message_text, "CQ K5ARH EM12");
+            }
+            other => panic!("expected re-enqueued MultiTransmitRequest, got {other:?}"),
+        }
+        // Exactly one thing re-enqueued (no duplicate transmission).
+        assert!(
+            tx_rx.try_recv().is_err(),
+            "no second re-enqueue — the in-flight bundle is abandoned, not duplicated"
         );
     }
 
