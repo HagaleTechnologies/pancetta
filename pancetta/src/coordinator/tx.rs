@@ -379,6 +379,97 @@ async fn interruptible_sleep(
     false
 }
 
+/// Outcome of `interruptible_sleep_or_supersede`.
+///
+/// Deliberately does NOT derive `PartialEq`/`Eq`: `Superseded` carries the
+/// full `MessageType`, and `MessageType` itself does not (and should not,
+/// without a much wider cross-crate change — see
+/// docs/superpowers/sdd/task-5-report.md) derive `PartialEq`. Tests that
+/// need to assert on a `Superseded` payload pattern-match and compare
+/// individual fields instead of using `assert_eq!` on the whole enum.
+// `Superseded(MessageType)` is intentionally not boxed: this keeps the
+// public shape exactly as specified (a later task's re-key consumer wants
+// the full `MessageType`, including `MultiTransmitRequest`'s `items` list —
+// see task-5-report.md), at the cost of a size-difference lint between
+// variants. Silenced rather than changed.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum SleepOutcome {
+    /// The full duration elapsed with no abort, shutdown, or supersede.
+    Completed,
+    AbortedByShutdown,
+    /// F8 (or any other existing abort_current_tx setter) fired with no
+    /// stashed replacement request.
+    AbortedByOperator,
+    /// A qualifying request arrived; abort_current_tx was set by this
+    /// function itself. Caller should attempt to re-key with the contained
+    /// message.
+    Superseded(MessageType),
+}
+
+/// Like `interruptible_sleep`, but also polls `tx_rx` for a qualifying
+/// incoming request (Task 4's `classify_incoming_during_tx`) on every 50ms
+/// tick. A qualifying request sets `abort` itself (mirroring the operator
+/// F8 path) and is returned via `SleepOutcome::Superseded` for the caller to
+/// re-key. A non-qualifying request (exact duplicate or pivot tombstone) is
+/// silently consumed — same as it would have been had it reached the main
+/// dequeue loop naturally — and the sleep keeps waiting.
+///
+/// See docs/superpowers/specs/2026-07-22-mid-tx-abort-restart-design.md,
+/// "Abort + re-key mechanics."
+#[allow(clippy::too_many_arguments)]
+async fn interruptible_sleep_or_supersede(
+    total: Duration,
+    shutdown: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
+    in_flight_qso_id: Option<&str>,
+    in_flight_text: &str,
+    pivoted_once: &std::collections::HashMap<String, String>,
+) -> SleepOutcome {
+    use std::sync::atomic::Ordering;
+
+    let check_once =
+        |tx_rx: &crossbeam_channel::Receiver<ComponentMessage>| -> Option<SleepOutcome> {
+            if shutdown.load(Ordering::Acquire) {
+                return Some(SleepOutcome::AbortedByShutdown);
+            }
+            if abort.load(Ordering::Acquire) {
+                return Some(SleepOutcome::AbortedByOperator);
+            }
+            if let Ok(message) = tx_rx.try_recv() {
+                match classify_incoming_during_tx(
+                    &message.message_type,
+                    in_flight_qso_id,
+                    in_flight_text,
+                    pivoted_once,
+                ) {
+                    IncomingDuringTx::Drop => {}
+                    IncomingDuringTx::Supersede { .. } => {
+                        abort.store(true, Ordering::Release);
+                        return Some(SleepOutcome::Superseded(message.message_type));
+                    }
+                }
+            }
+            None
+        };
+
+    if let Some(outcome) = check_once(tx_rx) {
+        return outcome;
+    }
+
+    let chunk = Duration::from_millis(50);
+    let deadline = tokio::time::Instant::now() + total;
+    while tokio::time::Instant::now() < deadline {
+        if let Some(outcome) = check_once(tx_rx) {
+            return outcome;
+        }
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        sleep(remaining.min(chunk)).await;
+    }
+    SleepOutcome::Completed
+}
+
 #[cfg(test)]
 mod interruptible_sleep_tests {
     use super::*;
@@ -425,6 +516,135 @@ mod interruptible_sleep_tests {
         let aborted = interruptible_sleep(Duration::from_secs(5), &shutdown, &abort).await;
         assert!(aborted);
         assert!(start.elapsed() < Duration::from_millis(200));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_completes_normally_with_no_incoming_message() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let pivoted_once = std::collections::HashMap::new();
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(80),
+            &shutdown,
+            &abort,
+            &rx,
+            Some("qso-1"),
+            "in flight text",
+            &pivoted_once,
+        )
+        .await;
+        assert!(matches!(outcome, super::SleepOutcome::Completed));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_detects_a_qualifying_incoming_message() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let pivoted_once = std::collections::HashMap::new();
+
+        let new_request = MessageType::TransmitRequest {
+            message_text: "KA1ABC K5ARH RR73".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+        tx.send(crate::message_bus::ComponentMessage::new(
+            crate::message_bus::ComponentId::Autonomous,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            new_request.clone(),
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(500),
+            &shutdown,
+            &abort,
+            &rx,
+            Some("qso-1"),
+            "KA1ABC K5ARH R-15",
+            &pivoted_once,
+        )
+        .await;
+
+        match outcome {
+            super::SleepOutcome::Superseded(MessageType::TransmitRequest {
+                message_text,
+                qso_id,
+                frequency_offset,
+                ..
+            }) => {
+                assert_eq!(message_text, "KA1ABC K5ARH RR73");
+                assert_eq!(qso_id.as_deref(), Some("qso-1"));
+                assert_eq!(frequency_offset, 1500.0);
+            }
+            other => panic!("expected Superseded(TransmitRequest), got {:?}", other),
+        }
+        assert!(
+            abort.load(Ordering::Acquire),
+            "should set abort_current_tx itself"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_drops_non_qualifying_message_and_keeps_waiting() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let pivoted_once = std::collections::HashMap::new();
+
+        // Identical content to what's in flight — should be Dropped, not treated
+        // as a trigger, and the sleep should complete normally.
+        let duplicate = MessageType::TransmitRequest {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1500.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+        tx.send(crate::message_bus::ComponentMessage::new(
+            crate::message_bus::ComponentId::Autonomous,
+            crate::message_bus::ComponentId::Ft8Transmitter,
+            duplicate,
+            std::time::Instant::now(),
+        ))
+        .unwrap();
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(80),
+            &shutdown,
+            &abort,
+            &rx,
+            Some("qso-1"),
+            "KA1ABC K5ARH R-15",
+            &pivoted_once,
+        )
+        .await;
+
+        assert!(matches!(outcome, super::SleepOutcome::Completed));
+        assert!(!abort.load(Ordering::Acquire));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_still_honors_shutdown() {
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let abort = Arc::new(AtomicBool::new(false));
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let pivoted_once = std::collections::HashMap::new();
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_secs(60),
+            &shutdown,
+            &abort,
+            &rx,
+            Some("qso-1"),
+            "in flight text",
+            &pivoted_once,
+        )
+        .await;
+        assert!(matches!(outcome, super::SleepOutcome::AbortedByShutdown));
     }
 }
 
