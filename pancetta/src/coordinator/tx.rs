@@ -1663,7 +1663,38 @@ impl Drop for PttGuard {
 /// (Phase 1 manual override; a cross-QSO supersede re-keys the new text but
 /// keeps the original request's identity for liveness/tombstone bookkeeping).
 #[allow(clippy::too_many_arguments)]
-async fn supersede_and_rekey(
+/// Outcome of `supersede_and_rekey_or_bundle` — replaces Task 6's bare
+/// `bool`. A viable mid-TX supersede can now either fold the new request into
+/// a multi-TX bundle alongside the in-flight content (`Bundle`, when
+/// `max_concurrent_qsos > 1`; the actual per-item ~75 Hz frequency-separation
+/// check runs in the CALLER via `encode_and_modulate_multi_tx`), or fully
+/// replace the in-flight single frame (`Replace` — Task 6's original
+/// behavior, and the single-TX caller's fallback when a bundle attempt
+/// collides on frequency).
+#[derive(Debug)]
+enum SupersedeOutcome {
+    /// Not viable this slot (arrived too late, or the superseding message
+    /// isn't a re-keyable single `TransmitRequest`). Caller abandons this
+    /// message; PTT was already deasserted.
+    NotViable,
+    /// Single-item replace. The working `message_text`/`frequency_offset`/
+    /// `schedule` have been mutated in place to the new item; the single-TX
+    /// caller's `'key_and_send` retry re-encodes and re-keys with it.
+    Replace,
+    /// Bundle-add is viable. The caller encodes `items` via
+    /// `encode_and_modulate_multi_tx`; on success it re-enqueues a
+    /// `MultiTransmitRequest` for them (picked up by the unmodified multi-TX
+    /// arm), on a frequency collision it falls back to a single-item replace.
+    /// `items.last()` is always the new request, and the working single-item
+    /// state was ALSO mutated to it, so the single-TX caller can retry the
+    /// replace with no extra plumbing.
+    Bundle {
+        items: Vec<crate::message_bus::TransmitRequestItem>,
+    },
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn supersede_and_rekey_or_bundle(
     new_request: MessageType,
     message_text: &mut String,
     frequency_offset: &mut f64,
@@ -1676,17 +1707,21 @@ async fn supersede_and_rekey(
     slot_ns: i64,
     tx_self_parity: pancetta_config::station::TxSelfParity,
     _request_received_at: chrono::DateTime<chrono::Utc>,
-) -> bool {
+    max_concurrent_qsos: u32,
+    in_flight_items: &[crate::message_bus::TransmitRequestItem],
+) -> SupersedeOutcome {
     let MessageType::TransmitRequest {
         message_text: new_text,
         frequency_offset: new_freq,
         tx_parity: new_tx_parity,
+        qso_id: new_qso_id,
         ..
     } = new_request
     else {
-        // MultiTransmitRequest supersede is handled by Task 7 — for now,
-        // treat as not viable so the bundle path (once built) takes over.
-        return false;
+        // A `MultiTransmitRequest` arriving as the superseding message isn't
+        // re-keyable content here (Phase 1 manual triggers are single
+        // requests) — not viable, so PTT stays off and the caller abandons.
+        return SupersedeOutcome::NotViable;
     };
 
     // Deassert PTT immediately — the aborted transmission's audio may still
@@ -1720,7 +1755,7 @@ async fn supersede_and_rekey(
             "supersede: '{}' arrived too late to re-key this slot — deferring to next slot via normal scheduling",
             new_text
         );
-        return false;
+        return SupersedeOutcome::NotViable;
     }
 
     info!(
@@ -1729,11 +1764,165 @@ async fn supersede_and_rekey(
         new_text, new_freq
     );
 
-    *message_text = new_text;
+    // Mutate the working single-item state to the new request unconditionally.
+    // This IS the `Replace` result, and it also serves as the single-TX
+    // caller's fallback if the `Bundle` attempt below collides on frequency —
+    // the caller can retry the single item with no extra plumbing.
+    *message_text = new_text.clone();
     *frequency_offset = new_freq;
     *schedule = new_schedule;
     let _ = last_ptt_on_ms; // re-stamped by PttGuard when Step 5 re-asserts PTT
-    true
+
+    // Prefer folding the new request into a multi-TX bundle alongside the
+    // in-flight content when the station runs concurrent QSOs. The actual
+    // frequency-separation check (>= ~75 Hz for FT8) lives inside
+    // `encode_and_modulate_multi_tx`; the caller runs it and falls back to the
+    // single-item `Replace` mutation above on a collision.
+    if max_concurrent_qsos > 1 {
+        let mut candidate_items: Vec<crate::message_bus::TransmitRequestItem> =
+            in_flight_items.to_vec();
+        candidate_items.push(crate::message_bus::TransmitRequestItem {
+            message_text: new_text,
+            frequency_offset: new_freq,
+            qso_id: new_qso_id,
+        });
+        return SupersedeOutcome::Bundle {
+            items: candidate_items,
+        };
+    }
+
+    SupersedeOutcome::Replace
+}
+
+/// Multi-TX arm's mid-TX supersede handler (Task 7 Step 4).
+///
+/// The multi-TX arm has no `'key_and_send` retry loop (unlike the single-TX
+/// arm), so on a qualifying supersede it ALWAYS abandons the current in-flight
+/// bundle and re-enqueues the resolved content back to the worker's own
+/// channel (picked up next dequeue by the unmodified Steps 1-10) rather than
+/// re-keying in place. This runs `supersede_and_rekey_or_bundle` (which
+/// deasserts PTT), then:
+///
+/// - `Bundle` + encode Ok → re-enqueue a `MultiTransmitRequest` folding the
+///   new request alongside the in-flight items.
+/// - `Bundle` + encode Err (frequency collision) → re-enqueue just the new
+///   item (the candidate bundle's last element) as a single `TransmitRequest`.
+/// - `Replace` (`max_concurrent_qsos == 1`, an edge for a bundle-in-flight) →
+///   re-enqueue the new single item; `qso_id` isn't threaded through `Replace`
+///   so it's re-enqueued as a manual (drop-stale-ungated) send.
+/// - `NotViable` → nothing re-enqueued; the bundle is abandoned.
+///
+/// The caller disarms its `PttGuard` and `continue`s after this returns.
+#[allow(clippy::too_many_arguments)]
+async fn supersede_multi_reenqueue(
+    new_request: MessageType,
+    in_flight_items: &[crate::message_bus::TransmitRequestItem],
+    origin: crate::message_bus::TxOrigin,
+    encoder: &mut Ft8Encoder,
+    active_protocol: pancetta_ft8::Protocol,
+    tx_params: &pancetta_ft8::ProtocolParams,
+    message_bus: &crate::message_bus::MessageBus,
+    ptt_active: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    last_ptt_on_ms: &std::sync::Arc<std::sync::atomic::AtomicU64>,
+    tx_late_max_ms_eff: u64,
+    sample_rate: u32,
+    slot_ns: i64,
+    tx_self_parity: pancetta_config::station::TxSelfParity,
+    request_received_at: chrono::DateTime<chrono::Utc>,
+    max_concurrent_qsos: u32,
+) {
+    // Scratch single-item working state: the multi-TX arm never reads it back
+    // (it re-enqueues rather than retrying in place), so these locals only
+    // exist to satisfy `supersede_and_rekey_or_bundle`'s `&mut` contract and
+    // to recover the new item on the `Replace` edge case.
+    let mut scratch_text = String::new();
+    let mut scratch_freq = 0.0f64;
+    let mut scratch_schedule = TxSchedule {
+        target_slot: chrono::Utc::now(),
+        silent_pad_samples: 0,
+        cursor_offset_samples: 0,
+        deferred: false,
+    };
+    match supersede_and_rekey_or_bundle(
+        new_request,
+        &mut scratch_text,
+        &mut scratch_freq,
+        &mut scratch_schedule,
+        message_bus,
+        ptt_active,
+        last_ptt_on_ms,
+        tx_late_max_ms_eff,
+        sample_rate,
+        slot_ns,
+        tx_self_parity,
+        request_received_at,
+        max_concurrent_qsos,
+        in_flight_items,
+    )
+    .await
+    {
+        SupersedeOutcome::NotViable => {
+            // PTT already off; the in-flight bundle is abandoned by the caller.
+        }
+        SupersedeOutcome::Bundle { items } => {
+            let bundle_outcome =
+                encode_and_modulate_multi_tx(encoder, active_protocol, tx_params, &items);
+            let reenqueue = if bundle_outcome.samples.is_ok() {
+                ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::MultiTransmitRequest {
+                        items,
+                        tx_parity: None,
+                        origin,
+                    },
+                    Instant::now(),
+                )
+            } else {
+                // Frequency collision: fall back to re-enqueueing only the new
+                // item (always the last element of the candidate bundle).
+                let new_item = items
+                    .last()
+                    .cloned()
+                    .expect("candidate bundle always contains the new item");
+                ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::TransmitRequest {
+                        message_text: new_item.message_text,
+                        frequency_offset: new_item.frequency_offset,
+                        qso_id: new_item.qso_id,
+                        tx_parity: None,
+                        origin,
+                    },
+                    Instant::now(),
+                )
+            };
+            if let Err(e) = message_bus.send_message(reenqueue).await {
+                warn!(
+                    "supersede (multi-TX): failed to re-enqueue bundle-add: {}",
+                    e
+                );
+            }
+        }
+        SupersedeOutcome::Replace => {
+            let reenqueue = ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: scratch_text,
+                    frequency_offset: scratch_freq,
+                    qso_id: None,
+                    tx_parity: None,
+                    origin,
+                },
+                Instant::now(),
+            );
+            if let Err(e) = message_bus.send_message(reenqueue).await {
+                warn!("supersede (multi-TX): failed to re-enqueue replace: {}", e);
+            }
+        }
+    }
 }
 
 impl super::ApplicationCoordinator {
@@ -1751,13 +1940,19 @@ impl super::ApplicationCoordinator {
         let message_bus = self.message_bus.clone();
 
         // Capture config snapshot for TX timing parameters.
-        let (tx_late_max_ms, tx_self_parity, ptt_lead_ms, sample_rate) = {
+        let (tx_late_max_ms, tx_self_parity, ptt_lead_ms, sample_rate, max_concurrent_qsos) = {
             let cfg = self.config.read().await;
             (
                 cfg.station.tx_late_max_ms,
                 cfg.station.tx_self_parity,
                 cfg.station.ptt_lead_ms,
                 12000u32, // FT8 sample rate
+                // Mid-TX supersede bundle-add (Task 7): when the station runs
+                // concurrent QSOs, a superseding manual request folds into the
+                // current window's multi-TX bundle alongside the in-flight
+                // content instead of fully replacing it. `1` (the default)
+                // keeps the single-item replace path byte-identical to Task 6.
+                cfg.autonomous.max_concurrent_qsos,
             )
         };
 
@@ -2818,7 +3013,16 @@ impl super::ApplicationCoordinator {
                                                 continue 'worker;
                                             }
                                             SleepOutcome::Superseded(new_request) => {
-                                                if !supersede_and_rekey(
+                                                // The current in-flight single item — passed to the
+                                                // helper so a bundle-add (max_concurrent_qsos > 1)
+                                                // can fold the new request alongside it.
+                                                let in_flight_items =
+                                                    vec![crate::message_bus::TransmitRequestItem {
+                                                        message_text: message_text.clone(),
+                                                        frequency_offset,
+                                                        qso_id: qso_id.clone(),
+                                                    }];
+                                                match supersede_and_rekey_or_bundle(
                                                     new_request,
                                                     &mut message_text,
                                                     &mut frequency_offset,
@@ -2834,27 +3038,84 @@ impl super::ApplicationCoordinator {
                                                     slot_ns,
                                                     tx_self_parity,
                                                     request_received_at,
+                                                    max_concurrent_qsos,
+                                                    &in_flight_items,
                                                 )
                                                 .await
                                                 {
-                                                    // Too late to re-key this slot — PTT already
-                                                    // off; abandon THIS message (not the worker):
-                                                    // leave the retry loop and fall through to the
-                                                    // next dequeue. The armed PttGuard's drop is
-                                                    // the PTT-off safety net if the explicit send
-                                                    // failed.
-                                                    break 'key_and_send;
+                                                    SupersedeOutcome::NotViable => {
+                                                        // Too late to re-key this slot — PTT already
+                                                        // off; abandon THIS message (not the worker):
+                                                        // leave the retry loop and fall through to
+                                                        // the next dequeue. The armed PttGuard's
+                                                        // drop is the PTT-off safety net if the
+                                                        // explicit send failed.
+                                                        break 'key_and_send;
+                                                    }
+                                                    SupersedeOutcome::Replace => {
+                                                        // Viable single-item re-key (Task 6): carry
+                                                        // the recomputed schedule into the retry,
+                                                        // flush stale audio at Step 7, clear the
+                                                        // abort flag the supersede set, and disarm
+                                                        // this iteration's PttGuard (PTT-off was
+                                                        // already sent; Step 5 re-asserts on retry).
+                                                        rekey_schedule = Some(schedule);
+                                                        is_rekey = true;
+                                                        abort_current_tx
+                                                            .store(false, Ordering::Release);
+                                                        ptt_guard.disarm();
+                                                        continue 'key_and_send;
+                                                    }
+                                                    SupersedeOutcome::Bundle { items } => {
+                                                        // Prefer a multi-TX bundle: encode the
+                                                        // in-flight + new item together. On success,
+                                                        // hand it back to the worker as a fresh
+                                                        // MultiTransmitRequest (picked up by the
+                                                        // unmodified multi-TX arm) and abandon this
+                                                        // single-TX retry. On a frequency collision,
+                                                        // fall back to the single-item replace — the
+                                                        // working state was already mutated to the
+                                                        // new item by the helper.
+                                                        let tx_params =
+                                                            pancetta_ft8::ProtocolParams::from_protocol(
+                                                                active_protocol,
+                                                            );
+                                                        let bundle_outcome =
+                                                            encode_and_modulate_multi_tx(
+                                                                &mut encoder,
+                                                                active_protocol,
+                                                                &tx_params,
+                                                                &items,
+                                                            );
+                                                        if bundle_outcome.samples.is_ok() {
+                                                            let bundle_msg = ComponentMessage::new(
+                                                                ComponentId::Ft8Transmitter,
+                                                                ComponentId::Ft8Transmitter,
+                                                                MessageType::MultiTransmitRequest {
+                                                                    items,
+                                                                    tx_parity: None,
+                                                                    origin,
+                                                                },
+                                                                Instant::now(),
+                                                            );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(bundle_msg)
+                                                                .await
+                                                            {
+                                                                warn!("supersede: failed to re-enqueue multi-TX bundle: {}", e);
+                                                            }
+                                                            ptt_guard.disarm();
+                                                            break 'key_and_send;
+                                                        }
+                                                        // Frequency collision: single-item replace.
+                                                        rekey_schedule = Some(schedule);
+                                                        is_rekey = true;
+                                                        abort_current_tx
+                                                            .store(false, Ordering::Release);
+                                                        ptt_guard.disarm();
+                                                        continue 'key_and_send;
+                                                    }
                                                 }
-                                                // Viable re-key: carry the recomputed schedule
-                                                // into the retry, flush stale audio at Step 7,
-                                                // clear the abort flag the supersede set, and
-                                                // disarm this iteration's PttGuard (PTT-off was
-                                                // already sent; Step 5 re-asserts on the retry).
-                                                rekey_schedule = Some(schedule);
-                                                is_rekey = true;
-                                                abort_current_tx.store(false, Ordering::Release);
-                                                ptt_guard.disarm();
-                                                continue 'key_and_send;
                                             }
                                         }
 
@@ -2904,7 +3165,14 @@ impl super::ApplicationCoordinator {
                                                 continue 'worker;
                                             }
                                             SleepOutcome::Superseded(new_request) => {
-                                                if !supersede_and_rekey(
+                                                // Same bundle-add-or-replace decision as Step 6.
+                                                let in_flight_items =
+                                                    vec![crate::message_bus::TransmitRequestItem {
+                                                        message_text: message_text.clone(),
+                                                        frequency_offset,
+                                                        qso_id: qso_id.clone(),
+                                                    }];
+                                                match supersede_and_rekey_or_bundle(
                                                     new_request,
                                                     &mut message_text,
                                                     &mut frequency_offset,
@@ -2920,19 +3188,67 @@ impl super::ApplicationCoordinator {
                                                     slot_ns,
                                                     tx_self_parity,
                                                     request_received_at,
+                                                    max_concurrent_qsos,
+                                                    &in_flight_items,
                                                 )
                                                 .await
                                                 {
-                                                    // Too late to re-key this slot — abandon THIS
-                                                    // message (not the worker): leave the retry
-                                                    // loop and fall through to the next dequeue.
-                                                    break 'key_and_send;
+                                                    SupersedeOutcome::NotViable => {
+                                                        // Too late to re-key this slot — abandon
+                                                        // THIS message (not the worker): leave the
+                                                        // retry loop and fall through to next
+                                                        // dequeue.
+                                                        break 'key_and_send;
+                                                    }
+                                                    SupersedeOutcome::Replace => {
+                                                        rekey_schedule = Some(schedule);
+                                                        is_rekey = true;
+                                                        abort_current_tx
+                                                            .store(false, Ordering::Release);
+                                                        ptt_guard.disarm();
+                                                        continue 'key_and_send;
+                                                    }
+                                                    SupersedeOutcome::Bundle { items } => {
+                                                        let tx_params =
+                                                            pancetta_ft8::ProtocolParams::from_protocol(
+                                                                active_protocol,
+                                                            );
+                                                        let bundle_outcome =
+                                                            encode_and_modulate_multi_tx(
+                                                                &mut encoder,
+                                                                active_protocol,
+                                                                &tx_params,
+                                                                &items,
+                                                            );
+                                                        if bundle_outcome.samples.is_ok() {
+                                                            let bundle_msg = ComponentMessage::new(
+                                                                ComponentId::Ft8Transmitter,
+                                                                ComponentId::Ft8Transmitter,
+                                                                MessageType::MultiTransmitRequest {
+                                                                    items,
+                                                                    tx_parity: None,
+                                                                    origin,
+                                                                },
+                                                                Instant::now(),
+                                                            );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(bundle_msg)
+                                                                .await
+                                                            {
+                                                                warn!("supersede: failed to re-enqueue multi-TX bundle: {}", e);
+                                                            }
+                                                            ptt_guard.disarm();
+                                                            break 'key_and_send;
+                                                        }
+                                                        // Frequency collision: single-item replace.
+                                                        rekey_schedule = Some(schedule);
+                                                        is_rekey = true;
+                                                        abort_current_tx
+                                                            .store(false, Ordering::Release);
+                                                        ptt_guard.disarm();
+                                                        continue 'key_and_send;
+                                                    }
                                                 }
-                                                rekey_schedule = Some(schedule);
-                                                is_rekey = true;
-                                                abort_current_tx.store(false, Ordering::Release);
-                                                ptt_guard.disarm();
-                                                continue 'key_and_send;
                                             }
                                         }
                                         let success = true;
@@ -4075,21 +4391,64 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 6: Sleep precisely until target slot ---
+                                    // ptt_guard in scope — drop on any loop exit fires PTT-off.
+                                    // A qualifying request arriving here supersedes the in-flight
+                                    // bundle: prefer folding it in (bundle-add), else re-enqueue
+                                    // a single-item replace — see `supersede_multi_reenqueue`.
                                     let to_slot = pancetta_core::slot::duration_until(
                                         schedule.target_slot,
                                         chrono::Utc::now(),
                                     );
-                                    if interruptible_sleep(to_slot, &shutdown, &abort_current_tx)
-                                        .await
+                                    match interruptible_sleep_or_supersede(
+                                        to_slot,
+                                        &shutdown,
+                                        &abort_current_tx,
+                                        &tx_rx,
+                                        items.first().and_then(|it| it.qso_id.as_deref()),
+                                        items
+                                            .first()
+                                            .map(|it| it.message_text.as_str())
+                                            .unwrap_or(""),
+                                        &pivoted_once,
+                                    )
+                                    .await
                                     {
-                                        if shutdown.load(Ordering::Acquire) {
+                                        SleepOutcome::Completed => {}
+                                        SleepOutcome::AbortedByShutdown => {
                                             info!(
                                                 "Multi-TX aborted between PTT and slot by shutdown"
                                             );
                                             break;
                                         }
-                                        info!("Multi-TX aborted between PTT and slot by operator (F8)");
-                                        continue;
+                                        SleepOutcome::AbortedByOperator => {
+                                            info!("Multi-TX aborted between PTT and slot by operator (F8)");
+                                            continue;
+                                        }
+                                        SleepOutcome::Superseded(new_request) => {
+                                            supersede_multi_reenqueue(
+                                                new_request,
+                                                &items,
+                                                origin,
+                                                &mut encoder,
+                                                active_protocol,
+                                                &tx_params,
+                                                &message_bus,
+                                                &ptt_active,
+                                                &last_ptt_on_ms,
+                                                tx_late_max_ms_effective(
+                                                    active_protocol,
+                                                    tx_late_max_ms,
+                                                ),
+                                                sample_rate,
+                                                slot_ns,
+                                                tx_self_parity,
+                                                request_received_at,
+                                                max_concurrent_qsos,
+                                            )
+                                            .await;
+                                            ptt_guard.disarm();
+                                            continue;
+                                        }
                                     }
 
                                     // --- Step 7: Route audio to output ---
@@ -4108,19 +4467,59 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 8: Wait for playback to complete ---
-                                    if interruptible_sleep(
+                                    // Playback is now on the air; a qualifying request here
+                                    // supersedes the bundle (same bundle-add-or-replace decision
+                                    // as Step 6 via `supersede_multi_reenqueue`).
+                                    match interruptible_sleep_or_supersede(
                                         Duration::from_millis(audio_duration_ms),
                                         &shutdown,
                                         &abort_current_tx,
+                                        &tx_rx,
+                                        items.first().and_then(|it| it.qso_id.as_deref()),
+                                        items
+                                            .first()
+                                            .map(|it| it.message_text.as_str())
+                                            .unwrap_or(""),
+                                        &pivoted_once,
                                     )
                                     .await
                                     {
-                                        if shutdown.load(Ordering::Acquire) {
+                                        SleepOutcome::Completed => {}
+                                        SleepOutcome::AbortedByShutdown => {
                                             info!("Multi-TX aborted during playback by shutdown");
                                             break;
                                         }
-                                        info!("Multi-TX aborted during playback by operator (F8)");
-                                        continue;
+                                        SleepOutcome::AbortedByOperator => {
+                                            info!(
+                                                "Multi-TX aborted during playback by operator (F8)"
+                                            );
+                                            continue;
+                                        }
+                                        SleepOutcome::Superseded(new_request) => {
+                                            supersede_multi_reenqueue(
+                                                new_request,
+                                                &items,
+                                                origin,
+                                                &mut encoder,
+                                                active_protocol,
+                                                &tx_params,
+                                                &message_bus,
+                                                &ptt_active,
+                                                &last_ptt_on_ms,
+                                                tx_late_max_ms_effective(
+                                                    active_protocol,
+                                                    tx_late_max_ms,
+                                                ),
+                                                sample_rate,
+                                                slot_ns,
+                                                tx_self_parity,
+                                                request_received_at,
+                                                max_concurrent_qsos,
+                                            )
+                                            .await;
+                                            ptt_guard.disarm();
+                                            continue;
+                                        }
                                     }
                                     let success = true;
                                     let duration_ms = audio_duration_ms;
@@ -5066,7 +5465,7 @@ mod supersede_rekey_tests {
     #[tokio::test(flavor = "current_thread")]
     async fn supersede_and_rekey_updates_state_when_viable() {
         let bus = MessageBus::new(16).unwrap();
-        // Hamlib channel so supersede_and_rekey's PTT-OFF send has a receiver.
+        // Hamlib channel so the helper's PTT-OFF send has a receiver.
         let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
         let now = chrono::Utc::now();
@@ -5095,7 +5494,8 @@ mod supersede_rekey_tests {
             origin: crate::message_bus::TxOrigin::Local,
         };
 
-        let viable = super::supersede_and_rekey(
+        // max_concurrent_qsos == 1 → single-item replace (Task 6 behavior).
+        let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
@@ -5108,12 +5508,14 @@ mod supersede_rekey_tests {
             pancetta_core::slot::SLOT_NS,
             pancetta_config::station::TxSelfParity::Auto,
             now,
+            1,
+            &[],
         )
         .await;
 
         assert!(
-            viable,
-            "re-key targeting the current slot parity must be viable"
+            matches!(outcome, super::SupersedeOutcome::Replace),
+            "re-key targeting the current slot parity with max_concurrent_qsos==1 must Replace"
         );
         // The state swap is what makes the retry re-encode the NEW content:
         // Step 1 re-runs `encode_for_protocol(&message_text)` at the new freq.
@@ -5129,11 +5531,91 @@ mod supersede_rekey_tests {
         );
     }
 
-    /// A `MultiTransmitRequest` is not re-keyable by this Phase-1 single-TX
-    /// helper (Task 7 owns bundle supersede) — it must report "not viable" and
-    /// leave the working text untouched (no PTT/schedule mutation).
+    /// With `max_concurrent_qsos > 1`, a viable supersede folds the new
+    /// request into a bundle alongside the in-flight item: the outcome is
+    /// `Bundle` carrying both items (in-flight first, new item last), PTT is
+    /// deasserted, and the working state is ALSO mutated to the new item (the
+    /// single-TX caller's collision fallback).
     #[tokio::test(flavor = "current_thread")]
-    async fn supersede_and_rekey_declines_multi_transmit_request() {
+    async fn supersede_returns_bundle_when_concurrent() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        let in_flight = vec![crate::message_bus::TransmitRequestItem {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-1".to_string()),
+        }];
+
+        let new_request = MessageType::TransmitRequest {
+            message_text: "CQ K5ARH EM12".to_string(),
+            frequency_offset: 1400.0,
+            qso_id: Some("qso-2".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+
+        let outcome = super::supersede_and_rekey_or_bundle(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2,
+            &in_flight,
+        )
+        .await;
+
+        match outcome {
+            super::SupersedeOutcome::Bundle { items } => {
+                assert_eq!(items.len(), 2, "bundle = in-flight + new item");
+                assert_eq!(items[0].message_text, "KA1ABC K5ARH R-15");
+                assert_eq!(items[0].frequency_offset, 1000.0);
+                assert_eq!(items[1].message_text, "CQ K5ARH EM12");
+                assert_eq!(items[1].frequency_offset, 1400.0);
+                assert_eq!(items[1].qso_id.as_deref(), Some("qso-2"));
+            }
+            other => panic!("expected Bundle, got {other:?}"),
+        }
+        assert!(
+            !ptt_active.load(Ordering::Acquire),
+            "PTT must be deasserted"
+        );
+        // Working state also mutated to the new item (collision fallback).
+        assert_eq!(message_text, "CQ K5ARH EM12");
+        assert_eq!(frequency_offset, 1400.0);
+    }
+
+    /// A `MultiTransmitRequest` arriving AS the superseding message isn't
+    /// re-keyable content — it must report `NotViable` and leave the working
+    /// text untouched (no schedule mutation).
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_declines_multi_transmit_request() {
         let bus = MessageBus::new(16).unwrap();
         let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
 
@@ -5155,7 +5637,7 @@ mod supersede_rekey_tests {
             origin: crate::message_bus::TxOrigin::Local,
         };
 
-        let viable = super::supersede_and_rekey(
+        let outcome = super::supersede_and_rekey_or_bundle(
             new_request,
             &mut message_text,
             &mut frequency_offset,
@@ -5168,13 +5650,85 @@ mod supersede_rekey_tests {
             pancetta_core::slot::SLOT_NS,
             pancetta_config::station::TxSelfParity::Auto,
             chrono::Utc::now(),
+            2,
+            &[],
         )
         .await;
 
-        assert!(!viable);
+        assert!(matches!(outcome, super::SupersedeOutcome::NotViable));
         assert_eq!(
             message_text, "OLD TEXT",
             "a declined supersede leaves the working text untouched"
+        );
+    }
+
+    /// Grounding check (brief Step 1/2): the pre-existing multi-TX encode path
+    /// that bundle-add reuses succeeds when two items are well clear of the
+    /// ~75 Hz FT8 minimum separation, yielding a 2-item summed waveform.
+    #[test]
+    fn bundle_add_succeeds_when_frequencies_are_well_separated() {
+        let mut encoder = super::Ft8Encoder::new();
+        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
+        let in_flight = vec![crate::message_bus::TransmitRequestItem {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-1".to_string()),
+        }];
+        let new_item = crate::message_bus::TransmitRequestItem {
+            message_text: "CQ K5ARH EM12".to_string(),
+            frequency_offset: 1400.0, // 400 Hz away — well clear of the ~75 Hz minimum
+            qso_id: None,
+        };
+        let bundled: Vec<_> = in_flight
+            .iter()
+            .cloned()
+            .chain(std::iter::once(new_item))
+            .collect();
+        let outcome = super::encode_and_modulate_multi_tx(
+            &mut encoder,
+            pancetta_ft8::Protocol::Ft8,
+            &tx_params,
+            &bundled,
+        );
+        assert!(
+            outcome.samples.is_ok(),
+            "expected bundle-add to succeed: {:?}",
+            outcome.samples
+        );
+        assert_eq!(outcome.encoded_items.len(), 2);
+    }
+
+    /// Bundle-add falls back (encode error) when the new item collides on
+    /// frequency with the in-flight item (inside the ~75 Hz minimum) — this is
+    /// the collision the caller detects to fall back to a single-item replace.
+    #[test]
+    fn bundle_add_falls_back_when_frequencies_collide() {
+        let mut encoder = super::Ft8Encoder::new();
+        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
+        let in_flight = vec![crate::message_bus::TransmitRequestItem {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-1".to_string()),
+        }];
+        let new_item = crate::message_bus::TransmitRequestItem {
+            message_text: "CQ K5ARH EM12".to_string(),
+            frequency_offset: 1010.0, // 10 Hz away — well inside the ~75 Hz minimum, must collide
+            qso_id: None,
+        };
+        let bundled: Vec<_> = in_flight
+            .iter()
+            .cloned()
+            .chain(std::iter::once(new_item))
+            .collect();
+        let outcome = super::encode_and_modulate_multi_tx(
+            &mut encoder,
+            pancetta_ft8::Protocol::Ft8,
+            &tx_params,
+            &bundled,
+        );
+        assert!(
+            outcome.samples.is_err(),
+            "expected the frequency collision to be rejected"
         );
     }
 }
