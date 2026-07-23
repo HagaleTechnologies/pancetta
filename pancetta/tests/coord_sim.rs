@@ -729,6 +729,7 @@ impl CoordSim {
                 MessageType::AudioOutput {
                     samples: vec![0.0f32; 16],
                     sample_rate: 12_000,
+                    flush_first: false,
                 },
                 Instant::now(),
             ))

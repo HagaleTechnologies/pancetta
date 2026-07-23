@@ -27,7 +27,7 @@ impl super::ApplicationCoordinator {
         let (audio_level_tx, audio_level_rx) = crossbeam_channel::bounded::<f32>(1);
 
         // TX audio channel: Ft8Transmitter -> Audio thread for playback
-        let (tx_audio_tx, tx_audio_rx) = crossbeam_channel::bounded::<(Vec<f32>, u32)>(4);
+        let (tx_audio_tx, tx_audio_rx) = crossbeam_channel::bounded::<(Vec<f32>, u32, bool)>(4);
 
         // Pipeline health tracking (atomics shared across threads)
         let health_dsp_windows = Arc::new(std::sync::atomic::AtomicU64::new(0));
@@ -98,6 +98,7 @@ impl super::ApplicationCoordinator {
                             if let MessageType::AudioOutput {
                                 samples,
                                 sample_rate,
+                                flush_first,
                             } = message.message_type
                             {
                                 info!(
@@ -106,7 +107,10 @@ impl super::ApplicationCoordinator {
                                     sample_rate,
                                     message.source
                                 );
-                                if tx_audio_tx.send((samples, sample_rate)).is_err() {
+                                if tx_audio_tx
+                                    .send((samples, sample_rate, flush_first))
+                                    .is_err()
+                                {
                                     warn!("Audio TX relay: audio thread channel closed");
                                     break;
                                 }

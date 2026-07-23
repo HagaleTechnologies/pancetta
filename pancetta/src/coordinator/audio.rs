@@ -52,7 +52,7 @@ impl super::ApplicationCoordinator {
     pub(crate) async fn start_audio_pipeline(
         &mut self,
         audio_to_dsp_tx: crossbeam_channel::Sender<Vec<f32>>,
-        tx_audio_rx: crossbeam_channel::Receiver<(Vec<f32>, u32)>,
+        tx_audio_rx: crossbeam_channel::Receiver<(Vec<f32>, u32, bool)>,
         health_audio_alive: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         if self.no_audio {
@@ -354,13 +354,16 @@ impl super::ApplicationCoordinator {
 
                     // Check for TX audio to play out
                     match tx_audio_rx.try_recv() {
-                        Ok((samples, sample_rate)) => {
+                        Ok((samples, sample_rate, flush_first)) => {
                             info!(
-                                "Audio TX: queueing {} samples at {} Hz",
+                                "Audio TX: queueing {} samples at {} Hz (flush_first={})",
                                 samples.len(),
-                                sample_rate
+                                sample_rate,
+                                flush_first
                             );
-                            if let Err(e) = audio_manager.queue_output(&samples, sample_rate) {
+                            if let Err(e) =
+                                audio_manager.queue_output(&samples, sample_rate, flush_first)
+                            {
                                 let s = e.to_string();
                                 error!("Audio TX output error: {}", s);
                                 maybe_report_runtime("TX output error", s);
