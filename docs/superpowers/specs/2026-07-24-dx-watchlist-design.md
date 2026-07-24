@@ -157,9 +157,12 @@ every heard station.
 
 ## Open questions for planning
 
-- Exact hook point for "QSO completed" → `watchlist.remove(callsign)` — needs to be located in the
-  coordinator wiring during implementation planning (auto-sequencer completion event vs. QSO
-  manager state transition).
+- **Resolved during planning:** no explicit "QSO completed → `watchlist.remove(callsign)`" hook was
+  added. `AutonomousOperator` (which owns the watchlist) isn't reachable from the QSO-completion
+  call site (`pancetta/src/coordinator/qso.rs`'s `record_worked` call) without new cross-module
+  plumbing, and a stale entry has no side effect — it never triggers a transmission, it's inert
+  bookkeeping that self-clears via TTL (~2.5 min) either way. If on-air experience shows the DX
+  Hunter marker lingering on a just-worked station is confusing, add the hook then.
 - Default TTL: ~2.5 minutes is a reasonable starting point (roughly the midpoint of the "~2-3
   minutes" the operator specified); expose as a config field under `AutonomousConfig` rather than
   hardcoding, in case on-air experience says otherwise.
