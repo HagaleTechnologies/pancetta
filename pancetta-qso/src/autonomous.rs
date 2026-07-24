@@ -305,6 +305,20 @@ impl CollisionDetector {
 /// in the coordinator wiring layer.
 pub trait DxEvaluator: Send + Sync {
     fn evaluate_cq(&self, callsign: &str, grid: Option<&str>, snr: i8, freq_hz: f64) -> f64;
+
+    /// Tiered classification, when available. `None` for evaluators that
+    /// don't implement tiered scoring (e.g. `NullDxEvaluator`, test
+    /// scaffolding) — callers that need a tier (the DX watchlist) simply
+    /// skip entries where this returns `None`.
+    fn evaluate_cq_tiered(
+        &self,
+        _callsign: &str,
+        _grid: Option<&str>,
+        _snr: i8,
+        _freq_hz: f64,
+    ) -> Option<crate::priority::TieredScore> {
+        None
+    }
 }
 
 /// A no-op evaluator that assigns the same score to everything.
@@ -2694,6 +2708,16 @@ mod tests {
         fn evaluate_cq(&self, _: &str, _: Option<&str>, _: i8, _: f64) -> f64 {
             self.0
         }
+    }
+
+    #[test]
+    fn null_dx_evaluator_tiered_defaults_to_none() {
+        let evaluator = NullDxEvaluator;
+        assert_eq!(
+            evaluator.evaluate_cq_tiered("W1ABC", None, -10, 14_074_000.0),
+            None,
+            "evaluators that don't implement tiered scoring must default to None"
+        );
     }
 
     #[test]
