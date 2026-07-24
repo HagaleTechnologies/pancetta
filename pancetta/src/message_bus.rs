@@ -182,6 +182,13 @@ pub enum MessageType {
         snapshot: pancetta_qso::frequency::PlacementSnapshot,
     },
 
+    /// Currently-watchlisted callsigns (#197 DX watchlist) — sent every
+    /// autonomous tick alongside `TxPlacementUpdate`, same housekeeping
+    /// cadence. A full resync each tick (not a diff), matching this
+    /// codebase's existing "bulk replace, self-healing" convention (see
+    /// `FrequencyAllocator::set_own_frequencies`).
+    DxWatchlistUpdate { callsigns: Vec<String> },
+
     /// Hamlib rig control messages
     RigControl(RigControlMessage),
 
