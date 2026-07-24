@@ -147,7 +147,6 @@ pub mod states;
 pub mod statistics;
 
 pub mod watchlist;
-pub use watchlist::{DxWatchlist, DxWatchlistEntry};
 
 pub mod callsign_continuity;
 pub use callsign_continuity::{build_filter, CallsignContinuityFilter};

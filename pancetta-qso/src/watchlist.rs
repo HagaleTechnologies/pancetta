@@ -40,7 +40,13 @@ impl DxWatchlist {
     /// existing entry for the same callsign, including its tier — a station
     /// re-heard at a different tier reflects the current, more accurate
     /// classification.
-    pub fn refresh(&mut self, callsign: &str, grid: Option<&str>, tier: PriorityTier, now: DateTime<Utc>) {
+    pub fn refresh(
+        &mut self,
+        callsign: &str,
+        grid: Option<&str>,
+        tier: PriorityTier,
+        now: DateTime<Utc>,
+    ) {
         let key = callsign.to_uppercase();
         self.entries.insert(
             key.clone(),
@@ -133,5 +139,16 @@ mod tests {
         wl.refresh("W1XYZ", None, PriorityTier::Atno, t(0));
         wl.remove("ja1abc");
         assert_eq!(wl.callsigns(), vec!["W1XYZ".to_string()]);
+    }
+
+    #[test]
+    fn prune_removes_entry_at_exact_ttl_boundary() {
+        let mut wl = DxWatchlist::new(Duration::seconds(150));
+        wl.refresh("JA1ABC", None, PriorityTier::PerBandDxccNew, t(0));
+        wl.prune(t(150));
+        assert!(
+            wl.is_empty(),
+            "entry must be pruned at exactly TTL boundary (now - last_heard == ttl)"
+        );
     }
 }
