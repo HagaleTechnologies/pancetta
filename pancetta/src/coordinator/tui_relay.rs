@@ -625,6 +625,13 @@ impl super::ApplicationCoordinator {
                                 },
                             );
                         }
+                        MessageType::DxWatchlistUpdate { ref callsigns } => {
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::DxWatchlistUpdate {
+                                    callsigns: callsigns.clone(),
+                                },
+                            );
+                        }
                         _ => {}
                     }
                 }

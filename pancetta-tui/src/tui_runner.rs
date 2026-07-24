@@ -291,6 +291,9 @@ pub enum TuiMessage {
         /// TUI-local mirror of the qso-crate snapshot.
         view: crate::app::PlacementView,
     },
+    /// Currently-watchlisted callsigns (#197 DX watchlist). Full resync each
+    /// time — `App::apply_dx_watchlist` bulk-replaces, never diffs.
+    DxWatchlistUpdate { callsigns: Vec<String> },
 }
 
 /// Commands sent from TUI
@@ -884,6 +887,9 @@ impl TuiRunner {
             }
             TuiMessage::TxPlacementUpdate { view } => {
                 app.apply_placement(view);
+            }
+            TuiMessage::DxWatchlistUpdate { callsigns } => {
+                app.apply_dx_watchlist(&callsigns);
             }
         }
 
