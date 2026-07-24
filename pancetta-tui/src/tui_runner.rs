@@ -3549,6 +3549,7 @@ mod key_tests {
                     last_seen_network: None,
                     audio_offset_hz: Some(750),
                     slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    watchlisted: false,
                 },
             );
             a.dx_hunter_scroll = 0;
@@ -4205,6 +4206,7 @@ mod key_tests {
                     last_seen_network: None,
                     audio_offset_hz: Some(750),
                     slot_parity: Some(pancetta_core::slot::SlotParity::Even),
+                    watchlisted: false,
                 },
             );
             a.dx_hunter_scroll = 0;
