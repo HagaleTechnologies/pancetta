@@ -73,7 +73,9 @@ impl DxWatchlist {
 
     /// Currently-watchlisted callsigns (uppercased), for TUI/status surfacing.
     pub fn callsigns(&self) -> Vec<String> {
-        self.entries.keys().cloned().collect()
+        let mut callsigns: Vec<String> = self.entries.keys().cloned().collect();
+        callsigns.sort();
+        callsigns
     }
 
     pub fn len(&self) -> usize {

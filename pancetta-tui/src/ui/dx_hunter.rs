@@ -473,7 +473,7 @@ mod tests {
     }
 
     #[test]
-    fn watchlist_glyph_appears_only_when_watchlisted_and_not_atno() {
+    fn watchlist_glyph_appears_when_watchlisted() {
         // Mirrors the band_needed precedent: the glyph is additive to the
         // need_marker cluster, not folded into need_marker itself (keeps
         // need_marker's existing signature/tests untouched).
