@@ -2,6 +2,15 @@
 
 **Date:** 2026-07-25
 **Status:** Approved (operator-reviewed design, this session)
+**Status update (2026-07-25):** Phase 1 SHIPPED (this session, `worktree-task-supervision`) — the
+coordinator now auto-restarts the 5 components with real no-argument `&mut self -> Result<()>`
+start methods (Autonomous, DxCluster, PskReporter, RemoteGateway, Qso), under a 5-restarts/
+10-minute rolling budget with capped-exponential backoff, surfacing dropped in-flight QSOs via
+the new `QsoFailureReason::SupervisorRestart`. Explicitly deferred as follow-on work: Dsp and
+Ft8Decoder need new channel/atomic re-supply plumbing before their moved-once start parameters
+can be restarted; Hamlib, StationAgent, and Audio need teardown semantics (safe PTT/TX-arm
+unwind) that are only sketched in §2 below, not yet designed in code. See §4.6 for the
+already-shipped panic-hook groundwork this builds on.
 **Scope crates:** `pancetta` (coordinator), `pancetta-qso` (new `QsoFailureReason` variant)
 **Supersedes:** `docs/task-supervision-plan.md` (2026-07-03) — that doc's research and touch
 points are correct and are folded in here; this spec is now the authoritative source and

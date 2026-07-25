@@ -65,6 +65,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - `merge_with` must carry every config field (see the §5 config-merge guardrail).
 - Every transmitted frame (single or multi-TX bundle item) reflects the freshest `MessageToSend` the QSO engine emitted for that qso_id at key-time, or at the moment of an operator-triggered mid-TX abort+re-key, whichever is later.
 - At most one QSO object exists per (callsign, band) among active-or-recently-completed QSOs; repeated manual actions resolve to it, never spawn a sibling.
+- The coordinator supervisor auto-restarts a crashed Autonomous/DxCluster/PskReporter/RemoteGateway/Qso task (5 restarts/10min, capped-exponential backoff), surfacing dropped QSOs as `QsoFailureReason::SupervisorRestart`; Dsp/Ft8Decoder/Hamlib/StationAgent/Audio are not yet covered.
 
 ## Where Things Live
 
@@ -82,8 +83,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 The `target/` directory can balloon to 40-50GB with stale incremental compilation caches. Run periodically:
 
 ```bash
-cargo sweep --installed          # remove artifacts from unused toolchains
-cargo sweep --maxsize 10GB       # cap target/ size
+cargo sweep --installed && cargo sweep --maxsize 10GB   # unused toolchains, then cap target/ size
 ```
 
 ## Knowledge Wiki and Multi-Agent Hygiene
