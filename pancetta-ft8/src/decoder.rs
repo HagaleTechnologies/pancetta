@@ -20329,6 +20329,7 @@ mod a8_qso_state_tests {
             my_call: MyCallAp::new(my),
             recent_calls: vec![],
             active_qso: Some(qso),
+            active_qsos: vec![],
         }
     }
 
@@ -20355,6 +20356,7 @@ mod a8_qso_state_tests {
             my_call: MyCallAp::new("K1ABC"),
             recent_calls: vec![],
             active_qso: None,
+            active_qsos: vec![],
         };
         assert!(!a8_text_matches(&ctx, "K1ABC W1AW RR73"));
     }
@@ -22330,6 +22332,7 @@ mod w26_ap_coverage_tests {
             my_call: Some(my),
             recent_calls: vec![],
             active_qso: Some(qso),
+            active_qsos: vec![],
         };
         (ctx, hyp)
     }
@@ -22466,6 +22469,7 @@ mod w26_ap_coverage_tests {
             my_call: Some(my_call),
             recent_calls: vec![],
             active_qso: None,
+            active_qsos: vec![],
         };
 
         // Legacy: inject then normalize.

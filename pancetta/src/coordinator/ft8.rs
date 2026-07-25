@@ -947,6 +947,11 @@ impl super::ApplicationCoordinator {
                             my_call: my_call_ap.clone(),
                             recent_calls: recent_pool.clone(),
                             active_qso: current_qso_ap,
+                            // Task 5 wires real multi-QSO ranked population
+                            // into this coordinator call site; until then
+                            // this stays empty and Ap1-Ap4 keep reading
+                            // `active_qso` unchanged.
+                            active_qsos: vec![],
                         };
 
                         // hb-229: QSO partner band-collapse. When a QSO is

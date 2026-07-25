@@ -632,8 +632,14 @@ pub struct ApContext {
     pub my_call: Option<MyCallAp>,
     /// Recently heard callsigns (candidates for AP2).
     pub recent_calls: Vec<RecentCallAp>,
-    /// Currently active QSO, if any.
+    /// Retained for back-compat with existing Ap1-Ap4 call sites that read
+    /// a single QSO -- always set to `active_qsos.first().cloned()` by
+    /// whichever constructor populates both, so old and new readers agree.
     pub active_qso: Option<QsoAp>,
+    /// Ranked (highest priority first), capped at `MAX_AP_QSOS`. Empty
+    /// when no QSOs are in flight. The Ap5 hypothesis loop (Task 6)
+    /// iterates this; existing Ap3/Ap4 keep reading `active_qso` unchanged.
+    pub active_qsos: Vec<QsoAp>,
 }
 
 // ---------------------------------------------------------------------------
@@ -908,6 +914,7 @@ mod tests {
             my_call: Some(my_call.clone()),
             recent_calls: vec![],
             active_qso: None,
+            active_qsos: vec![],
         };
 
         let mut llrs = vec![0.0f32; 77];
@@ -939,6 +946,7 @@ mod tests {
             my_call: Some(my_call.clone()),
             recent_calls: vec![],
             active_qso: Some(qso.clone()),
+            active_qsos: vec![],
         };
 
         let mut llrs = vec![0.0f32; 77];
@@ -996,6 +1004,7 @@ mod tests {
             my_call: Some(my_call.clone()),
             recent_calls: vec![],
             active_qso: Some(qso.clone()),
+            active_qsos: vec![],
         };
 
         let mut llrs = vec![0.0f32; 77];
@@ -1147,6 +1156,7 @@ mod tests {
             my_call: Some(MyCallAp::new("K1ABC").unwrap()),
             recent_calls: vec![RecentCallAp::new("W1AW", -5.0).unwrap()],
             active_qso: Some(QsoAp::new("W1AW", QsoApProgress::WaitingForReport).unwrap()),
+            active_qsos: vec![],
         };
 
         let mut llrs_empty = vec![0.0f32; 77];
@@ -1157,6 +1167,22 @@ mod tests {
         assert_eq!(
             llrs_empty, llrs_full,
             "ApLevel::Cq injection must be identical regardless of ApContext contents"
+        );
+    }
+
+    #[test]
+    fn active_qso_stays_in_sync_with_active_qsos_first() {
+        let qso1 = QsoAp::new("K1ABC", QsoApProgress::WaitingForReport).unwrap();
+        let qso2 = QsoAp::new("K2DEF", QsoApProgress::WaitingForReport).unwrap();
+        let ctx = ApContext {
+            my_call: None,
+            recent_calls: vec![],
+            active_qso: Some(qso1.clone()),
+            active_qsos: vec![qso1.clone(), qso2],
+        };
+        assert_eq!(
+            ctx.active_qso.as_ref().unwrap().their_call,
+            ctx.active_qsos[0].their_call
         );
     }
 
