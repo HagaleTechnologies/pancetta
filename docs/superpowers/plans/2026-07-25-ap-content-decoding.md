@@ -10,7 +10,7 @@ graduates from its default of `false`.
 
 **Architecture:** Extends the existing, production-wired Ap0–Ap4 soft-LLR-injection ladder
 (`pancetta-ft8/src/ap.rs` + `decoder.rs`) with a new `ApLevel::Ap5` that injects the same
-callsign-field bits as Ap3/Ap4 plus one enumerated hypothesis's content bits (56–76), gated by a
+callsign-field bits as Ap3/Ap4 plus one enumerated hypothesis's content bits (58–76), gated by a
 stricter confidence floor and an extended `ap_injection_survived` content-match check. The
 coordinator widens its AP context from a single `active_qso` to a priority-ranked, capped list,
 using the existing `PriorityScorer`. A new `pancetta-research` example measures the recall vs
@@ -68,17 +68,17 @@ convention.
 ```rust
 /// One enumerated content hypothesis, ready for Ap5 injection: the source
 /// text (for logging/content-match verification) plus its extracted
-/// 21-bit content-field pattern (payload bits 56-76: report/token + i3
+/// 19-bit content-field pattern (payload bits 58-76: report/token + i3
 /// type bits), and the measured-SNR-seeded ordering key.
 #[derive(Debug, Clone)]
 pub struct ContentHypothesis {
     pub text: String,
-    pub content_bits: [bool; 21],
+    pub content_bits: [bool; 19],
 }
 
 /// Encode each of `qso.expected_next_message_texts` once (via the existing
 /// `Ft8Message`/pack path this crate already uses for encoding) and
-/// extract payload bits 56-76 from each. Returns hypotheses in the SAME
+/// extract payload bits 58-76 from each. Returns hypotheses in the SAME
 /// order as the input `Vec<String>` — ordering by SNR-seeded likelihood is
 /// the caller's job (Task 3/5), not this pure builder's.
 ///
@@ -124,7 +124,7 @@ fn build_content_hypotheses_empty_when_no_expected_texts() {
 ```
 
 - [ ] **Step 3: Implement** `ContentHypothesis` + `build_content_hypotheses`, encoding each text via
-  the real path found in Step 1 and extracting payload bits 56–76 into a `[bool; 21]`.
+  the real path found in Step 1 and extracting payload bits 58-76 into a `[bool; 19]` (bits 56-57 belong to the from_callsign/suffix-flag area, not content -- verified byte-exact against the real encoder by Task 1's implementer).
 
 - [ ] **Step 4: Run tests to verify they pass**
 
@@ -170,7 +170,7 @@ fn ap5_injects_callsigns_and_content_bits() {
     // must carry the SAME sign convention as the existing Ap3 test (mirror
     // whatever assertion style Ap3's own test already uses -- find it
     // first with `rg "fn ap3" pancetta-ft8/src/ap.rs` and match it).
-    // Content bits 56-76 must carry hyp.content_bits' sign pattern.
+    // Content bits 58-76 must carry hyp.content_bits' sign pattern.
 }
 ```
 
@@ -185,7 +185,7 @@ Add to `ApLevel` (mirror the existing `Ap4` doc-comment style):
 
 ```rust
     /// Ap3 (own call at 0-27, partner at 29-56) + inject one specific
-    /// enumerated content hypothesis's bits 56-76 (report/token + type).
+    /// enumerated content hypothesis's bits 58-76 (report/token + type).
     /// Soft injection, same ±AP_LLR_MAGNITUDE convention as every other
     /// level -- LDPC/CRC can still override a wrong hypothesis, which is
     /// exactly what makes the Step 4 survival check meaningful.
@@ -194,7 +194,7 @@ Add to `ApLevel` (mirror the existing `Ap4` doc-comment style):
 
 Add the `Ap5` arm to `inject_ap_llrs`'s match: inject exactly what `Ap3` injects (own call +
 partner call — read Ap3's existing arm and reuse its two `inject_28_bits` calls) plus a new loop
-injecting `hyp.content_bits` at payload positions 56..77 via the existing `inject_bit` helper.
+injecting `hyp.content_bits` at payload positions 58..77 via the existing `inject_bit` helper.
 
 - [ ] **Step 4: Extend `ap_injection_survived` with the content-match check**
 
