@@ -81,6 +81,32 @@ pub struct Spectrum {
     pub timestamp: DateTime<Utc>,
 }
 
+/// One ranked TX-placement candidate — dispensa Q-0026.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlacementSlice {
+    pub offset_hz: f64,
+    pub score: f64,
+    pub clear_first: bool,
+    pub clear_second: bool,
+}
+
+/// Per-window TX-placement/openness snapshot — dispensa Q-0026. Mirrors
+/// `pancetta_qso::frequency::PlacementSnapshot` field-for-field, minus
+/// `clear_both_slots`/`noise_floor` (local-TUI-only, not part of the agreed
+/// wire contract). `offset_hz` values are baseband/audio-passband offsets,
+/// NOT RF-absolute (unlike `Spectrum::bin_start_hz`) — consumers combine
+/// with the `frequency` serverEvent's dial Hz for an absolute value, the
+/// same convention the local TUI already uses.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Placement {
+    pub slices: Vec<PlacementSlice>,
+    pub openness: Vec<u8>,
+    pub bin_hz: f64,
+    pub range: (f64, f64),
+}
+
 /// A single decoded FT8 frame (the live decode feed).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -249,5 +275,28 @@ mod tests {
         assert!(j.contains(r#""magsDb""#), "expected magsDb in: {j}");
         assert!(j.contains(r#""seq":1234"#), "expected seq in: {j}");
         assert_eq!(serde_json::from_str::<Spectrum>(&j).unwrap(), s);
+    }
+
+    #[test]
+    fn placement_fields_are_camel_case() {
+        let p = Placement {
+            slices: vec![PlacementSlice {
+                offset_hz: 1500.0,
+                score: 42.5,
+                clear_first: true,
+                clear_second: false,
+            }],
+            openness: vec![3, 2, 0],
+            bin_hz: 5.86,
+            range: (200.0, 3000.0),
+        };
+        let j = serde_json::to_string(&p).unwrap();
+        assert!(j.contains(r#""offsetHz":1500.0"#), "expected offsetHz in: {j}");
+        assert!(j.contains(r#""clearFirst":true"#), "expected clearFirst in: {j}");
+        assert!(j.contains(r#""clearSecond":false"#), "expected clearSecond in: {j}");
+        assert!(j.contains(r#""binHz":5.86"#), "expected binHz in: {j}");
+        assert!(j.contains(r#""range":[200.0,3000.0]"#), "expected range array in: {j}");
+        let round: Placement = serde_json::from_str(&j).unwrap();
+        assert_eq!(round, p);
     }
 }
