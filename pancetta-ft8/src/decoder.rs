@@ -1717,6 +1717,44 @@ pub struct Ft8Config {
     /// unreachable while `max_decode_passes` stays at 1). Default
     /// `false`.
     pub full_scale_subtraction_enabled: bool,
+
+    /// AP content-decoding plan §3.5 (Task 4 — config surface only; the
+    /// decode loop doesn't call Ap5 yet, that's Task 6). Master switch for
+    /// content-AP (Ap5) injection. Default `false` — graduated only after
+    /// the Task 7 eval harness supports flipping it, per
+    /// `docs/ap-decoding-design.md`'s ship gate. This field alone flipping
+    /// to `true` has no effect yet, since nothing reads it until Task 6
+    /// wires a caller.
+    pub content_ap_enabled: bool,
+
+    /// Soft-LLR injection magnitude for all AP levels (Ap1-Ap5). Promoted
+    /// from the hardcoded `AP_LLR_MAGNITUDE = 15.0` const in `ap.rs`;
+    /// default unchanged, so promoting it to config doesn't alter today's
+    /// behavior. `ap.rs`'s injection helpers still read the const directly
+    /// (not this field) until a later task wires it through — see this
+    /// plan's Task 4 scope note.
+    pub ap_llr_magnitude: f32,
+
+    /// Confidence floor for Ap1-Ap4 decodes. Promoted from the hardcoded
+    /// `MIN_AP_DECODE_CONFIDENCE = 0.55` local const in
+    /// `try_ldpc_with_ap`; default unchanged. That function still uses its
+    /// own local const (not this field) until a later task wires it
+    /// through — see this plan's Task 4 scope note.
+    pub min_ap_decode_confidence: f32,
+
+    /// Stricter confidence floor for Ap5 (content-AP) decodes specifically
+    /// — content injection is higher-risk than callsign-only AP. New knob;
+    /// unused until Task 6 wires Ap5 into the decode loop.
+    pub min_content_ap_confidence: f32,
+
+    /// Max content hypotheses tried per QSO in the Ap5 loop (Task 6),
+    /// SNR-seeded ordering (nearest-to-measured-SNR first). New knob;
+    /// unused until Task 6.
+    pub max_ap_hypotheses: usize,
+
+    /// Max concurrent QSOs represented in `ApContext::active_qsos`,
+    /// priority-ranked (Task 5). New knob; unused until Task 5/6 read it.
+    pub max_ap_qsos: usize,
 }
 
 impl Default for Ft8Config {
@@ -2136,6 +2174,23 @@ impl Default for Ft8Config {
             // above, default OFF — see the field doc for the noise-
             // sensitivity tradeoff this needs its own A/B for.
             full_scale_subtraction_enabled: false,
+            // AP content-decoding plan Task 4: config surface only.
+            // MUST stay false — Ap5 isn't wired into the decode loop yet
+            // (Task 6), and graduating this is gated on the Task 7 eval
+            // harness per docs/ap-decoding-design.md's ship gate.
+            content_ap_enabled: false,
+            // Was the hardcoded AP_LLR_MAGNITUDE const in ap.rs (15.0);
+            // default unchanged.
+            ap_llr_magnitude: 15.0,
+            // Was the hardcoded MIN_AP_DECODE_CONFIDENCE local const in
+            // try_ldpc_with_ap (0.55); default unchanged.
+            min_ap_decode_confidence: 0.55,
+            // New knob, inert until Task 6 wires Ap5 into the decode loop.
+            min_content_ap_confidence: 0.60,
+            // New knob, inert until Task 6.
+            max_ap_hypotheses: 8,
+            // New knob, inert until Task 5/6.
+            max_ap_qsos: 4,
         }
     }
 }
@@ -14382,6 +14437,25 @@ mod tests {
         let config = Ft8Config::default();
         assert_eq!(config.sample_rate, SAMPLE_RATE);
         assert_eq!(config.max_candidates, MAX_DECODE_CANDIDATES);
+    }
+
+    /// AP content-decoding plan §3.5 (Task 4): the new AP tuning knobs must
+    /// default to values that preserve today's exact behavior — the two
+    /// promoted consts (`ap_llr_magnitude`, `min_ap_decode_confidence`) keep
+    /// their existing hardcoded values, and the master switch
+    /// (`content_ap_enabled`) plus the two brand-new sizing knobs
+    /// (`max_ap_hypotheses`, `max_ap_qsos`) default to values that are
+    /// inert because Ap5 isn't wired into any decode-loop caller yet
+    /// (Task 6's job).
+    #[test]
+    fn ft8_config_ap_knobs_default_preserve_current_behavior() {
+        let cfg = Ft8Config::default();
+        assert!(!cfg.content_ap_enabled);
+        assert_eq!(cfg.ap_llr_magnitude, 15.0);
+        assert_eq!(cfg.min_ap_decode_confidence, 0.55);
+        assert_eq!(cfg.min_content_ap_confidence, 0.60);
+        assert_eq!(cfg.max_ap_hypotheses, 8);
+        assert_eq!(cfg.max_ap_qsos, 4);
     }
 
     #[test]
