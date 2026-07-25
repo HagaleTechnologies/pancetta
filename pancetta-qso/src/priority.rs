@@ -488,6 +488,16 @@ impl DxEvaluator for PriorityScorer {
     fn evaluate_cq(&self, callsign: &str, grid: Option<&str>, snr: i8, freq_hz: f64) -> f64 {
         self.score_cq_detailed(callsign, grid, snr, freq_hz).total
     }
+
+    fn evaluate_cq_tiered(
+        &self,
+        callsign: &str,
+        grid: Option<&str>,
+        snr: i8,
+        freq_hz: f64,
+    ) -> Option<TieredScore> {
+        Some(self.score_tiered(callsign, grid, snr, freq_hz))
+    }
 }
 
 #[cfg(test)]
@@ -1047,6 +1057,23 @@ mod tests {
             "rarer station must rank higher within the same (Standard) tier: {} vs {}",
             rare.secondary,
             common.secondary
+        );
+    }
+
+    #[test]
+    fn evaluate_cq_tiered_matches_score_tiered_exactly() {
+        let mut lookup = TestLookup::new();
+        lookup.needed_dxcc.insert("JA1ABC".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+
+        let via_trait = scorer.evaluate_cq_tiered("JA1ABC", Some("PM95"), -10, 14_074_000.0);
+        let via_inherent = scorer.score_tiered("JA1ABC", Some("PM95"), -10, 14_074_000.0);
+
+        assert_eq!(
+            via_trait,
+            Some(via_inherent),
+            "DxEvaluator::evaluate_cq_tiered must delegate to score_tiered exactly \
+             (single-scorer invariant) — no second, divergent tier computation"
         );
     }
 }

@@ -448,6 +448,11 @@ pub struct DxStation {
     /// `CallStation` command so the QSO layer can reply on the opposite
     /// parity.
     pub slot_parity: Option<pancetta_core::slot::SlotParity>,
+    /// DX watchlist (#197): true while this callsign is currently
+    /// remembered as a heard-but-not-pounced-on PerBandDxccNew+/Atno CQ.
+    /// Bulk-resynced each autonomous tick via `apply_dx_watchlist` — never
+    /// diffed, so a stale `true` can't linger past the next tick.
+    pub watchlisted: bool,
 }
 
 /// Status data received from the autonomous operator.
@@ -1705,6 +1710,7 @@ impl App {
                             last_seen_network: None,
                             audio_offset_hz: Some(audio_offset_hz),
                             slot_parity: message.slot_parity,
+                            watchlisted: false,
                         },
                     );
                 }
@@ -2523,6 +2529,7 @@ impl App {
             last_seen_network: None,
             audio_offset_hz: None,
             slot_parity: None,
+            watchlisted: false,
         };
         self.dx_stations.insert(callsign, dx_station);
         // Adding a spot can re-sort the DX-Hunter list; keep the cursor pinned.
@@ -2627,6 +2634,19 @@ impl App {
 
         self.placement = Some(v);
         self.placement_cursor = self.placement_cursor.min(max_index);
+    }
+
+    /// Bulk-resync `DxStation.watchlisted` from the autonomous operator's
+    /// current DX watchlist (#197). Full replace, not a diff — a callsign
+    /// missing from `callsigns` is cleared, matching this codebase's
+    /// existing "self-healing bulk replace" convention (e.g.
+    /// `FrequencyAllocator::set_own_frequencies`).
+    pub fn apply_dx_watchlist(&mut self, callsigns: &[String]) {
+        let watchlisted: std::collections::HashSet<String> =
+            callsigns.iter().map(|c| c.to_uppercase()).collect();
+        for station in self.dx_stations.values_mut() {
+            station.watchlisted = watchlisted.contains(&station.call_sign.to_uppercase());
+        }
     }
 
     pub fn update_component_status(&mut self, component: String, status: String) {
@@ -3408,6 +3428,7 @@ impl App {
                     // Network spots carry no passband / slot information.
                     audio_offset_hz: None,
                     slot_parity: None,
+                    watchlisted: false,
                 });
 
             // If already exists from local decode, upgrade source
@@ -5130,6 +5151,7 @@ mod tests {
                 last_seen_network: None,
                 audio_offset_hz: None,
                 slot_parity: None,
+                watchlisted: false,
             },
         );
 
@@ -5140,6 +5162,41 @@ mod tests {
                 .all(|s| !s.call_sign.eq_ignore_ascii_case("K5ARH")),
             "displayed_dx_stations must never surface our own callsign"
         );
+    }
+
+    #[test]
+    fn apply_dx_watchlist_bulk_resyncs_flag_case_insensitively() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(fixture_app());
+
+        app.dx_stations.insert(
+            "ja1abc".to_string(),
+            dx_fixture("ja1abc", 3000, -10, 14.074, false),
+        );
+        app.dx_stations.insert(
+            "W1XYZ".to_string(),
+            dx_fixture("W1XYZ", 500, -10, 14.074, false),
+        );
+
+        app.apply_dx_watchlist(&["JA1ABC".to_string()]);
+
+        assert!(app.dx_stations["ja1abc"].watchlisted);
+        assert!(!app.dx_stations["W1XYZ"].watchlisted);
+    }
+
+    #[test]
+    fn apply_dx_watchlist_clears_flag_once_no_longer_listed() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        let mut app = rt.block_on(fixture_app());
+
+        let mut station = dx_fixture("JA1ABC", 3000, -10, 14.074, false);
+        station.watchlisted = true;
+        app.dx_stations.insert("JA1ABC".to_string(), station);
+
+        // Bulk resync with an empty list — must clear, not just leave stale.
+        app.apply_dx_watchlist(&[]);
+
+        assert!(!app.dx_stations["JA1ABC"].watchlisted);
     }
 
     /// Batch 95 regression: an S-meter reading must NOT clobber the
@@ -5241,6 +5298,7 @@ mod tests {
             last_seen_network: None,
             audio_offset_hz: Some(1200),
             slot_parity: None,
+            watchlisted: false,
         }
     }
 

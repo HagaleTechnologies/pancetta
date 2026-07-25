@@ -413,6 +413,10 @@ impl super::ApplicationCoordinator {
             // DX-busy suppression window. Not yet plumbed to pancetta-config;
             // use the AutonomousConfig default (90 s).
             dx_busy_window_secs: pancetta_qso::AutonomousConfig::default().dx_busy_window_secs,
+            // DX watchlist (#197) TTL. Not yet plumbed to pancetta-config;
+            // use the AutonomousConfig default (150 s / 2.5 min), same
+            // precedent as dx_busy_window_secs above.
+            watchlist_ttl_secs: pancetta_qso::AutonomousConfig::default().watchlist_ttl_secs,
         };
 
         let dry_run = config.autonomous.dry_run;
@@ -660,6 +664,23 @@ impl super::ApplicationCoordinator {
                             }
 
                             op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
+
+                            // DX watchlist (#197): housekeeping broadcast every
+                            // tick, same cadence as the TX-placement instrument
+                            // below — sent regardless of whether the list is
+                            // empty, so the TUI side can bulk-resync (self-
+                            // healing; never diffed).
+                            {
+                                let msg = ComponentMessage::new(
+                                    ComponentId::Autonomous,
+                                    ComponentId::Tui,
+                                    MessageType::DxWatchlistUpdate {
+                                        callsigns: op.watchlist_callsigns(),
+                                    },
+                                    Instant::now(),
+                                );
+                                let _ = message_bus.send_message(msg).await;
+                            }
 
                             // Task 16: opt-in auto-repark inputs, captured
                             // (if this tick has a snapshot) BEFORE

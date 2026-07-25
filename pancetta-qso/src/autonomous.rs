@@ -14,6 +14,8 @@ use crate::frequency::{
     DecodeHistory, DecodeRecord, FrequencyAllocatorConfig, FrequencyCandidate, PlacementSnapshot,
     SmartFrequencyAllocator, SpectralSnapshot, TimeSlot,
 };
+use crate::priority::{PriorityTier, TieredScore};
+use crate::watchlist::DxWatchlist;
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -305,6 +307,20 @@ impl CollisionDetector {
 /// in the coordinator wiring layer.
 pub trait DxEvaluator: Send + Sync {
     fn evaluate_cq(&self, callsign: &str, grid: Option<&str>, snr: i8, freq_hz: f64) -> f64;
+
+    /// Tiered classification, when available. `None` for evaluators that
+    /// don't implement tiered scoring (e.g. `NullDxEvaluator`, test
+    /// scaffolding) — callers that need a tier (the DX watchlist) simply
+    /// skip entries where this returns `None`.
+    fn evaluate_cq_tiered(
+        &self,
+        _callsign: &str,
+        _grid: Option<&str>,
+        _snr: i8,
+        _freq_hz: f64,
+    ) -> Option<crate::priority::TieredScore> {
+        None
+    }
 }
 
 /// A no-op evaluator that assigns the same score to everything.
@@ -508,6 +524,10 @@ pub struct AutonomousConfig {
     /// new call to it even if it briefly CQs again — it is presumed busy
     /// with a third party. Default: 90 s.
     pub dx_busy_window_secs: u64,
+    /// DX watchlist (#197) TTL in seconds: how long a `PerBandDxccNew`+/
+    /// `Atno` CQ heard-but-not-pounced-on stays remembered before being
+    /// dropped as presumed moved on. Default: 150 s (~2.5 min).
+    pub watchlist_ttl_secs: u64,
 }
 
 impl Default for AutonomousConfig {
@@ -525,6 +545,7 @@ impl Default for AutonomousConfig {
             band_hopping: BandHoppingConfig::default(),
             frequency: FrequencyAllocatorConfig::default(),
             dx_busy_window_secs: 90,
+            watchlist_ttl_secs: 150,
         }
     }
 }
@@ -833,6 +854,9 @@ pub struct AutonomousOperator {
     /// Hold-mode falls back to the static `config.tx_offset_hz` — today's
     /// behavior is preserved byte-for-byte.
     tx_offset_hold_hz: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// DX watchlist (#197): short-lived memory of `PerBandDxccNew`+/`Atno`
+    /// CQs heard but not pounced on. See `pancetta_qso::watchlist`.
+    watchlist: DxWatchlist,
 }
 
 impl AutonomousOperator {
@@ -844,6 +868,8 @@ impl AutonomousOperator {
         let frequency_allocator = FrequencyAllocator::new(75.0, (200.0, 2800.0));
         let decode_history = DecodeHistory::new(config.frequency.decode_history_cycles);
         let smart_allocator = SmartFrequencyAllocator::new(config.frequency.clone());
+        let watchlist =
+            DxWatchlist::new(chrono::Duration::seconds(config.watchlist_ttl_secs as i64));
 
         Self {
             config,
@@ -870,6 +896,7 @@ impl AutonomousOperator {
                 pancetta_core::TxFreqMode::Hold.as_u8(),
             )),
             tx_offset_hold_hz: None,
+            watchlist,
         }
     }
 
@@ -1032,6 +1059,21 @@ impl AutonomousOperator {
                     let snr = msg.snr.clamp(-128, 127) as i8;
                     let score = evaluator.evaluate_cq(call, grid.as_deref(), snr, msg.frequency_hz);
 
+                    // DX watchlist (#197): remember PerBandDxccNew+/Atno CQs
+                    // heard this cycle regardless of what decide_at() goes on
+                    // to do with them — bridges the "heard while at TX
+                    // capacity" and "lost this cycle's single pounce slot"
+                    // gaps. Never triggers a transmission by itself; see
+                    // pancetta_qso::watchlist module docs.
+                    if let Some(tiered) =
+                        evaluator.evaluate_cq_tiered(call, grid.as_deref(), snr, msg.frequency_hz)
+                    {
+                        if tiered.tier >= PriorityTier::PerBandDxccNew {
+                            self.watchlist
+                                .refresh(call, grid.as_deref(), tiered.tier, now);
+                        }
+                    }
+
                     self.pending_cqs.push(CqCandidate {
                         callsign: call.clone(),
                         grid,
@@ -1047,6 +1089,7 @@ impl AutonomousOperator {
                 }
             }
         }
+        self.watchlist.prune(now);
 
         // Sort: best score first.
         self.pending_cqs.sort_by(|a, b| {
@@ -1309,6 +1352,12 @@ impl AutonomousOperator {
     /// Mutable access to the frequency allocator.
     pub fn frequency_allocator_mut(&mut self) -> &mut FrequencyAllocator {
         &mut self.frequency_allocator
+    }
+
+    /// Currently-watchlisted callsigns, for TUI/status surfacing. Read-only —
+    /// mirrors `placement_snapshot`'s "instrument, not a decision" pattern.
+    pub fn watchlist_callsigns(&self) -> Vec<String> {
+        self.watchlist.callsigns()
     }
 
     pub fn pause(&mut self) {
@@ -2694,6 +2743,149 @@ mod tests {
         fn evaluate_cq(&self, _: &str, _: Option<&str>, _: i8, _: f64) -> f64 {
             self.0
         }
+    }
+
+    #[test]
+    fn null_dx_evaluator_tiered_defaults_to_none() {
+        let evaluator = NullDxEvaluator;
+        assert_eq!(
+            evaluator.evaluate_cq_tiered("W1ABC", None, -10, 14_074_000.0),
+            None,
+            "evaluators that don't implement tiered scoring must default to None"
+        );
+    }
+
+    /// Test helper: evaluator whose tier is controllable per-callsign, default
+    /// score irrelevant to these tests.
+    struct TieredTestEvaluator {
+        tier_for: std::collections::HashMap<String, PriorityTier>,
+    }
+    impl TieredTestEvaluator {
+        fn new() -> Self {
+            Self {
+                tier_for: std::collections::HashMap::new(),
+            }
+        }
+        fn with_tier(mut self, callsign: &str, tier: PriorityTier) -> Self {
+            self.tier_for.insert(callsign.to_string(), tier);
+            self
+        }
+    }
+    impl DxEvaluator for TieredTestEvaluator {
+        fn evaluate_cq(&self, _: &str, _: Option<&str>, _: i8, _: f64) -> f64 {
+            0.5
+        }
+        fn evaluate_cq_tiered(
+            &self,
+            callsign: &str,
+            _: Option<&str>,
+            _: i8,
+            _: f64,
+        ) -> Option<TieredScore> {
+            self.tier_for.get(callsign).map(|&tier| TieredScore {
+                tier,
+                secondary: 0.5,
+            })
+        }
+    }
+
+    fn cq_message(callsign: &str, grid: &str) -> DecodedMessageInfo {
+        DecodedMessageInfo {
+            callsign: Some(callsign.to_string()),
+            frequency_hz: 1500.0,
+            snr: -10,
+            message_text: format!("CQ {callsign} {grid}"),
+            slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
+            decode_origin: None,
+        }
+    }
+
+    #[test]
+    fn watchlist_gains_per_band_dxcc_new_cq_even_when_at_tx_capacity() {
+        let config = AutonomousConfig::default();
+        let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
+        // Simulate being at full TX capacity — feed_decoded_messages_at must
+        // still populate the watchlist regardless of decide_at()'s capacity gate.
+        op.set_active_qso_count(999);
+
+        let evaluator =
+            TieredTestEvaluator::new().with_tier("JA1ABC", PriorityTier::PerBandDxccNew);
+        op.feed_decoded_messages_at(&[cq_message("JA1ABC", "PM95")], &evaluator, Utc::now());
+
+        assert_eq!(op.watchlist_callsigns(), vec!["JA1ABC".to_string()]);
+    }
+
+    #[test]
+    fn watchlist_ignores_standard_tier_cqs() {
+        let config = AutonomousConfig::default();
+        let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
+
+        let evaluator = TieredTestEvaluator::new().with_tier("W2XYZ", PriorityTier::Standard);
+        op.feed_decoded_messages_at(&[cq_message("W2XYZ", "FN42")], &evaluator, Utc::now());
+
+        assert!(
+            op.watchlist_callsigns().is_empty(),
+            "Standard-tier CQs must never enter the watchlist"
+        );
+    }
+
+    #[test]
+    fn watchlist_ignores_untiered_evaluators() {
+        // NullDxEvaluator (and any evaluator that doesn't implement tiered
+        // scoring) must never populate the watchlist — `evaluate_cq_tiered`
+        // defaults to None, which this feed loop must skip.
+        let config = AutonomousConfig::default();
+        let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
+
+        op.feed_decoded_messages_at(
+            &[cq_message("JA1ABC", "PM95")],
+            &NullDxEvaluator,
+            Utc::now(),
+        );
+
+        assert!(op.watchlist_callsigns().is_empty());
+    }
+
+    #[test]
+    fn watchlist_entry_expires_after_ttl_with_no_rehear() {
+        let mut config = AutonomousConfig::default();
+        config.watchlist_ttl_secs = 150;
+        let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
+
+        let t0 = DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap();
+        let evaluator =
+            TieredTestEvaluator::new().with_tier("JA1ABC", PriorityTier::PerBandDxccNew);
+        op.feed_decoded_messages_at(&[cq_message("JA1ABC", "PM95")], &evaluator, t0);
+        assert_eq!(op.watchlist_callsigns(), vec!["JA1ABC".to_string()]);
+
+        // Feed again, 151s later, with no re-hear of JA1ABC at all.
+        let t1 = t0 + ChronoDuration::seconds(151);
+        op.feed_decoded_messages_at(&[], &evaluator, t1);
+
+        assert!(
+            op.watchlist_callsigns().is_empty(),
+            "entry must be pruned once its TTL elapses with no re-hear"
+        );
+    }
+
+    #[test]
+    fn watchlist_entry_survives_within_ttl_with_no_rehear() {
+        let mut config = AutonomousConfig::default();
+        config.watchlist_ttl_secs = 150;
+        let mut op = AutonomousOperator::new(config, "W1ABC".to_string(), Some("FN42".to_string()));
+
+        let t0 = DateTime::<Utc>::from_timestamp(1_000_000, 0).unwrap();
+        let evaluator =
+            TieredTestEvaluator::new().with_tier("JA1ABC", PriorityTier::PerBandDxccNew);
+        op.feed_decoded_messages_at(&[cq_message("JA1ABC", "PM95")], &evaluator, t0);
+
+        // Feed again, only 30s later, with no re-hear — must still be present.
+        let t1 = t0 + ChronoDuration::seconds(30);
+        op.feed_decoded_messages_at(&[], &evaluator, t1);
+
+        assert_eq!(op.watchlist_callsigns(), vec!["JA1ABC".to_string()]);
     }
 
     #[test]

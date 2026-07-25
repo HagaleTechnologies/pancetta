@@ -170,17 +170,7 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
     // (never worked on ANY band) already implies band-needed and a second
     // marker would be redundant noise. 2026-07-18, DX Hunter
     // per-band-needed gap.
-    let call_display = format!(
-        "{}{}{}{}",
-        need_marker(station.atno, station.needed, station.is_notable),
-        if station.band_needed && !station.atno {
-            "▲"
-        } else {
-            ""
-        },
-        if is_engaged { "● " } else { "" },
-        station.call_sign
-    );
+    let call_display = format_call_display(station, is_engaged);
 
     // Staleness check for network-only spots
     let is_stale = if station.source != SpotSource::Local {
@@ -303,6 +293,25 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
         Cell::from(last_str).style(dim),
         Cell::from(pri_str).style(priority_style),
     ])
+}
+
+/// Build the full callsign cell display: need/notable markers, band-needed
+/// triangle, DX-watchlist diamond (#197), engaged dot, then the callsign.
+/// Factored out of `create_dx_row` so the glyph logic is unit-testable
+/// without a full ratatui `Row`.
+fn format_call_display(station: &DxStation, is_engaged: bool) -> String {
+    format!(
+        "{}{}{}{}{}",
+        need_marker(station.atno, station.needed, station.is_notable),
+        if station.band_needed && !station.atno {
+            "▲"
+        } else {
+            ""
+        },
+        if station.watchlisted { "◇" } else { "" },
+        if is_engaged { "● " } else { "" },
+        station.call_sign
+    )
 }
 
 /// Build the callsign-prefix marker string for the DX Hunter:
@@ -461,5 +470,56 @@ mod tests {
         assert_eq!(need_marker(false, true, true), "+★");
         // Notable-only.
         assert_eq!(need_marker(false, false, true), "★");
+    }
+
+    #[test]
+    fn watchlist_glyph_appears_when_watchlisted() {
+        // Mirrors the band_needed precedent: the glyph is additive to the
+        // need_marker cluster, not folded into need_marker itself (keeps
+        // need_marker's existing signature/tests untouched).
+        let mut station = make_test_station("JA1ABC");
+        station.watchlisted = true;
+        let call_display = format_call_display(&station, false);
+        assert!(
+            call_display.contains('◇'),
+            "expected watchlist glyph in {call_display}"
+        );
+    }
+
+    #[test]
+    fn watchlist_glyph_absent_when_not_watchlisted() {
+        let station = make_test_station("W1XYZ");
+        let call_display = format_call_display(&station, false);
+        assert!(!call_display.contains('◇'));
+    }
+
+    fn make_test_station(call: &str) -> crate::app::DxStation {
+        crate::app::DxStation {
+            call_sign: call.to_string(),
+            grid_square: None,
+            frequency: 14.074,
+            mode: "FT8".to_string(),
+            last_seen: chrono::Utc::now(),
+            snr: -10,
+            distance: None,
+            bearing: None,
+            worked_before: false,
+            needed: false,
+            atno: false,
+            band_needed: false,
+            priority_score: 0,
+            source: crate::app::SpotSource::Local,
+            entity_name: None,
+            rarity_tier: None,
+            reporter_count: None,
+            is_notable: false,
+            notable_type: None,
+            confidence: None,
+            best_snr_network: None,
+            last_seen_network: None,
+            audio_offset_hz: None,
+            slot_parity: None,
+            watchlisted: false,
+        }
     }
 }
