@@ -70,6 +70,7 @@ Press `?` inside the TUI for the same list as an overlay.
 | `?` | Toggle this help |
 | `Shift+D` | Toggle Diagnostics overlay (retained event history) |
 | `Shift+S` | Toggle station-health panel (is the station healthy?) |
+| `Shift+R` | Toggle Recent-QSOs panel (retained terminal-QSO outcome history) |
 | `x` | Clear decoded messages (press twice within 3s) |
 
 ## Session & safety

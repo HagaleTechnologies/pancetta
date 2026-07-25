@@ -231,6 +231,12 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         false,
     ),
     kb(
+        "Shift+R",
+        "Toggle Recent-QSOs panel (retained terminal-QSO outcome history)",
+        Category::Diagnostics,
+        false,
+    ),
+    kb(
         "m",
         "Toggle audio monitoring",
         Category::AudioDevices,

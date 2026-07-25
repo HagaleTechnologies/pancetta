@@ -1378,6 +1378,116 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
     f.render_widget(Paragraph::new(lines), inner);
 }
 
+/// Color a `Failed` row by how actionable/severe the reason is — mirrors the
+/// Diagnostics overlay's level-based coloring, but keyed off
+/// `QsoFailureReason` since terminal-QSO outcomes don't carry a
+/// `DiagnosticLevel`. Red = a real defect (protocol/callsign/frequency
+/// problem worth investigating); Yellow = propagation/timing, likely just
+/// band conditions; Gray = benign/administrative (cancelled, superseded,
+/// deduped).
+fn recent_qso_failure_color(reason: &pancetta_qso::QsoFailureReason) -> Color {
+    use pancetta_qso::QsoFailureReason as R;
+    match reason {
+        R::Timeout | R::SignalLost | R::StationQrt => Color::Yellow,
+        R::InvalidCallsign | R::FrequencyConflict | R::ProtocolError(_) => Color::Red,
+        R::Duplicate | R::UserCancelled | R::Superseded => Color::Gray,
+    }
+}
+
+/// Render the Shift+R Recent-QSOs panel: a scrollable, retained history of
+/// terminal QSO outcomes (docs/observability-diagnostics-plan.md Layer 2) —
+/// "what happened to my last N QSOs," as opposed to the Diagnostics
+/// overlay's finer-grained "why did this specific thing happen." Mirrors
+/// `render_diagnostics_overlay`'s layout/scroll/empty-state conventions
+/// exactly; only the row formatting and color rule differ.
+pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.width < 20 || area.height < 6 {
+        return;
+    }
+    let modal_width = area.width.saturating_sub(4);
+    let modal_height = area.height.saturating_sub(4);
+    let modal_area = Rect {
+        x: (area.width.saturating_sub(modal_width)) / 2,
+        y: (area.height.saturating_sub(modal_height)) / 2,
+        width: modal_width,
+        height: modal_height,
+    };
+    f.render_widget(ratatui::widgets::Clear, modal_area);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " Recent QSOs ({}/{}) — \u{2191}\u{2193}/jk scroll, Esc/R close ",
+            app.recent_qsos.len().min(app.recent_qsos_scroll + 1),
+            app.recent_qsos.len()
+        ))
+        .border_style(Style::default().fg(Color::Cyan));
+    let inner = block.inner(modal_area);
+    f.render_widget(block, modal_area);
+
+    if app.recent_qsos.is_empty() {
+        f.render_widget(
+            Paragraph::new(" No completed QSOs yet this session."),
+            inner,
+        );
+        return;
+    }
+
+    // Same windowing approach as the Diagnostics overlay: a page of rows
+    // ending at (or centered near) the scroll cursor, oldest-first within
+    // the window.
+    let visible_rows = inner.height as usize;
+    let cursor = app
+        .recent_qsos_scroll
+        .min(app.recent_qsos.len().saturating_sub(1));
+    let end = cursor + 1;
+    let start = end.saturating_sub(visible_rows);
+
+    let lines: Vec<Line> = app
+        .recent_qsos
+        .iter()
+        .enumerate()
+        .skip(start)
+        .take(end - start)
+        .map(|(i, qso)| {
+            let color = match &qso.outcome {
+                crate::app::QsoOutcome::Completed => Color::Green,
+                crate::app::QsoOutcome::Failed(reason) => recent_qso_failure_color(reason),
+            };
+            // `brief_timeline`'s last line is the terminal summary the
+            // coordinator already built ("Completed" / "Failed: <reason>") —
+            // reuse it rather than re-deriving reason text here. Row format
+            // per spec (docs/superpowers/plans/2026-07-25-observability-
+            // recent-qsos-and-timeline.md): callsign, outcome + reason, freq.
+            // "Final rung reached" / precise duration aren't in scope for
+            // this payload — that's the fuller per-message `state_history`
+            // Task 4 persists; `brief_timeline` is a short digest only.
+            let summary = qso
+                .brief_timeline
+                .last()
+                .map(String::as_str)
+                .unwrap_or(&qso.last_state);
+            let line = format!(
+                "{} {:<10} {}  ({} Hz)",
+                qso.ts.format("%H:%M:%S"),
+                qso.callsign,
+                summary,
+                qso.freq_hz
+            );
+            let style = if i == cursor {
+                Style::default()
+                    .fg(color)
+                    .add_modifier(Modifier::BOLD | Modifier::REVERSED)
+            } else {
+                Style::default().fg(color)
+            };
+            Line::from(Span::styled(line, style))
+        })
+        .collect();
+
+    f.render_widget(Paragraph::new(lines), inner);
+}
+
 /// Render the Shift+S station-health panel: a consolidated "is the station
 /// healthy right now?" snapshot (docs/observability-diagnostics-plan.md
 /// Layer 3), aggregating signals already computed elsewhere rather than
@@ -2052,6 +2162,95 @@ mod view_render_tests {
             let backend = TestBackend::new(w.max(1), h.max(1));
             let mut term = Terminal::new(backend).unwrap();
             term.draw(|f| render_health_panel(f, f.area(), &app))
+                .unwrap();
+        }
+    }
+
+    /// Task 3: `render_recent_qsos_panel` (Shift+R Recent-QSOs panel) must
+    /// not panic on an empty ring, and must render a mixed
+    /// Completed/Failed outcome stream with per-outcome coloring — green
+    /// for Completed, red/yellow/gray by failure reason for Failed.
+    #[tokio::test]
+    async fn render_recent_qsos_panel_smoke_test() {
+        let mut app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        let backend = TestBackend::new(120, 40);
+        let mut term = Terminal::new(backend).unwrap();
+
+        // Empty ring — must not panic, and shows the empty-state message.
+        term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(buffer_contains(&buf, "Recent QSOs"));
+        assert!(buffer_contains(&buf, "No completed QSOs yet this session."));
+
+        // A mixed stream: one Completed, and Faileds spanning all three
+        // color buckets (Timeout=yellow, InvalidCallsign=red,
+        // UserCancelled=gray).
+        app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 1500,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec![
+                "K1ABC started at 00:00:00".to_string(),
+                "Completed".to_string(),
+            ],
+        });
+        app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+            callsign: "KJ5NJF".to_string(),
+            outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
+            last_state: "Failed".to_string(),
+            freq_hz: 1832,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec![
+                "KJ5NJF started at 00:00:05".to_string(),
+                "Failed: watchdog timeout".to_string(),
+            ],
+        });
+        app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+            callsign: "W2XYZ".to_string(),
+            outcome: crate::app::QsoOutcome::Failed(
+                pancetta_qso::QsoFailureReason::InvalidCallsign,
+            ),
+            last_state: "Failed".to_string(),
+            freq_hz: 2100,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Failed: invalid callsign".to_string()],
+        });
+        app.push_recent_qso_outcome(crate::app::RecentQsoOutcome {
+            callsign: "N3TEST".to_string(),
+            outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::UserCancelled),
+            last_state: "Failed".to_string(),
+            freq_hz: 800,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["Failed: cancelled by operator".to_string()],
+        });
+        app.recent_qsos_scroll = app.recent_qsos.len().saturating_sub(1);
+
+        term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+            .unwrap();
+        let buf2 = term.backend().buffer().clone();
+        assert!(buffer_contains(&buf2, "K1ABC"));
+        assert!(buffer_contains(&buf2, "Completed"));
+        assert!(buffer_contains(&buf2, "KJ5NJF"));
+        assert!(buffer_contains(&buf2, "Failed: watchdog timeout"));
+        assert!(buffer_contains(&buf2, "W2XYZ"));
+        assert!(buffer_contains(&buf2, "Failed: invalid callsign"));
+        assert!(buffer_contains(&buf2, "N3TEST"));
+        assert!(buffer_contains(&buf2, "Failed: cancelled by operator"));
+        // Header reflects the ring size / scroll position, same convention
+        // as the Diagnostics overlay's "(n/total)" title.
+        assert!(buffer_contains(&buf2, "Recent QSOs (4/4)"));
+
+        // Also must not panic at tiny/degenerate sizes (mirrors the
+        // Station Health smoke test's underflow guard).
+        for (w, h) in [(1u16, 1u16), (0, 0), (10, 2), (19, 5)] {
+            let backend = TestBackend::new(w.max(1), h.max(1));
+            let mut term = Terminal::new(backend).unwrap();
+            term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
                 .unwrap();
         }
     }

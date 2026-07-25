@@ -880,8 +880,16 @@ pub struct App {
     /// `show_diagnostics` (a scrollback), this is a snapshot view — no
     /// scroll-position field needed.
     pub show_health: bool,
+    /// Shift+R overlay visibility for `recent_qsos` (docs/observability-
+    /// diagnostics-plan.md Layer 2 — the Recent-QSOs panel). Sibling toggle
+    /// to `show_diagnostics`; lowercase `r` is taken (Re-send last TX), so
+    /// this uses R.
+    pub show_recent_qsos: bool,
     /// Scroll cursor into `diagnostic_events` while the overlay is open.
     pub diagnostics_scroll: usize,
+    /// Scroll cursor into `recent_qsos` while the overlay is open. Same
+    /// semantics as `diagnostics_scroll`.
+    pub recent_qsos_scroll: usize,
     /// Count of QSOs completed this session (Task 20d). Counted TUI-side
     /// from the diagnostic-event stream that already flows — no new bus
     /// message — by matching the exact completion text the coordinator
@@ -1222,7 +1230,9 @@ impl App {
             recent_qsos: VecDeque::with_capacity(50),
             show_diagnostics: false,
             show_health: false,
+            show_recent_qsos: false,
             diagnostics_scroll: 0,
+            recent_qsos_scroll: 0,
             session_completed: 0,
             session_failed: 0,
             session_tx_drops: 0,
@@ -2619,13 +2629,17 @@ impl App {
     /// Append a retained terminal-QSO outcome, evicting the oldest once the
     /// bounded ring is full (docs/observability-diagnostics-plan.md Layer
     /// 2). Same push-back/evict-oldest ordering as `push_diagnostic_event`
-    /// above, at a tighter 50-entry cap. No scroll-cursor bookkeeping here
-    /// (unlike `push_diagnostic_event`) — that's Task 3's panel-render job.
+    /// above, at a tighter 50-entry cap, and the same scroll-auto-follow
+    /// behavior (Task 3: the Recent-QSOs panel).
     pub fn push_recent_qso_outcome(&mut self, outcome: RecentQsoOutcome) {
         const MAX_RECENT_QSOS: usize = 50;
+        let was_at_end = self.recent_qsos.len().saturating_sub(1) == self.recent_qsos_scroll;
         self.recent_qsos.push_back(outcome);
         while self.recent_qsos.len() > MAX_RECENT_QSOS {
             self.recent_qsos.pop_front();
+        }
+        if was_at_end || self.show_recent_qsos && self.recent_qsos.len() == 1 {
+            self.recent_qsos_scroll = self.recent_qsos.len().saturating_sub(1);
         }
     }
 
@@ -4574,6 +4588,34 @@ mod tests {
         );
         // The oldest entries must have been evicted.
         assert!(!app.recent_qsos.iter().any(|e| e.callsign == "K1ABC"));
+    }
+
+    /// Same auto-follow contract as `push_diagnostic_event_auto_follows_
+    /// only_when_at_the_end` (Task 3: the Recent-QSOs panel gets the same
+    /// UX as Diagnostics).
+    #[tokio::test]
+    async fn push_recent_qso_outcome_auto_follows_only_when_at_the_end() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.push_recent_qso_outcome(fixture_recent_qso("K1ABC"));
+        app.push_recent_qso_outcome(fixture_recent_qso("W2XYZ"));
+        assert_eq!(
+            app.recent_qsos_scroll, 1,
+            "cursor starts at the newest entry"
+        );
+
+        app.push_recent_qso_outcome(fixture_recent_qso("N3TEST"));
+        assert_eq!(
+            app.recent_qsos_scroll, 2,
+            "cursor auto-follows when it was at the end"
+        );
+
+        // Operator scrolls back to review history.
+        app.recent_qsos_scroll = 0;
+        app.push_recent_qso_outcome(fixture_recent_qso("K4LMN"));
+        assert_eq!(
+            app.recent_qsos_scroll, 0,
+            "cursor must NOT jump while the operator is scrolled back"
+        );
     }
 
     /// docs/observability-diagnostics-plan.md Layer 1: pushing events grows

@@ -1200,6 +1200,27 @@ impl TuiRunner {
             return Ok(true);
         }
 
+        // Recent-QSOs panel (docs/observability-diagnostics-plan.md Layer
+        // 2). Same read-only-scrollback shape as the Diagnostics overlay
+        // above — dismiss (Esc or the same Shift+R toggle) and scroll
+        // (Up/Down/j/k).
+        if app.show_recent_qsos {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('R') => {
+                    app.show_recent_qsos = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.recent_qsos_scroll = app.recent_qsos_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max = app.recent_qsos.len().saturating_sub(1);
+                    app.recent_qsos_scroll = (app.recent_qsos_scroll + 1).min(max);
+                }
+                _ => {} // swallow other keys while the overlay is open
+            }
+            return Ok(true);
+        }
+
         match key.code {
             // hb-161: Esc clears the operator-stop banner without re-enabling
             // anything. Re-enabling autonomous still requires `a`. Bound here
@@ -1451,6 +1472,14 @@ impl TuiRunner {
             // so health uses S.
             KeyCode::Char('S') => {
                 app.show_health = true;
+            }
+            // Shift+R — toggle the Recent-QSOs panel (retained terminal-QSO
+            // outcome history: what happened to my last N QSOs). Lowercase
+            // `r` is taken by re-send-last-TX, so Recent-QSOs uses R. Opens
+            // scrolled to the newest entry.
+            KeyCode::Char('R') => {
+                app.show_recent_qsos = true;
+                app.recent_qsos_scroll = app.recent_qsos.len().saturating_sub(1);
             }
             // Shift+H — Engage Hound mode on the selected DX-Hunter station.
             // Lowercase `h` is taken by StopTx (halt TX), so Hound uses H.
@@ -1896,6 +1925,8 @@ impl TuiRunner {
                 crate::ui::render_diagnostics_overlay(f, f.area(), &app);
             } else if app.show_health {
                 crate::ui::render_health_panel(f, f.area(), &app);
+            } else if app.show_recent_qsos {
+                crate::ui::render_recent_qsos_panel(f, f.area(), &app);
             }
         })?;
 
