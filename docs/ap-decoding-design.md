@@ -1,5 +1,15 @@
 # A-priori (AP) decoding from live QSO context — design
 
+**Status (2026-07-25): scope confirmed, moving to implementation.** The operator confirmed
+building the full design below — content-hypothesis injection (§2), multi-QSO priority ranking
+(§1), the `Ft8Config` tradeoff knobs (§3.5), and the §4 eval harness — with one binding
+constraint: **`content_ap_enabled` stays `false` regardless of eval outcome**; flipping the
+default is a separate decision made after seeing real recall/false-decode numbers, not
+automatic. This updates §5's original "STOP before live wiring" framing — the mechanism itself
+now ships (default-off), only the *default flip* stays gated. The prerequisite AP1-AP4 injection
+bug (backwards callsign-field bit offsets, found 2026-07-07) is already fixed and independently
+re-verified — the injection engine this design builds on is correct as of today.
+
 Design doc for using live QSO state to generate a-priori message hypotheses that
 pull weak FT8 signals out of the noise, recovering decodes **without inflating the
 false-decode rate**. **This is a plan, not an implementation** — it stops at a
