@@ -1053,6 +1053,54 @@ fn failure_reason_text(reason: &pancetta_qso::QsoFailureReason) -> String {
     }
 }
 
+/// Build a `RecentQsoOutcome` (observability-diagnostics-plan.md Layer 2 —
+/// the Recent-QSOs panel) from a terminal QSO's already-in-scope
+/// `QsoMetadata`. Pure and side-effect-free so it can be unit tested without
+/// standing up the full coordinator/bus plumbing; both the `QsoCompleted`
+/// and `QsoFailed` handlers call this to construct their sibling
+/// `MessageType::RecentQsoOutcome` emission.
+///
+/// `brief_timeline` is intentionally short (start time, exchanged reports,
+/// terminal line) — it is NOT the full per-message `state_history` (that
+/// timeline isn't available at this call site; persisting it is a separate,
+/// larger change).
+fn recent_qso_outcome(
+    their_call: &str,
+    outcome: crate::message_bus::QsoOutcome,
+    metadata: &pancetta_qso::QsoMetadata,
+) -> crate::message_bus::RecentQsoOutcome {
+    use crate::message_bus::QsoOutcome;
+
+    let mut brief_timeline = vec![format!(
+        "{} started at {}",
+        their_call,
+        metadata.start_time.format("%H:%M:%S")
+    )];
+    if let Some(sent) = metadata.reports.sent {
+        brief_timeline.push(format!("Report sent: {sent:+}"));
+    }
+    if let Some(received) = metadata.reports.received {
+        brief_timeline.push(format!("Report received: {received:+}"));
+    }
+    let (last_state, tail) = match &outcome {
+        QsoOutcome::Completed => ("Completed".to_string(), "Completed".to_string()),
+        QsoOutcome::Failed(reason) => (
+            "Failed".to_string(),
+            format!("Failed: {}", failure_reason_text(reason)),
+        ),
+    };
+    brief_timeline.push(tail);
+
+    crate::message_bus::RecentQsoOutcome {
+        callsign: their_call.to_string(),
+        outcome,
+        last_state,
+        freq_hz: metadata.frequency as u32,
+        ts: chrono::Utc::now(),
+        brief_timeline,
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Start QSO management component
     ///
@@ -2036,6 +2084,22 @@ impl super::ApplicationCoordinator {
                                     );
                                     let _ = snapshot_bus.send_message(diag_msg).await;
 
+                                    // observability-diagnostics-plan.md Layer 2
+                                    // (2026-07-25 plan, Task 1): sibling
+                                    // structured Recent-QSOs outcome, additive
+                                    // to the DiagnosticEvent above.
+                                    let recent_msg = ComponentMessage::new(
+                                        ComponentId::Qso,
+                                        ComponentId::Tui,
+                                        MessageType::RecentQsoOutcome(recent_qso_outcome(
+                                            their_call,
+                                            crate::message_bus::QsoOutcome::Completed,
+                                            &metadata,
+                                        )),
+                                        Instant::now(),
+                                    );
+                                    let _ = snapshot_bus.send_message(recent_msg).await;
+
                                     let band =
                                         pancetta_qso::utils::frequency_to_band(metadata.frequency);
                                     qso_lookup.record_worked(their_call, &band);
@@ -2184,6 +2248,26 @@ impl super::ApplicationCoordinator {
                                     Instant::now(),
                                 );
                                 let _ = snapshot_bus.send_message(diag_msg).await;
+
+                                // observability-diagnostics-plan.md Layer 2
+                                // (2026-07-25 plan, Task 1): sibling
+                                // structured Recent-QSOs outcome, additive
+                                // to the DiagnosticEvent above. Gated on a
+                                // known callsign, same as the QsoHistoryEntry
+                                // push above.
+                                if let Some(ref their_call) = metadata.their_callsign {
+                                    let recent_msg = ComponentMessage::new(
+                                        ComponentId::Qso,
+                                        ComponentId::Tui,
+                                        MessageType::RecentQsoOutcome(recent_qso_outcome(
+                                            their_call,
+                                            crate::message_bus::QsoOutcome::Failed(reason.clone()),
+                                            &metadata,
+                                        )),
+                                        Instant::now(),
+                                    );
+                                    let _ = snapshot_bus.send_message(recent_msg).await;
+                                }
 
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!(
@@ -4325,6 +4409,77 @@ mod snapshot_tests {
         assert_eq!(
             super::failure_reason_text(&R::ProtocolError("boom".to_string())),
             "protocol error: boom"
+        );
+    }
+
+    /// observability-diagnostics-plan.md Layer 2 (Task 1): the `Completed`
+    /// path of `recent_qso_outcome` — correct callsign, outcome, frequency,
+    /// and a brief timeline that reflects the exchanged reports.
+    #[test]
+    fn recent_qso_outcome_completed_carries_callsign_and_reports() {
+        let progress = fixture_progress();
+        let metadata = progress.metadata;
+        let their_call = metadata.their_callsign.clone().expect("fixture has a call");
+
+        let outcome = super::recent_qso_outcome(
+            &their_call,
+            crate::message_bus::QsoOutcome::Completed,
+            &metadata,
+        );
+
+        assert_eq!(outcome.callsign, "JA1ABC");
+        assert!(matches!(
+            outcome.outcome,
+            crate::message_bus::QsoOutcome::Completed
+        ));
+        assert_eq!(outcome.last_state, "Completed");
+        assert_eq!(outcome.freq_hz, 1500);
+        assert!(
+            outcome
+                .brief_timeline
+                .iter()
+                .any(|l| l.contains("Report sent: -8")),
+            "brief_timeline should mention the sent report: {:?}",
+            outcome.brief_timeline
+        );
+        assert!(
+            outcome
+                .brief_timeline
+                .iter()
+                .any(|l| l.contains("Report received: -12")),
+            "brief_timeline should mention the received report: {:?}",
+            outcome.brief_timeline
+        );
+        assert_eq!(
+            outcome.brief_timeline.last().map(String::as_str),
+            Some("Completed")
+        );
+    }
+
+    /// observability-diagnostics-plan.md Layer 2 (Task 1): the `Failed`
+    /// path of `recent_qso_outcome` — correct callsign + reason, and the
+    /// reason surfaces in the brief timeline's final line.
+    #[test]
+    fn recent_qso_outcome_failed_timeout_carries_reason() {
+        let progress = fixture_progress();
+        let metadata = progress.metadata;
+        let their_call = metadata.their_callsign.clone().expect("fixture has a call");
+
+        let outcome = super::recent_qso_outcome(
+            &their_call,
+            crate::message_bus::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
+            &metadata,
+        );
+
+        assert_eq!(outcome.callsign, "JA1ABC");
+        assert!(matches!(
+            outcome.outcome,
+            crate::message_bus::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout)
+        ));
+        assert_eq!(outcome.last_state, "Failed");
+        assert_eq!(
+            outcome.brief_timeline.last().map(String::as_str),
+            Some("Failed: watchdog timeout")
         );
     }
 }
