@@ -496,6 +496,23 @@ git commit -m "feat(ft8): wire Ap5 content-hypothesis loop into the decode hot p
 
 ## Task 7: Eval harness — recall vs false-decode vs SNR
 
+**⚠️ CARRY-FORWARD FROM TASK 6 REVIEW — READ THIS FIRST, IT CHANGES THIS TASK'S FIRST STEP:**
+Task 6's implementer searched real audio via 3 methodologies and found **no natural window where
+AP0-AP4 (the existing ladder) all fail but Ap5 (content injection) succeeds** at this decoder's
+default LDPC strength — the rescue test had to isolate Ap5 by structurally disabling AP2-4 in the
+test's `ApContext` (a legitimate way to prove the *wiring* is correct, per Task 6's own review, but
+NOT proof that Ap5 provides real recall lift over the full ladder). **This is the single most
+consequential open question for this task and for whether `content_ap_enabled` ever graduates**: if
+this harness's synthetic AWGN/burst corruption *also* can't construct a window where the full AP0-4
+ladder fails but Ap5 rescues it, the feature has no demonstrable benefit to measure, regardless of
+how the eval numbers otherwise look. **Before running the full §4A/§4B sweep, first verify the
+harness's corruption methodology can construct at least a handful of genuine AP0-4-fails/Ap5-rescues
+cases** (e.g. a small pilot run at a few SNR points with the full ladder enabled, checking the
+count of such cases is non-zero) — if it cannot, report that finding prominently in Step 6's
+journal entry as the primary result, not a footnote, since it would mean the ship-gate question
+("does recall rise meaningfully") has a knowable answer (no) before the rest of the sweep even
+needs to run.
+
 **Files:**
 - Create: `pancetta-research/examples/ap5_content_recall_fp_sweep.rs`
 - Test: none (research example, excluded from CI per CLAUDE.md's `pancetta-research` note)
