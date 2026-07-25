@@ -9,6 +9,20 @@ use tracing::{debug, info};
 
 use crate::config::{Config, Theme};
 
+/// Bounds for a real, in-band FT8 audio-offset decode — used to guard against
+/// genuinely out-of-range decoder output (split-VFO artifacts, reference
+/// markers), NOT to bound where we choose to transmit (that's a separate,
+/// narrower concern already handled downstream by the coordinator's TX
+/// de-conflict logic). Matches the audio passband bound already established
+/// elsewhere in this project (`pancetta-config`'s `hound.rs` validation range
+/// and `audio.rs`'s `lowpass_cutoff: 3000.0`) — NOT the previous (200, 2500)
+/// clamp here, which was narrower than the real passband and silently
+/// truncated genuine high-frequency decodes (e.g. a station consistently
+/// operating at 2846.9 Hz got truncated to exactly 2500 Hz), corrupting the
+/// frequency used to track/match that station's QSO.
+pub const AUDIO_PASSBAND_MIN_HZ: u64 = 200;
+pub const AUDIO_PASSBAND_MAX_HZ: u64 = 3000;
+
 // Test-only thread-local backing `App::set_test_tui_state_path` /
 // `App::tui_state_path`. See those for why this is a thread-local rather
 // than a process-global env var. Never compiled into production builds.
@@ -198,8 +212,9 @@ pub struct ActiveQsoBanner {
     pub state: String,
     /// When this QSO started (used to render an elapsed timer).
     pub started_at: chrono::DateTime<chrono::Utc>,
-    /// Audio frequency in Hz (200-2500 range, where the contra station was
-    /// heard / where we're transmitting back).
+    /// Audio frequency in Hz (`AUDIO_PASSBAND_MIN_HZ`-`AUDIO_PASSBAND_MAX_HZ`
+    /// range, where the contra station was heard / where we're transmitting
+    /// back).
     pub frequency_hz: f64,
     /// Parity our station transmits in for this QSO. None when unknown.
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
@@ -1639,7 +1654,8 @@ impl App {
             });
             // Audio offset where we heard this station, clamped into the
             // FT8 passband. Used by the Space call-target.
-            let audio_offset_hz = (message.delta_freq as u64).clamp(200, 2500);
+            let audio_offset_hz =
+                (message.delta_freq as u64).clamp(AUDIO_PASSBAND_MIN_HZ, AUDIO_PASSBAND_MAX_HZ);
             let local_score = self.calculate_dx_priority(&message);
 
             // Merge into any existing entry rather than wholesale-replacing
@@ -2795,8 +2811,9 @@ impl App {
     /// Get the callsign, audio offset (Hz, within FT8 passband), and slot
     /// parity of the currently selected station. Returns the AUDIO frequency
     /// offset, not the dial frequency — the TransmitRequest pipeline expects
-    /// an absolute audio frequency in 200-2500 Hz, and the modulator validates
-    /// against MAX_FREQUENCY_DEVIATION = 2500 Hz. The slot parity is `Some`
+    /// an audio frequency in `[AUDIO_PASSBAND_MIN_HZ, AUDIO_PASSBAND_MAX_HZ]`,
+    /// comfortably within the modulator's real `MAX_FREQUENCY_DEVIATION`
+    /// (3100 Hz; `pancetta_ft8::modulator`). The slot parity is `Some`
     /// when the station was decoded from a Band Activity message (so we know
     /// which 15-second slot they transmit on), and `None` for DX cluster spots.
     ///
@@ -2815,9 +2832,11 @@ impl App {
                     return None;
                 }
                 // delta_freq is the audio offset in Hz where the signal was
-                // decoded. Clamp into [200, 2500] since some decoders produce
-                // out-of-range values for split-VFO or reference markers.
-                let audio_hz = (msg.delta_freq as u64).clamp(200, 2500);
+                // decoded. Clamp into the real FT8 passband since some
+                // decoders produce out-of-range values for split-VFO or
+                // reference markers.
+                let audio_hz =
+                    (msg.delta_freq as u64).clamp(AUDIO_PASSBAND_MIN_HZ, AUDIO_PASSBAND_MAX_HZ);
                 Some((callsign.clone(), audio_hz, msg.slot_parity))
             }
             ActivePanel::DxHunter => {
@@ -2847,7 +2866,8 @@ impl App {
                 }
                 // delta_freq is the audio offset where we heard them; reply
                 // there. Clamp into the FT8 passband like the Band Activity arm.
-                let audio_hz = (msg.delta_freq.round() as u64).clamp(200, 2500);
+                let audio_hz = (msg.delta_freq.round() as u64)
+                    .clamp(AUDIO_PASSBAND_MIN_HZ, AUDIO_PASSBAND_MAX_HZ);
                 Some((callsign.clone(), audio_hz, msg.slot_parity))
             }
             _ => None,
@@ -2917,7 +2937,8 @@ impl App {
             let step = classify_caller_reply(&msg.message, &self.station_info.call_sign);
             // Reply on the passband where we actually heard them, on their slot
             // parity if we know it — mirrors the Callers-Enter reply target.
-            let reply_freq = (msg.delta_freq.round() as u64).clamp(200, 2500);
+            let reply_freq =
+                (msg.delta_freq.round() as u64).clamp(AUDIO_PASSBAND_MIN_HZ, AUDIO_PASSBAND_MAX_HZ);
             return Some(SpaceAction::Reply {
                 callsign,
                 frequency: reply_freq,
@@ -5431,6 +5452,103 @@ mod tests {
         app.dx_hunter_scroll = 0;
         let (_, freq, _) = app.get_selected_station().unwrap();
         assert_eq!(freq, 1500, "network-only spot falls back to 1500 Hz");
+    }
+
+    /// Real on-air regression (2026-07-25): OM5NU decoded consistently at
+    /// 2846.9 Hz across ~15 separate exchanges with other stations in the
+    /// same log. Selecting them and pressing Space silently truncated the
+    /// tracked DX frequency to 2500 Hz (`TUI CallStation: OM5NU at 2500 Hz`),
+    /// which then fed the QSO engine's frequency-relevance gate — every
+    /// genuine reply from OM5NU (always at their real 2846.9 Hz) fell outside
+    /// even the widened 100 Hz established-QSO tolerance and was silently
+    /// dropped, so the QSO never advanced automatically. The FT8 passband
+    /// legitimately extends to ~3000 Hz (matches `hound.rs`'s
+    /// `AUDIO_MIN`/`AUDIO_MAX` validation range and `audio.rs`'s
+    /// `lowpass_cutoff: 3000.0`), so 2500 Hz was simply the wrong upper bound.
+    #[tokio::test]
+    async fn get_selected_station_band_activity_high_passband_frequency_not_truncated() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        let mut msg = fixture_view("OM5NU", -13);
+        msg.delta_freq = 2846.9;
+        app.add_decoded_message(msg).await.unwrap();
+        app.band_activity_scroll = 0;
+
+        let (call, freq, _) = app.get_selected_station().expect("station at cursor");
+        assert_eq!(call, "OM5NU");
+        assert_eq!(
+            freq, 2846,
+            "a real 2846.9 Hz decode must not be truncated down to 2500 Hz"
+        );
+    }
+
+    /// Same regression as the Band Activity test above, but for the DX
+    /// Hunter panel's path: `add_decoded_message` clamps the frequency
+    /// stored on the `DxStation` entry (`audio_offset_hz`) before
+    /// `get_selected_station`'s DxHunter arm ever reads it.
+    #[tokio::test]
+    async fn get_selected_station_dx_hunter_high_passband_frequency_not_truncated() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::DxHunter;
+        let mut msg = fixture_view("OM5NU", -13);
+        msg.delta_freq = 2846.9;
+        app.add_decoded_message(msg).await.unwrap();
+        app.dx_hunter_scroll = 0;
+
+        let (call, freq, _) = app.get_selected_station().expect("station at cursor");
+        assert_eq!(call, "OM5NU");
+        assert_eq!(
+            freq, 2846,
+            "a real 2846.9 Hz decode must not be truncated down to 2500 Hz"
+        );
+    }
+
+    /// Same regression, Callers panel path.
+    #[tokio::test]
+    async fn get_selected_station_callers_high_passband_frequency_not_truncated() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::Callers;
+        let mut msg = fixture_view_directed("OM5NU", -13);
+        msg.delta_freq = 2846.9;
+        app.add_decoded_message(msg).await.unwrap();
+        app.callers_scroll = 0;
+
+        let (call, freq, _) = app.get_selected_station().expect("station at cursor");
+        assert_eq!(call, "OM5NU");
+        assert_eq!(
+            freq, 2847,
+            "a real 2846.9 Hz decode must not be truncated down to 2500 Hz"
+        );
+    }
+
+    /// Same regression, the manual-reply path (`resolve_space_action`'s
+    /// `SpaceAction::Reply` branch) — this is the path the operator had to
+    /// fall back to manually, and it carries the same clamp bug: replying to
+    /// a station heard above 2500 Hz would itself compute the wrong
+    /// `reply_freq`.
+    #[tokio::test]
+    async fn resolve_space_action_reply_high_passband_frequency_not_truncated() {
+        let mut app = fixture_app().await;
+        app.active_panel = ActivePanel::BandActivity;
+        let mut msg = fixture_view_directed_payload("OM5NU", "+04", -13);
+        msg.delta_freq = 2846.9;
+        app.add_decoded_message(msg).await.unwrap();
+        app.band_activity_scroll = 0;
+
+        match app.resolve_space_action().expect("station selectable") {
+            SpaceAction::Reply {
+                callsign,
+                frequency,
+                ..
+            } => {
+                assert_eq!(callsign, "OM5NU");
+                assert_eq!(
+                    frequency, 2847,
+                    "a real 2846.9 Hz decode must not be truncated down to 2500 Hz"
+                );
+            }
+            other => panic!("expected Reply, got {:?}", other),
+        }
     }
 
     /// A local re-decode of a callsign already known from the network must
