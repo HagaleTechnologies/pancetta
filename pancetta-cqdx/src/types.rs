@@ -132,16 +132,10 @@ pub struct LiveSpotsResponse {
 /// operator-authorized (agentKeyId, clientKeyId) pairing, already filtered
 /// server-side to non-revoked.
 ///
-/// # Contract gap
-///
-/// This endpoint is **not yet documented** in
-/// `dispensa/contracts/cqdx-api/cqdx-api.v1.schema.json` — the shape below is
-/// inferred from cqdx's prose answer to dispensa Q-0043 (2026-07-21), pointing
-/// at its own `apps/web/src/lib/server/registry.ts` `listAuthorizationEdges`
-/// implementation, not a pinned contract. See Task 5 of
-/// `docs/superpowers/plans/2026-07-22-tx-allow-list-auto-populate.md` for the
-/// proposed contract entry. Field casing (camelCase) matches ADR-0003, same as
-/// every other endpoint in this file.
+/// Shape confirmed against `dispensa` contracts/cqdx-api/cqdx-api.v1.schema.json
+/// (cqdx, 2026-07-24, dispensa Q-0043) — per-item fields match the original
+/// proposal; field casing (camelCase) matches ADR-0003, same as every other
+/// endpoint in this file.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthorizationEdge {
     pub id: String,
@@ -154,12 +148,12 @@ pub struct AuthorizationEdge {
     pub created_at: String,
 }
 
-/// Envelope for `GET /api/v1/authorizations`. Envelope key
-/// (`authorization_edges`) is UNVERIFIED against the live API — same category
-/// of gap as `LiveSpotsResponse`'s `groups` key note above.
+/// Envelope for `GET /api/v1/authorizations`. Envelope key is `authorizations`
+/// — confirmed against the live handler (cqdx, 2026-07-24, dispensa Q-0043);
+/// corrects the earlier `authorization_edges` guess.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthorizationsResponse {
-    pub authorization_edges: Vec<AuthorizationEdge>,
+    pub authorizations: Vec<AuthorizationEdge>,
 }
 
 // --- Spot Reporting ---

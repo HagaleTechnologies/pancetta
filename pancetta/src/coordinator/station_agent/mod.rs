@@ -1192,7 +1192,7 @@ fn load_client_device_keys(
 /// UNTOUCHED — a transient cqdx outage (relevant right now: cqdx.io's
 /// production deploy is currently down) must never spuriously revoke an
 /// already-admitted, connected client. Only a successful poll (a 200 with a
-/// parseable body, even if `authorization_edges` is genuinely empty) replaces
+/// parseable body, even if `authorizations` is genuinely empty) replaces
 /// the shared contents.
 async fn poll_authorizations_loop(
     cqdx_cfg: pancetta_config::network::CqdxConfig,
