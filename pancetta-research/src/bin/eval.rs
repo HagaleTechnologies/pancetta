@@ -2184,6 +2184,7 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
             my_call,
             recent_calls,
             active_qso: None,
+            active_qsos: Vec::new(),
         };
         d = d.with_ap_context(ctx);
     }

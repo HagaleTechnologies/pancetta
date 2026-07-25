@@ -904,6 +904,7 @@ impl DecoderUnderTest for Ft8Decoder {
                 my_call: None,
                 recent_calls: recent,
                 active_qso: None,
+                active_qsos: Vec::new(),
             };
             let r = decoder
                 .decode_window_with_ap_scoped_partner_budgeted(
@@ -962,6 +963,7 @@ impl DecoderUnderTest for Ft8Decoder {
                 my_call: None,
                 recent_calls: recent,
                 active_qso: None,
+                active_qsos: Vec::new(),
             };
             let r = decoder
                 .decode_window_with_ap_scoped_partner_budgeted(
@@ -1026,6 +1028,7 @@ impl DecoderUnderTest for Ft8Decoder {
                         my_call: None,
                         recent_calls: Vec::new(),
                         active_qso: None,
+                        active_qsos: Vec::new(),
                     };
                     decoder
                         .decode_window_with_ap_scoped_partner_budgeted(
