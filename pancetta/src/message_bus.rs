@@ -170,6 +170,18 @@ pub enum MessageType {
         callsign: Option<String>,
     },
 
+    /// A structured, retained terminal-QSO outcome (docs/observability-
+    /// diagnostics-plan.md Layer 2 — the Recent-QSOs panel). Sibling to
+    /// `DiagnosticEvent` above: sent from the SAME `QsoEvent::QsoCompleted`/
+    /// `QsoEvent::QsoFailed` handlers (`pancetta/src/coordinator/qso.rs`),
+    /// right alongside (not instead of) their existing `DiagnosticEvent`
+    /// emission. Also distinct from `QsoHistoryEntry` (#165's flat
+    /// success/reason strings for the last-10 strip) — this carries the
+    /// richer `QsoOutcome` enum plus a short human-readable timeline so a
+    /// future panel can render more than one line per QSO. Emitted once per
+    /// QSO reaching a terminal state, never per-decode.
+    RecentQsoOutcome(RecentQsoOutcome),
+
     /// Per-window TX-placement ranking for the TUI instrument
     /// (docs/superpowers/specs/2026-07-03-tui-redesign-design.md §2). Computed
     /// in the autonomous tick from the SAME `SmartFrequencyAllocator` /
@@ -463,6 +475,41 @@ pub struct TxItem {
     /// show "QUEUED → deferred 30s" instead of looking dead.
     #[serde(default)]
     pub deferred: bool,
+}
+
+/// How a QSO ended, for `MessageType::RecentQsoOutcome`. Reuses the QSO
+/// crate's existing `QsoFailureReason` rather than inventing a parallel
+/// taxonomy (`docs/observability-diagnostics-plan.md` Layer 2).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum QsoOutcome {
+    /// The QSO reached `QsoState::Completed`.
+    Completed,
+    /// The QSO reached `QsoState::Failed` — carries WHY.
+    Failed(pancetta_qso::QsoFailureReason),
+}
+
+/// Payload of `MessageType::RecentQsoOutcome` — a structured, retained
+/// record of a single terminal QSO, for the (future) Recent-QSOs panel.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RecentQsoOutcome {
+    /// The DX station's callsign.
+    pub callsign: String,
+    /// How the QSO ended.
+    pub outcome: QsoOutcome,
+    /// Short terminal-state label ("Completed" / "Failed"). NOT the full
+    /// prior `QsoState` — `QsoEvent::QsoCompleted`/`QsoFailed` only carry
+    /// `QsoMetadata` at this call site, not the state machine's internal
+    /// `state_history` (persisting that is Task 4's job, a separate,
+    /// larger change).
+    pub last_state: String,
+    /// Operating frequency in Hz at the time of the outcome.
+    pub freq_hz: u32,
+    /// When the outcome was recorded.
+    pub ts: chrono::DateTime<chrono::Utc>,
+    /// Short human-readable summary lines built from the QSO's metadata
+    /// (start time, exchanged reports, final outcome) — a brief digest, NOT
+    /// the full per-message `state_history` timeline (that's Task 4).
+    pub brief_timeline: Vec<String>,
 }
 
 /// One item in a `MessageType::ActiveQsosSnapshot` payload — flattened

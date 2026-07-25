@@ -57,6 +57,7 @@ use tracing::{debug, info};
 // Re-export all configuration modules
 pub mod audio;
 pub mod autonomous;
+pub mod database;
 pub mod decoder;
 pub mod duplicate_check;
 pub mod fox;
@@ -71,6 +72,7 @@ pub mod ui;
 
 pub use audio::*;
 pub use autonomous::*;
+pub use database::*;
 pub use decoder::*;
 pub use duplicate_check::*;
 pub use fox::*;
@@ -167,6 +169,10 @@ pub struct Config {
     #[serde(default)]
     pub duplicate_checking: duplicate_check::DuplicateCheckingConfig,
 
+    /// Database / QSO-log persistence (Layer 2 timeline persistence)
+    #[serde(default)]
+    pub database: database::DatabaseConfig,
+
     /// Metadata about the configuration
     #[serde(skip_serializing_if = "Option::is_none")]
     pub metadata: Option<ConfigMetadata>,
@@ -202,6 +208,7 @@ impl Default for Config {
             tx_placement: tx_placement::TxPlacementConfig::default(),
             decoder: decoder::DecoderConfig::default(),
             duplicate_checking: duplicate_check::DuplicateCheckingConfig::default(),
+            database: database::DatabaseConfig::default(),
             metadata: Some(ConfigMetadata {
                 version: "1.0".to_string(),
                 last_modified: Some(chrono::Utc::now()),
@@ -269,6 +276,7 @@ impl Config {
         self.tx_placement.validate_section()?;
         self.decoder.validate_section()?;
         self.duplicate_checking.validate_section()?;
+        self.database.validate_section()?;
 
         info!("Configuration validation successful");
         Ok(())
@@ -289,6 +297,7 @@ impl Config {
         self.tx_placement.merge_with(other.tx_placement);
         self.decoder.merge_with(other.decoder);
         self.duplicate_checking.merge_with(other.duplicate_checking);
+        self.database.merge_with(other.database);
 
         // Update metadata
         if let Some(ref mut metadata) = self.metadata {
@@ -945,5 +954,9 @@ mod merge_guard {
             &[("allowed_request_hosts", json!(["example.com"]))],
             |a, b| a.merge_with(b),
         );
+
+        assert_carries_all::<database::DatabaseConfig>("DatabaseConfig", &[], |a, b| {
+            a.merge_with(b)
+        });
     }
 }

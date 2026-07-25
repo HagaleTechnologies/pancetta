@@ -1,5 +1,17 @@
 # Security Review — Remote-Rig-Control Stack (2026-07-02)
 
+**Status update (2026-07-25):** of the four load-bearing pre-flight items in the Bottom Line
+below, three are resolved. (a) The Noise-static/read-qsy relay-admission gap and (c) the
+`clientSig` domain-separation tag both shipped in pancetta PR #73 (merged 2026-07-03, adopting
+dispensa Q-0019 #5/#6 — see `contracts/auth/e2e-auth.v1.schema.json` and cqdx PRs #143/#144). (d)
+The `e2e-auth.v1` §4/§6 wording contradiction was fixed in dispensa's own contract the same day
+(2026-07-02, Q-0018 resolution) — never a pancetta change. (b) Agent-key rotation/revocation has
+`dispensa/adr/0010-key-rotation-and-keyid-revocation.md` (Proposed; pancetta + panino gave
+concurring positions 2026-07-03) but the registry/relay-side plumbing is explicitly cqdx's to
+build; pancetta's only follow-on (an `AuditKind` removal-actor distinction) is blocked on a seam
+(`ArmContext.revoked_jtis`) that is still inert. No pancetta-side code is actionable on (b) right
+now. **No open pancetta engineering work remains from this review's four gate items.**
+
 Deep review of the whole remote-rig stack: `pancetta-agent` (arm/audit/noise/keys/pairing/
 capability/relay/session/control) + `pancetta/src/coordinator/station_agent/{mod,net}` + the
 coordinator TX gate (`tx.rs`) + QSO-origin routing (`qso.rs`). Anchored to the three findings

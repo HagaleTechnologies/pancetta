@@ -136,6 +136,12 @@ pub enum TuiMessage {
         qso_id: Option<String>,
         callsign: Option<String>,
     },
+    /// A structured, retained terminal-QSO outcome (docs/observability-
+    /// diagnostics-plan.md Layer 2 — the Recent-QSOs panel) — relayed from
+    /// `MessageType::RecentQsoOutcome`. Sibling to `DiagnosticEvent` above:
+    /// appended to `App`'s own bounded ring (`App::recent_qsos`), separate
+    /// from `diagnostic_events`.
+    RecentQsoOutcome(crate::app::RecentQsoOutcome),
     /// Waterfall display data (normalized power rows, each Vec<f32> is one time-slice)
     WaterfallUpdate { rows: Vec<Vec<f32>> },
     /// Live spot groups from cqdx.io
@@ -885,6 +891,9 @@ impl TuiRunner {
                     callsign,
                 });
             }
+            TuiMessage::RecentQsoOutcome(outcome) => {
+                app.push_recent_qso_outcome(outcome);
+            }
             TuiMessage::TxPlacementUpdate { view } => {
                 app.apply_placement(view);
             }
@@ -1191,6 +1200,27 @@ impl TuiRunner {
             return Ok(true);
         }
 
+        // Recent-QSOs panel (docs/observability-diagnostics-plan.md Layer
+        // 2). Same read-only-scrollback shape as the Diagnostics overlay
+        // above — dismiss (Esc or the same Shift+R toggle) and scroll
+        // (Up/Down/j/k).
+        if app.show_recent_qsos {
+            match key.code {
+                KeyCode::Esc | KeyCode::Char('R') => {
+                    app.show_recent_qsos = false;
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    app.recent_qsos_scroll = app.recent_qsos_scroll.saturating_sub(1);
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    let max = app.recent_qsos.len().saturating_sub(1);
+                    app.recent_qsos_scroll = (app.recent_qsos_scroll + 1).min(max);
+                }
+                _ => {} // swallow other keys while the overlay is open
+            }
+            return Ok(true);
+        }
+
         match key.code {
             // hb-161: Esc clears the operator-stop banner without re-enabling
             // anything. Re-enabling autonomous still requires `a`. Bound here
@@ -1442,6 +1472,14 @@ impl TuiRunner {
             // so health uses S.
             KeyCode::Char('S') => {
                 app.show_health = true;
+            }
+            // Shift+R — toggle the Recent-QSOs panel (retained terminal-QSO
+            // outcome history: what happened to my last N QSOs). Lowercase
+            // `r` is taken by re-send-last-TX, so Recent-QSOs uses R. Opens
+            // scrolled to the newest entry.
+            KeyCode::Char('R') => {
+                app.show_recent_qsos = true;
+                app.recent_qsos_scroll = app.recent_qsos.len().saturating_sub(1);
             }
             // Shift+H — Engage Hound mode on the selected DX-Hunter station.
             // Lowercase `h` is taken by StopTx (halt TX), so Hound uses H.
@@ -1887,6 +1925,8 @@ impl TuiRunner {
                 crate::ui::render_diagnostics_overlay(f, f.area(), &app);
             } else if app.show_health {
                 crate::ui::render_health_panel(f, f.area(), &app);
+            } else if app.show_recent_qsos {
+                crate::ui::render_recent_qsos_panel(f, f.area(), &app);
             }
         })?;
 
@@ -3094,6 +3134,51 @@ mod key_tests {
 
         assert_eq!(app.read().await.session_failed, 1);
         assert_eq!(app.read().await.session_tx_drops, 1);
+    }
+
+    /// Layer 2 Recent-QSOs panel (Task 2): a relayed `RecentQsoOutcome`
+    /// bus message reaches `App.recent_qsos`, and the ring evicts the
+    /// oldest entry once past its 50-entry cap — the relay round-trip
+    /// mirroring `diagnostic_event_qso_completed_increments_session_counter`
+    /// above, but for the new ring instead of the diagnostic scrollback.
+    #[tokio::test]
+    async fn recent_qso_outcome_relays_into_bounded_app_ring() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert!(app.read().await.recent_qsos.is_empty());
+
+        r.handle_message(TuiMessage::RecentQsoOutcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 1500,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["QSO with K1ABC logged".to_string()],
+        }))
+        .await
+        .unwrap();
+        assert_eq!(app.read().await.recent_qsos.len(), 1);
+        assert_eq!(app.read().await.recent_qsos[0].callsign, "K1ABC");
+
+        for i in 0..60 {
+            r.handle_message(TuiMessage::RecentQsoOutcome(crate::app::RecentQsoOutcome {
+                callsign: format!("N{i}TEST"),
+                outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
+                last_state: "Failed".to_string(),
+                freq_hz: 1500,
+                ts: chrono::Utc::now(),
+                brief_timeline: vec!["QSO failed: timeout".to_string()],
+            }))
+            .await
+            .unwrap();
+        }
+
+        let recent = app.read().await;
+        assert!(
+            recent.recent_qsos.len() <= 50,
+            "recent-QSO ring must stay bounded, got {}",
+            recent.recent_qsos.len()
+        );
+        assert!(!recent.recent_qsos.iter().any(|e| e.callsign == "K1ABC"));
     }
 
     /// Whole-branch-review fix (finding 1): `TxOffsetUpdate` (the

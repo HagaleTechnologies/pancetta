@@ -40,6 +40,16 @@ pub struct LoggerConfig {
 
     /// Validation settings
     pub validation: ValidationConfig,
+
+    /// Layer 2 timeline persistence (docs/observability-diagnostics-plan.md):
+    /// when true, a completed QSO's `state_history`/`messages` are written
+    /// into the `qsos` row's `progress_data`, and a failed QSO's timeline is
+    /// written into the separate `qso_events` table (failed QSOs never get a
+    /// row in `qsos` — that table is the confirmed-contact log). Mirrors
+    /// `pancetta_config::DatabaseConfig::persist_qso_timeline` — threaded in
+    /// by the coordinator at startup. Defaults to `false`: an absent
+    /// `[database]` config section changes nothing.
+    pub persist_qso_timeline: bool,
 }
 
 /// Automatic logging configuration
@@ -303,6 +313,7 @@ impl Default for LoggerConfig {
             backup: BackupConfig::default(),
             integrations: IntegrationConfig::default(),
             validation: ValidationConfig::default(),
+            persist_qso_timeline: false,
         }
     }
 }
@@ -692,9 +703,31 @@ impl QsoLogger {
 
                     event = receiver.recv() => {
                         match event {
-                            Ok(QsoEvent::QsoCompleted { qso_id, metadata }) => {
-                                if let Err(e) = self.handle_qso_completed(qso_id, metadata).await {
+                            Ok(QsoEvent::QsoCompleted {
+                                qso_id,
+                                metadata,
+                                state_history,
+                                messages,
+                            }) => {
+                                if let Err(e) = self
+                                    .handle_qso_completed(qso_id, metadata, state_history, messages)
+                                    .await
+                                {
                                     error!("Error handling QSO completion: {}", e);
+                                }
+                            }
+                            Ok(QsoEvent::QsoFailed {
+                                qso_id,
+                                reason,
+                                metadata,
+                                state_history,
+                                messages,
+                            }) => {
+                                if let Err(e) = self
+                                    .handle_qso_failed(qso_id, reason, metadata, state_history, messages)
+                                    .await
+                                {
+                                    error!("Error handling QSO failure: {}", e);
                                 }
                             }
                             Err(broadcast::error::RecvError::Closed) => {
@@ -730,8 +763,10 @@ impl QsoLogger {
 
     async fn handle_qso_completed(
         &self,
-        _qso_id: QsoId,
+        qso_id: QsoId,
         metadata: QsoMetadata,
+        state_history: Vec<StateTransition>,
+        messages: Vec<QsoMessage>,
     ) -> Result<(), AsyncLoggerError> {
         // Extract signal reports from metadata (populated during state transition)
         let their_report = metadata.reports.received.unwrap_or(0);
@@ -739,6 +774,17 @@ impl QsoLogger {
         let grid_square = metadata.grids.theirs.clone();
         let completed_at = metadata.end_time.unwrap_or_else(Utc::now);
         let duration_seconds = (completed_at - metadata.start_time).num_seconds().max(0) as u32;
+
+        // Layer 2 timeline persistence (docs/observability-diagnostics-plan.md
+        // §"Persist the timeline"): only populate the real state_history /
+        // messages when the operator has opted in via
+        // `[database].persist_qso_timeline`. Off by default so a QSO row's
+        // `progress_data` blob stays exactly as small as it is today.
+        let (state_history, messages) = if self.config.persist_qso_timeline {
+            (state_history, messages)
+        } else {
+            (Vec::new(), Vec::new())
+        };
 
         // Create a QsoProgress from the metadata
         let progress = QsoProgress {
@@ -751,12 +797,73 @@ impl QsoLogger {
                 completed_at,
                 duration_seconds,
             },
-            state_history: vec![],
-            messages: vec![],
-            metadata,
+            state_history: state_history.clone(),
+            messages: messages.clone(),
+            metadata: metadata.clone(),
         };
 
         self.log_qso(&progress).await?;
+        debug!("Logged completed QSO {} to database", qso_id);
+
+        // Also record into `qso_events` (same table failed QSOs use) so a
+        // caller reconstructing "what happened" for ANY terminal QSO —
+        // completed or failed — has one uniform read path
+        // (`QsoDatabase::get_qso_timeline`), rather than having to know
+        // whether to look in `qsos.progress_data` or `qso_events` depending
+        // on outcome.
+        if self.config.persist_qso_timeline {
+            self.database
+                .insert_qso_timeline(
+                    qso_id,
+                    metadata.their_callsign.as_deref(),
+                    "completed",
+                    None,
+                    &state_history,
+                    &messages,
+                )
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    /// Persist a failed QSO's timeline (Layer 2). Unlike `handle_qso_completed`,
+    /// this never touches the `qsos` contact-log table — a failed QSO is not a
+    /// logged contact (it would corrupt duplicate-checks / ADIF export /
+    /// worked-station seeding, all of which read that table). Instead it goes
+    /// into the separate `qso_events` table, gated by the same
+    /// `persist_qso_timeline` flag as the completed path. A no-op when the
+    /// flag is off — failed QSOs get no persistent record at all, matching
+    /// today's behavior.
+    async fn handle_qso_failed(
+        &self,
+        qso_id: QsoId,
+        reason: QsoFailureReason,
+        metadata: QsoMetadata,
+        state_history: Vec<StateTransition>,
+        messages: Vec<QsoMessage>,
+    ) -> Result<(), AsyncLoggerError> {
+        if !self.config.persist_qso_timeline {
+            return Ok(());
+        }
+
+        self.database
+            .insert_qso_timeline(
+                qso_id,
+                metadata.their_callsign.as_deref(),
+                "failed",
+                Some(&format!("{reason:?}")),
+                &state_history,
+                &messages,
+            )
+            .await?;
+        debug!(
+            "Persisted timeline for failed QSO {} ({:?}, {} transitions, {} messages)",
+            qso_id,
+            reason,
+            state_history.len(),
+            messages.len()
+        );
         Ok(())
     }
 
@@ -872,6 +979,8 @@ impl QsoLogger {
 mod tests {
     use super::*;
     use crate::qso_manager::QsoManagerConfig;
+    use std::collections::HashMap;
+    use uuid::Uuid;
 
     fn test_logger_config() -> LoggerConfig {
         let tmp_dir = tempfile::tempdir().expect("failed to create temp dir");
@@ -911,5 +1020,213 @@ mod tests {
 
         let result = handle.await;
         assert!(result.is_ok());
+    }
+
+    // --- Layer 2 timeline persistence (docs/observability-diagnostics-plan.md
+    // §"Persist the timeline") -------------------------------------------
+    //
+    // These exercise the actual discard sites this task fixed:
+    // `handle_qso_completed` used to hard-code `state_history: vec![],
+    // messages: vec![]` regardless of what the QsoCompleted event carried,
+    // and failed QSOs were never persisted anywhere at all. Both are now
+    // gated by `LoggerConfig::persist_qso_timeline` (default false, which
+    // must reproduce the old discard-everything behavior exactly).
+
+    fn test_metadata(qso_id: QsoId, their_callsign: &str) -> QsoMetadata {
+        let now = Utc::now();
+        QsoMetadata {
+            qso_id,
+            our_callsign: "W1ABC".to_string(),
+            their_callsign: Some(their_callsign.to_string()),
+            frequency: 14074000.0,
+            mode: "FT8".to_string(),
+            start_time: now,
+            end_time: Some(now),
+            reports: SignalReports {
+                sent: Some(-9),
+                received: Some(-12),
+            },
+            grids: GridSquares::default(),
+            contest_info: None,
+            tags: HashMap::new(),
+            notes: None,
+            tx_parity: None,
+            initiated_by: Default::default(),
+            role: Default::default(),
+            call_count: 1,
+            first_call_at: Some(now),
+            last_call_at: Some(now),
+            progressed_this_cycle: false,
+            last_rx_text: None,
+            dx_repeat_count: 0,
+            hound: false,
+            partner_freq: None,
+            hound_qsyed: false,
+            remote_origin: false,
+            tx_parity_provisional: false,
+        }
+    }
+
+    fn non_trivial_timeline(now: DateTime<Utc>) -> (Vec<StateTransition>, Vec<QsoMessage>) {
+        let state_history = vec![StateTransition {
+            from_state: QsoState::Idle,
+            to_state: QsoState::CallingCq {
+                frequency: 1500.0,
+                started_at: now,
+                call_count: 1,
+            },
+            timestamp: now,
+            reason: TransitionReason::UserAction,
+        }];
+        let messages = vec![QsoMessage {
+            timestamp: now,
+            direction: MessageDirection::Sent,
+            message_type: MessageType::Cq {
+                callsign: "W1ABC".to_string(),
+                grid: Some("FN42".to_string()),
+            },
+            raw_text: "CQ W1ABC FN42".to_string(),
+            signal_strength: None,
+            frequency: 1500.0,
+        }];
+        (state_history, messages)
+    }
+
+    #[tokio::test]
+    async fn completed_qso_timeline_persisted_only_when_flag_enabled() {
+        let (state_history, messages) = non_trivial_timeline(Utc::now());
+
+        // Flag off (default): the qsos row must carry an EMPTY timeline,
+        // exactly like the pre-fix hard-coded `vec![]`, and no qso_events
+        // row should exist.
+        let off_config = test_logger_config();
+        let qso_manager = QsoManager::new(QsoManagerConfig::default());
+        let off_logger = QsoLogger::new(off_config, qso_manager.clone())
+            .await
+            .unwrap();
+        let qso_id = Uuid::new_v4();
+        off_logger
+            .handle_qso_completed(
+                qso_id,
+                test_metadata(qso_id, "K1DEF"),
+                state_history.clone(),
+                messages.clone(),
+            )
+            .await
+            .unwrap();
+        let stored = off_logger.database.get_qso(qso_id).await.unwrap();
+        assert!(
+            stored.state_history.is_empty() && stored.messages.is_empty(),
+            "persist_qso_timeline=false must reproduce the old empty-vec behavior"
+        );
+        assert!(
+            off_logger
+                .database
+                .get_qso_timeline(qso_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "persist_qso_timeline=false must not write a qso_events row either"
+        );
+
+        // Flag on: the qsos row AND the qso_events row both carry the real
+        // timeline, byte-for-byte.
+        let mut on_config = test_logger_config();
+        on_config.persist_qso_timeline = true;
+        let qso_manager2 = QsoManager::new(QsoManagerConfig::default());
+        let on_logger = QsoLogger::new(on_config, qso_manager2).await.unwrap();
+        let qso_id2 = Uuid::new_v4();
+        on_logger
+            .handle_qso_completed(
+                qso_id2,
+                test_metadata(qso_id2, "K1DEF"),
+                state_history.clone(),
+                messages.clone(),
+            )
+            .await
+            .unwrap();
+        let stored2 = on_logger.database.get_qso(qso_id2).await.unwrap();
+        assert_eq!(stored2.state_history, state_history);
+        assert_eq!(stored2.messages, messages);
+
+        let timeline = on_logger
+            .database
+            .get_qso_timeline(qso_id2)
+            .await
+            .unwrap()
+            .expect("persist_qso_timeline=true must write a qso_events row too");
+        assert_eq!(timeline.outcome, "completed");
+        assert_eq!(timeline.state_history, state_history);
+        assert_eq!(timeline.messages, messages);
+    }
+
+    #[tokio::test]
+    async fn failed_qso_timeline_persisted_only_when_flag_enabled() {
+        let (state_history, messages) = non_trivial_timeline(Utc::now());
+
+        // Flag off (default): failed QSOs get NO persistent record at all —
+        // matches today's behavior (QsoFailed was never logged anywhere).
+        let off_config = test_logger_config();
+        let qso_manager = QsoManager::new(QsoManagerConfig::default());
+        let off_logger = QsoLogger::new(off_config, qso_manager.clone())
+            .await
+            .unwrap();
+        let qso_id = Uuid::new_v4();
+        off_logger
+            .handle_qso_failed(
+                qso_id,
+                QsoFailureReason::Timeout,
+                test_metadata(qso_id, "K1DEF"),
+                state_history.clone(),
+                messages.clone(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            off_logger
+                .database
+                .get_qso_timeline(qso_id)
+                .await
+                .unwrap()
+                .is_none(),
+            "persist_qso_timeline=false must not persist failed-QSO timelines"
+        );
+        // And it must never leak into the confirmed-contact log either.
+        assert!(off_logger.database.get_qso(qso_id).await.is_err());
+
+        // Flag on: the failed QSO's full timeline round-trips via
+        // qso_events, keyed by qso_id, and the contact log is still
+        // untouched (a Failed QSO is never a logged contact).
+        let mut on_config = test_logger_config();
+        on_config.persist_qso_timeline = true;
+        let qso_manager2 = QsoManager::new(QsoManagerConfig::default());
+        let on_logger = QsoLogger::new(on_config, qso_manager2).await.unwrap();
+        let qso_id2 = Uuid::new_v4();
+        on_logger
+            .handle_qso_failed(
+                qso_id2,
+                QsoFailureReason::Timeout,
+                test_metadata(qso_id2, "K1DEF"),
+                state_history.clone(),
+                messages.clone(),
+            )
+            .await
+            .unwrap();
+
+        let timeline = on_logger
+            .database
+            .get_qso_timeline(qso_id2)
+            .await
+            .unwrap()
+            .expect("persist_qso_timeline=true must persist a failed QSO's timeline");
+        assert_eq!(timeline.outcome, "failed");
+        assert_eq!(timeline.reason.as_deref(), Some("Timeout"));
+        assert_eq!(timeline.callsign.as_deref(), Some("K1DEF"));
+        assert_eq!(timeline.state_history, state_history);
+        assert_eq!(timeline.messages, messages);
+        assert!(
+            on_logger.database.get_qso(qso_id2).await.is_err(),
+            "a failed QSO must never appear in the confirmed-contact `qsos` table"
+        );
     }
 }

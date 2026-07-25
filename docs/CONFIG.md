@@ -221,6 +221,29 @@ for completeness.
 
 ---
 
+### `[database]` — QSO-log persistence
+
+```toml
+[database]
+persist_qso_timeline = false
+```
+
+Off by default. When `true`, a completed or failed QSO's full
+state-transition + message timeline (`QsoProgress.state_history` /
+`.messages` — every rung the QSO climbed and every frame sent/received)
+is persisted so it can be reconstructed offline, keyed by QSO id
+(`QsoDatabase::get_qso_timeline`). Completed QSOs also get the real
+timeline written into the existing `qsos.progress_data` column; failed
+QSOs (which are never logged as contacts) get a row in a separate
+`qso_events` table instead. Leave this off unless you're diagnosing why
+QSOs are failing — the timeline is unbounded per-QSO JSON that
+accumulates for the life of the SQLite index, so enabling it is a
+deliberate storage/IO tradeoff, not a default an operator should pay
+without asking for it. See `docs/observability-diagnostics-plan.md`
+§"Persist the timeline" for the full design rationale.
+
+---
+
 ## `[network]` — external services
 
 QRZ.com, LoTW, eQSL, Clublog, PSKReporter all live under `[network]`.

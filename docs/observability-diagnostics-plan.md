@@ -1,10 +1,14 @@
 # Observability / diagnostics — implementation plan
 
-**Status (2026-07-12): Layer 1 + core Layer 2 shipped PR #84. `tx.policy`-category Layer-1 emission
-+ Layer 3 health panel shipped in this pass (Shift+S).** Remaining: `qso.security`-category Layer-1
-emission (blocked on a real architecture change to the QSO state machine — see
-`project_observability_remaining_layers_scoped` memory), Layer 2's structured Recent-QSOs
-ring/panel, Layer 2's optional per-QSO timeline persistence.
+**Status (2026-07-25): Layer 1 + core Layer 2 shipped PR #84. `tx.policy`-category Layer-1 emission
++ Layer 3 health panel shipped 2026-07-12 (Shift+S). Layer 2's structured Recent-QSOs ring/panel
+shipped (commits 5cdafd17/02699723/51cbcbff). Layer 2's optional per-QSO timeline persistence
+shipped: `state_history`/`messages` now flow through `QsoEvent::QsoCompleted`/`QsoFailed` and are
+persisted — gated behind `[database].persist_qso_timeline` (default off) — into the existing
+`qsos.progress_data` blob for completed QSOs and a new `qso_events` table for failed ones
+(`QsoDatabase::insert_qso_timeline`/`get_qso_timeline`, keyed by `qso_id`).** Remaining:
+`qso.security`-category Layer-1 emission (blocked on a real architecture change to the QSO state
+machine — see `project_observability_remaining_layers_scoped` memory).
 
 Detailed plan to let the operator answer, **without hand-reading the log**: "why did
 that QSO fail?", "why are we retrying / not transmitting?", and "is the station healthy

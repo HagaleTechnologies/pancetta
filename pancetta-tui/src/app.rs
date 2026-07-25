@@ -504,6 +504,41 @@ pub struct DiagnosticEventRecord {
     pub callsign: Option<String>,
 }
 
+/// Terminal outcome of a QSO, mirroring
+/// `pancetta::message_bus::QsoOutcome`. Deliberately a TUI-local type (see
+/// `PlacementSlice` below) — `pancetta-tui` must not depend on the
+/// `pancetta` binary crate; the coordinator's relay layer (`tui_relay.rs`)
+/// converts. `Failed`'s payload reuses `pancetta_qso::QsoFailureReason`
+/// directly since `pancetta-tui` already depends on `pancetta-qso`.
+#[derive(Debug, Clone)]
+pub enum QsoOutcome {
+    /// The QSO reached `QsoState::Completed`.
+    Completed,
+    /// The QSO reached `QsoState::Failed` — carries WHY.
+    Failed(pancetta_qso::QsoFailureReason),
+}
+
+/// One retained terminal-QSO outcome (docs/observability-diagnostics-
+/// plan.md Layer 2 — the Recent-QSOs panel), mirroring
+/// `pancetta::message_bus::RecentQsoOutcome` field-for-field. TUI-local
+/// type (see `QsoOutcome`); relayed from `MessageType::RecentQsoOutcome`
+/// via `TuiMessage::RecentQsoOutcome` into `App::recent_qsos`.
+#[derive(Debug, Clone)]
+pub struct RecentQsoOutcome {
+    /// The DX station's callsign.
+    pub callsign: String,
+    /// How the QSO ended.
+    pub outcome: QsoOutcome,
+    /// Short terminal-state label ("Completed" / "Failed").
+    pub last_state: String,
+    /// Operating frequency in Hz at the time of the outcome.
+    pub freq_hz: u32,
+    /// When the outcome was recorded.
+    pub ts: chrono::DateTime<chrono::Utc>,
+    /// Short human-readable summary lines built from the QSO's metadata.
+    pub brief_timeline: Vec<String>,
+}
+
 /// One scored candidate slice in the TX-placement instrument, mirroring
 /// `pancetta_qso::frequency::FrequencyCandidate` field-for-field (minus
 /// `clear_both_slots`/`noise_floor`, which the instrument doesn't need).
@@ -832,6 +867,12 @@ pub struct App {
     /// QSO outcomes, drops, rejects. Toggled into view alongside the
     /// existing panels; see `ActivePanel`.
     pub diagnostic_events: VecDeque<DiagnosticEventRecord>,
+    /// Retained terminal-QSO outcome history (docs/observability-
+    /// diagnostics-plan.md Layer 2 — the Recent-QSOs panel). Sibling ring
+    /// to `diagnostic_events`, same push-back/evict-oldest ordering, but a
+    /// tighter 50-entry cap (Task 3 renders this; this field is just the
+    /// bounded ring + relay wiring).
+    pub recent_qsos: VecDeque<RecentQsoOutcome>,
     /// Shift+D overlay visibility for `diagnostic_events`.
     pub show_diagnostics: bool,
     /// Shift+S overlay visibility for the consolidated station-health panel
@@ -839,8 +880,16 @@ pub struct App {
     /// `show_diagnostics` (a scrollback), this is a snapshot view — no
     /// scroll-position field needed.
     pub show_health: bool,
+    /// Shift+R overlay visibility for `recent_qsos` (docs/observability-
+    /// diagnostics-plan.md Layer 2 — the Recent-QSOs panel). Sibling toggle
+    /// to `show_diagnostics`; lowercase `r` is taken (Re-send last TX), so
+    /// this uses R.
+    pub show_recent_qsos: bool,
     /// Scroll cursor into `diagnostic_events` while the overlay is open.
     pub diagnostics_scroll: usize,
+    /// Scroll cursor into `recent_qsos` while the overlay is open. Same
+    /// semantics as `diagnostics_scroll`.
+    pub recent_qsos_scroll: usize,
     /// Count of QSOs completed this session (Task 20d). Counted TUI-side
     /// from the diagnostic-event stream that already flows — no new bus
     /// message — by matching the exact completion text the coordinator
@@ -1178,9 +1227,12 @@ impl App {
             status_message: "Pancetta TUI Ready".to_string(),
             theme: config.ui.theme,
             diagnostic_events: VecDeque::with_capacity(500),
+            recent_qsos: VecDeque::with_capacity(50),
             show_diagnostics: false,
             show_health: false,
+            show_recent_qsos: false,
             diagnostics_scroll: 0,
+            recent_qsos_scroll: 0,
             session_completed: 0,
             session_failed: 0,
             session_tx_drops: 0,
@@ -2571,6 +2623,23 @@ impl App {
         }
         if was_at_end || self.show_diagnostics && self.diagnostic_events.len() == 1 {
             self.diagnostics_scroll = self.diagnostic_events.len().saturating_sub(1);
+        }
+    }
+
+    /// Append a retained terminal-QSO outcome, evicting the oldest once the
+    /// bounded ring is full (docs/observability-diagnostics-plan.md Layer
+    /// 2). Same push-back/evict-oldest ordering as `push_diagnostic_event`
+    /// above, at a tighter 50-entry cap, and the same scroll-auto-follow
+    /// behavior (Task 3: the Recent-QSOs panel).
+    pub fn push_recent_qso_outcome(&mut self, outcome: RecentQsoOutcome) {
+        const MAX_RECENT_QSOS: usize = 50;
+        let was_at_end = self.recent_qsos.len().saturating_sub(1) == self.recent_qsos_scroll;
+        self.recent_qsos.push_back(outcome);
+        while self.recent_qsos.len() > MAX_RECENT_QSOS {
+            self.recent_qsos.pop_front();
+        }
+        if was_at_end || self.show_recent_qsos && self.recent_qsos.len() == 1 {
+            self.recent_qsos_scroll = self.recent_qsos.len().saturating_sub(1);
         }
     }
 
@@ -4480,6 +4549,73 @@ mod tests {
             qso_id: None,
             callsign: None,
         }
+    }
+
+    fn fixture_recent_qso(callsign: &str) -> RecentQsoOutcome {
+        RecentQsoOutcome {
+            callsign: callsign.to_string(),
+            outcome: QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 1500,
+            ts: Utc::now(),
+            brief_timeline: vec!["QSO with X logged".to_string()],
+        }
+    }
+
+    /// docs/observability-diagnostics-plan.md Layer 2 (Recent-QSOs panel):
+    /// pushing outcomes grows the retained history, newest at the back
+    /// (matching `push_diagnostic_event`'s ordering), bounded at 50 —
+    /// tighter than `diagnostic_events`'s 500 since these are per-QSO
+    /// terminal events, not per-decode.
+    #[tokio::test]
+    async fn push_recent_qso_outcome_appends_and_bounds_history() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        assert!(app.recent_qsos.is_empty());
+
+        app.push_recent_qso_outcome(fixture_recent_qso("K1ABC"));
+        app.push_recent_qso_outcome(fixture_recent_qso("W2XYZ"));
+        assert_eq!(app.recent_qsos.len(), 2);
+        assert_eq!(app.recent_qsos[0].callsign, "K1ABC");
+        assert_eq!(app.recent_qsos[1].callsign, "W2XYZ");
+
+        for i in 0..60 {
+            app.push_recent_qso_outcome(fixture_recent_qso(&format!("N{i}TEST")));
+        }
+        assert!(
+            app.recent_qsos.len() <= 50,
+            "recent-QSO history must stay bounded, got {}",
+            app.recent_qsos.len()
+        );
+        // The oldest entries must have been evicted.
+        assert!(!app.recent_qsos.iter().any(|e| e.callsign == "K1ABC"));
+    }
+
+    /// Same auto-follow contract as `push_diagnostic_event_auto_follows_
+    /// only_when_at_the_end` (Task 3: the Recent-QSOs panel gets the same
+    /// UX as Diagnostics).
+    #[tokio::test]
+    async fn push_recent_qso_outcome_auto_follows_only_when_at_the_end() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.push_recent_qso_outcome(fixture_recent_qso("K1ABC"));
+        app.push_recent_qso_outcome(fixture_recent_qso("W2XYZ"));
+        assert_eq!(
+            app.recent_qsos_scroll, 1,
+            "cursor starts at the newest entry"
+        );
+
+        app.push_recent_qso_outcome(fixture_recent_qso("N3TEST"));
+        assert_eq!(
+            app.recent_qsos_scroll, 2,
+            "cursor auto-follows when it was at the end"
+        );
+
+        // Operator scrolls back to review history.
+        app.recent_qsos_scroll = 0;
+        app.push_recent_qso_outcome(fixture_recent_qso("K4LMN"));
+        assert_eq!(
+            app.recent_qsos_scroll, 0,
+            "cursor must NOT jump while the operator is scrolled back"
+        );
     }
 
     /// docs/observability-diagnostics-plan.md Layer 1: pushing events grows
