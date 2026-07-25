@@ -423,9 +423,12 @@ git commit -m "refactor(coordinator): widen emit_diagnostic visibility for reuse
   check first with `grep -n "#\[cfg(test)\]" pancetta/src/coordinator/health.rs`.
 
 **Interfaces:**
-- Consumes: Task 1's `get_or_create_channel` (used inside the restarted components' own
-  `start_*_component`, not called directly here), Task 2's `component_restart_policy`, Task 3's
-  `RestartBudget`, Task 4's `emit_diagnostic`.
+- Consumes: Task 1's `get_or_create_channel` — **not yet wired anywhere as of Task 1's commit**;
+  this task's Step 0 below wires it into the 5 restartable components' own `create_channel` call
+  sites, which is what actually makes restart work (a restarted component that still calls the
+  plain `create_channel` will error on re-registration and the "restart" will silently fail every
+  time). Also consumes Task 2's `component_restart_policy`, Task 3's `RestartBudget`, Task 4's
+  `emit_diagnostic`.
 - Produces: the restructured `check_task_handles` dispatches restart via a new private helper:
 
 ```rust
@@ -444,7 +447,24 @@ async fn restart_component(&mut self, id: ComponentId) -> anyhow::Result<()> {
 }
 ```
 
-- [ ] **Step 1: Write the failing integration test**
+- [ ] **Step 1: Wire Task 1's `get_or_create_channel` into the 5 restartable components (do this FIRST — the integration test in Step 2 depends on it to be meaningful)**
+
+Verified current call sites (re-verify line numbers, may have shifted since this plan was
+written): `pancetta/src/coordinator/autonomous.rs:529`, `pancetta/src/coordinator/dx_cluster.rs:26`
+and `:55` (two sites — the disabled-config drain branch and the enabled branch, both create
+`ComponentId::DxCluster`), `pancetta/src/coordinator/psk_reporter.rs:37` and `:85` (same
+disabled/enabled two-site pattern for `ComponentId::PskReporter`),
+`pancetta/src/coordinator/remote_gateway/mod.rs:285`, `pancetta/src/coordinator/qso.rs:1115`.
+
+In each of these 6 call sites, change `.create_channel(ComponentId::X)` to
+`.get_or_create_channel(ComponentId::X)` — mechanical, same `.await?` shape, no other change.
+
+**Do NOT touch** `pancetta/src/coordinator/autonomous.rs:2069` (and its two neighboring
+`create_channel` calls in the same block) — that one is test-fixture setup code for a *different*
+component's test (per its own comment, "`start_autonomous_component` only ever creates its OWN
+channel"), not a restart-path call site.
+
+- [ ] **Step 2: Write the failing integration test**
 
 ```rust
 #[tokio::test]
@@ -454,6 +474,19 @@ async fn panicking_restartable_component_is_restarted_after_backoff() {
     // `fn test_coordinator()`/`fn make_coordinator()` helper and reuse it;
     // do not hand-construct the full struct if a helper already exists).
     let mut coordinator = test_coordinator().await;
+
+    // Pre-create DxCluster's channel, simulating "this component already ran
+    // once" — this is the scenario that actually exercises Step 1's fix.
+    // Without it, this test would pass even if the restart path still called
+    // the plain `create_channel` (a fresh coordinator has no registration
+    // yet, so the first-ever call always succeeds regardless of which method
+    // is used) — the bug this test must catch only manifests on the SECOND
+    // registration attempt for the same ComponentId.
+    coordinator
+        .message_bus
+        .create_channel(ComponentId::DxCluster)
+        .await
+        .unwrap();
 
     // Spawn a fake task under ComponentId::DxCluster that panics immediately.
     let handle = tokio::spawn(async {
@@ -472,6 +505,9 @@ async fn panicking_restartable_component_is_restarted_after_backoff() {
 
     let status = coordinator.component_status.read().await;
     // After a successful restart, the component is Running again, not Failed.
+    // Fails today (even after Step 1) without Step 3's restructure, because
+    // check_task_handles doesn't restart anything yet; fails BEFORE Step 1
+    // with a channel-already-exists error surfaced as a Failed restart.
     assert_eq!(
         status.get(&ComponentId::DxCluster).map(|s| &s.state),
         Some(&ComponentState::Running)
@@ -483,12 +519,12 @@ Adapt this to whatever test-fixture pattern `health.rs` or `mod.rs` already uses
 a coordinator in tests — grep for existing `#[tokio::test]` functions in `health.rs` first and
 mirror their setup exactly rather than inventing a new one.
 
-- [ ] **Step 2: Run test to verify it fails**
+- [ ] **Step 3: Run test to verify it fails**
 
 Run: `cargo test -p pancetta panicking_restartable_component --lib`
 Expected: FAIL — today's `check_task_handles` never restarts, so `state` stays `Failed`.
 
-- [ ] **Step 3: Restructure `check_task_handles`**
+- [ ] **Step 4: Restructure `check_task_handles`**
 
 Replace the by-reference loop with a drain-by-index loop. The key structural change: collect
 indices of finished handles first (immutable borrow), then process them one at a time by
@@ -637,23 +673,23 @@ block. `ComponentCriticality`-based log-level branching from the original code i
 preserved in spirit — if a test pins the exact original log text, keep it, adjusting only what's
 needed for the restructure).
 
-- [ ] **Step 4: Add the `restart_budget` field**
+- [ ] **Step 5: Add the `restart_budget` field**
 
 In `mod.rs`, add `restart_budget: RestartBudget,` to the coordinator struct near
 `named_task_handles` (line 592), and `restart_budget: RestartBudget::new(),` in the constructor
 near `named_task_handles: Vec::new()` (line 1319).
 
-- [ ] **Step 5: Run test to verify it passes**
+- [ ] **Step 6: Run test to verify it passes**
 
 Run: `cargo test -p pancetta panicking_restartable_component --lib`
 Expected: PASS
 
-- [ ] **Step 6: Full workspace check**
+- [ ] **Step 7: Full workspace check**
 
 Run: `cargo test --workspace --features transmit 2>&1 | tail -30`
 Expected: all green, no regressions in existing `health.rs`/`mod.rs` tests.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add pancetta/src/coordinator/health.rs pancetta/src/coordinator/mod.rs
