@@ -62,7 +62,10 @@ that acts on the catch tokio already gives for free.
 ## 3. Current state (grounded in code)
 
 - **Tracking:** `named_task_handles: Vec<(ComponentId, JoinHandle<Result<()>>)>` (`mod.rs:386`);
-  every `start_*_component` pushes one or more handles. 12 `ComponentId`s: Audio, Dsp,
+  every `start_*_component` pushes one or more handles. 15 `ComponentId`s at implementation time
+  (12 originally scoped here plus `Config`, `Coordinator`, and `WsjtxUdp`, discovered when the
+  exhaustive `RestartPolicy` match forced their classification — see the implementation plan):
+  Audio, Dsp,
   Ft8Decoder, Hamlib, Qso, DxCluster, Ft8Transmitter, Autonomous, PskReporter, RemoteGateway,
   StationAgent, Tui.
 - **Detection = polling `is_finished()`, never `.await`.** `check_task_handles` iterates handles

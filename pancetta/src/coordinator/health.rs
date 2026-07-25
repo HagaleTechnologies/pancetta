@@ -600,9 +600,11 @@ impl super::ApplicationCoordinator {
                     }
                     Err(e) => {
                         error!("Component {} restart failed: {}", component_id, e);
-                        let mut status_map = self.component_status.write().await;
-                        if let Some(status) = status_map.get_mut(&component_id) {
-                            status.state = ComponentState::Failed(degradation.to_string());
+                        {
+                            let mut status_map = self.component_status.write().await;
+                            if let Some(status) = status_map.get_mut(&component_id) {
+                                status.state = ComponentState::Failed(degradation.to_string());
+                            }
                         }
                         self.notify_tui_of_failure(component_id, degradation).await;
                     }
