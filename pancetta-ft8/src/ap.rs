@@ -206,7 +206,14 @@ pub fn u16_to_bits_15(value: u16) -> [bool; 15] {
 // ---------------------------------------------------------------------------
 
 /// AP level controlling how much a priori information is injected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// Not `Copy`: `Ap5` carries an owned [`ContentHypothesis`] (a `String` +
+/// bit array), so this enum can no longer be bitwise-duplicated implicitly.
+/// Every call site that used to rely on an implicit copy now clones
+/// explicitly — cheap for the unit variants (Ap0-Ap4, Cq), and only
+/// meaningfully allocates for Ap5, which isn't wired into any decode-loop
+/// hot path yet (see Ap5's doc comment).
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApLevel {
     /// No AP injection.
     Ap0,
@@ -223,6 +230,16 @@ pub enum ApLevel {
     /// AP3 + inject i3 type bits (74-76) as 0,0,1 (i3=1, the "standard
     /// message" family RR73/RRR/73 actually use).
     Ap4,
+    /// Ap3 (own call at 0-27, partner at 29-56) + inject one specific
+    /// enumerated content hypothesis's bits 58-76 (report/token + type).
+    /// Soft injection, same ±AP_LLR_MAGNITUDE convention as every other
+    /// level -- LDPC/CRC can still override a wrong hypothesis, which is
+    /// exactly what makes the survival check (`ap_injection_survived`'s
+    /// `Ap5` arm) meaningful. Unlike Ap0-Ap4 and `Cq`, which are unit
+    /// variants selected once per candidate, `Ap5` needs per-attempt
+    /// data (which hypothesis is being tried this pass), so it carries
+    /// the [`ContentHypothesis`] itself.
+    Ap5(ContentHypothesis),
     /// Decoder-TP-sensitivity Task W2.6 [A/B]: assume this candidate is a
     /// plain "CQ" call. Injects the `to_callsign` field (bits 0-27 + the
     /// bit-28 suffix flag) with the packed "CQ" special token (`pack28`
@@ -750,6 +767,25 @@ pub fn inject_ap_llrs(
             inject_bit(llrs, 76, true ^ xor_bit_at(xor_sequence, 76));
         }
 
+        ApLevel::Ap5(hyp) => {
+            // Same callsign injection as Ap3: own call at bits 0-27
+            // (to_callsign), active QSO partner at bits 29-56
+            // (from_callsign).
+            if let Some(ref my_call) = context.my_call {
+                inject_28_bits(llrs, 0, &my_call.bits, xor_sequence);
+            }
+            if let Some(ref qso) = context.active_qso {
+                inject_28_bits(llrs, 29, &qso.their_bits, xor_sequence);
+            }
+            // Plus the enumerated content hypothesis's bits at payload
+            // positions 58-76 (`ir` + `igrid4` + `i3`) -- the specific
+            // completion content this attempt assumes.
+            for (i, &b) in hyp.content_bits.iter().enumerate() {
+                let pos = CONTENT_FIELD_START_BIT + i;
+                inject_bit(llrs, pos, b ^ xor_bit_at(xor_sequence, pos));
+            }
+        }
+
         ApLevel::Cq => {
             // Context-free: "CQ" is a fixed protocol token, not a personal
             // callsign, so `context` is intentionally unused here.
@@ -942,6 +978,78 @@ mod tests {
         // Bits 57-76 should be untouched
         for i in 57..77 {
             assert_eq!(llrs[i], 0.0, "bit {} should be untouched", i);
+        }
+    }
+
+    #[test]
+    fn ap5_injects_callsigns_and_content_bits() {
+        let my_call = MyCallAp::new("K1ABC").expect("K1ABC should encode");
+        let mut qso =
+            QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).expect("W1AW should encode");
+        qso = qso.with_expected_texts(["K1ABC W1AW RR73"]);
+        let hyps = build_content_hypotheses(&qso);
+        assert_eq!(hyps.len(), 1, "RR73 must produce exactly one hypothesis");
+        let hyp = hyps[0].clone();
+        assert_eq!(hyp.text, "K1ABC W1AW RR73");
+
+        let ctx = ApContext {
+            my_call: Some(my_call.clone()),
+            recent_calls: vec![],
+            active_qso: Some(qso.clone()),
+        };
+
+        let mut llrs = vec![0.0f32; 77];
+        inject_ap_llrs(&mut llrs, ApLevel::Ap5(hyp.clone()), &ctx, None);
+
+        // Bits 0-27: my callsign (K1ABC) -- to_callsign / called station,
+        // same convention as Ap3's own test.
+        for i in 0..28 {
+            let expected_bit = my_call.bits[i];
+            let expected_llr = if expected_bit {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(llrs[i], expected_llr, "bit {} (my call) mismatch", i);
+        }
+
+        // Bit 28 (to_callsign suffix flag gap) untouched.
+        assert_eq!(
+            llrs[28], 0.0,
+            "bit 28 (suffix flag gap) should be untouched"
+        );
+
+        // Bits 29-56: their callsign (W1AW) -- from_callsign / calling
+        // station.
+        for i in 29..57 {
+            let expected_bit = qso.their_bits[i - 29];
+            let expected_llr = if expected_bit {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(llrs[i], expected_llr, "bit {} (their call) mismatch", i);
+        }
+
+        // Bit 57 (gap before the content field at bit 58) untouched.
+        assert_eq!(llrs[57], 0.0, "bit 57 (gap) should be untouched");
+
+        // Bits 58-76: the content hypothesis's bits, same sign convention
+        // (real values from `build_content_hypotheses`, ground-truthed
+        // against the real encoder in Task 1 -- not a placeholder).
+        for i in 0..CONTENT_FIELD_LEN {
+            let expected_bit = hyp.content_bits[i];
+            let expected_llr = if expected_bit {
+                -AP_LLR_MAGNITUDE
+            } else {
+                AP_LLR_MAGNITUDE
+            };
+            assert_eq!(
+                llrs[CONTENT_FIELD_START_BIT + i],
+                expected_llr,
+                "content bit {} mismatch",
+                i
+            );
         }
     }
 
