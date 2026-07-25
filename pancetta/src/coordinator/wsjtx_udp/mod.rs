@@ -29,6 +29,7 @@ use codec::{InMsg, OutMsg};
 use pancetta_config::WsjtxUdpConfig;
 use pancetta_core::DiagnosticLevel;
 use pancetta_ft8::Ft8Message;
+use pancetta_tui::app::{AUDIO_PASSBAND_MAX_HZ, AUDIO_PASSBAND_MIN_HZ};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType, QsoMessage};
 
@@ -911,10 +912,10 @@ pub(crate) struct CallIntent {
     /// message sender otherwise (only CQ/QRZ intents are ever acted on).
     pub(crate) callsign: String,
     /// TX **audio offset** in Hz within the FT8 passband, clamped to
-    /// `[200, 2500]` exactly like the TUI CallStation path
-    /// (`app.rs::get_selected_station`). `StartQso.frequency` is an audio
-    /// offset, NOT an absolute RF frequency — the modulator validates against
-    /// `MAX_FREQUENCY_DEVIATION = 2500 Hz`.
+    /// `[AUDIO_PASSBAND_MIN_HZ, AUDIO_PASSBAND_MAX_HZ]` exactly like the TUI
+    /// CallStation path (`app.rs::get_selected_station`). `StartQso.frequency`
+    /// is an audio offset, NOT an absolute RF frequency — comfortably within
+    /// the modulator's real `MAX_FREQUENCY_DEVIATION` (3100 Hz).
     pub(crate) frequency_hz: u64,
     /// `true` iff the echoed decode is a CQ or QRZ. Only CQ/QRZ intents are
     /// TX-eligible; every other match is refused-with-audit (checked
@@ -971,7 +972,7 @@ pub(crate) fn reply_to_call(
     Some(CallIntent {
         // Reply there: the audio offset where the DX was decoded, clamped into
         // the FT8 passband identically to `app.rs::get_selected_station`.
-        frequency_hz: (key.delta_freq as u64).clamp(200, 2500),
+        frequency_hz: (key.delta_freq as u64).clamp(AUDIO_PASSBAND_MIN_HZ, AUDIO_PASSBAND_MAX_HZ),
         // The decoder's own authoritative parity, carried verbatim off the
         // matched `StoredKey` — never re-derived from `time_ms` here. See
         // `StoredKey::slot_parity` for why re-derivation is unsafe (decode
@@ -1701,6 +1702,47 @@ mod decode_tests {
         assert_eq!(intent.dx_parity, Some(pancetta_core::slot::SlotParity::Odd));
     }
 
+    /// Same regression as `app.rs::get_selected_station` (2026-07-25 on-air
+    /// bug: a station decoded at 2846.9 Hz got silently truncated to 2500 Hz,
+    /// which then broke the QSO engine's frequency-relevance gate). This
+    /// path shares the identical `.clamp(200, 2500)` call (per its own doc
+    /// comment, "exactly like the TUI CallStation path") so it carries the
+    /// same bug. The real modulator ceiling is
+    /// `pancetta_ft8::modulator::MAX_FREQUENCY_DEVIATION` = 3100 Hz, not
+    /// 2500 — the doc comments citing "MAX_FREQUENCY_DEVIATION = 2500 Hz"
+    /// were simply wrong.
+    #[test]
+    fn reply_to_call_high_passband_frequency_not_truncated() {
+        let mut ring: VecDeque<(OutMsg, StoredKey)> = VecDeque::new();
+        let key = StoredKey {
+            time_ms: 12_345,
+            delta_freq: 2847,
+            message: "CQ OM5NU JN98".to_string(),
+            slot_parity: None,
+        };
+        push_decode_ring(
+            &mut ring,
+            (OutMsg::Clear, key.clone()),
+            DECODE_RING_CAPACITY,
+        );
+
+        let reply = InMsg::Reply {
+            time_ms: key.time_ms,
+            snr: 0,
+            delta_time: 0.0,
+            delta_freq: key.delta_freq,
+            mode: "~".to_string(),
+            message: key.message.clone(),
+            low_confidence: false,
+            modifiers: 0,
+        };
+        let intent = reply_to_call(&reply, &ring).expect("Reply must match the retained decode");
+        assert_eq!(
+            intent.frequency_hz, 2847,
+            "a real 2846.9 Hz (rounded 2847) decode must not be truncated down to 2500 Hz"
+        );
+    }
+
     #[test]
     fn push_decode_ring_evicts_oldest_past_capacity() {
         let mut ring: VecDeque<(OutMsg, StoredKey)> = VecDeque::new();
@@ -2091,13 +2133,16 @@ mod reply_tests {
                 .frequency_hz,
             200
         );
-        // Above the passband ceiling → clamped down to 2500.
+        // Above the passband ceiling → clamped down to 3000 (not 2500 — see
+        // AUDIO_PASSBAND_MAX_HZ's doc comment: 2500 was narrower than the
+        // real FT8 passband and silently truncated genuine high-frequency
+        // decodes).
         ring.push_back(stored("CQ N0AX EN10", 30, 9000, None));
         assert_eq!(
             reply_to_call(&reply("CQ N0AX EN10", 30, 9000), &ring)
                 .unwrap()
                 .frequency_hz,
-            2500
+            3000
         );
     }
 
