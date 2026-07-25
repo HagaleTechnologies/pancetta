@@ -10,7 +10,7 @@
 //! Note: serde's `rename_all = "camelCase"` on an internally-tagged enum only
 //! renames the variant tag values, NOT struct-variant field names. Each
 //! multi-word field therefore carries an explicit `#[serde(rename = "...")]`.
-use crate::dto::{DecodedView, DxRow, PendingCall, QsoProgress, Spectrum};
+use crate::dto::{DecodedView, DxRow, PendingCall, Placement, QsoProgress, Spectrum};
 use crate::wire_serde;
 use serde::{Deserialize, Serialize};
 
@@ -50,6 +50,11 @@ pub enum ServerEvent {
     /// `{"event":"spectrum","spectrum":{…}}`. Additive, dispensa Q-0024.
     Spectrum {
         spectrum: Spectrum,
+    },
+    /// Per-window TX-placement/openness ranking — nested as
+    /// `{"event":"placement","placement":{…}}`. Additive, dispensa Q-0026.
+    Placement {
+        placement: Placement,
     },
     TxStatus {
         active: bool,
@@ -177,6 +182,17 @@ mod tests {
                     },
                 },
             ),
+            (
+                "placement",
+                ServerEvent::Placement {
+                    placement: Placement {
+                        slices: vec![],
+                        openness: vec![],
+                        bin_hz: 5.86,
+                        range: (200.0, 3000.0),
+                    },
+                },
+            ),
             ("txStatus", ServerEvent::TxStatus { active: true }),
             (
                 "txPolicy",
@@ -254,5 +270,26 @@ mod tests {
             j.contains(r#""policy":"respondOnly""#),
             "expected respondOnly in: {j}"
         );
+    }
+
+    #[test]
+    fn placement_field_is_camel_case() {
+        let e = ServerEvent::Placement {
+            placement: Placement {
+                slices: vec![crate::dto::PlacementSlice {
+                    offset_hz: 1500.0,
+                    score: 10.0,
+                    clear_first: true,
+                    clear_second: true,
+                }],
+                openness: vec![3],
+                bin_hz: 5.86,
+                range: (200.0, 3000.0),
+            },
+        };
+        let j = serde_json::to_string(&e).unwrap();
+        assert!(j.contains(r#""event":"placement""#), "expected placement tag in: {j}");
+        assert!(j.contains(r#""offsetHz""#), "expected offsetHz in: {j}");
+        assert!(j.contains(r#""binHz""#), "expected binHz in: {j}");
     }
 }
