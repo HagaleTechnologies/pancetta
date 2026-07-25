@@ -217,7 +217,7 @@ impl CqdxClient {
             .await?;
         let resp = self.check_status(resp).await?;
         let body: AuthorizationsResponse = self.checked_json(resp).await?;
-        Ok(body.authorization_edges)
+        Ok(body.authorizations)
     }
 
     pub async fn report_spots(&self, spots: Vec<SpotReport>) -> Result<()> {
@@ -653,7 +653,7 @@ mod tests {
             .and(path("/api/v1/authorizations"))
             .and(header("Authorization", "Bearer pat_test_token"))
             .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-                "authorization_edges": [{
+                "authorizations": [{
                     "id": "auth_1",
                     "agentKeyId": "agent_abc",
                     "clientKeyId": "client_xyz",
@@ -679,7 +679,7 @@ mod tests {
             .and(path("/api/v1/authorizations"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .set_body_json(serde_json::json!({ "authorization_edges": [] })),
+                    .set_body_json(serde_json::json!({ "authorizations": [] })),
             )
             .mount(&server)
             .await;
