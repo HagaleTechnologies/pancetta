@@ -136,6 +136,12 @@ pub enum TuiMessage {
         qso_id: Option<String>,
         callsign: Option<String>,
     },
+    /// A structured, retained terminal-QSO outcome (docs/observability-
+    /// diagnostics-plan.md Layer 2 — the Recent-QSOs panel) — relayed from
+    /// `MessageType::RecentQsoOutcome`. Sibling to `DiagnosticEvent` above:
+    /// appended to `App`'s own bounded ring (`App::recent_qsos`), separate
+    /// from `diagnostic_events`.
+    RecentQsoOutcome(crate::app::RecentQsoOutcome),
     /// Waterfall display data (normalized power rows, each Vec<f32> is one time-slice)
     WaterfallUpdate { rows: Vec<Vec<f32>> },
     /// Live spot groups from cqdx.io
@@ -884,6 +890,9 @@ impl TuiRunner {
                     qso_id,
                     callsign,
                 });
+            }
+            TuiMessage::RecentQsoOutcome(outcome) => {
+                app.push_recent_qso_outcome(outcome);
             }
             TuiMessage::TxPlacementUpdate { view } => {
                 app.apply_placement(view);
@@ -3094,6 +3103,51 @@ mod key_tests {
 
         assert_eq!(app.read().await.session_failed, 1);
         assert_eq!(app.read().await.session_tx_drops, 1);
+    }
+
+    /// Layer 2 Recent-QSOs panel (Task 2): a relayed `RecentQsoOutcome`
+    /// bus message reaches `App.recent_qsos`, and the ring evicts the
+    /// oldest entry once past its 50-entry cap — the relay round-trip
+    /// mirroring `diagnostic_event_qso_completed_increments_session_counter`
+    /// above, but for the new ring instead of the diagnostic scrollback.
+    #[tokio::test]
+    async fn recent_qso_outcome_relays_into_bounded_app_ring() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        assert!(app.read().await.recent_qsos.is_empty());
+
+        r.handle_message(TuiMessage::RecentQsoOutcome(crate::app::RecentQsoOutcome {
+            callsign: "K1ABC".to_string(),
+            outcome: crate::app::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 1500,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["QSO with K1ABC logged".to_string()],
+        }))
+        .await
+        .unwrap();
+        assert_eq!(app.read().await.recent_qsos.len(), 1);
+        assert_eq!(app.read().await.recent_qsos[0].callsign, "K1ABC");
+
+        for i in 0..60 {
+            r.handle_message(TuiMessage::RecentQsoOutcome(crate::app::RecentQsoOutcome {
+                callsign: format!("N{i}TEST"),
+                outcome: crate::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout),
+                last_state: "Failed".to_string(),
+                freq_hz: 1500,
+                ts: chrono::Utc::now(),
+                brief_timeline: vec!["QSO failed: timeout".to_string()],
+            }))
+            .await
+            .unwrap();
+        }
+
+        let recent = app.read().await;
+        assert!(
+            recent.recent_qsos.len() <= 50,
+            "recent-QSO ring must stay bounded, got {}",
+            recent.recent_qsos.len()
+        );
+        assert!(!recent.recent_qsos.iter().any(|e| e.callsign == "K1ABC"));
     }
 
     /// Whole-branch-review fix (finding 1): `TxOffsetUpdate` (the

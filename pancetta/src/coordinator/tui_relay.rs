@@ -597,6 +597,17 @@ impl super::ApplicationCoordinator {
                                 },
                             );
                         }
+                        MessageType::RecentQsoOutcome(ref outcome) => {
+                            // docs/observability-diagnostics-plan.md Layer 2 —
+                            // relay the structured terminal-QSO-outcome stream
+                            // into the TUI's own bounded ring (App::recent_qsos),
+                            // sibling to the DiagnosticEvent relay above.
+                            let _ = tui_msg_tx_relay.send(
+                                pancetta_tui::tui_runner::TuiMessage::RecentQsoOutcome(
+                                    map_recent_qso_outcome(outcome),
+                                ),
+                            );
+                        }
                         MessageType::TxPlacementUpdate { ref snapshot } => {
                             // TX-placement instrument (Task 9/10): convert the
                             // qso-crate PlacementSnapshot into the TUI-local
@@ -2212,6 +2223,31 @@ fn map_qso_snapshot_item(
     }
 }
 
+/// Converts the bus's `RecentQsoOutcome` (docs/observability-diagnostics-
+/// plan.md Layer 2) into the TUI-local mirror type
+/// (`pancetta_tui::app::RecentQsoOutcome`) — `pancetta-tui` must not
+/// depend on the `pancetta` binary crate, so this relay is the only place
+/// the conversion happens (same reasoning as `map_qso_snapshot_item`
+/// above). `QsoFailureReason` is reused unconverted since `pancetta-tui`
+/// already depends on `pancetta-qso` directly.
+fn map_recent_qso_outcome(
+    outcome: &crate::message_bus::RecentQsoOutcome,
+) -> pancetta_tui::app::RecentQsoOutcome {
+    pancetta_tui::app::RecentQsoOutcome {
+        callsign: outcome.callsign.clone(),
+        outcome: match &outcome.outcome {
+            crate::message_bus::QsoOutcome::Completed => pancetta_tui::app::QsoOutcome::Completed,
+            crate::message_bus::QsoOutcome::Failed(reason) => {
+                pancetta_tui::app::QsoOutcome::Failed(reason.clone())
+            }
+        },
+        last_state: outcome.last_state.clone(),
+        freq_hz: outcome.freq_hz,
+        ts: outcome.ts,
+        brief_timeline: outcome.brief_timeline.clone(),
+    }
+}
+
 /// Worked-before check for TUI enrichment (Batch 95).
 ///
 /// Delegates to `CachedStationLookup::is_duplicate` — the exact method
@@ -2387,6 +2423,55 @@ mod tui_relay_tests {
         assert!(banner.report_sent.is_none());
         assert!(banner.report_received.is_none());
         assert_eq!(banner.exchange_count, 0);
+    }
+
+    /// Layer 2 Recent-QSOs relay: a completed outcome carries every field
+    /// through field-for-field, mirroring
+    /// `map_qso_snapshot_item_carries_all_detail_fields` above.
+    #[test]
+    fn map_recent_qso_outcome_carries_completed_fields() {
+        let ts = chrono::Utc::now();
+        let outcome = crate::message_bus::RecentQsoOutcome {
+            callsign: "JA1ABC".to_string(),
+            outcome: crate::message_bus::QsoOutcome::Completed,
+            last_state: "Completed".to_string(),
+            freq_hz: 1500,
+            ts,
+            brief_timeline: vec!["QSO with JA1ABC logged (RST -10/-05)".to_string()],
+        };
+        let mapped = map_recent_qso_outcome(&outcome);
+        assert_eq!(mapped.callsign, "JA1ABC");
+        assert!(matches!(
+            mapped.outcome,
+            pancetta_tui::app::QsoOutcome::Completed
+        ));
+        assert_eq!(mapped.last_state, "Completed");
+        assert_eq!(mapped.freq_hz, 1500);
+        assert_eq!(mapped.ts, ts);
+        assert_eq!(
+            mapped.brief_timeline,
+            vec!["QSO with JA1ABC logged (RST -10/-05)".to_string()]
+        );
+    }
+
+    /// A failed outcome carries its `QsoFailureReason` through unconverted.
+    #[test]
+    fn map_recent_qso_outcome_carries_failure_reason() {
+        let outcome = crate::message_bus::RecentQsoOutcome {
+            callsign: "W2XYZ".to_string(),
+            outcome: crate::message_bus::QsoOutcome::Failed(
+                pancetta_qso::QsoFailureReason::Timeout,
+            ),
+            last_state: "Failed".to_string(),
+            freq_hz: 900,
+            ts: chrono::Utc::now(),
+            brief_timeline: vec!["QSO failed: timeout".to_string()],
+        };
+        let mapped = map_recent_qso_outcome(&outcome);
+        assert!(matches!(
+            mapped.outcome,
+            pancetta_tui::app::QsoOutcome::Failed(pancetta_qso::QsoFailureReason::Timeout)
+        ));
     }
 
     fn sample_status(enabled: bool) -> crate::message_bus::AutonomousStatusData {
