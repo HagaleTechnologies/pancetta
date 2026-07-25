@@ -10,7 +10,9 @@
 //! that enriched context and emits `ServerEvent::decoded(view)` itself.
 
 use pancetta_ft8::DecodedMessage;
-use pancetta_protocol::{DecodedView, PendingCall, QsoProgress, ServerEvent, Spectrum};
+use pancetta_protocol::{
+    DecodedView, PendingCall, Placement, PlacementSlice, QsoProgress, ServerEvent, Spectrum,
+};
 
 use crate::message_bus::{
     ActiveQsoSnapshotItem, MessageType, PendingCallSnapshotItem, RigControlMessage,
@@ -147,6 +149,34 @@ pub(crate) fn spectrum_row_to_event(
     }
 }
 
+/// Convert the qso-crate `PlacementSnapshot` into the wire `placement`
+/// server event (dispensa Q-0026). Field-for-field copy, dropping
+/// `clear_both_slots`/`noise_floor` (local-TUI-only, not part of the agreed
+/// wire contract) — same allocator-sourced data `coordinator/tui_relay.rs`
+/// converts for the local `PlacementView`, so remote and local clients see
+/// identical rankings (single-scorer invariant).
+pub(crate) fn placement_snapshot_to_event(
+    snapshot: &pancetta_qso::frequency::PlacementSnapshot,
+) -> ServerEvent {
+    ServerEvent::Placement {
+        placement: Placement {
+            slices: snapshot
+                .slices
+                .iter()
+                .map(|c| PlacementSlice {
+                    offset_hz: c.offset_hz,
+                    score: c.score,
+                    clear_first: c.clear_first,
+                    clear_second: c.clear_second,
+                })
+                .collect(),
+            openness: snapshot.openness.clone(),
+            bin_hz: snapshot.bin_hz,
+            range: snapshot.range,
+        },
+    }
+}
+
 /// Map enrichment-free `MessageType` variants to `ServerEvent`.
 ///
 /// Returns `None` for every variant that either requires caller-supplied
@@ -172,6 +202,7 @@ pub(crate) fn server_event_from_bus(msg: &MessageType) -> Option<ServerEvent> {
         MessageType::SplitStatus { tx_hz } => Some(ServerEvent::Split { tx_hz: *tx_hz }),
         MessageType::TxStatus { active } => Some(ServerEvent::TxStatus { active: *active }),
         MessageType::ModeStatus { mode } => Some(ServerEvent::Mode { mode: mode.clone() }),
+        MessageType::TxPlacementUpdate { snapshot } => Some(placement_snapshot_to_event(snapshot)),
         _ => None,
     }
 }
@@ -419,5 +450,59 @@ mod tests {
             0.0,
         ));
         assert!(server_event_from_bus(&msg).is_none());
+    }
+
+    // ── placement_snapshot_to_event ──────────────────────────────────────────
+
+    #[test]
+    fn placement_snapshot_to_event_maps_fields_and_drops_local_only_fields() {
+        use pancetta_qso::frequency::{FrequencyCandidate, PlacementSnapshot};
+
+        let snapshot = PlacementSnapshot {
+            slices: vec![FrequencyCandidate {
+                offset_hz: 1500.0,
+                score: 42.5,
+                clear_both_slots: true,
+                clear_first: true,
+                clear_second: true,
+                noise_floor: -120.0,
+            }],
+            openness: vec![3, 2, 0],
+            bin_hz: 5.86,
+            range: (200.0, 3000.0),
+        };
+
+        let event = placement_snapshot_to_event(&snapshot);
+        match event {
+            ServerEvent::Placement { placement } => {
+                assert_eq!(placement.slices.len(), 1);
+                assert_eq!(placement.slices[0].offset_hz, 1500.0);
+                assert_eq!(placement.slices[0].score, 42.5);
+                assert!(placement.slices[0].clear_first);
+                assert!(placement.slices[0].clear_second);
+                assert_eq!(placement.openness, vec![3, 2, 0]);
+                assert_eq!(placement.bin_hz, 5.86);
+                assert_eq!(placement.range, (200.0, 3000.0));
+            }
+            other => panic!("expected Placement, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn server_event_from_bus_handles_tx_placement_update() {
+        use pancetta_qso::frequency::PlacementSnapshot;
+
+        let snapshot = PlacementSnapshot {
+            slices: vec![],
+            openness: vec![],
+            bin_hz: 5.86,
+            range: (200.0, 3000.0),
+        };
+        let msg = MessageType::TxPlacementUpdate { snapshot };
+        let event = server_event_from_bus(&msg);
+        assert!(
+            matches!(event, Some(ServerEvent::Placement { .. })),
+            "expected Some(Placement), got {event:?}"
+        );
     }
 }
