@@ -680,9 +680,16 @@ pub struct ApplicationCoordinator {
     /// when the autonomous component actually starts.
     waterfall_to_auto_rx: Option<crossbeam_channel::Receiver<Vec<Vec<f32>>>>,
 
-    /// Shared active QSO AP state for FT8 AP3/AP4 decoding.
-    /// Updated by the QSO component, read by the FT8 decoder thread.
-    active_qso_ap: std::sync::Arc<std::sync::RwLock<Option<pancetta_ft8::QsoAp>>>,
+    /// Shared active-QSOs AP state for FT8 AP3/AP4/Ap5 decoding.
+    ///
+    /// Task 5 (gap 2/4, docs/ap-decoding-design.md §1): the QSO component
+    /// ranks ALL currently-active QSOs by `PriorityScorer::evaluate_cq` and
+    /// writes the ranked+capped (`Ft8Config::max_ap_qsos`) list here,
+    /// highest-priority first. The FT8 decoder thread reads it and derives
+    /// both `ApContext.active_qsos` (the full list) and the back-compat
+    /// singular `ApContext.active_qso` (`active_qsos.first().cloned()`) from
+    /// the SAME read, so the two can never disagree.
+    active_qso_ap: std::sync::Arc<std::sync::RwLock<Vec<pancetta_ft8::QsoAp>>>,
 
     /// hb-091 scoped fast-path: most recent active QSO partner's audio
     /// frequency in Hz. Updated by the QSO component alongside
@@ -1355,7 +1362,7 @@ impl ApplicationCoordinator {
             cqdx_bridge: None,
             waterfall_to_auto_tx: Some(waterfall_to_auto_tx),
             waterfall_to_auto_rx: Some(waterfall_to_auto_rx),
-            active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            active_qso_ap: std::sync::Arc::new(std::sync::RwLock::new(Vec::new())),
             active_qso_freq_hz: std::sync::Arc::new(std::sync::RwLock::new(None)),
             active_tx_offsets: Arc::new(std::sync::RwLock::new(HashMap::new())),
             fp_filter: std::sync::Arc::new(std::sync::RwLock::new(None)),
