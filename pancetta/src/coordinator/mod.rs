@@ -30,6 +30,7 @@ mod psk_reporter;
 mod qso;
 mod qso_filter;
 mod remote_gateway;
+mod restart_budget;
 mod shutdown;
 pub mod station_agent;
 mod tier;
