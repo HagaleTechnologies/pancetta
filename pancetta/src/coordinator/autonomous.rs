@@ -526,7 +526,7 @@ impl super::ApplicationCoordinator {
 
         let (_auto_tx, auto_rx) = self
             .message_bus
-            .create_channel(ComponentId::Autonomous)
+            .get_or_create_channel(ComponentId::Autonomous)
             .await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();

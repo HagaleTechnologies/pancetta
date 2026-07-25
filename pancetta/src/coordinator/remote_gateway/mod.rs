@@ -282,7 +282,7 @@ impl super::ApplicationCoordinator {
 
         let (_gw_tx, gw_rx) = self
             .message_bus
-            .create_channel(ComponentId::RemoteGateway)
+            .get_or_create_channel(ComponentId::RemoteGateway)
             .await?;
 
         if !wants_feed {

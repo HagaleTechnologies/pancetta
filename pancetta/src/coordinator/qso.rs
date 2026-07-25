@@ -1112,7 +1112,10 @@ impl super::ApplicationCoordinator {
 
         info!("Starting QSO component");
 
-        let (_qso_tx, qso_rx) = self.message_bus.create_channel(ComponentId::Qso).await?;
+        let (_qso_tx, qso_rx) = self
+            .message_bus
+            .get_or_create_channel(ComponentId::Qso)
+            .await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
 

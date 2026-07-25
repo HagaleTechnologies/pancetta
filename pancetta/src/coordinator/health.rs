@@ -6,8 +6,8 @@ use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    component_criticality, degradation_message, ComponentCriticality, ComponentState,
-    ComponentStatus,
+    component_criticality, component_restart_policy, degradation_message, ComponentCriticality,
+    ComponentState, ComponentStatus, RestartPolicy,
 };
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
@@ -440,76 +440,205 @@ impl super::ApplicationCoordinator {
     /// application. Critical components are logged at error level, others
     /// at warn level.
     pub(crate) async fn check_task_handles(&mut self) {
-        for (component_id, handle) in &self.named_task_handles {
-            // Skip coordinator's own tasks and already-known failures
-            if *component_id == ComponentId::Coordinator {
-                continue;
-            }
+        // Collect indices of finished, non-Coordinator handles first (a
+        // read-only pass over `named_task_handles` by reference). We must
+        // NOT restart a component while still holding this by-reference
+        // iteration: restart dispatch needs `&mut self` (it pushes a new
+        // handle back onto `named_task_handles` via the component's own
+        // `start_*_component`), which would conflict with an outstanding
+        // shared borrow of the vector. So instead we collect indices here,
+        // drop the borrow, then remove-and-process one at a time below.
+        let finished_indices: Vec<usize> = self
+            .named_task_handles
+            .iter()
+            .enumerate()
+            .filter(|(_, (id, handle))| *id != ComponentId::Coordinator && handle.is_finished())
+            .map(|(i, _)| i)
+            .collect();
 
+        // Remove from the back forward so earlier indices stay valid as
+        // later ones are removed.
+        for &i in finished_indices.iter().rev() {
+            let (component_id, handle) = self.named_task_handles.remove(i);
+            self.handle_finished_task(component_id, handle).await;
+        }
+
+        // Unchanged: update last_seen for still-running handles.
+        for (component_id, handle) in &self.named_task_handles {
             if !handle.is_finished() {
-                // Task is still running -- update last_seen
                 let mut status_map = self.component_status.write().await;
                 if let Some(status) = status_map.get_mut(component_id) {
                     if status.state == ComponentState::Running {
                         status.last_seen = Instant::now();
                     }
                 }
-                continue;
             }
+        }
+    }
 
-            // Task has finished -- check if we already know about it
+    /// Handle a single finished (no longer running) task: classify the
+    /// outcome, apply the Hamlib PTT-off safety behavior verbatim, and
+    /// either dispatch a restart (Task 2's `component_restart_policy` +
+    /// Task 3's `RestartBudget`) or degrade to `Failed`, exactly as the
+    /// pre-restructure `check_task_handles` did for every non-restartable
+    /// component.
+    async fn handle_finished_task(
+        &mut self,
+        component_id: ComponentId,
+        handle: tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let outcome = handle.await;
+        let is_clean_exit = matches!(outcome, Ok(Ok(())));
+
+        {
             let mut status_map = self.component_status.write().await;
             let status = status_map
-                .entry(*component_id)
+                .entry(component_id)
                 .or_insert_with(ComponentStatus::new_running);
-
             if status.state != ComponentState::Running {
-                // Already recorded this failure
-                continue;
+                // Already recorded this failure/restart-exhaustion.
+                return;
             }
-
-            // First time seeing this component as finished
-            let degradation = degradation_message(*component_id);
-            let criticality = component_criticality(*component_id);
-
             status.error_count += 1;
-            status.state = ComponentState::Failed(degradation.to_string());
+        }
 
-            match criticality {
-                ComponentCriticality::Important => {
-                    error!(
-                        "CRITICAL component {} has stopped unexpectedly: {}",
-                        component_id, degradation
-                    );
-                }
-                ComponentCriticality::NonCritical => {
-                    warn!("Component {} has stopped: {}", component_id, degradation);
-                }
-            }
+        if is_clean_exit {
+            // Intentional exit (e.g. a disabled component's drain task) --
+            // do not restart, do not mark Failed either. Log at info, not
+            // warn/error.
+            info!("Component {} exited cleanly, not restarting", component_id);
+            return;
+        }
 
-            // For Hamlib failure: ensure PTT defaults to off for safety
-            if *component_id == ComponentId::Hamlib {
-                warn!("PTT safety: forcing PTT off due to Hamlib disconnect");
-                let ptt_off_msg = ComponentMessage::new(
-                    ComponentId::Coordinator,
-                    ComponentId::Hamlib,
-                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
-                        state: false,
-                    }),
-                    Instant::now(),
-                );
-                // Best-effort: channel may be disconnected
-                let _ = self.message_bus.send_message(ptt_off_msg).await;
-            }
+        let degradation = degradation_message(component_id);
 
-            // Notify TUI of the component failure
-            let error_msg = ComponentMessage::new(
+        // For Hamlib failure: ensure PTT defaults to off for safety.
+        // Preserved verbatim from the pre-restructure logic.
+        if component_id == ComponentId::Hamlib {
+            warn!("PTT safety: forcing PTT off due to Hamlib disconnect");
+            let ptt_off_msg = ComponentMessage::new(
                 ComponentId::Coordinator,
-                ComponentId::Tui,
-                MessageType::StatusUpdate(format!("{}: {}", component_id, degradation)),
+                ComponentId::Hamlib,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                    state: false,
+                }),
                 Instant::now(),
             );
-            let _ = self.message_bus.send_message(error_msg).await;
+            // Best-effort: channel may be disconnected
+            let _ = self.message_bus.send_message(ptt_off_msg).await;
+        }
+
+        match component_restart_policy(component_id) {
+            RestartPolicy::Restartable
+                if self
+                    .restart_budget
+                    .may_restart(component_id, Instant::now()) =>
+            {
+                let backoff = self
+                    .restart_budget
+                    .record_attempt_and_backoff(component_id, Instant::now());
+                crate::coordinator::tx::emit_diagnostic(
+                    &self.message_bus,
+                    "supervisor",
+                    pancetta_core::DiagnosticLevel::Warn,
+                    format!(
+                        "{} {} -- restarting in {:?}",
+                        component_id, degradation, backoff
+                    ),
+                    None,
+                )
+                .await;
+                tokio::time::sleep(backoff).await;
+                match self.restart_component(component_id).await {
+                    Ok(()) => {
+                        info!("Component {} restarted successfully", component_id);
+                    }
+                    Err(e) => {
+                        error!("Component {} restart failed: {}", component_id, e);
+                        let mut status_map = self.component_status.write().await;
+                        if let Some(status) = status_map.get_mut(&component_id) {
+                            status.state = ComponentState::Failed(degradation.to_string());
+                        }
+                        self.notify_tui_of_failure(component_id, degradation).await;
+                    }
+                }
+            }
+            RestartPolicy::Restartable => {
+                // Budget exhausted -- degrade instead of restarting again.
+                warn!(
+                    "Component {} exceeded restart budget -- degrading",
+                    component_id
+                );
+                crate::coordinator::tx::emit_diagnostic(
+                    &self.message_bus,
+                    "supervisor",
+                    pancetta_core::DiagnosticLevel::Error,
+                    format!(
+                        "{} restarted too many times -- giving up, needs a manual restart",
+                        component_id
+                    ),
+                    None,
+                )
+                .await;
+                let mut status_map = self.component_status.write().await;
+                if let Some(status) = status_map.get_mut(&component_id) {
+                    status.state = ComponentState::Failed(degradation.to_string());
+                }
+                drop(status_map);
+                self.notify_tui_of_failure(component_id, degradation).await;
+            }
+            RestartPolicy::DegradeOnly | RestartPolicy::FatalAbort => {
+                // ComponentCriticality-based log-level split, preserved
+                // from the pre-restructure behavior.
+                match component_criticality(component_id) {
+                    ComponentCriticality::Important => {
+                        error!(
+                            "CRITICAL component {} has stopped unexpectedly: {}",
+                            component_id, degradation
+                        );
+                    }
+                    ComponentCriticality::NonCritical => {
+                        warn!("Component {} has stopped: {}", component_id, degradation);
+                    }
+                }
+                let mut status_map = self.component_status.write().await;
+                if let Some(status) = status_map.get_mut(&component_id) {
+                    status.state = ComponentState::Failed(degradation.to_string());
+                }
+                drop(status_map);
+                self.notify_tui_of_failure(component_id, degradation).await;
+            }
+        }
+    }
+
+    /// Best-effort immediate TUI notification of a component transitioning
+    /// to `Failed`, preserved from the pre-restructure `check_task_handles`
+    /// (which sent this for every finished, non-restartable component).
+    /// The 5s periodic health-summary tick (`start_health_monitor`) also
+    /// reports any `Failed` component, so this is a lower-latency nudge,
+    /// not the only path.
+    async fn notify_tui_of_failure(&self, component_id: ComponentId, degradation: &str) {
+        let error_msg = ComponentMessage::new(
+            ComponentId::Coordinator,
+            ComponentId::Tui,
+            MessageType::StatusUpdate(format!("{}: {}", component_id, degradation)),
+            Instant::now(),
+        );
+        let _ = self.message_bus.send_message(error_msg).await;
+    }
+
+    /// Re-invoke the given component's start method. Only the 5 components
+    /// this plan covers are wired; anything else reaching here is a bug
+    /// (Task 2's `component_restart_policy` should have already routed it
+    /// to `DegradeOnly`).
+    async fn restart_component(&mut self, id: ComponentId) -> Result<()> {
+        match id {
+            ComponentId::Autonomous => self.start_autonomous_component().await,
+            ComponentId::DxCluster => self.start_dx_cluster_component().await,
+            ComponentId::PskReporter => self.start_pskreporter_component().await,
+            ComponentId::RemoteGateway => self.start_remote_gateway_component().await,
+            ComponentId::Qso => self.start_qso_component().await,
+            other => anyhow::bail!("restart_component called for non-restartable {other}"),
         }
     }
 
@@ -547,6 +676,97 @@ impl super::ApplicationCoordinator {
             message_count,
             audio_status,
             decode_status
+        );
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::super::ApplicationCoordinator;
+    use crate::message_bus::ComponentId;
+    use pancetta_config::Config;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    /// Mirrors the direct-construction pattern used by `mod.rs`'s
+    /// `test_coordinator_creation` / `autonomous.rs`'s `build_coordinator`:
+    /// `Config::default()`, `no_audio=true`, `headless=true`. No shared
+    /// helper exists yet for `health.rs` (this is its first test module),
+    /// so this is a local copy of that same pattern rather than a new one.
+    async fn test_coordinator() -> ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// Task 5's central regression guard. DxCluster is `Restartable`
+    /// (Task 2's `component_restart_policy`) so a panicking task under
+    /// `ComponentId::DxCluster` must be restarted, not just marked
+    /// `Failed`, by `check_task_handles`.
+    ///
+    /// The pre-created channel is the load-bearing part of this test: it
+    /// simulates "this component already ran once" so the restart path
+    /// exercises the SECOND registration for `ComponentId::DxCluster`.
+    /// `Config::default()` has DX cluster disabled, so the real
+    /// `start_dx_cluster_component` restart call takes its cheap
+    /// disabled-branch return (channel re-create + immediate `Ok(())`),
+    /// no network I/O — safe to invoke as the actual production entry
+    /// point rather than a fixture stand-in. Before Task 1's
+    /// `get_or_create_channel` wiring (Step 1 above), this second
+    /// registration would error with "Channel already exists" and the
+    /// restart would silently fail, leaving the component `Failed`.
+    #[tokio::test]
+    async fn panicking_restartable_component_is_restarted_after_backoff() {
+        let mut coordinator = test_coordinator().await;
+
+        // Pre-create DxCluster's channel, simulating "this component
+        // already ran once".
+        coordinator
+            .message_bus
+            .create_channel(ComponentId::DxCluster)
+            .await
+            .unwrap();
+
+        // Spawn a fake task under ComponentId::DxCluster that panics
+        // immediately.
+        let handle = tokio::spawn(async {
+            panic!("injected test panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        coordinator
+            .named_task_handles
+            .push((ComponentId::DxCluster, handle));
+
+        // Give the spawned task a chance to actually panic and finish
+        // before polling — `tokio::spawn` does not guarantee the task has
+        // run by the time control returns here, so without this the poll
+        // below can race and see `is_finished() == false`.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // First poll: detects the panic, classifies it, restarts.
+        coordinator.check_task_handles().await;
+
+        let status = coordinator.component_status.read().await;
+        // After a successful restart, the component is Running again, not
+        // Failed.
+        assert_eq!(
+            status.get(&ComponentId::DxCluster).map(|s| &s.state),
+            Some(&super::ComponentState::Running)
         );
     }
 }

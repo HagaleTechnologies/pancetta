@@ -573,6 +573,7 @@ use tracing::{error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
+use restart_budget::RestartBudget;
 use util::resample_linear;
 
 /// Application coordinator that manages all Pancetta components
@@ -591,6 +592,10 @@ pub struct ApplicationCoordinator {
 
     /// Named component task handles for health monitoring
     named_task_handles: Vec<(ComponentId, JoinHandle<Result<()>>)>,
+
+    /// Restart bookkeeping (rolling-window budget + capped-exponential
+    /// backoff) for the supervisor's `check_task_handles` restart dispatch.
+    restart_budget: RestartBudget,
 
     /// Component health status map (shared with health monitor task)
     component_status: Arc<RwLock<HashMap<ComponentId, ComponentStatus>>>,
@@ -1361,6 +1366,7 @@ impl ApplicationCoordinator {
             message_bus,
             ft8_decoder: None,
             named_task_handles: Vec::new(),
+            restart_budget: RestartBudget::new(),
             component_status: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(AtomicBool::new(false)),
             shutdown_signal,
