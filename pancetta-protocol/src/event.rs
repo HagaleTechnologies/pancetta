@@ -288,7 +288,10 @@ mod tests {
             },
         };
         let j = serde_json::to_string(&e).unwrap();
-        assert!(j.contains(r#""event":"placement""#), "expected placement tag in: {j}");
+        assert!(
+            j.contains(r#""event":"placement""#),
+            "expected placement tag in: {j}"
+        );
         assert!(j.contains(r#""offsetHz""#), "expected offsetHz in: {j}");
         assert!(j.contains(r#""binHz""#), "expected binHz in: {j}");
     }

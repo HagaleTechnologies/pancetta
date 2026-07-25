@@ -291,11 +291,23 @@ mod tests {
             range: (200.0, 3000.0),
         };
         let j = serde_json::to_string(&p).unwrap();
-        assert!(j.contains(r#""offsetHz":1500.0"#), "expected offsetHz in: {j}");
-        assert!(j.contains(r#""clearFirst":true"#), "expected clearFirst in: {j}");
-        assert!(j.contains(r#""clearSecond":false"#), "expected clearSecond in: {j}");
+        assert!(
+            j.contains(r#""offsetHz":1500.0"#),
+            "expected offsetHz in: {j}"
+        );
+        assert!(
+            j.contains(r#""clearFirst":true"#),
+            "expected clearFirst in: {j}"
+        );
+        assert!(
+            j.contains(r#""clearSecond":false"#),
+            "expected clearSecond in: {j}"
+        );
         assert!(j.contains(r#""binHz":5.86"#), "expected binHz in: {j}");
-        assert!(j.contains(r#""range":[200.0,3000.0]"#), "expected range array in: {j}");
+        assert!(
+            j.contains(r#""range":[200.0,3000.0]"#),
+            "expected range array in: {j}"
+        );
         let round: Placement = serde_json::from_str(&j).unwrap();
         assert_eq!(round, p);
     }
