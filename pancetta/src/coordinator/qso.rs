@@ -1050,6 +1050,7 @@ fn failure_reason_text(reason: &pancetta_qso::QsoFailureReason) -> String {
         R::Superseded => "superseded by a newer call".to_string(),
         R::StationQrt => "station went QRT".to_string(),
         R::ProtocolError(e) => format!("protocol error: {e}"),
+        R::SupervisorRestart => "dropped by an internal restart".to_string(),
     }
 }
 
@@ -1112,7 +1113,10 @@ impl super::ApplicationCoordinator {
 
         info!("Starting QSO component");
 
-        let (_qso_tx, qso_rx) = self.message_bus.create_channel(ComponentId::Qso).await?;
+        let (_qso_tx, qso_rx) = self
+            .message_bus
+            .get_or_create_channel(ComponentId::Qso)
+            .await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
 
@@ -1258,6 +1262,11 @@ impl super::ApplicationCoordinator {
         };
 
         let mut qso_manager = pancetta_qso::QsoManager::new(qso_config);
+        // Task 6 (task-supervision): store a cheap Arc-based handle clone so
+        // the task supervisor (health.rs) can still enumerate and fail
+        // in-flight QSOs after this component's task panics and dies. See
+        // the field's doc-comment in mod.rs for why the clone stays valid.
+        self.qso_manager_for_supervisor = Some(qso_manager.clone());
         // Share the rig dial-frequency source so completed QSOs log the
         // real RF frequency (dial + audio offset), not the bare offset
         // (was producing ADIF FREQ ~0.001 / BAND 0MHZ).

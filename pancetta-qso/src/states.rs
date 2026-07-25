@@ -166,6 +166,12 @@ pub enum QsoFailureReason {
 
     /// Protocol error
     ProtocolError(String),
+
+    /// The QSO engine's task was restarted by the coordinator's supervisor
+    /// (a panic or crash mid-QSO), dropping this QSO's in-flight state. Not
+    /// the operator's or the DX station's fault — surfaced distinctly so
+    /// the Recent-QSOs panel doesn't misattribute it as e.g. a Timeout.
+    SupervisorRestart,
 }
 
 /// FT8 message types used in QSO flow
@@ -1014,5 +1020,23 @@ mod tests {
         assert!(!msg.is_addressed_to("K1DEF"));
         assert!(msg.is_from("K1DEF"));
         assert!(!msg.is_from("W1ABC"));
+    }
+
+    #[test]
+    fn supervisor_restart_is_a_qso_failure_reason() {
+        // Mirrors the other QsoFailureReason variants' coverage: PartialEq
+        // (compared elsewhere via assert_eq! on emitted QsoFailed events)
+        // and that it round-trips through the Failed state exactly like
+        // every other reason (see test_ladder_view_terminal_none above).
+        let reason = QsoFailureReason::SupervisorRestart;
+        assert_eq!(reason, QsoFailureReason::SupervisorRestart);
+        assert_ne!(reason, QsoFailureReason::Timeout);
+
+        let failed = QsoState::Failed {
+            reason: QsoFailureReason::SupervisorRestart,
+            failed_at: Utc::now(),
+            last_state: Box::new(QsoState::Idle),
+        };
+        assert!(failed.ladder_view(QsoRole::Caller).is_none());
     }
 }

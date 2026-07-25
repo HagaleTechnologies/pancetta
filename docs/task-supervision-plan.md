@@ -1,5 +1,11 @@
 # Task supervision / crash recovery — implementation plan
 
+**Superseded (2026-07-25):** this doc's research and touch points are correct and are folded
+into `docs/superpowers/specs/2026-07-25-task-supervision-design.md`, which is now authoritative
+and resolves this doc's three open questions (retry-budget thresholds, QSO-drop surfacing,
+RestartPolicy split confirmation). Read that spec first; kept here for the original research
+detail.
+
 Detailed plan to make the coordinator **restart a dead component task** (with backoff and
 policy) instead of leaving the station degraded until a human restarts the whole app.
 **Plan only — no code here.** Grounded in the current code.

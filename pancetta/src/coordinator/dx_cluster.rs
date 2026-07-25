@@ -23,7 +23,7 @@ impl super::ApplicationCoordinator {
             // Still create channel so message bus doesn't complain
             let _ = self
                 .message_bus
-                .create_channel(ComponentId::DxCluster)
+                .get_or_create_channel(ComponentId::DxCluster)
                 .await?;
             return Ok(());
         }
@@ -52,7 +52,7 @@ impl super::ApplicationCoordinator {
 
         let (_dx_tx, _dx_rx) = self
             .message_bus
-            .create_channel(ComponentId::DxCluster)
+            .get_or_create_channel(ComponentId::DxCluster)
             .await?;
         let message_bus = self.message_bus.clone();
 

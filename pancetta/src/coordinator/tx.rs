@@ -968,7 +968,7 @@ async fn emit_tx_failure_diagnostic(
 /// `target:` (the tracing one gates file-log visibility via `EnvFilter`; this
 /// one is just a TUI-side label used for filtering the Diagnostics panel).
 /// Best-effort: never blocks or fails the TX path.
-async fn emit_diagnostic(
+pub(crate) async fn emit_diagnostic(
     message_bus: &MessageBus,
     target: &'static str,
     level: pancetta_core::DiagnosticLevel,

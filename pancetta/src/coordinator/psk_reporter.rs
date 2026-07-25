@@ -34,7 +34,7 @@ impl super::ApplicationCoordinator {
             // channel stays open but messages are silently discarded.
             let (_drain_tx, drain_rx) = self
                 .message_bus
-                .create_channel(ComponentId::PskReporter)
+                .get_or_create_channel(ComponentId::PskReporter)
                 .await?;
             let shutdown = self.shutdown_signal.clone();
             let drain_handle = tokio::spawn(async move {
@@ -82,7 +82,7 @@ impl super::ApplicationCoordinator {
 
         let (_psk_tx, psk_rx) = self
             .message_bus
-            .create_channel(ComponentId::PskReporter)
+            .get_or_create_channel(ComponentId::PskReporter)
             .await?;
 
         let psk_operating_freq = self.operating_frequency_hz.clone();

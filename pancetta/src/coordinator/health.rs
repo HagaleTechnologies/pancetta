@@ -6,8 +6,8 @@ use tokio::time::{interval, sleep};
 use tracing::{debug, error, info, warn};
 
 use super::{
-    component_criticality, degradation_message, ComponentCriticality, ComponentState,
-    ComponentStatus,
+    component_criticality, component_restart_policy, degradation_message, ComponentCriticality,
+    ComponentState, ComponentStatus, RestartPolicy,
 };
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
@@ -440,76 +440,252 @@ impl super::ApplicationCoordinator {
     /// application. Critical components are logged at error level, others
     /// at warn level.
     pub(crate) async fn check_task_handles(&mut self) {
-        for (component_id, handle) in &self.named_task_handles {
-            // Skip coordinator's own tasks and already-known failures
-            if *component_id == ComponentId::Coordinator {
-                continue;
-            }
+        // Collect indices of finished, non-Coordinator handles first (a
+        // read-only pass over `named_task_handles` by reference). We must
+        // NOT restart a component while still holding this by-reference
+        // iteration: restart dispatch needs `&mut self` (it pushes a new
+        // handle back onto `named_task_handles` via the component's own
+        // `start_*_component`), which would conflict with an outstanding
+        // shared borrow of the vector. So instead we collect indices here,
+        // drop the borrow, then remove-and-process one at a time below.
+        let finished_indices: Vec<usize> = self
+            .named_task_handles
+            .iter()
+            .enumerate()
+            .filter(|(_, (id, handle))| *id != ComponentId::Coordinator && handle.is_finished())
+            .map(|(i, _)| i)
+            .collect();
 
+        // Remove from the back forward so earlier indices stay valid as
+        // later ones are removed.
+        for &i in finished_indices.iter().rev() {
+            let (component_id, handle) = self.named_task_handles.remove(i);
+            self.handle_finished_task(component_id, handle).await;
+        }
+
+        // Unchanged: update last_seen for still-running handles.
+        for (component_id, handle) in &self.named_task_handles {
             if !handle.is_finished() {
-                // Task is still running -- update last_seen
                 let mut status_map = self.component_status.write().await;
                 if let Some(status) = status_map.get_mut(component_id) {
                     if status.state == ComponentState::Running {
                         status.last_seen = Instant::now();
                     }
                 }
-                continue;
             }
+        }
+    }
 
-            // Task has finished -- check if we already know about it
+    /// Handle a single finished (no longer running) task: classify the
+    /// outcome, apply the Hamlib PTT-off safety behavior verbatim, and
+    /// either dispatch a restart (Task 2's `component_restart_policy` +
+    /// Task 3's `RestartBudget`) or degrade to `Failed`, exactly as the
+    /// pre-restructure `check_task_handles` did for every non-restartable
+    /// component.
+    async fn handle_finished_task(
+        &mut self,
+        component_id: ComponentId,
+        handle: tokio::task::JoinHandle<Result<()>>,
+    ) {
+        let outcome = handle.await;
+        let is_clean_exit = matches!(outcome, Ok(Ok(())));
+
+        {
             let mut status_map = self.component_status.write().await;
             let status = status_map
-                .entry(*component_id)
+                .entry(component_id)
                 .or_insert_with(ComponentStatus::new_running);
-
             if status.state != ComponentState::Running {
-                // Already recorded this failure
-                continue;
+                // Already recorded this failure/restart-exhaustion.
+                return;
             }
-
-            // First time seeing this component as finished
-            let degradation = degradation_message(*component_id);
-            let criticality = component_criticality(*component_id);
-
             status.error_count += 1;
-            status.state = ComponentState::Failed(degradation.to_string());
+        }
 
-            match criticality {
-                ComponentCriticality::Important => {
-                    error!(
-                        "CRITICAL component {} has stopped unexpectedly: {}",
-                        component_id, degradation
-                    );
-                }
-                ComponentCriticality::NonCritical => {
-                    warn!("Component {} has stopped: {}", component_id, degradation);
-                }
-            }
+        if is_clean_exit {
+            // Intentional exit (e.g. a disabled component's drain task) --
+            // do not restart, do not mark Failed either. Log at info, not
+            // warn/error.
+            info!("Component {} exited cleanly, not restarting", component_id);
+            return;
+        }
 
-            // For Hamlib failure: ensure PTT defaults to off for safety
-            if *component_id == ComponentId::Hamlib {
-                warn!("PTT safety: forcing PTT off due to Hamlib disconnect");
-                let ptt_off_msg = ComponentMessage::new(
-                    ComponentId::Coordinator,
-                    ComponentId::Hamlib,
-                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
-                        state: false,
-                    }),
-                    Instant::now(),
-                );
-                // Best-effort: channel may be disconnected
-                let _ = self.message_bus.send_message(ptt_off_msg).await;
-            }
+        let degradation = degradation_message(component_id);
 
-            // Notify TUI of the component failure
-            let error_msg = ComponentMessage::new(
+        // For Hamlib failure: ensure PTT defaults to off for safety.
+        // Preserved verbatim from the pre-restructure logic.
+        if component_id == ComponentId::Hamlib {
+            warn!("PTT safety: forcing PTT off due to Hamlib disconnect");
+            let ptt_off_msg = ComponentMessage::new(
                 ComponentId::Coordinator,
-                ComponentId::Tui,
-                MessageType::StatusUpdate(format!("{}: {}", component_id, degradation)),
+                ComponentId::Hamlib,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                    state: false,
+                }),
                 Instant::now(),
             );
-            let _ = self.message_bus.send_message(error_msg).await;
+            // Best-effort: channel may be disconnected
+            let _ = self.message_bus.send_message(ptt_off_msg).await;
+        }
+
+        // Task 6 (task-supervision): a crashed Qso-component task drops
+        // whatever QSOs were in-flight at that moment -- the fresh
+        // `QsoManager` a restart constructs starts with an empty map, so
+        // without this those QSOs would just silently vanish from the
+        // operator's view. Surface each as `QsoFailed{SupervisorRestart}`
+        // through the manager's real state machine (`fail_qso`), reading off
+        // the cheap `Arc`-backed clone the coordinator stashed at
+        // `start_qso_component` time -- that clone shares the crashed
+        // task's `qsos` map and stays valid/readable regardless of whether
+        // the restart below actually happens (budget-exhausted degrade
+        // still means the in-flight QSOs are gone). Runs before the restart
+        // dispatch so this fires exactly once per crash, not once per
+        // (possibly repeated) restart attempt.
+        //
+        // Fix-review followup (2026-07-25): this MUST run on the pre-restart
+        // stashed clone, and MUST run before `restart_component` below --
+        // do not "fix" this into restart-then-fail. `fail_qso` looks the
+        // QSO up in the clone's OWN `qsos` map; a post-restart `QsoManager`
+        // is a fresh `QsoManager::new()` with an empty map (and its own new
+        // `event_sender`), so calling `fail_qso` on it for a pre-restart
+        // qso_id would silently no-op -- no manager instance both knows the
+        // QSO's metadata and feeds a guaranteed-fresh subscriber. This is
+        // safe as-is because the `QsoFailed` broadcast's real consumer -- the
+        // `tokio::spawn`ed forwarder inside `start_qso_component`
+        // (qso.rs ~L1583) that relays it to `MessageType::RecentQsoOutcome`
+        // -- is a genuinely independent task (its `JoinHandle` is discarded,
+        // never `.abort()`-ed), so it survives the "outer" Qso task's panic
+        // per tokio's task-independence guarantee and stays subscribed to
+        // the SAME `event_sender` this stashed clone shares (every
+        // `QsoManager::clone()` shares one `Arc`-backed `qsos` map and one
+        // `broadcast::Sender`). Proved end-to-end (real `start_qso_component`,
+        // real forwarder, real Tui bus channel -- not a fresh test
+        // subscriber) by
+        // `qso_restart_delivers_recent_qso_outcome_through_the_real_forwarder`
+        // below.
+        if component_id == ComponentId::Qso {
+            if let Some(manager) = self.qso_manager_for_supervisor.clone() {
+                for (qso_id, _progress) in manager.get_active_qsos().await {
+                    let _ = manager
+                        .fail_qso(qso_id, pancetta_qso::QsoFailureReason::SupervisorRestart)
+                        .await;
+                }
+            }
+        }
+
+        match component_restart_policy(component_id) {
+            RestartPolicy::Restartable
+                if self
+                    .restart_budget
+                    .may_restart(component_id, Instant::now()) =>
+            {
+                let backoff = self
+                    .restart_budget
+                    .record_attempt_and_backoff(component_id, Instant::now());
+                crate::coordinator::tx::emit_diagnostic(
+                    &self.message_bus,
+                    "supervisor",
+                    pancetta_core::DiagnosticLevel::Warn,
+                    format!(
+                        "{} {} -- restarting in {:?}",
+                        component_id, degradation, backoff
+                    ),
+                    None,
+                )
+                .await;
+                tokio::time::sleep(backoff).await;
+                match self.restart_component(component_id).await {
+                    Ok(()) => {
+                        info!("Component {} restarted successfully", component_id);
+                    }
+                    Err(e) => {
+                        error!("Component {} restart failed: {}", component_id, e);
+                        {
+                            let mut status_map = self.component_status.write().await;
+                            if let Some(status) = status_map.get_mut(&component_id) {
+                                status.state = ComponentState::Failed(degradation.to_string());
+                            }
+                        }
+                        self.notify_tui_of_failure(component_id, degradation).await;
+                    }
+                }
+            }
+            RestartPolicy::Restartable => {
+                // Budget exhausted -- degrade instead of restarting again.
+                warn!(
+                    "Component {} exceeded restart budget -- degrading",
+                    component_id
+                );
+                crate::coordinator::tx::emit_diagnostic(
+                    &self.message_bus,
+                    "supervisor",
+                    pancetta_core::DiagnosticLevel::Error,
+                    format!(
+                        "{} restarted too many times -- giving up, needs a manual restart",
+                        component_id
+                    ),
+                    None,
+                )
+                .await;
+                let mut status_map = self.component_status.write().await;
+                if let Some(status) = status_map.get_mut(&component_id) {
+                    status.state = ComponentState::Failed(degradation.to_string());
+                }
+                drop(status_map);
+                self.notify_tui_of_failure(component_id, degradation).await;
+            }
+            RestartPolicy::DegradeOnly | RestartPolicy::FatalAbort => {
+                // ComponentCriticality-based log-level split, preserved
+                // from the pre-restructure behavior.
+                match component_criticality(component_id) {
+                    ComponentCriticality::Important => {
+                        error!(
+                            "CRITICAL component {} has stopped unexpectedly: {}",
+                            component_id, degradation
+                        );
+                    }
+                    ComponentCriticality::NonCritical => {
+                        warn!("Component {} has stopped: {}", component_id, degradation);
+                    }
+                }
+                let mut status_map = self.component_status.write().await;
+                if let Some(status) = status_map.get_mut(&component_id) {
+                    status.state = ComponentState::Failed(degradation.to_string());
+                }
+                drop(status_map);
+                self.notify_tui_of_failure(component_id, degradation).await;
+            }
+        }
+    }
+
+    /// Best-effort immediate TUI notification of a component transitioning
+    /// to `Failed`, preserved from the pre-restructure `check_task_handles`
+    /// (which sent this for every finished, non-restartable component).
+    /// The 5s periodic health-summary tick (`start_health_monitor`) also
+    /// reports any `Failed` component, so this is a lower-latency nudge,
+    /// not the only path.
+    async fn notify_tui_of_failure(&self, component_id: ComponentId, degradation: &str) {
+        let error_msg = ComponentMessage::new(
+            ComponentId::Coordinator,
+            ComponentId::Tui,
+            MessageType::StatusUpdate(format!("{}: {}", component_id, degradation)),
+            Instant::now(),
+        );
+        let _ = self.message_bus.send_message(error_msg).await;
+    }
+
+    /// Re-invoke the given component's start method. Only the 5 components
+    /// this plan covers are wired; anything else reaching here is a bug
+    /// (Task 2's `component_restart_policy` should have already routed it
+    /// to `DegradeOnly`).
+    async fn restart_component(&mut self, id: ComponentId) -> Result<()> {
+        match id {
+            ComponentId::Autonomous => self.start_autonomous_component().await,
+            ComponentId::DxCluster => self.start_dx_cluster_component().await,
+            ComponentId::PskReporter => self.start_pskreporter_component().await,
+            ComponentId::RemoteGateway => self.start_remote_gateway_component().await,
+            ComponentId::Qso => self.start_qso_component().await,
+            other => anyhow::bail!("restart_component called for non-restartable {other}"),
         }
     }
 
@@ -547,6 +723,343 @@ impl super::ApplicationCoordinator {
             message_count,
             audio_status,
             decode_status
+        );
+    }
+}
+
+#[cfg(test)]
+mod supervisor_tests {
+    use super::super::ApplicationCoordinator;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+    use pancetta_config::Config;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    /// Mirrors the direct-construction pattern used by `mod.rs`'s
+    /// `test_coordinator_creation` / `autonomous.rs`'s `build_coordinator`:
+    /// `Config::default()`, `no_audio=true`, `headless=true`. No shared
+    /// helper exists yet for `health.rs` (this is its first test module),
+    /// so this is a local copy of that same pattern rather than a new one.
+    async fn test_coordinator() -> ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// Task 5's central regression guard. DxCluster is `Restartable`
+    /// (Task 2's `component_restart_policy`) so a panicking task under
+    /// `ComponentId::DxCluster` must be restarted, not just marked
+    /// `Failed`, by `check_task_handles`.
+    ///
+    /// The pre-created channel is the load-bearing part of this test: it
+    /// simulates "this component already ran once" so the restart path
+    /// exercises the SECOND registration for `ComponentId::DxCluster`.
+    /// `Config::default()` has DX cluster disabled, so the real
+    /// `start_dx_cluster_component` restart call takes its cheap
+    /// disabled-branch return (channel re-create + immediate `Ok(())`),
+    /// no network I/O — safe to invoke as the actual production entry
+    /// point rather than a fixture stand-in. Before Task 1's
+    /// `get_or_create_channel` wiring (Step 1 above), this second
+    /// registration would error with "Channel already exists" and the
+    /// restart would silently fail, leaving the component `Failed`.
+    #[tokio::test]
+    async fn panicking_restartable_component_is_restarted_after_backoff() {
+        let mut coordinator = test_coordinator().await;
+
+        // Pre-create DxCluster's channel, simulating "this component
+        // already ran once".
+        coordinator
+            .message_bus
+            .create_channel(ComponentId::DxCluster)
+            .await
+            .unwrap();
+
+        // Spawn a fake task under ComponentId::DxCluster that panics
+        // immediately.
+        let handle = tokio::spawn(async {
+            panic!("injected test panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        coordinator
+            .named_task_handles
+            .push((ComponentId::DxCluster, handle));
+
+        // Give the spawned task a chance to actually panic and finish
+        // before polling — `tokio::spawn` does not guarantee the task has
+        // run by the time control returns here, so without this the poll
+        // below can race and see `is_finished() == false`.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // First poll: detects the panic, classifies it, restarts.
+        coordinator.check_task_handles().await;
+
+        let status = coordinator.component_status.read().await;
+        // After a successful restart, the component is Running again, not
+        // Failed.
+        assert_eq!(
+            status.get(&ComponentId::DxCluster).map(|s| &s.state),
+            Some(&super::ComponentState::Running)
+        );
+    }
+
+    /// Task 6 (task-supervision): a panicked Qso-component task must not
+    /// let its in-flight QSOs silently vanish. `start_qso_component` stashes
+    /// a cheap `Arc`-based `QsoManager` clone at
+    /// `coordinator.qso_manager_for_supervisor` specifically so
+    /// `handle_finished_task` can still enumerate and fail whatever was
+    /// active at crash time, even though the panicked task's own
+    /// `QsoManager` instance is gone.
+    #[tokio::test]
+    async fn qso_restart_emits_supervisor_restart_failure_for_each_active_qso() {
+        let mut coordinator = test_coordinator().await;
+        // `respond_to_cq` refuses a placeholder callsign, so give the
+        // station a real one before the Qso component reads it.
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        coordinator.start_qso_component().await.unwrap();
+
+        // The coordinator's stashed handle shares the same `qsos` map as
+        // whatever `QsoManager` is running inside the (about to be killed)
+        // Qso-component task -- inserting an active QSO through it is
+        // equivalent to the real task having opened one.
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let qso_id = manager
+            .respond_to_cq("K1ABC".to_string(), 1500.0, None)
+            .await
+            .expect("seeding an active QSO via the real public API");
+
+        // Subscribe BEFORE triggering the restart so the QsoFailed emitted
+        // during `check_task_handles` isn't missed.
+        let mut qso_events_rx = manager.subscribe();
+
+        // Simulate a Qso-task panic: swap out whatever real task
+        // `start_qso_component` spawned for a fake one that panics
+        // immediately, mirroring `panicking_restartable_component_is_
+        // restarted_after_backoff` above.
+        let handle = tokio::spawn(async {
+            panic!("injected test panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        coordinator
+            .named_task_handles
+            .retain(|(id, _)| *id != ComponentId::Qso);
+        coordinator
+            .named_task_handles
+            .push((ComponentId::Qso, handle));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        coordinator.check_task_handles().await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = qso_events_rx.try_recv() {
+            events.push(event);
+        }
+        let failed = events.iter().find_map(|e| match e {
+            pancetta_qso::QsoEvent::QsoFailed {
+                qso_id: id, reason, ..
+            } if *id == qso_id => Some(reason.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            failed,
+            Some(pancetta_qso::QsoFailureReason::SupervisorRestart),
+            "expected a QsoFailed{{SupervisorRestart}} for the seeded QSO, got {events:?}"
+        );
+
+        // The Qso component was restarted (Restartable + within budget), so
+        // it's Running again -- the drop-surfacing must not have interfered
+        // with the restart path itself.
+        let status = coordinator.component_status.read().await;
+        assert_eq!(
+            status.get(&ComponentId::Qso).map(|s| &s.state),
+            Some(&super::ComponentState::Running)
+        );
+    }
+
+    /// Task 6 fix-review followup (2026-07-25): the sibling test above only
+    /// proves `fail_qso`'s `QsoFailed` reaches a subscriber the TEST ITSELF
+    /// creates via `manager.subscribe()`. The real operator-facing path is
+    /// different: the `QsoFailed` -> `MessageType::RecentQsoOutcome` relay
+    /// lives in a `tokio::spawn`ed subscriber task INSIDE
+    /// `start_qso_component` (qso.rs, ~L1568/1583/2271), and a
+    /// `tokio::sync::broadcast` channel only delivers to subscribers alive
+    /// AT SEND TIME. This test exercises that REAL relay path end to end --
+    /// real `start_qso_component`, real forwarder task, real Tui bus
+    /// channel -- instead of a fresh test-created subscriber.
+    ///
+    /// Why this is expected to pass with no reordering of the
+    /// enumerate-then-restart sequence in `handle_finished_task`: the
+    /// forwarder at qso.rs ~L1583 is `tokio::spawn`ed as a genuinely
+    /// independent task -- its `JoinHandle` is discarded (never stored in
+    /// `named_task_handles`, never `.abort()`-ed). Per tokio's task model, a
+    /// panic inside one spawned task only unwinds THAT task's stack and is
+    /// reported via ITS OWN `JoinHandle`; it does not cancel sibling tasks
+    /// that task itself spawned earlier. So when the "outer" Qso-component
+    /// task (the one `named_task_handles` tracks under `ComponentId::Qso`)
+    /// dies, the forwarder it spawned keeps running, still subscribed to
+    /// the same `event_sender` the coordinator's stashed
+    /// `qso_manager_for_supervisor` clone shares (every `QsoManager::clone()`
+    /// shares one `Arc`-backed `qsos` map and one `broadcast::Sender` --
+    /// only a fresh `QsoManager::new()`, as a *post-restart* component build
+    /// performs, gets independent ones). `fail_qso` MUST run on that
+    /// pre-restart stashed clone anyway, because it looks the QSO up in its
+    /// OWN `qsos` map (`qsos.write().await.remove(&qso_id)`) -- a
+    /// freshly-restarted manager's map is empty, so calling `fail_qso` on
+    /// the POST-restart clone for a PRE-restart qso_id would silently no-op.
+    /// That rules out "restart first, then fail on the new clone" as a fix:
+    /// there is no manager instance that both knows the QSO's metadata AND
+    /// feeds a guaranteed-fresh forwarder. Enumerate-then-fail-then-restart
+    /// (current code) is therefore correct as long as the pre-restart
+    /// forwarder survives the crash, which this test proves it does.
+    ///
+    /// A readiness handshake (a throwaway QSO, failed and observed on the
+    /// Tui channel) runs first so the test never races the real forwarder's
+    /// startup (DB/ADIF init) -- without it, a `fail_qso` broadcast sent
+    /// before the forwarder's `.subscribe()` call would be silently missed
+    /// even by a forwarder that is definitely alive, since `broadcast`
+    /// subscribers only see sends that happen after they subscribe.
+    #[tokio::test]
+    async fn qso_restart_delivers_recent_qso_outcome_through_the_real_forwarder() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+
+        // Real last hop of the real relay path: the forwarder sends
+        // `RecentQsoOutcome` to `ComponentId::Tui` via the real message
+        // bus. Create that channel before starting the Qso component so
+        // there's somewhere for it to land.
+        let (_tui_tx, tui_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+
+        coordinator.start_qso_component().await.unwrap();
+
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+
+        async fn poll_for(
+            rx: &crossbeam_channel::Receiver<ComponentMessage>,
+            want_callsign: &str,
+            max_tries: u32,
+        ) -> Option<crate::message_bus::RecentQsoOutcome> {
+            for _ in 0..max_tries {
+                if let Ok(msg) = rx.try_recv() {
+                    if let MessageType::RecentQsoOutcome(outcome) = &msg.message_type {
+                        if outcome.callsign == want_callsign {
+                            return Some(outcome.clone());
+                        }
+                    }
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            None
+        }
+
+        // Readiness handshake: `start_qso_component` returns as soon as the
+        // outer task is *spawned*, well before the tokio scheduler has
+        // polled it even once -- the forwarder's `.subscribe()` call (deep
+        // inside that task, after `.start()` + DB/ADIF init) has not
+        // necessarily happened yet. A `QsoFailed` broadcast sent before that
+        // `.subscribe()` call is silently missed forever by
+        // `tokio::sync::broadcast` semantics, even though the forwarder is
+        // "alive" moments later -- so a single fixed sleep-then-probe would
+        // just trade one race for a slower one. Instead, retry with a FRESH
+        // probe QSO each attempt (a consumed `fail_qso` cannot be re-fired
+        // for the same id) until one lands on the real Tui channel, proving
+        // the real forwarder is now subscribed before the real scenario
+        // below relies on it.
+        let mut ready = false;
+        for i in 0..20 {
+            let probe_call = format!("K9RD{i}");
+            let probe_id = manager
+                .respond_to_cq(probe_call.clone(), 1500.0, None)
+                .await
+                .expect("seeding a readiness-probe QSO");
+            manager
+                .fail_qso(probe_id, pancetta_qso::QsoFailureReason::UserCancelled)
+                .await
+                .expect("failing a readiness-probe QSO");
+            // Generous per-attempt window (up to 300ms) -- unlike a tight
+            // flood of probes, this gives the forwarder room to actually
+            // catch up and relay before we give up on this attempt and
+            // (if needed) fire another.
+            if poll_for(&tui_rx, &probe_call, 30).await.is_some() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            ready,
+            "readiness probe: real forwarder never relayed a RecentQsoOutcome to the Tui channel"
+        );
+
+        // Now the real scenario: seed a real active QSO, then simulate the
+        // outer Qso-component task crashing exactly like the sibling test
+        // above (swap its tracked JoinHandle for a fake panicking one).
+        // This does NOT touch the REAL task or its REAL forwarder child --
+        // they keep running completely undisturbed, which is exactly the
+        // production scenario being validated: the supervisor only ever
+        // observes the tracked JoinHandle, never the forwarder directly.
+        manager
+            .respond_to_cq("K1ABC".to_string(), 1501.0, None)
+            .await
+            .expect("seeding an active QSO via the real public API");
+
+        let handle = tokio::spawn(async {
+            panic!("injected test panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        coordinator
+            .named_task_handles
+            .retain(|(id, _)| *id != ComponentId::Qso);
+        coordinator
+            .named_task_handles
+            .push((ComponentId::Qso, handle));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        coordinator.check_task_handles().await;
+
+        let outcome = poll_for(&tui_rx, "K1ABC", 500).await.expect(
+            "expected a RecentQsoOutcome for K1ABC to reach the Tui channel via the REAL \
+             forwarder (not a test-created subscriber) after a supervisor restart",
+        );
+        assert!(
+            matches!(
+                outcome.outcome,
+                crate::message_bus::QsoOutcome::Failed(
+                    pancetta_qso::QsoFailureReason::SupervisorRestart
+                )
+            ),
+            "expected Failed(SupervisorRestart), got {:?}",
+            outcome.outcome
+        );
+
+        // Same regression guard as the sibling test: the restart itself
+        // must still have succeeded.
+        let status = coordinator.component_status.read().await;
+        assert_eq!(
+            status.get(&ComponentId::Qso).map(|s| &s.state),
+            Some(&super::ComponentState::Running)
         );
     }
 }

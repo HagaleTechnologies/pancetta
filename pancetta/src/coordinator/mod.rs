@@ -30,6 +30,7 @@ mod psk_reporter;
 mod qso;
 mod qso_filter;
 mod remote_gateway;
+mod restart_budget;
 mod shutdown;
 pub mod station_agent;
 mod tier;
@@ -572,6 +573,7 @@ use tracing::{error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
+use restart_budget::RestartBudget;
 use util::resample_linear;
 
 /// Application coordinator that manages all Pancetta components
@@ -590,6 +592,10 @@ pub struct ApplicationCoordinator {
 
     /// Named component task handles for health monitoring
     named_task_handles: Vec<(ComponentId, JoinHandle<Result<()>>)>,
+
+    /// Restart bookkeeping (rolling-window budget + capped-exponential
+    /// backoff) for the supervisor's `check_task_handles` restart dispatch.
+    restart_budget: RestartBudget,
 
     /// Component health status map (shared with health monitor task)
     component_status: Arc<RwLock<HashMap<ComponentId, ComponentStatus>>>,
@@ -999,6 +1005,15 @@ pub struct ApplicationCoordinator {
     /// today) would see an empty field rather than silently re-subscribing.
     pub(crate) wsjtx_qso_events_rx:
         Option<tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>>,
+
+    /// A cheap clone of the live `QsoManager` handle, stored so the task
+    /// supervisor (health.rs) can enumerate in-flight QSOs and surface them
+    /// as `QsoFailed{SupervisorRestart}` after the Qso component's task
+    /// dies -- `QsoManager::clone()` shares the same
+    /// `Arc<RwLock<..>>`-backed QSO map, so this stays valid and readable
+    /// even after the original task that constructed it has panicked.
+    /// Populated by `start_qso_component`, overwritten on every (re)start.
+    pub(crate) qso_manager_for_supervisor: Option<pancetta_qso::QsoManager>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -1108,6 +1123,49 @@ fn component_criticality(id: ComponentId) -> ComponentCriticality {
         ComponentId::Audio => ComponentCriticality::NonCritical,
         ComponentId::Dsp => ComponentCriticality::Important,
         _ => ComponentCriticality::NonCritical,
+    }
+}
+
+/// How the supervisor should react when a component's task dies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartPolicy {
+    /// Re-invoke the component's `start_*` method after backoff, up to the
+    /// shared retry budget (Task 3).
+    Restartable,
+    /// Never auto-restart; log and leave `Failed` (today's behavior).
+    DegradeOnly,
+    /// Unrecoverable in-process (e.g. a native C abort); document the
+    /// external OS-supervisor as the backstop. Treated identically to
+    /// `DegradeOnly` by the supervisor loop — the distinction is purely
+    /// for the log message and for future extension, not behavior.
+    FatalAbort,
+}
+
+/// Per-component restart policy (spec: docs/superpowers/specs/2026-07-25-task-supervision-design.md §4.1).
+/// Default for anything not listed is `DegradeOnly` (today's behavior) —
+/// this is the safety net: a component only gets auto-restarted if it's
+/// explicitly classified `Restartable` here.
+pub(crate) fn component_restart_policy(id: ComponentId) -> RestartPolicy {
+    match id {
+        ComponentId::Autonomous
+        | ComponentId::DxCluster
+        | ComponentId::PskReporter
+        | ComponentId::RemoteGateway
+        | ComponentId::Qso => RestartPolicy::Restartable,
+        // Out of scope for this plan (need channel/atomic re-supply design):
+        ComponentId::Dsp | ComponentId::Ft8Decoder => RestartPolicy::DegradeOnly,
+        // Out of scope for this plan (need teardown semantics):
+        ComponentId::Hamlib | ComponentId::StationAgent | ComponentId::Audio => {
+            RestartPolicy::DegradeOnly
+        }
+        // Owns the terminal; restart is awkward — degrade + notify.
+        ComponentId::Tui => RestartPolicy::DegradeOnly,
+        // Never a real task-handle target for this supervisor.
+        ComponentId::Config | ComponentId::Coordinator | ComponentId::Ft8Transmitter => {
+            RestartPolicy::DegradeOnly
+        }
+        // Companion protocol integration; not critical for autonomous operation.
+        ComponentId::WsjtxUdp => RestartPolicy::DegradeOnly,
     }
 }
 
@@ -1317,6 +1375,7 @@ impl ApplicationCoordinator {
             message_bus,
             ft8_decoder: None,
             named_task_handles: Vec::new(),
+            restart_budget: RestartBudget::new(),
             component_status: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(AtomicBool::new(false)),
             shutdown_signal,
@@ -1430,6 +1489,7 @@ impl ApplicationCoordinator {
                 Arc::new(std::sync::Mutex::new(st))
             },
             wsjtx_qso_events_rx: None,
+            qso_manager_for_supervisor: None,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);
@@ -2613,5 +2673,49 @@ mod tests {
         );
 
         assert!(matches!(result, Err(ModeSwitchError::QsoSetUnavailable)));
+    }
+
+    #[test]
+    fn restart_policy_matches_spec_classification() {
+        use RestartPolicy::*;
+        assert_eq!(component_restart_policy(ComponentId::Qso), Restartable);
+        assert_eq!(
+            component_restart_policy(ComponentId::Autonomous),
+            Restartable
+        );
+        assert_eq!(
+            component_restart_policy(ComponentId::DxCluster),
+            Restartable
+        );
+        assert_eq!(
+            component_restart_policy(ComponentId::PskReporter),
+            Restartable
+        );
+        assert_eq!(
+            component_restart_policy(ComponentId::RemoteGateway),
+            Restartable
+        );
+        assert_eq!(component_restart_policy(ComponentId::Dsp), DegradeOnly);
+        assert_eq!(
+            component_restart_policy(ComponentId::Ft8Decoder),
+            DegradeOnly
+        );
+        assert_eq!(component_restart_policy(ComponentId::Hamlib), DegradeOnly);
+        assert_eq!(
+            component_restart_policy(ComponentId::StationAgent),
+            DegradeOnly
+        );
+        assert_eq!(component_restart_policy(ComponentId::Audio), DegradeOnly);
+        assert_eq!(component_restart_policy(ComponentId::Tui), DegradeOnly);
+        assert_eq!(component_restart_policy(ComponentId::Config), DegradeOnly);
+        assert_eq!(
+            component_restart_policy(ComponentId::Coordinator),
+            DegradeOnly
+        );
+        assert_eq!(
+            component_restart_policy(ComponentId::Ft8Transmitter),
+            DegradeOnly
+        );
+        assert_eq!(component_restart_policy(ComponentId::WsjtxUdp), DegradeOnly);
     }
 }

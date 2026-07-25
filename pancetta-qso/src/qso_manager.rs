@@ -1872,6 +1872,55 @@ impl QsoManager {
         Ok(())
     }
 
+    /// Fail a QSO with an explicit `reason`, transitioning it to
+    /// `QsoState::Failed` and emitting both `QsoEvent::StateChanged` and
+    /// `QsoEvent::QsoFailed` — the same producer pattern `cancel_qso` (fixed
+    /// at `UserCancelled`) and the supersede/timeout retirement paths each
+    /// use inline, generalized here to an arbitrary reason so callers
+    /// outside this module (the coordinator's task supervisor, specifically)
+    /// can retire a QSO through the manager's real state machine instead of
+    /// constructing a `QsoEvent` by hand. Currently used for
+    /// `QsoFailureReason::SupervisorRestart`: when the Qso component's task
+    /// is restarted after a panic, every QSO still active at that moment is
+    /// surfaced this way rather than silently vanishing from the map.
+    pub async fn fail_qso(
+        &self,
+        qso_id: QsoId,
+        reason: QsoFailureReason,
+    ) -> Result<(), QsoManagerError> {
+        let mut qsos = self.qsos.write().await;
+        if let Some(mut progress) = qsos.remove(&qso_id) {
+            let old_state = progress.state.clone();
+            progress.state = QsoState::Failed {
+                reason: reason.clone(),
+                failed_at: Utc::now(),
+                last_state: Box::new(old_state.clone()),
+            };
+            let metadata = progress.metadata.clone();
+            let state_history = progress.state_history.clone();
+            let messages = progress.messages.clone();
+
+            self.emit_state_change(qso_id, old_state, progress.state.clone())
+                .await;
+            self.emit_event(QsoEvent::QsoFailed {
+                qso_id,
+                reason,
+                metadata,
+                state_history,
+                messages,
+            })
+            .await;
+
+            if let Some(callsign) = progress.metadata.their_callsign.as_ref() {
+                self.remove_callsign_mapping(callsign, qso_id).await;
+            }
+
+            info!("Failed QSO {}: {:?}", qso_id, progress.state);
+        }
+
+        Ok(())
+    }
+
     /// Emit a MessageToSend event for a QSO.
     ///
     /// Reads `tx_parity` from the QSO metadata so that every emission
@@ -9450,6 +9499,53 @@ mod sm_f5_qso_failed_event_tests {
         assert_eq!(*failed_id, qso_id);
         assert_eq!(*reason, QsoFailureReason::UserCancelled);
         assert_eq!(metadata.their_callsign.as_deref(), Some(DX));
+    }
+
+    #[tokio::test]
+    async fn fail_qso_emits_qso_failed_with_the_given_reason() {
+        // Task 6 (task-supervision): the coordinator's task supervisor calls
+        // `fail_qso` (not `cancel_qso`, which is hardcoded to
+        // UserCancelled) to surface a QSO dropped by a Qso-component
+        // restart as SupervisorRestart specifically.
+        let manager = QsoManager::new(test_config());
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq(DX.to_string(), FREQ, None)
+            .await
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        manager
+            .fail_qso(qso_id, QsoFailureReason::SupervisorRestart)
+            .await
+            .unwrap();
+
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                QsoEvent::StateChanged {
+                    new_state: QsoState::Failed { .. },
+                    ..
+                }
+            )),
+            "expected a StateChanged -> Failed, got {events:?}"
+        );
+        let failed = qso_failed_events(&events);
+        assert_eq!(
+            failed.len(),
+            1,
+            "expected exactly one QsoFailed, got {failed:?}"
+        );
+        let (failed_id, reason, metadata) = &failed[0];
+        assert_eq!(*failed_id, qso_id);
+        assert_eq!(*reason, QsoFailureReason::SupervisorRestart);
+        assert_eq!(metadata.their_callsign.as_deref(), Some(DX));
+
+        // The QSO must actually leave the active map -- otherwise it would
+        // both show as "dropped" in Recent-QSOs AND still be sitting in
+        // get_active_qsos() for a subsequent supervisor pass to double-fail.
+        assert!(manager.get_qso(qso_id).await.is_err());
     }
 
     #[tokio::test]
