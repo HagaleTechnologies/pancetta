@@ -14365,6 +14365,13 @@ mod tests {
         assert!(super::min_abs_llr(&all_big) > 1e29);
     }
 
+    // Pre-existing gap found while verifying Task 1 of
+    // docs/superpowers/plans/2026-07-25-ap-content-decoding.md: this test
+    // uses `crate::{Ft8Encoder, Ft8Modulator}`, both gated behind the
+    // `transmit` feature, but the test itself was not -- `cargo test -p
+    // pancetta-ft8 --lib` with default features failed to compile before
+    // this fix, unrelated to anything else in that task.
+    #[cfg(feature = "transmit")]
     #[test]
     fn decode_soft_with_features_round_trip_on_clean_signal() {
         // Encode + modulate + add light noise + decode. The features

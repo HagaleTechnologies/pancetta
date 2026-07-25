@@ -2771,6 +2771,14 @@ mod tests {
         assert_eq!(msg.standard_type, Some(StandardMessageType::RR73));
     }
 
+    // Pre-existing gap found while verifying Task 1 of
+    // docs/superpowers/plans/2026-07-25-ap-content-decoding.md: this test
+    // calls `crate::encoder::pack28`, but `encoder` is gated behind the
+    // `transmit` feature while this module (and its `#[cfg(test)] mod
+    // tests`) is not -- `cargo test -p pancetta-ft8 --lib` with default
+    // features failed to compile before this fix, unrelated to anything
+    // else in that task.
+    #[cfg(feature = "transmit")]
     #[test]
     fn test_ip_flag_renders_as_slash_p_not_slash_r() {
         // Batch 35 (hb-219): a Standard message with ip=1 must render

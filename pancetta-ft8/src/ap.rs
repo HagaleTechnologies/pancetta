@@ -455,6 +455,149 @@ pub fn enumerate_a8_expected_texts(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Content-hypothesis bit builder (ap-decoding-design.md gap 1: content
+// bits are enumerated as text but never turned into an LLR-injectable
+// bit pattern)
+// ---------------------------------------------------------------------------
+
+/// First payload bit of the AP5 content field. Per
+/// `message.rs::parse_type1_standard` (ground truth: `n29a(29) +
+/// n29b(29) + ir(1) + igrid4(15) + i3(3) = 77`), `from_callsign`'s 28-bit
+/// packed value occupies bits 29-56 and its suffix flag is bit 57, so the
+/// content field (`ir` + `igrid4` + `i3`) starts at bit 58, not 56 — see
+/// [`ContentHypothesis`]'s doc for the full correction vs the originating
+/// plan prose.
+const CONTENT_FIELD_START_BIT: usize = 58;
+
+/// Length in bits of the AP5 content field: `ir`(1) + `igrid4`(15) +
+/// `i3`(3) = 19.
+const CONTENT_FIELD_LEN: usize = 19;
+
+/// One enumerated content hypothesis, ready for Ap5 injection: the source
+/// text (for logging/content-match verification) plus its extracted
+/// content-field bit pattern.
+///
+/// **Bit-range correction vs the originating plan prose**
+/// (`docs/superpowers/plans/2026-07-25-ap-content-decoding.md`, and
+/// `docs/ap-decoding-design.md`): those describe "content bits 56-76", a
+/// 21-bit field. That count predates this project's own W1.7
+/// callsign-bit-offset fix (2026-07-07 — see this module's top-of-file
+/// doc comment and `pancetta-ft8/tests/ap_i3_tests.rs`) and doesn't
+/// account for the two 1-bit callsign-suffix-flag gaps (bit 28 between
+/// `to_callsign` and `from_callsign`, bit 57 right after
+/// `from_callsign`). Per `message.rs::parse_type1_standard` (ground
+/// truth, `n29a(29) + n29b(29) + ir(1) + igrid4(15) + i3(3) = 77`), the
+/// actual content field is payload bits **58-76 (19 bits)**: `ir` (bit
+/// 58) + `igrid4` (bits 59-73) + `i3` (bits 74-76). Bits 56-57 belong to
+/// `from_callsign`'s packed value / suffix flag — already covered by the
+/// existing AP3/AP4 callsign injection (bit 57's suffix flag is the one
+/// exception: AP3/AP4 don't inject it today, but it is constant across
+/// every hypothesis for a fixed QSO partner call, so it carries no
+/// discriminating content and is correctly excluded here). This struct
+/// therefore uses the verified 58-76 / 19-bit range
+/// ([`CONTENT_FIELD_START_BIT`], [`CONTENT_FIELD_LEN`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContentHypothesis {
+    /// The canonical FT8 text this hypothesis was encoded from (e.g.
+    /// "K1ABC W1AW RR73").
+    pub text: String,
+    /// Payload bits 58-76 (`ir` + `igrid4` + `i3`), MSB-first / bit-order
+    /// matching `content_bits[i]` == payload bit `58 + i`.
+    pub content_bits: [bool; CONTENT_FIELD_LEN],
+}
+
+/// Pack a standard message's third whitespace-separated token (the
+/// `extra` field: empty, a signal report, or a confirmation token) into
+/// `(ir, igrid4)`.
+///
+/// Mirrors `encoder.rs::packgrid`'s token/report branches bit-for-bit
+/// (grid-square packing is intentionally omitted: `enumerate_a8_expected
+/// _texts` — the only populator of `QsoAp::expected_next_message_texts`
+/// today — never produces one). Duplicated here rather than calling
+/// `encoder::packgrid` directly because the `encoder` module is gated
+/// behind the `transmit` feature and this module (used on every decode,
+/// AP or not) is not — the same precedent as the standalone `pack28`
+/// above and `ConfirmationToken::igrid4_value` below. Cross-checked
+/// against the real encoder in
+/// `content_hypotheses_match_real_encoder_ground_truth` (`--features
+/// transmit`).
+///
+/// Returns `None` if `extra` isn't a recognized token/report — the
+/// caller treats that as an enumerator bug (log + skip), not a runtime
+/// condition to recover from.
+fn pack_extra_field(extra: &str) -> Option<(bool, u16)> {
+    const MAXGRID4: u16 = 32400;
+
+    if extra.is_empty() {
+        return Some((false, MAXGRID4 + 1));
+    }
+    match extra {
+        "RRR" => return Some((false, ConfirmationToken::Rrr.igrid4_value())),
+        "RR73" => return Some((false, ConfirmationToken::RR73.igrid4_value())),
+        "73" => return Some((false, ConfirmationToken::Final73.igrid4_value())),
+        _ => {}
+    }
+
+    // Signal report: "R+dd"/"R-dd" (ir=1) or bare "+dd"/"-dd" (ir=0).
+    let (ir, report_str) = match extra.strip_prefix('R') {
+        Some(rest) if rest.starts_with('+') || rest.starts_with('-') => (true, rest),
+        _ => (false, extra),
+    };
+    let dd: i32 = report_str.parse().ok()?;
+    if !(-35..=30).contains(&dd) {
+        return None;
+    }
+    let igrid4 = MAXGRID4 + (35 + dd) as u16;
+    Some((ir, igrid4))
+}
+
+/// Encode each of `qso.expected_next_message_texts` (via
+/// [`pack_extra_field`], the standalone mirror of this crate's canonical
+/// `encoder.rs::packgrid` content-packing) and extract the content-field
+/// bits (payload bits 58-76 — see [`ContentHypothesis`]'s doc for why
+/// this isn't 56-76). Returns hypotheses in the SAME order as the input
+/// `Vec<String>` — ordering by SNR-seeded likelihood is the caller's job
+/// (Task 3/5), not this pure builder's.
+///
+/// Returns an empty `Vec` if `qso.expected_next_message_texts` is empty.
+/// A text that fails to encode indicates a bug in the enumerator (every
+/// `enumerate_a8_expected_texts` output is a well-formed `<to> <from>
+/// <extra>` standard message), not a runtime condition to recover from
+/// gracefully — log a warning and skip that one hypothesis, don't panic.
+pub fn build_content_hypotheses(qso: &QsoAp) -> Vec<ContentHypothesis> {
+    let mut out = Vec::with_capacity(qso.expected_next_message_texts.len());
+
+    for text in &qso.expected_next_message_texts {
+        let extra = text.split_whitespace().nth(2).unwrap_or("");
+        let Some((ir, igrid4)) = pack_extra_field(extra) else {
+            tracing::warn!(
+                text = %text,
+                "build_content_hypotheses: failed to pack content field \
+                 (extra = {extra:?}) -- skipping; this indicates a bug in \
+                 enumerate_a8_expected_texts, not a runtime condition"
+            );
+            continue;
+        };
+
+        let mut content_bits = [false; CONTENT_FIELD_LEN];
+        content_bits[0] = ir;
+        content_bits[1..16].copy_from_slice(&u16_to_bits_15(igrid4));
+        // i3 = 1 (the "standard message" family every RR73/RRR/73/report
+        // reply uses), MSB-first: bits 74,75,76 = false,false,true.
+        content_bits[16] = false;
+        content_bits[17] = false;
+        content_bits[18] = true;
+
+        out.push(ContentHypothesis {
+            text: text.clone(),
+            content_bits,
+        });
+    }
+
+    out
+}
+
 /// Normalise a decoded message text for matching against the a8
 /// expected-templates list. Collapses interior whitespace runs to a
 /// single space and uppercases the result.
@@ -946,5 +1089,141 @@ mod tests {
         assert_eq!(ConfirmationToken::Rrr.igrid4_value(), MAXGRID4 + 2);
         assert_eq!(ConfirmationToken::RR73.igrid4_value(), MAXGRID4 + 3);
         assert_eq!(ConfirmationToken::Final73.igrid4_value(), MAXGRID4 + 4);
+    }
+
+    // -----------------------------------------------------------------
+    // build_content_hypotheses
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn build_content_hypotheses_extracts_bits_58_to_76() {
+        let mut qso = QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).unwrap();
+        qso = qso.with_expected_texts(["K1ABC W1AW RR73", "K1ABC W1AW RRR", "K1ABC W1AW 73"]);
+        let hyps = build_content_hypotheses(&qso);
+        assert_eq!(hyps.len(), 3);
+        assert_eq!(hyps[0].text, "K1ABC W1AW RR73");
+
+        // Real values, derived from ConfirmationToken::igrid4_value (already
+        // verified against this project's own encoder in
+        // test_confirmation_token_igrid4_values_match_maxgrid4_offsets /
+        // ap_i3_tests.rs): ir=0 for all three tokens (no R-prefix), i3=1
+        // (standard message family) for all three.
+        const MAXGRID4: u16 = 32400;
+        let expected = |igrid4: u16| -> [bool; CONTENT_FIELD_LEN] {
+            let mut bits = [false; CONTENT_FIELD_LEN];
+            bits[1..16].copy_from_slice(&u16_to_bits_15(igrid4));
+            bits[18] = true; // i3 = 1
+            bits
+        };
+        assert_eq!(hyps[0].content_bits, expected(MAXGRID4 + 3), "RR73");
+        assert_eq!(hyps[1].content_bits, expected(MAXGRID4 + 2), "RRR");
+        assert_eq!(hyps[2].content_bits, expected(MAXGRID4 + 4), "73");
+
+        // The three confirmation hypotheses must produce three DIFFERENT
+        // content-bit patterns (if they collided, Ap5 could never
+        // distinguish them) -- the load-bearing property.
+        assert_ne!(hyps[0].content_bits, hyps[1].content_bits);
+        assert_ne!(hyps[1].content_bits, hyps[2].content_bits);
+        assert_ne!(hyps[0].content_bits, hyps[2].content_bits);
+    }
+
+    #[test]
+    fn build_content_hypotheses_empty_when_no_expected_texts() {
+        let qso = QsoAp::new("W1AW", QsoApProgress::WaitingForReport).unwrap();
+        assert!(build_content_hypotheses(&qso).is_empty());
+    }
+
+    #[test]
+    fn build_content_hypotheses_distinguishes_report_values() {
+        // WaitingForReport hypotheses (R-12, -12, R-10, ...) must also
+        // produce pairwise-distinct content bits -- this is the numeric
+        // (igrid4 = MAXGRID4 + 35 + dd) path, not the fixed-token path
+        // exercised above.
+        let mut qso = QsoAp::new("W1AW", QsoApProgress::WaitingForReport).unwrap();
+        qso = qso.with_expected_texts(["K1ABC W1AW R-12", "K1ABC W1AW -12", "K1ABC W1AW R-10"]);
+        let hyps = build_content_hypotheses(&qso);
+        assert_eq!(hyps.len(), 3);
+        // R-12 vs -12: same igrid4, but the ir bit differs.
+        assert_ne!(hyps[0].content_bits, hyps[1].content_bits);
+        assert!(hyps[0].content_bits[0], "R-12 must set ir=1");
+        assert!(!hyps[1].content_bits[0], "-12 (no R) must set ir=0");
+        // R-12 vs R-10: different report value -> different igrid4.
+        assert_ne!(hyps[0].content_bits, hyps[2].content_bits);
+    }
+
+    #[test]
+    fn build_content_hypotheses_skips_unencodable_extra_and_warns() {
+        // Not produced by enumerate_a8_expected_texts, but with_expected_texts
+        // accepts arbitrary caller text -- an unencodable `extra` token must
+        // be skipped, not panic.
+        let mut qso = QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).unwrap();
+        qso = qso.with_expected_texts(["K1ABC W1AW GARBAGE123", "K1ABC W1AW RR73"]);
+        let hyps = build_content_hypotheses(&qso);
+        assert_eq!(
+            hyps.len(),
+            1,
+            "the unencodable hypothesis must be skipped, not panic"
+        );
+        assert_eq!(hyps[0].text, "K1ABC W1AW RR73");
+    }
+
+    /// Ground-truth cross-check: `pack_extra_field`'s standalone mirror of
+    /// `encoder.rs::packgrid` must match the REAL encoder byte-for-byte at
+    /// payload bits 58-76, for both the fixed-token and numeric-report
+    /// paths. Guards against `pack_extra_field` silently drifting from the
+    /// canonical encode path it duplicates (see its doc comment for why it
+    /// can't just call `encoder::packgrid` -- the `transmit` feature gate).
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn content_hypotheses_match_real_encoder_ground_truth() {
+        use crate::ldpc::gray_to_binary;
+        use crate::message::PAYLOAD_BITS;
+        use crate::{Ft8Encoder, NUM_SYMBOLS};
+
+        fn encode_to_payload_bits_58_76(text: &str) -> [bool; CONTENT_FIELD_LEN] {
+            let mut encoder = Ft8Encoder::new();
+            let symbols = encoder
+                .encode_message(text, None)
+                .unwrap_or_else(|e| panic!("failed to encode {text:?}: {e}"));
+
+            let mut codeword_bits = Vec::with_capacity(174);
+            for i_tone in 0..NUM_SYMBOLS {
+                let is_data = (7..36).contains(&i_tone) || (43..72).contains(&i_tone);
+                if !is_data {
+                    continue;
+                }
+                let v = gray_to_binary(symbols[i_tone]);
+                codeword_bits.push((v & 4) != 0);
+                codeword_bits.push((v & 2) != 0);
+                codeword_bits.push((v & 1) != 0);
+            }
+            let payload = &codeword_bits[0..PAYLOAD_BITS];
+
+            let mut bits = [false; CONTENT_FIELD_LEN];
+            bits.copy_from_slice(
+                &payload[CONTENT_FIELD_START_BIT..CONTENT_FIELD_START_BIT + CONTENT_FIELD_LEN],
+            );
+            bits
+        }
+
+        for text in [
+            "K1ABC W1AW RR73",
+            "K1ABC W1AW RRR",
+            "K1ABC W1AW 73",
+            "K1ABC W1AW R-12",
+            "K1ABC W1AW -12",
+            "K1ABC W1AW R+05",
+        ] {
+            let mut qso = QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).unwrap();
+            qso = qso.with_expected_texts([text]);
+            let hyps = build_content_hypotheses(&qso);
+            assert_eq!(hyps.len(), 1, "{text} should encode");
+            assert_eq!(
+                hyps[0].content_bits,
+                encode_to_payload_bits_58_76(text),
+                "build_content_hypotheses's content bits for {text:?} must match \
+                 this project's own real encoder at payload bits 58-76"
+            );
+        }
     }
 }
