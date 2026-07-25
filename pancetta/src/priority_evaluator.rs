@@ -424,6 +424,24 @@ impl WorkedStationLookup for CachedStationLookup {
         // trivially claim the operator's OWN callsign is "needed" too.
         // Mirror is_needed_dxcc's home-exclusion semantics so a home-country
         // station is never "needed," regardless of local worked history.
+
+        // AP-decoding Task 5 review fix: `freq_hz <= 0.0` means "no real RF
+        // dial frequency available" (callers like the recent_calls/Ap2
+        // ranking pool in `coordinator/ft8.rs` pass 0.0 because
+        // `RecentCallAp` carries no frequency data at all). Naively
+        // classifying that into a band string bins it into a synthetic
+        // "0MHZ" bucket (`freq_hz_to_band`'s fallthrough) that no real QSO
+        // is EVER logged against — so `!worked.get(&band).is_some_and(..)`
+        // would return `true` (needed) for essentially every callsign,
+        // always, corrupting `needed_dxcc` (the largest weight in
+        // `score_cq_detailed`) into a constant `true`. Return `false`
+        // instead: with no real per-band evidence, this signal contributes
+        // nothing, and `needed_dxcc` correctly falls back to the reliable
+        // global `is_needed_dxcc` check alone.
+        if freq_hz <= 0.0 {
+            return false;
+        }
+
         let upper = callsign.to_uppercase();
         let excluded = self.excluded_dxcc_prefixes.read();
         if excluded
@@ -595,6 +613,88 @@ mod tests {
         // identify (safe default, matches the fn's own doc contract).
         let lookup = CachedStationLookup::new();
         assert!(!lookup.is_dxcc_needed_on_band("1", 14_074_000.0));
+    }
+
+    #[test]
+    fn dxcc_needed_on_band_false_for_zero_freq_even_when_never_worked() {
+        // AP-decoding Task 5 review fix: `freq_hz = 0.0` means "no real RF
+        // dial frequency available" (the recent_calls/Ap2 ranking pool in
+        // `coordinator/ft8.rs` has none). Before the fix, `freq_hz = 0.0`
+        // classified into the synthetic "0MHZ" band, which is NEVER
+        // populated by real QSOs — so `!worked.get(&band).is_some_and(..)`
+        // returned `true` (needed) unconditionally, for every callsign,
+        // even ones that are NOT genuinely needed. Assert the opposite of
+        // `dxcc_needed_on_band_true_before_ever_worked` (which uses a real
+        // freq_hz) to prove the always-true corruption is gone: with no
+        // real frequency, this band-scoped signal must be inert (false),
+        // never a universal "needed" hit.
+        let lookup = CachedStationLookup::new();
+        assert!(!lookup.is_dxcc_needed_on_band("JA1ABC", 0.0));
+
+        // Also true even for an entity that WOULD read as needed on a real
+        // band (nothing worked anywhere yet) — freq_hz=0.0 must short-
+        // circuit before any worked-on-band lookup happens at all.
+        assert!(lookup.is_dxcc_needed_on_band("JA1ABC", 14_074_000.0));
+        assert!(!lookup.is_dxcc_needed_on_band("JA1ABC", 0.0));
+    }
+
+    #[test]
+    fn score_cq_detailed_not_needed_dxcc_with_zero_freq_when_not_globally_needed() {
+        // End-to-end regression for the AP-decoding Task 5 review finding:
+        // `recent_calls_scorer.evaluate_cq(callsign, None, snr, 0.0)`
+        // (`coordinator/ft8.rs`) must NOT inflate `needed_dxcc` to `true`
+        // for a callsign that is neither globally needed (cqdx set) nor
+        // an ATNO — even though `is_dxcc_needed_on_band` used to always
+        // report "needed" for freq_hz=0.0 regardless of truth, corrupting
+        // the OR in `score_cq_detailed`'s `needed_dxcc` term (weight 0.35,
+        // the largest single weight in the formula).
+        use pancetta_qso::priority::{PriorityScorer, PriorityWeights};
+
+        let lookup = CachedStationLookup::new();
+        // Populate cqdx's needed-DXCC set with a prefix that does NOT match
+        // JA1ABC ("DL" only) — this puts `is_needed_dxcc` on the
+        // cqdx-populated branch (prefix-match, no exclusion fallback
+        // involved), so `is_needed_dxcc("JA1ABC")` is false purely because
+        // JA isn't in cqdx's needed set, genuinely not needed. Critically,
+        // `excluded_dxcc_prefixes` is left EMPTY here, so
+        // `is_dxcc_needed_on_band`'s own exclusion short-circuit can't mask
+        // the freq_hz=0.0 corruption under test — before the fix, it would
+        // still (wrongly) report "needed" for the synthetic "0MHZ" band.
+        let mut needed = HashSet::new();
+        needed.insert("DL".to_string());
+        lookup.update_needed_dxcc(needed);
+        assert!(!lookup.is_needed_dxcc("JA1ABC"));
+
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let breakdown = scorer.score_cq_detailed("JA1ABC", None, -10, 0.0);
+        assert_eq!(
+            breakdown.needed_dxcc, 0.0,
+            "needed_dxcc must reflect the genuinely-not-needed global \
+             signal, not be forced to 1.0 by the freq_hz=0.0 band-scoped \
+             OR term"
+        );
+    }
+
+    #[test]
+    fn score_cq_detailed_still_needed_dxcc_via_global_signal_with_zero_freq() {
+        // Companion test: a genuinely globally-needed callsign must still
+        // score as needed through `is_needed_dxcc` even with freq_hz=0.0 —
+        // the fix must not throw out the reliable global signal along with
+        // the corrupted band-scoped one.
+        use pancetta_qso::priority::{PriorityScorer, PriorityWeights};
+
+        let lookup = CachedStationLookup::new();
+        let mut needed = HashSet::new();
+        needed.insert("JA".to_string());
+        lookup.update_needed_dxcc(needed);
+
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let breakdown = scorer.score_cq_detailed("JA1ABC", None, -10, 0.0);
+        assert_eq!(
+            breakdown.needed_dxcc, 1.0,
+            "genuinely needed (via cqdx global set) must still score as \
+             needed even when freq_hz=0.0"
+        );
     }
 
     #[test]

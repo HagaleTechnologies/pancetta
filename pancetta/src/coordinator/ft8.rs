@@ -574,17 +574,30 @@ impl super::ApplicationCoordinator {
             //
             // KNOWN LIMITATION: `RecentCallAp` carries only a callsign +
             // last-heard SNR, no grid or real RF dial frequency (only an
-            // audio offset, wrong scale for band classification). Passing
-            // `grid = None` and `freq_hz = 0.0` below lands every candidate
-            // in `CachedStationLookup`'s "unknown band" bucket, which is
-            // SAFE (its per-band lookups default to false/not-needed there)
-            // except deliberately not exploited for `is_grid_needed_on_band`
-            // (which defaults to true/needed for an unrecognized band) — so
-            // grid is never passed. Net effect: global-scope signals (ATNO,
-            // global needed-DXCC, rarity, POTA/SOTA pattern, signal
-            // strength) still rank correctly; band-scoped bonuses
-            // (needed-on-this-band, duplicate-on-this-band) are inert here.
-            // Full per-band accuracy is used for the (higher-stakes)
+            // audio offset, wrong scale for band classification). `grid =
+            // None` is passed below, so `is_needed_grid`/`is_grid_needed_on_
+            // band` never fire for this pool (both need `Some(grid)` to do
+            // anything) — safely inert, not corrupting.
+            //
+            // `freq_hz = 0.0` is also passed (no real dial frequency to
+            // give). Review fix (AP-decoding Task 5): `freq_hz = 0.0` used
+            // to land in `CachedStationLookup`'s synthetic "0MHZ" band
+            // bucket, which — for `is_dxcc_needed_on_band` specifically —
+            // does NOT default to "not needed": a band key that's never
+            // populated (true for "0MHZ", since no real QSO is ever logged
+            // on it) reads as "needed" (`!worked.get(&band).is_some_and(..)`
+            // when absent = true). That silently forced `needed_dxcc`
+            // (the largest weight in `score_cq_detailed`) to `true` for
+            // nearly every candidate, regardless of whether the entity was
+            // genuinely needed. Fixed at the `is_dxcc_needed_on_band` impl
+            // (`priority_evaluator.rs`): `freq_hz <= 0.0` now short-circuits
+            // to `false` there, so `needed_dxcc` correctly falls back to the
+            // reliable global `is_needed_dxcc` signal alone for this pool.
+            // Net effect: global-scope signals (ATNO, global needed-DXCC,
+            // rarity, POTA/SOTA pattern, signal strength) rank correctly;
+            // band-scoped bonuses (needed-on-this-band, duplicate-on-this-
+            // band, needed-grid-on-this-band) are inert (not corrupting)
+            // here. Full per-band accuracy is used for the (higher-stakes)
             // concurrent-QSO ranking in qso.rs, which has real state/
             // metadata frequency data available.
             let recent_calls_scorer = pancetta_qso::PriorityScorer::new(
