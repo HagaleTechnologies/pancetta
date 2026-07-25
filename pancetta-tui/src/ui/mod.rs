@@ -1388,7 +1388,7 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
 fn recent_qso_failure_color(reason: &pancetta_qso::QsoFailureReason) -> Color {
     use pancetta_qso::QsoFailureReason as R;
     match reason {
-        R::Timeout | R::SignalLost | R::StationQrt => Color::Yellow,
+        R::Timeout | R::SignalLost | R::StationQrt | R::SupervisorRestart => Color::Yellow,
         R::InvalidCallsign | R::FrequencyConflict | R::ProtocolError(_) => Color::Red,
         R::Duplicate | R::UserCancelled | R::Superseded => Color::Gray,
     }
@@ -2184,6 +2184,13 @@ mod view_render_tests {
         let buf = term.backend().buffer().clone();
         assert!(buffer_contains(&buf, "Recent QSOs"));
         assert!(buffer_contains(&buf, "No completed QSOs yet this session."));
+
+        // SupervisorRestart rides the same Yellow bucket as Timeout — a
+        // system-side interruption, not an operator or protocol error.
+        assert_eq!(
+            recent_qso_failure_color(&pancetta_qso::QsoFailureReason::SupervisorRestart),
+            Color::Yellow
+        );
 
         // A mixed stream: one Completed, and Faileds spanning all three
         // color buckets (Timeout=yellow, InvalidCallsign=red,
