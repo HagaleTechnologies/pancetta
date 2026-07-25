@@ -23091,6 +23091,176 @@ mod ap5_hot_path_rescue_tests {
              via active_qsos), not a coincidental AP0/AP1-equivalent hit"
         );
     }
+
+    /// Closes a gap the single-QSO test above cannot: with only one entry
+    /// in `active_qsos`, `active_qsos[0]` and "the QSO actually being
+    /// tried" are the same object, so a regression that accidentally
+    /// pinned the per-attempt `ApContext` to `active_qsos[0]` instead of
+    /// the loop's current `qso` variable would pass that test anyway.
+    ///
+    /// This test uses a TWO-element `active_qsos` where the rescuing
+    /// hypothesis lives at index 1: `active_qsos[0]` is a decoy QSO with
+    /// the WRONG partner callsign ("W9XYZ") and `active_qsos[1]` is the
+    /// real partner ("W1AW") whose content hypothesis matches the actual
+    /// signal. The decoy's expected text ("K1ABC W9XYZ RR73") shares the
+    /// SAME `extra` field ("RR73") as the real signal, so its content
+    /// bits (58-76) are identical to the real signal's -- the ONLY thing
+    /// that distinguishes decoy from rescuer is the injected/verified
+    /// partner-callsign bits (29-56), which is exactly the field the
+    /// Task 6 bug fix (per-QSO `ApContext` construction) protects.
+    ///
+    /// The legacy singular `active_qso` field is set to `Some(decoy)`,
+    /// matching the real Task 3 invariant (`active_qsos[0]` mirrors
+    /// `active_qso`) -- this is deliberately NOT `None` like the sibling
+    /// test above, because a regression that reused `ctx.ap_context`
+    /// (instead of building a per-QSO context) verbatim across every
+    /// `active_qsos` entry would inject/verify the DECOY's callsign for
+    /// every attempt, including index 1 -- which must then fail. Setting
+    /// `active_qso` to `None` here would make that regression
+    /// unobservable (no callsign to mismatch against), silently defeating
+    /// the whole point of this test.
+    ///
+    /// Enabling `active_qso` also structurally re-enables AP3/AP4 (they
+    /// gate on `ap_context.active_qso.is_some()`) for the `content_ap_
+    /// enabled = false` tier, unlike the sibling test. That's fine here:
+    /// AP3/AP4 inject the DECOY's (wrong) partner callsign, which is
+    /// expected to fail exactly like AP1 does (no correct partner
+    /// knowledge) -- this is a different regime from the "AP3/AP4 with
+    /// the CORRECT callsign already rescues" cliff the sibling test's doc
+    /// comment describes avoiding.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn ap5_rescues_via_active_qsos_index_1_not_index_0() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let text = "K1ABC W1AW RR73";
+        let decoder = Ft8Decoder::new(Ft8Config {
+            content_ap_enabled: true,
+            ..Ft8Config::default()
+        })
+        .expect("decoder");
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message(text, None).expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        // Same proven noise recipe as the sibling test above.
+        let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        add_seeded_noise_snr_db(&mut tx, -26.0, 0xA995_5EED);
+        let cs_start = 7 * sps;
+        let cs_end = 26 * sps;
+        add_seeded_noise_snr_db(&mut tx[cs_start..cs_end], -24.0, 0x2455_5EED);
+
+        let my_call = MyCallAp::new("K1ABC").expect("K1ABC should encode");
+
+        // Decoy: wrong partner callsign, SAME content family ("RR73") as
+        // the real signal -- isolates the callsign field as the only
+        // possible source of a mismatch.
+        let decoy_qso = QsoAp::new("W9XYZ", QsoApProgress::WaitingForConfirmation)
+            .expect("W9XYZ should encode")
+            .with_expected_texts(["K1ABC W9XYZ RR73"]);
+
+        // Rescuer: correct partner callsign and content, at index 1.
+        let mut real_qso =
+            QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).expect("W1AW should encode");
+        real_qso =
+            real_qso.with_expected_texts(["K1ABC W1AW RR73", "K1ABC W1AW RRR", "K1ABC W1AW 73"]);
+
+        let ap_context = ApContext {
+            my_call: Some(my_call),
+            recent_calls: vec![],
+            // Mirrors the real Task 3 invariant: `active_qso` tracks
+            // `active_qsos[0]` (the decoy here) -- see doc comment above
+            // for why this must NOT be `None` in this particular test.
+            active_qso: Some(decoy_qso.clone()),
+            active_qsos: vec![decoy_qso, real_qso],
+        };
+
+        let audio = decoder.preprocess_audio(&tx).expect("preprocess");
+        let spectrogram = decoder.compute_spectrogram(&audio).expect("spectrogram");
+        let candidates = decoder
+            .costas_sync_search_with_threshold(&spectrogram, 0.0, None)
+            .expect("sync search");
+        let candidate = candidates
+            .into_iter()
+            .max_by(|a, b| {
+                a.sync_score
+                    .partial_cmp(&b.sync_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("a noisy signal must still produce at least one sync candidate");
+
+        let mut fft_buffer = vec![Complex::new(0.0, 0.0); sps];
+        let decoded_calls: HashSet<String> = HashSet::new();
+
+        // Tier 1: AP0 must fail.
+        let ctx_ap0 = build_ctx(&decoder, &spectrogram, &audio, &ap_context, false);
+        let ap0_result = par_decode_candidate(
+            &ctx_ap0,
+            &candidate,
+            &decoder.ldpc_decoder,
+            None,
+            &mut fft_buffer,
+        );
+        assert!(
+            ap0_result.is_none(),
+            "AP0 (par_decode_candidate) must NOT decode this noisy \
+             candidate (test is only meaningful if this tier genuinely \
+             fails); got: {:?}",
+            ap0_result.map(|m| m.text)
+        );
+
+        // Tier 2: with `content_ap_enabled = false`, `par_try_ap_decode`
+        // reaches AP1 and (since `active_qso` is `Some(decoy)` here) also
+        // AP3/AP4, all using the DECOY's wrong partner callsign -- none
+        // of them should rescue.
+        let ctx_ap1 = build_ctx(&decoder, &spectrogram, &audio, &ap_context, false);
+        let ap1_result = par_try_ap_decode(
+            &ctx_ap1,
+            &candidate,
+            &decoder.ldpc_decoder,
+            &decoded_calls,
+            0,
+        );
+        assert!(
+            ap1_result.is_none(),
+            "AP1/AP3/AP4 (par_try_ap_decode, content_ap_enabled = false) \
+             must NOT rescue this candidate using the decoy's wrong \
+             partner callsign (test is only meaningful if this tier \
+             genuinely fails too); got: {:?}",
+            ap1_result.map(|m| m.text)
+        );
+
+        // Tier 3: Ap5 must rescue via `active_qsos[1]` (the real partner)
+        // specifically -- NOT via `active_qsos[0]` (the decoy), which
+        // carries the wrong callsign and must be tried-and-rejected first.
+        // A regression that pinned the per-attempt context to
+        // `active_qsos[0]` for every iteration would make this fail: the
+        // index-1 attempt would (incorrectly) verify against the decoy's
+        // callsign too, and reject the genuine W1AW decode.
+        let ctx_ap5 = build_ctx(&decoder, &spectrogram, &audio, &ap_context, true);
+        let ap5_result = par_try_ap_decode(
+            &ctx_ap5,
+            &candidate,
+            &decoder.ldpc_decoder,
+            &decoded_calls,
+            0,
+        );
+        let rescued = ap5_result.expect(
+            "Ap5 (par_try_ap_decode, content_ap_enabled = true) must \
+             rescue the candidate via active_qsos[1] (the real partner), \
+             even though active_qsos[0] (the decoy) is tried first and \
+             must fail",
+        );
+        assert_eq!(rescued.text, text);
+        assert_eq!(
+            rescued.ap_level, 6,
+            "the rescue must come from Ap5 (content-hypothesis injection \
+             via active_qsos[1]), not a coincidental AP0/AP1-equivalent hit"
+        );
+    }
 }
 
 // ============================================================================
