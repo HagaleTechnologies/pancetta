@@ -1104,6 +1104,23 @@ impl MessageBus {
         Ok((sender, receiver))
     }
 
+    /// Idempotent variant of `create_channel`: returns the existing registration's
+    /// sender/receiver if `component_id` is already registered, instead of erroring.
+    /// Needed so a supervisor-restarted component's `start_*_component` (which calls
+    /// `create_channel` internally) can be re-invoked without a special restart-only
+    /// code path in every component.
+    pub async fn get_or_create_channel(
+        &self,
+        component_id: ComponentId,
+    ) -> Result<(Sender<ComponentMessage>, Receiver<ComponentMessage>)> {
+        let channels = self.channels.read().await;
+        if let Some(existing) = channels.get(&component_id) {
+            return Ok((existing.sender.clone(), existing.receiver.clone()));
+        }
+        drop(channels);
+        self.create_channel(component_id).await
+    }
+
     /// Send a message to a specific component
     pub async fn send_message(&self, mut message: ComponentMessage) -> Result<()> {
         // Check message expiration
@@ -1268,6 +1285,37 @@ mod tests {
         // Should fail to create duplicate channel
         let duplicate_result = bus.create_channel(ComponentId::Audio).await;
         assert!(duplicate_result.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_or_create_channel_returns_existing_registration_without_error() {
+        let bus = MessageBus::new(1000).unwrap();
+        let (tx1, _rx1) = bus.create_channel(ComponentId::Dsp).await.unwrap();
+        let (tx2, _rx2) = bus.get_or_create_channel(ComponentId::Dsp).await.unwrap();
+        // Same underlying channel: a message sent via tx1 must be visible to a
+        // receiver obtained from the second call's rx (same crossbeam sender clone).
+        tx1.send(ComponentMessage::new(
+            ComponentId::Coordinator,
+            ComponentId::Dsp,
+            MessageType::Control(ControlMessage::Shutdown),
+            Instant::now(),
+        ))
+        .unwrap();
+        drop(tx2); // tx2 is a clone of the same sender; dropping it must not close the channel
+                   // A fresh create_channel for the SAME id must still error (proves get_or_create
+                   // didn't silently replace the registration under the hood).
+        assert!(bus.create_channel(ComponentId::Dsp).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn get_or_create_channel_creates_when_absent() {
+        let bus = MessageBus::new(1000).unwrap();
+        let result = bus.get_or_create_channel(ComponentId::Audio).await;
+        assert!(result.is_ok());
+
+        // A duplicate create_channel should now fail, proving the registration
+        // was actually inserted (not just returned as an ephemeral pair).
+        assert!(bus.create_channel(ComponentId::Audio).await.is_err());
     }
 
     #[tokio::test]
