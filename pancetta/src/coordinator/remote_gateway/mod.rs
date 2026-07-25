@@ -615,4 +615,53 @@ mod server_tests {
             other => panic!("expected two Spectrum events, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn tx_placement_update_bus_message_becomes_placement_event() {
+        use pancetta_qso::frequency::{FrequencyCandidate, PlacementSnapshot};
+
+        let (evt_tx, mut rx) = broadcast::channel::<ServerEvent>(16);
+        let snapshot_state = RwLock::new(empty_snapshot());
+        let op_freq = AtomicU64::new(14_074_000);
+        let lookup = crate::priority_evaluator::CachedStationLookup::new();
+        let spectrum_seq = AtomicU64::new(0);
+
+        let placement_snapshot = PlacementSnapshot {
+            slices: vec![FrequencyCandidate {
+                offset_hz: 1500.0,
+                score: 42.5,
+                clear_both_slots: true,
+                clear_first: true,
+                clear_second: true,
+                noise_floor: -120.0,
+            }],
+            openness: vec![3, 2, 0],
+            bin_hz: 5.86,
+            range: (200.0, 3000.0),
+        };
+        let msg = MessageType::TxPlacementUpdate {
+            snapshot: placement_snapshot,
+        };
+
+        handle_bus_msg(
+            &msg,
+            &op_freq,
+            &lookup,
+            "K5ARH",
+            &evt_tx,
+            &snapshot_state,
+            &spectrum_seq,
+        )
+        .await;
+
+        let event = rx.recv().await.unwrap();
+        match event {
+            ServerEvent::Placement { placement } => {
+                assert_eq!(placement.slices.len(), 1);
+                assert_eq!(placement.slices[0].offset_hz, 1500.0);
+                assert_eq!(placement.openness, vec![3, 2, 0]);
+            }
+            other => panic!("expected Placement, got {other:?}"),
+        }
+    }
 }
