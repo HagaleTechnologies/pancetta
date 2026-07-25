@@ -1111,6 +1111,49 @@ fn component_criticality(id: ComponentId) -> ComponentCriticality {
     }
 }
 
+/// How the supervisor should react when a component's task dies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RestartPolicy {
+    /// Re-invoke the component's `start_*` method after backoff, up to the
+    /// shared retry budget (Task 3).
+    Restartable,
+    /// Never auto-restart; log and leave `Failed` (today's behavior).
+    DegradeOnly,
+    /// Unrecoverable in-process (e.g. a native C abort); document the
+    /// external OS-supervisor as the backstop. Treated identically to
+    /// `DegradeOnly` by the supervisor loop — the distinction is purely
+    /// for the log message and for future extension, not behavior.
+    FatalAbort,
+}
+
+/// Per-component restart policy (spec: docs/superpowers/specs/2026-07-25-task-supervision-design.md §4.1).
+/// Default for anything not listed is `DegradeOnly` (today's behavior) —
+/// this is the safety net: a component only gets auto-restarted if it's
+/// explicitly classified `Restartable` here.
+pub(crate) fn component_restart_policy(id: ComponentId) -> RestartPolicy {
+    match id {
+        ComponentId::Autonomous
+        | ComponentId::DxCluster
+        | ComponentId::PskReporter
+        | ComponentId::RemoteGateway
+        | ComponentId::Qso => RestartPolicy::Restartable,
+        // Out of scope for this plan (need channel/atomic re-supply design):
+        ComponentId::Dsp | ComponentId::Ft8Decoder => RestartPolicy::DegradeOnly,
+        // Out of scope for this plan (need teardown semantics):
+        ComponentId::Hamlib | ComponentId::StationAgent | ComponentId::Audio => {
+            RestartPolicy::DegradeOnly
+        }
+        // Owns the terminal; restart is awkward — degrade + notify.
+        ComponentId::Tui => RestartPolicy::DegradeOnly,
+        // Never a real task-handle target for this supervisor.
+        ComponentId::Config | ComponentId::Coordinator | ComponentId::Ft8Transmitter => {
+            RestartPolicy::DegradeOnly
+        }
+        // Companion protocol integration; not critical for autonomous operation.
+        ComponentId::WsjtxUdp => RestartPolicy::DegradeOnly,
+    }
+}
+
 /// Human-readable degradation message for a failed component
 fn degradation_message(id: ComponentId) -> &'static str {
     match id {
@@ -2613,5 +2656,49 @@ mod tests {
         );
 
         assert!(matches!(result, Err(ModeSwitchError::QsoSetUnavailable)));
+    }
+
+    #[test]
+    fn restart_policy_matches_spec_classification() {
+        use RestartPolicy::*;
+        assert_eq!(component_restart_policy(ComponentId::Qso), Restartable);
+        assert_eq!(
+            component_restart_policy(ComponentId::Autonomous),
+            Restartable
+        );
+        assert_eq!(
+            component_restart_policy(ComponentId::DxCluster),
+            Restartable
+        );
+        assert_eq!(
+            component_restart_policy(ComponentId::PskReporter),
+            Restartable
+        );
+        assert_eq!(
+            component_restart_policy(ComponentId::RemoteGateway),
+            Restartable
+        );
+        assert_eq!(component_restart_policy(ComponentId::Dsp), DegradeOnly);
+        assert_eq!(
+            component_restart_policy(ComponentId::Ft8Decoder),
+            DegradeOnly
+        );
+        assert_eq!(component_restart_policy(ComponentId::Hamlib), DegradeOnly);
+        assert_eq!(
+            component_restart_policy(ComponentId::StationAgent),
+            DegradeOnly
+        );
+        assert_eq!(component_restart_policy(ComponentId::Audio), DegradeOnly);
+        assert_eq!(component_restart_policy(ComponentId::Tui), DegradeOnly);
+        assert_eq!(component_restart_policy(ComponentId::Config), DegradeOnly);
+        assert_eq!(
+            component_restart_policy(ComponentId::Coordinator),
+            DegradeOnly
+        );
+        assert_eq!(
+            component_restart_policy(ComponentId::Ft8Transmitter),
+            DegradeOnly
+        );
+        assert_eq!(component_restart_policy(ComponentId::WsjtxUdp), DegradeOnly);
     }
 }
