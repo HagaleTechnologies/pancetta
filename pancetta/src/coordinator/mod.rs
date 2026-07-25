@@ -1005,6 +1005,15 @@ pub struct ApplicationCoordinator {
     /// today) would see an empty field rather than silently re-subscribing.
     pub(crate) wsjtx_qso_events_rx:
         Option<tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>>,
+
+    /// A cheap clone of the live `QsoManager` handle, stored so the task
+    /// supervisor (health.rs) can enumerate in-flight QSOs and surface them
+    /// as `QsoFailed{SupervisorRestart}` after the Qso component's task
+    /// dies -- `QsoManager::clone()` shares the same
+    /// `Arc<RwLock<..>>`-backed QSO map, so this stays valid and readable
+    /// even after the original task that constructed it has panicked.
+    /// Populated by `start_qso_component`, overwritten on every (re)start.
+    pub(crate) qso_manager_for_supervisor: Option<pancetta_qso::QsoManager>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -1480,6 +1489,7 @@ impl ApplicationCoordinator {
                 Arc::new(std::sync::Mutex::new(st))
             },
             wsjtx_qso_events_rx: None,
+            qso_manager_for_supervisor: None,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);

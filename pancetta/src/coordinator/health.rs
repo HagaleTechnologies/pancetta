@@ -528,6 +528,29 @@ impl super::ApplicationCoordinator {
             let _ = self.message_bus.send_message(ptt_off_msg).await;
         }
 
+        // Task 6 (task-supervision): a crashed Qso-component task drops
+        // whatever QSOs were in-flight at that moment -- the fresh
+        // `QsoManager` a restart constructs starts with an empty map, so
+        // without this those QSOs would just silently vanish from the
+        // operator's view. Surface each as `QsoFailed{SupervisorRestart}`
+        // through the manager's real state machine (`fail_qso`), reading off
+        // the cheap `Arc`-backed clone the coordinator stashed at
+        // `start_qso_component` time -- that clone shares the crashed
+        // task's `qsos` map and stays valid/readable regardless of whether
+        // the restart below actually happens (budget-exhausted degrade
+        // still means the in-flight QSOs are gone). Runs before the restart
+        // dispatch so this fires exactly once per crash, not once per
+        // (possibly repeated) restart attempt.
+        if component_id == ComponentId::Qso {
+            if let Some(manager) = self.qso_manager_for_supervisor.clone() {
+                for (qso_id, _progress) in manager.get_active_qsos().await {
+                    let _ = manager
+                        .fail_qso(qso_id, pancetta_qso::QsoFailureReason::SupervisorRestart)
+                        .await;
+                }
+            }
+        }
+
         match component_restart_policy(component_id) {
             RestartPolicy::Restartable
                 if self
@@ -766,6 +789,81 @@ mod supervisor_tests {
         // Failed.
         assert_eq!(
             status.get(&ComponentId::DxCluster).map(|s| &s.state),
+            Some(&super::ComponentState::Running)
+        );
+    }
+
+    /// Task 6 (task-supervision): a panicked Qso-component task must not
+    /// let its in-flight QSOs silently vanish. `start_qso_component` stashes
+    /// a cheap `Arc`-based `QsoManager` clone at
+    /// `coordinator.qso_manager_for_supervisor` specifically so
+    /// `handle_finished_task` can still enumerate and fail whatever was
+    /// active at crash time, even though the panicked task's own
+    /// `QsoManager` instance is gone.
+    #[tokio::test]
+    async fn qso_restart_emits_supervisor_restart_failure_for_each_active_qso() {
+        let mut coordinator = test_coordinator().await;
+        // `respond_to_cq` refuses a placeholder callsign, so give the
+        // station a real one before the Qso component reads it.
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        coordinator.start_qso_component().await.unwrap();
+
+        // The coordinator's stashed handle shares the same `qsos` map as
+        // whatever `QsoManager` is running inside the (about to be killed)
+        // Qso-component task -- inserting an active QSO through it is
+        // equivalent to the real task having opened one.
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let qso_id = manager
+            .respond_to_cq("K1ABC".to_string(), 1500.0, None)
+            .await
+            .expect("seeding an active QSO via the real public API");
+
+        // Subscribe BEFORE triggering the restart so the QsoFailed emitted
+        // during `check_task_handles` isn't missed.
+        let mut qso_events_rx = manager.subscribe();
+
+        // Simulate a Qso-task panic: swap out whatever real task
+        // `start_qso_component` spawned for a fake one that panics
+        // immediately, mirroring `panicking_restartable_component_is_
+        // restarted_after_backoff` above.
+        let handle = tokio::spawn(async {
+            panic!("injected test panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        coordinator
+            .named_task_handles
+            .retain(|(id, _)| *id != ComponentId::Qso);
+        coordinator
+            .named_task_handles
+            .push((ComponentId::Qso, handle));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        coordinator.check_task_handles().await;
+
+        let mut events = Vec::new();
+        while let Ok(event) = qso_events_rx.try_recv() {
+            events.push(event);
+        }
+        let failed = events.iter().find_map(|e| match e {
+            pancetta_qso::QsoEvent::QsoFailed {
+                qso_id: id, reason, ..
+            } if *id == qso_id => Some(reason.clone()),
+            _ => None,
+        });
+        assert_eq!(
+            failed,
+            Some(pancetta_qso::QsoFailureReason::SupervisorRestart),
+            "expected a QsoFailed{{SupervisorRestart}} for the seeded QSO, got {events:?}"
+        );
+
+        // The Qso component was restarted (Restartable + within budget), so
+        // it's Running again -- the drop-surfacing must not have interfered
+        // with the restart path itself.
+        let status = coordinator.component_status.read().await;
+        assert_eq!(
+            status.get(&ComponentId::Qso).map(|s| &s.state),
             Some(&super::ComponentState::Running)
         );
     }
