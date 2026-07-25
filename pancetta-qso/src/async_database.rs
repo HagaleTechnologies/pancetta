@@ -201,6 +201,30 @@ pub struct DatabaseStats {
     pub database_size: u64,
 }
 
+/// A persisted per-QSO timeline record (Layer 2 timeline persistence).
+///
+/// Reconstructs "what we sent / what we heard / why we advanced" for a
+/// completed or failed QSO, offline, keyed by `qso_id`. See
+/// `QsoDatabase::insert_qso_timeline` / `get_qso_timeline`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QsoTimelineRecord {
+    /// The QSO's stable identity (`QsoMetadata::qso_id`).
+    pub qso_id: QsoId,
+    /// The contra-station's callsign, if known at the time of persistence.
+    pub callsign: Option<String>,
+    /// `"completed"` or `"failed"`.
+    pub outcome: String,
+    /// The `QsoFailureReason` (as its `Debug` text), present only when
+    /// `outcome == "failed"`.
+    pub reason: Option<String>,
+    /// The full sequence of state transitions this QSO went through.
+    pub state_history: Vec<StateTransition>,
+    /// Every message sent/received over the life of the QSO.
+    pub messages: Vec<QsoMessage>,
+    /// When this timeline record was written.
+    pub created_at: DateTime<Utc>,
+}
+
 /// Async database operation errors
 #[derive(Debug, Error)]
 pub enum AsyncDatabaseError {
@@ -335,6 +359,29 @@ impl QsoDatabase {
                 version INTEGER PRIMARY KEY,
                 applied_at TEXT NOT NULL
             );
+
+            -- Layer 2 timeline persistence (docs/observability-diagnostics-plan.md):
+            -- a completed/failed QSO's full state-transition + message history,
+            -- gated behind `[database].persist_qso_timeline` (default off) so it
+            -- never grows unless the operator opts in. Deliberately a SEPARATE
+            -- table from `qsos` (the confirmed-contact log): a Failed QSO is not
+            -- a logged contact and must never appear in `qsos` (duplicate
+            -- checks / ADIF export / worked-station seeding all read that
+            -- table), but its timeline is still valuable for diagnosing why it
+            -- failed.
+            CREATE TABLE IF NOT EXISTS qso_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                qso_id TEXT NOT NULL,
+                callsign TEXT,
+                outcome TEXT NOT NULL,
+                reason TEXT,
+                state_history TEXT NOT NULL,
+                messages TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_qso_events_qso_id ON qso_events(qso_id);
+            CREATE INDEX IF NOT EXISTS idx_qso_events_created_at ON qso_events(created_at);
         "#;
 
         sqlx::query(schema).execute(&self.pool).await?;
@@ -1031,6 +1078,121 @@ impl QsoDatabase {
             .await?;
         Ok(count as u64)
     }
+
+    /// Persist a QSO's full state-transition + message timeline into the
+    /// `qso_events` table (Layer 2 timeline persistence — see
+    /// `docs/observability-diagnostics-plan.md`). Callers should gate this
+    /// behind `[database].persist_qso_timeline` (default off); this method
+    /// itself performs no gating so it stays trivially testable.
+    ///
+    /// Unlike `insert_qso`/`update_qso`, this always inserts a new row —
+    /// a QSO id can legitimately appear more than once here (e.g. superseded
+    /// then later cleaned up) and each is a distinct historical record, not
+    /// an upsert target.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn insert_qso_timeline(
+        &self,
+        qso_id: QsoId,
+        callsign: Option<&str>,
+        outcome: &str,
+        reason: Option<&str>,
+        state_history: &[StateTransition],
+        messages: &[QsoMessage],
+    ) -> Result<i64, AsyncDatabaseError> {
+        let state_history_json = serde_json::to_string(state_history)?;
+        let messages_json = serde_json::to_string(messages)?;
+        let now = Utc::now().to_rfc3339();
+
+        let result = sqlx::query(
+            "INSERT INTO qso_events (qso_id, callsign, outcome, reason, state_history,
+                                      messages, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+        )
+        .bind(qso_id.to_string())
+        .bind(callsign)
+        .bind(outcome)
+        .bind(reason)
+        .bind(&state_history_json)
+        .bind(&messages_json)
+        .bind(&now)
+        .execute(&self.pool)
+        .await?;
+
+        let id = result.last_insert_rowid();
+        debug!(
+            "Persisted QSO timeline for {} ({}, {} transitions, {} messages)",
+            qso_id,
+            outcome,
+            state_history.len(),
+            messages.len()
+        );
+        Ok(id)
+    }
+
+    /// Fetch the most recently persisted timeline for `qso_id`, if any.
+    ///
+    /// A QSO can have more than one row (see `insert_qso_timeline`); this
+    /// returns the latest so a caller reconstructing "what happened" gets
+    /// the final, most-complete history.
+    pub async fn get_qso_timeline(
+        &self,
+        qso_id: QsoId,
+    ) -> Result<Option<QsoTimelineRecord>, AsyncDatabaseError> {
+        // (qso_id, callsign, outcome, reason, state_history_json, messages_json, created_at)
+        type QsoEventRow = (
+            String,
+            Option<String>,
+            String,
+            Option<String>,
+            String,
+            String,
+            String,
+        );
+        let row: Option<QsoEventRow> = sqlx::query_as(
+            "SELECT qso_id, callsign, outcome, reason, state_history, messages, created_at
+                 FROM qso_events WHERE qso_id = ? ORDER BY id DESC LIMIT 1",
+        )
+        .bind(qso_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+
+        match row {
+            Some((
+                qso_id_str,
+                callsign,
+                outcome,
+                reason,
+                state_history_json,
+                messages_json,
+                created_at,
+            )) => {
+                let qso_id =
+                    Uuid::parse_str(&qso_id_str).map_err(|e| AsyncDatabaseError::InvalidQuery {
+                        message: format!("stored qso_id {qso_id_str} is not a valid UUID: {e}"),
+                    })?;
+                let state_history: Vec<StateTransition> =
+                    serde_json::from_str(&state_history_json)?;
+                let messages: Vec<QsoMessage> = serde_json::from_str(&messages_json)?;
+                let created_at = DateTime::parse_from_rfc3339(&created_at)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| AsyncDatabaseError::InvalidQuery {
+                        message: format!(
+                            "stored created_at {created_at} is not valid RFC3339: {e}"
+                        ),
+                    })?;
+                Ok(Some(QsoTimelineRecord {
+                    qso_id,
+                    callsign,
+                    outcome,
+                    reason,
+                    state_history,
+                    messages,
+                    created_at,
+                }))
+            }
+            None => Ok(None),
+        }
+    }
 }
 
 // QsoDatabase is automatically Send + Sync thanks to SqlitePool
@@ -1427,5 +1589,211 @@ mod tests {
             "missing K9DEF in {:?}",
             calls
         );
+    }
+
+    // --- Layer 2 timeline persistence (docs/observability-diagnostics-plan.md
+    // §"Persist the timeline") --------------------------------------------
+
+    /// A non-trivial state_history: Idle -> RespondingToCq -> SendingReport
+    /// -> Completed, driven by a mix of received/sent transitions.
+    fn sample_state_history(now: DateTime<Utc>) -> Vec<StateTransition> {
+        vec![
+            StateTransition {
+                from_state: QsoState::Idle,
+                to_state: QsoState::RespondingToCq {
+                    target_callsign: "K1DEF".to_string(),
+                    frequency: 1500.0,
+                    started_at: now,
+                },
+                timestamp: now,
+                reason: TransitionReason::UserAction,
+            },
+            StateTransition {
+                from_state: QsoState::RespondingToCq {
+                    target_callsign: "K1DEF".to_string(),
+                    frequency: 1500.0,
+                    started_at: now,
+                },
+                to_state: QsoState::SendingReport {
+                    their_callsign: "K1DEF".to_string(),
+                    their_report: None,
+                    our_report: -12,
+                    frequency: 1500.0,
+                    started_at: now,
+                },
+                timestamp: now + chrono::Duration::seconds(15),
+                reason: TransitionReason::MessageReceived(MessageType::CqResponse {
+                    calling_station: "K1DEF".to_string(),
+                    responding_station: "W1ABC".to_string(),
+                    grid: Some("FN42".to_string()),
+                }),
+            },
+            StateTransition {
+                from_state: QsoState::SendingReport {
+                    their_callsign: "K1DEF".to_string(),
+                    their_report: None,
+                    our_report: -12,
+                    frequency: 1500.0,
+                    started_at: now,
+                },
+                to_state: QsoState::Completed {
+                    their_callsign: "K1DEF".to_string(),
+                    their_report: -9,
+                    our_report: -12,
+                    frequency: 1500.0,
+                    grid_square: Some("FN42".to_string()),
+                    completed_at: now + chrono::Duration::seconds(45),
+                    duration_seconds: 45,
+                },
+                timestamp: now + chrono::Duration::seconds(45),
+                reason: TransitionReason::MessageReceived(MessageType::SeventyThree {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                }),
+            },
+        ]
+    }
+
+    fn sample_messages(now: DateTime<Utc>) -> Vec<QsoMessage> {
+        vec![
+            QsoMessage {
+                timestamp: now,
+                direction: MessageDirection::Sent,
+                message_type: MessageType::CqResponse {
+                    calling_station: "K1DEF".to_string(),
+                    responding_station: "W1ABC".to_string(),
+                    grid: Some("FN42".to_string()),
+                },
+                raw_text: "K1DEF W1ABC FN42".to_string(),
+                signal_strength: None,
+                frequency: 1500.0,
+            },
+            QsoMessage {
+                timestamp: now + chrono::Duration::seconds(15),
+                direction: MessageDirection::Received,
+                message_type: MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -9,
+                },
+                raw_text: "W1ABC K1DEF -09".to_string(),
+                signal_strength: Some(-9.0),
+                frequency: 1500.0,
+            },
+            QsoMessage {
+                timestamp: now + chrono::Duration::seconds(45),
+                direction: MessageDirection::Received,
+                message_type: MessageType::SeventyThree {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                },
+                raw_text: "W1ABC K1DEF 73".to_string(),
+                signal_strength: Some(-8.0),
+                frequency: 1500.0,
+            },
+        ]
+    }
+
+    #[tokio::test]
+    async fn qso_timeline_round_trips_state_history_and_messages_for_failed_qso() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        let qso_id = Uuid::new_v4();
+        let now = Utc::now();
+        let state_history = sample_state_history(now);
+        let messages = sample_messages(now);
+
+        db.insert_qso_timeline(
+            qso_id,
+            Some("K1DEF"),
+            "failed",
+            Some("Timeout"),
+            &state_history,
+            &messages,
+        )
+        .await
+        .unwrap();
+
+        let reloaded = db
+            .get_qso_timeline(qso_id)
+            .await
+            .unwrap()
+            .expect("timeline must be persisted and reloadable");
+
+        assert_eq!(reloaded.qso_id, qso_id);
+        assert_eq!(reloaded.callsign.as_deref(), Some("K1DEF"));
+        assert_eq!(reloaded.outcome, "failed");
+        assert_eq!(reloaded.reason.as_deref(), Some("Timeout"));
+        // The exact round-trip assertion the brief asks for: what comes back
+        // out must equal what went in, transition-for-transition and
+        // message-for-message — not just "some non-empty vec".
+        assert_eq!(reloaded.state_history, state_history);
+        assert_eq!(reloaded.messages, messages);
+    }
+
+    #[tokio::test]
+    async fn qso_timeline_round_trips_for_completed_qso() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        let qso_id = Uuid::new_v4();
+        let now = Utc::now();
+        let state_history = sample_state_history(now);
+        let messages = sample_messages(now);
+
+        db.insert_qso_timeline(
+            qso_id,
+            Some("K1DEF"),
+            "completed",
+            None,
+            &state_history,
+            &messages,
+        )
+        .await
+        .unwrap();
+
+        let reloaded = db.get_qso_timeline(qso_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.outcome, "completed");
+        assert_eq!(reloaded.reason, None);
+        assert_eq!(reloaded.state_history, state_history);
+        assert_eq!(reloaded.messages, messages);
+    }
+
+    #[tokio::test]
+    async fn qso_timeline_missing_qso_id_returns_none() {
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        assert!(db.get_qso_timeline(Uuid::new_v4()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn qso_timeline_returns_latest_row_when_qso_id_recurs() {
+        // A superseded-then-cleaned-up QSO can legitimately produce more
+        // than one row for the same qso_id; the most recent must win.
+        let db = QsoDatabase::new_in_memory().await.unwrap();
+        let qso_id = Uuid::new_v4();
+        let now = Utc::now();
+
+        db.insert_qso_timeline(
+            qso_id,
+            Some("K1DEF"),
+            "failed",
+            Some("Superseded"),
+            &[],
+            &[],
+        )
+        .await
+        .unwrap();
+        let second_history = sample_state_history(now);
+        db.insert_qso_timeline(
+            qso_id,
+            Some("K1DEF"),
+            "completed",
+            None,
+            &second_history,
+            &[],
+        )
+        .await
+        .unwrap();
+
+        let reloaded = db.get_qso_timeline(qso_id).await.unwrap().unwrap();
+        assert_eq!(reloaded.outcome, "completed");
+        assert_eq!(reloaded.state_history, second_history);
     }
 }

@@ -239,7 +239,7 @@ pub struct QsoProgress {
 }
 
 /// State transition record
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct StateTransition {
     /// Previous state
     pub from_state: QsoState,
@@ -255,7 +255,7 @@ pub struct StateTransition {
 }
 
 /// Reasons for state transitions
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum TransitionReason {
     /// Message received
     MessageReceived(MessageType),
@@ -277,7 +277,7 @@ pub enum TransitionReason {
 }
 
 /// QSO message record
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QsoMessage {
     /// Message timestamp
     pub timestamp: DateTime<Utc>,

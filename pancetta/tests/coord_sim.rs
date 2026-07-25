@@ -480,7 +480,9 @@ impl CoordSim {
                     self.active_tx_offsets.write().unwrap().remove(&key);
                 }
             }
-            QsoEvent::QsoCompleted { qso_id, metadata } => {
+            QsoEvent::QsoCompleted {
+                qso_id, metadata, ..
+            } => {
                 // Grace window: keep the key live so the final 73 still keys.
                 // The scenario removes it explicitly via `expire_qso` when it
                 // wants to model grace elapsing.

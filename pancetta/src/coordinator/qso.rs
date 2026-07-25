@@ -1166,6 +1166,8 @@ impl super::ApplicationCoordinator {
                 .unwrap_or(pancetta_config::OperatingMode::Ft8),
         )
         .to_string();
+        // Layer 2 timeline persistence gate — see docs/CONFIG.md `[database]`.
+        let persist_qso_timeline = config.database.persist_qso_timeline;
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -1325,6 +1327,7 @@ impl super::ApplicationCoordinator {
                 // startup replay (ADIF is source of truth; DB is cache).
                 let logger_config = LoggerConfig {
                     database_path: db_path.clone(),
+                    persist_qso_timeline,
                     ..Default::default()
                 };
 
@@ -2149,6 +2152,7 @@ impl super::ApplicationCoordinator {
                                 qso_id,
                                 reason,
                                 metadata,
+                                ..
                             }) => {
                                 // Drop-stale-TX gate: a failed QSO must stop
                                 // transmitting immediately. (StateChanged-into-

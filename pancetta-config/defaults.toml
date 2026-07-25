@@ -172,6 +172,9 @@ rarity = 0.1
 recent_failure_penalty = -0.15
 signal_strength = 0.05
 
+[database]
+persist_qso_timeline = false
+
 [decoder]
 ap_eval_mode = false
 effort = "auto"

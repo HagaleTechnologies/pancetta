@@ -371,6 +371,16 @@ pub enum QsoEvent {
     QsoCompleted {
         qso_id: QsoId,
         metadata: QsoMetadata,
+        /// Full state-transition + message timeline as of completion (Layer
+        /// 2 timeline persistence — see
+        /// docs/observability-diagnostics-plan.md). Captured at the
+        /// emission site from the live in-memory `QsoProgress` before it is
+        /// eventually dropped (`cleanup_completed_qsos` removes terminal
+        /// QSOs from the active map ~1h later, discarding these fields if
+        /// nothing persisted them first). Consumers that don't need the
+        /// timeline can destructure with `..`.
+        state_history: Vec<StateTransition>,
+        messages: Vec<QsoMessage>,
     },
 
     /// QSO failed
@@ -378,6 +388,9 @@ pub enum QsoEvent {
         qso_id: QsoId,
         reason: QsoFailureReason,
         metadata: QsoMetadata,
+        /// See `QsoCompleted::state_history`.
+        state_history: Vec<StateTransition>,
+        messages: Vec<QsoMessage>,
     },
 
     /// Duplicate QSO detected
@@ -1667,6 +1680,11 @@ impl QsoManager {
             }],
             metadata: metadata.clone(),
         };
+        // Captured before the move into the map below so the
+        // QsoCompleted-on-open-at-close emit further down still has it
+        // (Layer 2 timeline persistence).
+        let opening_state_history = progress.state_history.clone();
+        let opening_messages = progress.messages.clone();
 
         self.qsos.write().await.insert(qso_id, progress);
         self.add_callsign_mapping(&target, qso_id).await;
@@ -1707,8 +1725,13 @@ impl QsoManager {
             if dial > 0 {
                 metadata.frequency += dial as f64;
             }
-            self.emit_event(QsoEvent::QsoCompleted { qso_id, metadata })
-                .await;
+            self.emit_event(QsoEvent::QsoCompleted {
+                qso_id,
+                metadata,
+                state_history: opening_state_history,
+                messages: opening_messages,
+            })
+            .await;
         }
 
         Ok(qso_id)
@@ -1814,6 +1837,11 @@ impl QsoManager {
             };
             // Capture metadata before it's consumed below (Batch 4, SM-F5).
             let metadata = progress.metadata.clone();
+            // Layer 2 timeline persistence: capture the full timeline before
+            // `progress` is dropped at the end of this block — this is the
+            // "QSO leaves the active map" discard site.
+            let state_history = progress.state_history.clone();
+            let messages = progress.messages.clone();
 
             self.emit_state_change(qso_id, old_state, progress.state.clone())
                 .await;
@@ -1828,6 +1856,8 @@ impl QsoManager {
                 qso_id,
                 reason: QsoFailureReason::UserCancelled,
                 metadata,
+                state_history,
+                messages,
             })
             .await;
 
@@ -2219,8 +2249,13 @@ impl QsoManager {
 
             // Emit QsoCompleted event so loggers can auto-log the QSO
             if let Some(metadata) = completed_metadata {
-                self.emit_event(QsoEvent::QsoCompleted { qso_id, metadata })
-                    .await;
+                self.emit_event(QsoEvent::QsoCompleted {
+                    qso_id,
+                    metadata,
+                    state_history: progress.state_history.clone(),
+                    messages: progress.messages.clone(),
+                })
+                .await;
             }
         }
 
@@ -3701,9 +3736,22 @@ impl QsoManager {
             } else {
                 None
             };
-            (old_state, tx_parity, remote_origin, completed_metadata)
+            // Layer 2 timeline persistence: capture the timeline as of this
+            // mutation while the write lock is still held, for the
+            // QsoCompleted emit below (after the lock is released).
+            let state_history = progress.state_history.clone();
+            let messages = progress.messages.clone();
+            (
+                old_state,
+                tx_parity,
+                remote_origin,
+                completed_metadata,
+                state_history,
+                messages,
+            )
         };
-        let (old_state, tx_parity, remote_origin, completed_metadata) = emit;
+        let (old_state, tx_parity, remote_origin, completed_metadata, state_history, messages) =
+            emit;
 
         self.emit_state_change(qso_id, old_state, new_state).await;
         self.emit_event(QsoEvent::MessageToSend {
@@ -3715,8 +3763,13 @@ impl QsoManager {
         })
         .await;
         if let Some(metadata) = completed_metadata {
-            self.emit_event(QsoEvent::QsoCompleted { qso_id, metadata })
-                .await;
+            self.emit_event(QsoEvent::QsoCompleted {
+                qso_id,
+                metadata,
+                state_history,
+                messages,
+            })
+            .await;
         }
         Ok(())
     }
@@ -3769,12 +3822,22 @@ impl QsoManager {
                         };
                         // Capture metadata before this loop iteration's lock
                         // guard drops (Batch 4, SM-F5 — needed for QsoFailed).
-                        Some((old_state, progress.metadata.clone()))
+                        // Also capture the timeline (Layer 2 persistence) —
+                        // superseded QSOs stay in the map and are picked up
+                        // later by `cleanup_completed_qsos`, but emitting it
+                        // here too means a persistence subscriber doesn't
+                        // have to wait up to an hour for it.
+                        Some((
+                            old_state,
+                            progress.metadata.clone(),
+                            progress.state_history.clone(),
+                            progress.messages.clone(),
+                        ))
                     }
                     None => None,
                 }
             };
-            if let Some((old_state, metadata)) = old_state_and_metadata {
+            if let Some((old_state, metadata, state_history, messages)) = old_state_and_metadata {
                 let new_state = self.qsos.read().await.get(&qso_id).map(|p| p.state.clone());
                 if let Some(new_state) = new_state {
                     self.emit_state_change(qso_id, old_state, new_state).await;
@@ -3787,6 +3850,8 @@ impl QsoManager {
                     qso_id,
                     reason: QsoFailureReason::Superseded,
                     metadata,
+                    state_history,
+                    messages,
                 })
                 .await;
                 self.remove_callsign_mapping(callsign, qso_id).await;
@@ -4107,6 +4172,17 @@ impl QsoManager {
         }
     }
 
+    /// Layer 2 timeline persistence note (docs/observability-diagnostics-plan.md):
+    /// `progress.state_history`/`.messages` are dropped here along with the
+    /// rest of `progress` — this WAS the "QSO leaves the active map" discard
+    /// site the plan calls out. It's safe now: every path that can make a
+    /// QSO terminal (`process_message_for_qso`, `advance_existing_qso_to_step`,
+    /// the open-at-close branch of `respond_to_caller`, `cancel_qso`,
+    /// `supersede_active_qsos_for`, `check_timeouts_at`) already captured and
+    /// emitted the full timeline on `QsoEvent::QsoCompleted`/`QsoFailed` at
+    /// the moment the QSO went terminal — well before it ever reaches this
+    /// 1-hour-later cleanup. A `QsoLogger` with `persist_qso_timeline` on has
+    /// already durably written it by the time this runs.
     async fn cleanup_completed_qsos(&self) {
         let mut qsos = self.qsos.write().await;
         let cutoff_time = Utc::now() - Duration::hours(1); // Keep completed QSOs for 1 hour
@@ -4295,6 +4371,12 @@ impl QsoManager {
                 // Capture metadata before it's consumed below (Batch 4,
                 // SM-F5 — needed for QsoFailed).
                 let metadata = progress.metadata.clone();
+                // Layer 2 timeline persistence: this is the most common
+                // "QSO leaves the active map" discard site (every
+                // watchdog/timeout retirement runs through here) — capture
+                // the timeline before `progress` is dropped at loop end.
+                let state_history = progress.state_history.clone();
+                let messages = progress.messages.clone();
 
                 drop(qsos); // Release lock before emitting events
                 self.emit_state_change(qso_id, old_state, progress.state.clone())
@@ -4309,6 +4391,8 @@ impl QsoManager {
                     qso_id,
                     reason,
                     metadata,
+                    state_history,
+                    messages,
                 })
                 .await;
 
@@ -6000,6 +6084,106 @@ mod tests {
         assert_eq!(p.metadata.grids.theirs.as_deref(), Some("FN31"));
         assert_eq!(p.metadata.their_callsign.as_deref(), Some("K1DEF"));
         assert!(p.metadata.end_time.is_some());
+    }
+
+    /// Layer 2 timeline persistence (docs/observability-diagnostics-plan.md):
+    /// the `QsoEvent::QsoCompleted` broadcast at the end of a real multi-step
+    /// exchange must carry the QSO's ACTUAL state_history/messages, not the
+    /// empty vecs `QsoLogger::handle_qso_completed` used to hard-code. This
+    /// is what proves the emission sites (not just the DB round-trip) are
+    /// wired correctly — a persistence subscriber never sees an empty
+    /// timeline for a QSO that genuinely had one.
+    #[tokio::test]
+    async fn qso_completed_event_carries_full_timeline() {
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+        let qso_id = manager.start_cq(freq, None, false).await.unwrap();
+        let mut rx = manager.subscribe();
+
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                freq,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -12,
+                },
+                "W1ABC K1DEF R-12".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                },
+                "W1ABC K1DEF 73".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        let completed = events
+            .into_iter()
+            .find_map(|e| match e {
+                QsoEvent::QsoCompleted {
+                    qso_id: id,
+                    state_history,
+                    messages,
+                    ..
+                } if id == qso_id => Some((state_history, messages)),
+                _ => None,
+            })
+            .expect("expected a QsoCompleted event for this qso_id");
+        let (state_history, messages) = completed;
+
+        // Three forward transitions: CallingCq->WaitingForReport->
+        // WaitingForConfirmation->Completed, one per process_message call.
+        assert_eq!(
+            state_history.len(),
+            3,
+            "expected 3 state transitions in the completed event, got {:?}",
+            state_history
+        );
+        assert!(
+            matches!(state_history[0].from_state, QsoState::CallingCq { .. }),
+            "first transition must start from CallingCq, got {:?}",
+            state_history[0]
+        );
+        assert!(
+            matches!(
+                state_history.last().unwrap().to_state,
+                QsoState::Completed { .. }
+            ),
+            "last transition must land on Completed, got {:?}",
+            state_history.last()
+        );
+        // At minimum the CQ we sent plus the three replies we sent in
+        // response — never empty like the old hard-coded discard.
+        assert!(
+            !messages.is_empty(),
+            "expected a non-empty message history in the completed event"
+        );
     }
 
     /// The manual CQer also EMITS the right reply at each step (the auto-reply
@@ -9224,6 +9408,7 @@ mod sm_f5_qso_failed_event_tests {
                     qso_id,
                     reason,
                     metadata,
+                    ..
                 } => Some((*qso_id, reason.clone(), metadata.clone())),
                 _ => None,
             })
@@ -9301,6 +9486,65 @@ mod sm_f5_qso_failed_event_tests {
         assert_eq!(*failed_id, qso_id);
         assert_eq!(*reason, QsoFailureReason::Timeout);
         assert_eq!(metadata.their_callsign.as_deref(), Some(DX));
+    }
+
+    /// Layer 2 timeline persistence: `check_timeouts_at`'s retirement loop is
+    /// the single most common "QSO leaves the active map" site (every
+    /// watchdog/timeout retirement runs through it) and used to just drop
+    /// `progress` — state_history and messages included — on the floor after
+    /// cloning out `metadata`. The `QsoFailed` event it emits must now carry
+    /// the real timeline instead.
+    #[tokio::test]
+    async fn check_timeouts_at_retirement_qso_failed_event_carries_timeline() {
+        let manager = QsoManager::new(test_config());
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq(DX.to_string(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        manager
+            .check_timeouts_at(opened_at + Duration::seconds(45))
+            .await;
+
+        let mut events = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            events.push(ev);
+        }
+        let (state_history, messages) = events
+            .into_iter()
+            .find_map(|e| match e {
+                QsoEvent::QsoFailed {
+                    qso_id: id,
+                    state_history,
+                    messages,
+                    ..
+                } if id == qso_id => Some((state_history, messages)),
+                _ => None,
+            })
+            .expect("expected a QsoFailed event for this qso_id");
+
+        // `respond_to_cq` records the opening CqResponse reply as a Sent
+        // message at construction, so this must be non-empty — the old
+        // hard-coded discard would have made this an empty vec regardless
+        // of what the live QSO actually held.
+        assert!(
+            !messages.is_empty(),
+            "QsoFailed must carry the QSO's real message history, not an empty vec"
+        );
+        // This particular QSO times out before any `process_message`-driven
+        // forward advance, so 0 transitions is the CORRECT real value here
+        // (not a sign of discard) — the type-check that `state_history`
+        // exists on the event at all is what the earlier compile-time
+        // wiring enforces.
+        assert_eq!(state_history, Vec::<StateTransition>::new());
     }
 
     #[tokio::test]

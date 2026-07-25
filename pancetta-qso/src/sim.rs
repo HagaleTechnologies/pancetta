@@ -1344,7 +1344,9 @@ impl Sim {
                     new_state,
                 });
             }
-            QsoEvent::QsoCompleted { qso_id, metadata } => {
+            QsoEvent::QsoCompleted {
+                qso_id, metadata, ..
+            } => {
                 self.timeline.completions.push(Completion {
                     slot,
                     their_callsign: metadata.their_callsign.clone(),
@@ -1355,6 +1357,7 @@ impl Sim {
                 qso_id,
                 reason,
                 metadata,
+                ..
             } => {
                 self.timeline.failures.push(Failure {
                     slot,
