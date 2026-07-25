@@ -541,6 +541,28 @@ impl super::ApplicationCoordinator {
         // still means the in-flight QSOs are gone). Runs before the restart
         // dispatch so this fires exactly once per crash, not once per
         // (possibly repeated) restart attempt.
+        //
+        // Fix-review followup (2026-07-25): this MUST run on the pre-restart
+        // stashed clone, and MUST run before `restart_component` below --
+        // do not "fix" this into restart-then-fail. `fail_qso` looks the
+        // QSO up in the clone's OWN `qsos` map; a post-restart `QsoManager`
+        // is a fresh `QsoManager::new()` with an empty map (and its own new
+        // `event_sender`), so calling `fail_qso` on it for a pre-restart
+        // qso_id would silently no-op -- no manager instance both knows the
+        // QSO's metadata and feeds a guaranteed-fresh subscriber. This is
+        // safe as-is because the `QsoFailed` broadcast's real consumer -- the
+        // `tokio::spawn`ed forwarder inside `start_qso_component`
+        // (qso.rs ~L1583) that relays it to `MessageType::RecentQsoOutcome`
+        // -- is a genuinely independent task (its `JoinHandle` is discarded,
+        // never `.abort()`-ed), so it survives the "outer" Qso task's panic
+        // per tokio's task-independence guarantee and stays subscribed to
+        // the SAME `event_sender` this stashed clone shares (every
+        // `QsoManager::clone()` shares one `Arc`-backed `qsos` map and one
+        // `broadcast::Sender`). Proved end-to-end (real `start_qso_component`,
+        // real forwarder, real Tui bus channel -- not a fresh test
+        // subscriber) by
+        // `qso_restart_delivers_recent_qso_outcome_through_the_real_forwarder`
+        // below.
         if component_id == ComponentId::Qso {
             if let Some(manager) = self.qso_manager_for_supervisor.clone() {
                 for (qso_id, _progress) in manager.get_active_qsos().await {
@@ -706,7 +728,7 @@ impl super::ApplicationCoordinator {
 #[cfg(test)]
 mod supervisor_tests {
     use super::super::ApplicationCoordinator;
-    use crate::message_bus::ComponentId;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
     use pancetta_config::Config;
     use std::sync::atomic::AtomicBool;
     use std::sync::Arc;
@@ -861,6 +883,177 @@ mod supervisor_tests {
         // The Qso component was restarted (Restartable + within budget), so
         // it's Running again -- the drop-surfacing must not have interfered
         // with the restart path itself.
+        let status = coordinator.component_status.read().await;
+        assert_eq!(
+            status.get(&ComponentId::Qso).map(|s| &s.state),
+            Some(&super::ComponentState::Running)
+        );
+    }
+
+    /// Task 6 fix-review followup (2026-07-25): the sibling test above only
+    /// proves `fail_qso`'s `QsoFailed` reaches a subscriber the TEST ITSELF
+    /// creates via `manager.subscribe()`. The real operator-facing path is
+    /// different: the `QsoFailed` -> `MessageType::RecentQsoOutcome` relay
+    /// lives in a `tokio::spawn`ed subscriber task INSIDE
+    /// `start_qso_component` (qso.rs, ~L1568/1583/2271), and a
+    /// `tokio::sync::broadcast` channel only delivers to subscribers alive
+    /// AT SEND TIME. This test exercises that REAL relay path end to end --
+    /// real `start_qso_component`, real forwarder task, real Tui bus
+    /// channel -- instead of a fresh test-created subscriber.
+    ///
+    /// Why this is expected to pass with no reordering of the
+    /// enumerate-then-restart sequence in `handle_finished_task`: the
+    /// forwarder at qso.rs ~L1583 is `tokio::spawn`ed as a genuinely
+    /// independent task -- its `JoinHandle` is discarded (never stored in
+    /// `named_task_handles`, never `.abort()`-ed). Per tokio's task model, a
+    /// panic inside one spawned task only unwinds THAT task's stack and is
+    /// reported via ITS OWN `JoinHandle`; it does not cancel sibling tasks
+    /// that task itself spawned earlier. So when the "outer" Qso-component
+    /// task (the one `named_task_handles` tracks under `ComponentId::Qso`)
+    /// dies, the forwarder it spawned keeps running, still subscribed to
+    /// the same `event_sender` the coordinator's stashed
+    /// `qso_manager_for_supervisor` clone shares (every `QsoManager::clone()`
+    /// shares one `Arc`-backed `qsos` map and one `broadcast::Sender` --
+    /// only a fresh `QsoManager::new()`, as a *post-restart* component build
+    /// performs, gets independent ones). `fail_qso` MUST run on that
+    /// pre-restart stashed clone anyway, because it looks the QSO up in its
+    /// OWN `qsos` map (`qsos.write().await.remove(&qso_id)`) -- a
+    /// freshly-restarted manager's map is empty, so calling `fail_qso` on
+    /// the POST-restart clone for a PRE-restart qso_id would silently no-op.
+    /// That rules out "restart first, then fail on the new clone" as a fix:
+    /// there is no manager instance that both knows the QSO's metadata AND
+    /// feeds a guaranteed-fresh forwarder. Enumerate-then-fail-then-restart
+    /// (current code) is therefore correct as long as the pre-restart
+    /// forwarder survives the crash, which this test proves it does.
+    ///
+    /// A readiness handshake (a throwaway QSO, failed and observed on the
+    /// Tui channel) runs first so the test never races the real forwarder's
+    /// startup (DB/ADIF init) -- without it, a `fail_qso` broadcast sent
+    /// before the forwarder's `.subscribe()` call would be silently missed
+    /// even by a forwarder that is definitely alive, since `broadcast`
+    /// subscribers only see sends that happen after they subscribe.
+    #[tokio::test]
+    async fn qso_restart_delivers_recent_qso_outcome_through_the_real_forwarder() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+
+        // Real last hop of the real relay path: the forwarder sends
+        // `RecentQsoOutcome` to `ComponentId::Tui` via the real message
+        // bus. Create that channel before starting the Qso component so
+        // there's somewhere for it to land.
+        let (_tui_tx, tui_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+
+        coordinator.start_qso_component().await.unwrap();
+
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+
+        async fn poll_for(
+            rx: &crossbeam_channel::Receiver<ComponentMessage>,
+            want_callsign: &str,
+            max_tries: u32,
+        ) -> Option<crate::message_bus::RecentQsoOutcome> {
+            for _ in 0..max_tries {
+                if let Ok(msg) = rx.try_recv() {
+                    if let MessageType::RecentQsoOutcome(outcome) = &msg.message_type {
+                        if outcome.callsign == want_callsign {
+                            return Some(outcome.clone());
+                        }
+                    }
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            None
+        }
+
+        // Readiness handshake: `start_qso_component` returns as soon as the
+        // outer task is *spawned*, well before the tokio scheduler has
+        // polled it even once -- the forwarder's `.subscribe()` call (deep
+        // inside that task, after `.start()` + DB/ADIF init) has not
+        // necessarily happened yet. A `QsoFailed` broadcast sent before that
+        // `.subscribe()` call is silently missed forever by
+        // `tokio::sync::broadcast` semantics, even though the forwarder is
+        // "alive" moments later -- so a single fixed sleep-then-probe would
+        // just trade one race for a slower one. Instead, retry with a FRESH
+        // probe QSO each attempt (a consumed `fail_qso` cannot be re-fired
+        // for the same id) until one lands on the real Tui channel, proving
+        // the real forwarder is now subscribed before the real scenario
+        // below relies on it.
+        let mut ready = false;
+        for i in 0..20 {
+            let probe_call = format!("K9RD{i}");
+            let probe_id = manager
+                .respond_to_cq(probe_call.clone(), 1500.0, None)
+                .await
+                .expect("seeding a readiness-probe QSO");
+            manager
+                .fail_qso(probe_id, pancetta_qso::QsoFailureReason::UserCancelled)
+                .await
+                .expect("failing a readiness-probe QSO");
+            // Generous per-attempt window (up to 300ms) -- unlike a tight
+            // flood of probes, this gives the forwarder room to actually
+            // catch up and relay before we give up on this attempt and
+            // (if needed) fire another.
+            if poll_for(&tui_rx, &probe_call, 30).await.is_some() {
+                ready = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert!(
+            ready,
+            "readiness probe: real forwarder never relayed a RecentQsoOutcome to the Tui channel"
+        );
+
+        // Now the real scenario: seed a real active QSO, then simulate the
+        // outer Qso-component task crashing exactly like the sibling test
+        // above (swap its tracked JoinHandle for a fake panicking one).
+        // This does NOT touch the REAL task or its REAL forwarder child --
+        // they keep running completely undisturbed, which is exactly the
+        // production scenario being validated: the supervisor only ever
+        // observes the tracked JoinHandle, never the forwarder directly.
+        manager
+            .respond_to_cq("K1ABC".to_string(), 1501.0, None)
+            .await
+            .expect("seeding an active QSO via the real public API");
+
+        let handle = tokio::spawn(async {
+            panic!("injected test panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        coordinator
+            .named_task_handles
+            .retain(|(id, _)| *id != ComponentId::Qso);
+        coordinator
+            .named_task_handles
+            .push((ComponentId::Qso, handle));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        coordinator.check_task_handles().await;
+
+        let outcome = poll_for(&tui_rx, "K1ABC", 500).await.expect(
+            "expected a RecentQsoOutcome for K1ABC to reach the Tui channel via the REAL \
+             forwarder (not a test-created subscriber) after a supervisor restart",
+        );
+        assert!(
+            matches!(
+                outcome.outcome,
+                crate::message_bus::QsoOutcome::Failed(
+                    pancetta_qso::QsoFailureReason::SupervisorRestart
+                )
+            ),
+            "expected Failed(SupervisorRestart), got {:?}",
+            outcome.outcome
+        );
+
+        // Same regression guard as the sibling test: the restart itself
+        // must still have succeeded.
         let status = coordinator.component_status.read().await;
         assert_eq!(
             status.get(&ComponentId::Qso).map(|s| &s.state),
