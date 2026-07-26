@@ -6375,7 +6375,7 @@ mod tests {
     }
 
     #[test]
-    fn tx_rf_out_of_us_band_flags_only_out_of_band() {
+    fn tx_rf_out_of_band_plan_region2_flags_only_out_of_band() {
         // Region 2 falls back to the unchanged global table, so this
         // reproduces the exact pre-region-awareness behavior.
         let band_plan = pancetta_config::BandPlanConfig {
