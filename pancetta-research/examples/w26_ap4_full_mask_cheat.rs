@@ -214,7 +214,8 @@ fn run_hard200(workspace: &std::path::Path) -> anyhow::Result<()> {
             let ctx = ApContext {
                 my_call: Some(my_call),
                 recent_calls: vec![],
-                active_qso: Some(qso),
+                active_qso: Some(qso.clone()),
+                active_qsos: vec![qso],
             };
 
             let samples = match load_wav_samples(&PathBuf::from(wav_path)) {
@@ -314,7 +315,8 @@ fn run_noise(workspace: &std::path::Path) -> anyhow::Result<()> {
     let ctx = ApContext {
         my_call: Some(my_call),
         recent_calls: vec![],
-        active_qso: Some(qso),
+        active_qso: Some(qso.clone()),
+        active_qsos: vec![qso],
     };
 
     let mut baseline_fp = 0usize;
