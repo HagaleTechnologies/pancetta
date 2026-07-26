@@ -38,7 +38,7 @@ pub use diagnostic_level::DiagnosticLevel;
 pub use response_step::ResponseStep;
 pub use tx_freq_mode::TxFreqMode;
 pub use tx_policy::TxPolicy;
-pub use types::{Band, Mode, ModeValue, PancettaError, PancettaResult, StandardMode};
+pub use types::{Band, IaruRegion, Mode, ModeValue, PancettaError, PancettaResult, StandardMode};
 
 // Re-export error handling types
 pub use error::{

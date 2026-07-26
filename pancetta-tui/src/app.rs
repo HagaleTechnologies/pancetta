@@ -3961,12 +3961,41 @@ pub fn parse_mhz_to_hz(s: &str) -> Option<u64> {
     Some((mhz * 1_000_000.0).round() as u64)
 }
 
-/// Interim US-band check: `true` when `tx_rf_hz` is outside the ham band ranges
-/// modeled by `pancetta_core::Band::from_frequency` (used here as the proxy for
-/// US bands). Region-aware band plans are a deferred TODO (see the split design
-/// spec at docs/superpowers/specs/2026-06-25-arbitrary-freq-split-design.md).
-pub fn tx_rf_out_of_us_band(tx_rf_hz: u64) -> bool {
-    pancetta_core::Band::from_frequency(tx_rf_hz).is_none()
+/// Region-aware TX-outside-band-plan check: `true` when `tx_rf_hz` is outside
+/// the ham band ranges implied by `band_plan`. Consumes the previously-unwired
+/// `pancetta_config::BandPlanConfig` (see docs/superpowers/specs/2026-07-25-
+/// band-plan-region-awareness.md §3.3):
+///
+/// 1. `edge_warnings == false` suppresses the warning unconditionally.
+/// 2. `custom_bands` (keyed by the global table's `Band::Display` name, e.g.
+///    `"40m"`) overrides the region table for that band: in-band iff `tx_rf_hz`
+///    falls within ANY of the entry's `ranges` (OR semantics).
+/// 3. Otherwise resolve `band_plan.region` via `IaruRegion::from_u8` and use
+///    `Band::from_frequency_for_region`. An invalid region number (not 1/2/3)
+///    falls back to the original global-table behavior
+///    (`Band::from_frequency`), matching this function's pre-region-awareness
+///    behavior exactly.
+///
+/// This stays a soft, once-per-session warning — never a hard TX block.
+pub fn tx_rf_out_of_band_plan(tx_rf_hz: u64, band_plan: &pancetta_config::BandPlanConfig) -> bool {
+    if !band_plan.edge_warnings {
+        return false;
+    }
+
+    if let Some(band) = pancetta_core::Band::from_frequency(tx_rf_hz) {
+        if let Some(custom) = band_plan.custom_bands.get(&band.to_string()) {
+            let in_band = custom
+                .ranges
+                .iter()
+                .any(|r| tx_rf_hz >= r.start && tx_rf_hz <= r.end);
+            return !in_band;
+        }
+    }
+
+    match pancetta_core::IaruRegion::from_u8(band_plan.region) {
+        Some(region) => pancetta_core::Band::from_frequency_for_region(tx_rf_hz, region).is_none(),
+        None => pancetta_core::Band::from_frequency(tx_rf_hz).is_none(),
+    }
 }
 
 #[cfg(test)]
@@ -6347,10 +6376,88 @@ mod tests {
 
     #[test]
     fn tx_rf_out_of_us_band_flags_only_out_of_band() {
-        assert!(!super::tx_rf_out_of_us_band(14_074_000 + 1_500)); // 20m
-        assert!(!super::tx_rf_out_of_us_band(28_500_000)); // 10m
-        assert!(super::tx_rf_out_of_us_band(15_000_000)); // between 20m and 17m
-        assert!(super::tx_rf_out_of_us_band(100_000_000)); // nowhere near a ham band
+        // Region 2 falls back to the unchanged global table, so this
+        // reproduces the exact pre-region-awareness behavior.
+        let band_plan = pancetta_config::BandPlanConfig {
+            region: 2,
+            custom_bands: Default::default(),
+            edge_warnings: true,
+        };
+        assert!(!super::tx_rf_out_of_band_plan(
+            14_074_000 + 1_500,
+            &band_plan
+        )); // 20m
+        assert!(!super::tx_rf_out_of_band_plan(28_500_000, &band_plan)); // 10m
+        assert!(super::tx_rf_out_of_band_plan(15_000_000, &band_plan)); // between 20m and 17m
+        assert!(super::tx_rf_out_of_band_plan(100_000_000, &band_plan)); // nowhere near a ham band
+    }
+
+    #[test]
+    fn tx_rf_out_of_band_plan_respects_edge_warnings_toggle() {
+        let band_plan = pancetta_config::BandPlanConfig {
+            region: 2,
+            custom_bands: Default::default(),
+            edge_warnings: false,
+        };
+        // 15 MHz is between bands (out of band under any region) -- but the
+        // toggle being off must suppress the warning regardless.
+        assert!(!super::tx_rf_out_of_band_plan(15_000_000, &band_plan));
+    }
+
+    #[test]
+    fn tx_rf_out_of_band_plan_is_region_aware() {
+        let region1 = pancetta_config::BandPlanConfig {
+            region: 1,
+            custom_bands: Default::default(),
+            edge_warnings: true,
+        };
+        let region2 = pancetta_config::BandPlanConfig {
+            region: 2,
+            custom_bands: Default::default(),
+            edge_warnings: true,
+        };
+        // 7.25 MHz: in-band for Region 2 (US-shaped 40m), out-of-band for Region 1
+        // (international broadcast band there).
+        assert!(!super::tx_rf_out_of_band_plan(7_250_000, &region2));
+        assert!(super::tx_rf_out_of_band_plan(7_250_000, &region1));
+    }
+
+    #[test]
+    fn tx_rf_out_of_band_plan_invalid_region_falls_back_to_global_table() {
+        let bogus_region = pancetta_config::BandPlanConfig {
+            region: 9, // invalid -- IaruRegion::from_u8 returns None
+            custom_bands: Default::default(),
+            edge_warnings: true,
+        };
+        // Must not panic; must fall back to the existing global-table behavior
+        // (7.25 MHz is in-band under the global/Region-2-shaped table).
+        assert!(!super::tx_rf_out_of_band_plan(7_250_000, &bogus_region));
+    }
+
+    #[test]
+    fn tx_rf_out_of_band_plan_custom_bands_override_wins() {
+        use pancetta_config::{BandDefinition, BandType, FrequencyRange};
+        let mut custom_bands = std::collections::HashMap::new();
+        custom_bands.insert(
+            "40m".to_string(),
+            BandDefinition {
+                name: "40m".to_string(),
+                ranges: vec![FrequencyRange {
+                    start: 7_000_000,
+                    end: 7_100_000,
+                    modes: vec![],
+                }],
+                default_mode: "FT8".to_string(),
+                band_type: BandType::Hf,
+            },
+        );
+        let with_override = pancetta_config::BandPlanConfig {
+            region: 2, // Region 2's global 40m would allow 7.25 MHz, but the custom override doesn't
+            custom_bands,
+            edge_warnings: true,
+        };
+        assert!(super::tx_rf_out_of_band_plan(7_250_000, &with_override));
+        assert!(!super::tx_rf_out_of_band_plan(7_050_000, &with_override));
     }
 
     #[test]
