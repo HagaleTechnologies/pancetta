@@ -6431,6 +6431,7 @@ impl Ft8Decoder {
                     };
 
                     for hyp in hyps {
+                        crate::ap::record_ap5_attempt();
                         if let Some(msg) = self.try_ldpc_with_ap(
                             &base_llrs,
                             crate::ap::ApLevel::Ap5(hyp),
@@ -10296,6 +10297,7 @@ fn par_try_ap_decode(
                 };
 
                 for hyp in hyps {
+                    crate::ap::record_ap5_attempt();
                     if let Some(msg) = par_try_ldpc_with_ap(
                         ctx,
                         ldpc,

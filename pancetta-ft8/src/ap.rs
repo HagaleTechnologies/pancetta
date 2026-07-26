@@ -38,6 +38,41 @@ const NTOKENS: u32 = 2_063_592;
 const MAX22: u32 = 4_194_304;
 
 // ---------------------------------------------------------------------------
+// Ap5 attempt instrumentation (Task 7 eval-harness follow-up)
+// ---------------------------------------------------------------------------
+
+/// Process-global count of Ap5 (content-hypothesis) decode attempts
+/// actually entered — one increment per content hypothesis passed to
+/// `try_ldpc_with_ap`/`par_try_ldpc_with_ap` with `ApLevel::Ap5(_)` in
+/// `decoder.rs`'s two Ap5 "last resort" blocks. Exists so the Task 7 eval
+/// harness (`pancetta-research/examples/ap5_content_recall_fp_sweep.rs`)
+/// can prove Ap5 was actually reached during a measurement instead of
+/// inferring it from the sync/decode-rate gradient. `Relaxed` ordering is
+/// sufficient: callers only read the count after all decode work for a
+/// window has finished, never for synchronization. Zero cost when
+/// `content_ap_enabled` is `false` (the shipped default) — the increment
+/// site is only reached from inside that gate, so this is dead weight
+/// (one unread atomic) on every production decode path today.
+static AP5_ATTEMPT_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the current Ap5-attempt count without resetting it.
+pub fn ap5_attempt_count() -> u64 {
+    AP5_ATTEMPT_COUNT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Reset the Ap5-attempt counter to zero. Call before a measurement window
+/// so a later `ap5_attempt_count()` reflects only that window.
+pub fn reset_ap5_attempt_count() {
+    AP5_ATTEMPT_COUNT.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Record one Ap5 attempt. Called from `decoder.rs`'s Ap5 blocks only —
+/// not part of the public API surface used outside this crate.
+pub(crate) fn record_ap5_attempt() {
+    AP5_ATTEMPT_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+// ---------------------------------------------------------------------------
 // Standalone pack28 (avoids dependency on transmit-gated encoder module)
 // ---------------------------------------------------------------------------
 
