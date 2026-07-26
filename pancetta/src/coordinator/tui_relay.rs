@@ -2130,6 +2130,7 @@ impl super::ApplicationCoordinator {
                 enable_averaging: false,
             },
             bands: pancetta_tui::Config::default().bands,
+            band_plan: tui_config_lock.rig.frequency.band_plan.clone(),
         };
         drop(tui_config_lock);
 

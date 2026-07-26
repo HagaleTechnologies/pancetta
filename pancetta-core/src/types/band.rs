@@ -52,6 +52,40 @@ pub enum Band {
     Custom(u64, u64),
 }
 
+/// ITU/IARU amateur radio region. Numeric values match the ITU Region numbering
+/// used by `BandPlanConfig.region` in pancetta-config (1/2/3), so the two stay
+/// interchangeable at the config boundary without a translation table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum IaruRegion {
+    /// Europe, Africa, Middle East, northern Asia (Russia)
+    Region1,
+    /// The Americas
+    Region2,
+    /// Asia-Pacific
+    Region3,
+}
+
+impl IaruRegion {
+    /// `1`/`2`/`3` only — matches `BandPlanConfig.region`'s numbering.
+    pub fn from_u8(n: u8) -> Option<Self> {
+        match n {
+            1 => Some(Self::Region1),
+            2 => Some(Self::Region2),
+            3 => Some(Self::Region3),
+            _ => None,
+        }
+    }
+
+    /// Inverse of [`Self::from_u8`].
+    pub fn to_u8(self) -> u8 {
+        match self {
+            Self::Region1 => 1,
+            Self::Region2 => 2,
+            Self::Region3 => 3,
+        }
+    }
+}
+
 impl Band {
     /// Get frequency range in Hz (low, high)
     pub fn frequency_range(&self) -> (u64, u64) {
@@ -98,6 +132,44 @@ impl Band {
             }
         }
         None
+    }
+
+    /// Region-aware frequency range. Falls back to `frequency_range()` (today's
+    /// single global table) for any band without a documented regional edge
+    /// difference. Only 40m/60m/80m/2m/70cm have real per-region divergence.
+    ///
+    /// Segment edges below were verified 2026-07-25 against the IARU Region 1 HF
+    /// band plan (iaru-r1.org), ARRL's WRC-15 60m coverage, and Wikipedia's
+    /// 40m/80m band articles (which cite the IARU regional allocations) — not a
+    /// guess, but still a best-effort baseline since national band plans within
+    /// a region can vary and are periodically revised.
+    pub fn frequency_range_for_region(&self, region: IaruRegion) -> (u64, u64) {
+        match (self, region) {
+            (Band::Band40m, IaruRegion::Region1) => (7_000_000, 7_200_000),
+            (Band::Band80m, IaruRegion::Region1) => (3_500_000, 3_800_000),
+            (Band::Band60m, IaruRegion::Region1) => (5_351_500, 5_366_500), // WRC-15 channelized
+            (Band::Band2m, IaruRegion::Region1) => (144_000_000, 146_000_000),
+            (Band::Band70cm, IaruRegion::Region1) => (430_000_000, 440_000_000),
+            // Region 3 (Asia-Pacific) generally mirrors Region 1's narrower edges
+            // on these same bands (ITU-wide, not a US-style extended allocation) —
+            // same overrides apply.
+            (Band::Band40m, IaruRegion::Region3) => (7_000_000, 7_200_000),
+            (Band::Band80m, IaruRegion::Region3) => (3_500_000, 3_900_000), // varies by country; use the ITU R3 core segment
+            (Band::Band60m, IaruRegion::Region3) => (5_351_500, 5_366_500),
+            (Band::Band2m, IaruRegion::Region3) => (144_000_000, 146_000_000),
+            (Band::Band70cm, IaruRegion::Region3) => (430_000_000, 440_000_000),
+            // Region 2 (Americas) and every other (band, region) pair use the
+            // existing global table — it was effectively Region-2-shaped already.
+            _ => self.frequency_range(),
+        }
+    }
+
+    /// Region-aware band lookup — the region-aware analogue of `from_frequency`.
+    pub fn from_frequency_for_region(freq: u64, region: IaruRegion) -> Option<Band> {
+        Band::all().iter().copied().find(|b| {
+            let (low, high) = b.frequency_range_for_region(region);
+            freq >= low && freq <= high
+        })
     }
 
     /// Get wavelength in meters
@@ -271,6 +343,73 @@ impl FromStr for Band {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn iaru_region_from_u8_round_trips_and_rejects_invalid() {
+        assert_eq!(IaruRegion::from_u8(1), Some(IaruRegion::Region1));
+        assert_eq!(IaruRegion::from_u8(2), Some(IaruRegion::Region2));
+        assert_eq!(IaruRegion::from_u8(3), Some(IaruRegion::Region3));
+        assert_eq!(IaruRegion::from_u8(0), None);
+        assert_eq!(IaruRegion::from_u8(4), None);
+        for r in [
+            IaruRegion::Region1,
+            IaruRegion::Region2,
+            IaruRegion::Region3,
+        ] {
+            assert_eq!(IaruRegion::from_u8(r.to_u8()), Some(r));
+        }
+    }
+
+    #[test]
+    fn region_specific_bands_diverge_by_region() {
+        // 40m: Region 1/3 stop at 7.2 MHz; Region 2 (the existing global table) goes to 7.3 MHz.
+        assert_eq!(
+            Band::Band40m.frequency_range_for_region(IaruRegion::Region1),
+            (7_000_000, 7_200_000)
+        );
+        assert_eq!(
+            Band::Band40m.frequency_range_for_region(IaruRegion::Region2),
+            Band::Band40m.frequency_range()
+        );
+        assert_ne!(
+            Band::Band40m.frequency_range_for_region(IaruRegion::Region1),
+            Band::Band40m.frequency_range_for_region(IaruRegion::Region2),
+        );
+    }
+
+    #[test]
+    fn non_divergent_bands_are_identical_across_all_regions() {
+        // 20m has no documented regional edge difference -- must fall back to the
+        // same global table for all three regions.
+        let global = Band::Band20m.frequency_range();
+        for region in [
+            IaruRegion::Region1,
+            IaruRegion::Region2,
+            IaruRegion::Region3,
+        ] {
+            assert_eq!(Band::Band20m.frequency_range_for_region(region), global);
+        }
+    }
+
+    #[test]
+    fn from_frequency_for_region_resolves_within_the_narrower_region1_40m_edge() {
+        // 7.15 MHz is inside Region 1's 40m (7.0-7.2) -- resolves to Band40m there.
+        assert_eq!(
+            Band::from_frequency_for_region(7_150_000, IaruRegion::Region1),
+            Some(Band::Band40m)
+        );
+        // 7.25 MHz is inside Region 2's 40m (7.0-7.3) but OUTSIDE Region 1's (7.0-7.2)
+        // -- must resolve to None under Region 1 (it's broadcast band there), while
+        // still resolving to Band40m under Region 2.
+        assert_eq!(
+            Band::from_frequency_for_region(7_250_000, IaruRegion::Region1),
+            None
+        );
+        assert_eq!(
+            Band::from_frequency_for_region(7_250_000, IaruRegion::Region2),
+            Some(Band::Band40m)
+        );
+    }
 
     #[test]
     fn test_band_from_frequency() {

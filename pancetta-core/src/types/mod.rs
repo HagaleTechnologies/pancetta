@@ -5,7 +5,7 @@ pub mod error;
 pub mod mode;
 pub mod mode_v2;
 
-pub use band::Band;
+pub use band::{Band, IaruRegion};
 pub use error::{PancettaError, PancettaResult};
 pub use mode::Mode;
 pub use mode_v2::{ModeValue, StandardMode};

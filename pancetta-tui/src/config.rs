@@ -11,6 +11,14 @@ pub struct Config {
     pub audio: AudioConfig,
     pub decoder: DecoderConfig,
     pub bands: BandConfig,
+    /// Region-aware TX-outside-band-plan warning config, threaded through
+    /// from the loaded `pancetta_config::RigConfig::frequency::band_plan`
+    /// (see `pancetta::coordinator::tui_relay`'s TUI-config mapping). Not
+    /// itself a new setting — `BandPlanConfig` already existed and was
+    /// previously unconsumed by the TUI; `#[serde(default)]` keeps
+    /// standalone on-disk TUI configs without this field loadable.
+    #[serde(default)]
+    pub band_plan: pancetta_config::BandPlanConfig,
 }
 
 /// Default for [`StationConfig::mode`] (and serde-missing fallback): FT8.
@@ -226,6 +234,7 @@ impl Default for Config {
                     },
                 ],
             },
+            band_plan: pancetta_config::BandPlanConfig::default(),
         }
     }
 }

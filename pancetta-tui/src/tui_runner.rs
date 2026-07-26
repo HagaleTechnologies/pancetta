@@ -1049,7 +1049,9 @@ impl TuiRunner {
                             // Out-of-band check on the effective TX RF + current offset.
                             let tx_dial = if split_enabled { split_freq } else { rx };
                             let tx_rf = tx_dial + app.tx_frequency_offset as u64;
-                            if crate::app::tx_rf_out_of_us_band(tx_rf) && !app.out_of_band_warned {
+                            if crate::app::tx_rf_out_of_band_plan(tx_rf, &app.config.band_plan)
+                                && !app.out_of_band_warned
+                            {
                                 app.out_of_band_warned = true;
                                 app.out_of_band_ack_visible = true;
                                 app.out_of_band_rf_hz = tx_rf;
