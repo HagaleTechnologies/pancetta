@@ -1,7 +1,11 @@
 # Global band-plan region-awareness — design
 
 **Date:** 2026-07-25
-**Status:** Approved (operator-reviewed design, this session)
+**Status:** Implemented (2026-07-25). `pancetta_core::IaruRegion` +
+`Band::frequency_range_for_region` added; the TX warning
+(`tx_rf_out_of_band_plan`, `pancetta-tui`) now consumes `BandPlanConfig` region/custom_bands/
+edge_warnings instead of the old hardcoded US-shaped check. Still a soft, once-per-session
+warning — no TX blocking added.
 **Scope crates:** `pancetta-core` (region-aware band data), `pancetta-config` (validation only —
 no new fields needed), `pancetta-tui` (the warning check)
 

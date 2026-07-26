@@ -31,8 +31,12 @@ and `SetPtt` (`_ => {}` for everything else). The logged RF is computed as
 `dial + audio_offset` from that single atomic (`qso_manager.rs:1555-1557` and the
 completed-on-open mirror `:1205-1207`). There is **no band-edge / band-plan
 validation** gating transmit; §97.221 in code is an operator-presence gate only,
-not frequency. The unenforced `BandPlanConfig` / `band_limits` / `edge_warnings`
-structs live in `pancetta-config/src/rig.rs:302-328`.
+not frequency. `BandPlanConfig` / `band_limits` / `edge_warnings`
+structs live in `pancetta-config/src/rig.rs:302-328`; as of 2026-07-25 `BandPlanConfig`
+is wired into a region-aware, once-per-session soft TX warning (`pancetta_core::IaruRegion`,
+`Band::frequency_range_for_region`, `pancetta_tui::app::tx_rf_out_of_band_plan`) — see
+`docs/superpowers/specs/2026-07-25-band-plan-region-awareness-design.md`. That warning is
+still advisory only; it still doesn't gate transmit.
 
 ## Design
 
