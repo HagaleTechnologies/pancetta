@@ -123,6 +123,7 @@ fn ap4_full_mask_rescues_signal_that_plain_ap4_cannot_decode() {
         my_call: Some(my_call),
         recent_calls: vec![],
         active_qso: Some(qso),
+        active_qsos: vec![],
     };
 
     // AP0 must fail.

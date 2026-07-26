@@ -428,14 +428,36 @@ impl super::ApplicationCoordinator {
         // `ap_eval_mode` is read once here too — like the lead-in, it's a
         // static-for-the-session decode-pipeline knob, not hot-reloaded
         // per-window (see `partition_ap_eval_decodes`).
-        let (station_callsign, window_lead_secs, ap_eval_mode) = {
+        // Task 5 step 4 (gap 2/4, docs/ap-decoding-design.md §1): priority
+        // weights for ranking `recent_calls` (Ap2 candidates) by
+        // `PriorityScorer::evaluate_cq` instead of raw SNR — read once here
+        // (weights don't hot-reload) alongside the other one-time reads
+        // above, same pattern `tui_relay.rs`'s display scorer uses.
+        let (station_callsign, window_lead_secs, ap_eval_mode, recent_calls_priority_weights) = {
             let config = self.config.read().await;
+            let p = &config.autonomous.priorities;
             (
                 config.station.callsign.clone(),
                 super::resolve_window_lead_secs(&config.decoder),
                 config.decoder.ap_eval_mode,
+                pancetta_qso::priority::PriorityWeights {
+                    needed_dxcc: p.needed_dxcc,
+                    needed_grid: p.needed_grid,
+                    pota_sota: p.pota_sota,
+                    rarity: p.rarity,
+                    signal_strength: p.signal_strength,
+                    duplicate_penalty: p.duplicate_penalty,
+                    recent_failure_penalty: p.recent_failure_penalty,
+                    atno_bonus: p.atno_bonus,
+                },
             )
         };
+        // Same Arc<CachedStationLookup> the QSO component's active-QSO
+        // ranking and the TUI's display scorer read — an in-memory
+        // RwLock-backed snapshot the decoder thread reads via its own
+        // `.clone()`, so it always sees the latest needed/rarity/worked
+        // data without a new data path.
+        let recent_calls_lookup = self.cached_lookup.clone();
 
         // Shared AP state updated by the QSO component
         let active_qso_ap = self.active_qso_ap.clone();
@@ -544,6 +566,44 @@ impl super::ApplicationCoordinator {
                 );
             }
             let mut recent_pool: Vec<pancetta_ft8::RecentCallAp> = Vec::new();
+
+            // Task 5 step 4: built once per decoder-thread lifetime (weights
+            // are a one-time read; the lookup Arc's internal RwLock always
+            // reflects the latest worked/needed/rarity data). Used below to
+            // rank `recent_pool` by `evaluate_cq` instead of raw SNR.
+            //
+            // KNOWN LIMITATION: `RecentCallAp` carries only a callsign +
+            // last-heard SNR, no grid or real RF dial frequency (only an
+            // audio offset, wrong scale for band classification). `grid =
+            // None` is passed below, so `is_needed_grid`/`is_grid_needed_on_
+            // band` never fire for this pool (both need `Some(grid)` to do
+            // anything) — safely inert, not corrupting.
+            //
+            // `freq_hz = 0.0` is also passed (no real dial frequency to
+            // give). Review fix (AP-decoding Task 5): `freq_hz = 0.0` used
+            // to land in `CachedStationLookup`'s synthetic "0MHZ" band
+            // bucket, which — for `is_dxcc_needed_on_band` specifically —
+            // does NOT default to "not needed": a band key that's never
+            // populated (true for "0MHZ", since no real QSO is ever logged
+            // on it) reads as "needed" (`!worked.get(&band).is_some_and(..)`
+            // when absent = true). That silently forced `needed_dxcc`
+            // (the largest weight in `score_cq_detailed`) to `true` for
+            // nearly every candidate, regardless of whether the entity was
+            // genuinely needed. Fixed at the `is_dxcc_needed_on_band` impl
+            // (`priority_evaluator.rs`): `freq_hz <= 0.0` now short-circuits
+            // to `false` there, so `needed_dxcc` correctly falls back to the
+            // reliable global `is_needed_dxcc` signal alone for this pool.
+            // Net effect: global-scope signals (ATNO, global needed-DXCC,
+            // rarity, POTA/SOTA pattern, signal strength) rank correctly;
+            // band-scoped bonuses (needed-on-this-band, duplicate-on-this-
+            // band, needed-grid-on-this-band) are inert (not corrupting)
+            // here. Full per-band accuracy is used for the (higher-stakes)
+            // concurrent-QSO ranking in qso.rs, which has real state/
+            // metadata frequency data available.
+            let recent_calls_scorer = pancetta_qso::PriorityScorer::new(
+                recent_calls_priority_weights,
+                Box::new((*recent_calls_lookup).clone()),
+            );
 
             // TX-adjacent desense diagnostic (see `maybe_flag_tx_desense`):
             // a rolling history of recent per-window decode counts, sampled
@@ -940,13 +1000,27 @@ impl super::ApplicationCoordinator {
                             Vec::new()
                         });
 
-                        // Secondary: our native decoder with AP enhancement
-                        let current_qso_ap =
-                            active_qso_ap.read().ok().and_then(|guard| guard.clone());
+                        // Secondary: our native decoder with AP enhancement.
+                        //
+                        // Task 5 (gap 2/4): `active_qso_ap` now holds the
+                        // QSO component's ranked+capped list of ALL
+                        // currently-active QSOs (highest `PriorityScorer`
+                        // score first — see qso.rs's `rank_active_qsos_for_ap`).
+                        // Both `active_qsos` (the ranked list, consumed by
+                        // Ap5) and the back-compat singular `active_qso`
+                        // (Ap3/Ap4) are derived from the SAME read, so the
+                        // two can never disagree (`active_qso` is always
+                        // `active_qsos.first().cloned()`).
+                        let current_qsos: Vec<pancetta_ft8::QsoAp> = active_qso_ap
+                            .read()
+                            .ok()
+                            .map(|guard| guard.clone())
+                            .unwrap_or_default();
                         let ap_context = pancetta_ft8::ApContext {
                             my_call: my_call_ap.clone(),
                             recent_calls: recent_pool.clone(),
-                            active_qso: current_qso_ap,
+                            active_qso: current_qsos.first().cloned(),
+                            active_qsos: current_qsos,
                         };
 
                         // hb-229: QSO partner band-collapse. When a QSO is
@@ -1451,12 +1525,37 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                         }
-                        // Keep strongest 20, prune weak entries
-                        recent_pool.sort_by(|a, b| {
-                            b.last_snr
-                                .partial_cmp(&a.last_snr)
-                                .unwrap_or(std::cmp::Ordering::Equal)
-                        });
+                        // Task 5 step 4: rank by PriorityScorer::evaluate_cq
+                        // instead of raw SNR (docs/ap-decoding-design.md §1
+                        // — "priority-ordering + a cap cuts Ap2 trials on
+                        // low-value calls"), re-ordering the SAME 20-entry
+                        // pool. No new config knob: the design's own wording
+                        // only calls out today's 20-entry cap being reused,
+                        // not replaced, so `max_ap_hypotheses`/`max_ap_qsos`
+                        // are left untouched here (see the scorer
+                        // construction comment above for the grid/freq
+                        // limitation).
+                        {
+                            use pancetta_qso::DxEvaluator;
+                            // Score each entry once (not per-comparison) —
+                            // `evaluate_cq` does real lookup-table work.
+                            let mut scored: Vec<(f64, pancetta_ft8::RecentCallAp)> = recent_pool
+                                .drain(..)
+                                .map(|call| {
+                                    let score = recent_calls_scorer.evaluate_cq(
+                                        &call.callsign,
+                                        None,
+                                        call.last_snr.round().clamp(-128.0, 127.0) as i8,
+                                        0.0,
+                                    );
+                                    (score, call)
+                                })
+                                .collect();
+                            scored.sort_by(|a, b| {
+                                b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal)
+                            });
+                            recent_pool = scored.into_iter().map(|(_, call)| call).collect();
+                        }
                         recent_pool.truncate(20);
                     }
                     Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}

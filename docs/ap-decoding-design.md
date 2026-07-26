@@ -1,5 +1,40 @@
 # A-priori (AP) decoding from live QSO context — design
 
+**Status (2026-07-25): implemented, all 4 gaps closed at the mechanism level; ships
+disabled (`content_ap_enabled = false`).** The operator confirmed building the full design
+below — content-hypothesis injection (§2, gap 1), multi-QSO priority ranking (§1, gap 2), the
+`Ft8Config` tradeoff knobs (§3.5, gap 3), and the §4 eval harness (gap 4) — with one binding
+constraint: **`content_ap_enabled` stays `false` regardless of eval outcome**; flipping the
+default is a separate decision made after seeing real recall/false-decode numbers, not
+automatic. This updated §5's original "STOP before live wiring" framing — the mechanism itself
+ships (default-off), only the *default flip* stayed gated. The prerequisite AP1-AP4 injection
+bug (backwards callsign-field bit offsets, found 2026-07-07) was already fixed and independently
+re-verified — the injection engine this design builds on is correct as of today.
+
+**Eval outcome (§4, run 2026-07-25, `pancetta-research/examples/ap5_content_recall_fp_sweep.rs`,
+journal `research/experiments/2026-07-25-ap5-content-decoding.md`) — the ship gate was NOT met,
+and the reason is precise, not "doesn't work":**
+- A directly-instrumented Ap5-attempt counter (`ap.rs::ap5_attempt_count`) confirmed Ap5 fires
+  correctly at both content-bearing QSO stages — the mechanism itself is live and reachable.
+- **`WaitingForReport`** (the only stage where Ap5 gets an uncontested shot in the *shipped*
+  ladder — AP4-full-mask doesn't apply here): 0 rescues across 120 informative trials, with Ap5
+  confirmed entering ~95,000-96,000 times per SNR row. This is a genuine, directly-measured
+  zero-recall-benefit null, not an untested absence.
+- **`WaitingForConfirmation`**: with the shipped default `ap4_full_message_mask_enabled = true`
+  (which already tries the identical RR73/RRR/73 hypotheses first), Ap5 shows exactly 0 rescues —
+  it never gets a chance to act, because AP4-full already catches everything Ap5 would. Disabling
+  `ap4_full_message_mask_enabled` (a non-default, diagnostic-only config) to give Ap5 an
+  uncontested shot at this same stage revealed a genuine ~12.5% recall lift (15/120 informative
+  trials) — proving the Ap5 mechanism works, but that in the shipped configuration it is 100%
+  redundant with an already-shipped feature.
+- **Conclusion: `content_ap_enabled` stays `false`** — not because content-AP is broken, but
+  because in the current shipped ladder it delivers zero net recall (redundant where it would
+  help, genuinely null where it has an uncontested shot). **This redundancy argument is
+  conditional**: it depends on `ap4_full_message_mask_enabled` staying `true`. If that default
+  ever changes, or Ap5 is extended to cover content hypotheses AP4-full doesn't already try
+  (e.g. non-report/non-confirmation content), this null needs re-evaluation — it is not a
+  permanent verdict on the mechanism.
+
 Design doc for using live QSO state to generate a-priori message hypotheses that
 pull weak FT8 signals out of the noise, recovering decodes **without inflating the
 false-decode rate**. **This is a plan, not an implementation** — it stops at a
@@ -217,7 +252,12 @@ stays within budget across the SNR sweep AND the corpus A/B shows non-negative
 decode-rate at non-negative precision and bounded elapsed (bootstrap CI, per the
 project's A/B discipline). Otherwise document the null and leave it default-off.
 
-## 5. Rust core — the pieces to build (design-only; STOP before live wiring)
+## 5. Rust core — the pieces to build (design-only when written; now implemented, see status header)
+
+**Update 2026-07-25: all pieces below are built** (Tasks 1-7 of
+`docs/superpowers/plans/2026-07-25-ap-content-decoding.md`), gated behind
+`content_ap_enabled = false` per the eval outcome in the status header above. Left as
+originally written for historical/design-intent context:
 
 When implemented (separately — this doc stops here):
 - `pancetta-ft8/src/ap.rs`: a content-hypothesis builder (enumerated text →

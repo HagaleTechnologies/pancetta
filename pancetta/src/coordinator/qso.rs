@@ -1102,6 +1102,384 @@ fn recent_qso_outcome(
     }
 }
 
+// =============================================================================
+// Task 5 (gap 2 of 4): coordinator priority-ranking wiring for the AP context.
+// docs/superpowers/plans/2026-07-25-ap-content-decoding.md / the "Multi-QSO +
+// priority ranking" rule in docs/ap-decoding-design.md §1.
+// =============================================================================
+
+/// One active QSO's data needed to rank it for the AP context and build its
+/// [`pancetta_ft8::QsoAp`]. Kept separate from `QsoAp` itself so
+/// [`rank_active_qsos_for_ap`] stays pure and unit-testable without a live
+/// `QsoManager`.
+#[derive(Debug, Clone, PartialEq)]
+struct QsoApCandidate {
+    callsign: String,
+    grid: Option<String>,
+    snr: i8,
+    freq_hz: f64,
+    progress: pancetta_ft8::QsoApProgress,
+    /// WSJT-X Improved-style a8 expected-next-message templates — same
+    /// `enumerate_a8_expected_texts` call the old single-QSO write site made
+    /// (see `qso_ap_candidate_from_progress`).
+    expected_texts: Vec<String>,
+}
+
+/// Maps one active QSO's live `state`/`metadata` into a [`QsoApCandidate`],
+/// or `None` for states the AP context doesn't represent — `Idle` and
+/// `CallingCq` (no confirmed contra-callsign yet), terminal
+/// `Completed`/`Failed`, and `Contest`. Mirrors the progress mapping the
+/// single-QSO `active_qso_ap` write site used before Task 5.
+///
+/// Scoring inputs are pulled preferentially from the *live QSO state*
+/// (freshest — e.g. `WaitingForReport::our_report` is the report we JUST
+/// computed from decoding this station) and fall back to `metadata` (stamped
+/// at various transitions, notably QSO completion) when the current state
+/// variant doesn't carry the field — e.g. `RespondingToCq` precedes any
+/// report being computed.
+fn qso_ap_candidate_from_progress(
+    state: &pancetta_qso::QsoState,
+    metadata: &pancetta_qso::QsoMetadata,
+    my_call: &str,
+) -> Option<QsoApCandidate> {
+    use pancetta_qso::QsoState;
+
+    let (callsign, progress) = match state {
+        QsoState::RespondingToCq {
+            target_callsign, ..
+        }
+        | QsoState::WaitingForReport {
+            their_callsign: target_callsign,
+            ..
+        }
+        | QsoState::SendingReport {
+            their_callsign: target_callsign,
+            ..
+        } => (
+            target_callsign.clone(),
+            pancetta_ft8::QsoApProgress::WaitingForReport,
+        ),
+        QsoState::WaitingForConfirmation { their_callsign, .. }
+        | QsoState::SendingConfirmation { their_callsign, .. } => (
+            their_callsign.clone(),
+            pancetta_ft8::QsoApProgress::WaitingForConfirmation,
+        ),
+        // Idle / CallingCq / Completed / Failed / Contest: not represented
+        // in the AP context.
+        _ => return None,
+    };
+
+    let freq_hz = state.frequency().unwrap_or(metadata.frequency);
+
+    // `pancetta_qso::states::GridSquare` is a plain `String` alias (not
+    // `pancetta_core::gridsquare::GridSquare`) — no conversion needed.
+    let grid = match state {
+        QsoState::WaitingForReport { their_grid, .. } => their_grid.clone(),
+        QsoState::WaitingForConfirmation { grid_square, .. }
+        | QsoState::SendingConfirmation { grid_square, .. } => grid_square.clone(),
+        _ => None,
+    }
+    .or_else(|| metadata.grids.theirs.clone());
+
+    let snr = match state {
+        QsoState::WaitingForReport { our_report, .. }
+        | QsoState::SendingReport { our_report, .. }
+        | QsoState::WaitingForConfirmation { our_report, .. }
+        | QsoState::SendingConfirmation { our_report, .. } => *our_report,
+        _ => metadata.reports.sent.unwrap_or(0),
+    };
+
+    let expected_texts =
+        pancetta_ft8::ap::enumerate_a8_expected_texts(my_call, &callsign, progress);
+
+    Some(QsoApCandidate {
+        callsign,
+        grid,
+        snr,
+        freq_hz,
+        progress,
+        expected_texts,
+    })
+}
+
+/// Ranks active-QSO candidates by [`pancetta_qso::PriorityScorer::evaluate_cq`]
+/// (highest first) and caps to `max_qsos` — the multi-QSO anti-brute-force
+/// rule from docs/ap-decoding-design.md §1 ("Rank concurrent QSOs ... write
+/// the top-`MAX_AP_QSOS` QSOs into the context each slot"). Pure and
+/// independent of the live coordinator/`QsoManager`, so it's directly
+/// unit-testable (see the `ap_ranking_tests` module below).
+fn rank_active_qsos_for_ap(
+    candidates: &[QsoApCandidate],
+    scorer: &pancetta_qso::PriorityScorer,
+    max_qsos: usize,
+) -> Vec<pancetta_ft8::QsoAp> {
+    use pancetta_qso::DxEvaluator;
+
+    let mut scored: Vec<(f64, pancetta_ft8::QsoAp)> = candidates
+        .iter()
+        .filter_map(|c| {
+            let qso = pancetta_ft8::QsoAp::new(&c.callsign, c.progress)?
+                .with_expected_texts(c.expected_texts.clone());
+            let score = scorer.evaluate_cq(&c.callsign, c.grid.as_deref(), c.snr, c.freq_hz);
+            Some((score, qso))
+        })
+        .collect();
+    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
+    scored.truncate(max_qsos);
+    scored.into_iter().map(|(_, qso)| qso).collect()
+}
+
+/// Recomputes the ranked, capped `active_qso_ap` state from ALL currently
+/// -active QSOs and writes it into `ap_state`. Called after every QSO state
+/// transition — including completion/failure, so a QSO going terminal simply
+/// drops out of `get_active_qsos()` on its own and the write naturally
+/// reflects whichever QSOs remain active (or an empty list if none do), with
+/// no separate "clear" branch needed.
+async fn refresh_active_qso_ap(
+    qso_manager: &pancetta_qso::QsoManager,
+    my_call: &str,
+    scorer: &pancetta_qso::PriorityScorer,
+    ft8_config: &std::sync::Arc<tokio::sync::RwLock<pancetta_ft8::Ft8Config>>,
+    ap_state: &std::sync::Arc<std::sync::RwLock<Vec<pancetta_ft8::QsoAp>>>,
+) {
+    let active = qso_manager.get_active_qsos().await;
+    let candidates: Vec<QsoApCandidate> = active
+        .iter()
+        .filter_map(|(_, progress)| {
+            qso_ap_candidate_from_progress(&progress.state, &progress.metadata, my_call)
+        })
+        .collect();
+    let max_ap_qsos = ft8_config.read().await.max_ap_qsos;
+    let ranked = rank_active_qsos_for_ap(&candidates, scorer, max_ap_qsos);
+    if let Ok(mut guard) = ap_state.write() {
+        *guard = ranked;
+    }
+}
+
+#[cfg(test)]
+mod ap_ranking_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    /// Minimal `WorkedStationLookup` fixture — mirrors the one in
+    /// `pancetta-qso/src/priority.rs`'s own tests and `tui_relay.rs`'s
+    /// `priority_score_bucket_boundaries_are_exact` test, giving real
+    /// differentiation between an ATNO/needed-DXCC candidate and a plain
+    /// worked-before one.
+    struct TestLookup {
+        needed_dxcc: HashSet<String>,
+        atno: HashSet<String>,
+        duplicates: HashSet<String>,
+    }
+
+    impl pancetta_qso::priority::WorkedStationLookup for TestLookup {
+        fn is_duplicate(&self, callsign: &str, _freq_hz: f64) -> bool {
+            self.duplicates.contains(&callsign.to_uppercase())
+        }
+        fn is_recent_failure(&self, _callsign: &str) -> bool {
+            false
+        }
+        fn is_needed_dxcc(&self, callsign: &str) -> bool {
+            self.needed_dxcc.contains(&callsign.to_uppercase())
+        }
+        fn is_needed_grid(&self, _grid: &str) -> bool {
+            false
+        }
+        fn is_dxcc_needed_on_band(&self, callsign: &str, _freq_hz: f64) -> bool {
+            self.needed_dxcc.contains(&callsign.to_uppercase())
+        }
+        fn is_grid_needed_on_band(&self, _grid: &str, _freq_hz: f64) -> bool {
+            false
+        }
+        fn is_atno(&self, callsign: &str) -> bool {
+            self.atno.contains(&callsign.to_uppercase())
+        }
+        fn is_notable(&self, _callsign: &str) -> bool {
+            false
+        }
+        fn rarity(&self, _callsign: &str) -> f64 {
+            0.0
+        }
+        fn network_last_seen(&self, _callsign: &str) -> Option<i64> {
+            None
+        }
+        fn network_snr(&self, _callsign: &str) -> Option<(u32, i32)> {
+            None
+        }
+    }
+
+    fn scorer_with(
+        needed_dxcc: &[&str],
+        atno: &[&str],
+        duplicates: &[&str],
+    ) -> pancetta_qso::PriorityScorer {
+        let lookup = TestLookup {
+            needed_dxcc: needed_dxcc.iter().map(|s| s.to_uppercase()).collect(),
+            atno: atno.iter().map(|s| s.to_uppercase()).collect(),
+            duplicates: duplicates.iter().map(|s| s.to_uppercase()).collect(),
+        };
+        pancetta_qso::PriorityScorer::new(
+            pancetta_qso::priority::PriorityWeights::default(),
+            Box::new(lookup),
+        )
+    }
+
+    fn candidate(callsign: &str, snr: i8) -> QsoApCandidate {
+        QsoApCandidate {
+            callsign: callsign.to_string(),
+            grid: None,
+            snr,
+            freq_hz: 14_074_000.0,
+            progress: pancetta_ft8::QsoApProgress::WaitingForReport,
+            expected_texts: vec![],
+        }
+    }
+
+    // RED (pre-implementation): this test fails against the OLD single-QSO
+    // `Option<QsoAp>` design because there was no ranking function at all —
+    // `rank_active_qsos_for_ap` didn't exist. GREEN once implemented above.
+    #[test]
+    fn ranks_atno_above_worked_before_regardless_of_snr_order() {
+        // K5AAA is a plain, already-worked station with a strong signal;
+        // JA1ABC is an ATNO (needed + never-worked-anywhere) with a much
+        // weaker signal. Priority ranking must still put the ATNO first —
+        // a raw-SNR sort would get this backwards.
+        let scorer = scorer_with(&["JA1ABC"], &["JA1ABC"], &["K5AAA"]);
+        let candidates = vec![candidate("K5AAA", -5), candidate("JA1ABC", -20)];
+
+        let ranked = rank_active_qsos_for_ap(&candidates, &scorer, 4);
+
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(ranked[0].their_call, "JA1ABC", "ATNO must rank first");
+        assert_eq!(ranked[1].their_call, "K5AAA");
+    }
+
+    #[test]
+    fn caps_to_max_qsos_keeping_the_highest_scored() {
+        let scorer = scorer_with(&["JA1ABC"], &["JA1ABC"], &[]);
+        let candidates = vec![
+            candidate("W1AAA", -10),
+            candidate("W1BBB", -10),
+            candidate("JA1ABC", -25),
+            candidate("W1CCC", -10),
+        ];
+
+        let ranked = rank_active_qsos_for_ap(&candidates, &scorer, 2);
+
+        assert_eq!(ranked.len(), 2);
+        assert_eq!(
+            ranked[0].their_call, "JA1ABC",
+            "ATNO still wins despite weak SNR"
+        );
+    }
+
+    #[test]
+    fn empty_candidates_yields_empty_ranking() {
+        let scorer = scorer_with(&[], &[], &[]);
+        assert!(rank_active_qsos_for_ap(&[], &scorer, 4).is_empty());
+    }
+
+    #[test]
+    fn each_ranked_qso_carries_its_a8_expected_texts() {
+        let scorer = scorer_with(&[], &[], &[]);
+        let candidates = vec![candidate("W1AW", -10)];
+
+        let ranked = rank_active_qsos_for_ap(&candidates, &scorer, 4);
+
+        assert_eq!(ranked.len(), 1);
+        // candidate() defaults to WaitingForReport with no pre-populated
+        // expected_texts in the fixture — this test's contract is really
+        // about qso_ap_candidate_from_progress populating them from real
+        // state, exercised below.
+        assert_eq!(
+            ranked[0].progress,
+            pancetta_ft8::QsoApProgress::WaitingForReport
+        );
+    }
+
+    fn waiting_for_report_state(their_callsign: &str) -> pancetta_qso::QsoState {
+        pancetta_qso::QsoState::WaitingForReport {
+            their_callsign: their_callsign.to_string(),
+            frequency: 14_074_000.0,
+            started_at: chrono::Utc::now(),
+            their_grid: Some("FN31".to_string()),
+            our_report: -12,
+        }
+    }
+
+    fn empty_metadata(
+        qso_id: pancetta_qso::QsoId,
+        our_callsign: &str,
+    ) -> pancetta_qso::QsoMetadata {
+        let now = chrono::Utc::now();
+        pancetta_qso::QsoMetadata {
+            qso_id,
+            our_callsign: our_callsign.to_string(),
+            their_callsign: None,
+            frequency: 14_074_000.0,
+            mode: "FT8".to_string(),
+            start_time: now,
+            end_time: None,
+            reports: pancetta_qso::states::SignalReports::default(),
+            grids: pancetta_qso::states::GridSquares::default(),
+            contest_info: None,
+            tags: std::collections::HashMap::new(),
+            notes: None,
+            tx_parity: None,
+            tx_parity_provisional: false,
+            initiated_by: pancetta_qso::states::CallInitiation::Auto,
+            role: pancetta_qso::states::QsoRole::Caller,
+            call_count: 1,
+            first_call_at: Some(now),
+            last_call_at: Some(now),
+            progressed_this_cycle: false,
+            last_rx_text: None,
+            dx_repeat_count: 0,
+            hound: false,
+            partner_freq: None,
+            hound_qsyed: false,
+            remote_origin: false,
+        }
+    }
+
+    #[test]
+    fn qso_ap_candidate_from_progress_extracts_grid_snr_freq_from_live_state() {
+        let state = waiting_for_report_state("W1AW");
+        let metadata = empty_metadata(pancetta_qso::QsoId::new_v4(), "K5ARH");
+
+        let candidate = qso_ap_candidate_from_progress(&state, &metadata, "K5ARH")
+            .expect("WaitingForReport must produce a candidate");
+
+        assert_eq!(candidate.callsign, "W1AW");
+        assert_eq!(candidate.grid.as_deref(), Some("FN31"));
+        assert_eq!(candidate.snr, -12);
+        assert_eq!(candidate.freq_hz, 14_074_000.0);
+        assert_eq!(
+            candidate.progress,
+            pancetta_ft8::QsoApProgress::WaitingForReport
+        );
+        assert!(
+            !candidate.expected_texts.is_empty(),
+            "a8 expected-texts must be populated, same as the pre-Task-5 single-QSO write site"
+        );
+    }
+
+    #[test]
+    fn qso_ap_candidate_from_progress_returns_none_for_calling_cq_and_idle() {
+        let calling_cq = pancetta_qso::QsoState::CallingCq {
+            frequency: 14_074_000.0,
+            started_at: chrono::Utc::now(),
+            call_count: 1,
+        };
+        let metadata = empty_metadata(pancetta_qso::QsoId::new_v4(), "K5ARH");
+        assert!(qso_ap_candidate_from_progress(&calling_cq, &metadata, "K5ARH").is_none());
+        assert!(
+            qso_ap_candidate_from_progress(&pancetta_qso::QsoState::Idle, &metadata, "K5ARH")
+                .is_none()
+        );
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Start QSO management component
     ///
@@ -1172,6 +1550,24 @@ impl super::ApplicationCoordinator {
         .to_string();
         // Layer 2 timeline persistence gate — see docs/CONFIG.md `[database]`.
         let persist_qso_timeline = config.database.persist_qso_timeline;
+        // Task 5 (gap 2/4, docs/ap-decoding-design.md §1): priority weights
+        // for ranking ALL currently-active QSOs by `PriorityScorer::
+        // evaluate_cq` for the AP context — read once here before `drop`,
+        // same field set the autonomous operator's own scorer uses
+        // (`autonomous.rs`'s `priority_weights`).
+        let ap_priority_weights = {
+            let p = &config.autonomous.priorities;
+            pancetta_qso::priority::PriorityWeights {
+                needed_dxcc: p.needed_dxcc,
+                needed_grid: p.needed_grid,
+                pota_sota: p.pota_sota,
+                rarity: p.rarity,
+                signal_strength: p.signal_strength,
+                duplicate_penalty: p.duplicate_penalty,
+                recent_failure_penalty: p.recent_failure_penalty,
+                atno_bonus: p.atno_bonus,
+            }
+        };
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -1196,6 +1592,10 @@ impl super::ApplicationCoordinator {
         let qso_lookup = self.cached_lookup.clone();
         let upload_our_callsign = our_callsign.clone();
         let active_qso_ap = self.active_qso_ap.clone();
+        // Task 5: `max_ap_qsos` is hot-reloadable, so the AP-context write
+        // site below re-reads it fresh from this shared handle on every
+        // QSO event rather than snapshotting it once at startup.
+        let ft8_config_for_ap = self.ft8_config.clone();
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let split_tx_frequency_hz = self.split_tx_frequency_hz.clone();
@@ -1581,6 +1981,16 @@ impl super::ApplicationCoordinator {
                 let dx_activity_for_events = dx_activity.clone();
                 let display_feed_enabled = display_feed_enabled.clone();
                 tokio::spawn(async move {
+                    // Task 5 (gap 2/4): built once for this task's lifetime,
+                    // mirroring the autonomous operator's own scorer
+                    // (`autonomous.rs`) — same weights source, and a fresh
+                    // clone of the SAME `Arc`-shared `CachedStationLookup`
+                    // (`qso_lookup`) so this always sees the latest
+                    // needed/rarity/worked data.
+                    let ap_priority_scorer = pancetta_qso::PriorityScorer::new(
+                        ap_priority_weights,
+                        Box::new((*qso_lookup).clone()),
+                    );
                     while !tx_shutdown.load(Ordering::Acquire) {
                         match qso_events.recv().await {
                             Ok(pancetta_qso::QsoEvent::StateChanged {
@@ -1644,65 +2054,24 @@ impl super::ApplicationCoordinator {
 
                                 // Map QSO state to AP context for AP3/AP4 decoding.
                                 //
-                                // WSJT-X Improved-style a8 wiring: also enumerate
-                                // the expected next-message texts from the
-                                // partner so that the FT8 decoder's a8 path
-                                // (gated on `Ft8Config::a8_qso_state_ap_enabled`)
-                                // can relax the AP confidence floor for decodes
-                                // that match. Inspired by spec ref
-                                // `spec-wsjtx-improved-a8-decoding.md`. When
-                                // a8 is disabled the templates are still
-                                // populated but never consulted, so wiring
-                                // is byte-safe.
-                                let new_ap = match &new_state {
-                                    pancetta_qso::QsoState::RespondingToCq {
-                                        target_callsign,
-                                        ..
-                                    }
-                                    | pancetta_qso::QsoState::WaitingForReport {
-                                        their_callsign: target_callsign,
-                                        ..
-                                    }
-                                    | pancetta_qso::QsoState::SendingReport {
-                                        their_callsign: target_callsign,
-                                        ..
-                                    } => pancetta_ft8::QsoAp::new(
-                                        target_callsign,
-                                        pancetta_ft8::QsoApProgress::WaitingForReport,
-                                    )
-                                    .map(|q| {
-                                        let texts = pancetta_ft8::ap::enumerate_a8_expected_texts(
-                                            &tx_callsign,
-                                            target_callsign,
-                                            pancetta_ft8::QsoApProgress::WaitingForReport,
-                                        );
-                                        q.with_expected_texts(texts)
-                                    }),
-                                    pancetta_qso::QsoState::WaitingForConfirmation {
-                                        their_callsign,
-                                        ..
-                                    }
-                                    | pancetta_qso::QsoState::SendingConfirmation {
-                                        their_callsign,
-                                        ..
-                                    } => pancetta_ft8::QsoAp::new(
-                                        their_callsign,
-                                        pancetta_ft8::QsoApProgress::WaitingForConfirmation,
-                                    )
-                                    .map(|q| {
-                                        let texts = pancetta_ft8::ap::enumerate_a8_expected_texts(
-                                            &tx_callsign,
-                                            their_callsign,
-                                            pancetta_ft8::QsoApProgress::WaitingForConfirmation,
-                                        );
-                                        q.with_expected_texts(texts)
-                                    }),
-                                    // Terminal or idle states clear the AP context
-                                    _ => None,
-                                };
-                                if let Ok(mut guard) = ap_state.write() {
-                                    *guard = new_ap;
-                                }
+                                // Task 5 (gap 2/4, docs/ap-decoding-design.md
+                                // §1): rank ALL currently-active QSOs by
+                                // `PriorityScorer::evaluate_cq` and write the
+                                // top-`max_ap_qsos` into the shared AP state,
+                                // highest priority first. Replaces the old
+                                // single-QSO (whichever just changed state)
+                                // write — see `refresh_active_qso_ap` for the
+                                // WSJT-X Improved-style a8 wiring this
+                                // subsumed (each candidate still gets its
+                                // `enumerate_a8_expected_texts` templates).
+                                refresh_active_qso_ap(
+                                    &snapshot_qso_manager,
+                                    &tx_callsign,
+                                    &ap_priority_scorer,
+                                    &ft8_config_for_ap,
+                                    &ap_state,
+                                )
+                                .await;
 
                                 // hb-091 scoped fast-path: mirror the AP
                                 // update with the partner's audio freq.
@@ -2001,10 +2370,21 @@ impl super::ApplicationCoordinator {
                                         .await;
                                     });
                                 }
-                                // Clear AP state on QSO completion
-                                if let Ok(mut guard) = ap_state.write() {
-                                    *guard = None;
-                                }
+                                // Task 5: recompute the ranked active-QSO AP
+                                // state now this QSO has gone terminal — it
+                                // naturally drops out of `get_active_qsos()`,
+                                // so other still-active QSOs' AP context is
+                                // preserved (the old code unconditionally
+                                // cleared to `None`/empty here, which would
+                                // wipe a co-active QSO's AP context too).
+                                refresh_active_qso_ap(
+                                    &snapshot_qso_manager,
+                                    &tx_callsign,
+                                    &ap_priority_scorer,
+                                    &ft8_config_for_ap,
+                                    &ap_state,
+                                )
+                                .await;
                                 // hb-091: also clear the partner freq.
                                 if let Ok(mut guard) = qso_freq_state.write() {
                                     *guard = None;
@@ -2187,10 +2567,17 @@ impl super::ApplicationCoordinator {
                                     &snapshot_bus,
                                 )
                                 .await;
-                                // Clear AP state on QSO failure
-                                if let Ok(mut guard) = ap_state.write() {
-                                    *guard = None;
-                                }
+                                // Task 5: recompute (see the QsoCompleted arm
+                                // above for why this replaced an
+                                // unconditional clear-to-empty).
+                                refresh_active_qso_ap(
+                                    &snapshot_qso_manager,
+                                    &tx_callsign,
+                                    &ap_priority_scorer,
+                                    &ft8_config_for_ap,
+                                    &ap_state,
+                                )
+                                .await;
                                 // Push fresh snapshot so the banner drops
                                 // the failed QSO.
                                 let (snapshot, pending_snap) = build_active_qso_snapshot(

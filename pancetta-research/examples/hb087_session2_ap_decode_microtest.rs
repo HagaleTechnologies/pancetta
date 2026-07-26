@@ -436,6 +436,7 @@ fn main() -> anyhow::Result<()> {
             my_call: None,
             recent_calls: vec![recent_ap],
             active_qso: None,
+            active_qsos: Vec::new(),
         };
 
         let mut decoder = Ft8Decoder::new(cfg.clone())

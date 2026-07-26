@@ -1717,6 +1717,44 @@ pub struct Ft8Config {
     /// unreachable while `max_decode_passes` stays at 1). Default
     /// `false`.
     pub full_scale_subtraction_enabled: bool,
+
+    /// AP content-decoding plan §3.5 (Task 4 — config surface only; the
+    /// decode loop doesn't call Ap5 yet, that's Task 6). Master switch for
+    /// content-AP (Ap5) injection. Default `false` — graduated only after
+    /// the Task 7 eval harness supports flipping it, per
+    /// `docs/ap-decoding-design.md`'s ship gate. This field alone flipping
+    /// to `true` has no effect yet, since nothing reads it until Task 6
+    /// wires a caller.
+    pub content_ap_enabled: bool,
+
+    /// Soft-LLR injection magnitude for all AP levels (Ap1-Ap5). Promoted
+    /// from the hardcoded `AP_LLR_MAGNITUDE = 15.0` const in `ap.rs`;
+    /// default unchanged, so promoting it to config doesn't alter today's
+    /// behavior. `ap.rs`'s injection helpers still read the const directly
+    /// (not this field) until a later task wires it through — see this
+    /// plan's Task 4 scope note.
+    pub ap_llr_magnitude: f32,
+
+    /// Confidence floor for Ap1-Ap4 decodes. Promoted from the hardcoded
+    /// `MIN_AP_DECODE_CONFIDENCE = 0.55` local const in
+    /// `try_ldpc_with_ap`; default unchanged. That function still uses its
+    /// own local const (not this field) until a later task wires it
+    /// through — see this plan's Task 4 scope note.
+    pub min_ap_decode_confidence: f32,
+
+    /// Stricter confidence floor for Ap5 (content-AP) decodes specifically
+    /// — content injection is higher-risk than callsign-only AP. New knob;
+    /// unused until Task 6 wires Ap5 into the decode loop.
+    pub min_content_ap_confidence: f32,
+
+    /// Max content hypotheses tried per QSO in the Ap5 loop (Task 6),
+    /// SNR-seeded ordering (nearest-to-measured-SNR first). New knob;
+    /// unused until Task 6.
+    pub max_ap_hypotheses: usize,
+
+    /// Max concurrent QSOs represented in `ApContext::active_qsos`,
+    /// priority-ranked (Task 5). New knob; unused until Task 5/6 read it.
+    pub max_ap_qsos: usize,
 }
 
 impl Default for Ft8Config {
@@ -2136,6 +2174,23 @@ impl Default for Ft8Config {
             // above, default OFF — see the field doc for the noise-
             // sensitivity tradeoff this needs its own A/B for.
             full_scale_subtraction_enabled: false,
+            // AP content-decoding plan Task 4: config surface only.
+            // MUST stay false — Ap5 isn't wired into the decode loop yet
+            // (Task 6), and graduating this is gated on the Task 7 eval
+            // harness per docs/ap-decoding-design.md's ship gate.
+            content_ap_enabled: false,
+            // Was the hardcoded AP_LLR_MAGNITUDE const in ap.rs (15.0);
+            // default unchanged.
+            ap_llr_magnitude: 15.0,
+            // Was the hardcoded MIN_AP_DECODE_CONFIDENCE local const in
+            // try_ldpc_with_ap (0.55); default unchanged.
+            min_ap_decode_confidence: 0.55,
+            // New knob, inert until Task 6 wires Ap5 into the decode loop.
+            min_content_ap_confidence: 0.60,
+            // New knob, inert until Task 6.
+            max_ap_hypotheses: 8,
+            // New knob, inert until Task 5/6.
+            max_ap_qsos: 4,
         }
     }
 }
@@ -3404,6 +3459,13 @@ impl Ft8Decoder {
                 // byte-identical (also gated behind fine_sync_enabled).
                 nsym_combining_enabled: self.config.nsym_combining_enabled,
                 baseband_taps: &self.baseband_taps,
+                // AP content-decoding plan Task 6: Ap5 rescue-loop
+                // plumbing. Default OFF (content_ap_enabled: false) keeps
+                // par_try_ap_decode byte-identical to pre-Task-6 behavior.
+                content_ap_enabled: self.config.content_ap_enabled,
+                max_ap_hypotheses: self.config.max_ap_hypotheses,
+                max_ap_qsos: self.config.max_ap_qsos,
+                min_content_ap_confidence: self.config.min_content_ap_confidence,
             };
 
             // Step 3: Decode candidates in parallel using rayon
@@ -6333,6 +6395,63 @@ impl Ft8Decoder {
                     }
                 }
             }
+
+            // --- Ap5 (AP content-decoding plan Task 6): content-hypothesis
+            // rescue, LAST RESORT — serial twin of `par_try_ap_decode`'s Ap5
+            // block, kept in sync the same way this function's AP1-AP4
+            // mirror `par_try_ap_decode`'s. Only reached if AP1-AP4 all
+            // failed for this trial_freq_sub. Gated entirely on
+            // `self.config.content_ap_enabled` (default `false`) — with the
+            // flag off this block is never entered, byte-identical to
+            // pre-Task-6 behavior. Reuses the same
+            // clone-LLRs -> inject -> normalize -> decode -> CRC ->
+            // is_plausible -> ap_injection_survived -> confidence-floor ->
+            // suspicion pipeline Ap3/Ap4 use (`try_ldpc_with_ap`) — no
+            // duplication.
+            if self.config.content_ap_enabled && ap_context.my_call.is_some() {
+                for qso in ap_context.active_qsos.iter().take(self.config.max_ap_qsos) {
+                    let hyps = crate::ap::build_content_hypotheses(qso);
+                    if hyps.is_empty() {
+                        continue;
+                    }
+                    let hyps = order_and_cap_content_hypotheses(
+                        hyps,
+                        snr_db,
+                        self.config.max_ap_hypotheses,
+                    );
+
+                    // See the matching comment in `par_try_ap_decode`'s
+                    // Ap5 block: `inject_ap_llrs`/`ap_injection_survived`
+                    // read the partner callsign from `ApContext.
+                    // active_qso`, not a per-call override, so it must be
+                    // pinned to the qso actually being tried here.
+                    let per_qso_ap_context = crate::ap::ApContext {
+                        active_qso: Some(qso.clone()),
+                        ..ap_context.clone()
+                    };
+
+                    for hyp in hyps {
+                        crate::ap::record_ap5_attempt();
+                        if let Some(msg) = self.try_ldpc_with_ap(
+                            &base_llrs,
+                            crate::ap::ApLevel::Ap5(hyp),
+                            &per_qso_ap_context,
+                            None,
+                            snr_db,
+                            confidence,
+                            base_frequency,
+                            time_offset_s,
+                        )? {
+                            // Extra content-AP-specific confidence floor —
+                            // see the matching comment in
+                            // `par_try_ap_decode`'s Ap5 block.
+                            if msg.confidence >= self.config.min_content_ap_confidence {
+                                return Ok(Some(msg));
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Ok(None)
@@ -6372,9 +6491,13 @@ impl Ft8Decoder {
         const SCRUTINY_THRESHOLD: f32 = 0.65;
         let lowest_possible_floor = match ap_level {
             crate::ap::ApLevel::Ap0 => MIN_DECODE_CONFIDENCE,
-            crate::ap::ApLevel::Ap1 | crate::ap::ApLevel::Ap2 | crate::ap::ApLevel::Cq => {
-                MIN_AP_DECODE_CONFIDENCE
-            }
+            crate::ap::ApLevel::Ap1
+            | crate::ap::ApLevel::Ap2
+            | crate::ap::ApLevel::Cq
+            // Ap5 isn't wired into any decode-loop caller yet (Task 6) —
+            // this arm only exists to keep the match exhaustive. Treated
+            // as AP-biased like Ap1/Ap2/Cq (conservative default).
+            | crate::ap::ApLevel::Ap5(_) => MIN_AP_DECODE_CONFIDENCE,
             crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
                 if self.config.a8_qso_state_ap_enabled {
                     MIN_DECODE_CONFIDENCE
@@ -6397,7 +6520,7 @@ impl Ft8Decoder {
         match ap_level {
             crate::ap::ApLevel::Ap0 => {} // no injection
             crate::ap::ApLevel::Ap1 => {
-                crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
+                crate::ap::inject_ap_llrs(&mut llrs, ap_level.clone(), ap_context, xor_sequence);
             }
             crate::ap::ApLevel::Ap2 => {
                 // First inject AP1 (our call as called station)
@@ -6413,10 +6536,17 @@ impl Ft8Decoder {
                 }
             }
             crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
-                crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
+                crate::ap::inject_ap_llrs(&mut llrs, ap_level.clone(), ap_context, xor_sequence);
+            }
+            // Not wired into any decode-loop caller yet (Task 6) — kept
+            // here so the match stays exhaustive and so this function
+            // already behaves correctly the moment Task 6 starts calling
+            // it with a real Ap5(hyp).
+            crate::ap::ApLevel::Ap5(_) => {
+                crate::ap::inject_ap_llrs(&mut llrs, ap_level.clone(), ap_context, xor_sequence);
             }
             crate::ap::ApLevel::Cq => {
-                crate::ap::inject_ap_llrs(&mut llrs, ap_level, ap_context, xor_sequence);
+                crate::ap::inject_ap_llrs(&mut llrs, ap_level.clone(), ap_context, xor_sequence);
             }
         }
 
@@ -6470,7 +6600,7 @@ impl Ft8Decoder {
         // doesn't carry the AP-injected callsign. Such "successful" AP
         // decodes are false positives — the AP hint didn't help, the
         // codeword passed CRC by coincidence.
-        if !ap_injection_survived(ap_level, ap_context, &ft8_message) {
+        if !ap_injection_survived(ap_level.clone(), ap_context, &ft8_message) {
             return Ok(None);
         }
 
@@ -6481,6 +6611,9 @@ impl Ft8Decoder {
             crate::ap::ApLevel::Ap3 => 3,
             crate::ap::ApLevel::Ap4 => 4,
             crate::ap::ApLevel::Cq => 5,
+            // Appended, not inserted before Cq — Cq's existing telemetry
+            // number must not shift.
+            crate::ap::ApLevel::Ap5(_) => 6,
         };
         // Minimum confidence floor. Two thresholds: AP0 decodes can land at
         // sync_score ≥ 4.92 (the LDPC has no priors, so a CRC-valid output
@@ -8454,6 +8587,23 @@ struct DecodeContext<'a> {
     /// `Ft8Decoder::baseband_taps`'s doc) — computed once per decoder
     /// instance, reused across every candidate in every window.
     baseband_taps: &'a [f64],
+    /// AP content-decoding plan Task 6: master switch for the `Ap5`
+    /// content-hypothesis rescue loop. Default `false` — with the flag
+    /// off, `par_try_ap_decode` never enters the Ap5 block, byte-identical
+    /// to pre-Task-6 behavior. See `Ft8Config::content_ap_enabled`.
+    content_ap_enabled: bool,
+    /// Task 6: max content hypotheses tried per QSO in the Ap5 loop,
+    /// SNR-seeded ordering (nearest-to-measured-SNR first). See
+    /// `Ft8Config::max_ap_hypotheses`.
+    max_ap_hypotheses: usize,
+    /// Task 6: max concurrent QSOs (from `ApContext::active_qsos`) tried
+    /// in the Ap5 loop. See `Ft8Config::max_ap_qsos`.
+    max_ap_qsos: usize,
+    /// Task 6: stricter confidence floor applied specifically to Ap5
+    /// (content-AP) decodes, on top of the generic AP confidence gate
+    /// `par_try_ldpc_with_ap` already applies. See
+    /// `Ft8Config::min_content_ap_confidence`.
+    min_content_ap_confidence: f32,
 }
 
 /// Result from parallel candidate decoding (one candidate).
@@ -9835,6 +9985,51 @@ fn matched_demod_tone_correlation(
     acc
 }
 
+/// AP content-decoding plan Task 6: extract the numeric signal-report
+/// value (dB) embedded in a [`crate::ap::ContentHypothesis`]'s `text`, if
+/// any — used to order the Ap5 hypothesis loop by closeness to the
+/// candidate's own measured SNR (the true report a partner sends is
+/// usually close to what we actually measure). Mirrors `ap.rs`'s private
+/// `pack_extra_field`'s report-parsing branch (third whitespace-separated
+/// token, optional `R` prefix, `-35..=30` valid range) so the two stay
+/// consistent, without depending on that private helper directly.
+///
+/// Confirmation-family hypotheses (`RR73`/`RRR`/`73`) have no numeric
+/// report and return `None` — the caller treats `None` as "no SNR
+/// preference", not "excluded"; a bare `"73"` correctly falls out of the
+/// `-35..=30` range check rather than being misread as a +73 dB report.
+fn hypothesis_report_value(hyp: &crate::ap::ContentHypothesis) -> Option<i32> {
+    let extra = hyp.text.split_whitespace().nth(2)?;
+    let report_str = match extra.strip_prefix('R') {
+        Some(rest) if rest.starts_with('+') || rest.starts_with('-') => rest,
+        _ => extra,
+    };
+    let dd: i32 = report_str.parse().ok()?;
+    (-35..=30).contains(&dd).then_some(dd)
+}
+
+/// AP content-decoding plan Task 6: order `hyps` by SNR-seeded likelihood
+/// (nearest-to-`snr_db` report first; confirmation-family hypotheses with
+/// no numeric report keep their original relative order, sorted after any
+/// report-bearing hypotheses via a stable sort) and cap at
+/// `max_hypotheses`. Shared by both `par_try_ap_decode` and
+/// `Ft8Decoder::try_ap_decode` so the ordering/capping policy can't drift
+/// between the parallel and serial twins.
+fn order_and_cap_content_hypotheses(
+    mut hyps: Vec<crate::ap::ContentHypothesis>,
+    snr_db: f32,
+    max_hypotheses: usize,
+) -> Vec<crate::ap::ContentHypothesis> {
+    let target_report = snr_db.round() as i32;
+    hyps.sort_by_key(|h| {
+        hypothesis_report_value(h)
+            .map(|v| (v - target_report).abs())
+            .unwrap_or(i32::MAX)
+    });
+    hyps.truncate(max_hypotheses);
+    hyps
+}
+
 /// Try AP-enhanced decoding for a single candidate (parallel-safe).
 fn par_try_ap_decode(
     ctx: &DecodeContext,
@@ -10063,6 +10258,73 @@ fn par_try_ap_decode(
                 }
             }
         }
+
+        // --- Ap5 (AP content-decoding plan Task 6): content-hypothesis
+        // rescue, LAST RESORT. Only reached if AP0-AP4 (and CQ/recent-only,
+        // above) all failed to produce a decode for this trial_freq_sub.
+        // Gated entirely on `ctx.content_ap_enabled` (default `false`) —
+        // with the flag off this block is never entered, byte-identical to
+        // pre-Task-6 behavior. Reuses the exact same
+        // clone-LLRs -> inject -> normalize -> decode -> CRC ->
+        // is_plausible -> ap_injection_survived -> confidence-floor ->
+        // suspicion pipeline Ap3/Ap4 use (`par_try_ldpc_with_ap`) — no
+        // duplication.
+        if ctx.content_ap_enabled && ctx.ap_context.my_call.is_some() {
+            for qso in ctx.ap_context.active_qsos.iter().take(ctx.max_ap_qsos) {
+                let hyps = crate::ap::build_content_hypotheses(qso);
+                if hyps.is_empty() {
+                    continue;
+                }
+                let hyps = order_and_cap_content_hypotheses(hyps, snr_db, ctx.max_ap_hypotheses);
+
+                // `inject_ap_llrs`/`ap_injection_survived`'s `Ap5` arms
+                // reuse Ap3/Ap4's callsign logic verbatim, which reads
+                // the partner callsign from `ApContext.active_qso` (the
+                // back-compat SINGULAR field) — not a per-call override.
+                // Only `active_qsos[0]` matches `active_qso` by the
+                // Task 3 invariant, so trying any OTHER entry of
+                // `active_qsos` without overriding `active_qso` here
+                // would silently inject/verify the WRONG partner
+                // callsign (or, if `active_qso` is `None`, skip partner
+                // verification entirely and inject only the own-call
+                // half of Ap3's pair) for every qso but the first.
+                // Building a per-attempt `ApContext` with `active_qso`
+                // pinned to the qso actually being tried keeps each
+                // attempt correct regardless of position in the list.
+                let per_qso_ap_context = crate::ap::ApContext {
+                    active_qso: Some(qso.clone()),
+                    ..ctx.ap_context.clone()
+                };
+
+                for hyp in hyps {
+                    crate::ap::record_ap5_attempt();
+                    if let Some(msg) = par_try_ldpc_with_ap(
+                        ctx,
+                        ldpc,
+                        &base_llrs,
+                        crate::ap::ApLevel::Ap5(hyp),
+                        &per_qso_ap_context,
+                        None,
+                        snr_db,
+                        confidence,
+                        base_frequency,
+                        time_offset_s,
+                    ) {
+                        // Extra content-AP-specific confidence floor, on
+                        // top of the generic AP floor `par_try_ldpc_with_ap`
+                        // already applied. A decode that passed CRC +
+                        // `ap_injection_survived` (which for Ap5 requires
+                        // exact content-text match) but doesn't clear this
+                        // stricter floor is rejected -- try the next
+                        // hypothesis rather than accepting a marginal
+                        // content-AP decode.
+                        if msg.confidence >= ctx.min_content_ap_confidence {
+                            return Some(msg);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     None
@@ -10087,10 +10349,15 @@ fn par_try_ldpc_with_ap(
     let mut llrs = base_llrs.to_vec();
     let xor_sequence = ctx.xor_sequence;
 
+    // `ap_level.clone()` (not a bare move) at each `inject_ap_llrs` call:
+    // `ap_level` is not `Copy` (Ap5 carries an owned `ContentHypothesis`),
+    // and it's needed again below (`ap_injection_survived`, `ap_level_num`,
+    // the `a8_match` check) — capturing it by move into this closure would
+    // make those later uses a compile error.
     let inject = |llrs: &mut Vec<f32>| match ap_level {
         crate::ap::ApLevel::Ap0 => {}
         crate::ap::ApLevel::Ap1 => {
-            crate::ap::inject_ap_llrs(llrs, ap_level, ap_context, xor_sequence);
+            crate::ap::inject_ap_llrs(llrs, ap_level.clone(), ap_context, xor_sequence);
         }
         crate::ap::ApLevel::Ap2 => {
             crate::ap::inject_ap_llrs(llrs, crate::ap::ApLevel::Ap1, ap_context, xor_sequence);
@@ -10099,7 +10366,14 @@ fn par_try_ldpc_with_ap(
             }
         }
         crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 | crate::ap::ApLevel::Cq => {
-            crate::ap::inject_ap_llrs(llrs, ap_level, ap_context, xor_sequence);
+            crate::ap::inject_ap_llrs(llrs, ap_level.clone(), ap_context, xor_sequence);
+        }
+        // Not wired into any decode-loop caller yet (Task 6) — kept here
+        // so the match stays exhaustive and this function already
+        // behaves correctly the moment Task 6 starts calling it with a
+        // real Ap5(hyp).
+        crate::ap::ApLevel::Ap5(_) => {
+            crate::ap::inject_ap_llrs(llrs, ap_level.clone(), ap_context, xor_sequence);
         }
     };
 
@@ -10143,7 +10417,7 @@ fn par_try_ldpc_with_ap(
     // bias and produced a codeword that doesn't carry the injected
     // callsign, the AP didn't help — reject as a CRC-coincidence false
     // positive.
-    if !ap_injection_survived(ap_level, ap_context, &ft8_message) {
+    if !ap_injection_survived(ap_level.clone(), ap_context, &ft8_message) {
         return None;
     }
 
@@ -10154,6 +10428,9 @@ fn par_try_ldpc_with_ap(
         crate::ap::ApLevel::Ap3 => 3,
         crate::ap::ApLevel::Ap4 => 4,
         crate::ap::ApLevel::Cq => 5,
+        // Appended, not inserted before Cq — Cq's existing telemetry
+        // number must not shift.
+        crate::ap::ApLevel::Ap5(_) => 6,
     };
     // AP decodes need higher confidence than standard decodes because
     // AP injection biases the LDPC solver toward our callsign, producing
@@ -10585,22 +10862,26 @@ pub(crate) fn ap_injection_survived(
         // station) AND the active QSO partner at bits 29-56 (from_callsign /
         // calling station). Both must survive in the parsed message.
         crate::ap::ApLevel::Ap3 | crate::ap::ApLevel::Ap4 => {
-            let Some(ref my) = ap_context.my_call else {
-                return true;
-            };
-            let to = msg.to_callsign.as_deref().unwrap_or("");
-            let to_base = to.split('/').next().unwrap_or(to);
-            if to_base != my.callsign {
+            ap3_style_callsigns_survived(ap_context, msg)
+        }
+
+        // Ap5 = Ap3's callsign injection (own call as to_callsign, active
+        // QSO partner as from_callsign — reuses the exact Ap3/Ap4 check
+        // above, no duplication) PLUS one specific enumerated content
+        // hypothesis's bits (58-76). The callsign half is verified the
+        // same way; then the NEW, load-bearing check for content-AP: the
+        // decoded message's canonical text must match the injected
+        // hypothesis's text. LDPC's parity constraints can overrule the
+        // content bias exactly as they can overrule a callsign bias — a
+        // decode whose content drifted from the injected hypothesis is a
+        // CRC-coincidence false positive, not a real rescue of the
+        // assumed completion content, and must be rejected here.
+        crate::ap::ApLevel::Ap5(ref hyp) => {
+            if !ap3_style_callsigns_survived(ap_context, msg) {
                 return false;
             }
-            if let Some(ref qso) = ap_context.active_qso {
-                let from = msg.from_callsign.as_deref().unwrap_or("");
-                let from_base = from.split('/').next().unwrap_or(from);
-                if from_base != qso.their_call {
-                    return false;
-                }
-            }
-            true
+            crate::ap::normalize_for_a8_match(&msg.to_string())
+                == crate::ap::normalize_for_a8_match(&hyp.text)
         }
 
         // Cq injects the "CQ" special token at the to_callsign/first-token
@@ -10615,6 +10896,33 @@ pub(crate) fn ap_injection_survived(
             )
         }
     }
+}
+
+/// Shared AP3/AP4/AP5 callsign-survival check: own call as to_callsign
+/// (called station), active QSO partner (if any) as from_callsign
+/// (calling station). Extracted out of `ap_injection_survived`'s AP3/AP4
+/// arm so `Ap5`'s content-injection arm can reuse the identical callsign
+/// verification without duplicating it inline.
+fn ap3_style_callsigns_survived(
+    ap_context: &crate::ap::ApContext,
+    msg: &crate::message::Ft8Message,
+) -> bool {
+    let Some(ref my) = ap_context.my_call else {
+        return true;
+    };
+    let to = msg.to_callsign.as_deref().unwrap_or("");
+    let to_base = to.split('/').next().unwrap_or(to);
+    if to_base != my.callsign {
+        return false;
+    }
+    if let Some(ref qso) = ap_context.active_qso {
+        let from = msg.from_callsign.as_deref().unwrap_or("");
+        let from_base = from.split('/').next().unwrap_or(from);
+        if from_base != qso.their_call {
+            return false;
+        }
+    }
+    true
 }
 
 /// Task W2.6 [A/B]: verify that the full message-content mask injected by
@@ -14324,6 +14632,25 @@ mod tests {
         assert_eq!(config.max_candidates, MAX_DECODE_CANDIDATES);
     }
 
+    /// AP content-decoding plan §3.5 (Task 4): the new AP tuning knobs must
+    /// default to values that preserve today's exact behavior — the two
+    /// promoted consts (`ap_llr_magnitude`, `min_ap_decode_confidence`) keep
+    /// their existing hardcoded values, and the master switch
+    /// (`content_ap_enabled`) plus the two brand-new sizing knobs
+    /// (`max_ap_hypotheses`, `max_ap_qsos`) default to values that are
+    /// inert because Ap5 isn't wired into any decode-loop caller yet
+    /// (Task 6's job).
+    #[test]
+    fn ft8_config_ap_knobs_default_preserve_current_behavior() {
+        let cfg = Ft8Config::default();
+        assert!(!cfg.content_ap_enabled);
+        assert_eq!(cfg.ap_llr_magnitude, 15.0);
+        assert_eq!(cfg.min_ap_decode_confidence, 0.55);
+        assert_eq!(cfg.min_content_ap_confidence, 0.60);
+        assert_eq!(cfg.max_ap_hypotheses, 8);
+        assert_eq!(cfg.max_ap_qsos, 4);
+    }
+
     #[test]
     fn test_decoder_creation() {
         let config = Ft8Config::default();
@@ -14365,6 +14692,13 @@ mod tests {
         assert!(super::min_abs_llr(&all_big) > 1e29);
     }
 
+    // Pre-existing gap found while verifying Task 1 of
+    // docs/superpowers/plans/2026-07-25-ap-content-decoding.md: this test
+    // uses `crate::{Ft8Encoder, Ft8Modulator}`, both gated behind the
+    // `transmit` feature, but the test itself was not -- `cargo test -p
+    // pancetta-ft8 --lib` with default features failed to compile before
+    // this fix, unrelated to anything else in that task.
+    #[cfg(feature = "transmit")]
     #[test]
     fn decode_soft_with_features_round_trip_on_clean_signal() {
         // Encode + modulate + add light noise + decode. The features
@@ -20262,6 +20596,7 @@ mod a8_qso_state_tests {
             my_call: MyCallAp::new(my),
             recent_calls: vec![],
             active_qso: Some(qso),
+            active_qsos: vec![],
         }
     }
 
@@ -20288,6 +20623,7 @@ mod a8_qso_state_tests {
             my_call: MyCallAp::new("K1ABC"),
             recent_calls: vec![],
             active_qso: None,
+            active_qsos: vec![],
         };
         assert!(!a8_text_matches(&ctx, "K1ABC W1AW RR73"));
     }
@@ -21865,6 +22201,10 @@ mod w2_5_acceptance_gating_tests {
             fine_sync_enabled: decoder.config.fine_sync_enabled,
             nsym_combining_enabled: decoder.config.nsym_combining_enabled,
             baseband_taps: &decoder.baseband_taps,
+            content_ap_enabled: decoder.config.content_ap_enabled,
+            max_ap_hypotheses: decoder.config.max_ap_hypotheses,
+            max_ap_qsos: decoder.config.max_ap_qsos,
+            min_content_ap_confidence: decoder.config.min_content_ap_confidence,
         }
     }
 
@@ -22148,6 +22488,10 @@ mod w26_ap_coverage_tests {
             fine_sync_enabled: decoder.config.fine_sync_enabled,
             nsym_combining_enabled: decoder.config.nsym_combining_enabled,
             baseband_taps: &decoder.baseband_taps,
+            content_ap_enabled: decoder.config.content_ap_enabled,
+            max_ap_hypotheses: decoder.config.max_ap_hypotheses,
+            max_ap_qsos: decoder.config.max_ap_qsos,
+            min_content_ap_confidence: decoder.config.min_content_ap_confidence,
         }
     }
 
@@ -22242,6 +22586,97 @@ mod w26_ap_coverage_tests {
         assert!(ap_injection_survived(crate::ap::ApLevel::Cq, &ctx, &msg));
     }
 
+    /// Shared fixture for the `ApLevel::Ap5` survival tests below: a
+    /// `K1ABC` (my call) / `W1AW` (active QSO partner, awaiting
+    /// confirmation) context plus a content hypothesis for `text`, built
+    /// via the real `build_content_hypotheses` path (ground-truthed
+    /// against the encoder in Task 1) rather than hand-picked bits — the
+    /// content-match check under test compares `hyp.text`, not
+    /// `content_bits`, so the bit pattern itself is incidental here.
+    fn ap5_test_ctx_and_hyp(text: &str) -> (crate::ap::ApContext, crate::ap::ContentHypothesis) {
+        let my = crate::ap::MyCallAp::new("K1ABC").expect("K1ABC should encode");
+        let mut qso =
+            crate::ap::QsoAp::new("W1AW", crate::ap::QsoApProgress::WaitingForConfirmation)
+                .expect("W1AW should encode");
+        qso = qso.with_expected_texts([text]);
+        let hyp = crate::ap::build_content_hypotheses(&qso)
+            .into_iter()
+            .next()
+            .expect("hypothesis should build for a well-formed standard-message text");
+        let ctx = crate::ap::ApContext {
+            my_call: Some(my),
+            recent_calls: vec![],
+            active_qso: Some(qso),
+            active_qsos: vec![],
+        };
+        (ctx, hyp)
+    }
+
+    /// Positive case: a decode whose callsigns AND content match the
+    /// injected Ap5 hypothesis must survive.
+    #[test]
+    fn ap_injection_survived_ap5_accepts_matching_content() {
+        let (ctx, hyp) = ap5_test_ctx_and_hyp("K1ABC W1AW RR73");
+
+        let mut msg = crate::message::Ft8Message::default();
+        msg.message_type = crate::message::MessageType::Standard;
+        msg.standard_type = Some(crate::message::StandardMessageType::RR73);
+        msg.to_callsign = Some("K1ABC".to_string());
+        msg.from_callsign = Some("W1AW".to_string());
+
+        assert!(ap_injection_survived(
+            crate::ap::ApLevel::Ap5(hyp),
+            &ctx,
+            &msg
+        ));
+    }
+
+    /// Load-bearing: a decode with the RIGHT callsigns but content that
+    /// drifted from the injected hypothesis (RRR decoded when RR73 was
+    /// assumed) must be rejected. This is the single most important
+    /// false-decode gate in the content-AP feature — proves the check
+    /// actually discriminates on content, not a no-op that always
+    /// accepts once the callsign half matches. Mirrors the exact
+    /// "LDPC parity overruled the [...] bias and produced a coincidental
+    /// CRC-valid [...] message" false-positive pattern documented for
+    /// the Cq and AP4-full-mask checks above.
+    #[test]
+    fn ap_injection_survived_ap5_rejects_wrong_content() {
+        let (ctx, hyp) = ap5_test_ctx_and_hyp("K1ABC W1AW RR73");
+
+        let mut msg = crate::message::Ft8Message::default();
+        msg.message_type = crate::message::MessageType::Standard;
+        msg.standard_type = Some(crate::message::StandardMessageType::Rrr); // NOT RR73
+        msg.to_callsign = Some("K1ABC".to_string());
+        msg.from_callsign = Some("W1AW".to_string());
+
+        assert!(
+            !ap_injection_survived(crate::ap::ApLevel::Ap5(hyp), &ctx, &msg),
+            "a decode whose content drifted from the injected hypothesis must be rejected"
+        );
+    }
+
+    /// Ap5 must still enforce the Ap3/Ap4 callsign check (reused via
+    /// `ap3_style_callsigns_survived`, not duplicated): a decode with the
+    /// hypothesis's exact content but the WRONG partner callsign must
+    /// still be rejected.
+    #[test]
+    fn ap_injection_survived_ap5_rejects_wrong_callsign_even_with_matching_content() {
+        let (ctx, hyp) = ap5_test_ctx_and_hyp("K1ABC W1AW RR73");
+
+        let mut msg = crate::message::Ft8Message::default();
+        msg.message_type = crate::message::MessageType::Standard;
+        msg.standard_type = Some(crate::message::StandardMessageType::RR73);
+        msg.to_callsign = Some("K1ABC".to_string());
+        msg.from_callsign = Some("N0CALL".to_string()); // not the active QSO partner
+
+        assert!(!ap_injection_survived(
+            crate::ap::ApLevel::Ap5(hyp),
+            &ctx,
+            &msg
+        ));
+    }
+
     /// Direct unit tests of `ap4_full_mask_survived`: the decoded
     /// message's `standard_type` must equal the specific token that was
     /// injected — a message that decodes to a DIFFERENT standard type
@@ -22309,6 +22744,7 @@ mod w26_ap_coverage_tests {
             my_call: Some(my_call),
             recent_calls: vec![],
             active_qso: None,
+            active_qsos: vec![],
         };
 
         // Legacy: inject then normalize.
@@ -22351,6 +22787,480 @@ mod w26_ap_coverage_tests {
              the scale applied to the non-injected bits relative to \
              normalizing alone — otherwise this test's premise doesn't \
              hold for this input"
+        );
+    }
+}
+
+// ============================================================================
+// AP content-decoding plan Task 6: Ap5 hot-path rescue test
+// ============================================================================
+//
+// The most direct end-to-end scenario -- "AP0 fails, a *full* AP3/AP4
+// (both callsigns known) also fails, Ap5 (both callsigns + content)
+// rescues" -- was attempted first via extensive audio-domain noise/
+// erasure search and abandoned (see the Task 6 report for the full
+// account): the transition from "AP3/AP4 rescue" to "even Ap5 fails" is
+// a sub-0.1-dB cliff for this decoder/config, with no stable gap in
+// between. A "splice in a different, cleanly-encoded wrong confirmation
+// token" alternative failed for a different reason: `RRR`/`RR73`/`73`'s
+// `igrid4` values are adjacent integers (`MAXGRID4+2/+3/+4`) whose 15-bit
+// patterns differ in only ~1-2 bits, so the splice barely differs from
+// the truth at the bit level.
+//
+// This test instead makes AP2/AP3/AP4 STRUCTURALLY inapplicable (via
+// `ApContext.active_qso: None` while `active_qsos` -- what the Ap5 loop
+// actually reads -- is populated) rather than merely noise-defeated, and
+// reuses `ap_injection_ordering_tests.rs`'s own PROVEN noise recipe
+// (mildly relaxed) to beat only AP0 and AP1 (28 known bits) -- a much
+// more tractable target than beating a full AP3/AP4 (56 known bits).
+// Direct calls to the private hot-path functions Task 6 modified
+// (`par_decode_candidate` for AP0, `par_try_ap_decode` for AP1/Ap5) on a
+// real Costas-search candidate, following the SAME "mechanism-plumbing-
+// correctness" precedent `w26_ap_coverage_tests` established just above
+// for the CQ mask (see that module's doc comment).
+//
+// Getting this test working also surfaced a genuine Task 6 bug (fixed in
+// the same commit, not just worked around here): `inject_ap_llrs`/
+// `ap_injection_survived`'s `Ap5` arms (Task 2) read the QSO partner's
+// callsign from `ApContext.active_qso` (the back-compat singular field),
+// not a per-attempt override -- so the original Ap5 loop, when trying any
+// `active_qsos` entry other than index 0, silently injected/verified the
+// WRONG partner callsign (or none at all, if `active_qso` was `None`).
+// Both `par_try_ap_decode` and `try_ap_decode` now build a per-attempt
+// `ApContext` with `active_qso` pinned to the qso actually being tried.
+// This test's `active_qso: None` / `active_qsos: [qso]` setup exercises
+// exactly that "no partner callsign in `active_qso`" edge case.
+#[cfg(test)]
+mod ap5_hot_path_rescue_tests {
+    use super::*;
+    use crate::ap::{ApContext, MyCallAp, QsoAp, QsoApProgress};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
+
+    /// Mirrors `w26_ap_coverage_tests::build_ctx` field-for-field (small
+    /// intentional duplication across test modules, same pattern used
+    /// elsewhere in this file — see that function's doc comment), with
+    /// `content_ap_enabled` as an explicit parameter so the same
+    /// candidate/spectrogram can be tried at both settings.
+    #[cfg(feature = "transmit")]
+    #[allow(clippy::too_many_arguments)]
+    fn build_ctx<'a>(
+        decoder: &'a Ft8Decoder,
+        spectrogram: &'a Spectrogram,
+        audio: &'a [f64],
+        ap_context: &'a crate::ap::ApContext,
+        content_ap_enabled: bool,
+    ) -> DecodeContext<'a> {
+        DecodeContext {
+            protocol_params: &decoder.protocol_params,
+            message_parser: &decoder.message_parser,
+            spectrogram,
+            audio,
+            ap_context,
+            ap_active: true,
+            symbol_fft: &decoder.symbol_fft,
+            symbol_window: &decoder.symbol_window,
+            xor_sequence: decoder.protocol_params.xor_sequence,
+            ldpc_iterations: decoder.config.ldpc_iterations,
+            osd_depth: decoder.config.osd_depth,
+            osd_npre2_preprocessing_enabled: decoder.config.osd_npre2_preprocessing_enabled,
+            llr_target_variance: decoder.config.llr_target_variance,
+            adaptive_ldpc_iters: decoder.config.adaptive_ldpc_iters,
+            max_parity_errors_for_osd: decoder.config.max_parity_errors_for_osd,
+            bp_offset_subtract: decoder.config.bp_offset_subtract,
+            osd_input: decoder.config.osd_input,
+            layered_bp: decoder.config.layered_bp,
+            pade_atanh: decoder.config.pade_atanh,
+            ldpc_feedback_refinement_enabled: decoder.config.ldpc_feedback_refinement_enabled,
+            ldpc_feedback_boost_factor: decoder.config.ldpc_feedback_boost_factor,
+            ldpc_feedback_attenuate_factor: decoder.config.ldpc_feedback_attenuate_factor,
+            ldpc_feedback_erase_threshold: decoder.config.ldpc_feedback_erase_threshold,
+            sync_time_interp_linear_power: decoder.config.sync_time_interp_linear_power,
+            linear_power_averaging: decoder.config.linear_power_averaging,
+            window_start: Instant::now(),
+            soft_combiner: decoder.soft_combiner.as_ref(),
+            llr_whitening_enabled: decoder.config.llr_whitening_enabled,
+            per_candidate_freq_tracker_enabled: decoder.config.per_candidate_freq_tracker_enabled,
+            per_candidate_freq_tracker_alpha: decoder.config.per_candidate_freq_tracker_alpha,
+            per_candidate_freq_tracker_max_step_hz: decoder
+                .config
+                .per_candidate_freq_tracker_max_step_hz,
+            per_candidate_freq_tracker_max_error_hz: decoder
+                .config
+                .per_candidate_freq_tracker_max_error_hz,
+            a8_qso_state_ap_enabled: decoder.config.a8_qso_state_ap_enabled,
+            bicm_id_iterations: decoder.config.bicm_id_iterations,
+            bicm_id_max_unsatisfied_checks: decoder.config.bicm_id_max_unsatisfied_checks,
+            llr_metric: decoder.config.llr_metric,
+            bicm_id_em_reestimation: decoder.config.bicm_id_em_reestimation,
+            impulse_robust_llr: decoder.config.impulse_robust_llr,
+            escalation_enabled: decoder.config.escalation_enabled,
+            floor_iters: decoder.config.floor_iters,
+            deep_iters: decoder.config.deep_iters,
+            escalation_parity_max: decoder.config.escalation_parity_max,
+            budget: DecodeBudget::unlimited(),
+            acceptance_gating_enabled: decoder.config.acceptance_gating_enabled,
+            cq_ap_enabled: decoder.config.cq_ap_enabled,
+            ap4_full_message_mask_enabled: decoder.config.ap4_full_message_mask_enabled,
+            ap_injection_post_normalization: decoder.config.ap_injection_post_normalization,
+            fine_sync_enabled: decoder.config.fine_sync_enabled,
+            nsym_combining_enabled: decoder.config.nsym_combining_enabled,
+            baseband_taps: &decoder.baseband_taps,
+            content_ap_enabled,
+            max_ap_hypotheses: decoder.config.max_ap_hypotheses,
+            max_ap_qsos: decoder.config.max_ap_qsos,
+            min_content_ap_confidence: decoder.config.min_content_ap_confidence,
+        }
+    }
+
+    /// SNR-targeted deterministic Gaussian noise, added in-place.
+    /// Mirrors `tests/test_signal_generator.rs::add_gaussian_noise`'s
+    /// exact SNR-targeting formula (measure `samples`' own signal power,
+    /// derive `noise_std` from the requested `snr_db`) -- reimplemented
+    /// here (private to this module, same rationale as this file's other
+    /// seeded-noise test helpers) with a proper `rand`-crate Box-Muller
+    /// draw (rather than that helper's LCG approximation) so the SAME
+    /// proven SNR values `ap_injection_ordering_tests.rs` calibrated
+    /// (global -28.0 dB, callsign-field -24.0 dB) can be reused directly.
+    fn add_seeded_noise_snr_db(samples: &mut [f32], snr_db: f64, seed: u64) {
+        let signal_power: f64 = samples
+            .iter()
+            .map(|&x| (x as f64) * (x as f64))
+            .sum::<f64>()
+            / samples.len() as f64;
+        if signal_power < 1e-12 {
+            return;
+        }
+        let snr_linear = 10f64.powf(snr_db / 10.0);
+        let noise_std = (signal_power / snr_linear).sqrt();
+
+        let mut rng = StdRng::seed_from_u64(seed);
+        let mut i = 0;
+        while i < samples.len() {
+            let u1: f64 = rng.random::<f64>().max(1e-12);
+            let u2: f64 = rng.random::<f64>();
+            let r = (-2.0 * u1.ln()).sqrt();
+            let theta = 2.0 * std::f64::consts::PI * u2;
+            samples[i] += (r * theta.cos() * noise_std) as f32;
+            i += 1;
+            if i < samples.len() {
+                samples[i] += (r * theta.sin() * noise_std) as f32;
+                i += 1;
+            }
+        }
+    }
+
+    /// THE key end-to-end regression test for Task 6: on the SAME noisy
+    /// candidate/spectrogram/audio, AP0 (`par_decode_candidate`) fails,
+    /// AP1 (`par_try_ap_decode`, `content_ap_enabled = false`) also
+    /// fails, but Ap5 (`par_try_ap_decode`, `content_ap_enabled = true`)
+    /// rescues it -- proving the Task 6 wiring genuinely reaches and uses
+    /// the new Ap5 loop.
+    ///
+    /// AP2/AP3/AP4 are made STRUCTURALLY inapplicable (not just "likely
+    /// to fail"): `recent_calls` is empty (AP2 has nothing to try) and
+    /// `active_qso` is `None` while `active_qsos` (the Task 3 ranked
+    /// list, which is what the Ap5 loop reads) is populated -- AP3/AP4's
+    /// own gate (`ap_context.active_qso.is_some()`) is therefore false,
+    /// so they never run regardless of noise level. This also exercises
+    /// Ap5's independence from the legacy `active_qso` field.
+    ///
+    /// This reduces the test to "beat AP0 and AP1 (28 known bits), but
+    /// not Ap5 (28+19 known bits)" at the SAME noise recipe a full
+    /// audio-domain search already proved beats AP0 while a 56-known-bit
+    /// AP3 rescue survives (`ap_injection_ordering_tests.rs`) -- reusing
+    /// that proven recipe rather than re-deriving a fragile new one for
+    /// the much harder "beat AP3/AP4 specifically, but not Ap5" split
+    /// (extensively attempted and abandoned; see the Task 6 report for
+    /// why that split doesn't exist at this decoder's default config).
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn ap5_rescues_signal_that_ap0_and_ap1_cannot_decode_via_active_qsos_alone() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let text = "K1ABC W1AW RR73";
+        let decoder = Ft8Decoder::new(Ft8Config {
+            content_ap_enabled: true,
+            ..Ft8Config::default()
+        })
+        .expect("decoder");
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message(text, None).expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        // Same recipe `ap_injection_ordering_tests.rs::
+        // ap3_rescues_qso_context_signal_that_ap0_cannot_decode` proved
+        // discriminates at this crate's default `Ft8Config`: global noise
+        // across the whole window plus an extra burst on the callsign-
+        // field data tones (7..26). AP1 there knows only its OWN 28-bit
+        // call (to_callsign); AP3 knows both calls (56 bits) and
+        // survives -- AP1 alone, with half the prior, is not expected to.
+        let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        add_seeded_noise_snr_db(&mut tx, -26.0, 0xA995_5EED);
+        let cs_start = 7 * sps;
+        let cs_end = 26 * sps;
+        add_seeded_noise_snr_db(&mut tx[cs_start..cs_end], -24.0, 0x2455_5EED);
+
+        let my_call = MyCallAp::new("K1ABC").expect("K1ABC should encode");
+        let mut qso =
+            QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).expect("W1AW should encode");
+        qso = qso.with_expected_texts(["K1ABC W1AW RR73", "K1ABC W1AW RRR", "K1ABC W1AW 73"]);
+        let ap_context = ApContext {
+            my_call: Some(my_call),
+            recent_calls: vec![],
+            // Deliberately `None` (not `Some(qso.clone())`): structurally
+            // disables AP3/AP4, which gate on this legacy field, not
+            // `active_qsos`. See this test's doc comment.
+            active_qso: None,
+            active_qsos: vec![qso],
+        };
+
+        let audio = decoder.preprocess_audio(&tx).expect("preprocess");
+        let spectrogram = decoder.compute_spectrogram(&audio).expect("spectrogram");
+        let candidates = decoder
+            .costas_sync_search_with_threshold(&spectrogram, 0.0, None)
+            .expect("sync search");
+        let candidate = candidates
+            .into_iter()
+            .max_by(|a, b| {
+                a.sync_score
+                    .partial_cmp(&b.sync_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("a noisy signal must still produce at least one sync candidate");
+
+        let mut fft_buffer = vec![Complex::new(0.0, 0.0); sps];
+        let decoded_calls: HashSet<String> = HashSet::new();
+
+        // Tier 1: AP0 (`par_decode_candidate`) must fail.
+        let ctx_ap0 = build_ctx(&decoder, &spectrogram, &audio, &ap_context, false);
+        let ap0_result = par_decode_candidate(
+            &ctx_ap0,
+            &candidate,
+            &decoder.ldpc_decoder,
+            None,
+            &mut fft_buffer,
+        );
+        assert!(
+            ap0_result.is_none(),
+            "AP0 (par_decode_candidate) must NOT decode this noisy \
+             candidate (test is only meaningful if this tier genuinely \
+             fails); got: {:?}",
+            ap0_result.map(|m| m.text)
+        );
+
+        // Tier 2: with `content_ap_enabled = false`, `par_try_ap_decode`
+        // can only reach AP1 (AP2/AP3/AP4 are structurally gated off by
+        // this `ApContext`, and the Ap5 block itself is flag-gated) --
+        // must also fail.
+        let ctx_ap1 = build_ctx(&decoder, &spectrogram, &audio, &ap_context, false);
+        let ap1_result = par_try_ap_decode(
+            &ctx_ap1,
+            &candidate,
+            &decoder.ldpc_decoder,
+            &decoded_calls,
+            0,
+        );
+        assert!(
+            ap1_result.is_none(),
+            "AP1 (par_try_ap_decode, content_ap_enabled = false) must NOT \
+             rescue this candidate (test is only meaningful if this tier \
+             genuinely fails too); got: {:?}",
+            ap1_result.map(|m| m.text)
+        );
+
+        // Tier 3: the SAME candidate/spectrogram/audio/`ApContext`, but
+        // with `content_ap_enabled = true`, must rescue it via Ap5 --
+        // reached via `active_qsos` alone (`active_qso` is `None`).
+        let ctx_ap5 = build_ctx(&decoder, &spectrogram, &audio, &ap_context, true);
+        let ap5_result = par_try_ap_decode(
+            &ctx_ap5,
+            &candidate,
+            &decoder.ldpc_decoder,
+            &decoded_calls,
+            0,
+        );
+        let rescued = ap5_result.expect(
+            "Ap5 (par_try_ap_decode, content_ap_enabled = true) must \
+             rescue the candidate that AP0 and AP1 could not decode",
+        );
+        assert_eq!(rescued.text, text);
+        assert_eq!(
+            rescued.ap_level, 6,
+            "the rescue must come from Ap5 (content-hypothesis injection \
+             via active_qsos), not a coincidental AP0/AP1-equivalent hit"
+        );
+    }
+
+    /// Closes a gap the single-QSO test above cannot: with only one entry
+    /// in `active_qsos`, `active_qsos[0]` and "the QSO actually being
+    /// tried" are the same object, so a regression that accidentally
+    /// pinned the per-attempt `ApContext` to `active_qsos[0]` instead of
+    /// the loop's current `qso` variable would pass that test anyway.
+    ///
+    /// This test uses a TWO-element `active_qsos` where the rescuing
+    /// hypothesis lives at index 1: `active_qsos[0]` is a decoy QSO with
+    /// the WRONG partner callsign ("W9XYZ") and `active_qsos[1]` is the
+    /// real partner ("W1AW") whose content hypothesis matches the actual
+    /// signal. The decoy's expected text ("K1ABC W9XYZ RR73") shares the
+    /// SAME `extra` field ("RR73") as the real signal, so its content
+    /// bits (58-76) are identical to the real signal's -- the ONLY thing
+    /// that distinguishes decoy from rescuer is the injected/verified
+    /// partner-callsign bits (29-56), which is exactly the field the
+    /// Task 6 bug fix (per-QSO `ApContext` construction) protects.
+    ///
+    /// The legacy singular `active_qso` field is set to `Some(decoy)`,
+    /// matching the real Task 3 invariant (`active_qsos[0]` mirrors
+    /// `active_qso`) -- this is deliberately NOT `None` like the sibling
+    /// test above, because a regression that reused `ctx.ap_context`
+    /// (instead of building a per-QSO context) verbatim across every
+    /// `active_qsos` entry would inject/verify the DECOY's callsign for
+    /// every attempt, including index 1 -- which must then fail. Setting
+    /// `active_qso` to `None` here would make that regression
+    /// unobservable (no callsign to mismatch against), silently defeating
+    /// the whole point of this test.
+    ///
+    /// Enabling `active_qso` also structurally re-enables AP3/AP4 (they
+    /// gate on `ap_context.active_qso.is_some()`) for the `content_ap_
+    /// enabled = false` tier, unlike the sibling test. That's fine here:
+    /// AP3/AP4 inject the DECOY's (wrong) partner callsign, which is
+    /// expected to fail exactly like AP1 does (no correct partner
+    /// knowledge) -- this is a different regime from the "AP3/AP4 with
+    /// the CORRECT callsign already rescues" cliff the sibling test's doc
+    /// comment describes avoiding.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn ap5_rescues_via_active_qsos_index_1_not_index_0() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let text = "K1ABC W1AW RR73";
+        let decoder = Ft8Decoder::new(Ft8Config {
+            content_ap_enabled: true,
+            ..Ft8Config::default()
+        })
+        .expect("decoder");
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder.encode_message(text, None).expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        // Same proven noise recipe as the sibling test above.
+        let sps = decoder.protocol_params.samples_per_symbol(SAMPLE_RATE);
+        add_seeded_noise_snr_db(&mut tx, -26.0, 0xA995_5EED);
+        let cs_start = 7 * sps;
+        let cs_end = 26 * sps;
+        add_seeded_noise_snr_db(&mut tx[cs_start..cs_end], -24.0, 0x2455_5EED);
+
+        let my_call = MyCallAp::new("K1ABC").expect("K1ABC should encode");
+
+        // Decoy: wrong partner callsign, SAME content family ("RR73") as
+        // the real signal -- isolates the callsign field as the only
+        // possible source of a mismatch.
+        let decoy_qso = QsoAp::new("W9XYZ", QsoApProgress::WaitingForConfirmation)
+            .expect("W9XYZ should encode")
+            .with_expected_texts(["K1ABC W9XYZ RR73"]);
+
+        // Rescuer: correct partner callsign and content, at index 1.
+        let mut real_qso =
+            QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).expect("W1AW should encode");
+        real_qso =
+            real_qso.with_expected_texts(["K1ABC W1AW RR73", "K1ABC W1AW RRR", "K1ABC W1AW 73"]);
+
+        let ap_context = ApContext {
+            my_call: Some(my_call),
+            recent_calls: vec![],
+            // Mirrors the real Task 3 invariant: `active_qso` tracks
+            // `active_qsos[0]` (the decoy here) -- see doc comment above
+            // for why this must NOT be `None` in this particular test.
+            active_qso: Some(decoy_qso.clone()),
+            active_qsos: vec![decoy_qso, real_qso],
+        };
+
+        let audio = decoder.preprocess_audio(&tx).expect("preprocess");
+        let spectrogram = decoder.compute_spectrogram(&audio).expect("spectrogram");
+        let candidates = decoder
+            .costas_sync_search_with_threshold(&spectrogram, 0.0, None)
+            .expect("sync search");
+        let candidate = candidates
+            .into_iter()
+            .max_by(|a, b| {
+                a.sync_score
+                    .partial_cmp(&b.sync_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("a noisy signal must still produce at least one sync candidate");
+
+        let mut fft_buffer = vec![Complex::new(0.0, 0.0); sps];
+        let decoded_calls: HashSet<String> = HashSet::new();
+
+        // Tier 1: AP0 must fail.
+        let ctx_ap0 = build_ctx(&decoder, &spectrogram, &audio, &ap_context, false);
+        let ap0_result = par_decode_candidate(
+            &ctx_ap0,
+            &candidate,
+            &decoder.ldpc_decoder,
+            None,
+            &mut fft_buffer,
+        );
+        assert!(
+            ap0_result.is_none(),
+            "AP0 (par_decode_candidate) must NOT decode this noisy \
+             candidate (test is only meaningful if this tier genuinely \
+             fails); got: {:?}",
+            ap0_result.map(|m| m.text)
+        );
+
+        // Tier 2: with `content_ap_enabled = false`, `par_try_ap_decode`
+        // reaches AP1 and (since `active_qso` is `Some(decoy)` here) also
+        // AP3/AP4, all using the DECOY's wrong partner callsign -- none
+        // of them should rescue.
+        let ctx_ap1 = build_ctx(&decoder, &spectrogram, &audio, &ap_context, false);
+        let ap1_result = par_try_ap_decode(
+            &ctx_ap1,
+            &candidate,
+            &decoder.ldpc_decoder,
+            &decoded_calls,
+            0,
+        );
+        assert!(
+            ap1_result.is_none(),
+            "AP1/AP3/AP4 (par_try_ap_decode, content_ap_enabled = false) \
+             must NOT rescue this candidate using the decoy's wrong \
+             partner callsign (test is only meaningful if this tier \
+             genuinely fails too); got: {:?}",
+            ap1_result.map(|m| m.text)
+        );
+
+        // Tier 3: Ap5 must rescue via `active_qsos[1]` (the real partner)
+        // specifically -- NOT via `active_qsos[0]` (the decoy), which
+        // carries the wrong callsign and must be tried-and-rejected first.
+        // A regression that pinned the per-attempt context to
+        // `active_qsos[0]` for every iteration would make this fail: the
+        // index-1 attempt would (incorrectly) verify against the decoy's
+        // callsign too, and reject the genuine W1AW decode.
+        let ctx_ap5 = build_ctx(&decoder, &spectrogram, &audio, &ap_context, true);
+        let ap5_result = par_try_ap_decode(
+            &ctx_ap5,
+            &candidate,
+            &decoder.ldpc_decoder,
+            &decoded_calls,
+            0,
+        );
+        let rescued = ap5_result.expect(
+            "Ap5 (par_try_ap_decode, content_ap_enabled = true) must \
+             rescue the candidate via active_qsos[1] (the real partner), \
+             even though active_qsos[0] (the decoy) is tried first and \
+             must fail",
+        );
+        assert_eq!(rescued.text, text);
+        assert_eq!(
+            rescued.ap_level, 6,
+            "the rescue must come from Ap5 (content-hypothesis injection \
+             via active_qsos[1]), not a coincidental AP0/AP1-equivalent hit"
         );
     }
 }

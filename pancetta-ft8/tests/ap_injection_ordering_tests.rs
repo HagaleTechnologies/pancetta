@@ -164,6 +164,7 @@ fn ap3_rescues_qso_context_signal_that_ap0_cannot_decode() {
         my_call: Some(my_call),
         recent_calls: vec![],
         active_qso: Some(qso),
+        active_qsos: vec![],
     };
     let mut ap_decoder = Ft8Decoder::new(Ft8Config::default()).expect("decoder");
     let ap_results = ap_decoder

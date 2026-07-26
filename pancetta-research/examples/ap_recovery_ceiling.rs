@@ -216,6 +216,7 @@ fn main() -> anyhow::Result<()> {
             my_call: None,
             recent_calls: recent,
             active_qso: None,
+            active_qsos: Vec::new(),
         };
         let mut decoder_on =
             Ft8Decoder::new(cfg.clone()).map_err(|e| anyhow::anyhow!("Ft8Decoder::new: {e}"))?;

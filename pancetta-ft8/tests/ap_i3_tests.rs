@@ -163,6 +163,7 @@ fn ap4_injected_i3_bits_match_encoder_rr73_ground_truth() {
         my_call: Some(my_call),
         recent_calls: vec![],
         active_qso: Some(qso),
+        active_qsos: vec![],
     };
 
     let mut llrs = vec![0.0f32; 77];
@@ -190,6 +191,7 @@ fn ap4_only_changes_i3_bits_relative_to_ap3() {
         my_call: Some(my_call),
         recent_calls: vec![],
         active_qso: Some(qso),
+        active_qsos: vec![],
     };
 
     let mut ap3_llrs = vec![0.0f32; 77];
@@ -306,6 +308,7 @@ fn ap1_ft4_injection_matches_post_xor_codeword_not_raw_callsign_bits() {
         my_call: Some(my_call),
         recent_calls: vec![],
         active_qso: None,
+        active_qsos: vec![],
     };
 
     let mut llrs = vec![0.0f32; 77];
@@ -342,6 +345,7 @@ fn ap3_ft4_injection_matches_post_xor_codeword_both_callsign_fields() {
         my_call: Some(my_call),
         recent_calls: vec![],
         active_qso: Some(qso),
+        active_qsos: vec![],
     };
 
     let mut llrs = vec![0.0f32; 77];
@@ -377,6 +381,7 @@ fn ap4_ft4_i3_bits_match_post_xor_codeword() {
         my_call: Some(my_call),
         recent_calls: vec![],
         active_qso: Some(qso),
+        active_qsos: vec![],
     };
 
     let mut llrs = vec![0.0f32; 77];
@@ -409,6 +414,7 @@ fn ap1_ap3_ft8_injection_unaffected_by_whitening_fix() {
         my_call: Some(my_call.clone()),
         recent_calls: vec![],
         active_qso: Some(qso.clone()),
+        active_qsos: vec![],
     };
 
     // AP1: raw callsign bits, unchanged.
@@ -645,6 +651,7 @@ fn cq_mask_requires_no_context() {
         my_call: Some(MyCallAp::new("K1ABC").unwrap()),
         recent_calls: vec![RecentCallAp::new("W1AW", -3.0).unwrap()],
         active_qso: Some(QsoAp::new("W1AW", QsoApProgress::WaitingForConfirmation).unwrap()),
+        active_qsos: vec![],
     };
     let mut llrs_full = vec![0.0f32; 77];
     inject_ap_llrs(&mut llrs_full, ApLevel::Cq, &full, None);
@@ -740,6 +747,7 @@ fn ap4_plus_full_mask_matches_full_encoder_payload_for_rr73() {
         my_call: Some(my_call),
         recent_calls: vec![],
         active_qso: Some(qso),
+        active_qsos: vec![],
     };
 
     let mut llrs = vec![0.0f32; 77];
