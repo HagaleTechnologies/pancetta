@@ -32,7 +32,7 @@ async-trait = "0.1"
 
 # Numeric types for frequency/power handling
 num-traits = "0.2"
-num-derive = "0.4"
+num-derive = "0.5"
 
 # String interning for efficient model/mode handling
 string_cache = "0.10"
