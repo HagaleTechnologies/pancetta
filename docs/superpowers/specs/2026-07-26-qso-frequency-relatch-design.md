@@ -40,18 +40,33 @@ by hand in the log.
 
 ## Design
 
-### 1. Relevance gate: identity-verified arms skip the distance check
+### 1. Relevance gate: identity-verified arms skip the distance check — for non-Hound QSOs only
 
-For every match arm in `is_message_relevant()` that already checks
-`Self::is_partner(from, target) && self.is_us(to)` inside the arm (i.e. every
-state-specific arm once a QSO is established — `RespondingToCq`+`SignalReport`,
-`RespondingToCq`+`ReportAck`, `WaitingForReport`+`ReportAck`, `SendingReport`+`ReportAck`,
-the `FinalConfirmation`/`SeventyThree` close arms, etc.), drop the
-distance-from-latched-frequency check entirely. Replace it with a passband sanity bound:
-reject only if the decoded frequency falls outside 200–2900 Hz (matching the existing
-convention used for `freq_min_hz`/`freq_max_hz` elsewhere in this crate —
-`frequency.rs`, `autonomous.rs`). This is a decode-garbage guard (protects against a rare
-low-SNR mis-decode), not an identity check.
+The exact set of match arms in `is_message_relevant()` that already check
+`Self::is_partner(from, target) && self.is_us(to)` inside the arm (every state-specific
+arm once a QSO is established) is precisely these seven:
+`WaitingForReport`+`ReportAck`, `WaitingForReport`+`FinalConfirmation`/`SeventyThree`,
+`RespondingToCq`+`SignalReport`, `RespondingToCq`+`CqResponse`,
+`SendingReport`+`ReportAck`, `SendingReport`+`FinalConfirmation`/`SeventyThree`,
+`WaitingForConfirmation`+`FinalConfirmation`/`SeventyThree`. (A few other arms in the same
+state family — e.g. `RespondingToCq`+`ReportAck` "skip-rung", `SendingReport`+`SignalReport`
+regression — have no explicit identity-checked arm today and fall through to the generic
+`_ => is_addressed_to(...)` fallback; they are **out of scope**, unchanged.)
+
+For these seven, when **`metadata.partner_freq.is_none()`** (i.e. not a Hound/Fox QSO),
+drop the distance-from-latched-frequency check entirely and replace it with a passband
+sanity bound: reject only if the decoded frequency falls outside 200–2900 Hz (matching
+the existing convention used for `freq_min_hz`/`freq_max_hz` elsewhere in this crate —
+`frequency.rs`, `autonomous.rs`). This is a decode-garbage guard, not an identity check.
+
+**Critical carve-out found while tracing the code: Hound/Fox mode reuses this exact
+`RespondingToCq`+`SignalReport` arm with a legitimately large, by-design frequency gap**
+(`is_message_relevant_hound_keys_on_partner_freq` — Hound calls low at 600 Hz, Fox replies
+at 1800 Hz, and a frame at 600 Hz, the Hound's OWN offset, must still be REJECTED as not
+relevant — it's almost certainly a self-decode collision in a dense pileup, not the Fox).
+So the skip-the-distance-check relaxation must be gated on `metadata.partner_freq.is_none()`
+— when `partner_freq` is `Some` (Hound/Fox), the **existing distance check against
+`partner_freq` stays completely unchanged**, for all seven arms.
 
 Leave the **tight gate completely unchanged** for the genuinely ambiguous
 pre-identity-establishment arms:
@@ -62,26 +77,34 @@ pre-identity-establishment arms:
 These are exactly the cases the 2026-04-29 security review (catalog C-1, 50→15 Hz
 tightening) targeted, and remain unchanged.
 
-Hound/Fox `partner_freq` mode is unaffected — it's a separate, already-correct path
-(`metadata.partner_freq` continues to override `qso_freq` as today) and doesn't
-interact with this change.
-
-### 2. Transition function: relatch to the incoming message's real frequency
+### 2. Transition function: relatch to the incoming message's real frequency — also gated non-Hound
 
 Thread the incoming message's decoded `frequency` (`QsoMessage.frequency`, already
 captured in `process_message_for_qso`) through to `determine_state_transition()` as a
-new parameter. For the arms that advance the QSO on a message just received from the
-identified partner — `SignalReport`, `ReportAck`, `FinalConfirmation`/`SeventyThree`
-receipt arms — use that incoming frequency when constructing the new state's
-`frequency` field, instead of carrying forward the prior latched value.
+new parameter (`incoming_frequency: f64`), plus one more: whether this QSO is a Hound QSO
+(`progress.metadata.hound: bool`, already captured under the same write lock the
+existing `qso_frequency`/`qso_tx_parity` locals are). For the exact same seven arms
+listed above, construct the new state's `frequency` field as `if is_hound { *frequency }
+else { incoming_frequency }` — i.e. relatch only for ordinary (non-Hound) QSOs; Hound
+QSOs keep today's carried-forward value from the transition function's point of view.
 
-This means the QSO's tracked frequency (and therefore where we transmit our next reply)
-relatches automatically to wherever the DX actually is — mirroring exactly what the
-manual `RespondToCaller` override already does by hand, just automatic. Subsequent
-decodes from the same partner then naturally pass the identity-verified gate against the
-corrected value too (though after change #1 above, that check no longer gates on
-distance anyway — the relatch's main value is correcting our own future TX offset to
-match the DX, which is the real behavioral parity with the manual path).
+This mirrors exactly what the manual `RespondToCaller` override already does by hand for
+ordinary QSOs, just automatic. Hound is untouched here because it doesn't need this fix:
+`process_message_for_qso` already has its own dedicated post-transition QSY block (search
+`hound_qsyed`) that unconditionally overwrites `progress.metadata.frequency` — and even
+reaches into the just-built `QsoState::SendingReport`'s `frequency` field directly — with
+a computed response-region offset the moment a Hound's `RespondingToCq`→`SendingReport`
+transition fires. Whatever `determine_state_transition` produces for a Hound QSO's
+`frequency` field is clobbered by that block regardless, so leaving it at the old
+carried-forward value for Hound is both safe (matches existing, already-tested behavior)
+and simpler than trying to reconcile two frequency-correction mechanisms.
+
+The **only** production call site is `process_message_for_qso`'s call to
+`determine_state_transition` (`pancetta-qso/src/qso_manager.rs:2115-2122`); six existing
+unit tests call it directly too and all need the two new arguments added (trivial,
+mechanical — none of the six exercise the seven relatch-eligible arms in a way whose
+assertions depend on the specific frequency value carried, so passing the same frequency
+already in their fixture state plus `is_hound: false` preserves their behavior exactly).
 
 ### 3. Observability
 
@@ -105,19 +128,29 @@ fix to the observability gap this investigation hit, not a general logging audit
 ## Testing
 
 - **Regression test reproducing tonight exactly**: `RespondingToCq` latched at 1500 Hz;
-  feed a `SignalReport` decoded at 937.5 Hz from the correct partner. Must transition to
-  `SendingReport` (not silently drop), and the new state's `frequency` must equal 937.5,
-  not 1500.
-- Equivalent tests for the other identity-verified arms touched (`ReportAck` in
-  `RespondingToCq`/`WaitingForReport`/`SendingReport`, `FinalConfirmation`/`SeventyThree`
-  receipt arms) — same shape: DX replies from a frequency far from the latch, transition
-  must still fire and relatch.
-- Existing `CallingCq`-ambiguity tests and the Hound `partner_freq` routing tests
-  (`is_message_relevant_hound_keys_on_partner_freq`,
-  `is_message_relevant_partner_freq_none_falls_back_to_state_freq`) must stay green,
-  unchanged — these are the two-boundary regression contracts of this fix.
+  feed a `SignalReport` decoded at 937.5 Hz from the correct partner (`partner_freq =
+  None`). Must transition to `SendingReport` (not silently drop), and the new state's
+  `frequency` must equal 937.5, not 1500.
+- At least one equivalent test for another of the seven relatch-eligible arms (e.g.
+  `SendingReport`+`ReportAck`) — DX replies from a frequency far from the latch,
+  transition must still fire and relatch.
+- **Hound regression, unchanged**: `is_message_relevant_hound_keys_on_partner_freq` must
+  stay green with no code changes to the test itself — it exercises the exact same
+  `RespondingToCq`+`SignalReport` arm this fix touches, so it's the real boundary
+  contract proving the Hound carve-out works. `hound_qsy_on_fox_report_full_exchange`
+  (the full end-to-end Hound test) must also stay green unchanged.
+- **`is_message_relevant_partner_freq_none_falls_back_to_state_freq` must be retargeted**,
+  not left as-is: it currently uses `RespondingToCq`+`SignalReport` to assert a
+  far-frequency frame is rejected — exactly the behavior this fix intentionally reverses
+  for that arm. Change its message to `MessageType::ReportAck` (same `RespondingToCq`
+  state, but that combo has no explicit identity-verified arm and still falls through to
+  the unchanged fallback), preserving the test's real intent (distance-gate still applies
+  where identity isn't independently re-verified) without asserting the behavior this fix
+  removes.
 - A passband-sanity regression test: a decode at an out-of-range frequency (e.g. -50 Hz
   or 3200 Hz) from the correct partner must still be rejected.
+- The six existing direct unit-test callers of `determine_state_transition` need the two
+  new arguments added (see Design #2) — confirm all six still pass unchanged.
 
 ## Non-goals
 
