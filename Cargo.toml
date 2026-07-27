@@ -111,7 +111,7 @@ regex = "1.12"
 url = "2.5"
 
 # Encoding support
-base64 = "0.22"
+base64 = "0.23"
 
 # TLS and WebSocket support
 native-tls = "0.2"
