@@ -1,5 +1,10 @@
 # QSO Frequency Relatch Implementation Plan
 
+> **SUPERSEDED 2026-07-27 — DO NOT EXECUTE.** Task 1's design breaks an adversarial
+> anti-spoofing test (`b10_partner_call_used_by_other_station_discarded`). See
+> `docs/superpowers/specs/2026-07-26-qso-frequency-relatch-design.md`'s superseded notice
+> and `docs/superpowers/plans/2026-07-27-qso-frequency-relatch-v2.md` for the corrected plan.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Stop the QSO engine from silently dropping a legitimate reply from an

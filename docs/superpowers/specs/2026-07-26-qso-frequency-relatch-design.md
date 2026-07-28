@@ -1,6 +1,19 @@
 # QSO Frequency Relatch — Design
 
-**Status:** Approved for planning
+> **SUPERSEDED 2026-07-27.** The "Design" section below (relaxing `is_message_relevant`'s
+> distance check for identity-verified arms) breaks
+> `pancetta-qso/tests/adversarial_3party.rs::b10_partner_call_used_by_other_station_discarded`
+> — an adversarial anti-spoofing test. FT8 decoded text carries no cryptographic identity,
+> so frequency proximity is the only signal distinguishing a real DX with a stable-but-
+> different offset from a spoofed frame; a single off-frequency identity-matching message
+> cannot safely be trusted on first sight. The **Problem** and **Root cause** sections below
+> are still accurate and worth reading. The actual fix is now
+> `docs/superpowers/specs/2026-07-27-qso-frequency-relatch-v2-design.md` (a two-strike
+> confirm-before-relatch mechanism that never touches the matching/transition code this
+> document proposed changing). See `project_qso_frequency_relatch_incident` in memory for
+> the full incident writeup.
+
+**Status:** Superseded — see `2026-07-27-qso-frequency-relatch-v2-design.md`
 **Date:** 2026-07-26
 
 ## Problem
