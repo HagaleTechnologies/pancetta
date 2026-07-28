@@ -2,6 +2,12 @@
 
 **Status:** Approved for planning
 **Date:** 2026-07-27
+**Updated:** 2026-07-28 — final whole-branch review found the two-strike mechanism as
+originally specced below could be satisfied by a SINGLE physical transmission (the
+hb-091 scoped fast-path decodes one audio window twice and forwards both copies to the
+QSO component before the standard pipeline's dedup point). See "Duplicate-delivery
+hardening" below for the fix actually shipped; the original design below is otherwise
+unchanged and still accurate.
 **Supersedes:** `2026-07-26-qso-frequency-relatch-design.md` (broke an adversarial
 anti-spoofing test — see that file's superseded notice)
 
@@ -36,14 +42,18 @@ distinguished from a spoof — it can only be trusted once it repeats.
 Add one field to `QsoMetadata` (`pancetta-qso/src/states.rs`):
 
 ```rust
-/// The last off-latch frequency seen from this QSO's partner that didn't yet match
-/// the relevance gate's tolerance. `None` normally. Set when an identity-matching
-/// message arrives outside tolerance but inside the FT8 passband; cleared either when
-/// a SECOND message confirms the same frequency (triggering a relatch) or when a
-/// message arrives back within the existing tolerance (the drift resolved itself or
-/// was a one-off). See `QsoManager::maybe_confirm_frequency_drift`.
+/// The last off-latch frequency seen from this QSO's partner, together with the
+/// timestamp it was FIRST noted, that didn't yet match the relevance gate's
+/// tolerance. `None` normally. Set when an identity-matching message arrives outside
+/// tolerance but inside the FT8 passband; cleared either when a SECOND message, at
+/// least `DRIFT_CONFIRM_MIN_GAP` (5s) after the ORIGINAL timestamp, confirms the same
+/// frequency (triggering a relatch) or when a message arrives back within the
+/// existing tolerance. See `QsoManager::maybe_confirm_frequency_drift_at`. The
+/// timestamp requirement exists because a decode-pipeline duplicate of the SAME
+/// transmission (not a second, separate one) must never be able to satisfy
+/// confirmation on its own — see "Duplicate-delivery hardening" below.
 #[serde(default)]
-pub pending_freq_drift: Option<f64>,
+pub pending_freq_drift: Option<(f64, DateTime<Utc>)>,
 ```
 
 Add a new method, `QsoManager::maybe_confirm_frequency_drift`, called from
@@ -66,11 +76,22 @@ Add a new method, `QsoManager::maybe_confirm_frequency_drift`, called from
    - `distance <= ESTABLISHED_FREQ_TOLERANCE_HZ` (100 Hz, the existing constant): already
      within tolerance — clear `pending_freq_drift` to `None` (stale candidate no longer
      relevant) and do nothing else; the existing pipeline will route this normally.
-   - `distance > ESTABLISHED_FREQ_TOLERANCE_HZ` and `frequency` inside the FT8 audio
-     passband (200.0..=2900.0 Hz, matching the convention in `frequency.rs`/`autonomous.rs`):
-     - If `metadata.pending_freq_drift` is `Some(f)` and `(f - frequency).abs() <= 15.0`
-       (reusing the existing `FREQ_TOLERANCE_HZ` constant) — **confirmed**: this is the
-       second consecutive sighting of the same new frequency. Relatch:
+   - `distance > ESTABLISHED_FREQ_TOLERANCE_HZ` and `frequency` inside a dedicated
+     **RX-plausibility** bound (`DRIFT_CANDIDATE_MIN_HZ..=DRIFT_CANDIDATE_MAX_HZ`,
+     200.0..=2900.0 Hz — matching the convention in `frequency.rs`/`autonomous.rs`):
+     this is deliberately a *decode-garbage sanity filter on where we might plausibly
+     hear a real signal*, and is deliberately WIDER than this file's `TX_OFFSET_MIN_HZ`/
+     `TX_OFFSET_MAX_HZ` (300–2700 Hz, our own preferred range for autonomously *picking*
+     a fresh TX offset out of thin air). Do not conflate the two: responding to a CQ
+     already ties our reply's TX offset to wherever we decoded that CQ today, unclamped,
+     for any DX up to 2900-ish Hz (this app has real operational history of DX above
+     2500 Hz — see the frequency-clamp bug fixed in PR #202) — the relatch mechanism
+     must preserve that same behavior, not narrow it to `TX_OFFSET_*`.
+     - If `metadata.pending_freq_drift` is `Some((f, t))`, `(f - frequency).abs() <= 15.0`
+       (reusing the existing `FREQ_TOLERANCE_HZ` constant), **and** the confirming
+       sighting's timestamp is at least `DRIFT_CONFIRM_MIN_GAP` (5 real seconds) after
+       `t` — **confirmed**: this is a second, genuinely separate transmission at the
+       same new frequency. Relatch:
        - `metadata.frequency = frequency`
        - Reach into `progress.state` and overwrite whichever variant's own embedded
          `frequency` field is present — mirrors exactly the existing Hound-QSY block's
@@ -92,12 +113,55 @@ Add a new method, `QsoManager::maybe_confirm_frequency_drift`, called from
        - `info!(target: "qso.freq_gate", ...)` — this is an operationally significant,
          visible event (a QSO's tracked frequency just moved), unlike v1's buried
          `debug!`.
+       - Emit `QsoEvent::StateChanged` (capture the pre-mutation state as `old_state`,
+         call `self.emit_state_change(qso_id, old_state, new_state)` after mutating).
+         This is load-bearing, not cosmetic: the coordinator's `StateChanged` handler
+         refreshes `active_tx_offsets` and the hb-091 scoped fast-path's own decoder
+         frequency hint (`qso_freq_state`) from the QSO's current frequency — without
+         this emission, a relatched QSO would leave the scoped decoder pointed at the
+         stale pre-relatch offset.
      - Else (no pending candidate, or a different frequency than the pending one):
-       set `pending_freq_drift = Some(frequency)` (start or reset the candidate). No
-       state mutation. `debug!(target: "qso.freq_gate", ...)`.
-   - `distance > ESTABLISHED_FREQ_TOLERANCE_HZ` and outside the passband: leave
-     `pending_freq_drift` untouched (a passband-violating decode is likely garbage, not a
-     real drift candidate — don't let noise reset a legitimate pending candidate).
+       set `pending_freq_drift = Some((frequency, now))` (start or reset the candidate).
+       **If the pending candidate already has this SAME frequency** (within 15 Hz) but
+       the gap requirement wasn't met yet — leave it untouched, do NOT overwrite the
+       timestamp (see "Duplicate-delivery hardening" below for why). No state mutation.
+       `debug!(target: "qso.freq_gate", ...)`.
+   - `distance > ESTABLISHED_FREQ_TOLERANCE_HZ` and outside the RX-plausibility bound:
+     leave `pending_freq_drift` untouched (a passband-violating decode is likely
+     garbage, not a real drift candidate — don't let noise reset a legitimate pending
+     candidate).
+
+### Duplicate-delivery hardening (added 2026-07-28, post-review)
+
+`pancetta/src/coordinator/ft8.rs`'s hb-091 scoped fast-path decodes the same audio
+window twice — once via a scoped, narrow-frequency-range decode dispatched immediately
+to the QSO component, and again via the standard full pipeline shortly after — as a
+deliberate latency optimization. The code's own comment states dedup was assumed to
+happen "at `is_message_relevant`" (rejecting a duplicate because the QSO's state has
+already advanced past it). This pre-pass runs **before** that dedup point and has no
+such protection: two decode-pipeline copies of ONE physical transmission, landing
+milliseconds apart, would otherwise satisfy "two strikes" on their own — reopening
+exactly the spoofing hole this whole design exists to close, reached via decode
+duplication instead of the frequency gate directly.
+
+Fix: `pending_freq_drift` carries a timestamp (see the field above), and confirmation
+requires the second sighting to land **at least 5 real seconds** after the pending
+candidate's ORIGINAL timestamp — comfortably below FT4's 7.5s slot period (the
+shortest slot this app supports), so two genuinely separate transmissions always clear
+it while two same-window decode copies (milliseconds apart) never do. A same-frequency
+sighting arriving again within the gap does NOT reset the timestamp (only a
+DIFFERENT-frequency sighting does) — otherwise repeated fast redeliveries could push
+confirmation out indefinitely; a real DX's next genuine transmission will still land
+≥5s after the original sighting and confirm normally, one slot later than it otherwise
+would have.
+
+Implementation mirrors this file's existing `check_timeouts`/`check_timeouts_at` split
+for testability: `maybe_confirm_frequency_drift(&self, message_type, frequency)` is a
+thin wrapper over `maybe_confirm_frequency_drift_at(&self, message_type, frequency,
+now: DateTime<Utc>)`, which contains the real logic and is what tests call directly
+with constructed timestamps (no wall-clock sleeps needed for the core logic; the two
+existing end-to-end tests that need a real elapsed gap use `tokio::time::sleep`
+deliberately, since the production code reads real `Utc::now()`, not a mockable clock).
 
 After this pre-pass, `find_qsos_for_message`/`is_message_relevant`/
 `determine_state_transition` run **completely unmodified**. When a relatch happened, the
@@ -124,8 +188,9 @@ passes with **zero changes to the test itself**, which is the real proof this de
 
 Traced against the actual 2026-07-26 log: first `SignalReport` from LU7LRP at 937.5 Hz
 (19:22:13, latch was 1500) → `pending_freq_drift = Some(937.5)`, still dropped (identical to
-today's behavior). Second `SignalReport` at 937.5 Hz (19:22:43, ~30s later) → matches the
-pending candidate within 15 Hz → confirmed, relatch to 937.5, message routes normally,
+today's behavior). Second `SignalReport` at 937.5 Hz (19:22:43, ~30s later — comfortably past the 5s
+minimum gap) → matches the pending candidate within 15 Hz → confirmed, relatch to
+937.5, message routes normally,
 QSO advances to `SendingReport`. This design would have recovered automatically about one
 cycle after the real incident's actual manual-override point — a small, acceptable delay in
 exchange for closing the spoofing hole completely.
@@ -152,6 +217,10 @@ exchange for closing the spoofing hole completely.
 - **Hound QSOs untouched**: `is_message_relevant_hound_keys_on_partner_freq` and
   `hound_qsy_on_fox_report_full_exchange` — zero changes, both must stay green (proves the
   `partner_freq.is_some()` guard works and the new mechanism never runs for Hound).
+- **Duplicate-delivery does not confirm**: two sightings at the same off-latch frequency,
+  milliseconds apart (via `maybe_confirm_frequency_drift_at` with explicit timestamps) —
+  must NOT relatch, and the pending candidate's timestamp must remain the ORIGINAL one, not
+  the duplicate's. A third sighting ≥5s after the original must then confirm normally.
 - Existing full `pancetta-qso` suite (403 tests as of the last known-good baseline) must stay
   green with zero other changes — this design touches no existing test besides adding new
   ones, which is itself a strong signal the scope is correctly isolated.
