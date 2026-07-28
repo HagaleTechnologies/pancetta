@@ -450,17 +450,24 @@ pub struct QsoMetadata {
     pub partner_freq: Option<f64>,
 
     /// The last off-latch frequency seen from this QSO's partner that didn't yet match
-    /// the relevance gate's tolerance. `None` normally. Set when an identity-matching
-    /// message arrives outside tolerance but inside the FT8 passband; cleared either
-    /// when a SECOND message confirms the same frequency (triggering a relatch) or
-    /// when a message arrives back within the existing tolerance. See
-    /// `QsoManager::maybe_confirm_frequency_drift`. A single off-frequency
-    /// identity-matching message can't be safely trusted on its own — FT8 decoded text
-    /// has no cryptographic identity, so frequency proximity to the partner's last
-    /// confirmed location is the only defense against a spoofed callsign claim (see
-    /// `adversarial_3party.rs::b10_partner_call_used_by_other_station_discarded`).
+    /// the relevance gate's tolerance, together with the timestamp it was FIRST noted.
+    /// `None` normally. Set when an identity-matching message arrives outside tolerance
+    /// but inside the FT8 passband; cleared either when a SECOND message, at least 5
+    /// real seconds after the ORIGINAL timestamp, confirms the same frequency
+    /// (triggering a relatch) or when a message arrives back within the existing
+    /// tolerance. See `QsoManager::maybe_confirm_frequency_drift_at`. A single
+    /// off-frequency identity-matching message can't be safely trusted on its own —
+    /// FT8 decoded text has no cryptographic identity, so frequency proximity to the
+    /// partner's last confirmed location is the only defense against a spoofed
+    /// callsign claim (see
+    /// `adversarial_3party.rs::b10_partner_call_used_by_other_station_discarded`). The
+    /// timestamp is deliberately NOT reset on a near-duplicate same-frequency sighting
+    /// within the 5s gap — see `QsoManager::maybe_confirm_frequency_drift_at` — so
+    /// repeated fast redeliveries of the same physical transmission (e.g. the hb-091
+    /// scoped fast-path decoding one audio window twice) can never independently
+    /// satisfy the "two strikes" requirement.
     #[serde(default)]
-    pub pending_freq_drift: Option<f64>,
+    pub pending_freq_drift: Option<(f64, DateTime<Utc>)>,
 
     /// Hound: whether we have already QSY'd up to the response region after the
     /// Fox answered us (so the QSY fires exactly once).

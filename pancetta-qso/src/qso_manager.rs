@@ -1741,28 +1741,61 @@ impl QsoManager {
         Ok(qso_id)
     }
 
-    /// Two-strike confirm-before-relatch: track a pending off-latch frequency
-    /// candidate per QSO, and only relatch (mutate both `metadata.frequency` and the
-    /// active state's own embedded `frequency` field) once a SECOND message from the
-    /// same identified partner repeats at the same new frequency. Runs BEFORE the
-    /// existing `find_qsos_for_message`/`is_message_relevant` routing, which stays
-    /// completely unmodified — see
+    /// Two-strike confirm-before-relatch at the current time. See
+    /// [`Self::maybe_confirm_frequency_drift_at`].
+    async fn maybe_confirm_frequency_drift(&self, message_type: &MessageType, frequency: f64) {
+        self.maybe_confirm_frequency_drift_at(message_type, frequency, Utc::now())
+            .await;
+    }
+
+    /// Two-strike confirm-before-relatch at an explicit time (for testability,
+    /// mirroring [`Self::check_timeouts_at`]'s pattern): track a pending off-latch
+    /// frequency candidate per QSO, and only relatch (mutate both `metadata.frequency`
+    /// and the active state's own embedded `frequency` field) once a SECOND message
+    /// from the same identified partner repeats at the same new frequency AT LEAST 5
+    /// real seconds after the candidate was FIRST noted. Runs BEFORE the existing
+    /// `find_qsos_for_message`/`is_message_relevant` routing, which stays completely
+    /// unmodified — see
     /// `docs/superpowers/specs/2026-07-27-qso-frequency-relatch-v2-design.md`.
     ///
     /// A single off-frequency identity-matching message can't be safely distinguished
     /// from a spoofed frame claiming the partner's callsign (FT8 decoded text carries
     /// no cryptographic identity) — see
     /// `adversarial_3party.rs::b10_partner_call_used_by_other_station_discarded`. Only
-    /// a REPEATED match at the same new frequency is trusted.
-    async fn maybe_confirm_frequency_drift(&self, message_type: &MessageType, frequency: f64) {
+    /// a REPEATED match at the same new frequency is trusted — and "repeated" must mean
+    /// a genuinely separate transmission, not a second decode-pipeline copy of the same
+    /// one. The hb-091 scoped fast-path decodes the same audio window twice and forwards
+    /// both copies here (this pre-pass runs before the dedup that
+    /// `is_message_relevant` used to provide), landing within milliseconds of each
+    /// other, so a bare "matches an existing candidate" check is satisfiable by ONE
+    /// physical transmission. The 5s floor is comfortably below FT4's 7.5s slot period
+    /// (the shortest slot this app supports), so two genuinely separate transmissions
+    /// always clear it while two decode-pipeline copies of one transmission never do.
+    ///
+    /// A same-frequency sighting that arrives again WITHIN the 5s gap does NOT reset
+    /// the pending candidate's timestamp — it is presumed a duplicate delivery of the
+    /// same transmission, and the ORIGINAL timestamp is preserved untouched. If the
+    /// timestamp were reset on every near-duplicate, repeated fast deliveries (spoofed
+    /// or an artifact of the decode pipeline) could push confirmation out indefinitely;
+    /// a real DX repeating naturally will eventually land >=5s after the ORIGINAL
+    /// sighting and correctly confirm.
+    async fn maybe_confirm_frequency_drift_at(
+        &self,
+        message_type: &MessageType,
+        frequency: f64,
+        now: DateTime<Utc>,
+    ) {
         // Must match is_message_relevant's ESTABLISHED_FREQ_TOLERANCE_HZ (100.0) and
         // the concept of FREQ_TOLERANCE_HZ (15.0) for "counts as the same spot" —
         // redeclared here as local constants rather than shared, since this fix
         // deliberately does not touch is_message_relevant at all.
         const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
         const DRIFT_CONFIRM_TOLERANCE_HZ: f64 = 15.0;
-        const AUDIO_PASSBAND_MIN_HZ: f64 = 200.0;
-        const AUDIO_PASSBAND_MAX_HZ: f64 = 2900.0;
+        // Confirming sighting must land >=5 real seconds after the ORIGINAL candidate
+        // timestamp — comfortably below FT4's 7.5s slot period, so two genuinely
+        // separate transmissions always clear it while two decode-pipeline copies of
+        // the SAME transmission (milliseconds apart) never do.
+        const DRIFT_CONFIRM_MIN_GAP: chrono::Duration = chrono::Duration::seconds(5);
 
         let Some(sender) = message_type.sender_callsign() else {
             return;
@@ -1772,7 +1805,7 @@ impl QsoManager {
         }
 
         let mut qsos = self.qsos.write().await;
-        for progress in qsos.values_mut() {
+        for (&qso_id, progress) in qsos.iter_mut() {
             if !progress.state.is_active() {
                 continue;
             }
@@ -1796,16 +1829,17 @@ impl QsoManager {
                 continue;
             }
 
-            if !(AUDIO_PASSBAND_MIN_HZ..=AUDIO_PASSBAND_MAX_HZ).contains(&frequency) {
+            if !(TX_OFFSET_MIN_HZ..=TX_OFFSET_MAX_HZ).contains(&frequency) {
                 continue; // Out-of-band decode — don't let noise reset a real candidate.
             }
 
-            let confirmed = progress
-                .metadata
-                .pending_freq_drift
-                .is_some_and(|f| (f - frequency).abs() <= DRIFT_CONFIRM_TOLERANCE_HZ);
+            let confirmed = progress.metadata.pending_freq_drift.is_some_and(|(f, t)| {
+                (f - frequency).abs() <= DRIFT_CONFIRM_TOLERANCE_HZ
+                    && now - t >= DRIFT_CONFIRM_MIN_GAP
+            });
 
             if confirmed {
+                let old_state = progress.state.clone();
                 progress.metadata.frequency = frequency;
                 progress.metadata.pending_freq_drift = None;
                 match &mut progress.state {
@@ -1831,24 +1865,43 @@ impl QsoManager {
                     } => {
                         *state_freq = frequency;
                     }
-                    _ => {}
+                    _ => {
+                        debug_assert!(
+                            false,
+                            "confirmed drift relatch has no frequency-field mutation arm for \
+                             this QsoState variant — metadata.frequency and the state's own \
+                             frequency field are now desynced"
+                        );
+                    }
                 }
                 info!(
                     target: "qso.freq_gate",
                     partner = %their_callsign,
                     old_freq = qso_freq,
                     new_freq = frequency,
-                    "confirmed frequency drift (2 consistent sightings) — relatching QSO"
+                    "confirmed frequency drift (2 consistent sightings, >=5s apart) — \
+                     relatching QSO"
                 );
+                self.emit_state_change(qso_id, old_state, progress.state.clone())
+                    .await;
             } else {
-                progress.metadata.pending_freq_drift = Some(frequency);
+                // Only start (or leave untouched) a pending candidate — see the
+                // "duplicate delivery" doc comment above for why an existing
+                // candidate's timestamp is never bumped forward here.
+                if progress
+                    .metadata
+                    .pending_freq_drift
+                    .is_none_or(|(f, _)| (f - frequency).abs() > DRIFT_CONFIRM_TOLERANCE_HZ)
+                {
+                    progress.metadata.pending_freq_drift = Some((frequency, now));
+                }
                 debug!(
                     target: "qso.freq_gate",
                     partner = %their_callsign,
                     candidate_freq = frequency,
                     latched_freq = qso_freq,
                     "identity-verified message outside tolerance — noting drift candidate \
-                     (needs 1 more confirming sighting)"
+                     (needs 1 more confirming sighting >=5s later)"
                 );
             }
         }
@@ -2484,6 +2537,7 @@ impl QsoManager {
                 let old_off = progress.metadata.frequency;
                 let new_off = stuck_hopped_offset(old_off);
                 progress.metadata.frequency = new_off;
+                progress.metadata.pending_freq_drift = None;
                 progress.metadata.dx_repeat_count = 0;
                 // Keep the reply we are about to emit this cycle on the new
                 // offset (the captured `qso_frequency` was the pre-hop value).
@@ -2526,6 +2580,7 @@ impl QsoManager {
                 let qsy = hound_offset_for(fox_call, resp_min, resp_max);
                 let old_off = progress.metadata.frequency;
                 progress.metadata.frequency = qsy;
+                progress.metadata.pending_freq_drift = None;
                 progress.metadata.hound_qsyed = true;
                 // Keep the ReportAck emitted this cycle on the QSY'd offset.
                 qso_frequency = qsy;
@@ -7205,9 +7260,8 @@ mod sender_verification_tests {
             "a single off-frequency sighting must not advance the QSO; got {:?}",
             progress.state
         );
-        assert_eq!(
-            progress.metadata.pending_freq_drift,
-            Some(937.5),
+        assert!(
+            matches!(progress.metadata.pending_freq_drift, Some((f, _)) if f == 937.5),
             "the first sighting must be noted as a pending drift candidate"
         );
     }
@@ -7237,6 +7291,10 @@ mod sender_verification_tests {
             )
             .await
             .unwrap();
+        // Confirmation now requires a real >=5s gap from the ORIGINAL candidate
+        // timestamp (final-review Critical fix), so the confirming sighting must
+        // land after a genuine delay, not back-to-back with the first.
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         manager
             .process_message(
                 MessageType::SignalReport {
@@ -7308,9 +7366,8 @@ mod sender_verification_tests {
             "a differing second sighting must not confirm/advance; got {:?}",
             progress.state
         );
-        assert_eq!(
-            progress.metadata.pending_freq_drift,
-            Some(1100.0),
+        assert!(
+            matches!(progress.metadata.pending_freq_drift, Some((f, _)) if f == 1100.0),
             "the candidate must reset to the newest off-latch sighting"
         );
     }
@@ -7339,15 +7396,15 @@ mod sender_verification_tests {
             )
             .await
             .unwrap();
-        assert_eq!(
+        assert!(matches!(
             manager
                 .get_qso(qso_id)
                 .await
                 .unwrap()
                 .metadata
                 .pending_freq_drift,
-            Some(937.5)
-        );
+            Some((f, _)) if f == 937.5
+        ));
 
         manager
             .process_message(
@@ -7413,17 +7470,23 @@ mod sender_verification_tests {
             )
             .await
             .unwrap();
-        assert_eq!(
-            manager
-                .get_qso(qso_id)
-                .await
-                .unwrap()
-                .metadata
-                .pending_freq_drift,
-            Some(937.5),
+        assert!(
+            matches!(
+                manager
+                    .get_qso(qso_id)
+                    .await
+                    .unwrap()
+                    .metadata
+                    .pending_freq_drift,
+                Some((f, _)) if f == 937.5
+            ),
             "an out-of-passband decode must not overwrite a legitimate pending candidate"
         );
 
+        // Confirmation now requires a real >=5s gap from the ORIGINAL candidate
+        // timestamp (final-review Critical fix), so the confirming sighting must
+        // land after a genuine delay, not back-to-back with the earlier sightings.
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
         manager
             .process_message(
                 MessageType::SignalReport {
@@ -7444,6 +7507,63 @@ mod sender_verification_tests {
             ),
             "the real confirming sighting must still relatch and advance after the noise"
         );
+    }
+
+    /// Final-review Critical finding: the hb-091 scoped fast-path can forward two decode
+    /// copies of the SAME physical transmission to the QSO component milliseconds apart
+    /// (dedup previously relied on is_message_relevant, which this pre-pass runs before).
+    /// Two same-instant deliveries of one transmission must NOT confirm a relatch -- only a
+    /// sighting that's genuinely >=5s after the ORIGINAL candidate may confirm.
+    #[tokio::test]
+    async fn duplicate_delivery_of_same_transmission_does_not_confirm() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "LU7LRP".into(),
+            report: -11,
+        };
+        let t0 = Utc::now();
+        // Two decode-pipeline copies of the SAME transmission, milliseconds apart --
+        // mirrors the hb-091 scoped fast-path + standard pipeline both forwarding the
+        // same window's content to the QSO component.
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 937.5, t0)
+            .await;
+        manager
+            .maybe_confirm_frequency_drift_at(
+                &report,
+                937.5,
+                t0 + chrono::Duration::milliseconds(50),
+            )
+            .await;
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "two same-instant deliveries of ONE transmission must not confirm/relatch"
+        );
+        assert!(
+            matches!(progress.metadata.pending_freq_drift, Some((f, t)) if f == 937.5 && t == t0),
+            "the pending candidate must keep its ORIGINAL timestamp, not be pushed forward \
+             by the duplicate delivery -- otherwise repeated fast deliveries could delay \
+             confirmation indefinitely"
+        );
+
+        // A genuinely later sighting (>=5s after the ORIGINAL t0, not the duplicate) confirms.
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 937.5, t0 + chrono::Duration::seconds(6))
+            .await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.frequency, 937.5,
+            "a sighting >=5s after the original candidate must confirm and relatch"
+        );
+        assert_eq!(progress.metadata.pending_freq_drift, None);
     }
 
     #[tokio::test]
