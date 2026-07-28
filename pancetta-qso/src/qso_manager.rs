@@ -859,6 +859,7 @@ impl QsoManager {
             dx_repeat_count: 0,
             hound: false,
             partner_freq: None,
+            pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin,
             // CQ-path latch: resolved from our own preference, not an
@@ -991,6 +992,7 @@ impl QsoManager {
             dx_repeat_count: 0,
             hound: false,
             partner_freq: None,
+            pending_freq_drift: None,
             hound_qsyed: false,
             // `false` for operator-pressed `c` (local); `true` for a remote
             // operator's `startCq` routed via the station agent.
@@ -1312,6 +1314,7 @@ impl QsoManager {
             // gate routes the DX's reply (which arrives at their own audio offset)
             // to this QSO. `None` = Tx=Rx (legacy behavior, unchanged).
             partner_freq,
+            pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin,
             tx_parity_provisional,
@@ -1650,6 +1653,7 @@ impl QsoManager {
             // gate routes the DX's reply (which arrives at their audio offset) to
             // this QSO. `None` = Tx=Rx (legacy behavior, unchanged).
             partner_freq,
+            pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin,
             tx_parity_provisional,
@@ -1737,6 +1741,104 @@ impl QsoManager {
         Ok(qso_id)
     }
 
+    /// Two-strike confirm-before-relatch: track a pending off-latch frequency
+    /// candidate per QSO, and only relatch (mutate both `metadata.frequency` and the
+    /// active state's own embedded `frequency` field) once a SECOND message from the
+    /// same identified partner repeats at the same new frequency. Runs BEFORE the
+    /// existing `find_qsos_for_message`/`is_message_relevant` routing, which stays
+    /// completely unmodified — see
+    /// `docs/superpowers/specs/2026-07-27-qso-frequency-relatch-v2-design.md`.
+    ///
+    /// A single off-frequency identity-matching message can't be safely distinguished
+    /// from a spoofed frame claiming the partner's callsign (FT8 decoded text carries
+    /// no cryptographic identity) — see
+    /// `adversarial_3party.rs::b10_partner_call_used_by_other_station_discarded`. Only
+    /// a REPEATED match at the same new frequency is trusted.
+    async fn maybe_confirm_frequency_drift(&self, message_type: &MessageType, frequency: f64) {
+        // Must match is_message_relevant's ESTABLISHED_FREQ_TOLERANCE_HZ (100.0) and
+        // the concept of FREQ_TOLERANCE_HZ (15.0) for "counts as the same spot" —
+        // redeclared here as local constants rather than shared, since this fix
+        // deliberately does not touch is_message_relevant at all.
+        const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
+        const DRIFT_CONFIRM_TOLERANCE_HZ: f64 = 15.0;
+        const AUDIO_PASSBAND_MIN_HZ: f64 = 200.0;
+        const AUDIO_PASSBAND_MAX_HZ: f64 = 2900.0;
+
+        let Some(sender) = message_type.sender_callsign() else {
+            return;
+        };
+        if !message_type.is_addressed_to(&self.config.our_callsign) {
+            return;
+        }
+
+        let mut qsos = self.qsos.write().await;
+        for progress in qsos.values_mut() {
+            if !progress.state.is_active() {
+                continue;
+            }
+            if progress.metadata.partner_freq.is_some() {
+                continue; // Hound/Fox — has its own QSY mechanism, untouched.
+            }
+            let Some(their_callsign) = progress.state.their_callsign().map(|s| s.to_string())
+            else {
+                continue; // Pre-establishment (CallingCq/Idle) — not this mechanism's scope.
+            };
+            if !Self::is_partner(sender, &their_callsign) {
+                continue;
+            }
+            let Some(qso_freq) = progress.state.frequency() else {
+                continue;
+            };
+            let distance = (qso_freq - frequency).abs();
+
+            if distance <= ESTABLISHED_FREQ_TOLERANCE_HZ {
+                progress.metadata.pending_freq_drift = None;
+                continue;
+            }
+
+            if !(AUDIO_PASSBAND_MIN_HZ..=AUDIO_PASSBAND_MAX_HZ).contains(&frequency) {
+                continue; // Out-of-band decode — don't let noise reset a real candidate.
+            }
+
+            let confirmed = progress
+                .metadata
+                .pending_freq_drift
+                .is_some_and(|f| (f - frequency).abs() <= DRIFT_CONFIRM_TOLERANCE_HZ);
+
+            if confirmed {
+                progress.metadata.frequency = frequency;
+                progress.metadata.pending_freq_drift = None;
+                match &mut progress.state {
+                    QsoState::RespondingToCq { frequency: state_freq, .. }
+                    | QsoState::WaitingForReport { frequency: state_freq, .. }
+                    | QsoState::SendingReport { frequency: state_freq, .. }
+                    | QsoState::WaitingForConfirmation { frequency: state_freq, .. }
+                    | QsoState::SendingConfirmation { frequency: state_freq, .. } => {
+                        *state_freq = frequency;
+                    }
+                    _ => {}
+                }
+                info!(
+                    target: "qso.freq_gate",
+                    partner = %their_callsign,
+                    old_freq = qso_freq,
+                    new_freq = frequency,
+                    "confirmed frequency drift (2 consistent sightings) — relatching QSO"
+                );
+            } else {
+                progress.metadata.pending_freq_drift = Some(frequency);
+                debug!(
+                    target: "qso.freq_gate",
+                    partner = %their_callsign,
+                    candidate_freq = frequency,
+                    latched_freq = qso_freq,
+                    "identity-verified message outside tolerance — noting drift candidate \
+                     (needs 1 more confirming sighting)"
+                );
+            }
+        }
+    }
+
     /// Process an incoming message.
     ///
     /// Does not carry a decoded slot parity — the first-decode provisional-
@@ -1775,6 +1877,8 @@ impl QsoManager {
         observed_slot_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<(), QsoManagerError> {
         let timestamp = Utc::now();
+
+        self.maybe_confirm_frequency_drift(&message_type, frequency).await;
 
         // Find relevant QSO(s)
         let qso_ids = self.find_qsos_for_message(&message_type, frequency).await;
@@ -6279,6 +6383,7 @@ mod tests {
                 dx_repeat_count: 0,
                 hound: false,
                 partner_freq: None,
+                pending_freq_drift: None,
                 hound_qsyed: false,
                 remote_origin: false,
                 tx_parity_provisional: false,
@@ -6824,6 +6929,7 @@ mod sender_verification_tests {
             dx_repeat_count: 0,
             hound: false,
             partner_freq: None,
+            pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
             tx_parity_provisional: false,
@@ -7046,6 +7152,271 @@ mod sender_verification_tests {
         assert!(
             !manager.is_message_relevant(&state, &md, &legit, 2000.0),
             "regression: frame far from state.frequency must NOT be relevant when partner_freq=None"
+        );
+    }
+
+    /// 2026-07-26 incident regression (v2, two-strike confirm): a single off-latch
+    /// SignalReport must NOT advance the QSO — it only notes a pending drift
+    /// candidate. This must be byte-identical to today's existing (unmodified) drop
+    /// behavior; `is_message_relevant`/`determine_state_transition` are untouched by
+    /// this fix, so this test is really proving the new pre-pass doesn't change
+    /// first-sighting behavior at all.
+    #[tokio::test]
+    async fn single_off_frequency_sighting_does_not_advance_or_relatch() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "LU7LRP".into(),
+                    report: -11,
+                },
+                "K5ARH LU7LRP -11".into(),
+                937.5,
+                Some(-19.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "a single off-frequency sighting must not advance the QSO; got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.pending_freq_drift,
+            Some(937.5),
+            "the first sighting must be noted as a pending drift candidate"
+        );
+    }
+
+    /// The confirming second sighting at the SAME new frequency relatches and lets the
+    /// QSO advance normally through the completely-unmodified existing pipeline —
+    /// exactly the real 2026-07-26 LU7LRP timeline (two SignalReport decodes at
+    /// 937.5 Hz, ~30s apart).
+    #[tokio::test]
+    async fn second_matching_sighting_confirms_and_relatches() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "LU7LRP".into(),
+                    report: -11,
+                },
+                "K5ARH LU7LRP -11".into(),
+                937.5,
+                Some(-19.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "LU7LRP".into(),
+                    report: -11,
+                },
+                "K5ARH LU7LRP -11".into(),
+                937.5,
+                Some(-17.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::SendingReport { .. }),
+            "the confirmed second sighting must advance the QSO; got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.frequency, 937.5,
+            "metadata.frequency must relatch to the confirmed frequency"
+        );
+        assert_eq!(
+            progress.metadata.pending_freq_drift, None,
+            "pending_freq_drift must clear once confirmed"
+        );
+        if let QsoState::SendingReport { frequency, .. } = progress.state {
+            assert_eq!(
+                frequency, 937.5,
+                "the state's own embedded frequency field must also relatch \
+                 (is_message_relevant reads this field, not metadata.frequency)"
+            );
+        }
+    }
+
+    /// A different second frequency does NOT confirm — the candidate simply resets to
+    /// the newest off-latch sighting instead, and the QSO stays stuck (matching
+    /// today's behavior). This is the direct proof this mechanism can't be tricked by
+    /// two DIFFERENT spoofed frequencies in a row either.
+    #[tokio::test]
+    async fn different_second_frequency_does_not_confirm() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+
+        for freq in [937.5, 1100.0] {
+            manager
+                .process_message(
+                    MessageType::SignalReport {
+                        to_station: "K5ARH".into(),
+                        from_station: "LU7LRP".into(),
+                        report: -11,
+                    },
+                    "K5ARH LU7LRP -11".into(),
+                    freq,
+                    Some(-19.0),
+                )
+                .await
+                .unwrap();
+        }
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "a differing second sighting must not confirm/advance; got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.pending_freq_drift,
+            Some(1100.0),
+            "the candidate must reset to the newest off-latch sighting"
+        );
+    }
+
+    /// A normal in-tolerance message arriving after a pending candidate clears it —
+    /// no spurious relatch or advance from a stale candidate once the drift resolves
+    /// itself (or was noise).
+    #[tokio::test]
+    async fn in_tolerance_message_clears_a_stale_pending_candidate() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "LU7LRP".into(),
+                    report: -11,
+                },
+                "K5ARH LU7LRP -11".into(),
+                937.5,
+                Some(-19.0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.pending_freq_drift,
+            Some(937.5)
+        );
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "LU7LRP".into(),
+                    report: -9,
+                },
+                "K5ARH LU7LRP -09".into(),
+                1550.0,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::SendingReport { .. }),
+            "the in-tolerance message must advance the QSO normally; got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.pending_freq_drift, None,
+            "the stale candidate must clear once a normal in-tolerance message arrives"
+        );
+    }
+
+    /// A passband-violating decode must not overwrite a legitimate pending candidate —
+    /// it's likely a garbage decode, not a real drift signal, and shouldn't reset real
+    /// tracking. The genuine confirming sighting must still work afterward.
+    #[tokio::test]
+    async fn out_of_passband_decode_does_not_reset_pending_candidate() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "LU7LRP".into(),
+                    report: -11,
+                },
+                "K5ARH LU7LRP -11".into(),
+                937.5,
+                Some(-19.0),
+            )
+            .await
+            .unwrap();
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "LU7LRP".into(),
+                    report: -11,
+                },
+                "K5ARH LU7LRP -11".into(),
+                -50.0,
+                Some(-25.0),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.pending_freq_drift,
+            Some(937.5),
+            "an out-of-passband decode must not overwrite a legitimate pending candidate"
+        );
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "LU7LRP".into(),
+                    report: -11,
+                },
+                "K5ARH LU7LRP -11".into(),
+                937.5,
+                Some(-17.0),
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                manager.get_qso(qso_id).await.unwrap().state,
+                QsoState::SendingReport { .. }
+            ),
+            "the real confirming sighting must still relatch and advance after the noise"
         );
     }
 
@@ -9931,6 +10302,7 @@ mod has_active_or_recent_qso_tests {
             dx_repeat_count: 0,
             hound: false,
             partner_freq: None,
+            pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
             tx_parity_provisional: false,
@@ -10116,6 +10488,7 @@ mod hound_tests {
             dx_repeat_count: 0,
             hound: false,
             partner_freq: None,
+            pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
             tx_parity_provisional: false,

@@ -196,6 +196,7 @@ mod tests {
             dx_repeat_count: 0,
             hound: false,
             partner_freq: None,
+            pending_freq_drift: None,
             hound_qsyed: false,
             remote_origin: false,
             tx_parity_provisional: false,

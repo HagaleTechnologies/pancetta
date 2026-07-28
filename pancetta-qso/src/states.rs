@@ -449,6 +449,19 @@ pub struct QsoMetadata {
     #[serde(default)]
     pub partner_freq: Option<f64>,
 
+    /// The last off-latch frequency seen from this QSO's partner that didn't yet match
+    /// the relevance gate's tolerance. `None` normally. Set when an identity-matching
+    /// message arrives outside tolerance but inside the FT8 passband; cleared either
+    /// when a SECOND message confirms the same frequency (triggering a relatch) or
+    /// when a message arrives back within the existing tolerance. See
+    /// `QsoManager::maybe_confirm_frequency_drift`. A single off-frequency
+    /// identity-matching message can't be safely trusted on its own — FT8 decoded text
+    /// has no cryptographic identity, so frequency proximity to the partner's last
+    /// confirmed location is the only defense against a spoofed callsign claim (see
+    /// `adversarial_3party.rs::b10_partner_call_used_by_other_station_discarded`).
+    #[serde(default)]
+    pub pending_freq_drift: Option<f64>,
+
     /// Hound: whether we have already QSY'd up to the response region after the
     /// Fox answered us (so the QSY fires exactly once).
     #[serde(default)]
