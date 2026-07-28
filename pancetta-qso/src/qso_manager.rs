@@ -1809,11 +1809,26 @@ impl QsoManager {
                 progress.metadata.frequency = frequency;
                 progress.metadata.pending_freq_drift = None;
                 match &mut progress.state {
-                    QsoState::RespondingToCq { frequency: state_freq, .. }
-                    | QsoState::WaitingForReport { frequency: state_freq, .. }
-                    | QsoState::SendingReport { frequency: state_freq, .. }
-                    | QsoState::WaitingForConfirmation { frequency: state_freq, .. }
-                    | QsoState::SendingConfirmation { frequency: state_freq, .. } => {
+                    QsoState::RespondingToCq {
+                        frequency: state_freq,
+                        ..
+                    }
+                    | QsoState::WaitingForReport {
+                        frequency: state_freq,
+                        ..
+                    }
+                    | QsoState::SendingReport {
+                        frequency: state_freq,
+                        ..
+                    }
+                    | QsoState::WaitingForConfirmation {
+                        frequency: state_freq,
+                        ..
+                    }
+                    | QsoState::SendingConfirmation {
+                        frequency: state_freq,
+                        ..
+                    } => {
                         *state_freq = frequency;
                     }
                     _ => {}
@@ -1878,7 +1893,8 @@ impl QsoManager {
     ) -> Result<(), QsoManagerError> {
         let timestamp = Utc::now();
 
-        self.maybe_confirm_frequency_drift(&message_type, frequency).await;
+        self.maybe_confirm_frequency_drift(&message_type, frequency)
+            .await;
 
         // Find relevant QSO(s)
         let qso_ids = self.find_qsos_for_message(&message_type, frequency).await;
@@ -7324,7 +7340,12 @@ mod sender_verification_tests {
             .await
             .unwrap();
         assert_eq!(
-            manager.get_qso(qso_id).await.unwrap().metadata.pending_freq_drift,
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .pending_freq_drift,
             Some(937.5)
         );
 
@@ -7393,7 +7414,12 @@ mod sender_verification_tests {
             .await
             .unwrap();
         assert_eq!(
-            manager.get_qso(qso_id).await.unwrap().metadata.pending_freq_drift,
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .pending_freq_drift,
             Some(937.5),
             "an out-of-passband decode must not overwrite a legitimate pending candidate"
         );
