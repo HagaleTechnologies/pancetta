@@ -625,9 +625,11 @@ cargo fmt --check
 Expected: no output. If it prints a diff, run plain `cargo fmt` and re-check clean.
 
 ```bash
-cargo clippy -p pancetta-qso --all-targets --features transmit
+cargo clippy -p pancetta-qso --all-targets
 ```
-Expected: no warnings introduced by this change.
+Expected: no warnings introduced by this change. (Corrected post-review: `pancetta-qso`
+has no `transmit` feature — that flag belongs to `pancetta-ft8`/`pancetta`, not this
+crate — the original command as written errors immediately rather than running.)
 
 ```bash
 cargo test --workspace --features transmit
