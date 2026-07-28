@@ -3395,7 +3395,6 @@ dependencies = [
  "chrono",
  "crossbeam-channel",
  "futures",
- "num-derive",
  "num-traits",
  "pancetta-core",
  "parking_lot",
