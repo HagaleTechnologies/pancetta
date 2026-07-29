@@ -1796,6 +1796,14 @@ impl QsoManager {
         // separate transmissions always clear it while two decode-pipeline copies of
         // the SAME transmission (milliseconds apart) never do.
         const DRIFT_CONFIRM_MIN_GAP: chrono::Duration = chrono::Duration::seconds(5);
+        // Wide RX-plausibility sanity bound for candidate ELIGIBILITY -- deliberately
+        // NOT the same as TX_OFFSET_MIN_HZ/MAX_HZ (which govern where we autonomously
+        // PICK a fresh TX offset, not where we're willing to consider a real decoded
+        // signal a real DX). Responding to a CQ already ties our reply to wherever we
+        // decoded it, unclamped, for any DX up to ~2900 Hz -- this must preserve that,
+        // not narrow it. Matches the convention in frequency.rs/autonomous.rs.
+        const DRIFT_CANDIDATE_MIN_HZ: f64 = 200.0;
+        const DRIFT_CANDIDATE_MAX_HZ: f64 = 2900.0;
 
         let Some(sender) = message_type.sender_callsign() else {
             return;
@@ -1829,7 +1837,7 @@ impl QsoManager {
                 continue;
             }
 
-            if !(TX_OFFSET_MIN_HZ..=TX_OFFSET_MAX_HZ).contains(&frequency) {
+            if !(DRIFT_CANDIDATE_MIN_HZ..=DRIFT_CANDIDATE_MAX_HZ).contains(&frequency) {
                 continue; // Out-of-band decode — don't let noise reset a real candidate.
             }
 
@@ -1862,7 +1870,15 @@ impl QsoManager {
                     | QsoState::SendingConfirmation {
                         frequency: state_freq,
                         ..
-                    } => {
+                    }
+                    | QsoState::Contest(ContestState::ExchangingInfo {
+                        frequency: state_freq,
+                        ..
+                    })
+                    | QsoState::Contest(ContestState::ContestCompleted {
+                        frequency: state_freq,
+                        ..
+                    }) => {
                         *state_freq = frequency;
                     }
                     _ => {
@@ -1894,15 +1910,15 @@ impl QsoManager {
                     .is_none_or(|(f, _)| (f - frequency).abs() > DRIFT_CONFIRM_TOLERANCE_HZ)
                 {
                     progress.metadata.pending_freq_drift = Some((frequency, now));
+                    debug!(
+                        target: "qso.freq_gate",
+                        partner = %their_callsign,
+                        candidate_freq = frequency,
+                        latched_freq = qso_freq,
+                        "identity-verified message outside tolerance — noting drift candidate \
+                         (needs 1 more confirming sighting >=5s later)"
+                    );
                 }
-                debug!(
-                    target: "qso.freq_gate",
-                    partner = %their_callsign,
-                    candidate_freq = frequency,
-                    latched_freq = qso_freq,
-                    "identity-verified message outside tolerance — noting drift candidate \
-                     (needs 1 more confirming sighting >=5s later)"
-                );
             }
         }
     }
@@ -7564,6 +7580,46 @@ mod sender_verification_tests {
             "a sighting >=5s after the original candidate must confirm and relatch"
         );
         assert_eq!(progress.metadata.pending_freq_drift, None);
+    }
+
+    /// Boundary case for the 5s confirm gap: a sighting just under the gate must NOT
+    /// confirm, and must leave the pending candidate's ORIGINAL timestamp untouched
+    /// (proving the non-reset-on-duplicate rule holds right at the boundary, where a
+    /// future refactor is most likely to break it).
+    #[tokio::test]
+    async fn sighting_just_under_the_confirm_gap_does_not_confirm() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "LU7LRP".into(),
+            report: -11,
+        };
+        let t0 = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 937.5, t0)
+            .await;
+        manager
+            .maybe_confirm_frequency_drift_at(
+                &report,
+                937.5,
+                t0 + chrono::Duration::milliseconds(4900),
+            )
+            .await;
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "a sighting 4.9s after the original must not confirm/relatch"
+        );
+        assert!(
+            matches!(progress.metadata.pending_freq_drift, Some((f, t)) if f == 937.5 && t == t0),
+            "the candidate must still carry the ORIGINAL timestamp, unchanged"
+        );
     }
 
     #[tokio::test]
