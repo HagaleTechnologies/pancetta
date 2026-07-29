@@ -39,7 +39,7 @@
       "maxParallelCeiling": 2
     },
     "orchestration": {
-      "dispatchMode": "codex-exec"
+      "executor": "codex-exec"
     }
   }
 }
