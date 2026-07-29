@@ -1801,7 +1801,12 @@ impl QsoManager {
         // PICK a fresh TX offset, not where we're willing to consider a real decoded
         // signal a real DX). Responding to a CQ already ties our reply to wherever we
         // decoded it, unclamped, for any DX up to ~2900 Hz -- this must preserve that,
-        // not narrow it. Matches the convention in frequency.rs/autonomous.rs.
+        // not narrow it. The constraint that actually matters here is the modulator's
+        // transmittable envelope (`pancetta_ft8::modulator::MAX_FREQUENCY_DEVIATION` =
+        // 3100.0, verified to cover a 2900 Hz base plus the widest FT2 tone spread) --
+        // NOT `frequency.rs`/`autonomous.rs`'s own convention, which is actually
+        // 200-2800 (narrower on the top end) and governs a different concern (where
+        // the autonomous allocator prefers to place a fresh CQ/answer).
         const DRIFT_CANDIDATE_MIN_HZ: f64 = 200.0;
         const DRIFT_CANDIDATE_MAX_HZ: f64 = 2900.0;
 
@@ -1818,7 +1823,15 @@ impl QsoManager {
                 continue;
             }
             if progress.metadata.partner_freq.is_some() {
-                continue; // Hound/Fox — has its own QSY mechanism, untouched.
+                // Any split-TX QSO -- not just Hound/Fox. `partner_freq` is also set by
+                // `compute_manual_tx_offset` for a manually-deconflicted TX offset (e.g.
+                // a MIN_TX_SEPARATION_HZ collision nudge, or a DX heard beyond
+                // TX_OFFSET_MAX_HZ clamped down for our own reply). Every such QSO
+                // already tracks the DX's real RX frequency separately from our own TX
+                // offset via `partner_freq`/`is_message_relevant`'s own routing (see that
+                // function's Hound-mode branch) -- this drift-confirm mechanism is scoped
+                // to the ordinary Tx=Rx case only and deliberately does not touch these.
+                continue;
             }
             let Some(their_callsign) = progress.state.their_callsign().map(|s| s.to_string())
             else {
@@ -7620,6 +7633,40 @@ mod sender_verification_tests {
             matches!(progress.metadata.pending_freq_drift, Some((f, t)) if f == 937.5 && t == t0),
             "the candidate must still carry the ORIGINAL timestamp, unchanged"
         );
+    }
+
+    /// Closes the boundary from the other side: a sighting at EXACTLY 5.0s (the
+    /// inclusive edge of `DRIFT_CONFIRM_MIN_GAP`) must confirm. Combined with
+    /// `sighting_just_under_the_confirm_gap_does_not_confirm` (4.9s, must NOT confirm),
+    /// this pins the gate to `>=`, not `>` -- either an accidental `>` or a shift of
+    /// the constant itself (e.g. 5s -> 6s) would flip one of these two tests.
+    #[tokio::test]
+    async fn sighting_at_exactly_the_confirm_gap_does_confirm() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "LU7LRP".into(),
+            report: -11,
+        };
+        let t0 = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 937.5, t0)
+            .await;
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 937.5, t0 + chrono::Duration::seconds(5))
+            .await;
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.frequency, 937.5,
+            "a sighting at EXACTLY the 5s gap must confirm and relatch (inclusive bound)"
+        );
+        assert_eq!(progress.metadata.pending_freq_drift, None);
     }
 
     /// Final-review Important finding: the drift-candidate eligibility bound must be
