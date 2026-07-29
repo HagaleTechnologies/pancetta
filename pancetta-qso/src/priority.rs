@@ -413,7 +413,18 @@ impl PriorityScorer {
     /// redundant (if harmless, since they're constant within a tier) false
     /// economy. Reuses the `rarity`/`pota_sota`/`signal_strength`/penalty/
     /// staleness weights from `score_cq_detailed`'s formula.
+    ///
+    /// The raw weighted sum is rescaled by its actual achievable positive
+    /// ceiling (not just clamped to `[0,1]`) before returning: those
+    /// remaining weights are small fractions of 1.0 — calibrated for a
+    /// formula where `needed_dxcc`/`atno_bonus`/`notable_bonus` dominated
+    /// the total — so left unscaled, real rarity/signal variation only
+    /// ever moves the raw sum within a narrow low sub-band, making
+    /// `TieredScore::as_display_u32` cluster near the bottom of each
+    /// tier's 999-wide display band regardless of how rare or strong a
+    /// station actually is (the 2026-07-25 "no gradient" report).
     fn secondary_score(&self, callsign: &str, snr: i8, freq_hz: f64) -> f64 {
+        const NETWORK_SNR_BONUS: f64 = 0.1;
         let pota_sota = if is_pota_sota_candidate(callsign) {
             1.0
         } else {
@@ -446,23 +457,36 @@ impl PriorityScorer {
         let snr_bonus = if let Some((reporter_count, best_snr)) = self.lookup.network_snr(callsign)
         {
             if reporter_count >= 5 && best_snr >= -20 {
-                0.1
+                NETWORK_SNR_BONUS
             } else if reporter_count == 1 && best_snr < -25 {
-                -0.1
+                -NETWORK_SNR_BONUS
             } else {
                 0.0
             }
         } else {
             0.0
         };
-        let raw = (rarity * self.weights.rarity
+        let raw = rarity * self.weights.rarity
             + pota_sota * self.weights.pota_sota
             + signal_strength * self.weights.signal_strength
             + duplicate_penalty * self.weights.duplicate_penalty
             + recent_failure_penalty * self.weights.recent_failure_penalty
-            + snr_bonus)
-            * staleness;
-        raw.clamp(0.0, 1.0)
+            + snr_bonus;
+
+        // Rescale by the max achievable positive contribution so genuine
+        // variation spans close to the full [0,1] range `as_display_u32`
+        // expects, instead of clamping the raw (small-magnitude) sum
+        // directly and wasting most of the tier's display band.
+        let max_positive = self.weights.rarity.max(0.0)
+            + self.weights.pota_sota.max(0.0)
+            + self.weights.signal_strength.max(0.0)
+            + NETWORK_SNR_BONUS;
+        let normalized = if max_positive > 0.0 {
+            raw / max_positive
+        } else {
+            0.0
+        };
+        (normalized * staleness).clamp(0.0, 1.0)
     }
 
     /// Tiered score (#164): combines `classify_tier` (dominant) with
@@ -1057,6 +1081,52 @@ mod tests {
             "rarer station must rank higher within the same (Standard) tier: {} vs {}",
             rare.secondary,
             common.secondary
+        );
+    }
+
+    #[test]
+    fn secondary_score_rarity_spread_moves_the_display_by_a_meaningful_fraction_of_the_tier_band() {
+        // 2026-07-25 operator report: post-#164, DX Hunter scores still
+        // cluster into two visually-indistinguishable blobs (rescaled from
+        // ~425/~75 to ~3000/~1000) with no visible gradient. Ordering alone
+        // (asserted above) doesn't catch this — the two ends of the entire
+        // rarity spectrum (never-spotted 0.0 vs maximally-rare 1.0) must
+        // move the display by a real fraction of a tier's 999-wide band,
+        // not just a "greater than" amount.
+        struct FixedRarityLookup(f64);
+        impl WorkedStationLookup for FixedRarityLookup {
+            fn is_duplicate(&self, _c: &str, _f: f64) -> bool {
+                false
+            }
+            fn is_recent_failure(&self, _c: &str) -> bool {
+                false
+            }
+            fn is_needed_dxcc(&self, _c: &str) -> bool {
+                false
+            }
+            fn is_needed_grid(&self, _g: &str) -> bool {
+                false
+            }
+            fn rarity(&self, _c: &str) -> f64 {
+                self.0
+            }
+        }
+        let rarest =
+            PriorityScorer::new(PriorityWeights::default(), Box::new(FixedRarityLookup(1.0)))
+                .score_tiered("VP8RARE", None, -10, 14_074_000.0);
+        let never_spotted =
+            PriorityScorer::new(PriorityWeights::default(), Box::new(FixedRarityLookup(0.0)))
+                .score_tiered("W1XYZ", None, -10, 14_074_000.0);
+        assert_eq!(rarest.tier, PriorityTier::Standard);
+        assert_eq!(never_spotted.tier, PriorityTier::Standard);
+
+        let diff = rarest.as_display_u32() - never_spotted.as_display_u32();
+        assert!(
+            diff > 200,
+            "the full rarity spectrum should move the display by a visible fraction \
+             (>200 of the 999-wide tier band), got only {diff} (rarest={}, never_spotted={})",
+            rarest.as_display_u32(),
+            never_spotted.as_display_u32()
         );
     }
 
