@@ -7622,6 +7622,106 @@ mod sender_verification_tests {
         );
     }
 
+    /// Final-review Important finding: the drift-candidate eligibility bound must be
+    /// the wide RX-plausibility range (200-2900 Hz), NOT this file's narrower
+    /// TX_OFFSET_MIN_HZ/MAX_HZ (300-2700 Hz, which govern autonomous fresh-offset
+    /// picking, not where a real DX might legitimately be heard). Pins BOTH edges so a
+    /// future refactor that silently narrows this back to TX_OFFSET_* is caught —
+    /// exactly the un-caught regression that produced this test. A DX replying from
+    /// near either edge of the real passband must still be able to confirm and
+    /// relatch.
+    #[tokio::test]
+    async fn drift_candidate_confirms_near_the_passband_edges() {
+        let manager = manager_with_call("K5ARH");
+
+        // Lower edge: 250 Hz is inside DRIFT_CANDIDATE_MIN_HZ..=MAX_HZ (200-2900) but
+        // outside TX_OFFSET_MIN_HZ..=MAX_HZ (300-2700) -- if the eligibility check ever
+        // regresses back to the TX bounds, this confirm silently stops happening.
+        let qso_low = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let report_low = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "LU7LRP".into(),
+            report: -11,
+        };
+        let t0 = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report_low, 250.0, t0)
+            .await;
+        manager
+            .maybe_confirm_frequency_drift_at(&report_low, 250.0, t0 + chrono::Duration::seconds(6))
+            .await;
+        let progress = manager.get_qso(qso_low).await.unwrap();
+        assert_eq!(
+            progress.metadata.frequency, 250.0,
+            "a DX at 250 Hz (inside the RX-plausibility bound, outside TX_OFFSET_*) must \
+             still be able to confirm and relatch"
+        );
+
+        // Upper edge: 2850 Hz, same reasoning.
+        let qso_high = manager
+            .respond_to_cq_manual("VK9XYZ".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let report_high = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "VK9XYZ".into(),
+            report: -9,
+        };
+        let t1 = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report_high, 2850.0, t1)
+            .await;
+        manager
+            .maybe_confirm_frequency_drift_at(
+                &report_high,
+                2850.0,
+                t1 + chrono::Duration::seconds(6),
+            )
+            .await;
+        let progress = manager.get_qso(qso_high).await.unwrap();
+        assert_eq!(
+            progress.metadata.frequency, 2850.0,
+            "a DX at 2850 Hz (inside the RX-plausibility bound, outside TX_OFFSET_*) must \
+             still be able to confirm and relatch"
+        );
+    }
+
+    /// Pins the OUTER upper bound of DRIFT_CANDIDATE_MAX_HZ (2900 Hz) -- a decode past
+    /// it is implausible/garbage and must never become (or confirm) a candidate.
+    #[tokio::test]
+    async fn drift_candidate_rejects_outside_the_rx_plausibility_bound() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_manual("LU7LRP".into(), 1500.0, None)
+            .await
+            .unwrap();
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "LU7LRP".into(),
+            report: -11,
+        };
+        let t0 = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 2950.0, t0)
+            .await;
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 2950.0, t0 + chrono::Duration::seconds(6))
+            .await;
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "a decode past the RX-plausibility bound must never confirm/relatch"
+        );
+        assert_eq!(
+            progress.metadata.pending_freq_drift, None,
+            "an implausible decode must never even become a pending candidate"
+        );
+    }
+
     #[tokio::test]
     async fn spoofed_report_ack_does_not_advance_to_completion() {
         let manager = manager_with_call("K5ARH");
