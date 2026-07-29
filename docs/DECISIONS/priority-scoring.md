@@ -65,3 +65,31 @@ back on `pancetta-tui`) so every DX Hunter row, regardless of source, is scored 
 bands (Standard 0-999 through Atno 4000-4999) that can never bleed into each other.
 
 Full design: `docs/superpowers/specs/2026-07-19-dx-hunter-priority-tiers-and-history-panel-design.md`.
+
+## Secondary-score compression (post-#164 clustering), fixed 2026-07-29
+
+Operator reported the "no gradient" symptom was still present after #164's tier redesign — just
+rescaled: scores now clustered around ~3000 and ~1000 (tier bands) instead of the original
+~425/~75, with each cluster still visually indistinguishable internally. Root-caused via direct
+code tracing + a quantitative test, not a re-guess at the original #163 hypothesis (which had
+already been fixed and was confirmed still correct: `rarity()` and `is_dxcc_needed_on_band` are
+both genuinely wired and varying).
+
+The actual cause: `PriorityScorer::secondary_score`'s weighted sum (`rarity 0.10`,
+`pota_sota 0.15`, `signal_strength 0.05`, plus a `±0.1` network SNR bonus) was left over from a
+formula originally dominated by `needed_dxcc 0.35` + `atno_bonus 0.15` + `notable_bonus 0.3` —
+terms #164 moved into tier classification. With those large terms gone, `secondary_score` clamped
+its raw sum directly to `[0,1]`, but the remaining weights can only ever produce a raw value in a
+narrow low sub-band (max ~0.40, and typically ~0.05-0.15 for a real station with no POTA/network
+data) — so `TieredScore::as_display_u32` only ever moved a station within roughly the bottom 10%
+of its tier's 999-wide band, regardless of true rarity or signal quality. The existing test
+(`secondary_score_varies_by_rarity_within_standard_tier`) only asserted rare-beats-common
+*ordering*, never magnitude, so this shipped invisibly.
+
+Fixed by rescaling `secondary_score`'s raw sum by its actual achievable positive ceiling
+(`rarity + pota_sota + signal_strength weights + the SNR bonus magnitude`) before clamping, so
+real variation spans close to the full `[0,1]` range instead of a fixed narrow sub-band. A new
+test (`secondary_score_rarity_spread_moves_the_display_by_a_meaningful_fraction_of_the_tier_band`)
+asserts the full rarity spectrum (never-spotted vs. maximally-rare) must move the display by
+>200 of the 999-wide band — it failed at 99 before the fix, passes at 250 after. On-air
+re-verification of the visible gradient is still operator-gated.
