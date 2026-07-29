@@ -3417,7 +3417,7 @@ dependencies = [
  "num-complex",
  "pancetta-ft8",
  "pancetta-qso",
- "rand 0.8.7",
+ "rand 0.10.2",
  "rand_distr",
  "rustfft",
  "serde",
