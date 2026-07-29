@@ -1,0 +1,45 @@
+{
+  "catalyst": {
+    "projectKey": "HagaleTechnologies",
+    "repository": {
+      "org": "HagaleTechnologies",
+      "name": "pancetta"
+    },
+    "project": {
+      "ticketPrefix": "PAN",
+      "name": "pancetta"
+    },
+    "linear": {
+      "teamKey": "PAN",
+      "stateMap": {
+        "backlog": "Backlog",
+        "todo": "Todo",
+        "research": "In Progress",
+        "planning": "In Progress",
+        "inProgress": "In Progress",
+        "inReview": "In Review",
+        "done": "Done",
+        "canceled": "Canceled"
+      }
+    },
+    "thoughts": {
+      "user": null,
+      "directory": "pancetta",
+      "profile": "HagaleTechnologies"
+    },
+    "sweep": {
+      "idleHours": 48,
+      "intervalHours": 1,
+      "salvagePush": false,
+      "maxRemovalsPerRun": 10
+    },
+    "executionCore": {
+      "maxParallel": 1,
+      "minParallel": 1,
+      "maxParallelCeiling": 2
+    },
+    "orchestration": {
+      "dispatchMode": "codex-exec"
+    }
+  }
+}
