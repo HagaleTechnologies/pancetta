@@ -46,8 +46,11 @@
 //! - `kid` lives in the **JWS header**, not the payload.
 //! - The armed-window / heartbeat bounds enforced here are the schema's
 //!   **normative** `$defs.txArmGrant` values (both labelled "pancetta bound",
-//!   i.e. pancetta MUST enforce): `armedUntil` window **≤ 10 min**
-//!   ([`MAX_ARM_MS`] = 600_000 ms) and `heartbeatIntervalSec` in **[5, 15] s**
+//!   i.e. pancetta MUST enforce): `armedUntil` window **≤ 60 min** (raised
+//!   from the v1 conservative default of 10 min per dispensa Q-0048 — cqdx
+//!   concurred 2026-07-28 that this is a security-design constant, not a
+//!   Part-97 requirement, and 60 min covers a realistic operating session)
+//!   ([`MAX_ARM_MS`] = 3_600_000 ms) and `heartbeatIntervalSec` in **[5, 15] s**
 //!   ([`MIN_HEARTBEAT_SEC`], [`MAX_HEARTBEAT_SEC`]). Both are rejected (not
 //!   clamped) when out of range ([`CapError::ArmTooLong`] /
 //!   [`CapError::BadHeartbeat`]).
@@ -75,8 +78,12 @@ use crate::pairing::IdpKey;
 /// (`armedUntil - now`). A grant asking for a longer window is **rejected**
 /// ([`CapError::ArmTooLong`]) rather than silently clamped — an absurd arm is a
 /// red flag, not something to quietly truncate. The e2e-auth.v1 normative bound
-/// is **10 minutes** in milliseconds (`$defs.txArmGrant.armedUntil`).
-pub const MAX_ARM_MS: i64 = 600_000;
+/// is **60 minutes** in milliseconds (`$defs.txArmGrant.armedUntil`), raised
+/// from the original 10-minute v1 conservatism per dispensa Q-0048 (cqdx
+/// concurred 2026-07-28) — coordinated with panino's own `TxArmController`
+/// `BOUNDS` ceiling and the schema's normative text; none of the three sides
+/// should diverge from this value.
+pub const MAX_ARM_MS: i64 = 3_600_000;
 
 /// Minimum accepted `heartbeatIntervalSec` (e2e-auth.v1 normative bound: 5 s).
 pub const MIN_HEARTBEAT_SEC: i64 = 5;

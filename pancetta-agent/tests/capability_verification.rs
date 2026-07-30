@@ -626,13 +626,15 @@ fn grant_heartbeat_bounds_are_exact() {
     assert_eq!(check(16), Err(CapError::BadHeartbeat), "hb=16 rejected");
 }
 
-/// e2e-auth.v1 armedUntil boundary: window == 600_000 accepted, == 600_001
-/// rejected as ArmTooLong.
+/// e2e-auth.v1 armedUntil boundary: window == 3_600_000 accepted, ==
+/// 3_600_001 rejected as ArmTooLong. Bound raised from the original 10-min
+/// v1 conservatism to 60 min per dispensa Q-0048 (cqdx concurred
+/// 2026-07-28).
 #[test]
-fn grant_armed_window_600000_boundary_exact() {
+fn grant_armed_window_3600000_boundary_exact() {
     assert_eq!(
-        MAX_ARM_MS, 600_000,
-        "MAX_ARM_MS is the 10-min normative bound"
+        MAX_ARM_MS, 3_600_000,
+        "MAX_ARM_MS is the 60-min normative bound"
     );
     let v = default_verifier();
     let cap = valid_cap(&v);
@@ -654,11 +656,11 @@ fn grant_armed_window_600000_boundary_exact() {
         )
     };
 
-    assert!(check(600_000).is_ok(), "window == 600_000 accepted");
+    assert!(check(3_600_000).is_ok(), "window == 3_600_000 accepted");
     assert_eq!(
-        check(600_001),
+        check(3_600_001),
         Err(CapError::ArmTooLong),
-        "window == 600_001 rejected"
+        "window == 3_600_001 rejected"
     );
 }
 
