@@ -156,3 +156,22 @@ all already existed in rig-api.v1 — this work defines semantics for the previo
 Spec: `docs/superpowers/specs/2026-07-20-concurrent-multi-client-station-agent-design.md`
 (Status: Implemented). Plan:
 `docs/superpowers/plans/2026-07-20-concurrent-multi-client-station-agent.md`.
+
+## `armedUntil` ceiling raised 10 min → 60 min (dispensa Q-0048), 2026-07-29
+
+panino's operator hit this live: `armedUntil`'s v1 conservative 10-minute ceiling (originated as an
+arbitrary `N` instantiation in dispensa ADR-0002 §Decision #5, never derived from a Part-97 number or
+specific threat model) forced a full re-arm ceremony every 10 minutes during any real operating
+session. Confirmed via `docs/fcc-part97-compliance.md`: §97.109(c) control-operator presence is what
+the 5-15s dead-man heartbeat already enforces on a fast, continuous cadence; `armedUntil` is a
+coarser, independent worst-case-exposure backstop, not doing compliance work the heartbeat isn't
+already doing. cqdx concurred (2026-07-28) on 60 minutes as a fixed contract constant (not
+station-configurable — matches the existing `MIN_HEARTBEAT_SEC`/`MAX_HEARTBEAT_SEC` pattern).
+
+Coordinated three-sided bump, in-place `e2e-auth.v1` text/bound amendment (not a `v2` — no field
+shape changes): dispensa's `contracts/auth/e2e-auth.v1.schema.json` `txArmGrant.armedUntil`
+description → `<= 60 min`; pancetta's `MAX_ARM_MS` (`pancetta-agent/src/capability.rs`) →
+`3_600_000`; panino's `TxArmController.arm()` `BOUNDS` ceiling updates separately on panino's side
+(not this repo). None of the three should land independently — a mismatched trio would be a live
+footgun (e.g. panino allowing 60 min while pancetta still rejected above 10). Full thread: dispensa
+`questions/0048-relax-tx-arm-armeduntil-10min-ceiling.md`.
