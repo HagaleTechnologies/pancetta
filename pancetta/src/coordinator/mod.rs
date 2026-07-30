@@ -613,14 +613,20 @@ pub struct ApplicationCoordinator {
     /// the flag at the start of the next message, and continues.
     /// Distinct from `shutdown_signal` (which means "stop the whole app").
     abort_current_tx: Arc<AtomicBool>,
-    /// hb-161 — Phase 5 emergency-stop runtime gate. Set to `true` at
-    /// startup based on `config.autonomous.enabled`. Cleared (set to
-    /// `false`) when the operator presses Shift+Q in the TUI; the
-    /// autonomous decision loop reads this every cycle and skips
-    /// `TransmitRequest` dispatch when it's false. Toggled back on by
-    /// the autonomous TUI command (`a`) or by re-pressing Shift+Q (the
-    /// latter is reserved for future use; today it's one-shot off).
-    /// Separate from `shutdown_signal` and `abort_current_tx`.
+    /// hb-161 — Phase 5 emergency-stop runtime gate. Seeded at startup in
+    /// `start_autonomous_component`: `--headless` launches auto-arm
+    /// straight from `config.autonomous.enabled` (RUNBOOK.md: config is
+    /// the only switch for a supervised headless station, no TUI to press
+    /// `a` in); interactive (TUI) launches always start `false` regardless
+    /// of config — the operator must press `a` to arm (2026-07-29 fix; an
+    /// interactive launch auto-arming from config alone surprised the
+    /// operator and was not desirable). Cleared (set to `false`) when the
+    /// operator presses Shift+Q in the TUI; the autonomous decision loop
+    /// reads this every cycle and skips `TransmitRequest` dispatch when
+    /// it's false. Toggled back on by the autonomous TUI command (`a`) or
+    /// by re-pressing Shift+Q (the latter is reserved for future use;
+    /// today it's one-shot off). Separate from `shutdown_signal` and
+    /// `abort_current_tx`.
     autonomous_enabled_runtime: Arc<AtomicBool>,
 
     /// Global tri-state TX policy (`pancetta_core::TxPolicy` encoded via

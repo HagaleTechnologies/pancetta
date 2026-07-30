@@ -331,15 +331,20 @@ impl super::ApplicationCoordinator {
         let config = self.config.read().await;
         let auto_config_enabled = config.autonomous.enabled;
 
-        // hb-161: seed the runtime gate from the configured value. The
-        // TUI's OperatorEmergencyStop handler flips this to `false` on
-        // Shift+Q; the autonomous loop checks it before submitting any
-        // TX. Doing the seed here means: if the operator launched with
-        // autonomous=false in config, the gate is already `false` and
-        // any Q-press is a no-op (idempotent — that's the desired
+        // hb-161 + 2026-07-29 follow-up: seed the runtime gate. An
+        // interactive (TUI) launch always starts CLOSED regardless of
+        // config — the operator must press `a` to arm, the same
+        // safety-driver posture as Shift+Q's disarm. Auto-arming straight
+        // from config is reserved for `--headless` (`docs/RUNBOOK.md`:
+        // "for a supervised headless station, config is the only
+        // switch" — there is no TUI to press `a` in, so config must be
+        // able to arm it directly there). If the operator launched with
+        // autonomous=false in config, the gate is already `false` either
+        // way and any `a`-press is a no-op (idempotent — the desired
         // safety-driver property).
+        let seed_armed = auto_config_enabled && self.headless;
         self.autonomous_enabled_runtime
-            .store(auto_config_enabled, Ordering::Release);
+            .store(seed_armed, Ordering::Release);
 
         // FQ-F9: `auto_config_enabled` no longer early-returns into a
         // no-op drain task. The slot-tick loop below always runs — it
@@ -2001,15 +2006,15 @@ mod fq_f9_placement_feed_when_disabled_tests {
         msg
     }
 
-    async fn build_coordinator(autonomous_enabled: bool) -> ApplicationCoordinator {
+    async fn build_coordinator(autonomous_enabled: bool, headless: bool) -> ApplicationCoordinator {
         let mut config = Config::default();
         config.autonomous.enabled = autonomous_enabled;
         let shutdown = Arc::new(AtomicBool::new(false));
         ApplicationCoordinator::new(
             config,
             None,
-            true,  // no_audio
-            true,  // headless
+            true, // no_audio
+            headless,
             false, // metrics
             9090,
             None, // no WAV
@@ -2047,7 +2052,7 @@ mod fq_f9_placement_feed_when_disabled_tests {
 
     #[tokio::test]
     async fn disabled_feed_emits_placement_update_but_never_dispatches() {
-        let mut coordinator = build_coordinator(false).await;
+        let mut coordinator = build_coordinator(false, true).await;
 
         // Subscribe to every destination the (gated) dispatch block could
         // possibly write to, PLUS Tui (the housekeeping destination), all
@@ -2144,7 +2149,7 @@ mod fq_f9_placement_feed_when_disabled_tests {
     /// whether any CQ/pounce/collision decision happened to fire.
     #[tokio::test]
     async fn enabled_control_dispatches_autonomous_status_every_tick() {
-        let mut coordinator = build_coordinator(true).await;
+        let mut coordinator = build_coordinator(true, true).await;
 
         let (_tui_tx, tui_rx) = coordinator
             .message_bus
@@ -2180,6 +2185,62 @@ mod fq_f9_placement_feed_when_disabled_tests {
             "control failed: with autonomous.enabled = true, decide() should \
              run every tick and emit AutonomousStatus — if this fails, the \
              disabled test above proves nothing"
+        );
+
+        coordinator.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    /// 2026-07-29 operator report: launching pancetta with an interactive
+    /// TUI and `autonomous.enabled = true` in config immediately started
+    /// dispatching autonomous TX — no `a` keypress needed. Not desirable:
+    /// an interactive launch must always require the operator to
+    /// explicitly arm it, matching the same safety-driver posture as
+    /// Shift+Q. Auto-arming straight from config is reserved for
+    /// `--headless` (see the control test below), where there is no TUI
+    /// to press `a` in.
+    #[tokio::test]
+    async fn interactive_launch_never_auto_arms_even_when_config_enabled() {
+        let mut coordinator = build_coordinator(true, false).await;
+
+        coordinator
+            .start_autonomous_component()
+            .await
+            .expect("start_autonomous_component must succeed for an interactive launch");
+
+        assert!(
+            !coordinator
+                .autonomous_enabled_runtime
+                .load(Ordering::Acquire),
+            "an interactive (non-headless) launch must start with the runtime \
+             gate closed even when autonomous.enabled = true in config — the \
+             operator must press 'a' to arm autonomous TX"
+        );
+
+        coordinator.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    /// Control test: proves the fix above is conditioned on `--headless`,
+    /// not a blanket "never auto-arm" that would break the documented
+    /// supervised-headless workflow (`docs/RUNBOOK.md`: "for a supervised
+    /// headless station, config is the only switch" — there is no TUI to
+    /// press `a` in, so config-driven auto-arm must still work there).
+    #[tokio::test]
+    async fn headless_launch_still_auto_arms_from_config_per_runbook() {
+        let mut coordinator = build_coordinator(true, true).await;
+
+        coordinator
+            .start_autonomous_component()
+            .await
+            .expect("start_autonomous_component must succeed for a headless launch");
+
+        assert!(
+            coordinator
+                .autonomous_enabled_runtime
+                .load(Ordering::Acquire),
+            "a --headless launch must still auto-arm straight from \
+             autonomous.enabled = true — RUNBOOK.md documents config as the \
+             only switch for a supervised headless station, and there is no \
+             TUI to press 'a' in as an alternative"
         );
 
         coordinator.shutdown_signal.store(true, Ordering::Release);
