@@ -25,7 +25,7 @@
 use anyhow::Result;
 use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const SAMPLE_RATE: f32 = 12_000.0;
 
@@ -33,8 +33,8 @@ fn gaussian_noise(rng: &mut StdRng, n: usize, sigma: f32) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
     let mut i = 0;
     while i < n {
-        let u1: f32 = rng.gen_range(f32::EPSILON..1.0);
-        let u2: f32 = rng.gen_range(0.0..1.0);
+        let u1: f32 = rng.random_range(f32::EPSILON..1.0);
+        let u2: f32 = rng.random_range(0.0..1.0);
         let mag = (-2.0 * u1.ln()).sqrt();
         let z0 = mag * (2.0 * std::f32::consts::PI * u2).cos();
         let z1 = mag * (2.0 * std::f32::consts::PI * u2).sin();

@@ -58,7 +58,7 @@ use anyhow::{Context, Result};
 use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
 use pancetta_research::metrics::hash_normalize_message;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -114,8 +114,8 @@ fn gaussian_noise(rng: &mut StdRng, n: usize, sigma: f32) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
     let mut i = 0;
     while i < n {
-        let u1: f32 = rng.gen_range(f32::EPSILON..1.0);
-        let u2: f32 = rng.gen_range(0.0..1.0);
+        let u1: f32 = rng.random_range(f32::EPSILON..1.0);
+        let u2: f32 = rng.random_range(0.0..1.0);
         let mag = (-2.0 * u1.ln()).sqrt();
         let z0 = mag * (2.0 * std::f32::consts::PI * u2).cos();
         let z1 = mag * (2.0 * std::f32::consts::PI * u2).sin();
@@ -137,9 +137,9 @@ fn add_impulse_bursts(rng: &mut StdRng, noise: &mut [f32], sigma_base: f32) {
     // power, since independent Gaussian components add in variance).
     let mut extra_var = vec![0.0f64; n_symbols];
     for s in 0..n_symbols {
-        if rng.gen_range(0.0f64..1.0) < 0.02 {
-            let dur = rng.gen_range(1usize..=3);
-            let amp_db = rng.gen_range(10.0f64..30.0);
+        if rng.random_range(0.0f64..1.0) < 0.02 {
+            let dur = rng.random_range(1usize..=3);
+            let amp_db = rng.random_range(10.0f64..30.0);
             let sigma_burst = sigma_base as f64 * 10f64.powf(amp_db / 20.0);
             for d in 0..dur {
                 if s + d < n_symbols {

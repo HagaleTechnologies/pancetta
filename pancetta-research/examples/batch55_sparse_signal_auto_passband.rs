@@ -40,7 +40,7 @@
 use anyhow::Result;
 use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::collections::HashSet;
 
 const SAMPLE_RATE: f32 = 12_000.0;
@@ -49,8 +49,8 @@ fn gaussian_noise(rng: &mut StdRng, n: usize, sigma: f32) -> Vec<f32> {
     let mut out = Vec::with_capacity(n);
     let mut i = 0;
     while i < n {
-        let u1: f32 = rng.gen_range(f32::EPSILON..1.0);
-        let u2: f32 = rng.gen_range(0.0..1.0);
+        let u1: f32 = rng.random_range(f32::EPSILON..1.0);
+        let u2: f32 = rng.random_range(0.0..1.0);
         let mag = (-2.0 * u1.ln()).sqrt();
         let z0 = mag * (2.0 * std::f32::consts::PI * u2).cos();
         let z1 = mag * (2.0 * std::f32::consts::PI * u2).sin();
@@ -127,7 +127,7 @@ fn synth_sparse_corpus(n_slots: usize) -> Result<Vec<SparseSlot>> {
             // Random audio freq in [500, 2400] Hz. The modulator's
             // hard limit is total_freq + 7 * tone_spacing <= 2500, i.e.
             // audio_freq <= 2456.25; we use 2400 as a safe upper bound.
-            let audio_freq: f32 = rng.gen_range(500.0..2400.0);
+            let audio_freq: f32 = rng.random_range(500.0..2400.0);
             let offset_from_base = audio_freq - 1500.0;
 
             let symbols = encoder
@@ -143,7 +143,7 @@ fn synth_sparse_corpus(n_slots: usize) -> Result<Vec<SparseSlot>> {
 
             // Random per-signal scaling so they don't all have the same
             // amplitude (mimics real-band capture-effect variation).
-            let amp_db: f32 = rng.gen_range(-3.0..3.0);
+            let amp_db: f32 = rng.random_range(-3.0..3.0);
             let amp_scale = 10.0f32.powf(amp_db / 20.0);
 
             for (out, sample) in combined.iter_mut().zip(&tx) {
@@ -156,7 +156,7 @@ fn synth_sparse_corpus(n_slots: usize) -> Result<Vec<SparseSlot>> {
         // Add noise at SNR drawn from [-22, -10] dB relative to the
         // average signal power across this slot's plants.
         let avg_signal_power = total_signal_power / n_signals as f32;
-        let snr_db: f32 = rng.gen_range(-22.0..-10.0);
+        let snr_db: f32 = rng.random_range(-22.0..-10.0);
         let sigma = sigma_for_snr_db(avg_signal_power, snr_db);
         let noise = gaussian_noise(&mut rng, WINDOW_SAMPLES, sigma);
         for (out, n) in combined.iter_mut().zip(&noise) {
