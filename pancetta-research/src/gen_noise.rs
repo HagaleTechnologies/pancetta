@@ -17,7 +17,7 @@
 use anyhow::Context;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -125,7 +125,7 @@ fn select_birdie_indices(count: usize, birdie_fraction: f32, seed: u64) -> Vec<b
     // seed with any per-file noise RNG derived from the same base seed.
     let mut rng = StdRng::seed_from_u64(seed ^ 0xB1DD_1E5E_ED00_u64);
     for i in (1..indices.len()).rev() {
-        let j = rng.gen_range(0..=i);
+        let j = rng.random_range(0..=i);
         indices.swap(i, j);
     }
     let mut flags = vec![false; count];
@@ -154,11 +154,11 @@ fn generate_one_wav(n_samples: usize, file_seed: u64, has_birdie: bool) -> Vec<f
 /// (noise + birdies) is reproducible from a single per-file seed.
 fn add_birdies(samples: &mut [f32], rng: &mut StdRng) {
     let dt = 1.0 / SAMPLE_RATE as f64;
-    let n_steady = rng.gen_range(1..=3u32);
+    let n_steady = rng.random_range(1..=3u32);
     for _ in 0..n_steady {
-        let freq = rng.gen_range(300.0_f64..=2900.0);
-        let level_db = rng.gen_range(0.0_f64..=20.0);
-        let phase0 = rng.gen_range(0.0..TAU);
+        let freq = rng.random_range(300.0_f64..=2900.0);
+        let level_db = rng.random_range(0.0_f64..=20.0);
+        let phase0 = rng.random_range(0.0..TAU);
         let amp = carrier_amplitude(level_db);
         for (i, s) in samples.iter_mut().enumerate() {
             let t = i as f64 * dt;
@@ -166,10 +166,10 @@ fn add_birdies(samples: &mut [f32], rng: &mut StdRng) {
         }
     }
     // One slowly-drifting carrier, independent of the steady carriers above.
-    let center_freq = rng.gen_range(300.0_f64..=2900.0);
-    let level_db = rng.gen_range(0.0_f64..=20.0);
-    let drift_hz_per_sec = rng.gen_range(-0.5_f64..=0.5);
-    let phase0 = rng.gen_range(0.0..TAU);
+    let center_freq = rng.random_range(300.0_f64..=2900.0);
+    let level_db = rng.random_range(0.0_f64..=20.0);
+    let drift_hz_per_sec = rng.random_range(-0.5_f64..=0.5);
+    let phase0 = rng.random_range(0.0..TAU);
     let amp = carrier_amplitude(level_db);
     for (i, s) in samples.iter_mut().enumerate() {
         let t = i as f64 * dt;

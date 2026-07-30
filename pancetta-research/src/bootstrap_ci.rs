@@ -35,7 +35,7 @@
 //! missing (e.g. older archived scorecards).
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 /// Output of a bootstrap CI on a per-tier delta.
 ///
@@ -141,7 +141,7 @@ where
         let mut sum_a = 0.0_f64;
         let mut sum_b = 0.0_f64;
         for _ in 0..n {
-            let i = rng.gen_range(0..n);
+            let i = rng.random_range(0..n);
             sum_a += a_vals[i];
             sum_b += b_vals[i];
         }
