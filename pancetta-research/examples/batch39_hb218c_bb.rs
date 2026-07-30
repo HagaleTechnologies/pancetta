@@ -207,10 +207,10 @@ fn main() -> Result<()> {
         }
     }
     // Add light AWGN (rough -20 dBFS)
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
+    use rand::RngExt;
+    let mut rng = rand::rng();
     for s in wav.iter_mut() {
-        let noise: f32 = rng.gen_range(-0.05..0.05);
+        let noise: f32 = rng.random_range(-0.05..0.05);
         *s += noise;
     }
     let decoded = decode_default(&wav)?;

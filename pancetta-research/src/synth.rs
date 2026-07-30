@@ -550,4 +550,85 @@ mod generation_tests {
         assert_eq!(a.len(), b.len());
         assert_ne!(a, b);
     }
+
+    // ---------------------------------------------------------------------
+    // AWGN statistical invariants (PAN-1).
+    //
+    // `add_awgn_2500hz_ref` is the crate's primary noise-injection path and
+    // had no test at all. These four assert *distribution* properties — RMS
+    // level, SNR scaling, zero mean, per-seed reproducibility — never the
+    // RNG byte stream, so they hold on both sides of a `rand` major bump and
+    // are what distinguishes "the migration preserved behavior" from "the
+    // migration compiled". See `docs/DECISIONS/` / PAN-1 plan Phase 1.
+    // ---------------------------------------------------------------------
+
+    /// The WSJT-X 2500 Hz reference-bandwidth convention inflates the injected
+    /// noise RMS by sqrt(full_band / 2500) over a naive full-band calculation.
+    /// At 12 kHz that is sqrt(6000/2500) ≈ 1.5492. See `add_awgn_2500hz_ref`.
+    #[test]
+    fn awgn_2500hz_ref_hits_reference_bandwidth_rms() {
+        // 10 s @ 12 kHz. Relative std err of an RMS estimate is ≈ 1/sqrt(2n)
+        // ≈ 0.2%, so the 2% tolerance below is ~10σ — loose enough never to
+        // flake, tight enough to catch a wrong bandwidth factor (the nearest
+        // wrong answer, dropping the correction entirely, is 35% low).
+        let n = 120_000;
+        let mut buf = vec![0.0_f32; n];
+        add_awgn_2500hz_ref(&mut buf, 1.0, 0.0, 42);
+        let measured = signal_rms(&buf);
+        let expected = (6000.0_f64 / 2500.0).sqrt(); // ≈ 1.5492
+        assert!(
+            (measured - expected).abs() / expected < 0.02,
+            "measured RMS {measured} deviates >2% from expected {expected}"
+        );
+    }
+
+    /// A 6 dB drop in target SNR must double the injected noise RMS,
+    /// independent of the RNG implementation.
+    #[test]
+    fn awgn_2500hz_ref_scales_6db_as_factor_two() {
+        // Same seed both sides, so the underlying standard-normal draws are
+        // shared and only the σ scaling differs — the ratio is exact up to
+        // f32 rounding. The 3% tolerance is slack, not a fitted constant.
+        let n = 120_000;
+        let mut a = vec![0.0_f32; n];
+        let mut b = vec![0.0_f32; n];
+        add_awgn_2500hz_ref(&mut a, 1.0, 0.0, 7);
+        add_awgn_2500hz_ref(&mut b, 1.0, -6.0, 7);
+        let ratio = signal_rms(&b) / signal_rms(&a);
+        assert!(
+            (ratio - 2.0).abs() < 0.06,
+            "6 dB SNR drop gave RMS ratio {ratio}, expected ~2.0"
+        );
+    }
+
+    /// AWGN must be zero-mean; a biased generator would shift the DC term.
+    #[test]
+    fn awgn_2500hz_ref_is_zero_mean() {
+        // Std err of the mean is σ/sqrt(n) = 1.549/sqrt(120_000) ≈ 0.0045,
+        // i.e. 0.29% of the RMS. The 2%-of-RMS bound is ~7σ.
+        let n = 120_000;
+        let mut buf = vec![0.0_f32; n];
+        add_awgn_2500hz_ref(&mut buf, 1.0, 0.0, 99);
+        let mean = buf.iter().map(|&s| s as f64).sum::<f64>() / n as f64;
+        let rms = signal_rms(&buf);
+        assert!(
+            mean.abs() < 0.02 * rms,
+            "mean {mean} is not negligible against RMS {rms}"
+        );
+    }
+
+    /// The documented per-seed determinism contract (this module's header),
+    /// asserted within a single build. Survives the bump; does not pin the
+    /// stream — cross-version stream stability is explicitly not guaranteed
+    /// (see `pancetta-research/README.md`).
+    #[test]
+    fn awgn_2500hz_ref_is_deterministic_per_seed() {
+        let n = 4_096;
+        let (mut a, mut b, mut c) = (vec![0.0_f32; n], vec![0.0_f32; n], vec![0.0_f32; n]);
+        add_awgn_2500hz_ref(&mut a, 1.0, 3.0, 2026);
+        add_awgn_2500hz_ref(&mut b, 1.0, 3.0, 2026);
+        add_awgn_2500hz_ref(&mut c, 1.0, 3.0, 2027);
+        assert_eq!(a, b, "same seed must reproduce the same noise");
+        assert_ne!(a, c, "different seed must produce different noise");
+    }
 }

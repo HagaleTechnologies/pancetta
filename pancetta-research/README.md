@@ -65,6 +65,52 @@ subset, runs the decoder against it, and produces scorecards. Running this in
 CI would (a) burn Actions minutes on an iteration loop that is inherently
 operator-driven and (b) not have access to the real-world WAV corpus anyway.
 
+## RNG stream stability across `rand` majors
+
+The seed-derivation tree (`seed_from_u64` plus the `wrapping_add`/`wrapping_mul`
+folding and the XOR salts) is version-independent, and every generator here is
+deterministic *within* a given `rand` major: same seed + same config →
+byte-identical WAVs. That guarantee does **not** automatically extend across a
+`rand` major version, because the mapping from the raw RNG stream to a drawn
+value is not part of `rand`'s stability promise.
+
+The 2026-07-29 bump from `rand` 0.8 / `rand_distr` 0.4 to `rand` 0.10 /
+`rand_distr` 0.6 (PAN-1) was measured rather than assumed. Comparing both
+versions at seed 42:
+
+| Primitive | Across 0.8 → 0.10 |
+|---|---|
+| `StdRng::next_u64` (core stream) | **stable** — byte-identical |
+| `rand_distr::Normal::sample::<f64>` | **stable** — bit-identical |
+| `random::<f64>()` (was `gen()`) | **stable** — bit-identical |
+| `random_range(f32_lo..f32_hi)` | **stable** |
+| `random_range(f64_lo..=f64_hi)` | changed by ~1–2 ULP |
+| `random_range(0..n)` / `(0..=n)`, integer | **changed** — different draws entirely |
+
+So the practical consequence is narrower than "regenerate everything":
+
+- **Pure-AWGN output regenerates bit-identically.** A `gen-noise` corpus with
+  `--birdie-fraction 0` and a `gen-synth` AWGN corpus both reproduce their
+  pre-bump `wav_sha256` values exactly, because those paths only ever call
+  `Normal::sample`. Verified on a 4-WAV corpus: all four hashes matched.
+- **Anything drawing an integer range does not.** `select_birdie_indices`
+  (`gen_noise.rs`) is a Fisher-Yates shuffle over `random_range(0..=i)`, so
+  *which* files receive birdies changes. Verified with `--count 8 --seed 42
+  --birdie-fraction 0.5`: the selection moved from `[0,1,0,0,1,1,0,1]` to
+  `[0,1,0,1,1,0,1,0]` and 4 of 8 `wav_sha256` values changed. The *count* is
+  unaffected — exactly 4 birdies on both sides, which
+  `birdie_selection_count_is_exact_across_fractions` pins as a test.
+- `curate.rs` shuffles its pool the same way and does not persist its seed in
+  `CuratedManifest`, so a curated selection made before the bump cannot be
+  reproduced after it at all — re-curate from the source pool.
+
+**Regenerate any locally-held corpus that used a non-zero birdie fraction, and
+treat `wav_sha256` values in any pre-bump manifest as stale.** Nothing in-tree
+pins a golden hash, so nothing fails loudly if you skip this. The statistical
+contracts *are* preserved and are enforced by tests: noise-floor RMS, AWGN σ at
+the 2500 Hz reference bandwidth, SNR scaling, Gaussianity, and exact birdie
+counts all hold identically on both sides of the bump.
+
 ## Design
 
 See `docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md`.

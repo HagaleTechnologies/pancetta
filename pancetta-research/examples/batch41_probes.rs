@@ -15,7 +15,7 @@
 
 use anyhow::{Context, Result};
 use pancetta_ft8::{Ft8Config, Ft8Decoder};
-use rand::Rng;
+use rand::RngExt;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
@@ -282,9 +282,9 @@ fn main() -> Result<()> {
     for amp in [0.001f32, 0.005, 0.01] {
         eprintln!("  dither amp={}…", amp);
         let (decoded, total, tps) = run_pass(&entries, baseline_cfg.clone(), |s| {
-            let mut rng = rand::thread_rng();
+            let mut rng = rand::rng();
             for x in s.iter_mut() {
-                let g: f32 = rng.gen_range(-1.0..1.0);
+                let g: f32 = rng.random_range(-1.0..1.0);
                 *x += g * amp;
             }
         })?;
@@ -348,10 +348,10 @@ fn main() -> Result<()> {
     combo_cfg.osd_depth = Some(3);
     let (decoded, total, tps) = run_pass(&entries, combo_cfg, |s| {
         let mean = s.iter().copied().sum::<f32>() / s.len() as f32;
-        let mut rng = rand::thread_rng();
+        let mut rng = rand::rng();
         for x in s.iter_mut() {
             *x -= mean;
-            let g: f32 = rng.gen_range(-1.0..1.0);
+            let g: f32 = rng.random_range(-1.0..1.0);
             *x += g * 0.005;
         }
     })?;

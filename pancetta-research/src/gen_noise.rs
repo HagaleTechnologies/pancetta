@@ -17,7 +17,7 @@
 use anyhow::Context;
 use hound::{SampleFormat, WavSpec, WavWriter};
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_distr::{Distribution, Normal};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -125,7 +125,7 @@ fn select_birdie_indices(count: usize, birdie_fraction: f32, seed: u64) -> Vec<b
     // seed with any per-file noise RNG derived from the same base seed.
     let mut rng = StdRng::seed_from_u64(seed ^ 0xB1DD_1E5E_ED00_u64);
     for i in (1..indices.len()).rev() {
-        let j = rng.gen_range(0..=i);
+        let j = rng.random_range(0..=i);
         indices.swap(i, j);
     }
     let mut flags = vec![false; count];
@@ -154,11 +154,11 @@ fn generate_one_wav(n_samples: usize, file_seed: u64, has_birdie: bool) -> Vec<f
 /// (noise + birdies) is reproducible from a single per-file seed.
 fn add_birdies(samples: &mut [f32], rng: &mut StdRng) {
     let dt = 1.0 / SAMPLE_RATE as f64;
-    let n_steady = rng.gen_range(1..=3u32);
+    let n_steady = rng.random_range(1..=3u32);
     for _ in 0..n_steady {
-        let freq = rng.gen_range(300.0_f64..=2900.0);
-        let level_db = rng.gen_range(0.0_f64..=20.0);
-        let phase0 = rng.gen_range(0.0..TAU);
+        let freq = rng.random_range(300.0_f64..=2900.0);
+        let level_db = rng.random_range(0.0_f64..=20.0);
+        let phase0 = rng.random_range(0.0..TAU);
         let amp = carrier_amplitude(level_db);
         for (i, s) in samples.iter_mut().enumerate() {
             let t = i as f64 * dt;
@@ -166,10 +166,10 @@ fn add_birdies(samples: &mut [f32], rng: &mut StdRng) {
         }
     }
     // One slowly-drifting carrier, independent of the steady carriers above.
-    let center_freq = rng.gen_range(300.0_f64..=2900.0);
-    let level_db = rng.gen_range(0.0_f64..=20.0);
-    let drift_hz_per_sec = rng.gen_range(-0.5_f64..=0.5);
-    let phase0 = rng.gen_range(0.0..TAU);
+    let center_freq = rng.random_range(300.0_f64..=2900.0);
+    let level_db = rng.random_range(0.0_f64..=20.0);
+    let drift_hz_per_sec = rng.random_range(-0.5_f64..=0.5);
+    let phase0 = rng.random_range(0.0..TAU);
     let amp = carrier_amplitude(level_db);
     for (i, s) in samples.iter_mut().enumerate() {
         let t = i as f64 * dt;
@@ -360,6 +360,98 @@ mod tests {
         let flags = select_birdie_indices(20, 0.3, 42);
         assert_eq!(flags.len(), 20);
         assert_eq!(flags.iter().filter(|&&b| b).count(), 6); // round(20*0.3)=6
+    }
+
+    // ---------------------------------------------------------------------
+    // Noise-generator statistical invariants (PAN-1).
+    //
+    // The existing tests above compare two runs *within the same build*, so
+    // they pass vacuously across a `rand` major bump. These four assert
+    // distribution and exact-count properties instead: the noise floor level,
+    // actual Gaussianity, birdie energy, and Fisher-Yates selection counts.
+    // Nothing here can only pass on one `rand` version.
+    // ---------------------------------------------------------------------
+
+    /// The generated noise floor must sit at `TARGET_NOISE_RMS` (0.03), the
+    /// value the whole FP-on-noise metric is calibrated against.
+    #[test]
+    fn generated_noise_hits_target_rms() {
+        // 180k samples → RMS relative std err ≈ 1/sqrt(2n) ≈ 0.17%; the 2%
+        // bound is ~12σ.
+        let samples = generate_one_wav(180_000, 7, false);
+        let n = samples.len() as f64;
+        let measured = (samples.iter().map(|&s| (s as f64).powi(2)).sum::<f64>() / n).sqrt();
+        assert!(
+            (measured - TARGET_NOISE_RMS).abs() / TARGET_NOISE_RMS < 0.02,
+            "noise RMS {measured} deviates >2% from TARGET_NOISE_RMS {TARGET_NOISE_RMS}"
+        );
+    }
+
+    /// The AWGN must actually be Gaussian, not merely the right RMS — this is
+    /// the assertion that catches a distribution regression across the `rand`
+    /// major (e.g. a uniform generator with a matching variance would pass an
+    /// RMS check and fail here).
+    #[test]
+    fn generated_noise_is_approximately_gaussian() {
+        // Std err of a proportion at p≈0.68, n=180k is sqrt(p(1-p)/n) ≈ 0.0011,
+        // so the 0.01 bound is ~9σ. A uniform distribution of the same variance
+        // would give a 1σ fraction of 0.577 — 10× outside the tolerance.
+        let samples = generate_one_wav(180_000, 11, false);
+        let n = samples.len() as f64;
+        let within = |k: f64| {
+            samples
+                .iter()
+                .filter(|&&s| (s as f64).abs() < k * TARGET_NOISE_RMS)
+                .count() as f64
+                / n
+        };
+        let (one_sigma, two_sigma) = (within(1.0), within(2.0));
+        assert!(
+            (one_sigma - 0.6827).abs() < 0.01,
+            "1σ fraction {one_sigma}, expected ≈0.6827"
+        );
+        assert!(
+            (two_sigma - 0.9545).abs() < 0.01,
+            "2σ fraction {two_sigma}, expected ≈0.9545"
+        );
+    }
+
+    /// Birdie carriers sit 0..+20 dB over the noise floor, so their presence
+    /// must raise total energy for the same seed. Even the weakest case (one
+    /// carrier at 0 dB) adds in quadrature for a sqrt(2)× rise.
+    #[test]
+    fn birdies_raise_energy_above_pure_noise() {
+        let plain = generate_one_wav(60_000, 4242, false);
+        let birdied = generate_one_wav(60_000, 4242, true);
+        let (plain_rms, birdied_rms) = (rms(&plain), rms(&birdied));
+        assert!(
+            birdied_rms > plain_rms * 1.05,
+            "birdied RMS {birdied_rms} not meaningfully above plain RMS {plain_rms}"
+        );
+    }
+
+    /// The Fisher-Yates selection must yield an EXACT count for every
+    /// fraction, regardless of how the RNG lands. Extends
+    /// `birdie_fraction_selects_exact_count` across the range, including both
+    /// endpoints and a case where `round()` breaks a tie upward
+    /// (round(7 * 0.5) = round(3.5) = 4).
+    #[test]
+    fn birdie_selection_count_is_exact_across_fractions() {
+        for (count, frac, expected) in [
+            (20, 0.0_f32, 0),
+            (20, 0.25, 5),
+            (20, 0.5, 10),
+            (20, 1.0, 20),
+            (7, 0.5, 4),
+        ] {
+            let flags = select_birdie_indices(count, frac, 31337);
+            assert_eq!(flags.len(), count);
+            assert_eq!(
+                flags.iter().filter(|&&f| f).count(),
+                expected,
+                "count={count} frac={frac} produced the wrong number of birdies"
+            );
+        }
     }
 
     #[test]

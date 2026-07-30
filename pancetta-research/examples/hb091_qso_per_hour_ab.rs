@@ -84,7 +84,7 @@
 //!   cargo run --release -p pancetta-research --example hb091_qso_per_hour_ab
 
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 const N_TRIALS: usize = 2000;
 const LEGS_PER_QSO: usize = 4;
@@ -101,8 +101,8 @@ struct EmpiricalDist {
 
 impl EmpiricalDist {
     /// Sample by inverse-CDF via linear interpolation between percentile points.
-    fn sample(&self, rng: &mut impl Rng) -> f64 {
-        let u: f64 = rng.gen();
+    fn sample(&self, rng: &mut impl RngExt) -> f64 {
+        let u: f64 = rng.random();
         let p = &self.points;
         // Find bracket [p_lo, p_hi] containing u
         for w in p.windows(2) {
@@ -199,7 +199,7 @@ impl Arm {
         }
     }
 
-    fn sample_decode_ms(&self, rng: &mut impl Rng) -> f64 {
+    fn sample_decode_ms(&self, rng: &mut impl RngExt) -> f64 {
         match self {
             Arm::FullOnly => FULL_DIST.sample(rng),
             Arm::ScopedFastPath => SCOPED_DIST.sample(rng),
@@ -208,13 +208,13 @@ impl Arm {
 }
 
 /// Simulate one leg; return (slots_consumed, succeeded).
-fn simulate_leg(arm: Arm, fade: FadeScenario, rng: &mut impl Rng) -> (u32, bool) {
+fn simulate_leg(arm: Arm, fade: FadeScenario, rng: &mut impl RngExt) -> (u32, bool) {
     let mut slots = 1u32; // the partner-TX slot we're decoding
     for _attempt in 0..=MAX_RETRIES_PER_LEG {
         let decode_ms = arm.sample_decode_ms(rng);
         let tx_late_ms = (decode_ms - SLOT_BUDGET_MS).max(0.0);
         let fail_prob = fade.fail_prob(tx_late_ms);
-        if rng.gen::<f64>() >= fail_prob {
+        if rng.random::<f64>() >= fail_prob {
             // partner decoded our TX successfully → leg done
             // We consume one MORE slot for our TX itself
             return (slots + 1, true);
@@ -226,7 +226,7 @@ fn simulate_leg(arm: Arm, fade: FadeScenario, rng: &mut impl Rng) -> (u32, bool)
 }
 
 /// Simulate one QSO; return total slots consumed and whether all legs succeeded.
-fn simulate_qso(arm: Arm, fade: FadeScenario, rng: &mut impl Rng) -> (u32, bool) {
+fn simulate_qso(arm: Arm, fade: FadeScenario, rng: &mut impl RngExt) -> (u32, bool) {
     let mut total_slots = 0u32;
     for _ in 0..LEGS_PER_QSO {
         let (slots, ok) = simulate_leg(arm, fade, rng);
@@ -238,7 +238,7 @@ fn simulate_qso(arm: Arm, fade: FadeScenario, rng: &mut impl Rng) -> (u32, bool)
     (total_slots, true)
 }
 
-fn qsos_per_hour(arm: Arm, fade: FadeScenario, rng: &mut impl Rng) -> (f64, f64) {
+fn qsos_per_hour(arm: Arm, fade: FadeScenario, rng: &mut impl RngExt) -> (f64, f64) {
     let mut total_slots: u64 = 0;
     let mut successful = 0u64;
     for _ in 0..N_TRIALS {

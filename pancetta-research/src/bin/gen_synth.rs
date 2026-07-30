@@ -24,7 +24,7 @@ use pancetta_research::synth::{
 };
 use pancetta_research::Mode;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use std::path::{Path, PathBuf};
 
 /// Canonical FT8 sample rate (12 kHz, matches pancetta_ft8::SAMPLE_RATE)
@@ -201,8 +201,8 @@ fn main() -> anyhow::Result<()> {
                 // the AWGN fill (keeps the two independent while staying
                 // fully deterministic for a given top-level config seed).
                 let mut meta_rng = StdRng::seed_from_u64(seed_for_this_wav ^ 0xA5A5_A5A5_A5A5_A5A5);
-                let base_freq_hz: f64 = meta_rng.gen_range(BASE_FREQ_RANGE_HZ);
-                let dt_s: f64 = meta_rng.gen_range(dt_range_s.clone());
+                let base_freq_hz: f64 = meta_rng.random_range(BASE_FREQ_RANGE_HZ);
+                let dt_s: f64 = meta_rng.random_range(dt_range_s.clone());
 
                 let mut base_signal =
                     modulate_message_at_protocol(msg, base_freq_hz, &protocol_params)?;
