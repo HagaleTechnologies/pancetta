@@ -340,4 +340,41 @@ mod tests {
         assert!((percentile_sorted(&xs, 0.0) - 1.0).abs() < 1e-12);
         assert!((percentile_sorted(&xs, 100.0) - 11.0).abs() < 1e-12);
     }
+
+    /// PAN-1: the resample index draw (`bootstrap_delta_impl`) must cover the
+    /// full half-open `[0, n)` range. This is the only assertion in the module
+    /// that would catch a half-open→inclusive slip (which panics on index `n`)
+    /// or a truncated range (which biases the CI) — every other test above
+    /// feeds a uniform per-WAV shift, so its resample sum is constant no
+    /// matter which indices get drawn.
+    ///
+    /// Deliberately not a stream assertion: it pins the *distribution* the
+    /// draw induces, so it holds across a `rand` major bump.
+    #[test]
+    fn bootstrap_resampling_covers_the_full_index_range() {
+        // Per-WAV deltas are 0..=7 (mean 3.5). The statistic is a SUM over n=8
+        // resampled indices, so the bootstrap mean must approach 8 * 3.5 = 28.
+        let a: Vec<(u32, u32)> = vec![(0, 8); 8];
+        let b: Vec<(u32, u32)> = (0..8).map(|i| (i as u32, 8)).collect();
+        let ci = bootstrap_recall_delta(&a, &b, 5_000, 20_260_729);
+
+        // One draw has variance (8^2 - 1)/12 = 5.25, so a resample sum of 8
+        // draws has sd sqrt(8 * 5.25) ≈ 6.48 and the mean over 5000 resamples
+        // has std err ≈ 0.092. The 0.5 bound is ~5.4σ. Discriminating power:
+        // dropping index 7 from the range would give 8 * 3.0 = 24.0, and an
+        // inclusive `0..=n` would panic indexing an 8-element slice.
+        assert!(
+            (ci.mean - 28.0).abs() < 0.5,
+            "bootstrap mean {} far from the expected resample-sum mean 28.0 \
+             (a truncated index range biases this low)",
+            ci.mean
+        );
+        assert!(
+            ci.ci_low < ci.mean && ci.mean < ci.ci_high,
+            "mean {} not bracketed by CI [{}, {}]",
+            ci.mean,
+            ci.ci_low,
+            ci.ci_high
+        );
+    }
 }
