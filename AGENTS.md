@@ -100,3 +100,4 @@ You are never alone in this repo — other agents may work concurrently in other
 - **Isolate:** always a branch (worktree preferred), never a shared checkout's main; use per-session scratch dirs and don't bind fixed ports.
 - **Flush at the end:** push (`--force-with-lease` only) and open/update your PR before finishing — unpushed work is invisible work.
 - **Main moves only by PR merge.**
+- **Watch PR text near ticket IDs.** Linear's GitHub integration auto-closes any ticket whose ID appears immediately after a magic word (`Fixes`/`Closes`/`Resolves`, etc.) anywhere in a merged PR's title or body, mid-sentence included, even when that adjacency wasn't meant as a closing reference. If a PR isn't meant to close a specific ticket, keep that magic word away from the ticket ID entirely — write "addresses an issue found while working on it" or "related to" instead, never a magic word directly before the identifier.
