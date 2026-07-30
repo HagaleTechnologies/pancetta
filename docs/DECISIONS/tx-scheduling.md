@@ -83,6 +83,25 @@ moved, from inside that branching to a single point right before Step 5.
 Spec: `docs/superpowers/specs/2026-07-21-symptom-c-adaptive-coalesce-window-design.md`. Plan:
 `docs/superpowers/plans/2026-07-21-symptom-c-adaptive-coalesce-window.md`.
 
+## Autonomous runtime-arm gate no longer auto-arms on an interactive launch (2026-07-29)
+
+`autonomous_enabled_runtime` (`hb-161` Phase 5 emergency-stop gate, `coordinator/mod.rs`) is the
+atomic flag the autonomous decision loop checks before dispatching any `TransmitRequest`; Shift+Q
+clears it, `a` in the TUI toggles it. Previously `start_autonomous_component` (`coordinator/autonomous.rs`)
+seeded this gate directly from `config.autonomous.enabled` regardless of how pancetta was launched —
+so an interactive TUI session with `autonomous.enabled = true` in config started already
+transmitting autonomously, with no `a` keypress needed. Operator-reported (2026-07-29) as not
+desirable: an interactive launch should always require an explicit arm.
+
+Fixed by conditioning the seed on `--headless`: `seed_armed = auto_config_enabled && self.headless`.
+An interactive (TUI) launch now always starts with the gate closed, requiring `a` to arm, regardless
+of config — mirroring Shift+Q's disarm posture. A `--headless` launch is unaffected and still
+auto-arms straight from config, since `docs/RUNBOOK.md` documents config as the *only* switch for a
+supervised headless station (there is no TUI to press `a` in as an alternative — no other mechanism
+exists to flip this gate at runtime). Tests:
+`coordinator::autonomous::fq_f9_placement_feed_when_disabled_tests::interactive_launch_never_auto_arms_even_when_config_enabled`
+and its `headless_launch_still_auto_arms_from_config_per_runbook` control.
+
 ## Coordinator-level QSO sim harness
 
 `pancetta/tests/coord_sim.rs`: a durable, reusable `CoordSim` fixture that exercises the *coordinator's* TX gate + mock-rig PTT + multi-stream path, complementing the engine-level state-machine harness in `pancetta-qso/src/sim.rs`. It stands up a real `MessageBus`, a real `QsoManager`, a real `MockRig` behind a hamlib consumer (mirror of `coordinator/hamlib.rs`'s `SetPtt` handling), and the *real* shared `active_tx_qsos` set + `tx_policy` atomic. A scenario starts/advances QSOs via the manager's real entry points (`respond_to_cq_with` / `respond_to_caller` / `start_cq`), calls `pump_qso_events()` (a faithful mirror of `coordinator/qso.rs`'s populater — insert on `StateChanged→active`/`QsoCompleted`, remove on `Failed`/`QsoFailed`, forward `MessageToSend`→`TransmitRequest`), then `drive_slot(pending)` which replicates the worker's keying-decision chain — **policy hard-mute → coalesce (real `coalesce_transmit_requests`) → Step-4b gate (real `tx_qso_is_live` over the real set) → key/audio/unkey** — sending real `RigControl(SetPtt)` over the bus to the mock rig and **asserting at the rig level** (`mock.get_ptt() == On`, offset, release). **Determinism**: no `schedule_tx` UTC math and no slot sleep (that's unit-tested in `tx.rs::schedule_tx_tests`); only bounded ms `await`s — pass/fail never depends on wall-clock slot phase. A `Timeline` (keyed / dropped / per-slot offsets, mirroring `sim::Timeline`'s style + Display) carries the readable assertion helpers. Permanent scenarios: PTT-keys-for-scheduled-QSO (StateChanged-at-start fix), stale-TX-dropped-after-supersede (no PTT), coalesce-backlog (newest wins, older not keyed), two-simultaneous-QSOs on distinct freqs, TX-policy Disabled=silent / RespondOnly=in-progress-keys-but-initiation-suppressed / Full=keys, requested-offset-honored, manual-send-never-gated. Made testable by re-exporting `coalesce_transmit_requests` / `CoalesceEntry` / `resolve_required_parity` and widening `active_tx_qso_key` / `tx_qso_is_live` to `pub` from `coordinator/mod.rs` (visibility-only, behavior-preserving).
