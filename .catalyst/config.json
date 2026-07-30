@@ -34,9 +34,9 @@
       "maxRemovalsPerRun": 10
     },
     "executionCore": {
-      "maxParallel": 1,
+      "maxParallel": 3,
       "minParallel": 1,
-      "maxParallelCeiling": 2
+      "maxParallelCeiling": 3
     },
     "orchestration": {
       "executor": "codex-exec"
