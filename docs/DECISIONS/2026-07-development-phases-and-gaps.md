@@ -22,11 +22,9 @@
   the CI minutes — the crate is excluded by deliberate design (`AGENTS.md`), so this is an
   architecture decision, not a bug. (Surfaced by PAN-1, 2026-07-29.)
 
-- **~25 duplicated `gaussian_noise` Box-Muller helpers** in `pancetta-research/examples/` —
-  byte-identical copies (verified by hashing each function body: one distinct hash across 25
-  files), each edited in place during the PAN-1 `rand` 0.10 migration because keeping that
-  diff mechanical kept it reviewable. Consolidating them into one crate-level helper is a
-  standalone cleanup. (Surfaced by PAN-1, 2026-07-29.)
+- ~~**~25 duplicated `gaussian_noise` Box-Muller helpers** in `pancetta-research/examples/`~~ —
+  fixed 2026-07-31: consolidated into `pancetta_research::noise::gaussian_noise`, all 25
+  call sites updated. (Surfaced by PAN-1, 2026-07-29.)
 
 ## Missing-docs lint status (verified 2026-07-17)
 

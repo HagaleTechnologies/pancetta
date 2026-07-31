@@ -27,6 +27,7 @@
 //!   cargo run --release -p pancetta-research --example batch30_coherent_vs_noncoherent
 
 use anyhow::Result;
+use pancetta_research::noise::gaussian_noise;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 
@@ -36,25 +37,6 @@ const SYMBOL_DURATION: f32 = 0.160; // 160 ms per FT8 symbol
 const SAMPLES_PER_SYMBOL: usize = (SYMBOL_DURATION * SAMPLE_RATE) as usize; // 1920
 const N_SYMBOLS: usize = 10;
 const N_REALIZATIONS: usize = 500;
-
-fn gaussian_noise(rng: &mut StdRng, n: usize, sigma: f32) -> Vec<f32> {
-    let mut out = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
-        let u1: f32 = rng.random_range(f32::EPSILON..1.0);
-        let u2: f32 = rng.random_range(0.0..1.0);
-        let mag = (-2.0 * u1.ln()).sqrt();
-        let z0 = mag * (2.0 * std::f32::consts::PI * u2).cos();
-        let z1 = mag * (2.0 * std::f32::consts::PI * u2).sin();
-        out.push(z0 * sigma);
-        i += 1;
-        if i < n {
-            out.push(z1 * sigma);
-            i += 1;
-        }
-    }
-    out
-}
 
 /// Coherent integration: compute I+jQ per symbol, then sum across N
 /// symbols (coherent phase accumulation), return |sum|.
