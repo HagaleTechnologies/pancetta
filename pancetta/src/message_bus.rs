@@ -247,6 +247,19 @@ pub enum MessageType {
     /// never drives PTT or audio.
     TxStatus { active: bool },
 
+    /// A `TxOrigin::Remote` request was dropped by the station-agent arm
+    /// gate before keying PTT (dispensa Q-0051 Phase C). Sent alongside the
+    /// existing `TxDenied` audit-log append and `DiagnosticEvent` (Phase A/B)
+    /// — this one is additionally relayed to `ComponentId::RemoteGateway` so
+    /// connected remote clients (panino, cqdx-web) see a live `error` event
+    /// instead of silence. `reason` is a short human-readable explanation
+    /// (not the raw `ArmState` internals); `qso_id` is `None` for a
+    /// multi-TX bundle drop (no single QSO to attribute it to).
+    TxDenied {
+        reason: String,
+        qso_id: Option<String>,
+    },
+
     /// Richer TX-queue snapshot for the TUI's NOW-SENDING / QUEUED view.
     /// Sent by the TX worker alongside the boolean `TxStatus` badge:
     /// `sending` is `Some(item)` while a transmission is keyed (text +

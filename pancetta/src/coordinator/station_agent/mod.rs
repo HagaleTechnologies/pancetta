@@ -548,11 +548,13 @@ async fn dispatch_action(
             // We never key TX here. An unarmed remote operator's QSO is created
             // but every frame it emits is dropped by the TX worker's arm gate
             // (because it is `TxOrigin::Remote`) — logged (`warn!`, target
-            // "agent.tx") and surfaced to the local TUI Diagnostics overlay
-            // (`DiagnosticEvent`, dispensa Q-0051 Phase A), but NOT yet
-            // AuditLog-appended or relayed to remote clients (Q-0051 Phases
-            // B/C, not built here). There is deliberately NO code path here
-            // that keys TX outside the normal
+            // "agent.tx"), surfaced to the local TUI Diagnostics overlay
+            // (`DiagnosticEvent`), AuditLog-appended (`AuditKind::TxDenied`,
+            // matching this action's own `Arm`-rejection audit below), and
+            // relayed to any connected remote client as a generic `error`
+            // event (`MessageType::TxDenied` → `ServerEvent::Error`) — all
+            // three closed by dispensa Q-0051. There is deliberately NO code
+            // path here that keys TX outside the normal
             // QSO → MessageToSend → TransmitRequest(Remote) → arm-gate flow.
             let detail = match &kind {
                 TxKind::CallStation { callsign, .. } => format!("callStation {callsign}"),
@@ -1037,12 +1039,10 @@ impl super::ApplicationCoordinator {
             return self.spawn_station_agent_drain().await;
         }
 
-        let audit = AuditLog::new(
-            cfg.audit_log_path
-                .clone()
-                .map(std::path::PathBuf::from)
-                .unwrap_or_else(pancetta_agent::audit::default_audit_path),
-        );
+        // Shared with the TX worker (dispensa Q-0051 Phase B) — single source
+        // of truth, constructed once at coordinator startup from the same
+        // `cfg.audit_log_path` resolution this used to do locally.
+        let audit = self.audit_log();
 
         // Task 4: `run_session_loop`/`run_one_session` now drives a
         // `MultiPeerSession`, which can demux up to `multi_session::MAX_PEERS`
