@@ -2257,6 +2257,15 @@ impl super::ApplicationCoordinator {
             // poisoned lock (safety gate). Inert in P0–P2 (nothing arms it, no
             // remote request is constructed).
             let remote_tx_arm = self.remote_tx_arm();
+            // Shared station-agent audit log (dispensa Q-0051 Phase B) — the
+            // Step 0a remote-TX arm-gate drop appends `AuditKind::TxDenied`,
+            // matching the existing `Arm`-rejection audit pattern.
+            let audit_log = self.audit_log();
+            // Gates the additive Step 0a relay send below (Phase C): mirrors
+            // every other `relay_to_gateway` call site (hamlib.rs,
+            // autonomous.rs, qso.rs) — zero-cost no-op when neither the
+            // localhost gateway nor the station agent's read stream is live.
+            let display_feed_enabled = self.display_feed_enabled.clone();
 
             tokio::spawn(async move {
                 info!(
@@ -2670,6 +2679,32 @@ impl super::ApplicationCoordinator {
                                                 "Remote TX denied (not armed/permitted): '{message_text}' at {frequency_offset:.0} Hz"
                                             ),
                                             qso_id.as_deref(),
+                                        )
+                                        .await;
+                                        // dispensa Q-0051 Phase B/C: audit the
+                                        // drop (matches the existing `Arm`-
+                                        // rejection `TxDenied` pattern) and
+                                        // relay a client-visible signal to any
+                                        // connected remote client.
+                                        let denial_reason = format!(
+                                            "not armed/permitted: '{message_text}' at {frequency_offset:.0} Hz"
+                                        );
+                                        audit_log.append(&pancetta_agent::audit::AuditEvent {
+                                            ts_unix_ms: chrono::Utc::now().timestamp_millis(),
+                                            kind: pancetta_agent::audit::AuditKind::TxDenied,
+                                            operator_callsign: remote_tx_arm.lock().ok().and_then(
+                                                |s| s.operator_callsign().map(str::to_string),
+                                            ),
+                                            detail: denial_reason.clone(),
+                                        });
+                                        super::remote_gateway::relay_to_gateway(
+                                            &message_bus,
+                                            &display_feed_enabled,
+                                            ComponentId::Ft8Transmitter,
+                                            MessageType::TxDenied {
+                                                reason: denial_reason,
+                                                qso_id: qso_id.clone(),
+                                            },
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
@@ -3777,6 +3812,33 @@ impl super::ApplicationCoordinator {
                                                 items.len()
                                             ),
                                             None,
+                                        )
+                                        .await;
+                                        // dispensa Q-0051 Phase B/C: audit the
+                                        // drop and relay a client-visible
+                                        // signal, mirroring the single-TX site
+                                        // above. No single qso_id to attribute
+                                        // a bundle drop to.
+                                        let denial_reason = format!(
+                                            "not armed/permitted: multi-TX bundle of {} items",
+                                            items.len()
+                                        );
+                                        audit_log.append(&pancetta_agent::audit::AuditEvent {
+                                            ts_unix_ms: chrono::Utc::now().timestamp_millis(),
+                                            kind: pancetta_agent::audit::AuditKind::TxDenied,
+                                            operator_callsign: remote_tx_arm.lock().ok().and_then(
+                                                |s| s.operator_callsign().map(str::to_string),
+                                            ),
+                                            detail: denial_reason.clone(),
+                                        });
+                                        super::remote_gateway::relay_to_gateway(
+                                            &message_bus,
+                                            &display_feed_enabled,
+                                            ComponentId::Ft8Transmitter,
+                                            MessageType::TxDenied {
+                                                reason: denial_reason,
+                                                qso_id: None,
+                                            },
                                         )
                                         .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;

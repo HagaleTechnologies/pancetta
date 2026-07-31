@@ -1004,6 +1004,14 @@ pub struct ApplicationCoordinator {
     /// (default OFF), so with nothing arming it and no remote requests being
     /// constructed (P0–P2), this gate is inert. Local TX never consults it.
     pub(crate) remote_tx_arm: Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    /// The station-agent audit log, shared so more than just
+    /// `run_session_loop`'s own `ArmContext` can append to it — notably the
+    /// TX worker (`tx.rs`), which appends `AuditKind::TxDenied` when the
+    /// remote-TX arm gate drops a request (dispensa Q-0051 Phase B). Cheap
+    /// to construct unconditionally at startup (`AuditLog` is just a
+    /// `PathBuf`, no I/O until `append()`), so this is a single source of
+    /// truth even when the station agent itself never starts.
+    pub(crate) audit_log: pancetta_agent::audit::AuditLog,
 
     /// `QsoEvent` broadcast receiver for the WSJT-X UDP component
     /// (`start_wsjtx_udp_component`, started later in the boot sequence than
@@ -1269,6 +1277,21 @@ impl ApplicationCoordinator {
             config.network.station_agent.remote_tx_enabled,
             wsjtx_allow_tx_initiation_init,
         );
+        // Snapshot the audit log path before config is moved into the
+        // Arc<RwLock> — mirrors the other "snapshot before move" fields
+        // above. Constructed unconditionally (cheap, no I/O until the first
+        // `append()`) so the TX worker and the station agent share one
+        // `AuditLog` instead of each building their own (dispensa Q-0051
+        // Phase B).
+        let audit_log_init = pancetta_agent::audit::AuditLog::new(
+            config
+                .network
+                .station_agent
+                .audit_log_path
+                .clone()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(pancetta_agent::audit::default_audit_path),
+        );
         if wsjtx_allow_tx_initiation_init {
             warn!(
                 target: "remote.wsjtx",
@@ -1501,6 +1524,7 @@ impl ApplicationCoordinator {
                 let _ = st.set_local_consent(remote_tx_consent_init, now_ms);
                 Arc::new(std::sync::Mutex::new(st))
             },
+            audit_log: audit_log_init,
             wsjtx_qso_events_rx: None,
             qso_manager_for_supervisor: None,
         };
@@ -1838,6 +1862,11 @@ impl ApplicationCoordinator {
     /// inert; local TX never consults it.
     pub(crate) fn remote_tx_arm(&self) -> Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>> {
         self.remote_tx_arm.clone()
+    }
+
+    /// The shared station-agent audit log (see the field doc comment).
+    pub(crate) fn audit_log(&self) -> pancetta_agent::audit::AuditLog {
+        self.audit_log.clone()
     }
 
     /// Raw atomic handle for hot loops (DSP thread, decode loop, TX worker)
@@ -2182,6 +2211,75 @@ mod pivot_bundle_tests {
 mod tests {
     use super::*;
     use pancetta_config::Config;
+
+    // ------------------------------------------------------------------
+    // Shared audit log (dispensa Q-0051 Phase B): constructed once at
+    // startup from `[network.station_agent].audit_log_path`, so the TX
+    // worker and the station agent share the same `AuditLog` instead of
+    // each building their own.
+    // ------------------------------------------------------------------
+
+    async fn build_coordinator(config: Config) -> ApplicationCoordinator {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    #[tokio::test]
+    async fn audit_log_defaults_to_the_standard_path_when_unconfigured() {
+        let config = Config::default();
+        assert!(
+            config.network.station_agent.audit_log_path.is_none(),
+            "precondition: default config has no audit_log_path override"
+        );
+        let coordinator = build_coordinator(config).await;
+        assert_eq!(
+            coordinator.audit_log().path(),
+            &pancetta_agent::audit::default_audit_path(),
+            "with no configured path, the shared AuditLog must fall back to \
+             the standard default path"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_log_honors_a_configured_path() {
+        let mut config = Config::default();
+        let custom = std::env::temp_dir().join("pancetta-test-audit-log-honors-path.jsonl");
+        config.network.station_agent.audit_log_path = Some(custom.to_string_lossy().to_string());
+        let coordinator = build_coordinator(config).await;
+        assert_eq!(
+            coordinator.audit_log().path(),
+            &custom,
+            "a configured audit_log_path must be honored by the shared AuditLog"
+        );
+    }
+
+    #[tokio::test]
+    async fn audit_log_clones_share_the_same_path_as_remote_tx_arm_shares_state() {
+        // The TX worker and the station agent each hold their own clone of
+        // `AuditLog` (it's a cheap PathBuf wrapper, not a shared handle —
+        // see its own doc comment), but both clones must resolve to the
+        // SAME file so appends from either side land in one log. Mirrors
+        // `remote_tx_arm()`'s clone-shares-state guarantee (there, via
+        // `Arc<Mutex<_>>`; here, via equal `PathBuf`s).
+        let coordinator = build_coordinator(Config::default()).await;
+        let a = coordinator.audit_log();
+        let b = coordinator.audit_log();
+        assert_eq!(a.path(), b.path());
+    }
 
     // ------------------------------------------------------------------
     // DspTiming derivation — FT8 byte-identical regression guard + FT4.

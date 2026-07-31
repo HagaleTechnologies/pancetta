@@ -203,6 +203,10 @@ pub(crate) fn server_event_from_bus(msg: &MessageType) -> Option<ServerEvent> {
         MessageType::TxStatus { active } => Some(ServerEvent::TxStatus { active: *active }),
         MessageType::ModeStatus { mode } => Some(ServerEvent::Mode { mode: mode.clone() }),
         MessageType::TxPlacementUpdate { snapshot } => Some(placement_snapshot_to_event(snapshot)),
+        MessageType::TxDenied { reason, .. } => Some(ServerEvent::Error {
+            component: "tx".to_string(),
+            message: format!("remote TX denied: {reason}"),
+        }),
         _ => None,
     }
 }
@@ -504,5 +508,27 @@ mod tests {
             matches!(event, Some(ServerEvent::Placement { .. })),
             "expected Some(Placement), got {event:?}"
         );
+    }
+
+    /// dispensa Q-0051 Phase C: a remote-TX arm-gate drop must reach
+    /// connected clients as the existing generic `error` event — no new wire
+    /// shape, reusing `ServerEvent::Error { component, message }`.
+    #[test]
+    fn server_event_from_bus_maps_tx_denied_to_the_generic_error_event() {
+        let msg = MessageType::TxDenied {
+            reason: "not armed/permitted".to_string(),
+            qso_id: Some("qso-9".to_string()),
+        };
+        let event = server_event_from_bus(&msg);
+        match event {
+            Some(ServerEvent::Error { component, message }) => {
+                assert_eq!(component, "tx");
+                assert!(
+                    message.contains("not armed/permitted"),
+                    "message should carry the reason: {message}"
+                );
+            }
+            other => panic!("expected Some(ServerEvent::Error {{ .. }}), got {other:?}"),
+        }
     }
 }
