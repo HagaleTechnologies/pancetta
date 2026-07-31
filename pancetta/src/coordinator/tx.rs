@@ -2657,11 +2657,21 @@ impl super::ApplicationCoordinator {
                                             chrono::Utc::now().timestamp_millis(),
                                         )
                                     {
-                                        info!(
+                                        warn!(
                                             target: "agent.tx",
                                             "dropping remote TX — not armed/permitted: '{}' at {:.0} Hz (qso: {:?})",
                                             message_text, frequency_offset, qso_id
                                         );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "agent.tx",
+                                            pancetta_core::DiagnosticLevel::Warn,
+                                            format!(
+                                                "Remote TX denied (not armed/permitted): '{message_text}' at {frequency_offset:.0} Hz"
+                                            ),
+                                            qso_id.as_deref(),
+                                        )
+                                        .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
@@ -3753,11 +3763,22 @@ impl super::ApplicationCoordinator {
                                             chrono::Utc::now().timestamp_millis(),
                                         )
                                     {
-                                        info!(
+                                        warn!(
                                             target: "agent.tx",
                                             "dropping remote TX — not armed/permitted: multi-TX bundle of {} items",
                                             items.len()
                                         );
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "agent.tx",
+                                            pancetta_core::DiagnosticLevel::Warn,
+                                            format!(
+                                                "Remote TX denied (not armed/permitted): multi-TX bundle of {} items",
+                                                items.len()
+                                            ),
+                                            None,
+                                        )
+                                        .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
                                             let complete_msg = ComponentMessage::new(

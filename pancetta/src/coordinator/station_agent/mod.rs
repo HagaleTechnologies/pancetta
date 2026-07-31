@@ -546,9 +546,13 @@ async fn dispatch_action(
             //
             // SECURITY: creating the QSO is NOT the gated act — TRANSMISSION is.
             // We never key TX here. An unarmed remote operator's QSO is created
-            // but every frame it emits is dropped + audited by the TX worker's
-            // arm gate (because it is `TxOrigin::Remote`). There is deliberately
-            // NO code path here that keys TX outside the normal
+            // but every frame it emits is dropped by the TX worker's arm gate
+            // (because it is `TxOrigin::Remote`) — logged (`warn!`, target
+            // "agent.tx") and surfaced to the local TUI Diagnostics overlay
+            // (`DiagnosticEvent`, dispensa Q-0051 Phase A), but NOT yet
+            // AuditLog-appended or relayed to remote clients (Q-0051 Phases
+            // B/C, not built here). There is deliberately NO code path here
+            // that keys TX outside the normal
             // QSO → MessageToSend → TransmitRequest(Remote) → arm-gate flow.
             let detail = match &kind {
                 TxKind::CallStation { callsign, .. } => format!("callStation {callsign}"),
