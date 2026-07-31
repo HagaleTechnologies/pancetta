@@ -42,8 +42,9 @@
 use anyhow::{Context, Result};
 use pancetta_ft8::{Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, LlrMetric, WINDOW_SAMPLES};
 use pancetta_research::metrics::hash_normalize_message;
+use pancetta_research::noise::gaussian_noise;
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::SeedableRng;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -81,25 +82,6 @@ const CONFIGS: [(LlrMetric, usize, bool, &str); 4] = [
     (LlrMetric::Bessel, 2, false, "bessel/it2/em-off"),
     (LlrMetric::Bessel, 2, true, "bessel/it2/em-on"),
 ];
-
-fn gaussian_noise(rng: &mut StdRng, n: usize, sigma: f32) -> Vec<f32> {
-    let mut out = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
-        let u1: f32 = rng.random_range(f32::EPSILON..1.0);
-        let u2: f32 = rng.random_range(0.0..1.0);
-        let mag = (-2.0 * u1.ln()).sqrt();
-        let z0 = mag * (2.0 * std::f32::consts::PI * u2).cos();
-        let z1 = mag * (2.0 * std::f32::consts::PI * u2).sin();
-        out.push(z0 * sigma);
-        i += 1;
-        if i < n {
-            out.push(z1 * sigma);
-            i += 1;
-        }
-    }
-    out
-}
 
 fn signal_power(samples: &[f32]) -> f32 {
     samples.iter().map(|s| s * s).sum::<f32>() / samples.len() as f32

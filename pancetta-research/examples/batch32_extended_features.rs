@@ -18,8 +18,9 @@
 use anyhow::{Context, Result};
 use bitvec::prelude::BitVec;
 use pancetta_ft8::{DecodedMessage, Ft8Config, Ft8Decoder};
+use pancetta_research::noise::gaussian_noise;
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::SeedableRng;
 use serde_json::Value;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -66,25 +67,6 @@ fn load_truth(ws: &Path, sha: &str) -> HashSet<String> {
                 .collect()
         })
         .unwrap_or_default()
-}
-
-fn gaussian_noise(rng: &mut StdRng, n: usize, sigma: f32) -> Vec<f32> {
-    let mut out = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
-        let u1: f32 = rng.random_range(f32::EPSILON..1.0);
-        let u2: f32 = rng.random_range(0.0..1.0);
-        let mag = (-2.0 * u1.ln()).sqrt();
-        let z0 = mag * (2.0 * std::f32::consts::PI * u2).cos();
-        let z1 = mag * (2.0 * std::f32::consts::PI * u2).sin();
-        out.push(z0 * sigma);
-        i += 1;
-        if i < n {
-            out.push(z1 * sigma);
-            i += 1;
-        }
-    }
-    out
 }
 
 /// Shannon entropy of a bit sequence in bits (0..1 fraction; max = 1).

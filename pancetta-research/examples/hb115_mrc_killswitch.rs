@@ -37,8 +37,9 @@
 
 use anyhow::{Context, Result};
 use pancetta_ft8::{Ft8Config, Ft8Decoder};
+use pancetta_research::noise::gaussian_noise;
 use rand::rngs::StdRng;
-use rand::{RngExt, SeedableRng};
+use rand::SeedableRng;
 use serde_json::Value;
 use std::path::{Path, PathBuf};
 
@@ -66,24 +67,6 @@ fn load_wav(path: &Path) -> Result<Vec<f32>> {
 }
 
 /// Box-Muller transform for N(0, sigma²) Gaussian samples.
-fn gaussian_noise(rng: &mut StdRng, n: usize, sigma: f32) -> Vec<f32> {
-    let mut out = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
-        let u1: f32 = rng.random_range(f32::EPSILON..1.0);
-        let u2: f32 = rng.random_range(0.0..1.0);
-        let mag = (-2.0 * u1.ln()).sqrt();
-        let z0 = mag * (2.0 * std::f32::consts::PI * u2).cos();
-        let z1 = mag * (2.0 * std::f32::consts::PI * u2).sin();
-        out.push(z0 * sigma);
-        i += 1;
-        if i < n {
-            out.push(z1 * sigma);
-            i += 1;
-        }
-    }
-    out
-}
 
 fn decode_count(samples: &[f32], cfg: &Ft8Config) -> Result<usize> {
     let mut decoder =
