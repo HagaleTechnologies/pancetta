@@ -23,7 +23,7 @@ use ratatui::{
 };
 
 use super::create_panel_block;
-use crate::app::{ActivePanel, App, PlacementView};
+use crate::app::{ActivePanel, App, LiveTxAssignment, PlacementView};
 
 /// Circled digits for ranked candidates (①-⑩) — shared by the compact
 /// BEST row (Task 11, top 5) and the full-screen top-10 zoom table
@@ -115,7 +115,7 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
         return Ok(());
     };
 
-    let header_cells = ["#", "Freq", "Windows", "Score", "Gap(Hz)", "Quiet"]
+    let header_cells = ["#", "Freq", "Windows", "Score", "Gap(Hz)", "Live", "Quiet"]
         .iter()
         .map(|h| {
             Cell::from(*h).style(
@@ -127,6 +127,7 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
     let header = Row::new(header_cells).height(1).bottom_margin(0);
 
     let n_bins = placement.openness.len();
+    let live = app.live_tx_assignments();
     let mut rows: Vec<Row> = placement
         .slices
         .iter()
@@ -143,6 +144,21 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
                     .map(|bin| nearest_busy_gap_hz(bin, &placement.openness, placement.bin_hz))
                     .map(|hz| format!("{hz:.0}"))
                     .unwrap_or_else(|| "\u{2014}".to_string());
+            let owner = assignment_in_bin(
+                &live,
+                slice.offset_hz,
+                placement.range,
+                placement.bin_hz,
+                n_bins,
+            )
+            .map(|assignment| {
+                format!(
+                    "={}{}",
+                    assignment.callsign,
+                    if assignment.keyed { "*" } else { "" }
+                )
+            })
+            .unwrap_or_else(|| "-".to_string());
 
             Row::new([
                 Cell::from(rank),
@@ -150,6 +166,7 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
                 Cell::from(coverage),
                 Cell::from(format!("{:.0}", slice.score)),
                 Cell::from(gap),
+                Cell::from(owner),
                 Cell::from("-"),
             ])
         })
@@ -157,6 +174,7 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
 
     if rows.is_empty() {
         rows.push(Row::new([
+            Cell::from(""),
             Cell::from(""),
             Cell::from("no clear placement candidates yet"),
             Cell::from(""),
@@ -172,7 +190,11 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
         Constraint::Length(7), // Windows
         Constraint::Length(7), // Score
         Constraint::Length(8), // Gap(Hz)
-        Constraint::Length(6), // Quiet
+        // `=` + callsign + optional `*`. Sized for compound/portable calls
+        // (`VK9/G4ABC/P`); a narrower column truncated them into a different,
+        // still-plausible callsign. The zoom table has ~60 spare columns.
+        Constraint::Length(16), // Live
+        Constraint::Length(6),  // Quiet
     ];
 
     let table = Table::new(rows, widths)
@@ -268,6 +290,19 @@ pub(crate) fn bin_index_for_freq(
     n_bins: usize,
 ) -> Option<usize> {
     pancetta_core::freq_bin::bin_index_for_freq(freq_hz, range, bin_hz, n_bins)
+}
+
+pub(crate) fn assignment_in_bin(
+    live: &[LiveTxAssignment],
+    offset_hz: f64,
+    range: (f64, f64),
+    bin_hz: f64,
+    n_bins: usize,
+) -> Option<&LiveTxAssignment> {
+    let target = bin_index_for_freq(offset_hz, range, bin_hz, n_bins)?;
+    live.iter().find(|assignment| {
+        bin_index_for_freq(assignment.offset_hz, range, bin_hz, n_bins) == Some(target)
+    })
 }
 
 /// Map a frequency (Hz) to a screen column, mirroring
@@ -372,6 +407,18 @@ fn render_stream_markers(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
     let width = row.width as usize;
     let n_bins = placement.openness.len();
 
+    // Every marker column, so a label can stop before it runs into the next
+    // stream's `│`. Concurrent QSOs a few hundred Hz apart are the normal
+    // case here, and at ~20 Hz/column a `CALL 1480` label is wide enough to
+    // erase its neighbour's marker and leave a PARTIAL offset on screen
+    // (`JA1ABC 148`), which reads as a real frequency.
+    let mut marker_cols: Vec<usize> = app
+        .active_qsos
+        .iter()
+        .filter_map(|qso| freq_to_col(qso.frequency_hz, placement.range, width))
+        .collect();
+    marker_cols.sort_unstable();
+
     for qso in &app.active_qsos {
         let Some(col) = freq_to_col(qso.frequency_hz, placement.range, width) else {
             continue;
@@ -392,7 +439,23 @@ fn render_stream_markers(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
             .set_char('\u{2502}')
             .set_fg(color);
 
-        for (i, ch) in qso.their_callsign.chars().enumerate() {
+        // Room between this marker and the next one (or the right edge).
+        let limit = marker_cols
+            .iter()
+            .copied()
+            .find(|next| *next > col)
+            .unwrap_or(width)
+            .min(width)
+            .saturating_sub(col + 1);
+        let full = format!("{} {:.0}", qso.their_callsign, qso.frequency_hz);
+        // Drop the offset whole rather than clip it — a partial number is
+        // worse than no number, because nothing on screen marks it partial.
+        let label: String = if full.chars().count() <= limit {
+            full
+        } else {
+            qso.their_callsign.chars().take(limit).collect()
+        };
+        for (i, ch) in label.chars().enumerate() {
             let cx = col + 1 + i;
             if cx >= width {
                 break;
@@ -436,20 +499,43 @@ fn render_best_row(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placemen
     }
 
     let base = Style::default().fg(app.theme.foreground_color());
-    let mut spans: Vec<Span> = Vec::new();
+    let mut spans: Vec<Span> = vec![Span::styled(
+        "BEST ",
+        Style::default()
+            .fg(app.theme.accent_color())
+            .add_modifier(Modifier::BOLD),
+    )];
+    let live = app.live_tx_assignments();
+    let n_bins = placement.openness.len();
     for (i, slice) in placement.slices.iter().take(5).enumerate() {
         let digit = CIRCLED_DIGITS.get(i).copied().unwrap_or('\u{2022}');
         let coverage = coverage_label(slice.clear_first, slice.clear_second);
-        let text = format!(
+        let mut text = format!(
             "{} {:.0} {} {:.0}",
             digit, slice.offset_hz, coverage, slice.score
         );
-        let style = if i == app.placement_cursor {
+        let owner = assignment_in_bin(
+            &live,
+            slice.offset_hz,
+            placement.range,
+            placement.bin_hz,
+            n_bins,
+        );
+        if let Some(assignment) = owner {
+            text.push_str(&format!("={}", assignment.callsign));
+            if assignment.keyed {
+                text.push('*');
+            }
+        }
+        let mut style = if i == app.placement_cursor {
             base.add_modifier(Modifier::REVERSED)
                 .add_modifier(Modifier::BOLD)
         } else {
             base
         };
+        if owner.is_some() {
+            style = style.add_modifier(Modifier::DIM);
+        }
         spans.push(Span::styled(text, style));
         spans.push(Span::raw("  "));
     }
@@ -493,7 +579,12 @@ fn render_park_line(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placeme
     } else {
         "not parked \u{2014} Enter parks \u{2460}".to_string()
     };
-    let line = format!("{main} \u{b7} \u{2190}/\u{2192} pick \u{b7} Enter=park \u{b7} z=top-10");
+    let legend = "│=live ①=cand";
+    let line = if row.width >= 70 {
+        format!("{main} \u{b7} {legend} \u{b7} \u{2190}/\u{2192} pick \u{b7} Enter=park \u{b7} z=top-10")
+    } else {
+        format!("{main} \u{b7} {legend}")
+    };
     let p = Paragraph::new(line).style(Style::default().fg(app.theme.foreground_color()));
     f.render_widget(p, row);
 }
@@ -528,6 +619,22 @@ fn render_freq_axis(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placeme
 #[cfg(test)]
 mod geometry_tests {
     use super::*;
+
+    #[test]
+    fn assignment_in_same_bin_is_the_coincidence_test() {
+        let live = [LiveTxAssignment {
+            callsign: "JA1ABC".into(),
+            offset_hz: 1480.0,
+            keyed: false,
+        }];
+        assert_eq!(
+            assignment_in_bin(&live, 1490.0, (200.0, 2600.0), 25.0, 96)
+                .map(|a| a.callsign.as_str()),
+            Some("JA1ABC")
+        );
+        assert!(assignment_in_bin(&live, 1505.0, (200.0, 2600.0), 25.0, 96).is_none());
+        assert!(assignment_in_bin(&live, 1480.0, (200.0, 2600.0), 25.0, 0).is_none());
+    }
 
     #[test]
     fn nearest_busy_gap_hz_finds_nearer_busy_bin_on_either_side() {
