@@ -1412,7 +1412,10 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
         })
         .collect();
 
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
 }
 
 #[cfg(test)]
@@ -1485,7 +1488,7 @@ mod diagnostics_overlay_tests {
         let app = app_with(vec![rec(
             "tx.policy",
             DiagnosticLevel::Info,
-            "Operator-presence gate (FCC §97.221) — no console activity in 300s; suppressing autonomous initiation. Press any key at the station to resume",
+            "Operator-presence gate (FCC §97.221) — no console activity in 120s; suppressing autonomous initiation. Press any key at the station to resume",
             None,
         )])
         .await;
@@ -1493,7 +1496,7 @@ mod diagnostics_overlay_tests {
         term.draw(|f| render_diagnostics_overlay(f, f.area(), &app))
             .unwrap();
         assert!(
-            buffer_to_string(term.backend().buffer()).contains("FCC"),
+            buffer_to_string(term.backend().buffer()).contains("resume"),
             "the actionable part must survive the width"
         );
     }

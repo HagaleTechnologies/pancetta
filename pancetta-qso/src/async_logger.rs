@@ -722,6 +722,7 @@ impl QsoLogger {
                                 metadata,
                                 state_history,
                                 messages,
+                                ..
                             }) => {
                                 if let Err(e) = self
                                     .handle_qso_failed(qso_id, reason, metadata, state_history, messages)

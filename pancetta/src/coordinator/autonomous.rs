@@ -76,18 +76,31 @@ mod pan6_diagnostic_tests {
     fn gate_diagnostics_are_edge_triggered() {
         let mut state = GateDiagState::default();
         assert_eq!(
-            gate_diagnostics_for_slot(&mut state, &plan(2, 0, 0), pancetta_core::TxPolicy::Full)
-                .len(),
+            gate_diagnostics_for_slot(
+                &mut state,
+                &plan(2, 0, 0),
+                false,
+                pancetta_core::TxPolicy::Full,
+                true
+            )
+            .len(),
             1
         );
         assert!(gate_diagnostics_for_slot(
             &mut state,
-            &plan(2, 0, 0),
-            pancetta_core::TxPolicy::Full
+            &SlotPlan::default(),
+            false,
+            pancetta_core::TxPolicy::Full,
+            true,
         )
         .is_empty());
-        let resumed =
-            gate_diagnostics_for_slot(&mut state, &plan(0, 0, 0), pancetta_core::TxPolicy::Full);
+        let resumed = gate_diagnostics_for_slot(
+            &mut state,
+            &plan(0, 0, 0),
+            true,
+            pancetta_core::TxPolicy::Full,
+            true,
+        );
         assert_eq!(resumed.len(), 1);
         assert!(resumed[0].text.contains("resumed"));
     }
@@ -98,12 +111,16 @@ mod pan6_diagnostic_tests {
         let first = gate_diagnostics_for_slot(
             &mut state,
             &plan(0, 1, 0),
+            true,
             pancetta_core::TxPolicy::RespondOnly,
+            true,
         );
         let changed = gate_diagnostics_for_slot(
             &mut state,
             &plan(0, 1, 0),
+            true,
             pancetta_core::TxPolicy::Disabled,
+            true,
         );
         assert_eq!(first.len(), 1);
         assert_eq!(changed.len(), 1);
@@ -111,16 +128,18 @@ mod pan6_diagnostic_tests {
     }
 
     #[test]
-    fn policy_and_presence_suppression_are_reported_separately() {
+    fn policy_suppression_takes_precedence_over_presence() {
         let mut state = GateDiagState::default();
         let diagnostics = gate_diagnostics_for_slot(
             &mut state,
             &plan(0, 1, 1),
+            true,
             pancetta_core::TxPolicy::RespondOnly,
+            false,
         );
-        assert_eq!(diagnostics.len(), 2);
+        assert_eq!(diagnostics.len(), 1);
         assert!(diagnostics.iter().any(|d| d.text.contains("TX policy")));
-        assert!(diagnostics.iter().any(|d| d.text.contains("presence gate")));
+        assert!(!diagnostics.iter().any(|d| d.text.contains("presence gate")));
     }
 
     #[test]
@@ -129,7 +148,9 @@ mod pan6_diagnostic_tests {
         assert!(gate_diagnostics_for_slot(
             &mut state,
             &SlotPlan::default(),
+            true,
             pancetta_core::TxPolicy::Full,
+            true,
         )
         .is_empty());
     }
@@ -140,7 +161,9 @@ mod pan6_diagnostic_tests {
         let diagnostics = gate_diagnostics_for_slot(
             &mut state,
             &plan(1, 1, 1),
+            false,
             pancetta_core::TxPolicy::Disabled,
+            false,
         );
         assert!(diagnostics
             .iter()
@@ -482,11 +505,13 @@ pub(crate) struct GateDiagState {
 pub(crate) fn gate_diagnostics_for_slot(
     state: &mut GateDiagState,
     plan: &SlotPlan,
+    runtime_gate_open: bool,
     policy: pancetta_core::TxPolicy,
+    operator_present: bool,
 ) -> Vec<GateDiagnostic> {
     use pancetta_core::DiagnosticLevel as L;
     let mut out = Vec::new();
-    let runtime_now = plan.runtime_gate_dropped > 0;
+    let runtime_now = !runtime_gate_open;
     if runtime_now && !state.runtime_gate_suppressing {
         out.push(GateDiagnostic { target: "operator.override", level: L::Warn, text: format!("Autonomous runtime gate OFF (Shift+Q) — dropping autonomous TX; {} item(s) this slot", plan.runtime_gate_dropped) });
     } else if !runtime_now && state.runtime_gate_suppressing {
@@ -497,7 +522,7 @@ pub(crate) fn gate_diagnostics_for_slot(
         });
     }
     state.runtime_gate_suppressing = runtime_now;
-    let policy_now = (plan.policy_dropped > 0).then_some(policy);
+    let policy_now = (!policy.allows_initiation()).then_some(policy);
     if policy_now.is_some() && policy_now != state.policy_suppressing {
         out.push(GateDiagnostic {
             target: "tx.policy",
@@ -515,7 +540,7 @@ pub(crate) fn gate_diagnostics_for_slot(
         });
     }
     state.policy_suppressing = policy_now;
-    let presence_now = plan.presence_dropped > 0;
+    let presence_now = policy.allows_initiation() && !operator_present;
     if presence_now && !state.presence_suppressing {
         out.push(GateDiagnostic { target: "tx.policy", level: L::Info, text: format!("Operator-presence gate (FCC §97.221) — no console activity in {}s; suppressing autonomous initiation. Press any key to resume", super::OPERATOR_PRESENCE_WINDOW.as_secs()) });
     } else if !presence_now && state.presence_suppressing {
@@ -1473,7 +1498,13 @@ impl super::ApplicationCoordinator {
                                 );
                             }
                             for diagnostic in
-                                gate_diagnostics_for_slot(&mut gate_diag_state, &plan, policy)
+                                gate_diagnostics_for_slot(
+                                    &mut gate_diag_state,
+                                    &plan,
+                                    runtime_gate_open,
+                                    policy,
+                                    operator_present,
+                                )
                             {
                                 crate::coordinator::tx::emit_diagnostic_full(
                                     &message_bus,

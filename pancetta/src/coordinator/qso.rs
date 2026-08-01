@@ -2830,8 +2830,8 @@ impl super::ApplicationCoordinator {
                             Ok(pancetta_qso::QsoEvent::QsoFailed {
                                 qso_id,
                                 reason,
+                                last_state,
                                 metadata,
-                                state_history,
                                 ..
                             }) => {
                                 // Drop-stale-TX gate: a failed QSO must stop
@@ -2925,19 +2925,18 @@ impl super::ApplicationCoordinator {
                                     );
                                     let _ = snapshot_bus.send_message(history_msg).await;
                                 }
-                                let reason_text = if reason
-                                    == pancetta_qso::QsoFailureReason::Timeout
-                                {
-                                    let timeouts = &snapshot_qso_manager.config().timeouts;
-                                    timeout_detail(
-                                        state_history.last().map(|transition| &transition.to_state),
-                                        &metadata,
-                                        timeouts.manual_call_max_calls,
-                                        timeouts.manual_call_watchdog_minutes,
-                                    )
-                                } else {
-                                    failure_reason_text(&reason)
-                                };
+                                let reason_text =
+                                    if reason == pancetta_qso::QsoFailureReason::Timeout {
+                                        let timeouts = &snapshot_qso_manager.config().timeouts;
+                                        timeout_detail(
+                                            Some(&last_state),
+                                            &metadata,
+                                            timeouts.manual_call_max_calls,
+                                            timeouts.manual_call_watchdog_minutes,
+                                        )
+                                    } else {
+                                        failure_reason_text(&reason)
+                                    };
                                 let diag_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
