@@ -563,7 +563,10 @@ impl super::ApplicationCoordinator {
         // subscriber) by
         // `qso_restart_delivers_recent_qso_outcome_through_the_real_forwarder`
         // below.
-        if component_id == ComponentId::Qso {
+        if matches!(
+            component_id,
+            ComponentId::Qso | ComponentId::Dsp | ComponentId::Ft8Decoder
+        ) {
             if let Some(manager) = self.qso_manager_for_supervisor.clone() {
                 for (qso_id, _progress) in manager.get_active_qsos().await {
                     let _ = manager
@@ -674,7 +677,7 @@ impl super::ApplicationCoordinator {
         let _ = self.message_bus.send_message(error_msg).await;
     }
 
-    /// Re-invoke the given component's start method. Only the 5 components
+    /// Re-invoke the given component's start method. Only the seven components
     /// this plan covers are wired; anything else reaching here is a bug
     /// (Task 2's `component_restart_policy` should have already routed it
     /// to `DegradeOnly`).
@@ -685,6 +688,8 @@ impl super::ApplicationCoordinator {
             ComponentId::PskReporter => self.start_pskreporter_component().await,
             ComponentId::RemoteGateway => self.start_remote_gateway_component().await,
             ComponentId::Qso => self.start_qso_component().await,
+            ComponentId::Dsp => self.start_dsp_pipeline().await,
+            ComponentId::Ft8Decoder => self.start_ft8_pipeline().await,
             other => anyhow::bail!("restart_component called for non-restartable {other}"),
         }
     }
@@ -758,6 +763,84 @@ mod supervisor_tests {
         )
         .await
         .expect("coordinator creation should succeed")
+    }
+
+    async fn assert_decode_component_restarts(component: ComponentId) {
+        let mut coordinator = test_coordinator().await;
+        coordinator.init_decode_handles();
+        crate::coordinator::pipeline::register_decode_bus_channels(&coordinator.message_bus)
+            .await
+            .unwrap();
+        let handle = tokio::spawn(async {
+            panic!("injected test panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        coordinator.named_task_handles.push((component, handle));
+        for _ in 0..100 {
+            if coordinator
+                .named_task_handles
+                .last()
+                .unwrap()
+                .1
+                .is_finished()
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(coordinator
+            .named_task_handles
+            .last()
+            .unwrap()
+            .1
+            .is_finished());
+        coordinator.check_task_handles().await;
+        assert_eq!(
+            coordinator
+                .component_status
+                .read()
+                .await
+                .get(&component)
+                .map(|status| &status.state),
+            Some(&super::ComponentState::Running)
+        );
+        assert!(coordinator
+            .named_task_handles
+            .iter()
+            .any(|(id, _)| *id == component));
+        tokio::task::yield_now().await;
+        assert!(coordinator
+            .named_task_handles
+            .iter()
+            .find(|(id, _)| *id == component)
+            .is_some_and(|(_, handle)| !handle.is_finished()));
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[tokio::test]
+    async fn panicking_dsp_component_is_restarted_after_backoff() {
+        assert_decode_component_restarts(ComponentId::Dsp).await;
+    }
+
+    #[tokio::test]
+    async fn panicking_ft8_decoder_component_is_restarted_after_backoff() {
+        assert_decode_component_restarts(ComponentId::Ft8Decoder).await;
+    }
+
+    #[tokio::test]
+    async fn decode_stages_start_twice_from_self_alone() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.init_decode_handles();
+        coordinator.start_dsp_pipeline().await.unwrap();
+        coordinator.start_dsp_pipeline().await.unwrap();
+        coordinator.start_ft8_pipeline().await.unwrap();
+        coordinator.start_ft8_pipeline().await.unwrap();
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Task 5's central regression guard. DxCluster is `Restartable`
@@ -889,6 +972,68 @@ mod supervisor_tests {
         assert_eq!(
             status.get(&ComponentId::Qso).map(|s| &s.state),
             Some(&super::ComponentState::Running)
+        );
+    }
+
+    async fn failure_reason_after_component_restart(
+        component: ComponentId,
+    ) -> Option<pancetta_qso::QsoFailureReason> {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        coordinator.start_qso_component().await.unwrap();
+        if matches!(component, ComponentId::Dsp | ComponentId::Ft8Decoder) {
+            coordinator.init_decode_handles();
+        }
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        let qso_id = manager
+            .respond_to_cq("K1ABC".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        let mut events = manager.subscribe();
+        let handle = tokio::spawn(async {
+            panic!("injected test panic");
+            #[allow(unreachable_code)]
+            Ok(())
+        });
+        coordinator.named_task_handles.push((component, handle));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        coordinator.check_task_handles().await;
+        while let Ok(event) = events.try_recv() {
+            if let pancetta_qso::QsoEvent::QsoFailed {
+                qso_id: failed_id,
+                reason,
+                ..
+            } = event
+            {
+                if failed_id == qso_id {
+                    return Some(reason);
+                }
+            }
+        }
+        None
+    }
+
+    #[tokio::test]
+    async fn dsp_restart_emits_supervisor_restart_failure_for_each_active_qso() {
+        assert_eq!(
+            failure_reason_after_component_restart(ComponentId::Dsp).await,
+            Some(pancetta_qso::QsoFailureReason::SupervisorRestart)
+        );
+    }
+
+    #[tokio::test]
+    async fn ft8_restart_emits_supervisor_restart_failure_for_each_active_qso() {
+        assert_eq!(
+            failure_reason_after_component_restart(ComponentId::Ft8Decoder).await,
+            Some(pancetta_qso::QsoFailureReason::SupervisorRestart)
+        );
+    }
+
+    #[tokio::test]
+    async fn non_decode_non_qso_restart_does_not_fail_active_qsos() {
+        assert_eq!(
+            failure_reason_after_component_restart(ComponentId::DxCluster).await,
+            None
         );
     }
 

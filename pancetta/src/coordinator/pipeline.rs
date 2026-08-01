@@ -10,6 +10,151 @@ use tracing::{debug, error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
+pub(crate) enum ForwardOutcome {
+    Sent,
+    Dropped,
+    Disconnected,
+}
+
+pub(crate) fn forward_or_drop<T>(
+    tx: &crossbeam_channel::Sender<T>,
+    item: T,
+    timeout: Duration,
+) -> ForwardOutcome {
+    match tx.send_timeout(item, timeout) {
+        Ok(()) => ForwardOutcome::Sent,
+        Err(crossbeam_channel::SendTimeoutError::Timeout(_)) => ForwardOutcome::Dropped,
+        Err(crossbeam_channel::SendTimeoutError::Disconnected(_)) => ForwardOutcome::Disconnected,
+    }
+}
+
+pub(crate) const DECODE_FORWARD_TIMEOUT: Duration = Duration::from_millis(250);
+
+pub(crate) struct DecodePipelineHandles {
+    pub(crate) audio_to_dsp_tx: crossbeam_channel::Sender<Vec<f32>>,
+    pub(crate) audio_to_dsp_rx: crossbeam_channel::Receiver<Vec<f32>>,
+    pub(crate) dsp_to_ft8_tx: crossbeam_channel::Sender<Vec<f32>>,
+    pub(crate) dsp_to_ft8_rx: crossbeam_channel::Receiver<Vec<f32>>,
+    pub(crate) ft8_to_tui_tx: crossbeam_channel::Sender<pancetta_ft8::DecodedMessage>,
+    ft8_to_tui_rx: Option<crossbeam_channel::Receiver<pancetta_ft8::DecodedMessage>>,
+    pub(crate) waterfall_tx: crossbeam_channel::Sender<Vec<Vec<f32>>>,
+    waterfall_rx: Option<crossbeam_channel::Receiver<Vec<Vec<f32>>>>,
+    pub(crate) audio_level_tx: crossbeam_channel::Sender<f32>,
+    audio_level_rx: Option<crossbeam_channel::Receiver<f32>>,
+    pub(crate) health_dsp_windows: Arc<std::sync::atomic::AtomicU64>,
+    pub(crate) health_last_rms: Arc<std::sync::atomic::AtomicU32>,
+    pub(crate) health_total_decodes: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl DecodePipelineHandles {
+    pub(crate) fn new() -> Self {
+        let (audio_to_dsp_tx, audio_to_dsp_rx) = crossbeam_channel::bounded(100);
+        let (dsp_to_ft8_tx, dsp_to_ft8_rx) = crossbeam_channel::bounded(2);
+        let (ft8_to_tui_tx, ft8_to_tui_rx) = crossbeam_channel::bounded(500);
+        let (waterfall_tx, waterfall_rx) = crossbeam_channel::bounded(100);
+        let (audio_level_tx, audio_level_rx) = crossbeam_channel::bounded(1);
+        Self {
+            audio_to_dsp_tx,
+            audio_to_dsp_rx,
+            dsp_to_ft8_tx,
+            dsp_to_ft8_rx,
+            ft8_to_tui_tx,
+            ft8_to_tui_rx: Some(ft8_to_tui_rx),
+            waterfall_tx,
+            waterfall_rx: Some(waterfall_rx),
+            audio_level_tx,
+            audio_level_rx: Some(audio_level_rx),
+            health_dsp_windows: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            health_last_rms: Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            health_total_decodes: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        }
+    }
+
+    fn take_terminal_receivers(
+        &mut self,
+    ) -> Result<(
+        crossbeam_channel::Receiver<pancetta_ft8::DecodedMessage>,
+        crossbeam_channel::Receiver<Vec<Vec<f32>>>,
+        crossbeam_channel::Receiver<f32>,
+    )> {
+        Ok((
+            self.ft8_to_tui_rx
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("FT8 terminal receiver already taken"))?,
+            self.waterfall_rx
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("waterfall terminal receiver already taken"))?,
+            self.audio_level_rx
+                .take()
+                .ok_or_else(|| anyhow::anyhow!("audio-level terminal receiver already taken"))?,
+        ))
+    }
+}
+
+pub(crate) async fn register_decode_bus_channels(
+    bus: &crate::message_bus::MessageBus,
+) -> Result<()> {
+    let _ = bus.get_or_create_channel(ComponentId::Dsp).await?;
+    let _ = bus.get_or_create_channel(ComponentId::Ft8Decoder).await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message_bus::MessageBus;
+
+    #[tokio::test]
+    async fn decode_bus_channels_register_idempotently() {
+        let bus = MessageBus::new(64).expect("bus construction");
+        register_decode_bus_channels(&bus)
+            .await
+            .expect("first registration should succeed");
+        register_decode_bus_channels(&bus)
+            .await
+            .expect("re-registration must not error");
+    }
+
+    #[test]
+    fn forward_or_drop_times_out_instead_of_blocking_when_full() {
+        let (tx, _rx) = crossbeam_channel::bounded::<u8>(1);
+        assert_eq!(
+            forward_or_drop(&tx, 1, Duration::from_millis(10)),
+            ForwardOutcome::Sent
+        );
+        let started = Instant::now();
+        assert_eq!(
+            forward_or_drop(&tx, 2, Duration::from_millis(10)),
+            ForwardOutcome::Dropped
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[test]
+    fn forward_or_drop_reports_disconnected_when_all_receivers_dropped() {
+        let (tx, rx) = crossbeam_channel::bounded::<u8>(1);
+        drop(rx);
+        assert_eq!(
+            forward_or_drop(&tx, 1, Duration::from_millis(10)),
+            ForwardOutcome::Disconnected
+        );
+    }
+
+    #[test]
+    fn retained_decode_handles_outlive_a_dead_stage() {
+        let handles = DecodePipelineHandles::new();
+        drop((
+            handles.audio_to_dsp_rx.clone(),
+            handles.dsp_to_ft8_tx.clone(),
+        ));
+        handles.audio_to_dsp_tx.send(vec![1.0; 4]).unwrap();
+        assert_eq!(handles.audio_to_dsp_rx.recv().unwrap(), vec![1.0; 4]);
+        handles.dsp_to_ft8_tx.send(vec![0.0; 4]).unwrap();
+        assert!(handles.dsp_to_ft8_rx.recv().is_ok());
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Start the core pipeline with proper point-to-point channels.
     ///
@@ -18,21 +163,22 @@ impl super::ApplicationCoordinator {
     ///   dsp_tx   -> ft8_rx  (processed windows)
     ///   ft8_tx   -> tui_rx  (decoded messages)
     pub(crate) async fn start_pipeline(&mut self) -> Result<()> {
-        // Point-to-point channels for the data path
-        let (audio_to_dsp_tx, audio_to_dsp_rx) = crossbeam_channel::bounded::<Vec<f32>>(100);
-        let (dsp_to_ft8_tx, dsp_to_ft8_rx) = crossbeam_channel::bounded::<Vec<f32>>(2);
-        let (ft8_to_tui_tx, ft8_to_tui_rx) =
-            crossbeam_channel::bounded::<pancetta_ft8::DecodedMessage>(500);
-        let (waterfall_tx, waterfall_rx) = crossbeam_channel::bounded::<Vec<Vec<f32>>>(100);
-        let (audio_level_tx, audio_level_rx) = crossbeam_channel::bounded::<f32>(1);
+        self.init_decode_handles();
+        let (ft8_to_tui_rx, waterfall_rx, audio_level_rx) = self
+            .decode_handles
+            .as_mut()
+            .expect("decode handles initialized")
+            .take_terminal_receivers()?;
+        let handles = self.decode_handles()?;
+        let audio_to_dsp_tx = handles.audio_to_dsp_tx.clone();
+        let health_dsp_windows = handles.health_dsp_windows.clone();
+        let health_total_decodes = handles.health_total_decodes.clone();
+        let health_last_rms = handles.health_last_rms.clone();
 
         // TX audio channel: Ft8Transmitter -> Audio thread for playback
         let (tx_audio_tx, tx_audio_rx) = crossbeam_channel::bounded::<(Vec<f32>, u32, bool)>(4);
 
         // Pipeline health tracking (atomics shared across threads)
-        let health_dsp_windows = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let health_total_decodes = Arc::new(std::sync::atomic::AtomicU64::new(0));
-        let health_last_rms = Arc::new(std::sync::atomic::AtomicU32::new(0)); // f32 bits
         let health_audio_alive = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         let ft8lib_native = pancetta_ft8::ft8lib_is_available();
@@ -55,11 +201,7 @@ impl super::ApplicationCoordinator {
         // Also create message bus channels for control messages (hamlib, autonomous, etc.)
         let (_audio_bus_tx, audio_bus_rx) =
             self.message_bus.create_channel(ComponentId::Audio).await?;
-        let (_dsp_bus_tx, _dsp_bus_rx) = self.message_bus.create_channel(ComponentId::Dsp).await?;
-        let (_ft8_bus_tx, _ft8_bus_rx) = self
-            .message_bus
-            .create_channel(ComponentId::Ft8Decoder)
-            .await?;
+        register_decode_bus_channels(&self.message_bus).await?;
         let (_tui_bus_tx, tui_bus_rx) = self.message_bus.create_channel(ComponentId::Tui).await?;
 
         if !ft8lib_native {
@@ -129,24 +271,10 @@ impl super::ApplicationCoordinator {
         }
 
         // --- DSP component ---
-        self.start_dsp_pipeline(
-            audio_to_dsp_rx,
-            dsp_to_ft8_tx,
-            waterfall_tx.clone(),
-            audio_level_tx,
-            health_dsp_windows.clone(),
-            health_last_rms.clone(),
-        )
-        .await?;
+        self.start_dsp_pipeline().await?;
 
         // --- FT8 decoder component ---
-        self.start_ft8_pipeline(
-            dsp_to_ft8_rx,
-            ft8_to_tui_tx,
-            waterfall_tx,
-            health_total_decodes.clone(),
-        )
-        .await?;
+        self.start_ft8_pipeline().await?;
 
         // --- TUI component ---
         if !self.headless {

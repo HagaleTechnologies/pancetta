@@ -8,6 +8,10 @@
 
 # Known gaps and TODOs
 
+- **Supervisor coverage:** the cheap-restartable set now includes Dsp and Ft8Decoder (PAN-4),
+  using retained `DecodePipelineHandles`. Hamlib, StationAgent, and Audio remain intentionally
+  uncovered pending teardown semantics for hardware and TX safety.
+
 - **cqdx `GET /api/v1/spots?live=true` response envelope key (`groups`) unverified against live API** — a gated live test exists: `CQDX_TOKEN=pat_xxx cargo test -p pancetta-cqdx test_live_spots_envelope -- --ignored --nocapture`.
 
 - **`pancetta-research` has no CI coverage** — every workspace job passes

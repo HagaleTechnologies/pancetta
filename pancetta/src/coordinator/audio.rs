@@ -100,8 +100,16 @@ impl super::ApplicationCoordinator {
                     // RwLock write on every audio batch — the hottest lock).
                     last_timestamp.store(super::now_epoch_ms(), Ordering::Relaxed);
 
-                    if audio_to_dsp_tx.send(samples).is_err() {
-                        break;
+                    match super::pipeline::forward_or_drop(
+                        &audio_to_dsp_tx,
+                        samples,
+                        super::pipeline::DECODE_FORWARD_TIMEOUT,
+                    ) {
+                        super::pipeline::ForwardOutcome::Sent => {}
+                        super::pipeline::ForwardOutcome::Dropped => {
+                            warn!("Audio stub: DSP stage not draining -- dropped one batch");
+                        }
+                        super::pipeline::ForwardOutcome::Disconnected => break,
                     }
                 }
 
@@ -576,12 +584,23 @@ impl super::ApplicationCoordinator {
                     }
 
                     let len = samples.len();
-                    if audio_to_dsp_tx.send(samples).is_err() {
-                        info!(
-                            "Audio relay: DSP channel closed after {} sends",
-                            relay_count
-                        );
-                        break;
+                    match super::pipeline::forward_or_drop(
+                        &audio_to_dsp_tx,
+                        samples,
+                        super::pipeline::DECODE_FORWARD_TIMEOUT,
+                    ) {
+                        super::pipeline::ForwardOutcome::Sent => {}
+                        super::pipeline::ForwardOutcome::Dropped => {
+                            warn!("Audio relay: DSP stage not draining -- dropped one batch");
+                            continue;
+                        }
+                        super::pipeline::ForwardOutcome::Disconnected => {
+                            info!(
+                                "Audio relay: DSP channel closed after {} sends",
+                                relay_count
+                            );
+                            break;
+                        }
                     }
                     health_audio_alive_relay.store(true, Ordering::Relaxed);
                     relay_count += 1;

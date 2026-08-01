@@ -28,6 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Decode-pipeline crashes now recover automatically: the coordinator restarts DSP and FT8 decoder
+  tasks under the existing bounded supervisor policy, keeps adjacent stages alive during backoff,
+  and records stranded in-flight QSOs as `SupervisorRestart` failures.
+
 - Station agent: the relay's `CAPACITY` terminal code (sent on a 9th-client
   connection attempt) is now handled like the other 11 relay.v1 terminal
   codes instead of being silently unrecognized.

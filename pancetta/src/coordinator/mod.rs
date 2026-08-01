@@ -561,7 +561,7 @@ pub(crate) fn operator_present_now(last_input_ms: &std::sync::atomic::AtomicU64)
 
 use anyhow::Result;
 use pancetta_config::Config;
-use pancetta_ft8::{Ft8Config, Ft8Decoder};
+use pancetta_ft8::Ft8Config;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -587,11 +587,10 @@ pub struct ApplicationCoordinator {
     /// Central message bus for inter-component communication
     message_bus: MessageBus,
 
-    /// Component managers
-    ft8_decoder: Option<Ft8Decoder>,
-
     /// Named component task handles for health monitoring
     named_task_handles: Vec<(ComponentId, JoinHandle<Result<()>>)>,
+
+    decode_handles: Option<pipeline::DecodePipelineHandles>,
 
     /// Restart bookkeeping (rolling-window budget + capped-exponential
     /// backoff) for the supervisor's `check_task_handles` restart dispatch.
@@ -1172,9 +1171,9 @@ pub(crate) fn component_restart_policy(id: ComponentId) -> RestartPolicy {
         | ComponentId::DxCluster
         | ComponentId::PskReporter
         | ComponentId::RemoteGateway
-        | ComponentId::Qso => RestartPolicy::Restartable,
-        // Out of scope for this plan (need channel/atomic re-supply design):
-        ComponentId::Dsp | ComponentId::Ft8Decoder => RestartPolicy::DegradeOnly,
+        | ComponentId::Qso
+        | ComponentId::Dsp
+        | ComponentId::Ft8Decoder => RestartPolicy::Restartable,
         // Out of scope for this plan (need teardown semantics):
         ComponentId::Hamlib | ComponentId::StationAgent | ComponentId::Audio => {
             RestartPolicy::DegradeOnly
@@ -1187,6 +1186,20 @@ pub(crate) fn component_restart_policy(id: ComponentId) -> RestartPolicy {
         }
         // Companion protocol integration; not critical for autonomous operation.
         ComponentId::WsjtxUdp => RestartPolicy::DegradeOnly,
+    }
+}
+
+impl ApplicationCoordinator {
+    pub(crate) fn init_decode_handles(&mut self) {
+        if self.decode_handles.is_none() {
+            self.decode_handles = Some(pipeline::DecodePipelineHandles::new());
+        }
+    }
+
+    pub(crate) fn decode_handles(&self) -> Result<&pipeline::DecodePipelineHandles> {
+        self.decode_handles.as_ref().ok_or_else(|| {
+            anyhow::anyhow!("decode handles not initialized -- start_pipeline() must run first")
+        })
     }
 }
 
@@ -1409,8 +1422,8 @@ impl ApplicationCoordinator {
             id,
             config,
             message_bus,
-            ft8_decoder: None,
             named_task_handles: Vec::new(),
+            decode_handles: None,
             restart_budget: RestartBudget::new(),
             component_status: Arc::new(RwLock::new(HashMap::new())),
             is_running: Arc::new(AtomicBool::new(false)),
@@ -2806,10 +2819,10 @@ mod tests {
             component_restart_policy(ComponentId::RemoteGateway),
             Restartable
         );
-        assert_eq!(component_restart_policy(ComponentId::Dsp), DegradeOnly);
+        assert_eq!(component_restart_policy(ComponentId::Dsp), Restartable);
         assert_eq!(
             component_restart_policy(ComponentId::Ft8Decoder),
-            DegradeOnly
+            Restartable
         );
         assert_eq!(component_restart_policy(ComponentId::Hamlib), DegradeOnly);
         assert_eq!(

@@ -387,13 +387,16 @@ pub(crate) fn invoke_cross_sequence_consumer(
 
 impl super::ApplicationCoordinator {
     /// Start FT8 decoder with point-to-point channels.
-    pub(crate) async fn start_ft8_pipeline(
-        &mut self,
-        ft8_rx: crossbeam_channel::Receiver<Vec<f32>>,
-        ft8_to_tui_tx: crossbeam_channel::Sender<pancetta_ft8::DecodedMessage>,
-        waterfall_tx: crossbeam_channel::Sender<Vec<Vec<f32>>>,
-        health_total_decodes: Arc<std::sync::atomic::AtomicU64>,
-    ) -> Result<()> {
+    pub(crate) async fn start_ft8_pipeline(&mut self) -> Result<()> {
+        let (ft8_rx, ft8_to_tui_tx, waterfall_tx, health_total_decodes) = {
+            let h = self.decode_handles()?;
+            (
+                h.dsp_to_ft8_rx.clone(),
+                h.ft8_to_tui_tx.clone(),
+                h.waterfall_tx.clone(),
+                h.health_total_decodes.clone(),
+            )
+        };
         let span = span!(Level::INFO, "start_ft8");
         let _enter = span.enter();
 
