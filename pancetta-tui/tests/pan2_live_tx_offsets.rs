@@ -91,6 +91,19 @@ fn contains(buf: &Buffer, needle: &str) -> bool {
     rows(buf).iter().any(|r| r.contains(needle))
 }
 
+/// A row of the zoom table's BODY, not the active-QSO banner above it.
+///
+/// The banner renders `JA1ABC (wait rpt · 0:00 · 1480Hz)` on row 1, so a bare
+/// `row_containing(buf, "1480")` — or `"JA1ABC"` — matches the BANNER and any
+/// assertion made on it passes without the table having rendered anything at
+/// all. Anchoring on the `Windows` cell (`E+O`/`E`/`O`) keeps the match inside
+/// the table.
+fn zoom_table_row(buf: &Buffer, needle: &str) -> Option<String> {
+    rows(buf)
+        .into_iter()
+        .find(|r| r.contains(needle) && r.contains("E+O") && !r.contains("QSO: "))
+}
+
 // ---------------------------------------------------------------- TX strip
 
 /// Plan Phase 2: with NO active QSOs the strip is genuinely idle and keeps
@@ -175,12 +188,13 @@ async fn active_qsos_banner_reports_overflow_instead_of_clipping_silently() {
     assert!(!row.trim_end().ends_with('H'), "clipped mid-token: {row}");
 }
 
-/// DEFECT PROBE (phase-verify finding): `render_active_qsos` accumulates its
-/// width budget with `str::len()` (BYTES) while seeding it from
-/// `Span::width()` (DISPLAY CELLS). Each entry's detail carries two `·`
-/// (U+00B7 — 2 bytes, 1 cell) and each separator a `│` (U+2502 — 3 bytes,
-/// 1 cell), so the accumulator over-charges 2 cells per entry plus 2 per
-/// separator and drops entries that would have fit.
+/// REGRESSION GUARD (phase-verify finding, since fixed): `render_active_qsos`
+/// originally accumulated its width budget with `str::len()` (BYTES) while
+/// seeding it from `Span::width()` (DISPLAY CELLS). Each entry's detail carries
+/// two `·` (U+00B7 — 2 bytes, 1 cell) and each separator a `│` (U+2502 —
+/// 3 bytes, 1 cell), so the accumulator over-charged 2 cells per entry plus 2
+/// per separator and dropped entries that would have fit. The renderer now
+/// counts `chars()`; this test fails again if anyone reverts to `len()`.
 ///
 /// Constructed so the discrepancy alone decides the outcome. Three entries
 /// measure `5 ("QSO: ") + 32 + 5 (sep) + 32 + 5 + 32 = 111` display cells and
@@ -271,6 +285,71 @@ async fn tx_placement_best_row_tags_candidates_already_held_by_a_live_stream() {
     );
 }
 
+/// Plan Phase 3: the `*` keyed suffix is the only thing separating "this
+/// candidate belongs to a stream that is ON AIR right now" from "belongs to a
+/// stream that is merely assigned". Shipped untested — this closes that gap.
+#[tokio::test]
+async fn tx_placement_best_row_stars_an_owner_that_is_keyed() {
+    let mut app = new_app().await;
+    app.apply_placement(placement_view(&[(1480.0, 62.0)]));
+    app.apply_active_qsos(vec![banner_at("JA1ABC", 1480.0, "qso-a")], Vec::new());
+    app.tx_now_sending = Some(TxQueueItem {
+        text: "JA1ABC K5ARH -12".into(),
+        freq_hz: 1480.0,
+        qso_id: Some("qso-a".into()),
+        deferred: false,
+    });
+
+    let buf = render(&app, 140, 40);
+    let row = row_containing(&buf, "BEST").expect("BEST row");
+    assert!(
+        row.contains("=JA1ABC*"),
+        "a keyed owner must be starred: {row}"
+    );
+}
+
+/// The negative half of the pair: an assigned-but-silent owner is named
+/// WITHOUT the on-air star, so the two states stay distinguishable.
+#[tokio::test]
+async fn tx_placement_best_row_does_not_star_an_idle_owner() {
+    let mut app = new_app().await;
+    app.apply_placement(placement_view(&[(1480.0, 62.0)]));
+    app.apply_active_qsos(vec![banner_at("JA1ABC", 1480.0, "qso-a")], Vec::new());
+    assert!(app.tx_now_sending.is_none(), "precondition: not keyed");
+
+    let buf = render(&app, 140, 40);
+    let row = row_containing(&buf, "BEST").expect("BEST row");
+    assert!(row.contains("=JA1ABC"), "owner still named: {row}");
+    assert!(
+        !row.contains("=JA1ABC*"),
+        "an idle owner must not be starred: {row}"
+    );
+}
+
+/// Plan Phase 4: the same keyed/idle distinction in the top-10 zoom table's
+/// `Live` column, which shipped with the `*` suffix and no test.
+#[tokio::test]
+async fn placement_zoom_live_column_stars_a_keyed_owner() {
+    let mut app = new_app().await;
+    app.apply_placement(placement_view(&[(1480.0, 62.0)]));
+    app.apply_active_qsos(vec![banner_at("JA1ABC", 1480.0, "qso-a")], Vec::new());
+    app.tx_now_sending = Some(TxQueueItem {
+        text: "JA1ABC K5ARH -12".into(),
+        freq_hz: 1480.0,
+        qso_id: Some("qso-a".into()),
+        deferred: false,
+    });
+    app.active_panel = ActivePanel::TxPlacement;
+    app.zoomed = true;
+
+    let buf = render(&app, 120, 40);
+    let row = zoom_table_row(&buf, "1480").expect("occupied candidate row");
+    assert!(
+        row.contains("=JA1ABC*"),
+        "the Live column must star a keyed owner: {row}"
+    );
+}
+
 /// Plan Phase 3: no live QSOs ⇒ no owner tags at all.
 #[tokio::test]
 async fn tx_placement_best_row_is_untagged_without_live_assignments() {
@@ -293,12 +372,16 @@ async fn placement_zoom_table_has_a_live_column_naming_the_owner() {
 
     let buf = render(&app, 120, 40);
     assert!(contains(&buf, "Live"), "Live header column");
-    let occupied = row_containing(&buf, "1480").expect("occupied candidate row");
+    let occupied = zoom_table_row(&buf, "1480").expect("occupied candidate row");
     assert!(
-        occupied.contains("JA1ABC"),
+        occupied.contains("=JA1ABC"),
         "owner named on its row: {occupied}"
     );
-    let free = row_containing(&buf, "1720").expect("free candidate row");
+    let free = zoom_table_row(&buf, "1720").expect("free candidate row");
+    assert!(
+        !free.contains("JA1ABC"),
+        "a free candidate must not borrow the owner: {free}"
+    );
     assert!(
         free.contains('-'),
         "free rows render the placeholder: {free}"
