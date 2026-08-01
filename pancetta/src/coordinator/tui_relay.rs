@@ -1048,6 +1048,16 @@ impl super::ApplicationCoordinator {
                                     target: "qso.security",
                                     "Refusing to call our own station {}", callsign
                                 );
+                                crate::coordinator::tx::emit_diagnostic_full(
+                                    &cmd_message_bus,
+                                    ComponentId::Qso,
+                                    "qso.security",
+                                    pancetta_core::DiagnosticLevel::Warn,
+                                    format!("Refusing to call our own station {callsign}"),
+                                    None,
+                                    Some(&callsign),
+                                )
+                                .await;
                                 let _ = cmd_tui_msg_tx.send(
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                         component: "TX".to_string(),
@@ -1115,6 +1125,16 @@ impl super::ApplicationCoordinator {
                                     target: "qso.security",
                                     "Refusing EngageHound on our own callsign {}", callsign
                                 );
+                                crate::coordinator::tx::emit_diagnostic_full(
+                                    &cmd_message_bus,
+                                    ComponentId::Qso,
+                                    "qso.security",
+                                    pancetta_core::DiagnosticLevel::Warn,
+                                    format!("Refusing EngageHound on our own callsign {callsign}"),
+                                    None,
+                                    Some(&callsign),
+                                )
+                                .await;
                                 let _ = cmd_tui_msg_tx.send(
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                         component: "TX".to_string(),

@@ -1,14 +1,14 @@
 # Observability / diagnostics — implementation plan
 
-**Status (2026-07-25): Layer 1 + core Layer 2 shipped PR #84. `tx.policy`-category Layer-1 emission
+**Status (2026-07-31): Complete. Layer 1 + core Layer 2 shipped PR #84. `tx.policy`-category Layer-1 emission
 + Layer 3 health panel shipped 2026-07-12 (Shift+S). Layer 2's structured Recent-QSOs ring/panel
 shipped (commits 5cdafd17/02699723/51cbcbff). Layer 2's optional per-QSO timeline persistence
 shipped: `state_history`/`messages` now flow through `QsoEvent::QsoCompleted`/`QsoFailed` and are
 persisted — gated behind `[database].persist_qso_timeline` (default off) — into the existing
 `qsos.progress_data` blob for completed QSOs and a new `qso_events` table for failed ones
-(`QsoDatabase::insert_qso_timeline`/`get_qso_timeline`, keyed by `qso_id`).** Remaining:
-`qso.security`-category Layer-1 emission (blocked on a real architecture change to the QSO state
-machine — see `project_observability_remaining_layers_scoped` memory).
+(`QsoDatabase::insert_qso_timeline`/`get_qso_timeline`, keyed by `qso_id`). `qso.security` Layer-1
+emission shipped 2026-07-31: typed rejection events now cross the QSO/coordinator boundary and
+appear as retained Warn rows in the Shift+D Diagnostics overlay.**
 
 Detailed plan to let the operator answer, **without hand-reading the log**: "why did
 that QSO fail?", "why are we retrying / not transmitting?", and "is the station healthy
@@ -26,7 +26,9 @@ stalls, we retry, TX is late) but cannot *see why*.
 - **Logging:** `tracing` → daily-rotating file `~/.pancetta/logs/pancetta.log` (14-file
   retention); console layer only in `--headless` (in TUI mode the file is the *only*
   log). Plain text, **not JSON / not queryable**. There **is** a consistent `target:`
-  vocabulary already in use — `qso.security` (22 sites), `tx.policy` (22), `qso`,
+  vocabulary already in use — `qso.security` (formerly counted as 22 log sites, but completing
+  the category also required instrumenting sender-verification rejections shadowed inside
+  `is_message_relevant` before their transition-level log could run), `tx.policy` (22), `qso`,
   `operator.override`, `agent.tx`, `qso.autonomous`, `priority`, etc. — but it is
   **write-only to the file**; nothing indexes or surfaces it.
 - **Operator surfacing bottleneck:** `App.status_message: String`
