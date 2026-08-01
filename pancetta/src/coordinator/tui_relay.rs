@@ -1903,18 +1903,22 @@ impl super::ApplicationCoordinator {
                                 let policy = pancetta_core::TxPolicy::from_u8(
                                     cmd_tx_policy.load(Ordering::Acquire),
                                 );
-                                if !policy.allows_any_tx() {
+                                if !policy.allows_any_tx()
+                                    || cmd_tx_restart_inhibit.load(Ordering::Acquire) != 0
+                                {
+                                    let status = if !policy.allows_any_tx() {
+                                        "Can't key PTT — TX is DISABLED (press g to re-enable)"
+                                    } else {
+                                        "Can't key PTT — rig control is restarting"
+                                    };
                                     warn!(
                                         target: "tx.policy",
-                                        "Refusing PTT key-up: TX policy is {} (RX-only)",
-                                        policy.label()
+                                        "Refusing PTT key-up: {status}"
                                     );
                                     let _ = cmd_tui_msg_tx.send(
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "TX".to_string(),
-                                            status: "Can't key PTT — TX is DISABLED (press g \
-                                                     to re-enable)"
-                                                .to_string(),
+                                            status: status.to_string(),
                                         },
                                     );
                                     continue;

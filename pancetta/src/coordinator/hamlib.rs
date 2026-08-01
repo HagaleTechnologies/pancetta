@@ -109,18 +109,21 @@ impl super::ApplicationCoordinator {
             .get_or_create_channel(ComponentId::Hamlib)
             .await
         {
-            let mut unkeys = Vec::new();
+            let mut safe_messages = Vec::new();
             while let Ok(message) = receiver.try_recv() {
-                if matches!(
+                // A stale key-up is the only command that is unsafe after a
+                // restart. Preserve unkeys, frequency, mode, and split state
+                // so teardown cannot silently desynchronize the rig.
+                if !matches!(
                     message.message_type,
                     MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
-                        state: false
+                        state: true
                     })
                 ) {
-                    unkeys.push(message);
+                    safe_messages.push(message);
                 }
             }
-            for message in unkeys {
+            for message in safe_messages {
                 let _ = sender.send(message);
             }
         }
@@ -705,7 +708,11 @@ impl super::ApplicationCoordinator {
                 let initial_ptt_on = if ptt_active.load(Ordering::Acquire) {
                     let last_ms = super::now_epoch_ms()
                         .saturating_sub(last_ptt_on_ms.load(Ordering::Acquire));
-                    Some(Instant::now() - Duration::from_millis(last_ms))
+                    let now = Instant::now();
+                    Some(
+                        now.checked_sub(Duration::from_millis(last_ms))
+                            .unwrap_or(now),
+                    )
                 } else {
                     None
                 };
@@ -895,15 +902,15 @@ impl super::ApplicationCoordinator {
         // If the rig is slow or absent the timeout fires, we log a warning and
         // carry on — the poll loop (every 500 ms) will catch up; only the first
         // few seconds of operation could stamp band=0.
-        if rig_enabled {
+        if rig_enabled && first_start {
             match tokio::time::timeout(RIG_INITIAL_READ_TIMEOUT, initial_read_rx).await {
-                Ok(_) if first_start => {
+                Ok(_) => {
                     info!(
                         target: "rig",
                         "Rig initial frequency read complete before QSO pipeline start"
                     );
                 }
-                Err(_) if first_start => {
+                Err(_) => {
                     warn!(
                         target: "rig",
                         "Rig frequency not read within {}s at startup — band may be wrong \
@@ -911,7 +918,6 @@ impl super::ApplicationCoordinator {
                         RIG_INITIAL_READ_TIMEOUT.as_secs()
                     );
                 }
-                _ => {}
             }
         }
 

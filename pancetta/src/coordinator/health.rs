@@ -14,7 +14,6 @@ use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
 struct TxInhibitGuard {
     counter: Option<Arc<AtomicU32>>,
-    release: bool,
 }
 
 impl TxInhibitGuard {
@@ -23,27 +22,17 @@ impl TxInhibitGuard {
             counter.fetch_add(1, Ordering::AcqRel);
             Self {
                 counter: Some(counter),
-                release: true,
             }
         } else {
-            Self {
-                counter: None,
-                release: true,
-            }
+            Self { counter: None }
         }
-    }
-
-    fn latch(&mut self) {
-        self.release = false;
     }
 }
 
 impl Drop for TxInhibitGuard {
     fn drop(&mut self) {
-        if self.release {
-            if let Some(counter) = &self.counter {
-                counter.fetch_sub(1, Ordering::AcqRel);
-            }
+        if let Some(counter) = &self.counter {
+            counter.fetch_sub(1, Ordering::AcqRel);
         }
     }
 }
@@ -556,7 +545,7 @@ impl super::ApplicationCoordinator {
 
         let degradation = degradation_message(component_id);
 
-        let mut tx_inhibit =
+        let _tx_inhibit =
             TxInhibitGuard::for_component(component_id, self.tx_restart_inhibit.clone());
 
         // Task 6 (task-supervision): a crashed Qso-component task drops
@@ -626,7 +615,6 @@ impl super::ApplicationCoordinator {
                         info!("Component {} restarted successfully", component_id);
                     }
                     Err(e) => {
-                        tx_inhibit.latch();
                         error!("Component {} restart failed: {}", component_id, e);
                         {
                             let mut status_map = self.component_status.write().await;
@@ -639,7 +627,6 @@ impl super::ApplicationCoordinator {
                 }
             }
             RestartPolicy::Restartable => {
-                tx_inhibit.latch();
                 // Budget exhausted -- degrade instead of restarting again.
                 warn!(
                     "Component {} exceeded restart budget -- degrading",
@@ -824,9 +811,10 @@ impl super::ApplicationCoordinator {
 #[cfg(test)]
 mod supervisor_tests {
     use super::super::ApplicationCoordinator;
+    use super::TxInhibitGuard;
     use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
     use pancetta_config::Config;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
 
     /// Mirrors the direct-construction pattern used by `mod.rs`'s
@@ -930,6 +918,39 @@ mod supervisor_tests {
         coordinator
             .shutdown_signal
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[test]
+    fn budget_exhausted_degrade_still_clears_the_tx_inhibit() {
+        let inhibit = Arc::new(AtomicU32::new(0));
+        {
+            let _guard = TxInhibitGuard::for_component(ComponentId::Hamlib, inhibit.clone());
+            assert_eq!(inhibit.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(inhibit.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn hamlib_crash_mid_ptt_forces_ptt_off_on_the_rig() {
+        use pancetta_hamlib::{PttState, RigControl, Vfo};
+
+        let mut coordinator = test_coordinator().await;
+        let mock = Arc::new(pancetta_hamlib::MockRig::default());
+        mock.connect().await.expect("test rig should connect");
+        mock.set_ptt(Vfo::Current, PttState::On)
+            .await
+            .expect("test rig should key");
+        coordinator.rig_handle = Some(mock.clone());
+        coordinator.ptt_active.store(true, Ordering::Release);
+
+        coordinator.teardown_hamlib().await;
+
+        assert_eq!(
+            mock.get_ptt(Vfo::Current).await.expect("PTT state"),
+            PttState::Off
+        );
+        assert!(!coordinator.ptt_active.load(Ordering::Acquire));
     }
 
     #[tokio::test]

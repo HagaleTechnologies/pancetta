@@ -1263,6 +1263,9 @@ fn degradation_message(id: ComponentId) -> &'static str {
         ComponentId::Qso => "QSO manager failed -- contact logging unavailable",
         ComponentId::Ft8Transmitter => "FT8 transmitter failed -- TX disabled",
         ComponentId::Autonomous => "Autonomous operator failed -- manual operation only",
+        ComponentId::RemoteGateway => {
+            "Remote gateway failed -- remote operation unavailable until restart"
+        }
         ComponentId::StationAgent => "Remote-TX security agent lost -- remote TX disarmed",
         _ => "Component failed",
     }
@@ -2930,9 +2933,17 @@ mod tests {
 
     #[test]
     fn degradation_message_names_every_supervised_component() {
-        assert_ne!(
-            degradation_message(ComponentId::StationAgent),
-            "Component failed"
-        );
+        for id in [
+            ComponentId::Autonomous,
+            ComponentId::DxCluster,
+            ComponentId::PskReporter,
+            ComponentId::RemoteGateway,
+            ComponentId::Qso,
+            ComponentId::Hamlib,
+            ComponentId::StationAgent,
+            ComponentId::Audio,
+        ] {
+            assert_ne!(degradation_message(id), "Component failed", "{id}");
+        }
     }
 }
