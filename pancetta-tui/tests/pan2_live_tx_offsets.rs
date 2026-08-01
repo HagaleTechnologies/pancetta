@@ -418,3 +418,98 @@ async fn stream_marker_label_is_clipped_not_wrapped_at_the_right_edge() {
     let buf = render(&app, 120, 40);
     assert!(contains(&buf, "TX Placement"));
 }
+
+// ------------------------------------------------- phase-review remediations
+
+/// Helper: the TX-placement stream-marker row (not the banner, not NEXT TX).
+fn marker_row(buf: &Buffer) -> String {
+    rows(buf)
+        .into_iter()
+        .find(|r| {
+            r.contains('\u{2502}')
+                && !r.starts_with("QSO: ")
+                && !r.contains("NEXT TX")
+                && r.contains("Hz") == false
+                && r.contains('@') == false
+                && (r.contains("JA1ABC") || r.contains("K1ABC"))
+        })
+        .unwrap_or_else(|| "<<no marker row>>".into())
+}
+
+/// Concurrent QSOs are PAN-2's whole premise, and the allocator packs them a
+/// few hundred Hz apart. Appending the offset to the marker label (Phase 4)
+/// made the label long enough to run into the next stream's `│`, which both
+/// erased that marker and left a PARTIAL number on screen — a QSO at 1480 Hz
+/// rendering as `JA1ABC 148`, indistinguishable from a real offset.
+#[tokio::test]
+async fn stream_marker_never_renders_a_truncated_offset() {
+    let mut app = new_app().await;
+    app.apply_placement(placement_view(&[(1100.0, 62.0)]));
+    app.apply_active_qsos(
+        vec![
+            banner_at("JA1ABC", 1480.0, "qso-a"),
+            banner_at("K1ABC", 1700.0, "qso-b"),
+        ],
+        Vec::new(),
+    );
+    let marker = marker_row(&render(&app, 120, 40));
+    assert!(
+        !marker.contains("JA1ABC 148\u{2502}") && !marker.contains("JA1ABC 14 "),
+        "a clipped offset must be dropped whole, never left as a partial number: {marker}"
+    );
+    // Either the full offset or no offset at all — never a prefix of it.
+    if let Some(rest) = marker.split("JA1ABC ").nth(1) {
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        assert!(
+            digits.is_empty() || digits == "1480",
+            "offset must render whole; got {digits:?} in {marker}"
+        );
+    }
+}
+
+/// The neighbouring stream's `│` marker must survive its lower neighbour's
+/// label — otherwise a concurrent QSO vanishes from the row that exists to
+/// show it.
+#[tokio::test]
+async fn stream_marker_label_does_not_erase_the_next_stream_marker() {
+    // Both snapshot orderings: draw order must not decide who survives.
+    for reversed in [false, true] {
+        let mut app = new_app().await;
+        app.apply_placement(placement_view(&[(1100.0, 62.0)]));
+        let mut qsos = vec![
+            banner_at("JA1ABC", 1480.0, "qso-a"),
+            banner_at("K1ABC", 1620.0, "qso-b"),
+        ];
+        if reversed {
+            qsos.reverse();
+        }
+        app.apply_active_qsos(qsos, Vec::new());
+        let marker = marker_row(&render(&app, 120, 40));
+        assert!(
+            marker.contains("JA1ABC"),
+            "lower stream still labelled (reversed={reversed}): {marker}"
+        );
+        assert!(
+            marker.contains("K1ABC 1620"),
+            "upper stream keeps its marker and full label (reversed={reversed}): {marker}"
+        );
+    }
+}
+
+/// Compound/portable calls (`VK9/G4ABC/P`) are exactly the stations this
+/// instrument exists to help work. A 10-wide `Live` column silently truncated
+/// them to a DIFFERENT, still-plausible callsign, with ~60 columns unused.
+#[tokio::test]
+async fn placement_zoom_live_column_fits_a_compound_callsign() {
+    let mut app = new_app().await;
+    app.apply_placement(placement_view(&[(1480.0, 62.0)]));
+    app.apply_active_qsos(vec![banner_at("VK9/G4ABC/P", 1480.0, "qso-a")], Vec::new());
+    app.active_panel = ActivePanel::TxPlacement;
+    app.zoomed = true;
+
+    let row = zoom_table_row(&render(&app, 120, 40), "1480").expect("occupied candidate row");
+    assert!(
+        row.contains("=VK9/G4ABC/P"),
+        "compound callsign must not be truncated: {row}"
+    );
+}

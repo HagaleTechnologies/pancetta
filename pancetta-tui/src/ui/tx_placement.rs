@@ -185,12 +185,15 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
     }
 
     let widths = [
-        Constraint::Length(1),  // #
-        Constraint::Length(6),  // Freq
-        Constraint::Length(7),  // Windows
-        Constraint::Length(7),  // Score
-        Constraint::Length(8),  // Gap(Hz)
-        Constraint::Length(10), // Live
+        Constraint::Length(1), // #
+        Constraint::Length(6), // Freq
+        Constraint::Length(7), // Windows
+        Constraint::Length(7), // Score
+        Constraint::Length(8), // Gap(Hz)
+        // `=` + callsign + optional `*`. Sized for compound/portable calls
+        // (`VK9/G4ABC/P`); a narrower column truncated them into a different,
+        // still-plausible callsign. The zoom table has ~60 spare columns.
+        Constraint::Length(16), // Live
         Constraint::Length(6),  // Quiet
     ];
 
@@ -404,6 +407,18 @@ fn render_stream_markers(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
     let width = row.width as usize;
     let n_bins = placement.openness.len();
 
+    // Every marker column, so a label can stop before it runs into the next
+    // stream's `│`. Concurrent QSOs a few hundred Hz apart are the normal
+    // case here, and at ~20 Hz/column a `CALL 1480` label is wide enough to
+    // erase its neighbour's marker and leave a PARTIAL offset on screen
+    // (`JA1ABC 148`), which reads as a real frequency.
+    let mut marker_cols: Vec<usize> = app
+        .active_qsos
+        .iter()
+        .filter_map(|qso| freq_to_col(qso.frequency_hz, placement.range, width))
+        .collect();
+    marker_cols.sort_unstable();
+
     for qso in &app.active_qsos {
         let Some(col) = freq_to_col(qso.frequency_hz, placement.range, width) else {
             continue;
@@ -424,7 +439,22 @@ fn render_stream_markers(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Pl
             .set_char('\u{2502}')
             .set_fg(color);
 
-        let label = format!("{} {:.0}", qso.their_callsign, qso.frequency_hz);
+        // Room between this marker and the next one (or the right edge).
+        let limit = marker_cols
+            .iter()
+            .copied()
+            .find(|next| *next > col)
+            .unwrap_or(width)
+            .min(width)
+            .saturating_sub(col + 1);
+        let full = format!("{} {:.0}", qso.their_callsign, qso.frequency_hz);
+        // Drop the offset whole rather than clip it — a partial number is
+        // worse than no number, because nothing on screen marks it partial.
+        let label: String = if full.chars().count() <= limit {
+            full
+        } else {
+            qso.their_callsign.chars().take(limit).collect()
+        };
         for (i, ch) in label.chars().enumerate() {
             let cx = col + 1 + i;
             if cx >= width {
