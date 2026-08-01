@@ -144,6 +144,9 @@ fn main_layout_chunks(size: Rect) -> std::rc::Rc<[Rect]> {
         .split(size)
 }
 
+/// Split zoomed content into the persistent active-QSO banner and the focused
+/// panel. Both drawing and hit testing use this helper so their geometry cannot
+/// drift apart.
 fn compute_zoom_rects(content_area: Rect) -> (Rect, Rect) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
@@ -508,8 +511,8 @@ pub fn view_rects(
     area: Rect,
 ) -> Vec<(ActivePanel, Rect)> {
     if zoomed {
-        // Mirrors `render_zoomed_panel`: the focused panel fills the whole
-        // content area regardless of which view is selected.
+        // Mirrors `render_zoomed_panel`: the focused panel fills the content
+        // area below the reserved active-QSO banner, regardless of view.
         return vec![(active_panel, compute_zoom_rects(area).1)];
     }
     match view {
@@ -2443,7 +2446,7 @@ mod hit_test_tests {
     }
 
     #[test]
-    fn view_rects_zoomed_returns_single_full_area_pair_for_active_panel() {
+    fn view_rects_zoomed_reserves_the_banner_row_above_the_active_panel() {
         let area = Rect::new(0, 0, 120, 40);
         let rects = view_rects(ActiveView::Run, true, ActivePanel::DxHunter, area);
         assert_eq!(

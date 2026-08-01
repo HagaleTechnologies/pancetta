@@ -6,6 +6,7 @@
 //! via `TuiMessage::ActiveQsosUpdate` every time a QSO state changes.
 //! The widget is purely a renderer — no derived state, no caching.
 
+use crate::app::App;
 use ratatui::{
     layout::Rect,
     style::{Modifier, Style},
@@ -13,8 +14,6 @@ use ratatui::{
     widgets::Paragraph,
     Frame,
 };
-
-use crate::app::App;
 
 /// Render a one-line banner summarising active QSOs into `area`.
 /// Empty list renders as a muted "QSO: (none)" placeholder so the
@@ -58,11 +57,18 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
             q.frequency_hz
         );
         let remaining = qsos.len() - idx - 1;
-        let tail_width = (remaining > 0)
-            .then(|| format!("  │  +{remaining} more").len())
-            .unwrap_or(0);
+        let tail_width = if remaining > 0 {
+            format!("  │  +{remaining} more").chars().count()
+        } else {
+            0
+        };
         if shown > 0
-            && used + separator.len() + q.their_callsign.len() + detail.len() + tail_width > budget
+            && used
+                + separator.chars().count()
+                + q.their_callsign.chars().count()
+                + detail.chars().count()
+                + tail_width
+                > budget
         {
             break;
         }
@@ -82,7 +88,8 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
             detail.clone(),
             Style::default().fg(app.theme.foreground_color()),
         ));
-        used += separator.len() + q.their_callsign.len() + detail.len();
+        used +=
+            separator.chars().count() + q.their_callsign.chars().count() + detail.chars().count();
         shown += 1;
     }
     if shown < qsos.len() {

@@ -184,14 +184,10 @@ async fn active_qsos_banner_reports_overflow_instead_of_clipping_silently() {
 ///
 /// Constructed so the discrepancy alone decides the outcome. Three entries
 /// measure `5 ("QSO: ") + 32 + 5 (sep) + 32 + 5 + 32 = 111` display cells and
-/// fit in a 115-column banner, but the byte accumulator scores them at 121 and
-/// drops the third, rendering `+1 more` over ~29 unused columns.
-///
-/// Asserts the CURRENT (defective) behavior so the finding is reproducible
-/// without a red suite. When the accumulator is switched to display width,
-/// this test must be inverted to assert all three entries render.
+/// fit in a 115-column banner. The renderer must budget display cells rather
+/// than UTF-8 bytes so multibyte separators and arrows do not hide an entry.
 #[tokio::test]
-async fn active_qsos_banner_budget_over_counts_multibyte_glyphs() {
+async fn active_qsos_banner_budget_uses_display_width_for_multibyte_glyphs() {
     const W: u16 = 115;
     let mut app = new_app().await;
     app.apply_active_qsos(
@@ -204,8 +200,6 @@ async fn active_qsos_banner_budget_over_counts_multibyte_glyphs() {
     );
     let buf = render(&app, W, 40);
     let row = row_containing(&buf, "QSO: ").expect("banner row");
-    let used = row.trim_end().chars().count();
-
     // All three entries measure 111 display cells together — inside 115.
     let entry = "K1ABC (wait rpt · 0:00 · 1480Hz)".chars().count();
     let sep = "  │  ".chars().count();
@@ -213,16 +207,10 @@ async fn active_qsos_banner_budget_over_counts_multibyte_glyphs() {
     assert_eq!(all_three, 111, "fixture drift: recompute the widths");
     assert!(all_three <= W as usize, "fixture must fit the terminal");
 
-    assert!(
-        row.contains("+1 more"),
-        "documented defect: the byte-length budget drops an entry that fits \
-         (used={used} of {W} columns): {row}"
-    );
-    assert!(
-        used + 20 <= W as usize,
-        "documented defect: ≥20 columns left unused while claiming overflow \
-         (used={used}): {row}"
-    );
+    assert!(row.contains("K1ABC"), "first QSO missing: {row}");
+    assert!(row.contains("K2ABC"), "second QSO missing: {row}");
+    assert!(row.contains("K3ABC"), "third QSO missing: {row}");
+    assert!(!row.contains("more"), "a fitting QSO was hidden: {row}");
 }
 
 /// Plan Phase 2 / Decision 6: zoom is exactly the state that shows ONLY

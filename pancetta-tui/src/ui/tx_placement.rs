@@ -151,7 +151,13 @@ pub fn render_placement_zoom(f: &mut Frame<'_>, area: Rect, app: &App) -> Result
                 placement.bin_hz,
                 n_bins,
             )
-            .map(|assignment| assignment.callsign.clone())
+            .map(|assignment| {
+                format!(
+                    "={}{}",
+                    assignment.callsign,
+                    if assignment.keyed { "*" } else { "" }
+                )
+            })
             .unwrap_or_else(|| "-".to_string());
 
             Row::new([
@@ -283,13 +289,13 @@ pub(crate) fn bin_index_for_freq(
     pancetta_core::freq_bin::bin_index_for_freq(freq_hz, range, bin_hz, n_bins)
 }
 
-pub(crate) fn assignment_in_bin<'a>(
-    live: &'a [LiveTxAssignment],
+pub(crate) fn assignment_in_bin(
+    live: &[LiveTxAssignment],
     offset_hz: f64,
     range: (f64, f64),
     bin_hz: f64,
     n_bins: usize,
-) -> Option<&'a LiveTxAssignment> {
+) -> Option<&LiveTxAssignment> {
     let target = bin_index_for_freq(offset_hz, range, bin_hz, n_bins)?;
     live.iter().find(|assignment| {
         bin_index_for_freq(assignment.offset_hz, range, bin_hz, n_bins) == Some(target)
@@ -487,6 +493,9 @@ fn render_best_row(f: &mut Frame<'_>, row: Rect, app: &App, placement: &Placemen
         );
         if let Some(assignment) = owner {
             text.push_str(&format!("={}", assignment.callsign));
+            if assignment.keyed {
+                text.push('*');
+            }
         }
         let mut style = if i == app.placement_cursor {
             base.add_modifier(Modifier::REVERSED)
@@ -587,7 +596,6 @@ mod geometry_tests {
             callsign: "JA1ABC".into(),
             offset_hz: 1480.0,
             keyed: false,
-            qso_id: "qso-a".into(),
         }];
         assert_eq!(
             assignment_in_bin(&live, 1490.0, (200.0, 2600.0), 25.0, 96)

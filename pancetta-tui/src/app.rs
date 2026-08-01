@@ -845,7 +845,6 @@ pub struct LiveTxAssignment {
     pub callsign: String,
     pub offset_hz: f64,
     pub keyed: bool,
-    pub qso_id: String,
 }
 
 /// Rig connection state shown as a station-panel badge.
@@ -2412,7 +2411,6 @@ impl App {
                 callsign: qso.their_callsign.clone(),
                 offset_hz: qso.frequency_hz,
                 keyed: keyed_ids.contains(qso.qso_id.as_str()),
-                qso_id: qso.qso_id.clone(),
             })
             .collect();
         assignments.sort_by(|a, b| a.offset_hz.total_cmp(&b.offset_hz));
@@ -4604,21 +4602,52 @@ mod tests {
             qso_id: Some("qso-a".into()),
             deferred: false,
         });
-        app.tx_queued = vec![
-            TxQueueItem {
-                text: "b".into(),
-                freq_hz: 1234.0,
-                qso_id: Some("qso-b".into()),
-                deferred: false,
-            },
-            TxQueueItem {
-                text: "later".into(),
-                freq_hz: 1234.0,
-                qso_id: Some("other".into()),
-                deferred: true,
-            },
-        ];
+        app.tx_queued = vec![TxQueueItem {
+            text: "b".into(),
+            freq_hz: 1234.0,
+            qso_id: Some("qso-b".into()),
+            deferred: false,
+        }];
         assert!(app.live_tx_assignments().iter().all(|a| a.keyed));
+    }
+
+    #[tokio::test]
+    async fn live_tx_assignments_does_not_mark_deferred_items_keyed() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        let mut qso = fixture_banner("JA1ABC", "sending rpt", None);
+        qso.qso_id = "qso-a".into();
+        app.apply_active_qsos(vec![qso], Vec::new());
+        app.tx_queued = vec![TxQueueItem {
+            text: "later".into(),
+            freq_hz: 1234.0,
+            qso_id: Some("qso-a".into()),
+            deferred: true,
+        }];
+
+        assert!(!app.live_tx_assignments()[0].keyed);
+    }
+
+    #[tokio::test]
+    async fn live_tx_assignments_ignores_tx_items_with_no_qso_id() {
+        let mut app = App::new(Config::default(), None).await.unwrap();
+        app.apply_active_qsos(
+            vec![fixture_banner("JA1ABC", "sending rpt", None)],
+            Vec::new(),
+        );
+        app.tx_now_sending = Some(TxQueueItem {
+            text: "CQ TEST".into(),
+            freq_hz: 1234.0,
+            qso_id: None,
+            deferred: false,
+        });
+
+        assert!(!app.live_tx_assignments()[0].keyed);
+    }
+
+    #[tokio::test]
+    async fn live_tx_assignments_is_empty_without_active_qsos() {
+        let app = App::new(Config::default(), None).await.unwrap();
+        assert!(app.live_tx_assignments().is_empty());
     }
 
     /// Batch 94: an active-QSOs snapshot populates the QSO-detail panel
