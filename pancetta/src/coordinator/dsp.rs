@@ -247,15 +247,25 @@ impl super::ApplicationCoordinator {
     ///
     /// Simple direct pipeline: resample 48kHz->12kHz on a dedicated thread,
     /// accumulate FT8-sized windows, and send to the decoder.
-    pub(crate) async fn start_dsp_pipeline(
-        &mut self,
-        audio_rx: crossbeam_channel::Receiver<Vec<f32>>,
-        dsp_to_ft8_tx: crossbeam_channel::Sender<Vec<f32>>,
-        live_waterfall_tx: crossbeam_channel::Sender<Vec<Vec<f32>>>,
-        audio_level_tx: crossbeam_channel::Sender<f32>,
-        health_dsp_windows: Arc<std::sync::atomic::AtomicU64>,
-        health_last_rms: Arc<std::sync::atomic::AtomicU32>,
-    ) -> Result<()> {
+    pub(crate) async fn start_dsp_pipeline(&mut self) -> Result<()> {
+        let (
+            audio_rx,
+            dsp_to_ft8_tx,
+            live_waterfall_tx,
+            audio_level_tx,
+            health_dsp_windows,
+            health_last_rms,
+        ) = {
+            let h = self.decode_handles()?;
+            (
+                h.audio_to_dsp_rx.clone(),
+                h.dsp_to_ft8_tx.clone(),
+                h.waterfall_tx.clone(),
+                h.audio_level_tx.clone(),
+                h.health_dsp_windows.clone(),
+                h.health_last_rms.clone(),
+            )
+        };
         let span = span!(Level::INFO, "start_dsp");
         let _enter = span.enter();
 
@@ -648,9 +658,21 @@ impl super::ApplicationCoordinator {
                                 recorder.write_window(&window, &now, dial_hz);
                             }
 
-                            if dsp_to_ft8_tx.send(window).is_err() {
-                                info!("DSP: FT8 channel closed");
-                                return Ok(());
+                            match super::pipeline::forward_or_drop(
+                                &dsp_to_ft8_tx,
+                                window,
+                                super::pipeline::DECODE_FORWARD_TIMEOUT,
+                            ) {
+                                super::pipeline::ForwardOutcome::Sent => {}
+                                super::pipeline::ForwardOutcome::Dropped => {
+                                    // A restarted/slow decoder must not wedge the DSP stage:
+                                    // bounded backpressure intentionally sacrifices this slot,
+                                    // then the next slot is still eligible for decoding.
+                                    warn!(
+                                        "DSP: FT8 stage not draining -- dropped one decode window"
+                                    );
+                                }
+                                super::pipeline::ForwardOutcome::Disconnected => return Ok(()),
                             }
                             health_dsp_windows.fetch_add(1, Ordering::Relaxed);
                             health_last_rms.store(rms.to_bits(), Ordering::Relaxed);

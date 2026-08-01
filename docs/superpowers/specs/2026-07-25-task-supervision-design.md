@@ -11,6 +11,12 @@ Ft8Decoder need new channel/atomic re-supply plumbing before their moved-once st
 can be restarted; Hamlib, StationAgent, and Audio need teardown semantics (safe PTT/TX-arm
 unwind) that are only sketched in §2 below, not yet designed in code. See §4.6 for the
 already-shipped panic-hook groundwork this builds on.
+**Status update (2026-07-31):** PAN-4 completed ship-order step 3 for the decode pipeline. Dsp and
+Ft8Decoder now retain re-suppliable channel handles in `DecodePipelineHandles`, use bounded-wait
+forwarding during restart backoff, and auto-restart under the same supervisor policy. If a
+bounded DSP→FT8 channel remains full for 250 ms, the DSP stage logs and drops that decode window
+so decoder backpressure cannot kill or permanently wedge DSP; processing resumes with the next
+slot. Audio→DSP uses the same bounded policy without blocking a Tokio worker thread.
 **Scope crates:** `pancetta` (coordinator), `pancetta-qso` (new `QsoFailureReason` variant)
 **Supersedes:** `docs/task-supervision-plan.md` (2026-07-03) — that doc's research and touch
 points are correct and are folded in here; this spec is now the authoritative source and
@@ -148,11 +154,11 @@ code needed, just the new enum variant and its match arm in `recent_qso_failure_
 ### 4.5 Channel idempotency
 
 `MessageBus::get_or_create_channel(id)` replaces the duplicate-rejecting `create_channel`
-(`message_bus.rs:1065`) — returns the existing registration instead of erroring. Smaller and
+(`message_bus.rs:1088`) — returns the existing registration instead of erroring. Smaller and
 safer than having the supervisor tear down channels before restart, and unblocks every
 restartable component uniformly. Each `start_*` needs auditing for other first-run-only
-assumptions — in particular, Ft8Decoder/Dsp receive a channel receiver that is moved once; the
-supervisor needs either a re-creatable channel or a held clone to re-supply on restart.
+assumptions. PAN-4 resolved the Ft8Decoder/Dsp moved-once inputs by retaining idle clones in
+`DecodePipelineHandles` and re-supplying them from their no-argument start methods.
 
 ### 4.6 Panic surface (already shipped, no new work)
 
@@ -196,8 +202,8 @@ containment mechanism for these components, not an additional `catch_unwind` lay
 - **Safety-critical components must fail safe across a restart** — PTT off, disarmed, never key
   TX during a restart window. This is why teardown-restart for Hamlib/StationAgent/Audio ships
   last, after the cheap-restartable set has proven the supervisor mechanics.
-- **Ship order:** (1) panic hook — already shipped; (2) `get_or_create_channel`; (3) supervisor
-  for the cheap-restartable set; (4) teardown-restart for Hamlib/StationAgent/Audio last, with
+- **Ship order:** (1) panic hook — shipped; (2) `get_or_create_channel` — shipped; (3) supervisor
+  for the cheap-restartable set — complete with PAN-4; (4) teardown-restart for Hamlib/StationAgent/Audio last, with
   their safety invariants. Additive; the default `RestartPolicy` for anything unclassified stays
   `DegradeOnly` (today's behavior), so the change can't regress a component into an unsafe
   restart.
