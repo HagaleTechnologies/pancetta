@@ -1083,6 +1083,7 @@ fn failure_reason_text(reason: &pancetta_qso::QsoFailureReason) -> String {
         R::StationQrt => "station went QRT".to_string(),
         R::ProtocolError(e) => format!("protocol error: {e}"),
         R::SupervisorRestart => "dropped by an internal restart".to_string(),
+        R::ComponentCrash(component) => format!("{component} crashed mid-QSO"),
     }
 }
 
@@ -1351,6 +1352,10 @@ fn rejection_reason_text(reason: &pancetta_qso::RejectionReason) -> &'static str
         R::SenderAndAddresseeMismatch => "wrong sender and wrong addressee",
         R::UnsafeCompoundUpgrade => "unsafe compound-callsign upgrade",
     }
+}
+
+fn drop_should_promote(reason: &pancetta_qso::QsoFailureReason) -> bool {
+    !matches!(reason, pancetta_qso::QsoFailureReason::ComponentCrash(_))
 }
 
 /// Build a `RecentQsoOutcome` (observability-diagnostics-plan.md Layer 2 —
@@ -2322,10 +2327,10 @@ impl super::ApplicationCoordinator {
                                                 offsets.insert(key, freq);
                                             }
                                         }
-                                    } else if matches!(
-                                        new_state,
-                                        pancetta_qso::QsoState::Failed { .. }
-                                    ) {
+                                    } else if let pancetta_qso::QsoState::Failed {
+                                        reason, ..
+                                    } = &new_state
+                                    {
                                         if let Ok(mut set) = active_tx_qsos.write() {
                                             set.remove(&key);
                                         }
@@ -2343,12 +2348,14 @@ impl super::ApplicationCoordinator {
                                         // #40: a failed QSO frees its window
                                         // immediately (no trailing TX) — promote
                                         // any deferred cross-parity manual call.
-                                        promote_pending_manual_calls(
-                                            &snapshot_qso_manager,
-                                            &pending_for_events,
-                                            &snapshot_bus,
-                                        )
-                                        .await;
+                                        if drop_should_promote(reason) {
+                                            promote_pending_manual_calls(
+                                                &snapshot_qso_manager,
+                                                &pending_for_events,
+                                                &snapshot_bus,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
 
@@ -2862,12 +2869,14 @@ impl super::ApplicationCoordinator {
                                     }
                                 }
                                 // #40: window freed — promote a deferred call.
-                                promote_pending_manual_calls(
-                                    &snapshot_qso_manager,
-                                    &pending_for_events,
-                                    &snapshot_bus,
-                                )
-                                .await;
+                                if drop_should_promote(&reason) {
+                                    promote_pending_manual_calls(
+                                        &snapshot_qso_manager,
+                                        &pending_for_events,
+                                        &snapshot_bus,
+                                    )
+                                    .await;
+                                }
                                 // Task 5: recompute (see the QsoCompleted arm
                                 // above for why this replaced an
                                 // unconditional clear-to-empty).

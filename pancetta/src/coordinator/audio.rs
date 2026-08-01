@@ -56,6 +56,7 @@ impl super::ApplicationCoordinator {
         health_audio_alive: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         if self.no_audio {
+            self.audio_path_supervised = false;
             info!("Audio processing disabled");
             return Ok(());
         }
@@ -66,6 +67,7 @@ impl super::ApplicationCoordinator {
         let use_stub = std::env::var("PANCETTA_STUB_AUDIO").is_ok();
 
         if use_stub {
+            self.audio_path_supervised = false;
             info!("Starting audio component in STUB mode");
 
             let config = self.config.read().await;
@@ -121,6 +123,7 @@ impl super::ApplicationCoordinator {
 
             self.named_task_handles.push((ComponentId::Audio, handle));
         } else {
+            self.audio_path_supervised = true;
             info!("Starting audio component with real AudioManager");
 
             let config = self.config.read().await;

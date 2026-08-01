@@ -43,3 +43,22 @@ to keep that section to a policy statement rather than a point-in-time status li
   `#![allow(missing_docs)]` with a `// TODO: documentation pass pending` comment.
 
 Switch each crate to `warn`/`deny` as its doc coverage lands.
+
+## Supervisor crash-to-QSO scope (PAN-5, 2026-07-31)
+
+Component failure and QSO-engine restart are intentionally distinct operator diagnoses:
+`SupervisorRestart` means the QSO engine itself died and its in-memory state was lost;
+`ComponentCrash(name)` means a dependency died and the affected QSO was explicitly terminated.
+
+| Failed component | QSO scope | Failure reason |
+|---|---|---|
+| Qso | All active QSOs | `SupervisorRestart` |
+| Hamlib | All active QSOs | `ComponentCrash("Hamlib")` |
+| Audio | All active QSOs | `ComponentCrash("Audio")` |
+| StationAgent | Remote-origin QSOs only | `ComponentCrash("StationAgent")` |
+| Autonomous, DxCluster, PskReporter, RemoteGateway, Dsp, Ft8Decoder, Ft8Transmitter, Tui, Config, Coordinator, WsjtxUdp | None | No QSO failure emitted |
+
+The scope is dependency-based, not restart-policy-based: Audio remains deliberately `DegradeOnly`
+but its loss still invalidates every active on-air exchange, while a StationAgent crash cannot
+invalidate local operation. Component-crash drops also suppress the autonomous engine's normal
+"QSO ended, start another" reaction so recovery cannot cascade into fresh transmissions.

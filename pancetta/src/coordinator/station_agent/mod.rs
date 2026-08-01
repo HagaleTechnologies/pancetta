@@ -100,7 +100,7 @@ use ed25519_dalek::VerifyingKey;
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use pancetta_agent::arm::{ArmEffect, ArmState};
+use pancetta_agent::arm::{ArmEffect, ArmState, DisarmReason};
 use pancetta_agent::audit::{AuditEvent, AuditKind, AuditLog};
 use pancetta_agent::capability::CapabilityVerifier;
 use pancetta_agent::control::{map_client_frame, ControlAction, TxKind};
@@ -231,6 +231,27 @@ fn apply_arm_effects(audit: &AuditLog, effects: &[ArmEffect]) {
 /// Unix milliseconds now (the one clock read for arm timing; `ArmState` is pure).
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
+}
+
+/// Last-resort fail-safe for the live station-agent task. The guard is bound
+/// before session state is constructed and therefore disarms during unwinding
+/// from any panic in the session loop. Drop must remain synchronous and
+/// panic-free: it can itself run while another panic is already unwinding.
+struct RemoteTxDisarmGuard {
+    arm: Arc<Mutex<ArmState>>,
+    audit: AuditLog,
+}
+
+impl Drop for RemoteTxDisarmGuard {
+    fn drop(&mut self) {
+        let effects = match self.arm.lock() {
+            Ok(mut state) => state.disarm_with_reason(DisarmReason::ComponentCrash, now_ms()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .disarm_with_reason(DisarmReason::ComponentCrash, now_ms()),
+        };
+        apply_arm_effects(&self.audit, &effects);
+    }
 }
 
 /// The outcome of dispatching one decrypted control action — whether the caller
@@ -938,6 +959,31 @@ pub(crate) fn station_agent_active(
 }
 
 impl super::ApplicationCoordinator {
+    /// Definitively close the shared remote-TX arm after StationAgent loss.
+    ///
+    /// Poison is cleared only after the session has been removed, preserving
+    /// the fail-closed mutex behavior throughout recovery.
+    pub(crate) async fn fail_safe_disarm_remote_tx(&self, why: &str) {
+        let effects = match self.remote_tx_arm.lock() {
+            Ok(mut state) => state.disarm_with_reason(DisarmReason::ComponentCrash, now_ms()),
+            Err(poisoned) => poisoned
+                .into_inner()
+                .disarm_with_reason(DisarmReason::ComponentCrash, now_ms()),
+        };
+        apply_arm_effects(&self.audit_log(), &effects);
+        drop(effects);
+        self.remote_tx_arm.clear_poison();
+
+        crate::coordinator::tx::emit_diagnostic(
+            &self.message_bus,
+            "agent.tx",
+            pancetta_core::DiagnosticLevel::Error,
+            format!("Remote TX disarmed: {why}"),
+            None,
+        )
+        .await;
+    }
+
     /// Start the station-agent component (default-OFF, inert unless enabled +
     /// paired). Mirrors [`start_remote_gateway_component`](super::ApplicationCoordinator::start_remote_gateway_component):
     /// disabled/unpaired → drain-only; enabled + paired → connect + serve.
@@ -1072,7 +1118,7 @@ impl super::ApplicationCoordinator {
         // flood (parity with the gateway).
         let (_sa_tx, _sa_rx) = self
             .message_bus
-            .create_channel(ComponentId::StationAgent)
+            .get_or_create_channel(ComponentId::StationAgent)
             .await?;
 
         if cqdx_cfg.enabled && cqdx_cfg.token.as_ref().is_some_and(|t| !t.is_empty()) {
@@ -1082,7 +1128,7 @@ impl super::ApplicationCoordinator {
             let poll_agent_key_id = paired.agent_key_id.clone();
             let poll_shutdown = self.shutdown_signal.clone();
             let poll_interval = Duration::from_secs(cqdx_cfg.authorizations_poll_interval_secs);
-            tokio::spawn(async move {
+            let poll_handle = tokio::spawn(async move {
                 poll_authorizations_loop(
                     cqdx_cfg,
                     poll_agent_key_id,
@@ -1094,6 +1140,7 @@ impl super::ApplicationCoordinator {
                 )
                 .await;
             });
+            self.station_agent_poll = Some(poll_handle.abort_handle());
         }
 
         let handle = tokio::spawn(async move {
@@ -1122,7 +1169,7 @@ impl super::ApplicationCoordinator {
     async fn spawn_station_agent_drain(&mut self) -> Result<()> {
         let (_drain_tx, drain_rx) = self
             .message_bus
-            .create_channel(ComponentId::StationAgent)
+            .get_or_create_channel(ComponentId::StationAgent)
             .await?;
         let shutdown = self.shutdown_signal.clone();
         let handle = tokio::spawn(async move {
@@ -1272,6 +1319,10 @@ struct RunConfig {
 /// On any session teardown the arm is disarmed (fail TX-off on control-channel
 /// loss, Part-97), then the loop reconnects with capped backoff until shutdown.
 async fn run_session_loop(mut cfg: RunConfig) {
+    let _disarm_guard = RemoteTxDisarmGuard {
+        arm: cfg.arm.clone(),
+        audit: cfg.audit.clone(),
+    };
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut ctx = ArmContext {
         arm: cfg.arm.clone(),

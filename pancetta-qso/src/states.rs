@@ -172,6 +172,13 @@ pub enum QsoFailureReason {
     /// the operator's or the DX station's fault — surfaced distinctly so
     /// the Recent-QSOs panel doesn't misattribute it as e.g. a Timeout.
     SupervisorRestart,
+
+    /// A component this QSO depended on -- rig control, audio, or TX-arm security --
+    /// crashed mid-QSO, so the QSO could not continue. The payload is the crashed
+    /// component's coordinator-side name. Distinct from `SupervisorRestart` (which
+    /// means the QSO engine's own task died) so the Recent-QSOs panel misattributes
+    /// neither as a Timeout.
+    ComponentCrash(String),
 }
 
 /// Why the QSO engine refused a decoded frame on sender-verification grounds.
@@ -1151,6 +1158,27 @@ mod tests {
             failed_at: Utc::now(),
             last_state: Box::new(QsoState::Idle),
         };
+        assert!(failed.ladder_view(QsoRole::Caller).is_none());
+    }
+
+    #[test]
+    fn component_crash_is_a_distinct_qso_failure_reason() {
+        let reason = QsoFailureReason::ComponentCrash("Hamlib".to_string());
+        assert_ne!(reason, QsoFailureReason::SupervisorRestart);
+
+        let failed = QsoState::Failed {
+            reason: reason.clone(),
+            failed_at: Utc::now(),
+            last_state: Box::new(QsoState::Idle),
+        };
+        assert!(matches!(
+            &failed,
+            QsoState::Failed {
+                reason: failed_reason,
+                last_state,
+                ..
+            } if failed_reason == &reason && **last_state == QsoState::Idle
+        ));
         assert!(failed.ladder_view(QsoRole::Caller).is_none());
     }
 }

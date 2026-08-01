@@ -102,6 +102,19 @@ exists to flip this gate at runtime). Tests:
 `coordinator::autonomous::fq_f9_placement_feed_when_disabled_tests::interactive_launch_never_auto_arms_even_when_config_enabled`
 and its `headless_launch_still_auto_arms_from_config_per_runbook` control.
 
+## Hamlib restart windows hard-mute TX without changing operator policy (PAN-5), 2026-07-31
+
+Hamlib supervisor teardown raises `tx_restart_inhibit`, a reference-counted hard-mute separate from
+`TxPolicy`, before releasing PTT and tearing down rig-control resources. The inhibit spans teardown,
+restart backoff, and the restart attempt, and clears by RAII on success, failure, budget exhaustion,
+or unwind. Single-TX, multi-TX, supersede re-key, and manual TUI PTT paths re-check the combined hard
+mute at key time; PTT-OFF remains unconditionally allowed.
+
+The counter is deliberately not encoded in `TxPolicy`: policy records operator intent, while the
+restart inhibit is transient supervisor-owned safety state. Keeping them separate preserves the
+operator's `Disabled`, `RespondOnly`, or `Full` selection across both successful and failed restarts,
+and permits nested safety holds without one clearer accidentally unmuting another.
+
 ## Coordinator-level QSO sim harness
 
 `pancetta/tests/coord_sim.rs`: a durable, reusable `CoordSim` fixture that exercises the *coordinator's* TX gate + mock-rig PTT + multi-stream path, complementing the engine-level state-machine harness in `pancetta-qso/src/sim.rs`. It stands up a real `MessageBus`, a real `QsoManager`, a real `MockRig` behind a hamlib consumer (mirror of `coordinator/hamlib.rs`'s `SetPtt` handling), and the *real* shared `active_tx_qsos` set + `tx_policy` atomic. A scenario starts/advances QSOs via the manager's real entry points (`respond_to_cq_with` / `respond_to_caller` / `start_cq`), calls `pump_qso_events()` (a faithful mirror of `coordinator/qso.rs`'s populater — insert on `StateChanged→active`/`QsoCompleted`, remove on `Failed`/`QsoFailed`, forward `MessageToSend`→`TransmitRequest`), then `drive_slot(pending)` which replicates the worker's keying-decision chain — **policy hard-mute → coalesce (real `coalesce_transmit_requests`) → Step-4b gate (real `tx_qso_is_live` over the real set) → key/audio/unkey** — sending real `RigControl(SetPtt)` over the bus to the mock rig and **asserting at the rig level** (`mock.get_ptt() == On`, offset, release). **Determinism**: no `schedule_tx` UTC math and no slot sleep (that's unit-tested in `tx.rs::schedule_tx_tests`); only bounded ms `await`s — pass/fail never depends on wall-clock slot phase. A `Timeline` (keyed / dropped / per-slot offsets, mirroring `sim::Timeline`'s style + Display) carries the readable assertion helpers. Permanent scenarios: PTT-keys-for-scheduled-QSO (StateChanged-at-start fix), stale-TX-dropped-after-supersede (no PTT), coalesce-backlog (newest wins, older not keyed), two-simultaneous-QSOs on distinct freqs, TX-policy Disabled=silent / RespondOnly=in-progress-keys-but-initiation-suppressed / Full=keys, requested-offset-honored, manual-send-never-gated. Made testable by re-exporting `coalesce_transmit_requests` / `CoalesceEntry` / `resolve_required_parity` and widening `active_tx_qso_key` / `tx_qso_is_live` to `pub` from `coordinator/mod.rs` (visibility-only, behavior-preserving).

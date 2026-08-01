@@ -68,7 +68,7 @@ cargo test -p pancetta-hamlib --lib -- --test-threads=1
 - `merge_with` must carry every config field (see the §5 config-merge guardrail).
 - Every transmitted frame (single or multi-TX bundle item) reflects the freshest `MessageToSend` the QSO engine emitted for that qso_id at key-time, or at the moment of an operator-triggered mid-TX abort+re-key, whichever is later.
 - At most one QSO object exists per (callsign, band) among active-or-recently-completed QSOs; repeated manual actions resolve to it, never spawn a sibling.
-- The coordinator supervisor auto-restarts a crashed Autonomous/DxCluster/PskReporter/RemoteGateway/Qso/Dsp/Ft8Decoder task (5 restarts/10min, capped-exponential backoff), surfacing dropped QSOs as `QsoFailureReason::SupervisorRestart`; Hamlib/StationAgent/Audio are not yet covered.
+- The coordinator supervisor auto-restarts a crashed Autonomous/DxCluster/PskReporter/RemoteGateway/Qso/Dsp/Ft8Decoder/Hamlib/StationAgent task (5 restarts/10min, capped-exponential backoff). Restart teardown guarantees PTT release for Hamlib and definitive disarm for StationAgent; TX stays inhibited throughout a Hamlib restart window. Audio deliberately remains `DegradeOnly`. QSO-engine loss surfaces as `SupervisorRestart`; dependency loss as `ComponentCrash` with component-specific QSO scope.
 
 ## Where Things Live
 

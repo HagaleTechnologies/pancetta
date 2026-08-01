@@ -814,6 +814,7 @@ impl super::ApplicationCoordinator {
         // initiation commands (StartCq, CallStation) on it, and echoes the
         // resulting state back to the TUI banner.
         let cmd_tx_policy = self.tx_policy.clone();
+        let cmd_tx_restart_inhibit = self.tx_restart_inhibit.clone();
         // Operator Hold/Auto TX-frequency mode (`f`). The handler toggles this
         // atomic; the QSO engine and autonomous operator read it to gate
         // autonomous frequency moves.
@@ -1799,7 +1800,9 @@ impl super::ApplicationCoordinator {
                                 let policy = pancetta_core::TxPolicy::from_u8(
                                     cmd_tx_policy.load(Ordering::Acquire),
                                 );
-                                if !policy.allows_any_tx() {
+                                if !policy.allows_any_tx()
+                                    || cmd_tx_restart_inhibit.load(Ordering::Acquire) != 0
+                                {
                                     warn!(
                                         target: "tx.policy",
                                         "Refusing tune start: TX policy is {} (RX-only)",

@@ -17,6 +17,16 @@ forwarding during restart backoff, and auto-restart under the same supervisor po
 bounded DSP→FT8 channel remains full for 250 ms, the DSP stage logs and drops that decode window
 so decoder backpressure cannot kill or permanently wedge DSP; processing resumes with the next
 slot. Audio→DSP uses the same bounded policy without blocking a Tokio worker thread.
+**Status update (2026-07-31):** PAN-5 implemented Hamlib and StationAgent under the same
+5-restarts/10-minute rolling budget with capped-exponential backoff. Hamlib and StationAgent ship
+with explicit pre-restart teardown: Hamlib guarantees PTT release and inhibits TX for the complete
+restart window; StationAgent definitively disarms before restart. The `Restartable-with-teardown`
+tier was implemented as a `teardown_component` hook before the existing `RestartPolicy::Restartable`
+path, not as a fourth policy variant. Audio deliberately remains `DegradeOnly` because its in-place
+device-recovery path owns rollback semantics that task restart cannot reproduce. Restart-caused QSO
+drops are surfaced as described in §4.4. See §4.6 for the already-shipped panic-hook groundwork this
+builds on. With Dsp/Ft8Decoder (PAN-4) and Hamlib/StationAgent (PAN-5) now covered, only Audio
+remains intentionally `DegradeOnly`.
 **Scope crates:** `pancetta` (coordinator), `pancetta-qso` (new `QsoFailureReason` variant)
 **Supersedes:** `docs/task-supervision-plan.md` (2026-07-03) — that doc's research and touch
 points are correct and are folded in here; this spec is now the authoritative source and
@@ -99,16 +109,21 @@ enum RestartPolicy { Restartable { max_retries: u32, backoff: BackoffSpec }, Deg
 ```
 
 Extends the existing `component_criticality` seam (`mod.rs:773`) with a third axis. Confirmed
-split (operator-reviewed, no changes from the original research):
+split (updated through PAN-5):
 
-- **Restartable (cheap):** Ft8Decoder, Dsp, Autonomous, DxCluster, PskReporter, RemoteGateway,
-  Qso. Plain restart via the existing `start_*_component` methods, all already `&mut self`.
+- **Restartable (cheap):** Autonomous, DxCluster, PskReporter, RemoteGateway, Qso. Plain restart
+  via the existing `start_*_component` methods, all already `&mut self`.
   Restarting `Qso` drops in-flight QSOs — acceptable for crash recovery, and surfaced per §4.4.
-- **Restartable-with-teardown:** Hamlib (tear down untracked child poll/PTT tasks + device handle
-  first, then re-connect), StationAgent (re-load identity/keys; **preserve the shared
-  `Arc<Mutex<ArmState>>` and its fail-safe disarm** — Part-97 critical), Audio (device re-acquire
-  path, same primitive as PR #121's manual-reopen path).
+- **Restartable-with-teardown (shipped via `teardown_component`, not a separate policy
+  variant):** Hamlib tears down child poll/PTT tasks and the device handle, guarantees PTT-off,
+  and raises a dedicated TX inhibit until restart completes or fails. StationAgent definitively
+  disarms before task teardown, then re-loads identity/keys while preserving the shared
+  `Arc<Mutex<ArmState>>`. Audio is excluded: its supervised task is not the hardware recovery
+  unit, and `audio_recovery.rs` already provides in-place device recovery with rollback semantics
+  a task restart cannot preserve.
 - **DegradeOnly:** Tui (owns the terminal; restart is awkward — degrade + notify).
+- **Deferred / DegradeOnly:** Dsp and Ft8Decoder pending channel/atomic re-supply plumbing; Audio
+  for the in-place recovery reason above.
 - **FatalAbort:** native `ft8_lib` C abort — unrecoverable in-process; document the external
   OS-supervisor backstop.
 

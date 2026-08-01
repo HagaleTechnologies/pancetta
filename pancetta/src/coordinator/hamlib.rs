@@ -13,6 +13,11 @@ use tracing::{debug, error, info, span, warn, Level};
 /// may stamp the wrong band.
 const RIG_INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(8);
 
+pub(crate) struct HamlibChildren {
+    pub(crate) poll: tokio::task::AbortHandle,
+    pub(crate) watchdog: tokio::task::AbortHandle,
+}
+
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
 /// Rig connection state surfaced to the TUI as a station-panel badge.
@@ -54,6 +59,73 @@ impl RigConnState {
 }
 
 impl super::ApplicationCoordinator {
+    pub(crate) async fn teardown_hamlib(&mut self) {
+        for orphan in self.hamlib_orphans.drain(..) {
+            orphan.abort();
+        }
+
+        let mut ptt_off = false;
+        if let Some(rig) = self.rig_handle.as_ref() {
+            for attempt in 1..=3 {
+                match rig
+                    .set_ptt(
+                        pancetta_hamlib::Vfo::Current,
+                        pancetta_hamlib::PttState::Off,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        ptt_off = true;
+                        self.ptt_active.store(false, Ordering::Release);
+                        break;
+                    }
+                    Err(error) => {
+                        warn!("Hamlib teardown PTT-off attempt {attempt} failed: {error}");
+                        tokio::time::sleep(Duration::from_millis(500)).await;
+                    }
+                }
+            }
+        }
+
+        if let Some(children) = self.hamlib_children.take() {
+            children.poll.abort();
+            if ptt_off {
+                children.watchdog.abort();
+            } else {
+                self.hamlib_orphans.push(children.watchdog);
+                super::tx::emit_diagnostic(
+                    &self.message_bus,
+                    "supervisor",
+                    pancetta_core::DiagnosticLevel::Error,
+                    "Hamlib teardown could not force PTT off; watchdog retained".to_string(),
+                    None,
+                )
+                .await;
+            }
+        }
+
+        if let Ok((sender, receiver)) = self
+            .message_bus
+            .get_or_create_channel(ComponentId::Hamlib)
+            .await
+        {
+            let mut unkeys = Vec::new();
+            while let Ok(message) = receiver.try_recv() {
+                if matches!(
+                    message.message_type,
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
+                        state: false
+                    })
+                ) {
+                    unkeys.push(message);
+                }
+            }
+            for message in unkeys {
+                let _ = sender.send(message);
+            }
+        }
+    }
+
     /// Map rig model name to hamlib model number.
     /// See: https://github.com/Hamlib/Hamlib/wiki/Supported-Radios
     /// Public so `pancetta doctor` (in the bin crate) can pre-validate the
@@ -131,7 +203,18 @@ impl super::ApplicationCoordinator {
 
         info!("Starting Hamlib component");
 
-        let (_hamlib_tx, hamlib_rx) = self.message_bus.create_channel(ComponentId::Hamlib).await?;
+        if self
+            .rigctld_process
+            .as_mut()
+            .is_some_and(|child| child.try_wait().ok().flatten().is_some())
+        {
+            self.rigctld_process.take();
+        }
+
+        let (_hamlib_tx, hamlib_rx) = self
+            .message_bus
+            .get_or_create_channel(ComponentId::Hamlib)
+            .await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
 
@@ -288,8 +371,26 @@ impl super::ApplicationCoordinator {
             }
         }
 
+        let first_start = self.rig_handle.is_none();
+        let rig: Arc<dyn pancetta_hamlib::RigControl + Send + Sync> = if !rig_enabled {
+            info!("Rig control disabled, using mock rig");
+            Arc::new(pancetta_hamlib::MockRig::default())
+        } else {
+            info!("Connecting to rigctld at {}:{}", rigctld_host, rigctld_port);
+            Arc::new(pancetta_hamlib::RigctldClient::new(
+                pancetta_hamlib::RigctldConfig {
+                    host: rigctld_host.clone(),
+                    port: rigctld_port,
+                    ..Default::default()
+                },
+            ))
+        };
+        self.rig_handle = Some(rig.clone());
+
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let ptt_active = self.ptt_active.clone();
+        let last_ptt_on_ms = self.last_ptt_on_ms.clone();
+        let tx_restart_inhibit = self.tx_restart_inhibit.clone();
         let rig_conn_state = self.rig_conn_state.clone();
         // C9 dedup anchor (most recent pancetta-initiated SetFrequency) — the
         // poll loop reads it to tell an operator dial move (tear down) from a
@@ -303,28 +404,24 @@ impl super::ApplicationCoordinator {
         // the dial atomic is still 0, which would cause the first-slot QSO
         // completion to log the wrong band.
         let (initial_read_tx, initial_read_rx) = tokio::sync::oneshot::channel::<()>();
+        let (children_tx, children_rx) = tokio::sync::oneshot::channel();
 
         let hamlib_handle = {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                let rig: Box<dyn pancetta_hamlib::RigControl + Send + Sync> = if !rig_enabled {
-                    info!("Rig control disabled, using mock rig");
-                    Box::new(pancetta_hamlib::MockRig::default())
-                } else {
-                    info!("Connecting to rigctld at {}:{}", rigctld_host, rigctld_port);
-
-                    let config = pancetta_hamlib::RigctldConfig {
-                        host: rigctld_host,
-                        port: rigctld_port,
-                        ..Default::default()
-                    };
-                    Box::new(pancetta_hamlib::RigctldClient::new(config))
-                };
-
                 match rig.connect().await {
                     Ok(_) => {
                         info!("Rig connected successfully");
+                        if let Err(e) = rig
+                            .set_ptt(
+                                pancetta_hamlib::Vfo::Current,
+                                pancetta_hamlib::PttState::Off,
+                            )
+                            .await
+                        {
+                            warn!("Startup PTT-off failed: {e}");
+                        }
                         // Only flag a *real* CAT link as Connected — a mock rig
                         // (rig control disabled) stays NotConnected so the TUI
                         // badge never claims a radio is attached when none is.
@@ -373,7 +470,7 @@ impl super::ApplicationCoordinator {
                 let _ = initial_read_tx.send(());
 
                 // Polling task
-                let rig_poll = Arc::new(rig);
+                let rig_poll = rig;
                 let rig_for_polling = Arc::clone(&rig_poll);
                 let shutdown_for_polling = shutdown.clone();
                 let op_freq_for_polling = operating_frequency_hz.clone();
@@ -605,12 +702,21 @@ impl super::ApplicationCoordinator {
                 // legitimate FT8 TX, short enough to never bleed into the
                 // next slot. Catches stuck/crashed pipelines.
                 const PTT_SAFETY_TIMEOUT_SECS: u64 = 14;
-                let ptt_on_since: Arc<RwLock<Option<Instant>>> = Arc::new(RwLock::new(None));
+                let initial_ptt_on = if ptt_active.load(Ordering::Acquire) {
+                    let last_ms = super::now_epoch_ms()
+                        .saturating_sub(last_ptt_on_ms.load(Ordering::Acquire));
+                    Some(Instant::now() - Duration::from_millis(last_ms))
+                } else {
+                    None
+                };
+                let ptt_on_since: Arc<RwLock<Option<Instant>>> =
+                    Arc::new(RwLock::new(initial_ptt_on));
 
                 // Spawn the PTT watchdog as a background task
                 let rig_for_watchdog = Arc::clone(&rig_poll);
                 let ptt_watchdog_tracker = ptt_on_since.clone();
                 let shutdown_for_watchdog = shutdown.clone();
+                let ptt_active_watchdog = ptt_active.clone();
                 spawned_handles.push(tokio::spawn(async move {
                     let mut watchdog_interval = interval(Duration::from_secs(1));
                     loop {
@@ -639,6 +745,7 @@ impl super::ApplicationCoordinator {
                                 {
                                     Ok(_) => {
                                         warn!("PTT SAFETY WATCHDOG: PTT forced off successfully");
+                                        ptt_active_watchdog.store(false, Ordering::Release);
                                         // Only clear timer on success -- retry on next tick if it fails
                                         let mut guard = ptt_watchdog_tracker.write().await;
                                         *guard = None;
@@ -655,8 +762,16 @@ impl super::ApplicationCoordinator {
                     }
                 }));
 
+                let _ = children_tx.send(HamlibChildren {
+                    poll: spawned_handles[0].abort_handle(),
+                    watchdog: spawned_handles[1].abort_handle(),
+                });
+
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
+                    if spawned_handles.iter().any(|handle| handle.is_finished()) {
+                        anyhow::bail!("Hamlib polling or PTT-watchdog child terminated");
+                    }
                     match hamlib_rx.try_recv() {
                         Ok(message) => {
                             if let MessageType::RigControl(ref rig_msg) = message.message_type {
@@ -677,6 +792,13 @@ impl super::ApplicationCoordinator {
                                         }
                                     }
                                     crate::message_bus::RigControlMessage::SetPtt { state } => {
+                                        if *state && tx_restart_inhibit.load(Ordering::Acquire) != 0
+                                        {
+                                            warn!(
+                                                "Discarding PTT-on while Hamlib restart inhibit is active"
+                                            );
+                                            continue;
+                                        }
                                         // Update PTT watchdog tracker
                                         {
                                             let mut guard = ptt_on_since.write().await;
@@ -775,13 +897,13 @@ impl super::ApplicationCoordinator {
         // few seconds of operation could stamp band=0.
         if rig_enabled {
             match tokio::time::timeout(RIG_INITIAL_READ_TIMEOUT, initial_read_rx).await {
-                Ok(_) => {
+                Ok(_) if first_start => {
                     info!(
                         target: "rig",
                         "Rig initial frequency read complete before QSO pipeline start"
                     );
                 }
-                Err(_) => {
+                Err(_) if first_start => {
                     warn!(
                         target: "rig",
                         "Rig frequency not read within {}s at startup — band may be wrong \
@@ -789,7 +911,14 @@ impl super::ApplicationCoordinator {
                         RIG_INITIAL_READ_TIMEOUT.as_secs()
                     );
                 }
+                _ => {}
             }
+        }
+
+        if let Ok(Ok(children)) = tokio::time::timeout(Duration::from_secs(1), children_rx).await {
+            self.hamlib_children = Some(children);
+        } else {
+            warn!("Hamlib child handles were not published before startup returned");
         }
 
         info!("Hamlib component started");

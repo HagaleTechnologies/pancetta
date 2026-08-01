@@ -1022,6 +1022,19 @@ fn current_tx_policy(
     pancetta_core::TxPolicy::from_u8(tx_policy.load(Ordering::Acquire))
 }
 
+fn tx_hard_mute_reason(
+    tx_policy: &std::sync::Arc<std::sync::atomic::AtomicU8>,
+    restart_inhibit: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+) -> Option<&'static str> {
+    if restart_inhibit.load(Ordering::Acquire) != 0 {
+        Some("rig control is restarting")
+    } else if current_tx_policy(tx_policy) == pancetta_core::TxPolicy::Disabled {
+        Some("TX policy is Disabled")
+    } else {
+        None
+    }
+}
+
 /// Whether a TX item belonging to `qso_id` is still allowed on the air, given
 /// the shared active-QSO set. Thin wrapper over [`super::tx_qso_is_live`] that
 /// takes the read lock. A poisoned lock fails *open* (returns `true`) — a stuck
@@ -2246,6 +2259,7 @@ impl super::ApplicationCoordinator {
             // block to the TUI. RespondOnly is gated upstream (at the
             // initiation sources) so in-progress QSOs keep flowing here.
             let tx_policy = self.tx_policy.clone();
+            let tx_restart_inhibit = self.tx_restart_inhibit.clone();
             // Drop-stale-TX gate: the QSO component keeps this set in sync;
             // the worker refuses to key PTT for a request whose `qso_id` is no
             // longer present (superseded / cancelled / completed-past-grace).
@@ -2640,8 +2654,8 @@ impl super::ApplicationCoordinator {
                                     // report a failed TransmitComplete so any awaiting
                                     // QSO state machine doesn't hang. This is the
                                     // catch-all hard gate for every TX source.
-                                    if current_tx_policy(&tx_policy)
-                                        == pancetta_core::TxPolicy::Disabled
+                                    if tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
+                                        .is_some()
                                     {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -3074,6 +3088,25 @@ impl super::ApplicationCoordinator {
                                                 "dropping remote TX at key-time — arm went stale during slot wait: '{}' (qso: {:?})",
                                                 message_text, qso_id
                                             );
+                                            send_tx_queue_status(&message_bus, None, Vec::new())
+                                                .await;
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text,
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                            continue 'worker;
+                                        }
+
+                                        if tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
+                                            .is_some()
+                                        {
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
                                             let complete_msg = ComponentMessage::new(
@@ -3773,8 +3806,8 @@ impl super::ApplicationCoordinator {
                                     // modulate. Consume the bundle, clear the TUI TX
                                     // view, and report each item failed so any awaiting
                                     // state doesn't hang.
-                                    if current_tx_policy(&tx_policy)
-                                        == pancetta_core::TxPolicy::Disabled
+                                    if tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
+                                        .is_some()
                                     {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -4662,6 +4695,26 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
+                                    if tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
+                                        .is_some()
+                                    {
+                                        send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                        for item in &items {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: item.message_text.clone(),
+                                                    duration_ms: 0,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
+                                        }
+                                        continue;
+                                    }
+
                                     // Double-PTT fix: record every pivot from Step
                                     // 4b-pivot now that we're actually about to key this
                                     // bundle, so the newer request that PRODUCED each
@@ -4991,8 +5044,8 @@ impl super::ApplicationCoordinator {
                                     // TransmitRequest / MultiTransmitRequest
                                     // arms — defends against any TuneRequest
                                     // source, not just the TUI relay.
-                                    if current_tx_policy(&tx_policy)
-                                        == pancetta_core::TxPolicy::Disabled
+                                    if tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
+                                        .is_some()
                                     {
                                         info!(
                                             target: "pancetta::tx.policy",
