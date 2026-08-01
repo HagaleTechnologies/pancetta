@@ -32,12 +32,6 @@ fn manager() -> QsoManager {
 /// security event — but QSO B is also active, in a state whose relevance arm
 /// matches `SignalReport`, and its partner is W1AW, so the frame is classified
 /// against QSO B as `SenderNotPartner`.
-///
-// KNOWN BUG (PAN-3 phase-verify): fails today. `classify_relevance` runs for
-// every active QSO with no frequency gate and no knowledge of whether the frame
-// already matched a different QSO, so QSO A's legitimate partner reply is
-// reported as a security rejection against QSO B. Assertion left intact.
-#[ignore]
 #[tokio::test]
 async fn legit_partner_reply_is_not_reported_as_a_security_rejection() {
     let manager = manager();
@@ -95,12 +89,6 @@ async fn legit_partner_reply_is_not_reported_as_a_security_rejection() {
 
 /// Catalog scenario B1: our own partner is working a third party
 /// (`W9ZZZ K9ZZ -07`). This is routine on-air behavior, not an attack.
-///
-// KNOWN BUG (PAN-3 phase-verify): fails today with `addressee-not-us`.
-// `classify_relevance`'s `verify` closure filters only
-// `SenderAndAddresseeMismatch`, so a frame FROM our partner TO a third party
-// still emits an operator-facing Warn. Assertion left intact.
-#[ignore]
 #[tokio::test]
 async fn partner_working_a_third_party_is_not_reported_as_a_security_rejection() {
     let manager = manager();

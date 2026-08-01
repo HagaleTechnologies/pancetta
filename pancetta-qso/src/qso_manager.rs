@@ -3610,8 +3610,13 @@ impl QsoManager {
             }
         }
 
-        for event in rejections {
-            self.emit_event(event).await;
+        // A frame that matched any active QSO is legitimate traffic for this
+        // manager.  Do not report it as an impostor against every other
+        // concurrent QSO whose state happens to accept the same message kind.
+        if matching_qsos.is_empty() {
+            for event in rejections {
+                self.emit_event(event).await;
+            }
         }
 
         matching_qsos
@@ -3632,9 +3637,32 @@ impl QsoManager {
             };
         }
 
+        // Routing-stage diagnostics are only meaningful when the decode is
+        // close enough to be entangled with this QSO.  Otherwise ordinary
+        // traffic elsewhere in the passband would be classified against every
+        // active QSO.
+        let within_frequency_gate = state.frequency().is_none_or(|qso_frequency| {
+            let match_frequency = metadata.partner_freq.unwrap_or(qso_frequency);
+            let tolerance = if state.their_callsign().is_some() {
+                100.0
+            } else {
+                15.0
+            };
+            (match_frequency - frequency).abs() <= tolerance
+        });
+        if !within_frequency_gate {
+            return Relevance {
+                relevant: false,
+                reason: None,
+            };
+        }
+
         let verify = |from: &str, partner: &str, to: &str| {
             RejectionReason::classify(Self::is_partner(from, partner), self.is_us(to))
-                .filter(|reason| *reason != RejectionReason::SenderAndAddresseeMismatch)
+                // A partner working a third party is routine band traffic, not
+                // a security event.  At routing time only an impostor sending
+                // to us is distinguishable from ordinary traffic.
+                .filter(|reason| *reason == RejectionReason::SenderNotPartner)
         };
         let reason = match (state, message_type) {
             (
@@ -7359,17 +7387,21 @@ mod sender_verification_tests {
         assert!(!verdict.relevant);
         assert_eq!(verdict.reason, Some(RejectionReason::SenderNotPartner));
 
-        let unrelated = MessageType::SignalReport {
-            to_station: "W1AW".into(),
-            from_station: "NF4KE".into(),
-            report: -12,
-        };
-        let verdict = manager.classify_relevance(&state, &metadata, &unrelated, 1500.0);
-        assert!(!verdict.relevant);
-        assert_eq!(
-            verdict.reason, None,
-            "ordinary band traffic must stay silent"
-        );
+        for (from_station, to_station, frequency, description) in [
+            ("K9ZZ", "W1AW", 1500.0, "partner working a third party"),
+            ("NF4KE", "W1AW", 1500.0, "unrelated third-party traffic"),
+            ("NF4KE", "K5ARH", 2400.0, "off-frequency impostor traffic"),
+        ] {
+            let ordinary_traffic = MessageType::SignalReport {
+                to_station: to_station.into(),
+                from_station: from_station.into(),
+                report: -12,
+            };
+            let verdict =
+                manager.classify_relevance(&state, &metadata, &ordinary_traffic, frequency);
+            assert!(!verdict.relevant, "{description}");
+            assert_eq!(verdict.reason, None, "{description} must stay silent");
+        }
     }
 
     #[tokio::test]
