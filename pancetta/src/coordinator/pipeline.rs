@@ -29,7 +29,36 @@ pub(crate) fn forward_or_drop<T>(
     }
 }
 
+pub(crate) async fn forward_or_drop_async<T>(
+    tx: &crossbeam_channel::Sender<T>,
+    mut item: T,
+    timeout: Duration,
+) -> ForwardOutcome {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match tx.try_send(item) {
+            Ok(()) => return ForwardOutcome::Sent,
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                return ForwardOutcome::Disconnected;
+            }
+            Err(crossbeam_channel::TrySendError::Full(returned)) => item = returned,
+        }
+
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return ForwardOutcome::Dropped;
+        }
+        tokio::time::sleep((deadline - now).min(Duration::from_millis(5))).await;
+    }
+}
+
 pub(crate) const DECODE_FORWARD_TIMEOUT: Duration = Duration::from_millis(250);
+
+type TerminalReceivers = (
+    crossbeam_channel::Receiver<pancetta_ft8::DecodedMessage>,
+    crossbeam_channel::Receiver<Vec<Vec<f32>>>,
+    crossbeam_channel::Receiver<f32>,
+);
 
 pub(crate) struct DecodePipelineHandles {
     pub(crate) audio_to_dsp_tx: crossbeam_channel::Sender<Vec<f32>>,
@@ -71,13 +100,7 @@ impl DecodePipelineHandles {
         }
     }
 
-    fn take_terminal_receivers(
-        &mut self,
-    ) -> Result<(
-        crossbeam_channel::Receiver<pancetta_ft8::DecodedMessage>,
-        crossbeam_channel::Receiver<Vec<Vec<f32>>>,
-        crossbeam_channel::Receiver<f32>,
-    )> {
+    fn take_terminal_receivers(&mut self) -> Result<TerminalReceivers> {
         Ok((
             self.ft8_to_tui_rx
                 .take()
@@ -98,61 +121,6 @@ pub(crate) async fn register_decode_bus_channels(
     let _ = bus.get_or_create_channel(ComponentId::Dsp).await?;
     let _ = bus.get_or_create_channel(ComponentId::Ft8Decoder).await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::message_bus::MessageBus;
-
-    #[tokio::test]
-    async fn decode_bus_channels_register_idempotently() {
-        let bus = MessageBus::new(64).expect("bus construction");
-        register_decode_bus_channels(&bus)
-            .await
-            .expect("first registration should succeed");
-        register_decode_bus_channels(&bus)
-            .await
-            .expect("re-registration must not error");
-    }
-
-    #[test]
-    fn forward_or_drop_times_out_instead_of_blocking_when_full() {
-        let (tx, _rx) = crossbeam_channel::bounded::<u8>(1);
-        assert_eq!(
-            forward_or_drop(&tx, 1, Duration::from_millis(10)),
-            ForwardOutcome::Sent
-        );
-        let started = Instant::now();
-        assert_eq!(
-            forward_or_drop(&tx, 2, Duration::from_millis(10)),
-            ForwardOutcome::Dropped
-        );
-        assert!(started.elapsed() < Duration::from_millis(500));
-    }
-
-    #[test]
-    fn forward_or_drop_reports_disconnected_when_all_receivers_dropped() {
-        let (tx, rx) = crossbeam_channel::bounded::<u8>(1);
-        drop(rx);
-        assert_eq!(
-            forward_or_drop(&tx, 1, Duration::from_millis(10)),
-            ForwardOutcome::Disconnected
-        );
-    }
-
-    #[test]
-    fn retained_decode_handles_outlive_a_dead_stage() {
-        let handles = DecodePipelineHandles::new();
-        drop((
-            handles.audio_to_dsp_rx.clone(),
-            handles.dsp_to_ft8_tx.clone(),
-        ));
-        handles.audio_to_dsp_tx.send(vec![1.0; 4]).unwrap();
-        assert_eq!(handles.audio_to_dsp_rx.recv().unwrap(), vec![1.0; 4]);
-        handles.dsp_to_ft8_tx.send(vec![0.0; 4]).unwrap();
-        assert!(handles.dsp_to_ft8_rx.recv().is_ok());
-    }
 }
 
 impl super::ApplicationCoordinator {
@@ -333,5 +301,79 @@ impl super::ApplicationCoordinator {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::message_bus::MessageBus;
+
+    #[tokio::test]
+    async fn decode_bus_channels_register_idempotently() {
+        let bus = MessageBus::new(64).expect("bus construction");
+        register_decode_bus_channels(&bus)
+            .await
+            .expect("first registration should succeed");
+        register_decode_bus_channels(&bus)
+            .await
+            .expect("re-registration must not error");
+    }
+
+    #[test]
+    fn forward_or_drop_times_out_instead_of_blocking_when_full() {
+        let (tx, _rx) = crossbeam_channel::bounded::<u8>(1);
+        assert_eq!(
+            forward_or_drop(&tx, 1, Duration::from_millis(10)),
+            ForwardOutcome::Sent
+        );
+        let started = Instant::now();
+        assert_eq!(
+            forward_or_drop(&tx, 2, Duration::from_millis(10)),
+            ForwardOutcome::Dropped
+        );
+        assert!(started.elapsed() < Duration::from_millis(500));
+    }
+
+    #[tokio::test]
+    async fn async_forward_drops_a_full_decode_window_and_then_continues() {
+        let (tx, rx) = crossbeam_channel::bounded::<u8>(2);
+        tx.send(1).unwrap();
+        tx.send(2).unwrap();
+        assert_eq!(
+            forward_or_drop_async(&tx, 3, Duration::from_millis(10)).await,
+            ForwardOutcome::Dropped
+        );
+        assert_eq!(rx.recv().unwrap(), 1);
+        assert_eq!(
+            forward_or_drop_async(&tx, 4, Duration::from_millis(10)).await,
+            ForwardOutcome::Sent
+        );
+        assert_eq!(rx.iter().take(2).collect::<Vec<_>>(), vec![2, 4]);
+    }
+
+    #[test]
+    fn forward_or_drop_reports_disconnected_when_all_receivers_dropped() {
+        let (tx, rx) = crossbeam_channel::bounded::<u8>(1);
+        drop(rx);
+        assert_eq!(
+            forward_or_drop(&tx, 1, Duration::from_millis(10)),
+            ForwardOutcome::Disconnected
+        );
+    }
+
+    #[test]
+    fn retained_decode_handles_outlive_a_dead_stage() {
+        let handles = DecodePipelineHandles::new();
+        let dead_stage_rx = handles.audio_to_dsp_rx.clone();
+        handles.audio_to_dsp_tx.send(vec![1.0; 4]).unwrap();
+        std::thread::spawn(move || dead_stage_rx.recv().unwrap())
+            .join()
+            .unwrap();
+
+        handles.audio_to_dsp_tx.send(vec![2.0; 4]).unwrap();
+        assert_eq!(handles.audio_to_dsp_rx.recv().unwrap(), vec![2.0; 4]);
+        handles.dsp_to_ft8_tx.send(vec![0.0; 4]).unwrap();
+        assert!(handles.dsp_to_ft8_rx.recv().is_ok());
     }
 }

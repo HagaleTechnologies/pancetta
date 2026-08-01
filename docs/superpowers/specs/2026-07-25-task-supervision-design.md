@@ -13,7 +13,10 @@ unwind) that are only sketched in §2 below, not yet designed in code. See §4.6
 already-shipped panic-hook groundwork this builds on.
 **Status update (2026-07-31):** PAN-4 completed ship-order step 3 for the decode pipeline. Dsp and
 Ft8Decoder now retain re-suppliable channel handles in `DecodePipelineHandles`, use bounded-wait
-forwarding during restart backoff, and auto-restart under the same supervisor policy.
+forwarding during restart backoff, and auto-restart under the same supervisor policy. If a
+bounded DSP→FT8 channel remains full for 250 ms, the DSP stage logs and drops that decode window
+so decoder backpressure cannot kill or permanently wedge DSP; processing resumes with the next
+slot. Audio→DSP uses the same bounded policy without blocking a Tokio worker thread.
 **Scope crates:** `pancetta` (coordinator), `pancetta-qso` (new `QsoFailureReason` variant)
 **Supersedes:** `docs/task-supervision-plan.md` (2026-07-03) — that doc's research and touch
 points are correct and are folded in here; this spec is now the authoritative source and

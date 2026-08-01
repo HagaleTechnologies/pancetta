@@ -100,11 +100,13 @@ impl super::ApplicationCoordinator {
                     // RwLock write on every audio batch — the hottest lock).
                     last_timestamp.store(super::now_epoch_ms(), Ordering::Relaxed);
 
-                    match super::pipeline::forward_or_drop(
+                    match super::pipeline::forward_or_drop_async(
                         &audio_to_dsp_tx,
                         samples,
                         super::pipeline::DECODE_FORWARD_TIMEOUT,
-                    ) {
+                    )
+                    .await
+                    {
                         super::pipeline::ForwardOutcome::Sent => {}
                         super::pipeline::ForwardOutcome::Dropped => {
                             warn!("Audio stub: DSP stage not draining -- dropped one batch");
@@ -584,11 +586,14 @@ impl super::ApplicationCoordinator {
                     }
 
                     let len = samples.len();
-                    match super::pipeline::forward_or_drop(
+                    health_audio_alive_relay.store(true, Ordering::Relaxed);
+                    match super::pipeline::forward_or_drop_async(
                         &audio_to_dsp_tx,
                         samples,
                         super::pipeline::DECODE_FORWARD_TIMEOUT,
-                    ) {
+                    )
+                    .await
+                    {
                         super::pipeline::ForwardOutcome::Sent => {}
                         super::pipeline::ForwardOutcome::Dropped => {
                             warn!("Audio relay: DSP stage not draining -- dropped one batch");
@@ -602,7 +607,6 @@ impl super::ApplicationCoordinator {
                             break;
                         }
                     }
-                    health_audio_alive_relay.store(true, Ordering::Relaxed);
                     relay_count += 1;
                     if relay_count == 1 {
                         info!("Audio relay: first batch sent ({} samples)", len);

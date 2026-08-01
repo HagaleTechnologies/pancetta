@@ -665,6 +665,9 @@ impl super::ApplicationCoordinator {
                             ) {
                                 super::pipeline::ForwardOutcome::Sent => {}
                                 super::pipeline::ForwardOutcome::Dropped => {
+                                    // A restarted/slow decoder must not wedge the DSP stage:
+                                    // bounded backpressure intentionally sacrifices this slot,
+                                    // then the next slot is still eligible for decoding.
                                     warn!(
                                         "DSP: FT8 stage not draining -- dropped one decode window"
                                     );
