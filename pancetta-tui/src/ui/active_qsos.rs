@@ -42,16 +42,36 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
             .add_modifier(Modifier::BOLD),
     ));
 
+    let budget = area.width as usize;
+    let mut used: usize = spans.iter().map(Span::width).sum();
+    let mut shown = 0usize;
     for (idx, q) in qsos.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::styled(
-                "  │  ",
-                Style::default().fg(app.theme.muted_color()),
-            ));
-        }
         let elapsed = (now - q.started_at).num_seconds().max(0);
         let mm = elapsed / 60;
         let ss = elapsed % 60;
+        let separator = if idx > 0 { "  │  " } else { "" };
+        let detail = format!(
+            " ({} · {}:{:02} · {:.0}Hz)",
+            friendly_state(&q.state),
+            mm,
+            ss,
+            q.frequency_hz
+        );
+        let remaining = qsos.len() - idx - 1;
+        let tail_width = (remaining > 0)
+            .then(|| format!("  │  +{remaining} more").len())
+            .unwrap_or(0);
+        if shown > 0
+            && used + separator.len() + q.their_callsign.len() + detail.len() + tail_width > budget
+        {
+            break;
+        }
+        if idx > 0 {
+            spans.push(Span::styled(
+                separator,
+                Style::default().fg(app.theme.muted_color()),
+            ));
+        }
         spans.push(Span::styled(
             q.their_callsign.clone(),
             Style::default()
@@ -59,14 +79,16 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
-            format!(
-                " ({} · {}:{:02} · {:.0}Hz)",
-                friendly_state(&q.state),
-                mm,
-                ss,
-                q.frequency_hz
-            ),
+            detail.clone(),
             Style::default().fg(app.theme.foreground_color()),
+        ));
+        used += separator.len() + q.their_callsign.len() + detail.len();
+        shown += 1;
+    }
+    if shown < qsos.len() {
+        spans.push(Span::styled(
+            format!("  │  +{} more", qsos.len() - shown),
+            Style::default().fg(app.theme.muted_color()),
         ));
     }
 

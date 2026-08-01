@@ -100,7 +100,9 @@ pub fn draw(f: &mut Frame<'_>, app: &App) -> Result<()> {
     // system — checked before the view dispatch so it applies identically
     // regardless of `app.active_view`.
     if app.zoomed {
-        render_zoomed_panel(f, chunks[1], app)?;
+        let (banner, panel) = compute_zoom_rects(chunks[1]);
+        render_active_qsos(f, banner, app);
+        render_zoomed_panel(f, panel, app)?;
     } else {
         // Per-view content layout dispatch. Operate is today's layout
         // (extracted verbatim below, byte-identical); Monitor is the
@@ -140,6 +142,14 @@ fn main_layout_chunks(size: Rect) -> std::rc::Rc<[Rect]> {
             Constraint::Length(2), // Status bar (status line + help line)
         ])
         .split(size)
+}
+
+fn compute_zoom_rects(content_area: Rect) -> (Rect, Rect) {
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(1)])
+        .split(content_area);
+    (rows[0], rows[1])
 }
 
 /// The main content `Rect` (`chunks[1]` from `draw()`) for a full-terminal
@@ -500,7 +510,7 @@ pub fn view_rects(
     if zoomed {
         // Mirrors `render_zoomed_panel`: the focused panel fills the whole
         // content area regardless of which view is selected.
-        return vec![(active_panel, area)];
+        return vec![(active_panel, compute_zoom_rects(area).1)];
     }
     match view {
         crate::view::ActiveView::Operate => {
@@ -871,6 +881,7 @@ fn render_title_bar(f: &mut Frame<'_>, area: Rect, app: &App) {
 /// queued for an upcoming slot. Lightweight: reuses the coordinator's
 /// `TxQueueUpdate` snapshot already in `App`.
 fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
+    const TX_STRIP_MAX_ITEMS: usize = 3;
     let mut spans: Vec<Span> = Vec::new();
 
     // Non-deferred queued items that share the on-air slot are CONCURRENT
@@ -923,10 +934,33 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
             ));
         }
         None => {
-            spans.push(Span::styled(
-                "▶ NOW: (idle) ",
-                Style::default().fg(app.theme.foreground_color()),
-            ));
+            let live = app.live_tx_assignments();
+            if live.is_empty() {
+                spans.push(Span::styled(
+                    "▶ NOW: (idle) ",
+                    Style::default().fg(app.theme.foreground_color()),
+                ));
+            } else {
+                spans.push(Span::styled(
+                    format!("▶ NEXT TX ({}): ", live.len()),
+                    Style::default()
+                        .fg(app.theme.accent_color())
+                        .add_modifier(Modifier::BOLD),
+                ));
+                let mut text = live
+                    .iter()
+                    .take(TX_STRIP_MAX_ITEMS)
+                    .map(|a| format!("{} @{:.0}Hz", a.callsign, a.offset_hz))
+                    .collect::<Vec<_>>()
+                    .join("  |  ");
+                if live.len() > TX_STRIP_MAX_ITEMS {
+                    text.push_str(&format!("  |  +{} more", live.len() - TX_STRIP_MAX_ITEMS));
+                }
+                spans.push(Span::styled(
+                    text,
+                    Style::default().fg(app.theme.foreground_color()),
+                ));
+            }
         }
     }
 
@@ -947,12 +981,12 @@ fn render_tx_strip(f: &mut Frame<'_>, area: Rect, app: &App) {
         // Show up to the first three deferred items so the strip stays 1 row.
         let shown: Vec<String> = deferred
             .iter()
-            .take(3)
+            .take(TX_STRIP_MAX_ITEMS)
             .map(|it| format!("{} @{:.0}Hz → deferred 30s", it.text, it.freq_hz))
             .collect();
         let mut text = shown.join(" | ");
-        if deferred.len() > 3 {
-            text.push_str(&format!(" | +{} more", deferred.len() - 3));
+        if deferred.len() > TX_STRIP_MAX_ITEMS {
+            text.push_str(&format!(" | +{} more", deferred.len() - TX_STRIP_MAX_ITEMS));
         }
         spans.push(Span::styled(
             text,
@@ -2048,8 +2082,8 @@ mod view_render_tests {
         // from "the banner already did", so require 2 rows.
         assert_eq!(
             buffer_row_count_containing(&buf, "JA1ABC"),
-            2,
-            "expected JA1ABC on both the Active-QSOs banner row AND the TX-placement stream-marker row"
+            3,
+            "expected JA1ABC on the Active-QSOs banner, TX-placement marker, and NEXT TX rows"
         );
         assert!(
             !buffer_contains(&buf, "\u{25bc}"),
@@ -2104,8 +2138,8 @@ mod view_render_tests {
         for call in ["K1AAA", "K2BBB", "K3CCC"] {
             assert_eq!(
                 buffer_row_count_containing(&buf, call),
-                2,
-                "expected {call} on both the Active-QSOs banner row AND the TX-placement stream-marker row"
+                3,
+                "expected {call} on the Active-QSOs banner, TX-placement marker, and NEXT TX rows"
             );
         }
     }
@@ -2412,7 +2446,10 @@ mod hit_test_tests {
     fn view_rects_zoomed_returns_single_full_area_pair_for_active_panel() {
         let area = Rect::new(0, 0, 120, 40);
         let rects = view_rects(ActiveView::Run, true, ActivePanel::DxHunter, area);
-        assert_eq!(rects, vec![(ActivePanel::DxHunter, area)]);
+        assert_eq!(
+            rects,
+            vec![(ActivePanel::DxHunter, Rect::new(0, 1, 120, 39))]
+        );
     }
 
     /// Step 1 of the brief: a point inside Band Activity's data region
@@ -2509,7 +2546,7 @@ mod hit_test_tests {
             10,
             area.y + 2 + 5,
         );
-        assert_eq!(hit, Some((ActivePanel::DxHunter, 5)));
+        assert_eq!(hit, Some((ActivePanel::DxHunter, 4)));
     }
 
     /// Issue #96: below the `draw()` resize-guard floor (MIN_TERMINAL_*),
