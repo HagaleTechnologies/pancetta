@@ -587,6 +587,19 @@ async fn expire_stale_queued_calls(pending: &PendingManualCalls, message_bus: &M
             ),
         )
         .await;
+        crate::coordinator::tx::emit_diagnostic_full(
+            message_bus,
+            ComponentId::Qso,
+            "qso",
+            pancetta_core::DiagnosticLevel::Warn,
+            format!(
+                "Retired queued call to {call} — no free TX window in {}m",
+                QUEUED_CALL_TTL.as_secs() / 60
+            ),
+            None,
+            Some(&call),
+        )
+        .await;
     }
 }
 
@@ -953,6 +966,14 @@ async fn maybe_answer_caller(
             "Skipping auto-answer to {} — cross-parity (active side {:?}); operator can queue manually",
             answer.their_call, current_side
         );
+        emit_skip_diagnostic(
+            message_bus,
+            SkipSite::AutoAnswerCrossParity {
+                callsign: answer.their_call.clone(),
+                active_side: current_side,
+            },
+        )
+        .await;
         return;
     }
 
@@ -978,6 +999,17 @@ async fn maybe_answer_caller(
         qso_manager.active_qso_count().await
     };
     if active_count >= effective_cap {
+        debug!(target: "qso", "Not auto-answering {} — at capacity {}/{}", answer.their_call, active_count, effective_cap);
+        emit_skip_diagnostic(
+            message_bus,
+            SkipSite::AutoAnswerAtCapacity {
+                callsign: answer.their_call.clone(),
+                active: active_count,
+                cap: effective_cap,
+                fox_mode: is_fox,
+            },
+        )
+        .await;
         return;
     }
 
@@ -1052,6 +1084,100 @@ fn failure_reason_text(reason: &pancetta_qso::QsoFailureReason) -> String {
         R::ProtocolError(e) => format!("protocol error: {e}"),
         R::SupervisorRestart => "dropped by an internal restart".to_string(),
     }
+}
+
+fn timeout_detail(
+    last_state: Option<&pancetta_qso::QsoState>,
+    metadata: &pancetta_qso::QsoMetadata,
+    max_calls: u32,
+    watchdog_minutes: u64,
+) -> String {
+    use pancetta_qso::{CallInitiation, QsoState};
+    let initial_call = matches!(
+        last_state,
+        Some(QsoState::CallingCq { .. } | QsoState::RespondingToCq { .. })
+    );
+    if metadata.initiated_by == CallInitiation::Manual {
+        if initial_call && metadata.call_count >= max_calls {
+            return format!(
+                "watchdog timeout — no reply after {} calls",
+                metadata.call_count
+            );
+        }
+        if metadata.first_call_at.is_some_and(|started| {
+            chrono::Utc::now() - started >= chrono::Duration::minutes(watchdog_minutes as i64)
+        }) {
+            return format!("watchdog timeout — no reply in {watchdog_minutes} min");
+        }
+        if matches!(
+            last_state,
+            Some(QsoState::SendingReport { .. } | QsoState::WaitingForReport { .. })
+        ) {
+            return "watchdog timeout — no reply after we sent the report".to_string();
+        }
+    } else if initial_call {
+        return "watchdog timeout — autonomous pounce never answered".to_string();
+    }
+    "watchdog timeout".to_string()
+}
+
+pub(crate) enum SkipSite {
+    CrossParityDeferral {
+        callsign: Option<String>,
+        active_side: Option<pancetta_core::slot::SlotParity>,
+        wanted: Option<pancetta_core::slot::SlotParity>,
+    },
+    AutonomousOpenFailed {
+        callsign: Option<String>,
+        error: String,
+    },
+    AutoAnswerCrossParity {
+        callsign: String,
+        active_side: Option<pancetta_core::slot::SlotParity>,
+    },
+    AutoAnswerAtCapacity {
+        callsign: String,
+        active: usize,
+        cap: usize,
+        fox_mode: bool,
+    },
+}
+
+pub(crate) struct SkipDiagnostic {
+    pub target: &'static str,
+    pub level: pancetta_core::DiagnosticLevel,
+    pub text: String,
+    pub callsign: Option<String>,
+}
+
+pub(crate) fn skip_diagnostic(site: SkipSite) -> SkipDiagnostic {
+    use pancetta_core::DiagnosticLevel as L;
+    match site {
+        SkipSite::CrossParityDeferral { callsign, active_side, wanted } => {
+            let call = callsign.as_deref().unwrap_or("CQ");
+            SkipDiagnostic { target: "qso.autonomous", level: L::Info, text: format!("Deferred autonomous QSO with {call} — cross-parity (active side {active_side:?}, wanted {wanted:?})"), callsign }
+        }
+        SkipSite::AutonomousOpenFailed { callsign, error } => {
+            let call = callsign.as_deref().unwrap_or("CQ");
+            SkipDiagnostic { target: "qso.autonomous", level: L::Warn, text: format!("Autonomous QSO with {call} not opened — {error}"), callsign }
+        }
+        SkipSite::AutoAnswerCrossParity { callsign, active_side } => SkipDiagnostic { target: "qso", level: L::Info, text: format!("Skipped auto-answer to {callsign} — cross-parity (active side {active_side:?}); queue manually to override"), callsign: Some(callsign) },
+        SkipSite::AutoAnswerAtCapacity { callsign, active, cap, fox_mode } => SkipDiagnostic { target: "qso", level: L::Info, text: format!("Skipped auto-answer to {callsign} — at capacity {active}/{cap}{}", if fox_mode { " (Fox mode)" } else { "" }), callsign: Some(callsign) },
+    }
+}
+
+pub(crate) async fn emit_skip_diagnostic(message_bus: &MessageBus, site: SkipSite) {
+    let d = skip_diagnostic(site);
+    crate::coordinator::tx::emit_diagnostic_full(
+        message_bus,
+        ComponentId::Qso,
+        d.target,
+        d.level,
+        d.text,
+        None,
+        d.callsign.as_deref(),
+    )
+    .await;
 }
 
 /// Build a `RecentQsoOutcome` (observability-diagnostics-plan.md Layer 2 —
@@ -2542,6 +2668,7 @@ impl super::ApplicationCoordinator {
                                 qso_id,
                                 reason,
                                 metadata,
+                                state_history,
                                 ..
                             }) => {
                                 // Drop-stale-TX gate: a failed QSO must stop
@@ -2635,7 +2762,19 @@ impl super::ApplicationCoordinator {
                                     );
                                     let _ = snapshot_bus.send_message(history_msg).await;
                                 }
-                                let reason_text = failure_reason_text(&reason);
+                                let reason_text = if reason
+                                    == pancetta_qso::QsoFailureReason::Timeout
+                                {
+                                    let timeouts = &snapshot_qso_manager.config().timeouts;
+                                    timeout_detail(
+                                        state_history.last().map(|transition| &transition.to_state),
+                                        &metadata,
+                                        timeouts.manual_call_max_calls,
+                                        timeouts.manual_call_watchdog_minutes,
+                                    )
+                                } else {
+                                    failure_reason_text(&reason)
+                                };
                                 let diag_msg = ComponentMessage::new(
                                     ComponentId::Qso,
                                     ComponentId::Tui,
@@ -3087,6 +3226,15 @@ impl super::ApplicationCoordinator {
                                                      waiting for current window to clear",
                                                     callsign, current_side, desired_tx_parity
                                                 );
+                                                emit_skip_diagnostic(
+                                                    &message_bus,
+                                                    SkipSite::CrossParityDeferral {
+                                                        callsign: callsign.clone(),
+                                                        active_side: current_side,
+                                                        wanted: desired_tx_parity,
+                                                    },
+                                                )
+                                                .await;
                                                 continue;
                                             }
                                             let result = match &callsign {
@@ -3155,6 +3303,14 @@ impl super::ApplicationCoordinator {
                                                         "Failed to open autonomous QSO ({:?}): {}",
                                                         callsign, e
                                                     );
+                                                    emit_skip_diagnostic(
+                                                        &message_bus,
+                                                        SkipSite::AutonomousOpenFailed {
+                                                            callsign: callsign.clone(),
+                                                            error: e.to_string(),
+                                                        },
+                                                    )
+                                                    .await;
                                                 }
                                             }
                                         }

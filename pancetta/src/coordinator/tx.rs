@@ -968,6 +968,32 @@ async fn emit_tx_failure_diagnostic(
 /// `target:` (the tracing one gates file-log visibility via `EnvFilter`; this
 /// one is just a TUI-side label used for filtering the Diagnostics panel).
 /// Best-effort: never blocks or fails the TX path.
+pub(crate) async fn emit_diagnostic_full(
+    message_bus: &MessageBus,
+    source: ComponentId,
+    target: &'static str,
+    level: pancetta_core::DiagnosticLevel,
+    text: String,
+    qso_id: Option<&str>,
+    callsign: Option<&str>,
+) {
+    let msg = ComponentMessage::new(
+        source,
+        ComponentId::Tui,
+        MessageType::DiagnosticEvent {
+            target,
+            level,
+            text,
+            qso_id: qso_id.map(|s| s.to_string()),
+            callsign: callsign.map(|s| s.to_string()),
+        },
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(msg).await {
+        tracing::debug!("DiagnosticEvent({}) relay failed (no TUI?): {}", target, e);
+    }
+}
+
 pub(crate) async fn emit_diagnostic(
     message_bus: &MessageBus,
     target: &'static str,
@@ -975,21 +1001,16 @@ pub(crate) async fn emit_diagnostic(
     text: String,
     qso_id: Option<&str>,
 ) {
-    let msg = ComponentMessage::new(
+    emit_diagnostic_full(
+        message_bus,
         ComponentId::Ft8Transmitter,
-        ComponentId::Tui,
-        MessageType::DiagnosticEvent {
-            target,
-            level,
-            text,
-            qso_id: qso_id.map(|s| s.to_string()),
-            callsign: None,
-        },
-        Instant::now(),
-    );
-    if let Err(e) = message_bus.send_message(msg).await {
-        tracing::debug!("DiagnosticEvent({}) relay failed (no TUI?): {}", target, e);
-    }
+        target,
+        level,
+        text,
+        qso_id,
+        None,
+    )
+    .await;
 }
 
 /// Read the current global TX policy from the shared atomic.

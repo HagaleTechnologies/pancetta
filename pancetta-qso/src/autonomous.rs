@@ -418,6 +418,28 @@ pub enum OperatorAction {
     StatusUpdate(AutonomousStatusData),
 }
 
+/// Why the autonomous operator did not act on a decoded CQ this slot.
+/// Bookkeeping only: this never influences the returned actions.
+#[derive(Debug, Clone, PartialEq)]
+pub enum SkipReason {
+    AtCapacity { active: u32, cap: u32 },
+    DxBusy { window_secs: u64 },
+    RecentlyResponded,
+    CallsignContinuity { dx_score: f64 },
+    ContentScore { score: f64, threshold: f64 },
+    FrequencyClash,
+}
+
+/// A CQ candidate rejected by an autonomous selection filter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CqSkipRecord {
+    pub callsign: Option<String>,
+    pub reason: SkipReason,
+}
+
+/// Hard per-slot bound for CQ skip bookkeeping.
+pub const MAX_SKIP_LOG_PER_SLOT: usize = 32;
+
 /// Status data sent to the TUI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AutonomousStatusData {
@@ -857,6 +879,8 @@ pub struct AutonomousOperator {
     /// DX watchlist (#197): short-lived memory of `PerBandDxccNew`+/`Atno`
     /// CQs heard but not pounced on. See `pancetta_qso::watchlist`.
     watchlist: DxWatchlist,
+    /// Rejections recorded during the most recent decision cycle.
+    skip_log: Vec<CqSkipRecord>,
 }
 
 impl AutonomousOperator {
@@ -897,6 +921,18 @@ impl AutonomousOperator {
             )),
             tx_offset_hold_hz: None,
             watchlist,
+            skip_log: Vec::new(),
+        }
+    }
+
+    /// Drain CQ skips recorded by the most recent decision cycle.
+    pub fn take_skip_log(&mut self) -> Vec<CqSkipRecord> {
+        std::mem::take(&mut self.skip_log)
+    }
+
+    fn push_skip(&mut self, record: CqSkipRecord) {
+        if self.skip_log.len() < MAX_SKIP_LOG_PER_SLOT {
+            self.skip_log.push(record);
         }
     }
 
@@ -1413,6 +1449,7 @@ impl AutonomousOperator {
 
     /// Run one cycle at a specific unix timestamp (for testing).
     pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
+        self.skip_log.clear();
         let mut actions = Vec::new();
 
         if self.paused {
@@ -1475,6 +1512,16 @@ impl AutonomousOperator {
                 let total_active = self.active_qso_count.max(tx_count);
                 let can_add_new = total_active < self.config.max_concurrent_qsos;
 
+                if !can_add_new && !self.pending_cqs.is_empty() {
+                    self.push_skip(CqSkipRecord {
+                        callsign: None,
+                        reason: SkipReason::AtCapacity {
+                            active: total_active,
+                            cap: self.config.max_concurrent_qsos,
+                        },
+                    });
+                }
+
                 if can_add_new {
                     // Choose threshold: first QSO uses min_dx_score,
                     // additional QSOs use the higher min_multi_slot_score.
@@ -1500,11 +1547,21 @@ impl AutonomousOperator {
                     // OSD fabrications that slipped through (e.g. the
                     // first one before the rolling window populated).
                     let fp = self.fp_filter.clone();
+                    let slot_skips = std::cell::RefCell::new(Vec::new());
                     let best_cq = self
                         .pending_cqs
                         .iter()
                         .filter(|cq| cq.dx_score >= threshold)
-                        .filter(|cq| !self.is_recently_responded_to(&cq.callsign, now))
+                        .filter(|cq| {
+                            let recent = self.is_recently_responded_to(&cq.callsign, now);
+                            if recent {
+                                slot_skips.borrow_mut().push(CqSkipRecord {
+                                    callsign: Some(cq.callsign.clone()),
+                                    reason: SkipReason::RecentlyResponded,
+                                });
+                            }
+                            !recent
+                        })
                         // DX-busy gate: do not start an auto-response to a
                         // station that was just working a third party, even
                         // if it CQs again mid-sequence.
@@ -1516,6 +1573,12 @@ impl AutonomousOperator {
                                     "suppressing CQ response: DX recently working a third party (callsign={}, window={}s)",
                                     cq.callsign, self.config.dx_busy_window_secs
                                 );
+                                slot_skips.borrow_mut().push(CqSkipRecord {
+                                    callsign: Some(cq.callsign.clone()),
+                                    reason: SkipReason::DxBusy {
+                                        window_secs: self.config.dx_busy_window_secs,
+                                    },
+                                });
                             }
                             !busy
                         })
@@ -1529,6 +1592,12 @@ impl AutonomousOperator {
                                         "rejecting CQ response: callsign continuity (callsign={}, score={:.2})",
                                         cq.callsign, cq.dx_score
                                     );
+                                    slot_skips.borrow_mut().push(CqSkipRecord {
+                                        callsign: Some(cq.callsign.clone()),
+                                        reason: SkipReason::CallsignContinuity {
+                                            dx_score: cq.dx_score,
+                                        },
+                                    });
                                 }
                                 ok
                             }
@@ -1600,13 +1669,33 @@ impl AutonomousOperator {
                                         MessageContentScore::SHIP_CONSERVATIVE,
                                         cq.decode_origin,
                                     );
+                                    slot_skips.borrow_mut().push(CqSkipRecord {
+                                        callsign: Some(cq.callsign.clone()),
+                                        reason: SkipReason::ContentScore {
+                                            score,
+                                            threshold: MessageContentScore::SHIP_CONSERVATIVE,
+                                        },
+                                    });
                                 }
                                 pass
                             }
                             _ => true,
                         })
-                        .find(|cq| self.frequency_allocator.is_clear_of_own(cq.frequency_hz))
+                        .find(|cq| {
+                            let clear = self.frequency_allocator.is_clear_of_own(cq.frequency_hz);
+                            if !clear {
+                                slot_skips.borrow_mut().push(CqSkipRecord {
+                                    callsign: Some(cq.callsign.clone()),
+                                    reason: SkipReason::FrequencyClash,
+                                });
+                            }
+                            clear
+                        })
                         .cloned();
+
+                    for record in slot_skips.into_inner() {
+                        self.push_skip(record);
+                    }
 
                     if let Some(cq) = best_cq {
                         if tx_count == 0 && self.active_qso_count == 0 {
@@ -3044,6 +3133,14 @@ mod tests {
 
         // Should NOT add a third QSO
         assert_eq!(tx_count, 2, "Should not exceed max_concurrent_qsos");
+        assert_eq!(
+            op.take_skip_log(),
+            vec![CqSkipRecord {
+                callsign: None,
+                reason: SkipReason::AtCapacity { active: 2, cap: 2 },
+            }]
+        );
+        assert!(op.take_skip_log().is_empty(), "taking the log drains it");
     }
 
     #[test]
@@ -3310,6 +3407,10 @@ mod dx_busy_tests {
             matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.contains("JA1ABC"))
         });
         assert!(!responded, "must suppress response to a busy DX");
+        assert!(op.take_skip_log().iter().any(|record| {
+            record.callsign.as_deref() == Some("JA1ABC")
+                && matches!(record.reason, SkipReason::DxBusy { window_secs: 90 })
+        }));
     }
 
     #[test]
@@ -3330,6 +3431,19 @@ mod dx_busy_tests {
             matches!(a, OperatorAction::Transmit { message_text, .. } if message_text.contains("JA1ABC"))
         });
         assert!(responded, "a non-busy DX CQ should be answered");
+        assert!(op.take_skip_log().is_empty());
+    }
+
+    #[test]
+    fn skip_log_is_bounded() {
+        let mut op = op_even("K5ARH");
+        for i in 0..(MAX_SKIP_LOG_PER_SLOT * 2) {
+            op.push_skip(CqSkipRecord {
+                callsign: Some(format!("CALL{i}")),
+                reason: SkipReason::FrequencyClash,
+            });
+        }
+        assert_eq!(op.take_skip_log().len(), MAX_SKIP_LOG_PER_SLOT);
     }
 
     #[test]
