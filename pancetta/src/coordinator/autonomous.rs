@@ -93,6 +93,72 @@ mod pan6_diagnostic_tests {
     }
 
     #[test]
+    fn a_policy_change_while_still_suppressing_re_emits() {
+        let mut state = GateDiagState::default();
+        let first = gate_diagnostics_for_slot(
+            &mut state,
+            &plan(0, 1, 0),
+            pancetta_core::TxPolicy::RespondOnly,
+        );
+        let changed = gate_diagnostics_for_slot(
+            &mut state,
+            &plan(0, 1, 0),
+            pancetta_core::TxPolicy::Disabled,
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].text.contains("DISABLED"));
+    }
+
+    #[test]
+    fn policy_and_presence_suppression_are_reported_separately() {
+        let mut state = GateDiagState::default();
+        let diagnostics = gate_diagnostics_for_slot(
+            &mut state,
+            &plan(0, 1, 1),
+            pancetta_core::TxPolicy::RespondOnly,
+        );
+        assert_eq!(diagnostics.len(), 2);
+        assert!(diagnostics.iter().any(|d| d.text.contains("TX policy")));
+        assert!(diagnostics.iter().any(|d| d.text.contains("presence gate")));
+    }
+
+    #[test]
+    fn a_quiet_slot_emits_nothing() {
+        let mut state = GateDiagState::default();
+        assert!(gate_diagnostics_for_slot(
+            &mut state,
+            &SlotPlan::default(),
+            pancetta_core::TxPolicy::Full,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn gate_text_does_not_collide_with_tui_drop_counter_prefix() {
+        let mut state = GateDiagState::default();
+        let diagnostics = gate_diagnostics_for_slot(
+            &mut state,
+            &plan(1, 1, 1),
+            pancetta_core::TxPolicy::Disabled,
+        );
+        assert!(diagnostics
+            .iter()
+            .all(|d| !d.text.starts_with("dropping stale")));
+    }
+
+    #[test]
+    fn callsign_continuity_diagnostic_includes_the_score() {
+        let diagnostic = skip_record_diagnostic(&pancetta_qso::CqSkipRecord {
+            callsign: Some("W1AW".into()),
+            reason: pancetta_qso::SkipReason::CallsignContinuity { dx_score: 0.42 },
+        });
+        assert_eq!(diagnostic.target, "qso.security");
+        assert!(diagnostic.text.contains("W1AW"));
+        assert!(diagnostic.text.contains("score 0.42"));
+    }
+
+    #[test]
     fn skip_suppression_is_per_reason_and_callsign_and_bounded() {
         let mut seen = SkipDiagSeen::default();
         let now = std::time::Instant::now();
@@ -107,6 +173,18 @@ mod pan6_diagnostic_tests {
             "dx_busy",
             Some("JA1ABC"),
             now
+        ));
+        assert!(!should_report_skip(
+            &mut seen,
+            "dx_busy",
+            Some("JA1ABC"),
+            now + Duration::from_secs(60)
+        ));
+        assert!(should_report_skip(
+            &mut seen,
+            "dx_busy",
+            Some("JA1ABC"),
+            now + SKIP_DIAG_REPEAT_WINDOW + Duration::from_secs(1)
         ));
         assert!(should_report_skip(
             &mut seen,
@@ -523,10 +601,12 @@ pub(crate) fn skip_record_diagnostic(record: &pancetta_qso::CqSkipRecord) -> Gat
             level: L::Info,
             text: format!("Skipped CQ from {call} — already answered within the last 60s"),
         },
-        pancetta_qso::SkipReason::CallsignContinuity { .. } => GateDiagnostic {
+        pancetta_qso::SkipReason::CallsignContinuity { dx_score } => GateDiagnostic {
             target: "qso.security",
             level: L::Warn,
-            text: format!("Rejected CQ from {call} — callsign not in the trust set"),
+            text: format!(
+                "Rejected CQ from {call} — callsign not in the trust set (score {dx_score:.2})"
+            ),
         },
         pancetta_qso::SkipReason::ContentScore { score, threshold } => GateDiagnostic {
             target: "qso.security",

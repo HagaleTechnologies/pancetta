@@ -961,13 +961,8 @@ async fn emit_tx_failure_diagnostic(
     .await;
 }
 
-/// Send a `DiagnosticEvent` to the TUI's retained Diagnostics overlay
-/// (observability-diagnostics-plan.md Layer 1, "Emission"). `target` reuses
-/// the same vocabulary already used by the co-located `tracing` call at each
-/// site (e.g. `"tx.policy"`) — this is a SEPARATE field from that macro's own
-/// `target:` (the tracing one gates file-log visibility via `EnvFilter`; this
-/// one is just a TUI-side label used for filtering the Diagnostics panel).
-/// Best-effort: never blocks or fails the TX path.
+/// Send a fully attributed `DiagnosticEvent` to the TUI's retained Diagnostics
+/// overlay. Best-effort: diagnostics never block or fail the caller's path.
 pub(crate) async fn emit_diagnostic_full(
     message_bus: &MessageBus,
     source: ComponentId,
@@ -994,6 +989,13 @@ pub(crate) async fn emit_diagnostic_full(
     }
 }
 
+/// Send a `DiagnosticEvent` to the TUI's retained Diagnostics overlay
+/// (observability-diagnostics-plan.md Layer 1, "Emission"). `target` reuses
+/// the same vocabulary already used by the co-located `tracing` call at each
+/// site (e.g. `"tx.policy"`) — this is a SEPARATE field from that macro's own
+/// `target:` (the tracing one gates file-log visibility via `EnvFilter`; this
+/// one is just a TUI-side label used for filtering the Diagnostics panel).
+/// Best-effort: never blocks or fails the TX path.
 pub(crate) async fn emit_diagnostic(
     message_bus: &MessageBus,
     target: &'static str,
@@ -5809,6 +5811,57 @@ mod tx_failure_diagnostic_tests {
         let msg = receiver.try_recv().expect("diagnostic should still send");
         match msg.message_type {
             MessageType::DiagnosticEvent { qso_id, .. } => assert_eq!(qso_id, None),
+            other => panic!("expected DiagnosticEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_diagnostic_full_carries_wide_attribution() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        emit_diagnostic_full(
+            &bus,
+            ComponentId::Qso,
+            "qso.security",
+            pancetta_core::DiagnosticLevel::Warn,
+            "rejected".into(),
+            Some("qso-7"),
+            Some("W1AW"),
+        )
+        .await;
+        let msg = receiver.try_recv().expect("diagnostic");
+        assert_eq!(msg.source, ComponentId::Qso);
+        match msg.message_type {
+            MessageType::DiagnosticEvent {
+                target,
+                qso_id,
+                callsign,
+                ..
+            } => {
+                assert_eq!(target, "qso.security");
+                assert_eq!(qso_id.as_deref(), Some("qso-7"));
+                assert_eq!(callsign.as_deref(), Some("W1AW"));
+            }
+            other => panic!("expected DiagnosticEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_diagnostic_delegates_without_changing_its_own_contract() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        emit_diagnostic(
+            &bus,
+            "tx.policy",
+            pancetta_core::DiagnosticLevel::Info,
+            "held".into(),
+            None,
+        )
+        .await;
+        let msg = receiver.try_recv().expect("diagnostic");
+        assert_eq!(msg.source, ComponentId::Ft8Transmitter);
+        match msg.message_type {
+            MessageType::DiagnosticEvent { callsign, .. } => assert_eq!(callsign, None),
             other => panic!("expected DiagnosticEvent, got {other:?}"),
         }
     }
