@@ -59,6 +59,171 @@ pub(crate) fn classify_autonomous_opening(
     (dx, frequency, parity)
 }
 
+#[cfg(test)]
+mod pan6_diagnostic_tests {
+    use super::*;
+
+    fn plan(runtime: usize, policy: usize, presence: usize) -> SlotPlan {
+        SlotPlan {
+            runtime_gate_dropped: runtime,
+            policy_dropped: policy,
+            presence_dropped: presence,
+            ..SlotPlan::default()
+        }
+    }
+
+    #[test]
+    fn gate_diagnostics_are_edge_triggered() {
+        let mut state = GateDiagState::default();
+        assert_eq!(
+            gate_diagnostics_for_slot(
+                &mut state,
+                &plan(2, 0, 0),
+                false,
+                pancetta_core::TxPolicy::Full,
+                true
+            )
+            .len(),
+            1
+        );
+        assert!(gate_diagnostics_for_slot(
+            &mut state,
+            &SlotPlan::default(),
+            false,
+            pancetta_core::TxPolicy::Full,
+            true,
+        )
+        .is_empty());
+        let resumed = gate_diagnostics_for_slot(
+            &mut state,
+            &plan(0, 0, 0),
+            true,
+            pancetta_core::TxPolicy::Full,
+            true,
+        );
+        assert_eq!(resumed.len(), 1);
+        assert!(resumed[0].text.contains("resumed"));
+    }
+
+    #[test]
+    fn a_policy_change_while_still_suppressing_re_emits() {
+        let mut state = GateDiagState::default();
+        let first = gate_diagnostics_for_slot(
+            &mut state,
+            &plan(0, 1, 0),
+            true,
+            pancetta_core::TxPolicy::RespondOnly,
+            true,
+        );
+        let changed = gate_diagnostics_for_slot(
+            &mut state,
+            &plan(0, 1, 0),
+            true,
+            pancetta_core::TxPolicy::Disabled,
+            true,
+        );
+        assert_eq!(first.len(), 1);
+        assert_eq!(changed.len(), 1);
+        assert!(changed[0].text.contains("DISABLED"));
+    }
+
+    #[test]
+    fn policy_suppression_takes_precedence_over_presence() {
+        let mut state = GateDiagState::default();
+        let diagnostics = gate_diagnostics_for_slot(
+            &mut state,
+            &plan(0, 1, 1),
+            true,
+            pancetta_core::TxPolicy::RespondOnly,
+            false,
+        );
+        assert_eq!(diagnostics.len(), 1);
+        assert!(diagnostics.iter().any(|d| d.text.contains("TX policy")));
+        assert!(!diagnostics.iter().any(|d| d.text.contains("presence gate")));
+    }
+
+    #[test]
+    fn a_quiet_slot_emits_nothing() {
+        let mut state = GateDiagState::default();
+        assert!(gate_diagnostics_for_slot(
+            &mut state,
+            &SlotPlan::default(),
+            true,
+            pancetta_core::TxPolicy::Full,
+            true,
+        )
+        .is_empty());
+    }
+
+    #[test]
+    fn gate_text_does_not_collide_with_tui_drop_counter_prefix() {
+        let mut state = GateDiagState::default();
+        let diagnostics = gate_diagnostics_for_slot(
+            &mut state,
+            &plan(1, 1, 1),
+            false,
+            pancetta_core::TxPolicy::Disabled,
+            false,
+        );
+        assert!(diagnostics
+            .iter()
+            .all(|d| !d.text.starts_with("dropping stale")));
+    }
+
+    #[test]
+    fn callsign_continuity_diagnostic_includes_the_score() {
+        let diagnostic = skip_record_diagnostic(&pancetta_qso::CqSkipRecord {
+            callsign: Some("W1AW".into()),
+            reason: pancetta_qso::SkipReason::CallsignContinuity { dx_score: 0.42 },
+        });
+        assert_eq!(diagnostic.target, "qso.security");
+        assert!(diagnostic.text.contains("W1AW"));
+        assert!(diagnostic.text.contains("score 0.42"));
+    }
+
+    #[test]
+    fn skip_suppression_is_per_reason_and_callsign_and_bounded() {
+        let mut seen = SkipDiagSeen::default();
+        let now = std::time::Instant::now();
+        assert!(should_report_skip(
+            &mut seen,
+            "dx_busy",
+            Some("JA1ABC"),
+            now
+        ));
+        assert!(!should_report_skip(
+            &mut seen,
+            "dx_busy",
+            Some("JA1ABC"),
+            now
+        ));
+        assert!(!should_report_skip(
+            &mut seen,
+            "dx_busy",
+            Some("JA1ABC"),
+            now + Duration::from_secs(60)
+        ));
+        assert!(should_report_skip(
+            &mut seen,
+            "dx_busy",
+            Some("JA1ABC"),
+            now + SKIP_DIAG_REPEAT_WINDOW + Duration::from_secs(1)
+        ));
+        assert!(should_report_skip(
+            &mut seen,
+            "dx_busy",
+            Some("VK2XYZ"),
+            now
+        ));
+        assert!(should_report_skip(&mut seen, "at_capacity", None, now));
+        for i in 0..2_000 {
+            let call = format!("X{i}");
+            should_report_skip(&mut seen, "dx_busy", Some(&call), now);
+        }
+        assert!(seen.len() <= 1024);
+    }
+}
+
 /// Maps the operator's parked TX offset (Hz) to the openness code (0-3) at
 /// that bin in a [`pancetta_qso::frequency::PlacementSnapshot`] — the
 /// coordinator-side counterpart to the TUI's own parked-bin lookup (Task
@@ -320,6 +485,164 @@ pub(crate) fn plan_slot_transmissions(
         runtime_gate_dropped,
         policy_dropped,
         presence_dropped,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GateDiagnostic {
+    pub target: &'static str,
+    pub level: pancetta_core::DiagnosticLevel,
+    pub text: String,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct GateDiagState {
+    runtime_gate_suppressing: bool,
+    policy_suppressing: Option<pancetta_core::TxPolicy>,
+    presence_suppressing: bool,
+}
+
+pub(crate) fn gate_diagnostics_for_slot(
+    state: &mut GateDiagState,
+    plan: &SlotPlan,
+    runtime_gate_open: bool,
+    policy: pancetta_core::TxPolicy,
+    operator_present: bool,
+) -> Vec<GateDiagnostic> {
+    use pancetta_core::DiagnosticLevel as L;
+    let mut out = Vec::new();
+    let runtime_now = !runtime_gate_open;
+    if runtime_now && !state.runtime_gate_suppressing {
+        out.push(GateDiagnostic { target: "operator.override", level: L::Warn, text: format!("Autonomous runtime gate OFF (Shift+Q) — dropping autonomous TX; {} item(s) this slot", plan.runtime_gate_dropped) });
+    } else if !runtime_now && state.runtime_gate_suppressing {
+        out.push(GateDiagnostic {
+            target: "operator.override",
+            level: L::Info,
+            text: "Autonomous runtime gate ON — autonomous TX resumed".into(),
+        });
+    }
+    state.runtime_gate_suppressing = runtime_now;
+    let policy_now = (!policy.allows_initiation()).then_some(policy);
+    if policy_now.is_some() && policy_now != state.policy_suppressing {
+        out.push(GateDiagnostic {
+            target: "tx.policy",
+            level: L::Info,
+            text: format!(
+                "TX policy {} — suppressing autonomous initiation; QSO-in-progress items still TX",
+                policy.label()
+            ),
+        });
+    } else if policy_now.is_none() && state.policy_suppressing.is_some() {
+        out.push(GateDiagnostic {
+            target: "tx.policy",
+            level: L::Info,
+            text: "TX policy allows initiation — autonomous initiation resumed".into(),
+        });
+    }
+    state.policy_suppressing = policy_now;
+    let presence_now = policy.allows_initiation() && !operator_present;
+    if presence_now && !state.presence_suppressing {
+        out.push(GateDiagnostic { target: "tx.policy", level: L::Info, text: format!("Operator-presence gate (FCC §97.221) — no console activity in {}s; suppressing autonomous initiation. Press any key to resume", super::OPERATOR_PRESENCE_WINDOW.as_secs()) });
+    } else if !presence_now && state.presence_suppressing {
+        out.push(GateDiagnostic {
+            target: "tx.policy",
+            level: L::Info,
+            text: "Operator present — autonomous initiation resumed".into(),
+        });
+    }
+    state.presence_suppressing = presence_now;
+    out
+}
+
+pub(crate) const SKIP_DIAG_REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+
+#[derive(Debug, Default)]
+pub(crate) struct SkipDiagSeen(
+    std::collections::HashMap<(&'static str, String), std::time::Instant>,
+);
+
+impl SkipDiagSeen {
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+pub(crate) fn should_report_skip(
+    seen: &mut SkipDiagSeen,
+    reason_key: &'static str,
+    callsign: Option<&str>,
+    now: std::time::Instant,
+) -> bool {
+    seen.0
+        .retain(|_, when| now.saturating_duration_since(*when) <= SKIP_DIAG_REPEAT_WINDOW);
+    let key = (reason_key, callsign.unwrap_or_default().to_string());
+    if seen.0.contains_key(&key) {
+        return false;
+    }
+    if seen.0.len() >= 1024 {
+        if let Some(oldest) = seen
+            .0
+            .iter()
+            .min_by_key(|(_, when)| **when)
+            .map(|(key, _)| key.clone())
+        {
+            seen.0.remove(&oldest);
+        }
+    }
+    seen.0.insert(key, now);
+    true
+}
+
+fn skip_reason_key(reason: &pancetta_qso::SkipReason) -> &'static str {
+    match reason {
+        pancetta_qso::SkipReason::AtCapacity { .. } => "at_capacity",
+        pancetta_qso::SkipReason::DxBusy { .. } => "dx_busy",
+        pancetta_qso::SkipReason::RecentlyResponded => "recently_responded",
+        pancetta_qso::SkipReason::CallsignContinuity { .. } => "callsign_continuity",
+        pancetta_qso::SkipReason::ContentScore { .. } => "content_score",
+        pancetta_qso::SkipReason::FrequencyClash => "frequency_clash",
+    }
+}
+
+pub(crate) fn skip_record_diagnostic(record: &pancetta_qso::CqSkipRecord) -> GateDiagnostic {
+    use pancetta_core::DiagnosticLevel as L;
+    let call = record.callsign.as_deref().unwrap_or("unknown");
+    match record.reason {
+        pancetta_qso::SkipReason::AtCapacity { active, cap } => GateDiagnostic {
+            target: "tx.policy",
+            level: L::Info,
+            text: format!("Not calling any CQ — at capacity {active}/{cap}"),
+        },
+        pancetta_qso::SkipReason::DxBusy { window_secs } => GateDiagnostic {
+            target: "qso.autonomous",
+            level: L::Info,
+            text: format!(
+                "Skipped CQ from {call} — DX working a third party (last {window_secs}s)"
+            ),
+        },
+        pancetta_qso::SkipReason::RecentlyResponded => GateDiagnostic {
+            target: "qso.autonomous",
+            level: L::Info,
+            text: format!("Skipped CQ from {call} — already answered within the last 60s"),
+        },
+        pancetta_qso::SkipReason::CallsignContinuity { dx_score } => GateDiagnostic {
+            target: "qso.security",
+            level: L::Warn,
+            text: format!(
+                "Rejected CQ from {call} — callsign not in the trust set (score {dx_score:.2})"
+            ),
+        },
+        pancetta_qso::SkipReason::ContentScore { score, threshold } => GateDiagnostic {
+            target: "qso.security",
+            level: L::Warn,
+            text: format!("Rejected CQ from {call} — content score {score:.2} < {threshold:.2}"),
+        },
+        pancetta_qso::SkipReason::FrequencyClash => GateDiagnostic {
+            target: "qso.autonomous",
+            level: L::Info,
+            text: format!("Skipped CQ from {call} — frequency clashes with our own TX"),
+        },
     }
 }
 
@@ -596,6 +919,8 @@ impl super::ApplicationCoordinator {
                 // diagnostic history vs. a transient status line) — the two
                 // are never unified.
                 let mut last_coverage: Option<u8> = None;
+                let mut gate_diag_state = GateDiagState::default();
+                let mut skip_seen = SkipDiagSeen::default();
                 // Align slot timer to FT8 UTC boundaries (0/15/30/45 seconds)
                 // with sub-second precision. tokio::time::interval_at then
                 // keeps the cadence exact every 15s relative to that first tick.
@@ -904,7 +1229,30 @@ impl super::ApplicationCoordinator {
                                 drop(op);
                             } else {
                             let actions = op.decide();
+                            let skip_records = op.take_skip_log();
                             drop(op);
+
+                            for record in skip_records {
+                                if !should_report_skip(
+                                    &mut skip_seen,
+                                    skip_reason_key(&record.reason),
+                                    record.callsign.as_deref(),
+                                    std::time::Instant::now(),
+                                ) {
+                                    continue;
+                                }
+                                let diagnostic = skip_record_diagnostic(&record);
+                                crate::coordinator::tx::emit_diagnostic_full(
+                                    &message_bus,
+                                    ComponentId::Autonomous,
+                                    diagnostic.target,
+                                    diagnostic.level,
+                                    diagnostic.text,
+                                    None,
+                                    record.callsign.as_deref(),
+                                )
+                                .await;
+                            }
 
                             // Collect Transmit actions, then bundle into a
                             // single MultiTransmitRequest (or single TransmitRequest).
@@ -1148,6 +1496,26 @@ impl super::ApplicationCoordinator {
                                     super::OPERATOR_PRESENCE_WINDOW.as_secs(),
                                     plan.presence_dropped
                                 );
+                            }
+                            for diagnostic in
+                                gate_diagnostics_for_slot(
+                                    &mut gate_diag_state,
+                                    &plan,
+                                    runtime_gate_open,
+                                    policy,
+                                    operator_present,
+                                )
+                            {
+                                crate::coordinator::tx::emit_diagnostic_full(
+                                    &message_bus,
+                                    ComponentId::Autonomous,
+                                    diagnostic.target,
+                                    diagnostic.level,
+                                    diagnostic.text,
+                                    None,
+                                    None,
+                                )
+                                .await;
                             }
                             for text in &plan.dry_run_openings {
                                 info!(

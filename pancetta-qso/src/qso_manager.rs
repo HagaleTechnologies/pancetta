@@ -387,6 +387,10 @@ pub enum QsoEvent {
     QsoFailed {
         qso_id: QsoId,
         reason: QsoFailureReason,
+        /// Operational state immediately before the QSO entered `Failed`.
+        /// Unlike `state_history`, this is populated even when a newly opened
+        /// QSO times out before its first sent/received transition.
+        last_state: QsoState,
         metadata: QsoMetadata,
         /// See `QsoCompleted::state_history`.
         state_history: Vec<StateTransition>,
@@ -2045,7 +2049,7 @@ impl QsoManager {
             let state_history = progress.state_history.clone();
             let messages = progress.messages.clone();
 
-            self.emit_state_change(qso_id, old_state, progress.state.clone())
+            self.emit_state_change(qso_id, old_state.clone(), progress.state.clone())
                 .await;
             // SM-F5: this producer previously emitted only StateChanged →
             // Failed, leaving `QsoEvent::QsoFailed` dead — the coordinator's
@@ -2057,6 +2061,7 @@ impl QsoManager {
             self.emit_event(QsoEvent::QsoFailed {
                 qso_id,
                 reason: QsoFailureReason::UserCancelled,
+                last_state: old_state,
                 metadata,
                 state_history,
                 messages,
@@ -2102,11 +2107,12 @@ impl QsoManager {
             let state_history = progress.state_history.clone();
             let messages = progress.messages.clone();
 
-            self.emit_state_change(qso_id, old_state, progress.state.clone())
+            self.emit_state_change(qso_id, old_state.clone(), progress.state.clone())
                 .await;
             self.emit_event(QsoEvent::QsoFailed {
                 qso_id,
                 reason,
+                last_state: old_state,
                 metadata,
                 state_history,
                 messages,
@@ -4093,7 +4099,8 @@ impl QsoManager {
             if let Some((old_state, metadata, state_history, messages)) = old_state_and_metadata {
                 let new_state = self.qsos.read().await.get(&qso_id).map(|p| p.state.clone());
                 if let Some(new_state) = new_state {
-                    self.emit_state_change(qso_id, old_state, new_state).await;
+                    self.emit_state_change(qso_id, old_state.clone(), new_state)
+                        .await;
                 }
                 // SM-F5: also emit QsoFailed alongside StateChanged — see the
                 // cancel_qso comment for why (dead priority-scoring backoff
@@ -4102,6 +4109,7 @@ impl QsoManager {
                 self.emit_event(QsoEvent::QsoFailed {
                     qso_id,
                     reason: QsoFailureReason::Superseded,
+                    last_state: old_state,
                     metadata,
                     state_history,
                     messages,
@@ -4632,7 +4640,7 @@ impl QsoManager {
                 let messages = progress.messages.clone();
 
                 drop(qsos); // Release lock before emitting events
-                self.emit_state_change(qso_id, old_state, progress.state.clone())
+                self.emit_state_change(qso_id, old_state.clone(), progress.state.clone())
                     .await;
                 // SM-F5: this is the most common failure producer (every
                 // watchdog/timeout retirement runs through here) and
@@ -4643,6 +4651,7 @@ impl QsoManager {
                 self.emit_event(QsoEvent::QsoFailed {
                     qso_id,
                     reason,
+                    last_state: old_state,
                     metadata,
                     state_history,
                     messages,
@@ -10334,15 +10343,16 @@ mod sm_f5_qso_failed_event_tests {
         while let Ok(ev) = rx.try_recv() {
             events.push(ev);
         }
-        let (state_history, messages) = events
+        let (last_state, state_history, messages) = events
             .into_iter()
             .find_map(|e| match e {
                 QsoEvent::QsoFailed {
                     qso_id: id,
+                    last_state,
                     state_history,
                     messages,
                     ..
-                } if id == qso_id => Some((state_history, messages)),
+                } if id == qso_id => Some((last_state, state_history, messages)),
                 _ => None,
             })
             .expect("expected a QsoFailed event for this qso_id");
@@ -10361,6 +10371,10 @@ mod sm_f5_qso_failed_event_tests {
         // exists on the event at all is what the earlier compile-time
         // wiring enforces.
         assert_eq!(state_history, Vec::<StateTransition>::new());
+        assert!(
+            matches!(last_state, QsoState::RespondingToCq { .. }),
+            "QsoFailed must preserve the operational state even with empty history"
+        );
     }
 
     #[tokio::test]

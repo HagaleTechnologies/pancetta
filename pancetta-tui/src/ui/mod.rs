@@ -1412,7 +1412,113 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
         })
         .collect();
 
-    f.render_widget(Paragraph::new(lines), inner);
+    f.render_widget(
+        Paragraph::new(lines).wrap(ratatui::widgets::Wrap { trim: false }),
+        inner,
+    );
+}
+
+#[cfg(test)]
+mod diagnostics_overlay_tests {
+    use super::*;
+    use crate::app::DiagnosticEventRecord;
+    use chrono::{TimeZone, Utc};
+    use pancetta_core::DiagnosticLevel;
+    use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+    use std::collections::VecDeque;
+
+    async fn app_with(events: Vec<DiagnosticEventRecord>) -> App {
+        let mut app = App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        app.diagnostic_events = VecDeque::from(events);
+        app
+    }
+
+    fn rec(
+        target: &'static str,
+        level: DiagnosticLevel,
+        text: &str,
+        callsign: Option<&str>,
+    ) -> DiagnosticEventRecord {
+        DiagnosticEventRecord {
+            ts: Utc.with_ymd_and_hms(2026, 7, 31, 12, 34, 56).unwrap(),
+            target,
+            level,
+            text: text.to_string(),
+            qso_id: None,
+            callsign: callsign.map(str::to_string),
+        }
+    }
+
+    fn buffer_to_string(buffer: &Buffer) -> String {
+        (0..buffer.area.height)
+            .map(|y| {
+                (0..buffer.area.width)
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[tokio::test]
+    async fn a_skip_row_renders_its_timestamp_target_text_and_callsign() {
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let app = app_with(vec![rec(
+            "qso.autonomous",
+            DiagnosticLevel::Info,
+            "Skipped CQ from JA1ABC — DX working a third party (last 300s)",
+            Some("JA1ABC"),
+        )])
+        .await;
+
+        term.draw(|f| render_diagnostics_overlay(f, f.area(), &app))
+            .unwrap();
+        let rendered = buffer_to_string(term.backend().buffer());
+        assert!(rendered.contains("12:34:56"));
+        assert!(rendered.contains("qso.autonomous"));
+        assert!(rendered.contains("DX working a third party"));
+        assert!(rendered.contains("[JA1ABC]"));
+    }
+
+    #[tokio::test]
+    async fn the_longest_pan6_message_is_not_cut_off_at_120_columns() {
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let app = app_with(vec![rec(
+            "tx.policy",
+            DiagnosticLevel::Info,
+            "Operator-presence gate (FCC §97.221) — no console activity in 120s; suppressing autonomous initiation. Press any key at the station to resume",
+            None,
+        )])
+        .await;
+
+        term.draw(|f| render_diagnostics_overlay(f, f.area(), &app))
+            .unwrap();
+        assert!(
+            buffer_to_string(term.backend().buffer()).contains("resume"),
+            "the actionable part must survive the width"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_empty_state_still_renders() {
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let app = app_with(vec![]).await;
+
+        term.draw(|f| render_diagnostics_overlay(f, f.area(), &app))
+            .unwrap();
+        assert!(buffer_to_string(term.backend().buffer()).contains("No diagnostic events yet"));
+    }
+
+    #[tokio::test]
+    async fn a_terminal_below_the_minimum_early_returns_without_panicking() {
+        let mut term = Terminal::new(TestBackend::new(18, 5)).unwrap();
+        let app = app_with(vec![rec("qso", DiagnosticLevel::Warn, "x", None)]).await;
+
+        term.draw(|f| render_diagnostics_overlay(f, f.area(), &app))
+            .unwrap();
+    }
 }
 
 /// Color a `Failed` row by how actionable/severe the reason is — mirrors the

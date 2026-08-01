@@ -961,6 +961,34 @@ async fn emit_tx_failure_diagnostic(
     .await;
 }
 
+/// Send a fully attributed `DiagnosticEvent` to the TUI's retained Diagnostics
+/// overlay. Best-effort: diagnostics never block or fail the caller's path.
+pub(crate) async fn emit_diagnostic_full(
+    message_bus: &MessageBus,
+    source: ComponentId,
+    target: &'static str,
+    level: pancetta_core::DiagnosticLevel,
+    text: String,
+    qso_id: Option<&str>,
+    callsign: Option<&str>,
+) {
+    let msg = ComponentMessage::new(
+        source,
+        ComponentId::Tui,
+        MessageType::DiagnosticEvent {
+            target,
+            level,
+            text,
+            qso_id: qso_id.map(|s| s.to_string()),
+            callsign: callsign.map(|s| s.to_string()),
+        },
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(msg).await {
+        tracing::debug!("DiagnosticEvent({}) relay failed (no TUI?): {}", target, e);
+    }
+}
+
 /// Send a `DiagnosticEvent` to the TUI's retained Diagnostics overlay
 /// (observability-diagnostics-plan.md Layer 1, "Emission"). `target` reuses
 /// the same vocabulary already used by the co-located `tracing` call at each
@@ -975,21 +1003,16 @@ pub(crate) async fn emit_diagnostic(
     text: String,
     qso_id: Option<&str>,
 ) {
-    let msg = ComponentMessage::new(
+    emit_diagnostic_full(
+        message_bus,
         ComponentId::Ft8Transmitter,
-        ComponentId::Tui,
-        MessageType::DiagnosticEvent {
-            target,
-            level,
-            text,
-            qso_id: qso_id.map(|s| s.to_string()),
-            callsign: None,
-        },
-        Instant::now(),
-    );
-    if let Err(e) = message_bus.send_message(msg).await {
-        tracing::debug!("DiagnosticEvent({}) relay failed (no TUI?): {}", target, e);
-    }
+        target,
+        level,
+        text,
+        qso_id,
+        None,
+    )
+    .await;
 }
 
 /// Read the current global TX policy from the shared atomic.
@@ -5788,6 +5811,57 @@ mod tx_failure_diagnostic_tests {
         let msg = receiver.try_recv().expect("diagnostic should still send");
         match msg.message_type {
             MessageType::DiagnosticEvent { qso_id, .. } => assert_eq!(qso_id, None),
+            other => panic!("expected DiagnosticEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_diagnostic_full_carries_wide_attribution() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        emit_diagnostic_full(
+            &bus,
+            ComponentId::Qso,
+            "qso.security",
+            pancetta_core::DiagnosticLevel::Warn,
+            "rejected".into(),
+            Some("qso-7"),
+            Some("W1AW"),
+        )
+        .await;
+        let msg = receiver.try_recv().expect("diagnostic");
+        assert_eq!(msg.source, ComponentId::Qso);
+        match msg.message_type {
+            MessageType::DiagnosticEvent {
+                target,
+                qso_id,
+                callsign,
+                ..
+            } => {
+                assert_eq!(target, "qso.security");
+                assert_eq!(qso_id.as_deref(), Some("qso-7"));
+                assert_eq!(callsign.as_deref(), Some("W1AW"));
+            }
+            other => panic!("expected DiagnosticEvent, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn emit_diagnostic_delegates_without_changing_its_own_contract() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        emit_diagnostic(
+            &bus,
+            "tx.policy",
+            pancetta_core::DiagnosticLevel::Info,
+            "held".into(),
+            None,
+        )
+        .await;
+        let msg = receiver.try_recv().expect("diagnostic");
+        assert_eq!(msg.source, ComponentId::Ft8Transmitter);
+        match msg.message_type {
+            MessageType::DiagnosticEvent { callsign, .. } => assert_eq!(callsign, None),
             other => panic!("expected DiagnosticEvent, got {other:?}"),
         }
     }
