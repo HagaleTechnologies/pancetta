@@ -2654,20 +2654,20 @@ impl super::ApplicationCoordinator {
                                     // report a failed TransmitComplete so any awaiting
                                     // QSO state machine doesn't hang. This is the
                                     // catch-all hard gate for every TX source.
-                                    if tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
-                                        .is_some()
+                                    if let Some(reason) =
+                                        tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
                                     {
                                         info!(
                                             target: "pancetta::tx.policy",
-                                            "TX DISABLED (RX-only): blocking '{}' at {:.0} Hz (qso: {:?})",
-                                            message_text, frequency_offset, qso_id
+                                            "TX blocked ({}): '{}' at {:.0} Hz (qso: {:?})",
+                                            reason, message_text, frequency_offset, qso_id
                                         );
                                         emit_diagnostic(
                                             &message_bus,
                                             "tx.policy",
                                             pancetta_core::DiagnosticLevel::Info,
                                             format!(
-                                                "TX DISABLED (RX-only): blocking '{message_text}' at {frequency_offset:.0} Hz"
+                                                "TX blocked ({reason}): '{message_text}' at {frequency_offset:.0} Hz"
                                             ),
                                             qso_id.as_deref(),
                                         )
@@ -3104,9 +3104,17 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
-                                        if tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
-                                            .is_some()
+                                        if let Some(reason) =
+                                            tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
                                         {
+                                            emit_diagnostic(
+                                                &message_bus,
+                                                "tx.policy",
+                                                pancetta_core::DiagnosticLevel::Info,
+                                                format!("TX re-key blocked ({reason}): '{message_text}'"),
+                                                qso_id.as_deref(),
+                                            )
+                                            .await;
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
                                             let complete_msg = ComponentMessage::new(
@@ -3806,20 +3814,20 @@ impl super::ApplicationCoordinator {
                                     // modulate. Consume the bundle, clear the TUI TX
                                     // view, and report each item failed so any awaiting
                                     // state doesn't hang.
-                                    if tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
-                                        .is_some()
+                                    if let Some(reason) =
+                                        tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
                                     {
                                         info!(
                                             target: "pancetta::tx.policy",
-                                            "TX DISABLED (RX-only): blocking multi-TX bundle of {} items",
-                                            items.len()
+                                            "TX blocked ({}): multi-TX bundle of {} items",
+                                            reason, items.len()
                                         );
                                         emit_diagnostic(
                                             &message_bus,
                                             "tx.policy",
                                             pancetta_core::DiagnosticLevel::Info,
                                             format!(
-                                                "TX DISABLED (RX-only): blocking multi-TX bundle of {} items",
+                                                "TX blocked ({reason}): multi-TX bundle of {} items",
                                                 items.len()
                                             ),
                                             None,
@@ -4695,9 +4703,20 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
-                                    if tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
-                                        .is_some()
+                                    if let Some(reason) =
+                                        tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
                                     {
+                                        emit_diagnostic(
+                                            &message_bus,
+                                            "tx.policy",
+                                            pancetta_core::DiagnosticLevel::Info,
+                                            format!(
+                                                "TX bundle re-key blocked ({reason}): {} items",
+                                                items.len()
+                                            ),
+                                            None,
+                                        )
+                                        .await;
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
                                         for item in &items {
                                             let complete_msg = ComponentMessage::new(
@@ -5044,20 +5063,20 @@ impl super::ApplicationCoordinator {
                                     // TransmitRequest / MultiTransmitRequest
                                     // arms — defends against any TuneRequest
                                     // source, not just the TUI relay.
-                                    if tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
-                                        .is_some()
+                                    if let Some(reason) =
+                                        tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
                                     {
                                         info!(
                                             target: "pancetta::tx.policy",
-                                            "TX DISABLED (RX-only): blocking tune ({}s @ {} Hz)",
-                                            duration_secs, tone_offset_hz
+                                            "TX blocked ({}): tune ({}s @ {} Hz)",
+                                            reason, duration_secs, tone_offset_hz
                                         );
                                         emit_diagnostic(
                                             &message_bus,
                                             "tx.policy",
                                             pancetta_core::DiagnosticLevel::Info,
                                             format!(
-                                                "TX DISABLED (RX-only): blocking tune ({duration_secs}s @ {tone_offset_hz} Hz)"
+                                                "TX blocked ({reason}): tune ({duration_secs}s @ {tone_offset_hz} Hz)"
                                             ),
                                             None,
                                         )

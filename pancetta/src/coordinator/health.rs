@@ -552,7 +552,7 @@ impl super::ApplicationCoordinator {
         // whatever QSOs were in-flight at that moment -- the fresh
         // `QsoManager` a restart constructs starts with an empty map, so
         // without this those QSOs would just silently vanish from the
-        // operator's view. Surface each as `QsoFailed{SupervisorRestart}`
+        // operator's view. Surface each with the component-specific failure
         // through the manager's real state machine (`fail_qso`), reading off
         // the cheap `Arc`-backed clone the coordinator stashed at
         // `start_qso_component` time -- that clone shares the crashed
@@ -1173,18 +1173,18 @@ mod supervisor_tests {
     }
 
     #[tokio::test]
-    async fn dsp_restart_emits_supervisor_restart_failure_for_each_active_qso() {
+    async fn dsp_restart_does_not_fail_active_qsos() {
         assert_eq!(
             failure_reason_after_component_restart(ComponentId::Dsp).await,
-            Some(pancetta_qso::QsoFailureReason::SupervisorRestart)
+            None
         );
     }
 
     #[tokio::test]
-    async fn ft8_restart_emits_supervisor_restart_failure_for_each_active_qso() {
+    async fn ft8_restart_does_not_fail_active_qsos() {
         assert_eq!(
             failure_reason_after_component_restart(ComponentId::Ft8Decoder).await,
-            Some(pancetta_qso::QsoFailureReason::SupervisorRestart)
+            None
         );
     }
 

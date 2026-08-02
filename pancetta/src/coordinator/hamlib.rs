@@ -886,6 +886,7 @@ impl super::ApplicationCoordinator {
             })
         };
 
+        let hamlib_abort = hamlib_handle.abort_handle();
         self.named_task_handles
             .push((ComponentId::Hamlib, hamlib_handle));
 
@@ -921,11 +922,19 @@ impl super::ApplicationCoordinator {
             }
         }
 
-        if let Ok(Ok(children)) = tokio::time::timeout(Duration::from_secs(1), children_rx).await {
-            self.hamlib_children = Some(children);
-        } else {
-            warn!("Hamlib child handles were not published before startup returned");
-        }
+        self.hamlib_children = Some(
+            match tokio::time::timeout(Duration::from_secs(1), children_rx).await {
+                Ok(Ok(children)) => children,
+                Ok(Err(_)) => {
+                    hamlib_abort.abort();
+                    anyhow::bail!("Hamlib task exited before publishing child teardown handles");
+                }
+                Err(_) => {
+                    hamlib_abort.abort();
+                    anyhow::bail!("Hamlib child teardown handles were not published within 1s");
+                }
+            },
+        );
 
         info!("Hamlib component started");
         Ok(())
