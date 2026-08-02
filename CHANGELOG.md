@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Operator-visible QSO security diagnostics: sender-mismatch/impostor rejections
+  and self-call refusals now appear as retained yellow `qso.security` Warn rows
+  in the Shift+D Diagnostics overlay, while preserving existing rejection,
+  logging, and status-line behavior.
 - GitHub release workflow: pushing a `v*` tag builds prebuilt binaries for
   macOS (Apple Silicon), Linux x86_64, and Windows x86_64 (MinGW) and attaches
   them to a draft release. CI refuses to ship any binary built without the

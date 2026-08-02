@@ -174,6 +174,45 @@ pub enum QsoFailureReason {
     SupervisorRestart,
 }
 
+/// Why the QSO engine refused a decoded frame on sender-verification grounds.
+///
+/// This type originates in the QSO state machine and rides the existing QSO
+/// event channel to consumers that turn it into operator-facing diagnostics.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum RejectionReason {
+    /// The frame's sender is not the callsign this QSO latched as its partner.
+    SenderNotPartner,
+    /// The frame is not addressed to our station callsign.
+    AddresseeNotUs,
+    /// Neither half of sender verification held.
+    SenderAndAddresseeMismatch,
+    /// A same-base, longer sender callsign failed the safe-compound upgrade
+    /// check, so the logged partner callsign was not rewritten.
+    UnsafeCompoundUpgrade,
+}
+
+impl RejectionReason {
+    /// A short, stable token for structured logs, audit trails, and tests.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::SenderNotPartner => "sender-not-partner",
+            Self::AddresseeNotUs => "addressee-not-us",
+            Self::SenderAndAddresseeMismatch => "sender-and-addressee-mismatch",
+            Self::UnsafeCompoundUpgrade => "unsafe-compound-upgrade",
+        }
+    }
+
+    /// Classify sender verification, returning `None` when both checks hold.
+    pub fn classify(sender_is_partner: bool, addressed_to_us: bool) -> Option<Self> {
+        match (sender_is_partner, addressed_to_us) {
+            (true, true) => None,
+            (false, true) => Some(Self::SenderNotPartner),
+            (true, false) => Some(Self::AddresseeNotUs),
+            (false, false) => Some(Self::SenderAndAddresseeMismatch),
+        }
+    }
+}
+
 /// FT8 message types used in QSO flow
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MessageType {
@@ -817,6 +856,21 @@ impl MessageType {
         }
     }
 
+    /// The decoded addressee callsign, when this message carries one.
+    pub fn addressee_callsign(&self) -> Option<&str> {
+        match self {
+            MessageType::CqResponse {
+                calling_station, ..
+            } => Some(calling_station),
+            MessageType::SignalReport { to_station, .. }
+            | MessageType::ReportAck { to_station, .. }
+            | MessageType::FinalConfirmation { to_station, .. }
+            | MessageType::SeventyThree { to_station, .. }
+            | MessageType::ContestExchange { to_station, .. } => Some(to_station),
+            MessageType::Cq { .. } | MessageType::NonStandard { .. } => None,
+        }
+    }
+
     /// Check if this message type is from a specific station
     pub fn is_from(&self, callsign: &str) -> bool {
         match self {
@@ -837,6 +891,46 @@ impl MessageType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejection_reason_classify_maps_each_verification_outcome() {
+        use RejectionReason as R;
+        assert_eq!(R::classify(true, true), None);
+        assert_eq!(R::classify(false, true), Some(R::SenderNotPartner));
+        assert_eq!(R::classify(true, false), Some(R::AddresseeNotUs));
+        assert_eq!(
+            R::classify(false, false),
+            Some(R::SenderAndAddresseeMismatch)
+        );
+    }
+
+    #[test]
+    fn rejection_reason_as_str_is_stable_and_distinct() {
+        use RejectionReason as R;
+        let all = [
+            R::SenderNotPartner,
+            R::AddresseeNotUs,
+            R::SenderAndAddresseeMismatch,
+            R::UnsafeCompoundUpgrade,
+        ];
+        assert_eq!(R::SenderNotPartner.as_str(), "sender-not-partner");
+        assert_eq!(R::AddresseeNotUs.as_str(), "addressee-not-us");
+        assert_eq!(
+            R::SenderAndAddresseeMismatch.as_str(),
+            "sender-and-addressee-mismatch"
+        );
+        assert_eq!(R::UnsafeCompoundUpgrade.as_str(), "unsafe-compound-upgrade");
+        let unique: std::collections::HashSet<_> = all.iter().map(|r| r.as_str()).collect();
+        assert_eq!(unique.len(), all.len(), "as_str() must be injective");
+    }
+
+    #[test]
+    fn rejection_reason_round_trips_through_serde() {
+        let r = RejectionReason::SenderNotPartner;
+        let json = serde_json::to_string(&r).expect("serialize");
+        let back: RejectionReason = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(r, back);
+    }
 
     #[test]
     fn test_qso_state_terminal() {

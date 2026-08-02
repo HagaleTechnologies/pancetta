@@ -1373,6 +1373,10 @@ impl Sim {
             QsoEvent::DuplicateDetected { .. } => {
                 // Surfaced via the absence of a new QSO id; not separately recorded.
             }
+            QsoEvent::MessageRejected { .. } => {
+                // Security rejections are observability-only and cause no state
+                // change, so the simulated timeline is unaffected.
+            }
         }
     }
 

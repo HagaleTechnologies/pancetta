@@ -403,6 +403,20 @@ pub enum QsoEvent {
         original_qso_id: QsoId,
         callsign: String,
     },
+
+    /// A decoded frame was refused on sender-verification grounds.
+    MessageRejected {
+        qso_id: QsoId,
+        reason: RejectionReason,
+        from_callsign: Option<String>,
+        to_callsign: Option<String>,
+    },
+}
+
+/// Routing verdict plus an optional security classification.
+struct Relevance {
+    relevant: bool,
+    reason: Option<RejectionReason>,
 }
 
 impl Default for QsoManagerConfig {
@@ -2226,6 +2240,7 @@ impl QsoManager {
         message: QsoMessage,
         observed_slot_parity: Option<pancetta_core::slot::SlotParity>,
     ) -> Result<(), QsoManagerError> {
+        let mut pending_rejections = Vec::new();
         let mut qsos = self.qsos.write().await;
         let progress = qsos
             .get_mut(&qso_id)
@@ -2313,6 +2328,15 @@ impl QsoManager {
                     rejected = %sender,
                     "rejected unsafe compound-callsign upgrade (unrecognized or substituted affix); keeping latched logged callsign"
                 );
+                pending_rejections.push(QsoEvent::MessageRejected {
+                    qso_id,
+                    reason: RejectionReason::UnsafeCompoundUpgrade,
+                    from_callsign: Some(sender.to_string()),
+                    to_callsign: message
+                        .message_type
+                        .addressee_callsign()
+                        .map(str::to_string),
+                });
             }
         }
 
@@ -2322,6 +2346,7 @@ impl QsoManager {
         // autonomous QSOs.
         let new_state = self
             .determine_state_transition(
+                qso_id,
                 &old_state,
                 &message.message_type,
                 message.signal_strength,
@@ -2664,6 +2689,10 @@ impl QsoManager {
         // style routing cannot deadlock).
         drop(qsos);
 
+        for event in pending_rejections {
+            self.emit_event(event).await;
+        }
+
         // Emit the auto-sequenced reply for manual QSOs. We transmit on the
         // QSO's own frequency and reuse the tx_parity latched at QSO start,
         // exactly as the initial-call MessageToSend does.
@@ -2707,6 +2736,42 @@ impl QsoManager {
         crate::exchange::callsigns_match(from, partner)
     }
 
+    fn verify_sender(&self, from: &str, partner: &str, to: &str) -> Option<RejectionReason> {
+        RejectionReason::classify(Self::is_partner(from, partner), self.is_us(to))
+    }
+
+    fn verify_addressee(&self, to: &str) -> Option<RejectionReason> {
+        (!self.is_us(to)).then_some(RejectionReason::AddresseeNotUs)
+    }
+
+    async fn reject_sender(&self, qso_id: QsoId, from: &str, partner: &str, to: &str) -> bool {
+        let Some(reason) = self.verify_sender(from, partner, to) else {
+            return false;
+        };
+        self.emit_event(QsoEvent::MessageRejected {
+            qso_id,
+            reason,
+            from_callsign: Some(from.to_string()),
+            to_callsign: Some(to.to_string()),
+        })
+        .await;
+        true
+    }
+
+    async fn reject_addressee(&self, qso_id: QsoId, from: &str, to: &str) -> bool {
+        let Some(reason) = self.verify_addressee(to) else {
+            return false;
+        };
+        self.emit_event(QsoEvent::MessageRejected {
+            qso_id,
+            reason,
+            from_callsign: Some(from.to_string()),
+            to_callsign: Some(to.to_string()),
+        })
+        .await;
+        true
+    }
+
     fn ladder_rank(state: &QsoState) -> Option<u8> {
         match state {
             QsoState::RespondingToCq { .. } => Some(0),
@@ -2720,6 +2785,7 @@ impl QsoManager {
 
     async fn determine_state_transition(
         &self,
+        qso_id: QsoId,
         current_state: &QsoState,
         message_type: &MessageType,
         signal_strength: Option<f32>,
@@ -2741,7 +2807,10 @@ impl QsoManager {
                     grid,
                 },
             ) => {
-                if !self.is_us(calling_station) {
+                if self
+                    .reject_addressee(qso_id, responding_station, calling_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         got_to = %calling_station,
@@ -2791,7 +2860,10 @@ impl QsoManager {
                     ..
                 },
             ) => {
-                if !self.is_us(to_station) {
+                if self
+                    .reject_addressee(qso_id, from_station, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         got_to = %to_station,
@@ -2843,7 +2915,10 @@ impl QsoManager {
                     to_station,
                 },
             ) => {
-                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
+                if self
+                    .reject_sender(qso_id, from_station, their_callsign, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -2903,8 +2978,9 @@ impl QsoManager {
                     ..
                 },
             ) => {
-                if !Self::is_partner(responding_station, their_callsign)
-                    || !self.is_us(calling_station)
+                if self
+                    .reject_sender(qso_id, responding_station, their_callsign, calling_station)
+                    .await
                 {
                     warn!(
                         target: "qso.security",
@@ -2949,7 +3025,10 @@ impl QsoManager {
                     report,
                 },
             ) => {
-                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
+                if self
+                    .reject_sender(qso_id, from_station, their_callsign, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -3003,8 +3082,9 @@ impl QsoManager {
                     ..
                 },
             ) => {
-                if !Self::is_partner(responding_station, target_callsign)
-                    || !self.is_us(calling_station)
+                if self
+                    .reject_sender(qso_id, responding_station, target_callsign, calling_station)
+                    .await
                 {
                     warn!(
                         target: "qso.security",
@@ -3045,7 +3125,10 @@ impl QsoManager {
                     report,
                 },
             ) => {
-                if !Self::is_partner(from_station, target_callsign) || !self.is_us(to_station) {
+                if self
+                    .reject_sender(qso_id, from_station, target_callsign, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         expected_from = %target_callsign,
@@ -3087,7 +3170,10 @@ impl QsoManager {
                     report,
                 },
             ) => {
-                if !Self::is_partner(from_station, target_callsign) || !self.is_us(to_station) {
+                if self
+                    .reject_sender(qso_id, from_station, target_callsign, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         expected_from = %target_callsign,
@@ -3136,7 +3222,10 @@ impl QsoManager {
                     to_station,
                 },
             ) => {
-                if !Self::is_partner(from_station, target_callsign) || !self.is_us(to_station) {
+                if self
+                    .reject_sender(qso_id, from_station, target_callsign, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         expected_from = %target_callsign,
@@ -3175,7 +3264,10 @@ impl QsoManager {
                     ..
                 },
             ) => {
-                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
+                if self
+                    .reject_sender(qso_id, from_station, their_callsign, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -3219,7 +3311,10 @@ impl QsoManager {
                     to_station,
                 },
             ) => {
-                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
+                if self
+                    .reject_sender(qso_id, from_station, their_callsign, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -3260,7 +3355,10 @@ impl QsoManager {
                     to_station,
                 },
             ) => {
-                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
+                if self
+                    .reject_sender(qso_id, from_station, their_callsign, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -3320,7 +3418,10 @@ impl QsoManager {
                     report,
                 },
             ) if initiated_by == CallInitiation::Manual => {
-                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
+                if self
+                    .reject_sender(qso_id, from_station, their_callsign, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -3384,7 +3485,10 @@ impl QsoManager {
                     report,
                 },
             ) => {
-                if !Self::is_partner(from_station, their_callsign) || !self.is_us(to_station) {
+                if self
+                    .reject_sender(qso_id, from_station, their_callsign, to_station)
+                    .await
+                {
                     warn!(
                         target: "qso.security",
                         expected_from = %their_callsign,
@@ -3435,8 +3539,9 @@ impl QsoManager {
                 // A "DX K5ARH GRID" repeat parses with calling_station = us,
                 // responding_station = DX. Verify both directions before
                 // regressing so a spurious station cannot reset our QSO.
-                if !Self::is_partner(responding_station, their_callsign)
-                    || !self.is_us(calling_station)
+                if self
+                    .reject_sender(qso_id, responding_station, their_callsign, calling_station)
+                    .await
                 {
                     warn!(
                         target: "qso.security",
@@ -3470,26 +3575,165 @@ impl QsoManager {
         message_type: &MessageType,
         frequency: f64,
     ) -> Vec<QsoId> {
-        let qsos = self.qsos.read().await;
         let mut matching_qsos = Vec::new();
+        let mut rejections = Vec::new();
+        {
+            let qsos = self.qsos.read().await;
+            for (&qso_id, progress) in qsos.iter() {
+                if !progress.state.is_active() {
+                    continue;
+                }
 
-        for (&qso_id, progress) in qsos.iter() {
-            if !progress.state.is_active() {
-                continue;
+                let verdict = self.classify_relevance(
+                    &progress.state,
+                    &progress.metadata,
+                    message_type,
+                    frequency,
+                );
+                if verdict.relevant {
+                    matching_qsos.push(qso_id);
+                } else if let Some(reason) = verdict.reason {
+                    warn!(
+                        target: "qso.security",
+                        %qso_id,
+                        reason = reason.as_str(),
+                        got_from = ?message_type.sender_callsign(),
+                        "frame entangled with an active QSO failed sender verification — not routed"
+                    );
+                    rejections.push(QsoEvent::MessageRejected {
+                        qso_id,
+                        reason,
+                        from_callsign: message_type.sender_callsign().map(str::to_string),
+                        to_callsign: message_type.addressee_callsign().map(str::to_string),
+                    });
+                }
             }
+        }
 
-            // Check if message is relevant to this QSO
-            if self.is_message_relevant(
-                &progress.state,
-                &progress.metadata,
-                message_type,
-                frequency,
-            ) {
-                matching_qsos.push(qso_id);
+        // A frame that matched any active QSO is legitimate traffic for this
+        // manager.  Do not report it as an impostor against every other
+        // concurrent QSO whose state happens to accept the same message kind.
+        if matching_qsos.is_empty() {
+            for event in rejections {
+                self.emit_event(event).await;
             }
         }
 
         matching_qsos
+    }
+
+    fn classify_relevance(
+        &self,
+        state: &QsoState,
+        metadata: &QsoMetadata,
+        message_type: &MessageType,
+        frequency: f64,
+    ) -> Relevance {
+        let relevant = self.is_message_relevant(state, metadata, message_type, frequency);
+        if relevant {
+            return Relevance {
+                relevant: true,
+                reason: None,
+            };
+        }
+
+        // Routing-stage diagnostics are only meaningful when the decode is
+        // close enough to be entangled with this QSO.  Otherwise ordinary
+        // traffic elsewhere in the passband would be classified against every
+        // active QSO.
+        let within_frequency_gate = state.frequency().is_none_or(|qso_frequency| {
+            let match_frequency = metadata.partner_freq.unwrap_or(qso_frequency);
+            let tolerance = if state.their_callsign().is_some() {
+                100.0
+            } else {
+                15.0
+            };
+            (match_frequency - frequency).abs() <= tolerance
+        });
+        if !within_frequency_gate {
+            return Relevance {
+                relevant: false,
+                reason: None,
+            };
+        }
+
+        let verify = |from: &str, partner: &str, to: &str| {
+            RejectionReason::classify(Self::is_partner(from, partner), self.is_us(to))
+                // A partner working a third party is routine band traffic, not
+                // a security event.  At routing time only an impostor sending
+                // to us is distinguishable from ordinary traffic.
+                .filter(|reason| *reason == RejectionReason::SenderNotPartner)
+        };
+        let reason = match (state, message_type) {
+            (
+                QsoState::WaitingForReport { their_callsign, .. },
+                MessageType::ReportAck {
+                    from_station,
+                    to_station,
+                    ..
+                }
+                | MessageType::FinalConfirmation {
+                    from_station,
+                    to_station,
+                }
+                | MessageType::SeventyThree {
+                    from_station,
+                    to_station,
+                },
+            ) => verify(from_station, their_callsign, to_station),
+            (
+                QsoState::RespondingToCq {
+                    target_callsign, ..
+                },
+                MessageType::SignalReport {
+                    from_station,
+                    to_station,
+                    ..
+                },
+            ) => verify(from_station, target_callsign, to_station),
+            (
+                QsoState::RespondingToCq {
+                    target_callsign, ..
+                },
+                MessageType::CqResponse {
+                    calling_station,
+                    responding_station,
+                    ..
+                },
+            ) => verify(responding_station, target_callsign, calling_station),
+            (
+                QsoState::SendingReport { their_callsign, .. },
+                MessageType::ReportAck {
+                    from_station,
+                    to_station,
+                    ..
+                }
+                | MessageType::FinalConfirmation {
+                    from_station,
+                    to_station,
+                }
+                | MessageType::SeventyThree {
+                    from_station,
+                    to_station,
+                },
+            ) => verify(from_station, their_callsign, to_station),
+            (
+                QsoState::WaitingForConfirmation { their_callsign, .. },
+                MessageType::FinalConfirmation {
+                    from_station,
+                    to_station,
+                }
+                | MessageType::SeventyThree {
+                    from_station,
+                    to_station,
+                },
+            ) => verify(from_station, their_callsign, to_station),
+            _ => None,
+        };
+        Relevance {
+            relevant: false,
+            reason,
+        }
     }
 
     fn is_message_relevant(
@@ -7048,6 +7292,8 @@ mod sender_verification_tests {
     #[tokio::test]
     async fn spoofed_signal_report_does_not_advance_state() {
         let manager = manager_with_call("K5ARH");
+        let mut events = manager.subscribe();
+        let qso_id = Uuid::new_v4();
         let state = QsoState::RespondingToCq {
             target_callsign: "K9ZZ".into(),
             frequency: 1500.0,
@@ -7060,11 +7306,25 @@ mod sender_verification_tests {
             report: -12,
         };
         let new_state = manager
-            .determine_state_transition(&state, &spoof, None, CallInitiation::Auto)
+            .determine_state_transition(qso_id, &state, &spoof, None, CallInitiation::Auto)
             .await
             .unwrap();
         // State must NOT advance.
         assert!(matches!(new_state, QsoState::RespondingToCq { .. }));
+        match events.try_recv().expect("security rejection event") {
+            QsoEvent::MessageRejected {
+                qso_id: got,
+                reason,
+                from_callsign,
+                to_callsign,
+            } => {
+                assert_eq!(got, qso_id);
+                assert_eq!(reason, RejectionReason::SenderNotPartner);
+                assert_eq!(from_callsign.as_deref(), Some("NF4KE"));
+                assert_eq!(to_callsign.as_deref(), Some("K5ARH"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -7081,7 +7341,7 @@ mod sender_verification_tests {
             report: -12,
         };
         let new_state = manager
-            .determine_state_transition(&state, &legit, None, CallInitiation::Auto)
+            .determine_state_transition(Uuid::new_v4(), &state, &legit, None, CallInitiation::Auto)
             .await
             .unwrap();
         assert!(
@@ -7107,6 +7367,60 @@ mod sender_verification_tests {
         // partner_freq = None → regression path (normal QSO behavior unchanged).
         let md = normal_metadata("K5ARH", 1500.0);
         assert!(!manager.is_message_relevant(&state, &md, &spoof, 1500.0));
+    }
+
+    #[test]
+    fn classify_relevance_reports_only_entangled_security_traffic() {
+        let manager = manager_with_call("K5ARH");
+        let state = QsoState::RespondingToCq {
+            target_callsign: "K9ZZ".into(),
+            frequency: 1500.0,
+            started_at: Utc::now(),
+        };
+        let metadata = normal_metadata("K5ARH", 1500.0);
+        let impostor = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "NF4KE".into(),
+            report: -12,
+        };
+        let verdict = manager.classify_relevance(&state, &metadata, &impostor, 1500.0);
+        assert!(!verdict.relevant);
+        assert_eq!(verdict.reason, Some(RejectionReason::SenderNotPartner));
+
+        for (from_station, to_station, frequency, description) in [
+            ("K9ZZ", "W1AW", 1500.0, "partner working a third party"),
+            ("NF4KE", "W1AW", 1500.0, "unrelated third-party traffic"),
+            ("NF4KE", "K5ARH", 2400.0, "off-frequency impostor traffic"),
+        ] {
+            let ordinary_traffic = MessageType::SignalReport {
+                to_station: to_station.into(),
+                from_station: from_station.into(),
+                report: -12,
+            };
+            let verdict =
+                manager.classify_relevance(&state, &metadata, &ordinary_traffic, frequency);
+            assert!(!verdict.relevant, "{description}");
+            assert_eq!(verdict.reason, None, "{description} must stay silent");
+        }
+    }
+
+    #[tokio::test]
+    async fn message_rejected_event_is_deliverable_to_subscribers() {
+        let manager = manager_with_call("K5ARH");
+        let mut events = manager.subscribe();
+        let qso_id = Uuid::new_v4();
+        manager
+            .emit_event(QsoEvent::MessageRejected {
+                qso_id,
+                reason: RejectionReason::SenderNotPartner,
+                from_callsign: Some("BOGUS9".into()),
+                to_callsign: Some("K5ARH".into()),
+            })
+            .await;
+        assert!(matches!(
+            events.try_recv(),
+            Ok(QsoEvent::MessageRejected { qso_id: got, .. }) if got == qso_id
+        ));
     }
 
     #[test]
@@ -7794,7 +8108,7 @@ mod sender_verification_tests {
             report: -10,
         };
         let new_state = manager
-            .determine_state_transition(&state, &spoof, None, CallInitiation::Auto)
+            .determine_state_transition(Uuid::new_v4(), &state, &spoof, None, CallInitiation::Auto)
             .await
             .unwrap();
         assert!(matches!(new_state, QsoState::SendingReport { .. }));
@@ -7816,7 +8130,7 @@ mod sender_verification_tests {
             from_station: "NF4KE".into(),
         };
         let new_state = manager
-            .determine_state_transition(&state, &spoof, None, CallInitiation::Auto)
+            .determine_state_transition(Uuid::new_v4(), &state, &spoof, None, CallInitiation::Auto)
             .await
             .unwrap();
         assert!(matches!(new_state, QsoState::WaitingForConfirmation { .. }));
@@ -7838,7 +8152,7 @@ mod sender_verification_tests {
             from_station: "K9ZZ".into(),
         };
         let new_state = manager
-            .determine_state_transition(&state, &legit, None, CallInitiation::Auto)
+            .determine_state_transition(Uuid::new_v4(), &state, &legit, None, CallInitiation::Auto)
             .await
             .unwrap();
         assert!(matches!(new_state, QsoState::Completed { .. }));
@@ -9322,6 +9636,7 @@ mod state_regression_tests {
         // DX re-sends their report (didn't copy our R).
         let result = manager
             .determine_state_transition(
+                qso_id,
                 &manager.get_qso(qso_id).await.unwrap().state,
                 &MessageType::SignalReport {
                     to_station: OUR.into(),

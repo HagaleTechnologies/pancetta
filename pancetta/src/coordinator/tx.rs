@@ -5901,6 +5901,33 @@ mod tx_failure_diagnostic_tests {
             other => panic!("expected DiagnosticEvent, got {other:?}"),
         }
     }
+
+    #[tokio::test]
+    async fn emit_diagnostic_full_carries_source_and_callsign() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        emit_diagnostic_full(
+            &bus,
+            ComponentId::Qso,
+            "qso.security",
+            pancetta_core::DiagnosticLevel::Warn,
+            "rejected frame".into(),
+            Some("qso-7"),
+            Some("BOGUS9"),
+        )
+        .await;
+        let msg = receiver.try_recv().expect("diagnostic should send");
+        assert_eq!(msg.source, ComponentId::Qso);
+        match msg.message_type {
+            MessageType::DiagnosticEvent {
+                target, callsign, ..
+            } => {
+                assert_eq!(target, "qso.security");
+                assert_eq!(callsign.as_deref(), Some("BOGUS9"));
+            }
+            other => panic!("expected DiagnosticEvent, got {other:?}"),
+        }
+    }
 }
 
 #[cfg(test)]

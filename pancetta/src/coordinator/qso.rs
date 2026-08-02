@@ -1343,6 +1343,16 @@ mod pan6_diagnostic_tests {
     }
 }
 
+fn rejection_reason_text(reason: &pancetta_qso::RejectionReason) -> &'static str {
+    use pancetta_qso::RejectionReason as R;
+    match reason {
+        R::SenderNotPartner => "sender is not our QSO partner",
+        R::AddresseeNotUs => "not addressed to us",
+        R::SenderAndAddresseeMismatch => "wrong sender and wrong addressee",
+        R::UnsafeCompoundUpgrade => "unsafe compound-callsign upgrade",
+    }
+}
+
 /// Build a `RecentQsoOutcome` (observability-diagnostics-plan.md Layer 2 —
 /// the Recent-QSOs panel) from a terminal QSO's already-in-scope
 /// `QsoMetadata`. Pure and side-effect-free so it can be unit tested without
@@ -2981,6 +2991,28 @@ impl super::ApplicationCoordinator {
                                     info!("QSO failed: {}", reason_text);
                                 }
                             }
+                            Ok(pancetta_qso::QsoEvent::MessageRejected {
+                                qso_id,
+                                reason,
+                                from_callsign,
+                                to_callsign,
+                            }) => {
+                                let who = from_callsign.as_deref().unwrap_or("?");
+                                let whom = to_callsign.as_deref().unwrap_or("us");
+                                crate::coordinator::tx::emit_diagnostic_full(
+                                    &snapshot_bus,
+                                    ComponentId::Qso,
+                                    "qso.security",
+                                    pancetta_core::DiagnosticLevel::Warn,
+                                    format!(
+                                        "Rejected frame from {who} to {whom} — {}",
+                                        rejection_reason_text(&reason)
+                                    ),
+                                    Some(&qso_id.to_string()),
+                                    from_callsign.as_deref(),
+                                )
+                                .await;
+                            }
                             Ok(_) => {} // Other events (StateChanged, etc.)
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
                                 warn!("QSO event subscriber lagged by {} events", n);
@@ -3189,6 +3221,16 @@ impl super::ApplicationCoordinator {
                                                     "Refusing StartQso for our own callsign {}",
                                                     callsign
                                                 );
+                                                crate::coordinator::tx::emit_diagnostic_full(
+                                                    &message_bus,
+                                                    ComponentId::Qso,
+                                                    "qso.security",
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                    format!("Refusing StartQso for our own callsign {callsign}"),
+                                                    None,
+                                                    Some(&callsign),
+                                                )
+                                                .await;
                                                 continue;
                                             }
                                             info!(
@@ -3492,6 +3534,16 @@ impl super::ApplicationCoordinator {
                                                     "Refusing EngageHound for our own callsign {}",
                                                     callsign
                                                 );
+                                                crate::coordinator::tx::emit_diagnostic_full(
+                                                    &message_bus,
+                                                    ComponentId::Qso,
+                                                    "qso.security",
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                    format!("Refusing EngageHound for our own callsign {callsign}"),
+                                                    None,
+                                                    Some(&callsign),
+                                                )
+                                                .await;
                                                 continue;
                                             }
                                             info!(
@@ -5129,6 +5181,23 @@ mod snapshot_tests {
         assert_eq!(
             super::failure_reason_text(&R::ProtocolError("boom".to_string())),
             "protocol error: boom"
+        );
+    }
+
+    #[test]
+    fn rejection_reason_text_covers_every_variant_and_fits_overlay() {
+        use pancetta_qso::RejectionReason as R;
+        for reason in [
+            R::SenderNotPartner,
+            R::AddresseeNotUs,
+            R::SenderAndAddresseeMismatch,
+            R::UnsafeCompoundUpgrade,
+        ] {
+            assert!(super::rejection_reason_text(&reason).len() <= 40);
+        }
+        assert_eq!(
+            super::rejection_reason_text(&R::SenderNotPartner),
+            "sender is not our QSO partner"
         );
     }
 

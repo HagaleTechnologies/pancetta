@@ -38,8 +38,14 @@ this whole engine end to end and shipped 5 batches of fixes — see that doc and
   `WaitingForReport` didn't have this arm at all before 2026-07-18.
 - **Sender verification** — every advance checks `from_station` == expected DX
   and frequency within tolerance (15 Hz initial, 100 Hz once established);
-  mismatches are logged (`target: "qso.security"`) and discarded. Origin:
-  Security Review C-1/I-1 (`docs/security-review-2026-04-29.md`).
+  mismatches are logged (`target: "qso.security"`), discarded, and emitted through
+  typed `QsoEvent::MessageRejected` events as retained yellow Warn rows in the
+  Shift+D Diagnostics overlay. `is_message_relevant` can reject a structurally
+  matching frame before `determine_state_transition` runs, so it emits the same
+  event for addressed-to-us partner mismatches instead of relying on the shadowed
+  transition guard. Unrelated band traffic stays silent to avoid flooding the
+  retained diagnostics ring. Origin: Security Review C-1/I-1
+  (`docs/security-review-2026-04-29.md`); operator visibility: PAN-3.
 - **Compound-callsign equivalence** — `exchange.rs::{base_callsign,
   callsigns_match}` treat a compound call and its bare base as the same operator
   mid-QSO, where WSJT-X/JTDX stall; conservative so impostors still reject.
