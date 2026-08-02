@@ -1230,9 +1230,7 @@ pub(crate) fn qso_drop_for(
 ) -> Option<(QsoDropScope, pancetta_qso::QsoFailureReason)> {
     use pancetta_qso::QsoFailureReason as R;
     match id {
-        ComponentId::Qso | ComponentId::Dsp | ComponentId::Ft8Decoder => {
-            Some((QsoDropScope::All, R::SupervisorRestart))
-        }
+        ComponentId::Qso => Some((QsoDropScope::All, R::SupervisorRestart)),
         ComponentId::Hamlib | ComponentId::Audio => {
             Some((QsoDropScope::All, R::ComponentCrash(id.to_string())))
         }
@@ -1240,6 +1238,8 @@ pub(crate) fn qso_drop_for(
             Some((QsoDropScope::RemoteOnly, R::ComponentCrash(id.to_string())))
         }
         ComponentId::Ft8Transmitter
+        | ComponentId::Dsp
+        | ComponentId::Ft8Decoder
         | ComponentId::Tui
         | ComponentId::Config
         | ComponentId::Coordinator

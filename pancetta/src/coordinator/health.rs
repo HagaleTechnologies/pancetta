@@ -704,8 +704,17 @@ impl super::ApplicationCoordinator {
             if scope == super::QsoDropScope::RemoteOnly && !progress.metadata.remote_origin {
                 continue;
             }
-            let _ = manager.fail_qso(qso_id, reason.clone()).await;
-            dropped += 1;
+            match manager.fail_qso(qso_id, reason.clone()).await {
+                Ok(()) => dropped += 1,
+                Err(error) => {
+                    error!(
+                        %qso_id,
+                        %component_id,
+                        %error,
+                        "failed to drop in-flight QSO after component crash"
+                    );
+                }
+            }
         }
         if dropped > 0 {
             crate::coordinator::tx::emit_diagnostic(
