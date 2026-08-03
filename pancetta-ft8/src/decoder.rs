@@ -11167,6 +11167,104 @@ fn sum_tone_magnitudes_linear(
     result
 }
 
+/// Translate one ft8_lib sync-search seed into pancetta spectrogram
+/// coordinates, or `None` when it cannot be faithfully represented.
+///
+/// PAN-7. `compute_spectrogram_with` is a line-for-line port of ft8_lib's
+/// `monitor_process` (`vendor/ft8_lib/common/monitor.c:133-155`, MIT) — same
+/// zero-filled persistent `last_frame`, same `copy_within` shift, same
+/// `bin * freq_osr + sub` unpacking — and both are fed from sample 0 of the
+/// same buffer. The axes are therefore the identity:
+///
+/// * `time_step = time_offset * TIME_OSR + time_sub` — ft8_lib's own row
+///   formula (`vendor/ft8_lib/ft8/decode.c:54-55`)
+/// * `freq_bin  = set.min_bin + freq_offset` (`common/monitor.c:103-105`)
+/// * `freq_sub` carries through unchanged
+///
+/// # `SLIDING_FRAME_LOOKBACK_STEPS` is deliberately NOT applied here
+///
+/// Do not "fix" that. The look-back is a row→*sample* **reporting** correction
+/// that lives in [`candidate_offset_samples`] and is applied identically to
+/// native and seeded candidates downstream; applying it during translation
+/// would shift every seed two steps off its true spectrogram position.
+/// Cross-check via the declared inverse: substituting pancetta's own reported
+/// dt for row `r` into [`reverse_derive_candidate`] gives
+/// `round(r - 2) + 0 + 2 = r`. The closely-related trap is feeding ft8_lib's
+/// *reported* `time_sec` — the upstream demo's
+/// `(time_offset + time_sub/time_osr) * symbol_period`, which
+/// `ft8lib_decode_audio_protocol` also computes — into
+/// `reverse_derive_candidate`; that lands 2 steps late.
+///
+/// # Negative rows are dropped, never clamped
+///
+/// ft8_lib sweeps `time_offset ∈ [-10, 20)` (`decode.c:205`) and deliberately
+/// admits candidates whose Costas blocks fall partly outside the slot,
+/// averaging over the sync symbols actually present. Pancetta's `time_padding`
+/// is 0 on every production path, so ft8_lib rows `[-20, -1]` are
+/// unrepresentable — roughly a third of its time range. Clamping them to 0
+/// would fabricate a different spectrogram position and inject garbage, so they
+/// are rejected. Reaching that channel needs `time_padding > 0` plus a
+/// partial-Costas metric; that is a separate change.
+///
+/// `sync_score` and `time_refinement` are left at 0.0 — the caller re-scores
+/// every seed on pancetta's own spectrogram. ft8_lib contributes candidate
+/// *locations* only, never scores.
+fn translate_ft8lib_seed(
+    seed: &crate::ft8_lib_ffi::Ft8LibSeed,
+    set: &crate::ft8_lib_ffi::Ft8LibSeedSet,
+    spectrogram: &Spectrogram,
+    pp: &ProtocolParams,
+    max_time_step: usize,
+    lo: usize,
+    hi: usize,
+) -> Option<CostasCandidate> {
+    // Grid-compatibility guards. The two grids are set by independent constants
+    // that happen to agree today; on mismatch reject rather than emit
+    // silently-wrong positions.
+    if set.time_osr != TIME_OSR as i32
+        || set.freq_osr != FREQ_OSR as i32
+        || spectrogram.freq_osr != FREQ_OSR
+        || set.block_size as usize != pp.samples_per_symbol(SAMPLE_RATE)
+    {
+        return None;
+    }
+
+    // `time_padding` is provably 0 on every production path, but it is carried
+    // in the formula for symmetry with `reverse_derive_candidate`.
+    let row = seed.time_offset as isize * TIME_OSR as isize
+        + seed.time_sub as isize
+        + spectrogram.time_padding as isize;
+    let bin = set.min_bin as isize + seed.freq_offset as isize;
+    if row < 0 || bin < 0 {
+        return None;
+    }
+
+    let time_step = row as usize;
+    let freq_bin = bin as usize;
+    let freq_sub = seed.freq_sub as usize;
+
+    // Seeds must obey exactly the envelope the native sweep obeys, or the
+    // "scoped out of range → zero candidates" contract breaks for
+    // `decode_window_scoped` / `decode_window_with_ap_scoped_partner`. The
+    // `freq_sub` bound matters because `Spectrogram::row` / `at` do not
+    // bounds-check it.
+    if time_step > max_time_step
+        || freq_bin < lo
+        || freq_bin >= hi
+        || freq_sub >= spectrogram.freq_osr
+    {
+        return None;
+    }
+
+    Some(CostasCandidate {
+        time_step,
+        freq_bin,
+        freq_sub,
+        sync_score: 0.0,
+        time_refinement: 0.0,
+    })
+}
+
 /// Reverse-derive a candidate from a DecodedMessage's
 /// `frequency_offset` and `time_offset`. We don't keep `(message,
 /// candidate)` pairs through the rayon decode path, so we reconstruct
@@ -23460,6 +23558,232 @@ mod w4_1_gfsk_reference_tests {
             ft8_ref.samples.len(),
             ft4_ref.samples.len(),
             "FT8 and FT4 references must differ in length (different protocol timing)"
+        );
+    }
+}
+
+/// PAN-7 — unit tests for the pure ft8_lib→pancetta seed coordinate
+/// translator. No FFI, no I/O: these run on stub builds too, which is the
+/// point — the translator is the piece most likely to acquire a silent sign
+/// error, and it must be pinned in the default `cargo test -p pancetta-ft8`
+/// loop rather than only in the real-library integration tests.
+#[cfg(test)]
+mod ft8lib_seed_translate_tests {
+    use super::*;
+    use crate::ft8_lib_ffi::{Ft8LibSeed, Ft8LibSeedSet};
+
+    const NUM_STEPS: usize = 300;
+    const NUM_BINS: usize = 961;
+    /// `spectrogram.num_steps.saturating_sub(pp.num_symbols * TIME_OSR + 1)`
+    /// for FT8: 300 - (79*2 + 1) = 141.
+    const MAX_TIME_STEP: usize = NUM_STEPS - (79 * TIME_OSR + 1);
+
+    fn spec() -> Spectrogram {
+        Spectrogram {
+            power: Vec::new(),
+            complex: None,
+            num_steps: NUM_STEPS,
+            num_bins: NUM_BINS,
+            freq_osr: FREQ_OSR,
+            time_padding: 0,
+        }
+    }
+
+    fn set() -> Ft8LibSeedSet {
+        let pp = ProtocolParams::ft8();
+        Ft8LibSeedSet {
+            seeds: Vec::new(),
+            min_bin: 16,
+            time_osr: TIME_OSR as i32,
+            freq_osr: FREQ_OSR as i32,
+            num_bins: 466,
+            num_blocks: 92,
+            block_size: pp.samples_per_symbol(SAMPLE_RATE) as i32,
+            symbol_period: 0.16,
+        }
+    }
+
+    fn seed(time_offset: i16, time_sub: u8, freq_offset: i16, freq_sub: u8) -> Ft8LibSeed {
+        Ft8LibSeed {
+            score: 42,
+            time_offset,
+            freq_offset,
+            time_sub,
+            freq_sub,
+        }
+    }
+
+    /// Translate with a wide-open frequency envelope.
+    fn xlate(s: &Ft8LibSeed) -> Option<CostasCandidate> {
+        translate_ft8lib_seed(
+            s,
+            &set(),
+            &spec(),
+            &ProtocolParams::ft8(),
+            MAX_TIME_STEP,
+            0,
+            NUM_BINS,
+        )
+    }
+
+    #[test]
+    fn ft8lib_seed_time_axis_maps_row_to_time_step() {
+        // (time_offset, time_sub) -> time_step, i.e. time_offset*TIME_OSR + time_sub.
+        for (time_offset, time_sub, expected) in
+            [(0, 0, 0), (0, 1, 1), (1, 0, 2), (5, 1, 11), (19, 1, 39)]
+        {
+            let c = xlate(&seed(time_offset, time_sub, 0, 0))
+                .unwrap_or_else(|| panic!("({time_offset},{time_sub}) should translate"));
+            assert_eq!(
+                c.time_step, expected,
+                "({time_offset},{time_sub}) must map to row {expected} \
+                 (time_offset*TIME_OSR + time_sub), got {}",
+                c.time_step
+            );
+        }
+
+        // The load-bearing case: row 0 must stay row 0. A translator that
+        // applied SLIDING_FRAME_LOOKBACK_STEPS would return 2 here — that
+        // constant is a row->sample REPORTING correction and must not be
+        // applied during translation.
+        assert_eq!(
+            xlate(&seed(0, 0, 0, 0)).unwrap().time_step,
+            0,
+            "SLIDING_FRAME_LOOKBACK_STEPS must not be applied by the translator"
+        );
+    }
+
+    #[test]
+    fn ft8lib_seed_negative_time_offset_is_dropped_not_clamped() {
+        // ft8_lib sweeps time_offset in [-10, 20). With time_padding = 0 the
+        // negative third is unrepresentable and must be REJECTED. A clamping
+        // implementation returns Some(time_step: 0) and fabricates a position.
+        for time_offset in -10..=-1 {
+            for time_sub in 0..TIME_OSR as u8 {
+                assert!(
+                    xlate(&seed(time_offset, time_sub, 0, 0)).is_none(),
+                    "time_offset {time_offset} (sub {time_sub}) must be dropped, not clamped"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ft8lib_seed_freq_axis_adds_min_bin() {
+        // min_bin = 16: a translator that forgets it puts every seed 100 Hz low.
+        let a = xlate(&seed(0, 0, 0, 0)).unwrap();
+        assert_eq!(a.freq_bin, 16, "freq_offset 0 must land on min_bin");
+
+        let b = xlate(&seed(0, 0, 100, 1)).unwrap();
+        assert_eq!(
+            b.freq_bin, 116,
+            "freq_offset 100 must land on min_bin + 100"
+        );
+        assert_eq!(b.freq_sub, 1, "freq_sub must carry through unchanged");
+    }
+
+    #[test]
+    fn ft8lib_seed_out_of_envelope_is_dropped() {
+        let s = set();
+        let sp = spec();
+        let pp = ProtocolParams::ft8();
+
+        // Past the end of the searchable time range.
+        let late = seed((MAX_TIME_STEP as i16 / 2) + 4, 0, 0, 0);
+        assert!(
+            translate_ft8lib_seed(&late, &s, &sp, &pp, MAX_TIME_STEP, 0, NUM_BINS).is_none(),
+            "time_step beyond max_time_step must be dropped"
+        );
+
+        // Below the caller's low bin (min_bin 16 + 0 = 16 < 20).
+        assert!(
+            translate_ft8lib_seed(&seed(0, 0, 0, 0), &s, &sp, &pp, MAX_TIME_STEP, 20, NUM_BINS)
+                .is_none(),
+            "freq_bin below `lo` must be dropped"
+        );
+
+        // At or above the caller's high bin (exclusive).
+        assert!(
+            translate_ft8lib_seed(&seed(0, 0, 4, 0), &s, &sp, &pp, MAX_TIME_STEP, 0, 20).is_none(),
+            "freq_bin >= `hi` must be dropped"
+        );
+
+        // freq_sub out of range — Spectrogram::row / at do not bounds-check it.
+        assert!(
+            translate_ft8lib_seed(
+                &seed(0, 0, 0, FREQ_OSR as u8),
+                &s,
+                &sp,
+                &pp,
+                MAX_TIME_STEP,
+                0,
+                NUM_BINS
+            )
+            .is_none(),
+            "freq_sub >= spectrogram.freq_osr must be dropped"
+        );
+    }
+
+    #[test]
+    fn ft8lib_seed_scope_filter_respects_caller_range() {
+        // A caller-supplied scope of 200..=210 must exclude a seed at bin 150.
+        // Without this the "scoped out of range -> zero candidates" contract
+        // breaks for decode_window_scoped.
+        let s150 = seed(0, 0, 150 - 16, 0);
+        assert!(
+            translate_ft8lib_seed(
+                &s150,
+                &set(),
+                &spec(),
+                &ProtocolParams::ft8(),
+                MAX_TIME_STEP,
+                200,
+                211
+            )
+            .is_none(),
+            "a seed at bin 150 must not survive a 200..=210 scope"
+        );
+
+        // ...and one inside the scope must survive it.
+        let s205 = seed(0, 0, 205 - 16, 0);
+        let kept = translate_ft8lib_seed(
+            &s205,
+            &set(),
+            &spec(),
+            &ProtocolParams::ft8(),
+            MAX_TIME_STEP,
+            200,
+            211,
+        )
+        .expect("a seed inside the scope must survive");
+        assert_eq!(kept.freq_bin, 205);
+    }
+
+    #[test]
+    fn ft8lib_seed_grid_mismatch_is_rejected() {
+        let sp = spec();
+        let pp = ProtocolParams::ft8();
+        let s = seed(0, 0, 0, 0);
+
+        let mut bad_time = set();
+        bad_time.time_osr = 1;
+        assert!(
+            translate_ft8lib_seed(&s, &bad_time, &sp, &pp, MAX_TIME_STEP, 0, NUM_BINS).is_none(),
+            "time_osr mismatch must reject"
+        );
+
+        let mut bad_freq = set();
+        bad_freq.freq_osr = 1;
+        assert!(
+            translate_ft8lib_seed(&s, &bad_freq, &sp, &pp, MAX_TIME_STEP, 0, NUM_BINS).is_none(),
+            "freq_osr mismatch must reject"
+        );
+
+        let mut bad_block = set();
+        bad_block.block_size = pp.samples_per_symbol(SAMPLE_RATE) as i32 + 1;
+        assert!(
+            translate_ft8lib_seed(&s, &bad_block, &sp, &pp, MAX_TIME_STEP, 0, NUM_BINS).is_none(),
+            "block_size mismatch must reject"
         );
     }
 }
