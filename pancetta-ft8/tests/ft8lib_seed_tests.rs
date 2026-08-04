@@ -109,3 +109,198 @@ fn top_seed_tracks_the_transmitted_signal_position() {
         "expected dt≈0 for a window-aligned signal, got {t}"
     );
 }
+
+// ===========================================================================
+// Phase 3 — the pass-0 union block
+// ===========================================================================
+
+use pancetta_ft8::{Ft8Config, Ft8Decoder, SyncCandidateRecord};
+
+fn read_wav(path: &str) -> Vec<f32> {
+    let reader = hound::WavReader::open(path).unwrap();
+    reader
+        .into_samples::<i16>()
+        .map(|s| s.unwrap() as f32 / 32768.0)
+        .collect()
+}
+
+fn fixture(subpath: &str) -> String {
+    format!(
+        "{}/tests/fixtures/wav/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        subpath
+    )
+}
+
+/// A real off-air recording — several simultaneous signals, which is the only
+/// condition under which the saturation story is testable.
+fn busy_wav() -> Vec<f32> {
+    read_wav(&fixture("wsjt/181201_180245.wav"))
+}
+
+fn dump_for(cfg: Ft8Config, samples: &[f32]) -> Vec<SyncCandidateRecord> {
+    let mut d = Ft8Decoder::new(cfg).expect("decoder");
+    d.decode_window_with_candidate_dump(samples)
+        .expect("decode")
+        .1
+}
+
+#[test]
+fn seeded_decode_admits_candidates_below_min_sync_score() {
+    let tx = busy_wav();
+
+    // `min_sync_score` raised so the native sweep emits only strong
+    // candidates, and the cap left generous so nothing is truncated away. A
+    // seed is admitted precisely BECAUSE it fell below the gate — that bypass
+    // is the mechanism, so this is the test that proves the block does its job.
+    let base = Ft8Config {
+        min_sync_score: 6.0,
+        max_sync_candidates: 400,
+        ..Ft8Config::default()
+    };
+
+    let off = dump_for(
+        Ft8Config {
+            ft8lib_sync_seeds_enabled: false,
+            ..base.clone()
+        },
+        &tx,
+    );
+    let on = dump_for(
+        Ft8Config {
+            ft8lib_sync_seeds_enabled: true,
+            ..base.clone()
+        },
+        &tx,
+    );
+
+    assert!(
+        off.iter().all(|r| !r.via_ft8lib_seed),
+        "with the flag off, nothing may be attributed to ft8_lib seeding"
+    );
+
+    let seeded: Vec<_> = on
+        .iter()
+        .filter(|r| r.pass == 0 && r.via_ft8lib_seed)
+        .collect();
+    assert!(
+        !seeded.is_empty(),
+        "the seeded run must admit at least one ft8_lib-sourced position the \
+         native sweep did not find"
+    );
+    assert!(
+        seeded.iter().any(|r| r.sync_score < 6.0),
+        "at least one admitted seed must score BELOW min_sync_score — bypassing \
+         that gate is the entire mechanism"
+    );
+}
+
+#[test]
+fn seeded_decode_respects_the_candidate_cap() {
+    let tx = busy_wav();
+    const CAP: usize = 50;
+
+    let on = dump_for(
+        Ft8Config {
+            ft8lib_sync_seeds_enabled: true,
+            max_sync_candidates: CAP,
+            ..Ft8Config::default()
+        },
+        &tx,
+    );
+
+    let pass0 = on.iter().filter(|r| r.pass == 0).count();
+    assert!(
+        pass0 <= CAP,
+        "the post-union pass-0 list must respect max_sync_candidates ({CAP}), got {pass0} — \
+         the sibling block forgot its own truncate"
+    );
+}
+
+/// Encodes the structural-inertness expectation rather than treating it as a
+/// surprise: at the default cap the native sweep is already saturated on busy
+/// audio, so few or no seeds survive. Raising the cap is what gives them a
+/// slot. Without this observable, an inert run and a genuine null result are
+/// indistinguishable in the measurement.
+#[test]
+fn raising_the_cap_is_what_lets_seeds_survive() {
+    let tx = busy_wav();
+    let default_cap = Ft8Config::default().max_sync_candidates;
+
+    let kept = |cap: usize| -> (usize, usize) {
+        let d = dump_for(
+            Ft8Config {
+                ft8lib_sync_seeds_enabled: true,
+                max_sync_candidates: cap,
+                ..Ft8Config::default()
+            },
+            &tx,
+        );
+        let pass0: Vec<_> = d.iter().filter(|r| r.pass == 0).collect();
+        let seeds = pass0.iter().filter(|r| r.via_ft8lib_seed).count();
+        (seeds, pass0.len())
+    };
+
+    let (kept_default, total_default) = kept(default_cap);
+    let (kept_raised, total_raised) = kept(default_cap * 2);
+
+    println!(
+        "PAN-7 seed survival: cap {default_cap} -> {kept_default}/{total_default} seeded; \
+         cap {} -> {kept_raised}/{total_raised} seeded",
+        default_cap * 2
+    );
+
+    assert!(
+        total_default <= default_cap && total_raised <= default_cap * 2,
+        "both arms must respect their own cap"
+    );
+    assert!(
+        kept_raised >= kept_default,
+        "a raised cap must not admit FEWER seeds than the default cap \
+         (got {kept_raised} at {} vs {kept_default} at {default_cap})",
+        default_cap * 2
+    );
+}
+
+#[test]
+fn seeded_decode_is_a_noop_on_pass_gt_zero() {
+    // Whether a given recording reaches a residual pass depends on what pass 0
+    // decoded and subtracted, so sweep a few real fixtures: the invariant is
+    // checked on every one, and the liveness assert at the end guarantees at
+    // least one of them actually exercised a later pass.
+    const FIXTURES: [&str; 3] = [
+        "wsjt/181201_180245.wav",
+        "wsjt/170709_135615.wav",
+        "basicft8/170923_082000.wav",
+    ];
+
+    let mut saw_later_pass = false;
+    for f in FIXTURES {
+        let tx = read_wav(&fixture(f));
+        let on = dump_for(
+            Ft8Config {
+                ft8lib_sync_seeds_enabled: true,
+                // The shipped default is a single pass, so multipass must be
+                // requested explicitly or there is no residual pass to check.
+                max_decode_passes: 3,
+                ..Ft8Config::default()
+            },
+            &tx,
+        );
+
+        if on.iter().any(|r| r.pass > 0) {
+            saw_later_pass = true;
+        }
+        assert!(
+            on.iter().filter(|r| r.pass > 0).all(|r| !r.via_ft8lib_seed),
+            "{f}: injection is pass-0 only — residual passes re-search subtracted \
+             audio, where ft8_lib's candidates (computed on the unsubtracted \
+             slot) would be stale"
+        );
+    }
+
+    assert!(
+        saw_later_pass,
+        "no fixture reached a residual pass — the pass-0-only claim went untested"
+    );
+}

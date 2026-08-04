@@ -2433,6 +2433,13 @@ pub struct SyncCandidateRecord {
     /// Whether the per-candidate loop (AP0 + AP retry) emitted a
     /// CRC-valid decode for this candidate on this pass.
     pub decoded: bool,
+    /// PAN-7: this candidate's position was contributed by the ft8_lib
+    /// sync-seed union (`Ft8Config::ft8lib_sync_seeds_enabled`) and was NOT
+    /// already found by the native Costas sweep. Always `false` when the flag
+    /// is off. Answers "did any seed survive the cap, and did it decode"
+    /// without adding a `DecodedMessage` field or an 8th
+    /// `ConfidenceFeatures::decode_origin` ordinal (0-7 are fully assigned).
+    pub via_ft8lib_seed: bool,
 }
 
 /// Waterfall display data for visualization
@@ -3330,6 +3337,196 @@ impl Ft8Decoder {
                 sync_candidates.truncate(self.config.max_sync_candidates);
             }
 
+            // PAN-7: seed the pass-0 candidate list from ft8_lib's own sync
+            // search (vendor/ft8_lib/ft8/decode.c `ftx_find_candidates`, MIT).
+            // POSITIONS ONLY — every seed is RE-SCORED on pancetta's own
+            // spectrogram below, so ft8_lib contributes candidate LOCATIONS,
+            // never scores. Seeds bypass the sweep's inline `min_sync_score`
+            // gate, and that bypass IS the mechanism: a seed is interesting
+            // exactly when pancetta scored its position below threshold.
+            //
+            // Pass-0 only, mirroring hb-228 — residual passes re-search
+            // subtracted audio, where candidates computed on the unsubtracted
+            // slot would be stale.
+            //
+            // Deliberately a self-contained SIBLING of the hb-228 block above,
+            // with its own dedup + re-sort + truncate tail rather than reusing
+            // hb-228's: that tail lives inside hb-228's `if`, so a sibling
+            // relying on it would silently blow the cap in the default
+            // configuration. Hoisting the dedup to run unconditionally is not
+            // an option either — `costas_two_baseline_enabled` deliberately
+            // emits exact-duplicate keys expecting downstream dedup, so a
+            // shared tail would change behavior whenever that flag is on.
+            let mut ft8lib_seed_keys: std::collections::HashSet<(usize, usize, usize)> =
+                std::collections::HashSet::new();
+            if self.config.ft8lib_sync_seeds_enabled && pass == 0 && self.current_budget.has_time()
+            {
+                let seed_start = std::time::Instant::now();
+
+                // Reproduce the native sweep's envelope EXACTLY (see
+                // `costas_sync_search_with_threshold_and_partner`). Seeds must
+                // obey the same bounds natives do, or the "scoped out of range
+                // -> zero candidates" contract breaks for scoped decodes.
+                let msg_span = self.protocol_params.num_symbols * TIME_OSR;
+                let max_time_step = spectrogram.num_steps.saturating_sub(msg_span + 1);
+                let max_freq_bin = spectrogram
+                    .num_bins
+                    .saturating_sub(self.protocol_params.num_tones)
+                    .min((4000.0 / self.protocol_params.tone_spacing) as usize);
+                let (lo, hi) = match effective_scope {
+                    Some(range) => (
+                        MIN_FREQ_BIN.max(*range.start()),
+                        max_freq_bin.min(range.end().saturating_add(1)),
+                    ),
+                    None => (MIN_FREQ_BIN, max_freq_bin),
+                };
+
+                let protocol = match self.protocol_params.protocol {
+                    Protocol::Ft4 => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT4,
+                    // FT2 has no ft8_lib counterpart. The translator's
+                    // block_size guard then rejects every seed, so this is
+                    // inert rather than wrong.
+                    _ => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT8,
+                };
+
+                // ft8_lib gets the RAW f32 residual — identical to `samples` at
+                // pass 0, but preferred so a future change to the pass-1
+                // smoothing above cannot silently alter the seed input. NOT
+                // `audio`: that is f64 *and* amplitude-rescaled by
+                // `0.95/max_abs`, which would change ft8_lib's uint8
+                // quantization and diverge from the already-measured
+                // `ft8lib_decode_audio`. The request size tracks the union cap
+                // so the `--max-sync-candidates` measurement arm widens the
+                // seed budget along with it.
+                let seed_set = crate::ft8_lib_ffi::ft8lib_find_candidate_seeds(
+                    &residual_samples,
+                    protocol,
+                    self.config.max_sync_candidates,
+                );
+
+                // Positions the native sweep already found. A seed landing on
+                // one of these adds nothing; recording that distinction is what
+                // lets a null result be read as "nothing was gained" rather
+                // than "nothing was admitted".
+                let native_keys: std::collections::HashSet<(usize, usize, usize)> = sync_candidates
+                    .iter()
+                    .map(|c| (c.time_step, c.freq_bin, c.freq_sub))
+                    .collect();
+
+                let raw = seed_set.seeds.len();
+                let mut translated = 0usize;
+                let mut dropped_negative_row = 0usize;
+                let mut dropped_out_of_envelope = 0usize;
+
+                for seed in &seed_set.seeds {
+                    // Recomputed only to attribute the drop reason; the
+                    // translator is the authority on whether it is usable.
+                    let row = seed.time_offset as isize * TIME_OSR as isize
+                        + seed.time_sub as isize
+                        + spectrogram.time_padding as isize;
+                    match translate_ft8lib_seed(
+                        seed,
+                        &seed_set,
+                        &spectrogram,
+                        &self.protocol_params,
+                        max_time_step,
+                        lo,
+                        hi,
+                    ) {
+                        Some(mut c) => {
+                            translated += 1;
+                            // Re-score through the SAME expression the native
+                            // sweep uses, parabolic refinement included, so
+                            // seeds and natives share one score scale.
+                            let base = self.costas_score_full_or_partial(
+                                &spectrogram,
+                                c.time_step,
+                                c.freq_bin,
+                                c.freq_sub,
+                            );
+                            let (score, refinement) = self.refine_costas_score(
+                                &spectrogram,
+                                c.time_step,
+                                c.freq_bin,
+                                c.freq_sub,
+                                max_time_step,
+                                base,
+                            );
+                            c.sync_score = score;
+                            c.time_refinement = refinement;
+                            let key = (c.time_step, c.freq_bin, c.freq_sub);
+                            if !native_keys.contains(&key) {
+                                ft8lib_seed_keys.insert(key);
+                            }
+                            sync_candidates.push(c);
+                        }
+                        None if row < 0 => dropped_negative_row += 1,
+                        None => dropped_out_of_envelope += 1,
+                    }
+                }
+
+                // Dedup exact (time,freq,sub) collisions keeping the highest
+                // score, then re-sort best-first and restore the configured
+                // cap. The two-level sort is a HARD PRECONDITION, not style:
+                // `dedup_by_key` removes only CONSECUTIVE equal keys, and the
+                // descending secondary sort is what makes the retained member
+                // of each group the highest-scoring one. Do not reorder it.
+                sync_candidates.sort_by(|a, b| {
+                    (a.time_step, a.freq_bin, a.freq_sub)
+                        .cmp(&(b.time_step, b.freq_bin, b.freq_sub))
+                        .then(
+                            b.sync_score
+                                .partial_cmp(&a.sync_score)
+                                .unwrap_or(std::cmp::Ordering::Equal),
+                        )
+                });
+                sync_candidates.dedup_by_key(|c| (c.time_step, c.freq_bin, c.freq_sub));
+                sync_candidates.sort_by(|a, b| {
+                    b.sync_score
+                        .partial_cmp(&a.sync_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                });
+                let after_dedup = sync_candidates.len();
+                sync_candidates.truncate(self.config.max_sync_candidates);
+
+                // Seeds that were BOTH novel AND survived the cap. These
+                // counters are LOAD-BEARING, not diagnostics: at the default
+                // cap the native sweep is already saturated on busy audio, so
+                // without them an inert run and a genuine null result are
+                // indistinguishable.
+                let kept_seeds = sync_candidates
+                    .iter()
+                    .filter(|c| ft8lib_seed_keys.contains(&(c.time_step, c.freq_bin, c.freq_sub)))
+                    .count();
+
+                debug!(
+                    target: "ft8.seed",
+                    raw,
+                    translated,
+                    dropped_negative_row,
+                    dropped_out_of_envelope,
+                    novel = ft8lib_seed_keys.len(),
+                    after_dedup,
+                    kept_seeds,
+                    total = sync_candidates.len(),
+                    cap = self.config.max_sync_candidates,
+                    "PAN-7 ft8_lib sync-seed union"
+                );
+
+                // Budget hygiene. Inert under `DecodeBudget::unlimited()` —
+                // which is what the whole measurement runs under — but without
+                // it the flag is a latent Eco / Auto+Slow regression, where the
+                // entire per-window budget is 1 ms and this pass runs before
+                // the pass's first `has_time()` checkpoint.
+                let elapsed_ms = seed_start.elapsed().as_millis() as u32;
+                self.current_budget_report.stages.push((
+                    "S0-ft8lib-seed",
+                    elapsed_ms,
+                    kept_seeds as u32,
+                    raw.saturating_sub(translated) as u32,
+                ));
+            }
+
             // On passes 2+, reduce candidate count — strong signals are already
             // decoded and subtracted, so fewer candidates need evaluation.
             if pass > 0 {
@@ -3358,9 +3555,20 @@ impl Ft8Decoder {
                 if pass == 0 {
                     best_sync_score = pass_best;
                 }
+                let seeded = if ft8lib_seed_keys.is_empty() {
+                    0
+                } else {
+                    sync_candidates
+                        .iter()
+                        .filter(|c| {
+                            ft8lib_seed_keys.contains(&(c.time_step, c.freq_bin, c.freq_sub))
+                        })
+                        .count()
+                };
                 info!(
                     pass,
                     candidates = sync_candidates.len(),
+                    seeded,
                     best_score = format!("{:.1}", pass_best),
                     spec_steps = spectrogram.num_steps,
                     spec_bins = spectrogram.num_bins,
@@ -3751,6 +3959,11 @@ impl Ft8Decoder {
                         start_sample,
                         sync_score: c.sync_score,
                         decoded: r.is_some(),
+                        via_ft8lib_seed: ft8lib_seed_keys.contains(&(
+                            c.time_step,
+                            c.freq_bin,
+                            c.freq_sub,
+                        )),
                     });
                 }
                 per_candidate.into_iter().flatten().collect()
@@ -5782,7 +5995,6 @@ impl Ft8Decoder {
         // metric drops block A from both the numerator and denominator,
         // so it stays meaningful for slot-edge negative-dt signals
         // where the leading edge fell outside the recorded window.
-        let partial_enabled = self.config.costas_partial_metric_enabled;
 
         // hb-242 wide-lag baseline: when enabled, also record (per
         // freq_sub, freq_bin) the peak score and time-step within a
@@ -5816,13 +6028,7 @@ impl Ft8Decoder {
         // both for the main score and for parabolic-refinement
         // neighbour scores so the refined-score scale stays consistent.
         let scored = |t0: usize, f0: usize, freq_sub: usize| -> f64 {
-            let full = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
-            if partial_enabled {
-                let partial = self.compute_costas_score_partial_bc(spectrogram, t0, f0, freq_sub);
-                full.max(partial)
-            } else {
-                full
-            }
+            self.costas_score_full_or_partial(spectrogram, t0, f0, freq_sub)
         };
 
         // hb-230: pre-resolve the near-partner relaxed-threshold context.
@@ -5906,49 +6112,14 @@ impl Ft8Decoder {
                         // - (c) reject large delta: if `|delta| >
                         //   sync_time_interp_max_delta_abs`, fall back to
                         //   integer-bin (delta=0, original score).
-                        let (refined_score, time_refinement) =
-                            if self.config.sync_time_interpolation
-                                && t0 > 0
-                                && t0 < max_time_step
-                                && score > self.config.sync_time_interp_score_gate
-                            {
-                                // hb-245: parabolic peak interpolation
-                                // (sub-sample DT refinement). Use the same
-                                // `scored` closure so the y_left / y_right
-                                // values match the y_center scoring rule
-                                // (hb-242 max(full, partial) when enabled).
-                                // The math is the textbook Smith parabola
-                                // through three equally-spaced points,
-                                // already proven correct by
-                                // `parabolic_peak_refinement` and its
-                                // unit tests.
-                                let y_left = scored(t0 - 1, f0, freq_sub);
-                                let y_right = scored(t0 + 1, f0, freq_sub);
-                                let (mut r_score, mut r_delta) =
-                                    parabolic_peak_refinement(y_left, score, y_right);
-                                // (b) delta scale: rescale the offset and
-                                // recompute the score from the parabola
-                                // so the score reflects the position used.
-                                let scale = self.config.sync_time_interp_delta_scale;
-                                if (scale - 1.0).abs() > f64::EPSILON && r_delta.abs() > 0.0 {
-                                    let a = (y_left + y_right - 2.0 * score) * 0.5;
-                                    let b = (y_right - y_left) * 0.5;
-                                    r_delta *= scale;
-                                    r_score = score + b * r_delta + a * r_delta * r_delta;
-                                }
-                                // (c) reject large delta: post-clamp/scale,
-                                // if magnitude exceeds threshold, fall back
-                                // to integer-bin position + original score.
-                                if let Some(max_abs) = self.config.sync_time_interp_max_delta_abs {
-                                    if r_delta.abs() > max_abs {
-                                        r_score = score;
-                                        r_delta = 0.0;
-                                    }
-                                }
-                                (r_score, r_delta)
-                            } else {
-                                (score, 0.0)
-                            };
+                        let (refined_score, time_refinement) = self.refine_costas_score(
+                            spectrogram,
+                            t0,
+                            f0,
+                            freq_sub,
+                            max_time_step,
+                            score,
+                        );
                         candidates.push(CostasCandidate {
                             time_step: t0,
                             freq_bin: f0,
@@ -6074,6 +6245,85 @@ impl Ft8Decoder {
     /// to colored noise than comparing against distant noise bins.
     ///
     /// Score = average of (signal_bin - neighbor_bin) across all valid comparisons.
+    /// The one Costas scoring expression, shared by the native sync sweep and
+    /// the PAN-7 ft8_lib seed union so the two score scales cannot drift apart.
+    ///
+    /// Applies the hb-242 `max(full, partial)` rule when
+    /// `costas_partial_metric_enabled` is set, otherwise the full metric.
+    #[inline]
+    fn costas_score_full_or_partial(
+        &self,
+        spectrogram: &Spectrogram,
+        t0: usize,
+        f0: usize,
+        freq_sub: usize,
+    ) -> f64 {
+        let full = self.compute_costas_score(spectrogram, t0, f0, freq_sub);
+        if self.config.costas_partial_metric_enabled {
+            let partial = self.compute_costas_score_partial_bc(spectrogram, t0, f0, freq_sub);
+            full.max(partial)
+        } else {
+            full
+        }
+    }
+
+    /// Apply the `sync_time_interpolation` parabolic peak refinement to an
+    /// already-computed `score`, returning `(sync_score, time_refinement)`.
+    ///
+    /// Extracted verbatim from the native sweep so the PAN-7 seed union can
+    /// re-score seeds on exactly the same scale. That matters more than it
+    /// looks: `sync_time_interpolation` defaults **true**, so every native
+    /// `sync_score` is the refined value. A seed re-scored with a bare
+    /// `compute_costas_score` would sit on a systematically lower scale,
+    /// biasing it out of the shared truncate, the LDPC score buckets and the AP
+    /// gate — defeating the comparability the union exists to achieve.
+    fn refine_costas_score(
+        &self,
+        spectrogram: &Spectrogram,
+        t0: usize,
+        f0: usize,
+        freq_sub: usize,
+        max_time_step: usize,
+        score: f64,
+    ) -> (f64, f64) {
+        if self.config.sync_time_interpolation
+            && t0 > 0
+            && t0 < max_time_step
+            && score > self.config.sync_time_interp_score_gate
+        {
+            // hb-245: parabolic peak interpolation (sub-sample DT
+            // refinement). Neighbour scores go through the same
+            // full/partial rule as the centre so the refined-score scale
+            // stays consistent. The math is the textbook Smith parabola
+            // through three equally-spaced points, already proven correct
+            // by `parabolic_peak_refinement` and its unit tests.
+            let y_left = self.costas_score_full_or_partial(spectrogram, t0 - 1, f0, freq_sub);
+            let y_right = self.costas_score_full_or_partial(spectrogram, t0 + 1, f0, freq_sub);
+            let (mut r_score, mut r_delta) = parabolic_peak_refinement(y_left, score, y_right);
+            // (b) delta scale: rescale the offset and recompute the score
+            // from the parabola so the score reflects the position used.
+            let scale = self.config.sync_time_interp_delta_scale;
+            if (scale - 1.0).abs() > f64::EPSILON && r_delta.abs() > 0.0 {
+                let a = (y_left + y_right - 2.0 * score) * 0.5;
+                let b = (y_right - y_left) * 0.5;
+                r_delta *= scale;
+                r_score = score + b * r_delta + a * r_delta * r_delta;
+            }
+            // (c) reject large delta: post-clamp/scale, if magnitude
+            // exceeds threshold, fall back to integer-bin position +
+            // original score.
+            if let Some(max_abs) = self.config.sync_time_interp_max_delta_abs {
+                if r_delta.abs() > max_abs {
+                    r_score = score;
+                    r_delta = 0.0;
+                }
+            }
+            (r_score, r_delta)
+        } else {
+            (score, 0.0)
+        }
+    }
+
     fn compute_costas_score(
         &self,
         spec: &Spectrogram,
@@ -23910,6 +24160,54 @@ mod pan7_ft8lib_sync_seed_tests {
             a.iter().any(|m| m.text == "CQ K5ARH EM10"),
             "synthetic signal must decode — otherwise the comparison is vacuous"
         );
+    }
+
+    /// A scoped decode must never pick up an out-of-scope seed. ft8_lib's
+    /// monitor always sweeps 100–3000 Hz and cannot itself be scoped, so the
+    /// envelope filter inside `translate_ft8lib_seed` is the only thing
+    /// preserving the "scoped out of range -> zero candidates" contract.
+    ///
+    /// Lives inline rather than in `tests/ft8lib_seed_tests.rs` because the
+    /// candidate dump is only drained by `decode_window_with_candidate_dump`,
+    /// which is unscoped; reaching a scoped dump needs the private flag.
+    #[cfg(not(ft8lib_stub))]
+    #[test]
+    fn seeded_decode_never_emits_candidates_outside_a_caller_scope() {
+        let tx = noisy_window();
+        const LO: usize = 200;
+        const HI: usize = 210;
+
+        let mut dec = Ft8Decoder::new(Ft8Config {
+            ft8lib_sync_seeds_enabled: true,
+            // Floor the gate and keep the cap small so the scope is densely
+            // populated with natives (making the test non-vacuous) without
+            // paying for hundreds of LDPC attempts.
+            min_sync_score: 0.0,
+            max_sync_candidates: 50,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+
+        dec.candidate_dump_enabled = true;
+        let _ = dec
+            .decode_window_scoped(&tx, LO..=HI)
+            .expect("scoped decode");
+        dec.candidate_dump_enabled = false;
+        let dump = std::mem::take(&mut dec.candidate_dump);
+
+        assert!(
+            !dump.is_empty(),
+            "expected candidates inside the scope — otherwise this is vacuous"
+        );
+        let tone_spacing = dec.protocol_params.tone_spacing;
+        for r in &dump {
+            let bin = (r.freq_hz / tone_spacing).floor() as usize;
+            assert!(
+                (LO..=HI).contains(&bin),
+                "candidate at bin {bin} ({:.1} Hz) escaped the {LO}..={HI} scope",
+                r.freq_hz
+            );
+        }
     }
 
     /// On a stub build `ft8lib_find_candidate_seeds` returns an empty set, so
