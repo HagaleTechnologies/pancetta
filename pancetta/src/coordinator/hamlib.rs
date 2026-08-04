@@ -374,7 +374,6 @@ impl super::ApplicationCoordinator {
             }
         }
 
-        let first_start = self.rig_handle.is_none();
         let rig: Arc<dyn pancetta_hamlib::RigControl + Send + Sync> = if !rig_enabled {
             info!("Rig control disabled, using mock rig");
             Arc::new(pancetta_hamlib::MockRig::default())
@@ -903,7 +902,20 @@ impl super::ApplicationCoordinator {
         // If the rig is slow or absent the timeout fires, we log a warning and
         // carry on — the poll loop (every 500 ms) will catch up; only the first
         // few seconds of operation could stamp band=0.
-        if rig_enabled && first_start {
+        //
+        // PAN-5 verify fix (hamlib.rs restart handshake race): this wait is NOT
+        // gated on `first_start`. teardown_hamlib() never clears self.rig_handle,
+        // so first_start is false on every restart — gating this wait on it meant
+        // a restart fell straight through to the children_rx wait below with only
+        // its hardcoded 1s timeout, no time for the spawned task's connect()
+        // (RigctldClient budgets 5000ms + retries) + set_ptt(Off) + get_frequency()
+        // to complete. That guaranteed the 1s timeout fired on every restart,
+        // aborting the task and bail!-ing startup — on exactly the condition
+        // (rig/rigctld unreachable) a Hamlib restart exists to recover from.
+        // Waiting here on every start means children_tx.send has typically
+        // already fired (or is about to) by the time the 1s children_rx wait
+        // below runs, regardless of first_start.
+        if rig_enabled {
             match tokio::time::timeout(RIG_INITIAL_READ_TIMEOUT, initial_read_rx).await {
                 Ok(_) => {
                     info!(
