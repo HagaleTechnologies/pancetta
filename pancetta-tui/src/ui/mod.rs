@@ -1531,7 +1531,11 @@ mod diagnostics_overlay_tests {
 fn recent_qso_failure_color(reason: &pancetta_qso::QsoFailureReason) -> Color {
     use pancetta_qso::QsoFailureReason as R;
     match reason {
-        R::Timeout | R::SignalLost | R::StationQrt | R::SupervisorRestart => Color::Yellow,
+        R::Timeout
+        | R::SignalLost
+        | R::StationQrt
+        | R::SupervisorRestart
+        | R::ComponentCrash(_) => Color::Yellow,
         R::InvalidCallsign | R::FrequencyConflict | R::ProtocolError(_) => Color::Red,
         R::Duplicate | R::UserCancelled | R::Superseded => Color::Gray,
     }
@@ -2332,6 +2336,12 @@ mod view_render_tests {
         // system-side interruption, not an operator or protocol error.
         assert_eq!(
             recent_qso_failure_color(&pancetta_qso::QsoFailureReason::SupervisorRestart),
+            Color::Yellow
+        );
+        assert_eq!(
+            recent_qso_failure_color(&pancetta_qso::QsoFailureReason::ComponentCrash(
+                "Hamlib".to_string()
+            )),
             Color::Yellow
         );
 

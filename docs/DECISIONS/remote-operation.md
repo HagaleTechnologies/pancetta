@@ -221,3 +221,17 @@ the original question, requiring zero `rig-api.v1` schema touch.
 
 Full technical trail: dispensa
 `questions/0051-remote-tx-dropped-by-arm-gate-is-invisible-to-clients.md`.
+
+## StationAgent crash teardown is a definitive, attributed disarm (PAN-5), 2026-07-31
+
+A StationAgent task death is a security-state transition, not merely a lost transport. Both the
+live session's unwind guard and supervisor teardown disarm the shared `ArmState` with
+`DisarmReason::ComponentCrash`, preserving an accurate audit attribution instead of reporting an
+operator disarm. If the arm mutex is poisoned, teardown recovers the protected state, removes the
+session, applies the disarm effects, and only then calls `clear_poison`; the remote-TX gate therefore
+remains fail-closed until no live authorization remains.
+
+The crash invalidates only remote-origin QSOs (`QsoMetadata.remote_origin == true`), reported as
+`QsoFailureReason::ComponentCrash("StationAgent")`. Local QSOs do not depend on StationAgent and
+continue unchanged. A restarted StationAgent keeps the same shared arm object but cannot inherit an
+authorization: re-arming must pass through the normal capability and grant-verification path.

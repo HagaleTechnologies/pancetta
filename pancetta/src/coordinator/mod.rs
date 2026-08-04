@@ -564,7 +564,7 @@ use pancetta_config::Config;
 use pancetta_ft8::Ft8Config;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::RwLock;
@@ -602,6 +602,14 @@ pub struct ApplicationCoordinator {
     /// Managed rigctld child process (killed on shutdown)
     #[cfg(feature = "pancetta-hamlib")]
     rigctld_process: Option<std::process::Child>,
+    #[cfg(feature = "pancetta-hamlib")]
+    pub(crate) rig_handle: Option<Arc<dyn pancetta_hamlib::RigControl + Send + Sync>>,
+    #[cfg(feature = "pancetta-hamlib")]
+    pub(crate) hamlib_children: Option<hamlib::HamlibChildren>,
+    #[cfg(feature = "pancetta-hamlib")]
+    pub(crate) hamlib_orphans: Vec<tokio::task::AbortHandle>,
+    /// Authorization refresh child owned by the current StationAgent generation.
+    pub(crate) station_agent_poll: Option<tokio::task::AbortHandle>,
 
     /// Application state
     is_running: Arc<AtomicBool>,
@@ -644,6 +652,9 @@ pub struct ApplicationCoordinator {
     /// QSO-in-progress messages and answering callers stay allowed under
     /// `RespondOnly` (only `Disabled` mutes them, at the TX worker).
     tx_policy: Arc<std::sync::atomic::AtomicU8>,
+    /// Number of active supervisor-owned hard mutes. Non-zero while Hamlib is
+    /// being torn down and reacquired; separate from operator TX policy.
+    pub(crate) tx_restart_inhibit: Arc<AtomicU32>,
 
     /// Operator TX-frequency mode (`pancetta_core::TxFreqMode` as `u8`),
     /// default `Hold`. Shared with the QSO engine (gates the stuck-DX TX-offset
@@ -662,6 +673,10 @@ pub struct ApplicationCoordinator {
     /// Configuration
     audio_device: Option<String>,
     no_audio: bool,
+    /// True only when the real-device audio relay was started. Audio relay
+    /// completion is unexpected only in this mode; no-audio and stub exits
+    /// remain intentional.
+    pub(crate) audio_path_supervised: bool,
     headless: bool,
     enable_metrics: bool,
     metrics_port: u16,
@@ -1173,11 +1188,12 @@ pub(crate) fn component_restart_policy(id: ComponentId) -> RestartPolicy {
         | ComponentId::RemoteGateway
         | ComponentId::Qso
         | ComponentId::Dsp
-        | ComponentId::Ft8Decoder => RestartPolicy::Restartable,
-        // Out of scope for this plan (need teardown semantics):
-        ComponentId::Hamlib | ComponentId::StationAgent | ComponentId::Audio => {
-            RestartPolicy::DegradeOnly
-        }
+        | ComponentId::Ft8Decoder
+        | ComponentId::Hamlib
+        | ComponentId::StationAgent => RestartPolicy::Restartable,
+        // Audio device recovery happens inside AudioManager; restarting the
+        // relays would compete for the same device and lose rollback state.
+        ComponentId::Audio => RestartPolicy::DegradeOnly,
         // Owns the terminal; restart is awkward — degrade + notify.
         ComponentId::Tui => RestartPolicy::DegradeOnly,
         // Never a real task-handle target for this supervisor.
@@ -1203,6 +1219,38 @@ impl ApplicationCoordinator {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum QsoDropScope {
+    All,
+    RemoteOnly,
+}
+
+pub(crate) fn qso_drop_for(
+    id: ComponentId,
+) -> Option<(QsoDropScope, pancetta_qso::QsoFailureReason)> {
+    use pancetta_qso::QsoFailureReason as R;
+    match id {
+        ComponentId::Qso => Some((QsoDropScope::All, R::SupervisorRestart)),
+        ComponentId::Hamlib | ComponentId::Audio => {
+            Some((QsoDropScope::All, R::ComponentCrash(id.to_string())))
+        }
+        ComponentId::StationAgent => {
+            Some((QsoDropScope::RemoteOnly, R::ComponentCrash(id.to_string())))
+        }
+        ComponentId::Ft8Transmitter
+        | ComponentId::Dsp
+        | ComponentId::Ft8Decoder
+        | ComponentId::Tui
+        | ComponentId::Config
+        | ComponentId::Coordinator
+        | ComponentId::DxCluster
+        | ComponentId::PskReporter
+        | ComponentId::RemoteGateway
+        | ComponentId::Autonomous
+        | ComponentId::WsjtxUdp => None,
+    }
+}
+
 /// Human-readable degradation message for a failed component
 fn degradation_message(id: ComponentId) -> &'static str {
     match id {
@@ -1215,6 +1263,10 @@ fn degradation_message(id: ComponentId) -> &'static str {
         ComponentId::Qso => "QSO manager failed -- contact logging unavailable",
         ComponentId::Ft8Transmitter => "FT8 transmitter failed -- TX disabled",
         ComponentId::Autonomous => "Autonomous operator failed -- manual operation only",
+        ComponentId::RemoteGateway => {
+            "Remote gateway failed -- remote operation unavailable until restart"
+        }
+        ComponentId::StationAgent => "Remote-TX security agent lost -- remote TX disarmed",
         _ => "Component failed",
     }
 }
@@ -1439,6 +1491,7 @@ impl ApplicationCoordinator {
             tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
                 pancetta_core::TxPolicy::default().as_u8(),
             )),
+            tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
             // Default TX-frequency mode = Hold (operator's picked offset is
             // sticky; pancetta never moves it autonomously). Operator switches
             // to Auto from the TUI (`f`).
@@ -1451,6 +1504,7 @@ impl ApplicationCoordinator {
             startup_time,
             audio_device,
             no_audio,
+            audio_path_supervised: false,
             headless,
             enable_metrics,
             metrics_port,
@@ -1513,6 +1567,13 @@ impl ApplicationCoordinator {
             last_freq_command: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "pancetta-hamlib")]
             rigctld_process: None,
+            #[cfg(feature = "pancetta-hamlib")]
+            rig_handle: None,
+            #[cfg(feature = "pancetta-hamlib")]
+            hamlib_children: None,
+            #[cfg(feature = "pancetta-hamlib")]
+            hamlib_orphans: Vec::new(),
+            station_agent_poll: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -2824,10 +2885,10 @@ mod tests {
             component_restart_policy(ComponentId::Ft8Decoder),
             Restartable
         );
-        assert_eq!(component_restart_policy(ComponentId::Hamlib), DegradeOnly);
+        assert_eq!(component_restart_policy(ComponentId::Hamlib), Restartable);
         assert_eq!(
             component_restart_policy(ComponentId::StationAgent),
-            DegradeOnly
+            Restartable
         );
         assert_eq!(component_restart_policy(ComponentId::Audio), DegradeOnly);
         assert_eq!(component_restart_policy(ComponentId::Tui), DegradeOnly);
@@ -2841,5 +2902,48 @@ mod tests {
             DegradeOnly
         );
         assert_eq!(component_restart_policy(ComponentId::WsjtxUdp), DegradeOnly);
+    }
+
+    #[test]
+    fn qso_drop_scope_matches_pan5_classification() {
+        use QsoDropScope::*;
+        assert_eq!(qso_drop_for(ComponentId::Qso).map(|v| v.0), Some(All));
+        assert_eq!(qso_drop_for(ComponentId::Hamlib).map(|v| v.0), Some(All));
+        assert_eq!(qso_drop_for(ComponentId::Audio).map(|v| v.0), Some(All));
+        assert_eq!(
+            qso_drop_for(ComponentId::StationAgent).map(|v| v.0),
+            Some(RemoteOnly)
+        );
+        for id in [
+            ComponentId::Dsp,
+            ComponentId::Ft8Decoder,
+            ComponentId::Ft8Transmitter,
+            ComponentId::Tui,
+            ComponentId::Config,
+            ComponentId::Coordinator,
+            ComponentId::DxCluster,
+            ComponentId::PskReporter,
+            ComponentId::RemoteGateway,
+            ComponentId::Autonomous,
+            ComponentId::WsjtxUdp,
+        ] {
+            assert!(qso_drop_for(id).is_none(), "{id}");
+        }
+    }
+
+    #[test]
+    fn degradation_message_names_every_supervised_component() {
+        for id in [
+            ComponentId::Autonomous,
+            ComponentId::DxCluster,
+            ComponentId::PskReporter,
+            ComponentId::RemoteGateway,
+            ComponentId::Qso,
+            ComponentId::Hamlib,
+            ComponentId::StationAgent,
+            ComponentId::Audio,
+        ] {
+            assert_ne!(degradation_message(id), "Component failed", "{id}");
+        }
     }
 }

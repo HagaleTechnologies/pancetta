@@ -1,5 +1,6 @@
 use anyhow::Result;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::task::JoinHandle;
 use tokio::time::{interval, sleep};
@@ -10,6 +11,31 @@ use super::{
     ComponentState, ComponentStatus, RestartPolicy,
 };
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
+
+struct TxInhibitGuard {
+    counter: Option<Arc<AtomicU32>>,
+}
+
+impl TxInhibitGuard {
+    fn for_component(component: ComponentId, counter: Arc<AtomicU32>) -> Self {
+        if component == ComponentId::Hamlib {
+            counter.fetch_add(1, Ordering::AcqRel);
+            Self {
+                counter: Some(counter),
+            }
+        } else {
+            Self { counter: None }
+        }
+    }
+}
+
+impl Drop for TxInhibitGuard {
+    fn drop(&mut self) {
+        if let Some(counter) = &self.counter {
+            counter.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+}
 
 /// Count of panics observed process-wide since startup, via the top-level
 /// panic hook installed by `main.rs`'s `install_panic_hook`. Lives here
@@ -488,7 +514,14 @@ impl super::ApplicationCoordinator {
         handle: tokio::task::JoinHandle<Result<()>>,
     ) {
         let outcome = handle.await;
-        let is_clean_exit = matches!(outcome, Ok(Ok(())));
+        let shutting_down = self.shutdown_signal.load(Ordering::Acquire);
+        let unexpected_clean_exit = !shutting_down
+            && ((component_id == ComponentId::Audio && self.audio_path_supervised)
+                || matches!(
+                    component_id,
+                    ComponentId::Hamlib | ComponentId::StationAgent
+                ));
+        let is_clean_exit = matches!(outcome, Ok(Ok(()))) && !unexpected_clean_exit;
 
         {
             let mut status_map = self.component_status.write().await;
@@ -512,27 +545,14 @@ impl super::ApplicationCoordinator {
 
         let degradation = degradation_message(component_id);
 
-        // For Hamlib failure: ensure PTT defaults to off for safety.
-        // Preserved verbatim from the pre-restructure logic.
-        if component_id == ComponentId::Hamlib {
-            warn!("PTT safety: forcing PTT off due to Hamlib disconnect");
-            let ptt_off_msg = ComponentMessage::new(
-                ComponentId::Coordinator,
-                ComponentId::Hamlib,
-                MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt {
-                    state: false,
-                }),
-                Instant::now(),
-            );
-            // Best-effort: channel may be disconnected
-            let _ = self.message_bus.send_message(ptt_off_msg).await;
-        }
+        let _tx_inhibit =
+            TxInhibitGuard::for_component(component_id, self.tx_restart_inhibit.clone());
 
         // Task 6 (task-supervision): a crashed Qso-component task drops
         // whatever QSOs were in-flight at that moment -- the fresh
         // `QsoManager` a restart constructs starts with an empty map, so
         // without this those QSOs would just silently vanish from the
-        // operator's view. Surface each as `QsoFailed{SupervisorRestart}`
+        // operator's view. Surface each with the component-specific failure
         // through the manager's real state machine (`fail_qso`), reading off
         // the cheap `Arc`-backed clone the coordinator stashed at
         // `start_qso_component` time -- that clone shares the crashed
@@ -563,18 +583,11 @@ impl super::ApplicationCoordinator {
         // subscriber) by
         // `qso_restart_delivers_recent_qso_outcome_through_the_real_forwarder`
         // below.
-        if matches!(
-            component_id,
-            ComponentId::Qso | ComponentId::Dsp | ComponentId::Ft8Decoder
-        ) {
-            if let Some(manager) = self.qso_manager_for_supervisor.clone() {
-                for (qso_id, _progress) in manager.get_active_qsos().await {
-                    let _ = manager
-                        .fail_qso(qso_id, pancetta_qso::QsoFailureReason::SupervisorRestart)
-                        .await;
-                }
-            }
+        if let Some((scope, reason)) = super::qso_drop_for(component_id) {
+            self.fail_qsos_dropped_by(component_id, scope, reason).await;
         }
+
+        self.teardown_component(component_id).await;
 
         match component_restart_policy(component_id) {
             RestartPolicy::Restartable
@@ -635,6 +648,14 @@ impl super::ApplicationCoordinator {
                     status.state = ComponentState::Failed(degradation.to_string());
                 }
                 drop(status_map);
+                crate::coordinator::tx::emit_diagnostic(
+                    &self.message_bus,
+                    "supervisor",
+                    pancetta_core::DiagnosticLevel::Error,
+                    format!("{component_id} {degradation}"),
+                    None,
+                )
+                .await;
                 self.notify_tui_of_failure(component_id, degradation).await;
             }
             RestartPolicy::DegradeOnly | RestartPolicy::FatalAbort => {
@@ -656,8 +677,69 @@ impl super::ApplicationCoordinator {
                     status.state = ComponentState::Failed(degradation.to_string());
                 }
                 drop(status_map);
+                crate::coordinator::tx::emit_diagnostic(
+                    &self.message_bus,
+                    "supervisor",
+                    pancetta_core::DiagnosticLevel::Error,
+                    format!("{component_id} {degradation}"),
+                    None,
+                )
+                .await;
                 self.notify_tui_of_failure(component_id, degradation).await;
             }
+        }
+    }
+
+    async fn fail_qsos_dropped_by(
+        &self,
+        component_id: ComponentId,
+        scope: super::QsoDropScope,
+        reason: pancetta_qso::QsoFailureReason,
+    ) {
+        let Some(manager) = self.qso_manager_for_supervisor.clone() else {
+            return;
+        };
+        let mut dropped = 0usize;
+        for (qso_id, progress) in manager.get_active_qsos().await {
+            if scope == super::QsoDropScope::RemoteOnly && !progress.metadata.remote_origin {
+                continue;
+            }
+            match manager.fail_qso(qso_id, reason.clone()).await {
+                Ok(()) => dropped += 1,
+                Err(error) => {
+                    error!(
+                        %qso_id,
+                        %component_id,
+                        %error,
+                        "failed to drop in-flight QSO after component crash"
+                    );
+                }
+            }
+        }
+        if dropped > 0 {
+            crate::coordinator::tx::emit_diagnostic(
+                &self.message_bus,
+                "supervisor",
+                pancetta_core::DiagnosticLevel::Warn,
+                format!("{component_id} crashed -- dropped {dropped} in-flight QSO(s)"),
+                None,
+            )
+            .await;
+        }
+    }
+
+    async fn teardown_component(&mut self, component_id: ComponentId) {
+        match component_id {
+            #[cfg(feature = "pancetta-hamlib")]
+            ComponentId::Hamlib => self.teardown_hamlib().await,
+            ComponentId::StationAgent => {
+                if let Some(poll) = self.station_agent_poll.take() {
+                    poll.abort();
+                }
+                self.fail_safe_disarm_remote_tx("station-agent component crash")
+                    .await;
+            }
+            _ => {}
         }
     }
 
@@ -690,6 +772,9 @@ impl super::ApplicationCoordinator {
             ComponentId::Qso => self.start_qso_component().await,
             ComponentId::Dsp => self.start_dsp_pipeline().await,
             ComponentId::Ft8Decoder => self.start_ft8_pipeline().await,
+            #[cfg(feature = "pancetta-hamlib")]
+            ComponentId::Hamlib => self.start_hamlib_component().await,
+            ComponentId::StationAgent => self.start_station_agent_component().await,
             other => anyhow::bail!("restart_component called for non-restartable {other}"),
         }
     }
@@ -735,9 +820,10 @@ impl super::ApplicationCoordinator {
 #[cfg(test)]
 mod supervisor_tests {
     use super::super::ApplicationCoordinator;
+    use super::TxInhibitGuard;
     use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
     use pancetta_config::Config;
-    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
     use std::sync::Arc;
 
     /// Mirrors the direct-construction pattern used by `mod.rs`'s
@@ -841,6 +927,79 @@ mod supervisor_tests {
         coordinator
             .shutdown_signal
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    #[test]
+    fn budget_exhausted_degrade_still_clears_the_tx_inhibit() {
+        let inhibit = Arc::new(AtomicU32::new(0));
+        {
+            let _guard = TxInhibitGuard::for_component(ComponentId::Hamlib, inhibit.clone());
+            assert_eq!(inhibit.load(Ordering::Acquire), 1);
+        }
+        assert_eq!(inhibit.load(Ordering::Acquire), 0);
+    }
+
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn hamlib_crash_mid_ptt_forces_ptt_off_on_the_rig() {
+        use pancetta_hamlib::{PttState, RigControl, Vfo};
+
+        let mut coordinator = test_coordinator().await;
+        let mock = Arc::new(pancetta_hamlib::MockRig::default());
+        mock.connect().await.expect("test rig should connect");
+        mock.set_ptt(Vfo::Current, PttState::On)
+            .await
+            .expect("test rig should key");
+        coordinator.rig_handle = Some(mock.clone());
+        coordinator.ptt_active.store(true, Ordering::Release);
+
+        coordinator.teardown_hamlib().await;
+
+        assert_eq!(
+            mock.get_ptt(Vfo::Current).await.expect("PTT state"),
+            PttState::Off
+        );
+        assert!(!coordinator.ptt_active.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn audio_handle_exit_on_a_live_audio_path_is_treated_as_a_failure() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.audio_path_supervised = true;
+        coordinator
+            .named_task_handles
+            .push((ComponentId::Audio, tokio::spawn(async { Ok(()) })));
+        tokio::task::yield_now().await;
+        coordinator.check_task_handles().await;
+        assert!(matches!(
+            coordinator
+                .component_status
+                .read()
+                .await
+                .get(&ComponentId::Audio)
+                .map(|status| &status.state),
+            Some(super::super::ComponentState::Failed(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn audio_handle_exit_is_benign_without_a_real_audio_path() {
+        let mut coordinator = test_coordinator().await;
+        assert!(!coordinator.audio_path_supervised);
+        coordinator
+            .named_task_handles
+            .push((ComponentId::Audio, tokio::spawn(async { Ok(()) })));
+        tokio::task::yield_now().await;
+        coordinator.check_task_handles().await;
+        assert!(!matches!(
+            coordinator
+                .component_status
+                .read()
+                .await
+                .get(&ComponentId::Audio)
+                .map(|status| &status.state),
+            Some(super::super::ComponentState::Failed(_))
+        ));
     }
 
     /// Task 5's central regression guard. DxCluster is `Restartable`
@@ -1014,18 +1173,18 @@ mod supervisor_tests {
     }
 
     #[tokio::test]
-    async fn dsp_restart_emits_supervisor_restart_failure_for_each_active_qso() {
+    async fn dsp_restart_does_not_fail_active_qsos() {
         assert_eq!(
             failure_reason_after_component_restart(ComponentId::Dsp).await,
-            Some(pancetta_qso::QsoFailureReason::SupervisorRestart)
+            None
         );
     }
 
     #[tokio::test]
-    async fn ft8_restart_emits_supervisor_restart_failure_for_each_active_qso() {
+    async fn ft8_restart_does_not_fail_active_qsos() {
         assert_eq!(
             failure_reason_after_component_restart(ComponentId::Ft8Decoder).await,
-            Some(pancetta_qso::QsoFailureReason::SupervisorRestart)
+            None
         );
     }
 

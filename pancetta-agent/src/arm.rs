@@ -117,6 +117,8 @@ pub enum DisarmReason {
     TtlExpired,
     /// No heartbeat within the dead-man window.
     HeartbeatLost,
+    /// The station-agent component terminated unexpectedly.
+    ComponentCrash,
 }
 
 impl DisarmReason {
@@ -126,6 +128,7 @@ impl DisarmReason {
             DisarmReason::OperatorDisarm => "operator-disarm",
             DisarmReason::TtlExpired => "ttl-expired",
             DisarmReason::HeartbeatLost => "heartbeat-lost",
+            DisarmReason::ComponentCrash => "component-crash",
         }
     }
 }
@@ -340,17 +343,22 @@ impl ArmState {
 
     /// Explicit operator/coordinator disarm. No-op (empty effects) if not armed.
     pub fn disarm(&mut self, now_ms: i64) -> Vec<ArmEffect> {
+        self.disarm_with_reason(DisarmReason::OperatorDisarm, now_ms)
+    }
+
+    /// Disarm with an explicit attribution reason. This is used by fail-safe
+    /// component teardown so the audit record does not misattribute a crash to
+    /// an operator action. No-op (empty effects) if not armed.
+    pub fn disarm_with_reason(&mut self, reason: DisarmReason, now_ms: i64) -> Vec<ArmEffect> {
         match self.session.take() {
             Some(s) => vec![
                 ArmEffect::Audit(AuditEvent {
                     ts_unix_ms: now_ms,
                     kind: AuditKind::Disarmed,
                     operator_callsign: Some(s.operator_callsign),
-                    detail: format!("disarmed: {}", DisarmReason::OperatorDisarm.as_str()),
+                    detail: format!("disarmed: {}", reason.as_str()),
                 }),
-                ArmEffect::Disarmed {
-                    reason: DisarmReason::OperatorDisarm,
-                },
+                ArmEffect::Disarmed { reason },
             ],
             None => Vec::new(),
         }
@@ -923,6 +931,29 @@ mod tests {
         assert!(!st.tx_permitted(T0 + 1_000));
         // Disarm again = no effects.
         assert!(st.disarm(T0 + 2_000).is_empty());
+    }
+
+    #[test]
+    fn disarm_with_component_crash_reason_is_truthfully_attributed() {
+        assert_eq!(DisarmReason::ComponentCrash.as_str(), "component-crash");
+
+        let mut st = armed_consented();
+        let effects = st.disarm_with_reason(DisarmReason::ComponentCrash, T0 + 1_000);
+
+        assert_eq!(effects.len(), 2);
+        assert!(matches!(
+            &effects[0],
+            ArmEffect::Audit(event)
+                if event.kind == AuditKind::Disarmed
+                    && event.detail == "disarmed: component-crash"
+        ));
+        assert_eq!(
+            effects[1],
+            ArmEffect::Disarmed {
+                reason: DisarmReason::ComponentCrash
+            }
+        );
+        assert!(!st.is_armed());
     }
 
     // --- consent/kill audit-emission edges --------------------------------
