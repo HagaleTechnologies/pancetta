@@ -1187,6 +1187,30 @@ pub struct Ft8Config {
     /// unchanged downstream CRC/LDPC gating. Costs ~2 extra FFT+sync passes on
     /// pass 0 only. Default **false** (research opt-in).
     pub three_method_spectral_sweep_enabled: bool,
+
+    /// PAN-7: seed the pass-0 sync-candidate list from ft8_lib's own sync
+    /// search. When `true`, the initial decode pass additionally runs ft8_lib's
+    /// `monitor_*` + `ftx_find_candidates` pipeline
+    /// (`vendor/ft8_lib/ft8/decode.c`, MIT) over the same slot audio,
+    /// translates each returned candidate into pancetta spectrogram
+    /// coordinates, RE-SCORES it with pancetta's own Costas kernel, and unions
+    /// it into the candidate list — dedup by (time, freq, sub), best score
+    /// kept, re-truncated to `max_sync_candidates`. ft8_lib contributes
+    /// candidate *locations* only, never scores. Seeds bypass the inline
+    /// `min_sync_score` gate, and **that bypass is the mechanism**: a seed is
+    /// interesting precisely when pancetta scored its position below threshold.
+    /// Costs one extra ft8_lib monitor pass on pass 0; no-op under
+    /// `ft8lib_stub`. Default **false** (research opt-in).
+    ///
+    /// Two ceilings worth knowing before reading a measurement:
+    /// at the default `max_sync_candidates` the native sweep is already
+    /// saturated on busy audio, so the union is expected to be largely inert
+    /// there — a raised cap is what gives seeds a slot; and because
+    /// `MIN_SYNC_SCORE_FOR_AP` equals the default `min_sync_score`, a seed that
+    /// is novel by virtue of scoring low is structurally excluded from the
+    /// AP1–AP4 retries and reaches AP0 only.
+    pub ft8lib_sync_seeds_enabled: bool,
+
     /// WSJT-X Improved-style a8 sequenced-QSO-state AP. When `true`
     /// AND the supplied `ApContext.active_qso` carries a non-empty
     /// `expected_next_message_texts` list AND `ApContext.my_call` is
@@ -2038,6 +2062,15 @@ impl Default for Ft8Config {
             // ref `spec-ft8mon-three-stage-sync-cascade.md`.
             three_stage_sync_cascade_enabled: false,
             three_method_spectral_sweep_enabled: false,
+            // PAN-7: union ft8_lib's own sync candidates into the pass-0
+            // candidate list. MUST stay false — this is a research opt-in
+            // whose entire promise is that the flag-off path is byte-identical
+            // to today (pinned by
+            // `pan7_ft8lib_sync_seed_tests::ft8lib_sync_seeds_off_is_byte_identical_to_default`).
+            // Graduating it is gated on the standing jt9 eval/compare ship
+            // gate — zero new FPs on noise_1000 and Δunverified-novels ≤ 2×ΔTP
+            // — per docs/superpowers/specs/2026-07-06-decoder-tp-sensitivity-design.md.
+            ft8lib_sync_seeds_enabled: false,
             // WSJT-X Improved-style a8 sequenced-QSO-state AP. Default
             // OFF — preserves byte-identical legacy AP3/AP4 confidence
             // gating. Flip on to relax the AP floor for decodes that
@@ -20105,6 +20138,18 @@ mod three_stage_sync_tests {
     }
 
     #[test]
+    fn default_config_keeps_ft8lib_sync_seeds_off() {
+        let cfg = Ft8Config::default();
+        assert!(
+            !cfg.ft8lib_sync_seeds_enabled,
+            "Ft8Config::default().ft8lib_sync_seeds_enabled must be false \
+             (PAN-7 is research opt-in; flipping default-ON requires the jt9 \
+             eval/compare ship gate: zero new FPs on noise_1000 and \
+             Δunverified-novels ≤ 2×ΔTP)"
+        );
+    }
+
+    #[test]
     fn known_coherence_score_returns_none_without_complex_retention() {
         let pp = ProtocolParams::ft8();
         let tones = synthetic_tone_symbols(&pp);
@@ -23784,6 +23829,114 @@ mod ft8lib_seed_translate_tests {
         assert!(
             translate_ft8lib_seed(&s, &bad_block, &sp, &pp, MAX_TIME_STEP, 0, NUM_BINS).is_none(),
             "block_size mismatch must reject"
+        );
+    }
+}
+
+/// PAN-7 — the flag-off byte-identity promise.
+///
+/// `ft8lib_sync_seeds_enabled` exists to be measurable, not to change shipped
+/// behavior, so the contract is that a decode with the flag explicitly `false`
+/// is indistinguishable from `Ft8Config::default()`. This module is what pins
+/// that. It becomes load-bearing once the pass-0 union block lands: it is what
+/// proves the block is gated on the flag and not merely on `pass == 0`.
+///
+/// `transmit` is required — `Ft8Encoder` / `Ft8Modulator` are re-exported only
+/// under that feature.
+#[cfg(all(test, feature = "transmit"))]
+mod pan7_ft8lib_sync_seed_tests {
+    use super::*;
+
+    /// Signal + deterministic pseudo-noise, so the comparison is reproducible.
+    /// Same recipe as `bicm_id_zero_is_byte_identical_to_default`.
+    fn noisy_window() -> Vec<f32> {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K5ARH EM10", None)
+            .expect("encode");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator.modulate_symbols(&symbols, 0.0).expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let mut state = 0x243F6A8885A308D3u64;
+        for s in tx.iter_mut() {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let u = ((state >> 33) as f32) / (u32::MAX as f32) - 0.5;
+            *s += u * 0.3;
+        }
+        tx
+    }
+
+    /// `(text, freq×100, dt×1000)` sorted — the shared decode-list identity key.
+    fn key(msgs: &[DecodedMessage]) -> Vec<(String, i64, i64)> {
+        let mut v: Vec<(String, i64, i64)> = msgs
+            .iter()
+            .map(|m| {
+                (
+                    m.text.clone(),
+                    (m.frequency_offset * 100.0).round() as i64,
+                    (m.time_offset * 1000.0).round() as i64,
+                )
+            })
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[test]
+    fn ft8lib_sync_seeds_off_is_byte_identical_to_default() {
+        let tx = noisy_window();
+
+        let mut dec_default = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let mut dec_off = Ft8Decoder::new(Ft8Config {
+            ft8lib_sync_seeds_enabled: false,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+
+        let a = dec_default.decode_window(&tx).expect("decode default");
+        let b = dec_off.decode_window(&tx).expect("decode flag-off");
+
+        assert_eq!(
+            key(&a),
+            key(&b),
+            "ft8lib_sync_seeds_enabled: false must be byte-identical to default"
+        );
+        assert!(
+            a.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "synthetic signal must decode — otherwise the comparison is vacuous"
+        );
+    }
+
+    /// On a stub build `ft8lib_find_candidate_seeds` returns an empty set, so
+    /// flag-on must equal flag-off. This pins the stub-safety contract for the
+    /// one build configuration no CI job ever exercises.
+    #[cfg(ft8lib_stub)]
+    #[test]
+    fn ft8lib_sync_seeds_on_changes_nothing_on_stub_builds() {
+        let tx = noisy_window();
+
+        let mut dec_off = Ft8Decoder::new(Ft8Config {
+            ft8lib_sync_seeds_enabled: false,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let mut dec_on = Ft8Decoder::new(Ft8Config {
+            ft8lib_sync_seeds_enabled: true,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+
+        let a = dec_off.decode_window(&tx).expect("decode flag-off");
+        let b = dec_on.decode_window(&tx).expect("decode flag-on");
+        assert_eq!(
+            key(&a),
+            key(&b),
+            "on a stub build the seed helper returns nothing, so the flag must be inert"
         );
     }
 }

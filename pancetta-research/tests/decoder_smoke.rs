@@ -48,3 +48,24 @@ fn ft8_decoder_identity_includes_version() {
     let id = decoder.identity();
     assert!(id.starts_with("pancetta-ft8@"));
 }
+
+/// PAN-7: the flag must be reachable from the research harness AND land in
+/// every scorecard's `ConfigInfo.decoder`, or the ship gate is unmeasurable.
+/// hb-228 shipped with neither a builder nor an eval flag and was measurable
+/// only through a bespoke example — do not repeat that.
+#[test]
+fn ft8lib_sync_seeds_builder_reaches_config_snapshot() {
+    let off = Ft8Decoder::with_default_config();
+    assert_eq!(
+        off.config_snapshot()["ft8lib_sync_seeds_enabled"].as_bool(),
+        Some(false),
+        "the PAN-7 flag must appear in the config snapshot and default false"
+    );
+
+    let on = Ft8Decoder::with_default_config().with_ft8lib_sync_seeds_enabled(true);
+    assert_eq!(
+        on.config_snapshot()["ft8lib_sync_seeds_enabled"].as_bool(),
+        Some(true),
+        "the research builder must mutate the wrapped Ft8Config"
+    );
+}
