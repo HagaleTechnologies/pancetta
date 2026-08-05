@@ -12,8 +12,13 @@ name: Wait for Codex
 # could otherwise exfiltrate CODEX_REVIEW_PAT or self-resolve its own
 # review threads before human review — see HagaleTechnologies/harbor#59/#60).
 on:
+  # `reopened` dropped: Codex's own docs describe automatic review as firing
+  # when a PR is newly opened for review, with re-requests done explicitly
+  # via `@codex review` — a reopen gets neither, so gating merge on it meant
+  # 70 minutes of passive polling for a signal that was never coming (Codex
+  # P2, flagged reviewing this file).
   pull_request:
-    types: [opened, reopened, ready_for_review, synchronize]
+    types: [opened, ready_for_review, synchronize]
 
 permissions:
   contents: read
@@ -64,9 +69,49 @@ jobs:
           # PAT under an account Codex already recognizes, stored as an org
           # secret, used ONLY to post this one comment.
           GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          # Read-only, always fully scoped (unlike a fine-grained PAT, which
+          # this step's own docs say is provisioned ONLY for posting the
+          # comment below) — used for the baseline review-threads read so a
+          # minimally-scoped PAT lacking PR-read can't crash this step before
+          # the request is even posted (Codex P2, flagged reviewing this
+          # file).
+          READ_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
         run: |
+          set -o pipefail
+          # GitHub does not expose secrets to a `pull_request`-triggered
+          # workflow run for a fork PR (by design — see GitHub's own docs on
+          # securely using pull_request_target/pull_request with forks), so
+          # CODEX_REVIEW_PAT expands to empty here and every `gh api` call
+          # below would fail auth and crash this step under `bash -e`,
+          # blocking a fork contributor's re-push behind a hard failure
+          # instead of just skipping the re-review request (Codex P1,
+          # flagged reviewing this file).
+          #
+          # DELIBERATELY NOT auto-discovering a maintainer's manual `@codex
+          # review` comment here: an earlier version of this fix tried that
+          # (a REST lookup + node_id capture) and Codex's review of THAT fix
+          # found three more real gaps in it — unpaginated (misses anything
+          # past GitHub's default 30-comment page), one-shot (a comment added
+          # during the 70-minute wait is never seen), and its knock-on effect
+          # on the error-comment check below. Chasing that kept spawning new
+          # edge cases in a path this repo is unlikely to ever exercise (a
+          # private repo with a single admin taking no outside fork PRs
+          # today). Accepted, deliberate scope limit instead: on a fork
+          # re-push, the poll step still catches a formal review tied to
+          # HEAD_SHA with zero extra code (that path never needed a captured
+          # comment id). The one case this doesn't cover — Codex's clean-pass
+          # landing ONLY as a reaction on a maintainer's own manually-posted
+          # comment, never a formal review — degrades to the 70-minute
+          # timeout, at which point the repo's admin-only bypass (configured
+          # on every HagaleTechnologies ruleset) is the intended way through,
+          # not more automation for a rare path.
+          if [ -z "$GH_TOKEN" ]; then
+            echo "CODEX_REVIEW_PAT not available (fork PR, or secret unset) — skipping the fresh re-review request. A formal Codex review tied to this head still resolves the check normally; a maintainer can otherwise use the repo's admin bypass."
+            exit 0
+          fi
+
           OWNER="${REPO%%/*}"
           NAME="${REPO##*/}"
 
@@ -91,7 +136,18 @@ jobs:
           # paginate past 50 replies in one thread (both flagged on harbor#59
           # /#60). Neither is realistic on these repos; revisit if that ever
           # stops being true.
-          gh api graphql -f query='
+          #
+          # NOTE on the author check below: "github-actions" (no `[bot]`
+          # suffix) is deliberate, not a REST-vs-GraphQL mixup — verified
+          # empirically against this exact rollout's own data (2026-08-05):
+          # GraphQL's `author.login` never carries the `[bot]` suffix REST
+          # uses (`dependabot`, not `dependabot[bot]`, appears in this same
+          # repo's own review-thread comments), matching `chatgpt-codex-
+          # connector` elsewhere in this file. A later Codex pass suggested
+          # adding the `[bot]`-suffixed form here on the theory that it's
+          # what a GITHUB_TOKEN-authored reply's login looks like — that
+          # variant does not occur in GraphQL responses, so it was not added.
+          GH_TOKEN="$READ_TOKEN" gh api graphql -f query='
             query($owner: String!, $name: String!, $pr: Int!) {
               repository(owner: $owner, name: $name) {
                 pullRequest(number: $pr) {
@@ -111,11 +167,13 @@ jobs:
               | .id]' \
             > /tmp/codex-baseline-threads.json
 
-          # Capture the comment's own id: a clean re-review can land as a 👍
-          # reaction on THIS comment specifically, not on the PR/issue itself
-          # (issue-level and comment-level reactions are separate REST
-          # endpoints — flagged reviewing this file, on harbor#59).
-          gh api "repos/$REPO/issues/$PR/comments" -f body="@codex review" --jq '.id' \
+          # Capture the comment's own GraphQL node_id (not its REST numeric
+          # id — the poll step's combined query looks it up via GraphQL's
+          # `node(id:)`, which needs the node_id): a clean re-review can land
+          # as a 👍 reaction on THIS comment specifically, not on the PR/
+          # issue itself (issue-level and comment-level reactions are
+          # separate endpoints — flagged reviewing this file, on harbor#59).
+          gh api "repos/$REPO/issues/$PR/comments" -f body="@codex review" --jq '.node_id' \
             > /tmp/codex-review-comment-id.json
 
       - name: Poll for a terminal Codex signal on this revision
@@ -126,25 +184,23 @@ jobs:
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           IS_SYNC: ${{ github.event.action == 'synchronize' }}
         run: |
+          set -o pipefail
           # Only count signals created at/after this run started, and reviews
           # submitted against the CURRENT head commit AND after this round
           # started (a small buffer absorbs clock skew between this runner
           # and Codex; the timestamp bound on reviews specifically closes the
           # stale-review gap noted in the step above).
           #
-          # NOTE: `gh api --jq` is gh's OWN limited jq subset and does NOT
-          # accept `--arg`/`--argjson` the way real `jq` does (`gh api ...
-          # --jq --arg x y '...'` silently mis-parses as extra positional args
-          # and errors "unknown flag: --arg", killing the job on its first
-          # loop iteration under `bash -e`). Pipe raw JSON into real `jq`
-          # instead — this bit this exact workflow TWICE already (the polling
-          # queries below, and — until this fix — the auto-resolve mutation
-          # query further down, which crashed immediately after every single
-          # successful wait: Codex would respond, `reviewed_head` would be
-          # set, and the very next `--jq --argjson ... --arg ...` call would
-          # exit 1 before any thread was ever resolved. Every "Wait for Codex
-          # Review" failure observed across this rollout — whether it failed
-          # after 7 minutes or 55 — was this exact crash, not a real timeout.
+          # A single combined GraphQL query per poll, not 3-4 separate REST
+          # calls: `GITHUB_TOKEN` is capped at 1,000 requests/hour/repository
+          # (shared across every concurrent workflow run in the repo, not
+          # just this one), and the previous 4-calls-per-20s loop could drive
+          # 1,000+ req/hr on its own with just two concurrent PRs under
+          # review — enough to make this required check fail on a rate limit
+          # rather than a real Codex signal (Codex P2, flagged reviewing this
+          # file, this rollout's own auto-merge PR).
+          OWNER="${REPO%%/*}"
+          NAME="${REPO##*/}"
           RUN_STARTED=$(cat /tmp/codex-run-started.txt 2>/dev/null || date -u -d '15 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
           # Bumped from 18min -> 28min -> 70min over this rollout: burst load
           # (many PRs/pushes landing across the org at once) has pushed
@@ -154,14 +210,40 @@ jobs:
           responded=""
           reviewed_head=""
           COMMENT_ID=$(cat /tmp/codex-review-comment-id.json 2>/dev/null || echo "")
+          HAS_COMMENT="false"
+          [ -n "$COMMENT_ID" ] && HAS_COMMENT="true"
           while [ $SECONDS -lt $END ]; do
-            comments=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/comments" | jq --arg since "$RUN_STARTED" '[.[] | .[] | select(.user.login=="chatgpt-codex-connector[bot]" and .created_at >= $since)] | length')
-            reviews=$(gh api --paginate --slurp "repos/$REPO/pulls/$PR/reviews" | jq --arg sha "$HEAD_SHA" --arg since "$RUN_STARTED" '[.[] | .[] | select(.user.login=="chatgpt-codex-connector[bot]" and .commit_id == $sha and .submitted_at >= $since)] | length')
-            thumbsup=$(gh api --paginate --slurp "repos/$REPO/issues/$PR/reactions" | jq --arg since "$RUN_STARTED" '[.[] | .[] | select(.user.login=="chatgpt-codex-connector[bot]" and .content=="+1" and .created_at >= $since)] | length')
-            comment_thumbsup=0
-            if [ -n "$COMMENT_ID" ]; then
-              comment_thumbsup=$(gh api --paginate --slurp "repos/$REPO/issues/comments/$COMMENT_ID/reactions" | jq '[.[] | .[] | select(.user.login=="chatgpt-codex-connector[bot]" and .content=="+1")] | length')
-            fi
+            poll=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!, $hasComment: Boolean!, $commentId: ID!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) {
+                    comments(last: 50) { nodes { author { login } body createdAt } }
+                    reviews(last: 50) { nodes { author { login } commit { oid } submittedAt } }
+                    reactions(last: 50, content: THUMBS_UP) { nodes { user { login } createdAt } }
+                  }
+                }
+                commentNode: node(id: $commentId) @include(if: $hasComment) {
+                  ... on IssueComment {
+                    reactions(last: 50, content: THUMBS_UP) { nodes { user { login } createdAt } }
+                  }
+                }
+              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" \
+              | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
+                def is_error_shaped: test("(quota|rate.?limit|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
+                .data.repository.pullRequest as $p
+                | ([$p.comments.nodes[] | select(.author.login=="chatgpt-codex-connector" and .createdAt >= $since)]) as $fresh_comments
+                | {
+                    comments: ([$fresh_comments[] | select(.body | is_error_shaped | not)] | length),
+                    error_comments: ([$fresh_comments[] | select(.body | is_error_shaped)] | length),
+                    reviews: ([$p.reviews.nodes[] | select(.author.login=="chatgpt-codex-connector" and .commit.oid==$sha and .submittedAt >= $since)] | length),
+                    thumbsup: ([$p.reactions.nodes[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
+                    comment_thumbsup: ([(.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
+                  }')
+            comments=$(echo "$poll" | jq '.comments')
+            error_comments=$(echo "$poll" | jq '.error_comments')
+            reviews=$(echo "$poll" | jq '.reviews')
+            thumbsup=$(echo "$poll" | jq '.thumbsup')
+            comment_thumbsup=$(echo "$poll" | jq '.comment_thumbsup')
             if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
               # A 👍 on the @codex-review comment itself is just as tightly
               # scoped to "responded to THIS request" as a formal review tied
@@ -170,10 +252,72 @@ jobs:
               # this file, on harbor#59).
               reviewed_head=1
             fi
-            if [ "$comments" -gt 0 ] || [ "$reviews" -gt 0 ] || [ "$thumbsup" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
-              echo "Codex responded on this revision: comments=$comments reviews=$reviews thumbsup=$thumbsup comment_thumbsup=$comment_thumbsup"
-              responded=1
-              break
+            if [ "$IS_SYNC" = "true" ]; then
+              # On a re-push specifically, a bare new issue comment or a
+              # generic issue-level thumbsup is NOT proof Codex looked at
+              # THIS head — either could be a stale signal from an unrelated
+              # earlier review landing after RUN_STARTED but before the fresh
+              # `@codex review` request was actually processed, which let
+              # this required check pass without any head-tied Codex signal
+              # ever arriving (Codex P1, flagged reviewing this file). Only
+              # accept the two signals that are provably tied to this
+              # specific request: a review against HEAD_SHA, or a reaction on
+              # the comment that requested it. `error_comments` is
+              # deliberately NOT checked on this branch — it exists only to
+              # keep a bare error comment from satisfying the non-sync
+              # "any comment counts" condition below, and an unscoped error
+              # from some earlier, unrelated request must not fail the
+              # CURRENT push's own still-pending signal (Codex P2, flagged
+              # reviewing this file).
+              if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
+                echo "Codex responded on this revision: reviews=$reviews comment_thumbsup=$comment_thumbsup"
+                responded=1
+                break
+              fi
+            else
+              # Check for a genuine success FIRST, error fail-fast second: a
+              # manually re-run job reuses the original event's cutoff, so an
+              # older transient Codex error and a later real success can both
+              # be in-window on the same poll. Only fail fast on the error
+              # when there's no success signal alongside it — otherwise a
+              # rerun (which this exact error message tells maintainers to
+              # do) could stay permanently poisoned by the first attempt's
+              # failure even after Codex succeeds on the second (Codex P2,
+              # flagged reviewing this file).
+              if [ "$comments" -gt 0 ] || [ "$reviews" -gt 0 ] || [ "$thumbsup" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
+                echo "Codex responded on this revision: comments=$comments reviews=$reviews thumbsup=$thumbsup comment_thumbsup=$comment_thumbsup"
+                responded=1
+                break
+              fi
+              if [ "$error_comments" -gt 0 ]; then
+                # Codex replies with an issue comment for its own failures too
+                # (auth/workspace/quota/account-connection errors), which
+                # would otherwise satisfy the "any comment counts" condition
+                # above and turn this required check green with no actual
+                # review ever happening (Codex P2, flagged reviewing this
+                # file). Only reachable here (never on a re-push, see above)
+                # since this is the one branch that treats a bare comment as
+                # a success signal at all. Fail loudly and immediately rather
+                # than either accepting it as success OR silently waiting out
+                # the remaining timeout for a different signal — Tony's own
+                # directive: don't waste wall-clock time on a wait that a
+                # Codex-reported error already tells us won't resolve itself.
+                #
+                # KNOWN LIMITATION, accepted not fixed: a fresh, genuinely
+                # unrelated Codex issue comment (e.g. someone asks
+                # `@codex fix CI` while this gate is waiting) would also
+                # satisfy the "any comment counts" condition above and pass
+                # as if it were a real review — this branch only guards
+                # against Codex's own documented error phrases, not against
+                # positively confirming a comment IS a completed review.
+                # Building a reliable positive classifier for "this comment
+                # proves a real review happened" is real ongoing work for
+                # marginal benefit on a low-traffic gate; revisit if an
+                # unrelated-comment false-pass is ever actually observed
+                # (flagged reviewing this file).
+                echo "::error::Codex reported an error (quota/auth/workspace/account-connection) instead of reviewing $HEAD_SHA — failing now rather than waiting out the remaining timeout. Re-run this check once the underlying Codex issue is resolved."
+                exit 1
+              fi
             fi
             echo "Still waiting for Codex to respond to $HEAD_SHA..."
             sleep 20
