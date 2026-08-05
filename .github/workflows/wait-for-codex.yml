@@ -280,7 +280,7 @@ jobs:
                 # `comment_thumbsup` ever fires for this shape). This IS a
                 # genuinely head-tied signal, just carried in the comment text
                 # instead of a separate GraphQL field.
-                def reviewed_commit_prefix: try (.body | capture("[Rr]eviewed commit:?\**\s*`(?<c>[0-9a-f]{7,40})`").c) catch null;
+                def reviewed_commit_prefix: try (.body | capture("[Rr]eviewed commit:?\\**\\s*`(?<c>[0-9a-f]{7,40})`").c) catch null;
                 .data.repository.pullRequest as $p
                 | ([$p.comments.nodes[] | select(.author.login=="chatgpt-codex-connector" and .createdAt >= $since)]) as $fresh_comments
                 | {
