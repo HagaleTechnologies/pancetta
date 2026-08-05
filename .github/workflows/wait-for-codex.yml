@@ -1,0 +1,61 @@
+name: Wait for Codex
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize]
+
+permissions:
+  contents: read
+  pull-requests: read
+  issues: read
+
+jobs:
+  wait-for-codex:
+    name: Wait for Codex Review
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Pass through on re-push
+        if: github.event.action == 'synchronize'
+        run: |
+          # Codex only auto-reviews on opened/ready_for_review, not on every
+          # push (this repo's own AGENTS.md: "not every push. After a
+          # remediation push, request a re-review with `@codex review`" — and
+          # that trigger requires an authenticated human comment; a
+          # github-actions[bot] comment gets "create a Codex account and
+          # connect to github" instead of a review, confirmed live on
+          # HagaleTechnologies/harbor#56). Forcing re-review per push would
+          # need a personal token stored as a secret — a separate decision,
+          # not made here. Existing findings from the original review are
+          # still enforced by required_review_thread_resolution regardless of
+          # new pushes; this check's job is just to confirm Codex got a first
+          # look, so it passes through here rather than waiting forever.
+          exit 0
+
+      - name: Poll for a terminal Codex signal on this revision
+        if: github.event.action != 'synchronize'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # Only count signals created at/after this run started, and reviews
+          # submitted against the CURRENT head commit specifically (a small
+          # buffer absorbs clock skew between this runner and Codex).
+          RUN_STARTED=$(date -u -d '15 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
+          END=$((SECONDS+1080))
+          while [ $SECONDS -lt $END ]; do
+            comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq --arg since "$RUN_STARTED" '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and .created_at >= $since)] | length')
+            reviews=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" --jq --arg sha "$HEAD_SHA" '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and .commit_id == $sha)] | length')
+            thumbsup=$(gh api --paginate "repos/$REPO/issues/$PR/reactions" --jq --arg since "$RUN_STARTED" '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and .content=="+1" and .created_at >= $since)] | length')
+            if [ "$comments" -gt 0 ] || [ "$reviews" -gt 0 ] || [ "$thumbsup" -gt 0 ]; then
+              echo "Codex responded on this revision: comments=$comments reviews=$reviews thumbsup=$thumbsup"
+              exit 0
+            fi
+            echo "Still waiting for Codex to respond to $HEAD_SHA..."
+            sleep 20
+          done
+          echo "::error::Codex did not respond to $HEAD_SHA within 18 minutes"
+          exit 1
