@@ -24162,6 +24162,101 @@ mod pan7_ft8lib_sync_seed_tests {
         );
     }
 
+    /// The end-to-end anchor for the coordinate translator, and the one guard
+    /// the unit tests in `ft8lib_seed_translate_tests` cannot substitute for.
+    /// Those tests pin the translator's *arithmetic* against hand-built inputs;
+    /// they all agree with a translator that is uniformly wrong, because they
+    /// assert against the same formula they are testing. This test instead
+    /// plants a real signal, asks the REAL ft8_lib where it is, translates that
+    /// answer, and checks it against the position pancetta *independently*
+    /// derived for its own decode of the same signal — so a 2-step sign error or
+    /// a missing `min_bin` shows up as a red test rather than as a null result
+    /// three phases later in the measurement.
+    ///
+    /// Both `translate_ft8lib_seed` and `reverse_derive_candidate` are private,
+    /// which is why this lives in-crate rather than in
+    /// `tests/ft8lib_seed_tests.rs`.
+    #[cfg(not(ft8lib_stub))]
+    #[test]
+    fn seed_for_a_known_signal_translates_onto_the_native_candidate() {
+        let tx = noisy_window();
+        let pp = ProtocolParams::ft8();
+
+        // 1. Pancetta's own answer, derived through the shipped decode path.
+        let mut dec = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        let msgs = dec.decode_window(&tx).expect("decode");
+        let msg = msgs
+            .iter()
+            .find(|m| m.text.contains("K5ARH"))
+            .expect("the planted signal must decode, or there is no anchor to compare against");
+
+        // Geometry only — `num_steps` / `num_bins` / `time_padding` are what the
+        // envelope and the row formula consume, and none of them depend on
+        // amplitude, so the f32->f64 cast standing in for `preprocess_audio`'s
+        // 0.95/max_abs rescale is immaterial here.
+        let audio: Vec<f64> = tx.iter().map(|&s| s as f64).collect();
+        let spec = dec.compute_spectrogram(&audio).expect("spectrogram");
+        let native = reverse_derive_candidate(msg, &pp, spec.time_padding);
+
+        // 2. ft8_lib's answer, translated through the code under test, under the
+        //    same envelope the pass-0 block computes (decoder.rs:3370-3382).
+        let msg_span = pp.num_symbols * TIME_OSR;
+        let max_time_step = spec.num_steps.saturating_sub(msg_span + 1);
+        let max_freq_bin = spec
+            .num_bins
+            .saturating_sub(pp.num_tones)
+            .min((4000.0 / pp.tone_spacing) as usize);
+
+        let set = crate::ft8_lib_ffi::ft8lib_find_candidate_seeds(
+            &tx,
+            crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT8,
+            MAX_SYNC_CANDIDATES,
+        );
+        assert!(
+            !set.seeds.is_empty(),
+            "ft8_lib found nothing in a clean planted signal — the monitor was mis-fed"
+        );
+
+        // The top-scoring seed on a clean, window-aligned signal IS that signal
+        // (already pinned independently by `top_seed_tracks_the_transmitted_\
+        // signal_position`), so it is the seed whose translation must coincide
+        // with pancetta's own position.
+        let top = translate_ft8lib_seed(
+            &set.seeds[0],
+            &set,
+            &spec,
+            &pp,
+            max_time_step,
+            MIN_FREQ_BIN,
+            max_freq_bin,
+        )
+        .expect("the top seed for a planted, window-aligned signal must translate in-envelope");
+
+        let d_time = top.time_step as isize - native.time_step as isize;
+        let d_freq = top.freq_bin as isize - native.freq_bin as isize;
+
+        assert!(
+            d_time.abs() <= 1,
+            "translated seed row {} vs pancetta's own row {} for the same signal \
+             (delta {d_time}). A delta of ±2 means SLIDING_FRAME_LOOKBACK_STEPS \
+             was applied to the seed path (it must be applied zero times — it is \
+             a row->sample REPORTING correction, already accounted for on both \
+             sides); a large delta means the time_offset*TIME_OSR + time_sub row \
+             formula drifted.",
+            top.time_step,
+            native.time_step
+        );
+        assert!(
+            d_freq.abs() <= 1,
+            "translated seed bin {} vs pancetta's own bin {} for the same signal \
+             (delta {d_freq}). A delta near -{} means `min_bin` was dropped from \
+             freq_bin = min_bin + freq_offset.",
+            top.freq_bin,
+            native.freq_bin,
+            set.min_bin
+        );
+    }
+
     /// A scoped decode must never pick up an out-of-scope seed. ft8_lib's
     /// monitor always sweeps 100–3000 Hz and cannot itself be scoped, so the
     /// envelope filter inside `translate_ft8lib_seed` is the only thing

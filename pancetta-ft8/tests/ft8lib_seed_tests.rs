@@ -217,13 +217,28 @@ fn seeded_decode_respects_the_candidate_cap() {
     );
 }
 
-/// Encodes the structural-inertness expectation rather than treating it as a
-/// surprise: at the default cap the native sweep is already saturated on busy
-/// audio, so few or no seeds survive. Raising the cap is what gives them a
-/// slot. Without this observable, an inert run and a genuine null result are
-/// indistinguishable in the measurement.
+/// The automated form of Key Discovery 1 — the measured fact that the whole
+/// ship/no-ship decision turns on.
+///
+/// On busy audio the native Costas sweep is *exhaustive* over its own grid and
+/// already produces more cells above `min_sync_score` than the cap admits, so
+/// every ft8_lib-sourced position is either a duplicate the dedup erases or a
+/// lower-scoring cell the truncate drops. The mechanism is therefore inert **by
+/// construction, not by tuning**.
+///
+/// The measured result is stronger than the plan predicted: on this fixture
+/// `kept_seeds == 0` at the default cap of 200 *and* at 400, so doubling the cap
+/// does **not** hand seeds a slot — arm C of the Phase 4 measurement is expected
+/// to be as inert as arm B. Only raising `min_sync_score` (which shrinks the
+/// native list itself) frees slots, which is why
+/// `seeded_decode_admits_candidates_below_min_sync_score` has to raise it to 6.0
+/// to observe the mechanism working at all.
+///
+/// If this test ever fires it is NOT necessarily a regression — it means the
+/// saturation premise changed, and Phase 4's numbers plus the experiment log's
+/// verdict have to be re-measured rather than patched.
 #[test]
-fn raising_the_cap_is_what_lets_seeds_survive() {
+fn seed_survival_is_capped_out_on_busy_audio_at_the_default_gate() {
     let tx = busy_wav();
     let default_cap = Ft8Config::default().max_sync_candidates;
 
@@ -255,10 +270,81 @@ fn raising_the_cap_is_what_lets_seeds_survive() {
         "both arms must respect their own cap"
     );
     assert!(
-        kept_raised >= kept_default,
-        "a raised cap must not admit FEWER seeds than the default cap \
-         (got {kept_raised} at {} vs {kept_default} at {default_cap})",
+        total_default == default_cap,
+        "premise check: the native list must SATURATE the cap on this fixture, \
+         else the inertness assertions below prove nothing (got {total_default} \
+         of {default_cap})"
+    );
+    assert_eq!(
+        kept_default, 0,
+        "Key Discovery 1: at the default gate the native sweep saturates the cap, \
+         so no ft8_lib-sourced position may survive on busy audio"
+    );
+    assert_eq!(
+        kept_raised, 0,
+        "doubling the cap to {} does not rescue the mechanism either — the native \
+         sweep saturates that too. This is the measured fact behind the arm-C \
+         expectation in research/experiments/2026-08-03-ft8lib-sync-seed-union*.md",
         default_cap * 2
+    );
+}
+
+/// Plan Phase 3 §Tests First: the `S0-ft8lib-seed` budget stage carries the
+/// seed-survival counters in assertable form — `(label, elapsed_ms, kept_seeds,
+/// raw - translated)` — so this pins both that the observability exists at all
+/// and what it currently reports. The `debug!(target: "ft8.seed", …)` record
+/// carries the same numbers for humans, but asserting on a log line would mean
+/// adding a tracing-capture dev-dependency the crate does not have.
+///
+/// These counters are load-bearing, not diagnostics: without them an inert run
+/// and a genuine null result are indistinguishable in the Phase 4 measurement.
+#[test]
+fn seed_survival_counters_are_emitted() {
+    use pancetta_ft8::DecodeBudget;
+
+    let tx = busy_wav();
+
+    let stage = |on: bool, cap: usize| -> Option<(&'static str, u32, u32, u32)> {
+        let mut d = Ft8Decoder::new(Ft8Config {
+            ft8lib_sync_seeds_enabled: on,
+            max_sync_candidates: cap,
+            ..Ft8Config::default()
+        })
+        .expect("decoder");
+        let (_msgs, report) = d
+            .decode_window_budgeted(&tx, DecodeBudget::unlimited())
+            .expect("decode");
+        report
+            .stages
+            .iter()
+            .copied()
+            .find(|s| s.0 == "S0-ft8lib-seed")
+    };
+
+    let default_cap = Ft8Config::default().max_sync_candidates;
+
+    assert!(
+        stage(false, default_cap).is_none(),
+        "with the flag off the seed block must not run, so it must contribute no \
+         budget stage — this is the budget-report half of the flag-off promise"
+    );
+
+    let (_label, _elapsed_ms, kept_seeds, dropped) =
+        stage(true, default_cap).expect("with the flag on, S0-ft8lib-seed must be reported");
+
+    assert_eq!(
+        kept_seeds, 0,
+        "Key Discovery 1 again, read through the budget report rather than the \
+         candidate dump: on busy audio at the default cap no seed survives"
+    );
+    assert!(
+        dropped > 0,
+        "raw - translated must be positive: ft8_lib sweeps time_offset in \
+         [-10,20) (vendor/ft8_lib/ft8/decode.c:205) and pancetta's time_step is \
+         usize with time_padding 0, so the negative-row third of that range is \
+         unrepresentable and MUST be dropped rather than clamped (clamping to 0 \
+         would fabricate a different spectrogram position). Zero drops means the \
+         envelope/negative-row filter stopped running."
     );
 }
 
@@ -268,10 +354,17 @@ fn seeded_decode_is_a_noop_on_pass_gt_zero() {
     // decoded and subtracted, so sweep a few real fixtures: the invariant is
     // checked on every one, and the liveness assert at the end guarantees at
     // least one of them actually exercised a later pass.
+    //
+    // Every fixture here decodes on pass 0 and therefore rolls into pass 1 —
+    // the loop only breaks early when a pass adds no new message
+    // (`decoder.rs:4288-4295`). The two other obvious WSJT fixtures
+    // (`wsjt/170709_135615.wav`, `basicft8/170923_082000.wav`) decode nothing
+    // at all, so they can never reach a residual pass and would contribute
+    // only dead weight to the sweep.
     const FIXTURES: [&str; 3] = [
         "wsjt/181201_180245.wav",
-        "wsjt/170709_135615.wav",
-        "basicft8/170923_082000.wav",
+        "wsjt/210703_133430.wav",
+        "basicft8/live_now.wav",
     ];
 
     let mut saw_later_pass = false;
@@ -283,6 +376,21 @@ fn seeded_decode_is_a_noop_on_pass_gt_zero() {
                 // The shipped default is a single pass, so multipass must be
                 // requested explicitly or there is no residual pass to check.
                 max_decode_passes: 3,
+                // Load-independence, NOT a shortcut. `decode_window_*` arms a
+                // 2500 ms wall-clock `BudgetTracker` for the WHOLE decode
+                // (`decoder.rs:3088-3091`, `osd_depth = Some(1)`) and the pass
+                // loop breaks on `budget.expired()` BEFORE pass 1 starts
+                // (`:3110-3113`). At the default cap of 200 a busy fixture's
+                // pass 0 already costs 1.3-2.1 s single-threaded, so under
+                // `cargo test`'s default thread fan-out on a loaded machine the
+                // budget expires first, no residual pass runs, and the liveness
+                // assert below fails for a reason that has nothing to do with
+                // seeding. At cap 40 pass 0 costs ~0.5-0.7 s — a ~4x margin —
+                // and all three fixtures reach pass 1 deterministically. The
+                // cap does not affect the invariant under test: attribution is
+                // keyed on the per-pass `ft8lib_seed_keys` set, not on list
+                // length.
+                max_sync_candidates: 40,
                 ..Ft8Config::default()
             },
             &tx,
@@ -301,6 +409,9 @@ fn seeded_decode_is_a_noop_on_pass_gt_zero() {
 
     assert!(
         saw_later_pass,
-        "no fixture reached a residual pass — the pass-0-only claim went untested"
+        "no fixture reached a residual pass — the pass-0-only claim went untested. \
+         If this fires, suspect the 2500 ms wall-clock BudgetTracker \
+         (decoder.rs:3088) expiring during pass 0 before the loop can reach \
+         pass 1 (decoder.rs:3110), not a change in seeding behavior"
     );
 }
