@@ -20,6 +20,14 @@ permissions:
   pull-requests: write
   issues: read
 
+# A newer push must supersede an older run outright rather than let the old
+# run finish and mutate review threads based on a review of a commit that's
+# no longer HEAD — cancelling is simpler and stronger than re-verifying HEAD
+# right before the mutation (Codex P2, this file's own auto-merge rollout).
+concurrency:
+  group: wait-for-codex-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
 jobs:
   wait-for-codex:
     name: Wait for Codex Review
@@ -27,6 +35,22 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
+      - name: Record run start
+        env:
+          # Seed from the PR event's OWN updated_at (set by GitHub at dispatch
+          # time), not a runner-observed "now". A queued or slow-starting
+          # runner previously computed its cutoff only after the runner was
+          # already up, so a Codex response that landed in the gap between
+          # the real event and the runner actually starting was silently
+          # older than the cutoff and got ignored as "before this round"
+          # (Codex P2, flagged reviewing this file). Doing this as its own
+          # unconditional first step means every trigger type (not just
+          # synchronize) gets the same immune-to-runner-startup timestamp.
+          PR_UPDATED_AT: ${{ github.event.pull_request.updated_at }}
+        run: |
+          RUN_STARTED=$(date -u -d "$PR_UPDATED_AT - 15 seconds" +%Y-%m-%dT%H:%M:%SZ)
+          echo "$RUN_STARTED" > /tmp/codex-run-started.txt
+
       - name: Request re-review on a re-push
         if: github.event.action == 'synchronize'
         env:
@@ -46,22 +70,21 @@ jobs:
           OWNER="${REPO%%/*}"
           NAME="${REPO##*/}"
 
-          # Single reference point for "before this round" used by both this
-          # step and the poll step — written to a file so both steps agree on
-          # it exactly, closing a real gap Codex found: recomputing "now" a
-          # second time in the poll step let an OLD, already-existing review
-          # on this same HEAD_SHA (from some earlier, unrelated run) satisfy
-          # "reviewed_head" without a genuinely fresh look ever happening.
-          RUN_STARTED=$(date -u -d '15 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
-          echo "$RUN_STARTED" > /tmp/codex-run-started.txt
-
           # Snapshot unresolved Codex-*started* review threads BEFORE asking
           # for a fresh look. Only a thread with EVERY comment authored by
-          # Codex is eligible for later auto-resolution — a thread any human
-          # has ever replied in is excluded permanently, not just for this
-          # round, so a clean Codex re-review can never silently override a
-          # human's still-open concern (flagged reviewing this file, on
-          # harbor#60; comments(first: 50) instead of first: 1 for this).
+          # Codex (or this workflow's own prior auto-resolve reply, which
+          # carries no new human concern) is eligible for later
+          # auto-resolution — a thread any human has ever replied in is
+          # excluded permanently, not just for this round, so a clean Codex
+          # re-review can never silently override a human's still-open
+          # concern (flagged reviewing this file, on harbor#60; comments
+          # (first: 50) instead of first: 1 for this). Treating this
+          # workflow's own reply as ignorable closes a separate gap: if a
+          # prior round's reply succeeded but resolveReviewThread then failed
+          # (permissions/transient), that thread must stay eligible for retry
+          # on the next clean re-review rather than becoming permanently
+          # manual just because it now contains a non-Codex comment (Codex
+          # P3, this file's own auto-merge rollout).
           #
           # KNOWN LIMITATION, accepted not fixed: reviewThreads(first: 100)
           # doesn't paginate past 100 threads, and comments(first: 50) doesn't
@@ -82,9 +105,9 @@ jobs:
                 }
               }
             }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" \
-            --jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+            | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
               | select(.isResolved == false)
-              | select([.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector"))
+              | select([.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions"))
               | .id]' \
             > /tmp/codex-baseline-threads.json
 
@@ -110,18 +133,18 @@ jobs:
           # stale-review gap noted in the step above).
           #
           # NOTE: `gh api --jq` is gh's OWN limited jq subset and does NOT
-          # accept `--arg` the way real `jq` does (`gh api ... --jq --arg x y
-          # '...'` silently mis-parses as 4 positional args and errors
-          # "accepts 1 arg(s), received 4", killing the job on its first loop
-          # iteration under `bash -e`). Pipe raw JSON into real `jq` instead
-          # — this bit this exact workflow once already.
-          #
-          # NOTE: `gh api --paginate` emits ONE JSON DOCUMENT PER PAGE, not one
-          # combined array — `--slurp` wraps all pages into a single top-level
-          # array (of per-page arrays), so flatten with `.[] | .[]` before
-          # counting. Without this, a busy PR (>1 page of comments/reviews/
-          # reactions) prints one length per page and the numeric `-gt` test
-          # breaks (also flagged reviewing this file, on harbor#59).
+          # accept `--arg`/`--argjson` the way real `jq` does (`gh api ...
+          # --jq --arg x y '...'` silently mis-parses as extra positional args
+          # and errors "unknown flag: --arg", killing the job on its first
+          # loop iteration under `bash -e`). Pipe raw JSON into real `jq`
+          # instead — this bit this exact workflow TWICE already (the polling
+          # queries below, and — until this fix — the auto-resolve mutation
+          # query further down, which crashed immediately after every single
+          # successful wait: Codex would respond, `reviewed_head` would be
+          # set, and the very next `--jq --argjson ... --arg ...` call would
+          # exit 1 before any thread was ever resolved. Every "Wait for Codex
+          # Review" failure observed across this rollout — whether it failed
+          # after 7 minutes or 55 — was this exact crash, not a real timeout.
           RUN_STARTED=$(cat /tmp/codex-run-started.txt 2>/dev/null || date -u -d '15 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
           # Bumped from 18min -> 28min -> 70min over this rollout: burst load
           # (many PRs/pushes landing across the org at once) has pushed
@@ -178,16 +201,25 @@ jobs:
           baseline=$(cat /tmp/codex-baseline-threads.json 2>/dev/null || echo '[]')
 
           # Re-fetch full thread state and compute, in one pass:
-          #   new_count  — unresolved threads NOT in baseline (Codex raised
-          #                something brand new this round)
-          #   resolvable — baseline threads that are STILL pure-Codex (no
-          #                human ever replied, checked again now — a human
-          #                could have joined since the snapshot) AND received
-          #                no fresh Codex comment after RUN_STARTED (Codex
-          #                restating a concern IN an existing thread, rather
-          #                than opening a new one, must not count as "clean" —
-          #                both gaps flagged reviewing this file, on
-          #                harbor#60).
+          #   new_count  — unresolved, PURE-CODEX threads NOT in baseline
+          #                (Codex raised something brand new this round).
+          #                Deliberately scoped to Codex-authored threads only
+          #                — an unrelated pre-existing human thread (or a
+          #                Codex thread a human already joined) must not
+          #                block auto-resolving OTHER, still-clean baseline
+          #                threads just by being unresolved (Codex P3,
+          #                flagged reviewing this file).
+          #   resolvable — baseline threads that are STILL unresolved (a
+          #                maintainer may have resolved one by hand while
+          #                this job was waiting — checked again now, not
+          #                assumed from the snapshot) AND STILL pure-Codex/
+          #                workflow-reply-only (no other human joined since
+          #                the snapshot) AND received no fresh Codex comment
+          #                after RUN_STARTED (Codex restating a concern IN an
+          #                existing thread, rather than opening a new one,
+          #                must not count as "clean" — all three gaps
+          #                flagged reviewing this file, on harbor#60 and this
+          #                file's own auto-merge rollout).
           result=$(gh api graphql -f query='
             query($owner: String!, $name: String!, $pr: Int!) {
               repository(owner: $owner, name: $name) {
@@ -202,15 +234,20 @@ jobs:
                 }
               }
             }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" \
-            --jq --argjson baseline "$baseline" --arg since "$RUN_STARTED" '
+            | jq --argjson baseline "$baseline" --arg since "$RUN_STARTED" '
+              def ignorable_author: . == "chatgpt-codex-connector" or . == "github-actions";
               .data.repository.pullRequest.reviewThreads.nodes as $nodes
-              | ($nodes | map(select(.isResolved == false) | .id)) as $all_unresolved
+              | ($nodes
+                  | map(select(.isResolved == false)
+                        | select([.comments.nodes[].author.login] | all(ignorable_author))
+                        | .id)) as $pure_codex_unresolved
               | {
-                  new_count: (($all_unresolved - $baseline) | length),
+                  new_count: (($pure_codex_unresolved - $baseline) | length),
                   resolvable: [
                     $nodes[]
+                    | select(.isResolved == false)
                     | select(.id as $id | $baseline | index($id))
-                    | select([.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector"))
+                    | select([.comments.nodes[].author.login] | all(ignorable_author))
                     | select([.comments.nodes[] | select(.createdAt >= $since)] | length == 0)
                     | .id
                   ]
@@ -238,7 +275,11 @@ jobs:
             # "Resource not accessible by integration" (flagged reviewing
             # this file, on harbor#60) — soft-skip rather than crash the
             # whole required check over a thread that's still genuinely
-            # addressed, just not mechanically resolvable here.
+            # addressed, just not mechanically resolvable here. The reply
+            # above is authored as "github-actions", which the ignorable-
+            # author filters above already treat as non-blocking, so this
+            # thread stays eligible for a clean resolve on the next round
+            # instead of becoming permanently manual (Codex P3).
             if ! gh api graphql -f query='
               mutation($id: ID!) {
                 resolveReviewThread(input: {threadId: $id}) {
