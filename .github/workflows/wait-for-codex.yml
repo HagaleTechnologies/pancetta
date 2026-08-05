@@ -14,7 +14,7 @@ jobs:
     name: Wait for Codex Review
     if: github.event.pull_request.draft == false
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 30
     steps:
       - name: Pass through on re-push
         if: github.event.action == 'synchronize'
@@ -44,12 +44,19 @@ jobs:
           # Only count signals created at/after this run started, and reviews
           # submitted against the CURRENT head commit specifically (a small
           # buffer absorbs clock skew between this runner and Codex).
+          #
+          # NOTE: `gh api --jq` is gh's OWN limited jq subset and does NOT
+          # accept `--arg` the way real `jq` does (`gh api ... --jq --arg x y
+          # '...'` silently mis-parses as 4 positional args and errors
+          # "accepts 1 arg(s), received 4", killing the job on its first loop
+          # iteration under `bash -e`). Pipe raw JSON into real `jq` instead
+          # — this bit this exact workflow once already.
           RUN_STARTED=$(date -u -d '15 seconds ago' +%Y-%m-%dT%H:%M:%SZ)
-          END=$((SECONDS+1080))
+          END=$((SECONDS+1680))
           while [ $SECONDS -lt $END ]; do
-            comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" --jq --arg since "$RUN_STARTED" '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and .created_at >= $since)] | length')
-            reviews=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" --jq --arg sha "$HEAD_SHA" '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and .commit_id == $sha)] | length')
-            thumbsup=$(gh api --paginate "repos/$REPO/issues/$PR/reactions" --jq --arg since "$RUN_STARTED" '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and .content=="+1" and .created_at >= $since)] | length')
+            comments=$(gh api --paginate "repos/$REPO/issues/$PR/comments" | jq --arg since "$RUN_STARTED" '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and .created_at >= $since)] | length')
+            reviews=$(gh api --paginate "repos/$REPO/pulls/$PR/reviews" | jq --arg sha "$HEAD_SHA" '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and .commit_id == $sha)] | length')
+            thumbsup=$(gh api --paginate "repos/$REPO/issues/$PR/reactions" | jq --arg since "$RUN_STARTED" '[.[] | select(.user.login=="chatgpt-codex-connector[bot]" and .content=="+1" and .created_at >= $since)] | length')
             if [ "$comments" -gt 0 ] || [ "$reviews" -gt 0 ] || [ "$thumbsup" -gt 0 ]; then
               echo "Codex responded on this revision: comments=$comments reviews=$reviews thumbsup=$thumbsup"
               exit 0
@@ -57,5 +64,5 @@ jobs:
             echo "Still waiting for Codex to respond to $HEAD_SHA..."
             sleep 20
           done
-          echo "::error::Codex did not respond to $HEAD_SHA within 18 minutes"
+          echo "::error::Codex did not respond to $HEAD_SHA within 28 minutes"
           exit 1
