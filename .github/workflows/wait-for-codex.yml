@@ -444,13 +444,29 @@ jobs:
             }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" \
             | jq --argjson baseline "$baseline" --arg since "$RUN_STARTED" '
               def ignorable_author: . == "chatgpt-codex-connector" or . == "github-actions";
+              # "New concern" and "safe to auto-resolve" need DIFFERENT
+              # authorship tests, not the same purity filter (Codex P2,
+              # flagged reviewing this file): if Codex opens a genuinely new
+              # thread this round and a maintainer replies to it before this
+              # query runs, the OLD single "all comments ignorable" test
+              # dropped that thread from new_count entirely, silently letting
+              # the round auto-resolve every OTHER baseline thread despite an
+              # unaddressed live concern. codex_initiated (did CODEX START
+              # this thread, regardless of who replied since) is the right
+              # test for "is this a concern Codex raised" — used for
+              # new_count. ignorable_author on EVERY comment (unchanged,
+              # stricter) stays the test for "is this safe to silently
+              # auto-resolve" — a human joining a thread, new or old, should
+              # always take it out of auto-resolution, whether or not it
+              # also counts as a blocking new concern.
+              def codex_initiated: (.comments.nodes[0].author.login == "chatgpt-codex-connector");
               .data.repository.pullRequest.reviewThreads.nodes as $nodes
               | ($nodes
                   | map(select(.isResolved == false)
-                        | select([.comments.nodes[].author.login] | all(ignorable_author))
-                        | .id)) as $pure_codex_unresolved
+                        | select(codex_initiated)
+                        | .id)) as $codex_unresolved
               | {
-                  new_count: (($pure_codex_unresolved - $baseline) | length),
+                  new_count: (($codex_unresolved - $baseline) | length),
                   resolvable: [
                     $nodes[]
                     | select(.isResolved == false)
