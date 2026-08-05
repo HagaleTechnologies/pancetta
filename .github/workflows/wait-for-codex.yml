@@ -488,7 +488,7 @@ jobs:
               # thread that already had a human reply BEFORE this round would
               # never be in the strict $baseline, so diffing against it would
               # make that old thread look "new" forever, permanently blocking
-              # every future round's auto-resolution — a direct follow-up gap
+              # every future round of auto-resolution — a direct follow-up gap
               # flagged reviewing this file). ignorable_author on EVERY
               # comment (unchanged, stricter) stays the test for "is this
               # safe to silently auto-resolve", diffed against the strict
