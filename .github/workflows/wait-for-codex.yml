@@ -1,11 +1,5 @@
 name: Wait for Codex
 
-# Trivial re-push to trigger a fresh synchronize event: testing whether
-# CODEX_REVIEW_PAT's newly-added Pull requests read/write permission fixes
-# resolveReviewThread (previously failed with "Resource not accessible by
-# personal access token" under this same token's prior, narrower scope).
-# No logic changed.
-#
 # INTERIM VARIANT — pull_request, not pull_request_target, deliberately.
 # This repo has no wait-for-codex.yml on main yet, and pull_request_target
 # always reads its definition from the BASE branch — switching to it on a
@@ -194,14 +188,27 @@ jobs:
               | .id]' \
             > /tmp/codex-baseline-initiated.json
 
+          request_comment=$(gh api "repos/$REPO/issues/$PR/comments" -f body="@codex review")
+
           # Capture the comment's own GraphQL node_id (not its REST numeric
           # id — the poll step's combined query looks it up via GraphQL's
           # `node(id:)`, which needs the node_id): a clean re-review can land
           # as a 👍 reaction on THIS comment specifically, not on the PR/
           # issue itself (issue-level and comment-level reactions are
           # separate endpoints — flagged reviewing this file, on harbor#59).
-          gh api "repos/$REPO/issues/$PR/comments" -f body="@codex review" --jq '.node_id' \
-            > /tmp/codex-review-comment-id.json
+          echo "$request_comment" | jq -r '.node_id' > /tmp/codex-review-comment-id.json
+
+          # Re-anchor RUN_STARTED to the moment THIS request was actually
+          # posted, not the broader PR_UPDATED_AT snapshot from "Record run
+          # start": a rerun of an already-completed synchronize job (or, as
+          # observed live on pancetta#239, several small pushes to the same
+          # PR in quick succession) can leave RUN_STARTED older than a
+          # genuinely fresh re-review request, letting an already-baselined
+          # prior review of the same HEAD_SHA satisfy the poll without ever
+          # waiting for Codex to look again (Codex P1, flagged reviewing this
+          # file). This request's own timestamp is always the correct,
+          # tightest cutoff for a synchronize round.
+          echo "$request_comment" | jq -r '.created_at' > /tmp/codex-run-started.txt
 
       - name: Poll for a terminal Codex signal on this revision
         env:
