@@ -16,25 +16,25 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
-      - name: Pass through on re-push
+      - name: Request re-review on a re-push
         if: github.event.action == 'synchronize'
-        run: |
+        env:
           # Codex only auto-reviews on opened/ready_for_review, not on every
           # push (this repo's own AGENTS.md: "not every push. After a
           # remediation push, request a re-review with `@codex review`" — and
           # that trigger requires an authenticated human comment; a
-          # github-actions[bot] comment gets "create a Codex account and
-          # connect to github" instead of a review, confirmed live on
-          # HagaleTechnologies/harbor#56). Forcing re-review per push would
-          # need a personal token stored as a secret — a separate decision,
-          # not made here. Existing findings from the original review are
-          # still enforced by required_review_thread_resolution regardless of
-          # new pushes; this check's job is just to confirm Codex got a first
-          # look, so it passes through here rather than waiting forever.
-          exit 0
+          # github-actions[bot]-authored comment gets "create a Codex account
+          # and connect to github" instead of a review, confirmed live on
+          # HagaleTechnologies/harbor#56). CODEX_REVIEW_PAT is a fine-grained
+          # PAT under an account Codex already recognizes, stored as an org
+          # secret, used ONLY to post this one comment.
+          GH_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          gh api "repos/$REPO/issues/$PR/comments" -f body="@codex review"
 
       - name: Poll for a terminal Codex signal on this revision
-        if: github.event.action != 'synchronize'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
