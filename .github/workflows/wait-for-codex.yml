@@ -347,6 +347,39 @@ jobs:
           fi
 
           if [ "$IS_SYNC" != "true" ]; then
+            # This branch previously exited 0 the moment ANY Codex signal was
+            # seen, without checking whether that signal actually left
+            # unresolved concerns open — so Codex's own initial automatic
+            # review finding real P1s could still turn this check green
+            # (Codex P2, flagged reviewing this file). Not a live merge-
+            # safety hole on this fleet specifically (every HagaleTechnologies
+            # ruleset also sets required_review_thread_resolution, which
+            # independently blocks merge regardless of this check's status —
+            # confirmed empirically on coppa#77), but this check's own name
+            # and green/red status should mean what it says rather than
+            # relying on a separate, easily-forgotten ruleset setting to
+            # catch the gap. Query and fail on any unresolved pure-Codex
+            # thread before declaring success.
+            OWNER="${REPO%%/*}"
+            NAME="${REPO##*/}"
+            unresolved=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100) {
+                      nodes { isResolved comments(first: 50) { nodes { author { login } } } }
+                    }
+                  }
+                }
+              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" \
+              | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+                | select(.isResolved == false)
+                | select([.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector"))
+              ] | length')
+            if [ "$unresolved" -gt 0 ]; then
+              echo "::error::Codex's initial review left $unresolved unresolved concern(s) open — resolve them, then push a remediation commit to trigger a fresh re-review."
+              exit 1
+            fi
             exit 0
           fi
 
