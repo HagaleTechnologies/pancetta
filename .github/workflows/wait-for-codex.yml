@@ -230,26 +230,45 @@ jobs:
               }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" \
               | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
                 def is_error_shaped: test("(quota|rate.?limit|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
+                # Codex'"'"'s clean-pass response on a re-push can ALSO land as a
+                # plain issue comment (not a formal review, not a reaction) whose
+                # body embeds "**Reviewed commit:** `<10-hex-char prefix>`" — a
+                # real, empirically observed shape (confirmed live on this
+                # rollout: HagaleTechnologies/pancetta#239, Codex replied
+                # "Didn'"'"'t find any major issues... Reviewed commit: `7ed84e468d`"
+                # matching that PR'"'"'s actual head SHA, and the required check
+                # still spun for 44+ minutes because neither `reviews` nor
+                # `comment_thumbsup` ever fires for this shape). This IS a
+                # genuinely head-tied signal, just carried in the comment text
+                # instead of a separate GraphQL field.
+                def reviewed_commit_prefix: try (.body | capture("[Rr]eviewed commit:?\\**\\s*`(?<c>[0-9a-f]{7,40})`").c) catch null;
                 .data.repository.pullRequest as $p
                 | ([$p.comments.nodes[] | select(.author.login=="chatgpt-codex-connector" and .createdAt >= $since)]) as $fresh_comments
                 | {
                     comments: ([$fresh_comments[] | select(.body | is_error_shaped | not)] | length),
+                    comment_head_tied: ([$fresh_comments[]
+                      | select(.body | is_error_shaped | not)
+                      | select((reviewed_commit_prefix // "") as $c | $c != "" and ($sha | startswith($c)))
+                    ] | length),
                     error_comments: ([$fresh_comments[] | select(.body | is_error_shaped)] | length),
                     reviews: ([$p.reviews.nodes[] | select(.author.login=="chatgpt-codex-connector" and .commit.oid==$sha and .submittedAt >= $since)] | length),
                     thumbsup: ([$p.reactions.nodes[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
                     comment_thumbsup: ([(.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
                   }')
             comments=$(echo "$poll" | jq '.comments')
+            comment_head_tied=$(echo "$poll" | jq '.comment_head_tied')
             error_comments=$(echo "$poll" | jq '.error_comments')
             reviews=$(echo "$poll" | jq '.reviews')
             thumbsup=$(echo "$poll" | jq '.thumbsup')
             comment_thumbsup=$(echo "$poll" | jq '.comment_thumbsup')
-            if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
-              # A 👍 on the @codex-review comment itself is just as tightly
+            if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ] || [ "$comment_head_tied" -gt 0 ]; then
+              # A 👍 on the @codex-review comment itself, or a plain comment
+              # whose own text names THIS head's commit, are just as tightly
               # scoped to "responded to THIS request" as a formal review tied
-              # to HEAD_SHA — Codex's clean-pass signal is often only this
-              # reaction, never a formal review object (flagged reviewing
-              # this file, on harbor#59).
+              # to HEAD_SHA — Codex's clean-pass signal is often only one of
+              # these, never a formal review object (flagged reviewing this
+              # file, on harbor#59; the comment-text shape found live on
+              # pancetta#239, see above).
               reviewed_head=1
             fi
             if [ "$IS_SYNC" = "true" ]; then
@@ -260,17 +279,17 @@ jobs:
               # `@codex review` request was actually processed, which let
               # this required check pass without any head-tied Codex signal
               # ever arriving (Codex P1, flagged reviewing this file). Only
-              # accept the two signals that are provably tied to this
-              # specific request: a review against HEAD_SHA, or a reaction on
-              # the comment that requested it. `error_comments` is
-              # deliberately NOT checked on this branch — it exists only to
-              # keep a bare error comment from satisfying the non-sync
-              # "any comment counts" condition below, and an unscoped error
-              # from some earlier, unrelated request must not fail the
-              # CURRENT push's own still-pending signal (Codex P2, flagged
-              # reviewing this file).
-              if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
-                echo "Codex responded on this revision: reviews=$reviews comment_thumbsup=$comment_thumbsup"
+              # accept signals that are provably tied to this specific
+              # request: a review against HEAD_SHA, a reaction on the comment
+              # that requested it, or a comment whose own text names this
+              # HEAD_SHA. `error_comments` is deliberately NOT checked on this
+              # branch — it exists only to keep a bare error comment from
+              # satisfying the non-sync "any comment counts" condition below,
+              # and an unscoped error from some earlier, unrelated request
+              # must not fail the CURRENT push's own still-pending signal
+              # (Codex P2, flagged reviewing this file).
+              if [ "$reviews" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ] || [ "$comment_head_tied" -gt 0 ]; then
+                echo "Codex responded on this revision: reviews=$reviews comment_thumbsup=$comment_thumbsup comment_head_tied=$comment_head_tied"
                 responded=1
                 break
               fi
