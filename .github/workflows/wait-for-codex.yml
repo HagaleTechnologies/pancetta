@@ -147,7 +147,7 @@ jobs:
           # adding the `[bot]`-suffixed form here on the theory that it's
           # what a GITHUB_TOKEN-authored reply's login looks like — that
           # variant does not occur in GraphQL responses, so it was not added.
-          GH_TOKEN="$READ_TOKEN" gh api graphql -f query='
+          baseline_query='
             query($owner: String!, $name: String!, $pr: Int!) {
               repository(owner: $owner, name: $name) {
                 pullRequest(number: $pr) {
@@ -160,12 +160,33 @@ jobs:
                   }
                 }
               }
-            }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" \
+            }'
+          baseline_response=$(GH_TOKEN="$READ_TOKEN" gh api graphql -f query="$baseline_query" -f owner="$OWNER" -f name="$NAME" -F pr="$PR")
+          echo "$baseline_response" \
             | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
               | select(.isResolved == false)
               | select([.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions"))
               | .id]' \
             > /tmp/codex-baseline-threads.json
+
+          # Second, BROADER baseline for deciding what's "new" this round
+          # (as opposed to /tmp/codex-baseline-threads.json above, which
+          # stays purity-filtered and is only for deciding what's safe to
+          # auto-resolve): a thread Codex started before this round, that
+          # since got a human reply, still isn't a NEW concern — but the
+          # poll step's new_count check now identifies Codex-started threads
+          # by their FIRST comment only (see that step's comments for why),
+          # so without this second snapshot such a thread would look "new"
+          # forever (never in the strict pure-only baseline, since the human
+          # reply excludes it there), permanently blocking every future
+          # round's auto-resolution (Codex P2, flagged reviewing this file —
+          # a direct follow-up to the codex_initiated fix in the poll step).
+          echo "$baseline_response" \
+            | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
+              | select(.isResolved == false)
+              | select(.comments.nodes[0].author.login == "chatgpt-codex-connector")
+              | .id]' \
+            > /tmp/codex-baseline-initiated.json
 
           # Capture the comment's own GraphQL node_id (not its REST numeric
           # id — the poll step's combined query looks it up via GraphQL's
@@ -370,8 +391,14 @@ jobs:
             # confirmed empirically on coppa#77), but this check's own name
             # and green/red status should mean what it says rather than
             # relying on a separate, easily-forgotten ruleset setting to
-            # catch the gap. Query and fail on any unresolved pure-Codex
-            # thread before declaring success.
+            # catch the gap. Query and fail on any unresolved Codex-STARTED
+            # thread before declaring success — tested by the thread's FIRST
+            # comment (codex_initiated), not "every comment is Codex", so a
+            # maintainer replying to a brand-new Codex finding before this
+            # query runs can't hide it (the same gap the synchronize path's
+            # new_count check had, flagged reviewing this file as a direct
+            # follow-up — the initial-review path had it too and hadn't been
+            # updated yet).
             OWNER="${REPO%%/*}"
             NAME="${REPO##*/}"
             unresolved=$(gh api graphql -f query='
@@ -386,7 +413,7 @@ jobs:
               }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" \
               | jq '[.data.repository.pullRequest.reviewThreads.nodes[]
                 | select(.isResolved == false)
-                | select([.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector"))
+                | select(.comments.nodes[0].author.login == "chatgpt-codex-connector")
               ] | length')
             if [ "$unresolved" -gt 0 ]; then
               echo "::error::Codex's initial review left $unresolved unresolved concern(s) open — resolve them, then push a remediation commit to trigger a fresh re-review."
@@ -407,6 +434,7 @@ jobs:
           OWNER="${REPO%%/*}"
           NAME="${REPO##*/}"
           baseline=$(cat /tmp/codex-baseline-threads.json 2>/dev/null || echo '[]')
+          baseline_initiated=$(cat /tmp/codex-baseline-initiated.json 2>/dev/null || echo '[]')
 
           # Re-fetch full thread state and compute, in one pass:
           #   new_count  — unresolved, PURE-CODEX threads NOT in baseline
@@ -442,7 +470,7 @@ jobs:
                 }
               }
             }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" \
-            | jq --argjson baseline "$baseline" --arg since "$RUN_STARTED" '
+            | jq --argjson baseline "$baseline" --argjson baselineInitiated "$baseline_initiated" --arg since "$RUN_STARTED" '
               def ignorable_author: . == "chatgpt-codex-connector" or . == "github-actions";
               # "New concern" and "safe to auto-resolve" need DIFFERENT
               # authorship tests, not the same purity filter (Codex P2,
@@ -454,11 +482,19 @@ jobs:
               # unaddressed live concern. codex_initiated (did CODEX START
               # this thread, regardless of who replied since) is the right
               # test for "is this a concern Codex raised" — used for
-              # new_count. ignorable_author on EVERY comment (unchanged,
-              # stricter) stays the test for "is this safe to silently
-              # auto-resolve" — a human joining a thread, new or old, should
-              # always take it out of auto-resolution, whether or not it
-              # also counts as a blocking new concern.
+              # new_count, compared against $baselineInitiated (the SAME
+              # codex_initiated test snapshotted before this round — NOT
+              # $baseline, which is purity-filtered: an old Codex-started
+              # thread that already had a human reply BEFORE this round would
+              # never be in the strict $baseline, so diffing against it would
+              # make that old thread look "new" forever, permanently blocking
+              # every future round's auto-resolution — a direct follow-up gap
+              # flagged reviewing this file). ignorable_author on EVERY
+              # comment (unchanged, stricter) stays the test for "is this
+              # safe to silently auto-resolve", diffed against the strict
+              # $baseline as before — a human joining a thread, new or old,
+              # should always take it out of auto-resolution, whether or not
+              # it also counts as a blocking new concern.
               def codex_initiated: (.comments.nodes[0].author.login == "chatgpt-codex-connector");
               .data.repository.pullRequest.reviewThreads.nodes as $nodes
               | ($nodes
@@ -466,7 +502,7 @@ jobs:
                         | select(codex_initiated)
                         | .id)) as $codex_unresolved
               | {
-                  new_count: (($codex_unresolved - $baseline) | length),
+                  new_count: (($codex_unresolved - $baselineInitiated) | length),
                   resolvable: [
                     $nodes[]
                     | select(.isResolved == false)
