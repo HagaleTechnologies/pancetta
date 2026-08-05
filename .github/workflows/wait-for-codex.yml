@@ -179,6 +179,18 @@ jobs:
       - name: Poll for a terminal Codex signal on this revision
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Only for the reply+resolve mutations at the end of this step —
+          # GITHUB_TOKEN (the github-actions[bot] identity) reliably fails
+          # resolveReviewThread on Codex-started threads with "Resource not
+          # accessible by integration" (confirmed live on pancetta#239: 10/10
+          # resolve attempts failed this way, replies posted fine). A PAT
+          # under a real user account with actual write access resolves the
+          # same threads without issue — proven directly this session
+          # resolving all 22 threads on coppa#77 by hand under this exact
+          # identity. Reusing CODEX_REVIEW_PAT rather than provisioning a
+          # second secret, since it's already a real-user PAT with repo
+          # write access, just used for a second purpose now.
+          RESOLVE_TOKEN: ${{ secrets.CODEX_REVIEW_PAT }}
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
@@ -466,17 +478,20 @@ jobs:
               echo "::warning::Could not reply to thread $thread_id — leaving unresolved: $(cat /tmp/reply-err.log)"
               continue
             fi
-            # GitHub can reject resolveReviewThread on a bot-started thread
-            # under the Actions token even with pull-requests: write, with
-            # "Resource not accessible by integration" (flagged reviewing
-            # this file, on harbor#60) — soft-skip rather than crash the
-            # whole required check over a thread that's still genuinely
-            # addressed, just not mechanically resolvable here. The reply
-            # above is authored as "github-actions", which the ignorable-
-            # author filters above already treat as non-blocking, so this
-            # thread stays eligible for a clean resolve on the next round
-            # instead of becoming permanently manual (Codex P3).
-            if ! gh api graphql -f query='
+            # GITHUB_TOKEN (github-actions[bot]) reliably fails this specific
+            # mutation on a bot-started thread with "Resource not accessible
+            # by integration" — confirmed live on pancetta#239, 10/10 resolve
+            # attempts failed this way even though the reply above succeeded
+            # every time. RESOLVE_TOKEN (a real-user PAT) does not have this
+            # restriction. Kept as a soft-skip on failure rather than crashing
+            # the whole required check, in case RESOLVE_TOKEN itself is ever
+            # unset/revoked — the reply above stays authored as
+            # "github-actions" regardless of which token resolves it, which
+            # the ignorable-author filters above already treat as
+            # non-blocking, so a thread that still fails here stays eligible
+            # for a clean resolve on the next round instead of becoming
+            # permanently manual (Codex P3).
+            if ! GH_TOKEN="$RESOLVE_TOKEN" gh api graphql -f query='
               mutation($id: ID!) {
                 resolveReviewThread(input: {threadId: $id}) {
                   thread { isResolved }
