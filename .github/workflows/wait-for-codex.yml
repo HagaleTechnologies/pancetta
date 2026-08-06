@@ -1,5 +1,10 @@
 name: Wait for Codex
 
+# Testing whether the classic personal access token (repo scope) fixes
+# resolveReviewThread, which failed under both GITHUB_TOKEN and the prior
+# fine-grained PAT with "Resource not accessible by integration/personal
+# access token" respectively. No logic changed.
+#
 # INTERIM VARIANT — pull_request, not pull_request_target, deliberately.
 # This repo has no wait-for-codex.yml on main yet, and pull_request_target
 # always reads its definition from the BASE branch — switching to it on a
