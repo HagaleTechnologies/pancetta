@@ -156,7 +156,25 @@ jobs:
           # against the PR's LIVE head at run time and no-op if this run is
           # for a superseded commit — a fresh run already exists (or will
           # exist) for the real current head and is the one that should gate.
-          CURRENT_HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha')
+          # Bounded retry, not a bare assignment: a transient REST/auth/
+          # rate-limit failure here would otherwise abort the whole required
+          # check before polling even begins, under this step's default
+          # `bash -e` (Codex P2, flagged reviewing this file). 3 attempts
+          # over ~15s is enough to absorb a genuine blip; if it's still
+          # failing after that, proceed as if not stale rather than crash —
+          # the downstream checks (reviewed_head, new_count, per-thread live
+          # rechecks) are the real safety net regardless of this step's
+          # own verdict.
+          CURRENT_HEAD_SHA=""
+          for _ in 1 2 3; do
+            CURRENT_HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/tmp/head-lookup-err.log) && break
+            echo "::warning::Transient error looking up the PR's current head — retrying in 5s: $(cat /tmp/head-lookup-err.log)"
+            sleep 5
+          done
+          if [ -z "$CURRENT_HEAD_SHA" ]; then
+            echo "::warning::Could not confirm the PR's current head after 3 attempts — proceeding as if this run's head is current."
+            CURRENT_HEAD_SHA="$EVENT_HEAD_SHA"
+          fi
           if [ "$EVENT_HEAD_SHA" != "$CURRENT_HEAD_SHA" ]; then
             echo "::notice::This run's head ($EVENT_HEAD_SHA) no longer matches the PR's current head ($CURRENT_HEAD_SHA) — skipping as superseded."
             echo "stale=true" >> "$GITHUB_OUTPUT"
@@ -354,6 +372,15 @@ jobs:
           # case; run_attempt extended proactively to close the identical
           # gap there before it needed its own separate finding).
           IS_SYNC: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1 }}
+          # Narrower than IS_SYNC on purpose: a reopened event or a rerun of
+          # opened/ready_for_review has no new commit, so a clean re-review
+          # of the SAME code must not auto-resolve baseline threads still
+          # describing that same code — only a genuine synchronize proves
+          # the head actually changed (Codex P1, flagged reviewing this
+          # file). IS_SYNC stays broadened for poll-branch selection (which
+          # signal shape counts as "responded"); this only gates whether
+          # auto-resolution is allowed to run at all.
+          IS_GENUINE_SYNC: ${{ github.event.action == 'synchronize' }}
         run: |
           set -o pipefail
           # Only count signals created at/after this run started, and reviews
@@ -601,6 +628,11 @@ jobs:
             exit 0
           fi
 
+          if [ "$IS_GENUINE_SYNC" != "true" ]; then
+            echo "This round is a reopened/rerun, not a genuine synchronize — the code hasn't changed, so not auto-resolving baseline threads that may still describe it."
+            exit 0
+          fi
+
           OWNER="${REPO%%/*}"
           NAME="${REPO##*/}"
           baseline=$(cat /tmp/codex-baseline-threads.json 2>/dev/null || echo '[]')
@@ -691,6 +723,39 @@ jobs:
 
           echo "$result" | jq -r '.resolvable[]' | while read -r thread_id; do
             [ -z "$thread_id" ] && continue
+            # Re-check PR-WIDE for a new Codex concern before touching THIS
+            # thread — the $new_count check above ran once before this loop
+            # started, but Codex can open a brand-new thread while this loop
+            # is still walking earlier baseline threads (each iteration costs
+            # 2-3 network round-trips), and a thread-scoped live recheck can
+            # never see a concern that landed in a DIFFERENT thread (Codex
+            # P2, flagged reviewing this file). Bails the whole loop, not
+            # just this thread — a fresh concern means "leave everything for
+            # human review" exactly as the pre-loop new_count check already
+            # means.
+            if ! fresh_check=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100) {
+                      nodes { isResolved comments(first: 1) { nodes { author { login } } } }
+                    }
+                  }
+                }
+              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" 2>/tmp/fresh-check-err.log               | jq --argjson baselineInitiated "$baseline_initiated" '
+                [.data.repository.pullRequest.reviewThreads.nodes[]
+                  | select(.isResolved == false)
+                  | select(.comments.nodes[0].author.login == "chatgpt-codex-connector")
+                  | .id
+                ] as $codex_unresolved
+                | ($codex_unresolved - $baselineInitiated) | length'); then
+              echo "::warning::Could not re-check for new PR-wide concerns — leaving remaining threads as-is: $(cat /tmp/fresh-check-err.log)"
+              break
+            fi
+            if [ "$fresh_check" -gt 0 ]; then
+              echo "Codex raised a new concern elsewhere on the PR while this loop was running — leaving all remaining threads as-is for human review."
+              break
+            fi
             # Re-check this thread's LIVE state immediately before mutating
             # it — the $result snapshot above is a single point-in-time
             # query, and a human can reply to (or a maintainer can resolve)
@@ -755,7 +820,12 @@ jobs:
             # own just-posted reply is authored "github-actions", which the
             # purity test already treats as ignorable, so it doesn't trip
             # live_pure on its own.
-            live2=$(gh api graphql -f query='
+            # Guarded the same skip-not-crash way as the first live check —
+            # this is a newly added second read, and an unguarded assignment
+            # here would abort the whole required check on a transient
+            # failure instead of just leaving this one thread's reply in
+            # place (Codex P2, flagged reviewing this file).
+            if ! live2=$(gh api graphql -f query='
               query($id: ID!) {
                 node(id: $id) {
                   ... on PullRequestReviewThread {
@@ -763,10 +833,23 @@ jobs:
                     comments(first: 50) { nodes { author { login } createdAt } }
                   }
                 }
-              }' -f id="$thread_id")
+              }' -f id="$thread_id" 2>/tmp/live2-check-err.log); then
+              echo "::warning::Could not re-check thread $thread_id's post-reply state — leaving unresolved: $(cat /tmp/live2-check-err.log)"
+              continue
+            fi
             live2_resolved=$(echo "$live2" | jq -r '.data.node.isResolved')
             live2_pure=$(echo "$live2" | jq '[.data.node.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions")')
-            if [ "$live2_resolved" != "false" ] || [ "$live2_pure" != "true" ]; then
+            # Freshness, not just purity: Codex is an "ignorable" author for
+            # purity (it's allowed to have started the thread), so Codex
+            # RESTATING the same concern in this thread between the first
+            # live check and now would leave live2_pure true even though a
+            # current-round concern now exists — the first live check tests
+            # freshness for exactly this reason, and this second check had
+            # silently dropped it (Codex P2, flagged reviewing this file).
+            # Excludes only this workflow's own just-posted reply (authored
+            # "github-actions"), which is expected and not a concern.
+            live2_fresh=$(echo "$live2" | jq --arg since "$RUN_STARTED" '[.data.node.comments.nodes[] | select(.author.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length == 0')
+            if [ "$live2_resolved" != "false" ] || [ "$live2_pure" != "true" ] || [ "$live2_fresh" != "true" ]; then
               echo "Skipping resolve for thread $thread_id — became ineligible between reply and resolve (left the reply in place)."
               continue
             fi
