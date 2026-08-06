@@ -342,12 +342,17 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # Must mirror the Request-re-review step's own `if:` exactly — a
-          # reopened event or a run_attempt>1 rerun also posts a fresh
-          # @codex review request, so the poll below needs the same strict
-          # head-tied branch those rounds get; leaving this synchronize-only
-          # let those rounds take the looser initial-review branch instead
-          # (Codex P2, flagged reviewing this file).
+          # reopened and a manual rerun (run_attempt>1) both post a fresh
+          # @codex review request (see the step above) — IS_SYNC drives the
+          # poll's re-review-vs-initial-review branch downstream, so it must
+          # recognize the same three cases the request step does, or a
+          # reopened/rerun round wrongly follows the initial-review branch:
+          # an unrelated fresh comment/reaction could satisfy the check
+          # without being tied to the new head, and a genuine clean
+          # re-review could fail on baselined threads it should auto-resolve
+          # instead (Codex P1, flagged reviewing this file — the reopened
+          # case; run_attempt extended proactively to close the identical
+          # gap there before it needed its own separate finding).
           IS_SYNC: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1 }}
         run: |
           set -o pipefail
@@ -378,19 +383,6 @@ jobs:
           COMMENT_ID=$(cat /tmp/codex-review-comment-id.json 2>/dev/null || echo "")
           HAS_COMMENT="false"
           [ -n "$COMMENT_ID" ] && HAS_COMMENT="true"
-          # A permanent failure (bad token scope, a broken query after a
-          # schema change, a consistently-failing jq expression) looks
-          # IDENTICAL to a transient one from this loop's point of view —
-          # both are a nonzero exit. Without a cap, this would retry a
-          # permanent failure every 20s for the full 70-minute budget and
-          # surface only the misleading "Codex did not respond" timeout
-          # message instead of the real, immediately-diagnosable error
-          # (Codex P2, flagged reviewing this file). 10 consecutive
-          # failures (~200s) is generous enough to absorb a real transient
-          # blip (the read-after-write gap this retry exists for resolves
-          # in low single-digit seconds) while still failing fast on
-          # anything that isn't.
-          consecutive_failures=0
           while [ $SECONDS -lt $END ]; do
             # A transient GraphQL read-after-write gap can make node($commentId)
             # briefly 404 right after the comment was posted via REST — this
@@ -402,7 +394,7 @@ jobs:
             # skimmer#45: the very first poll hit "Could not resolve to a
             # node" for a comment created less than a second earlier, and the
             # required check failed in 6 seconds instead of retrying).
-            if ! poll=$(gh api graphql -f query='
+            gh_poll_raw=$(gh api graphql -f query='
               query($owner: String!, $name: String!, $pr: Int!, $hasComment: Boolean!, $commentId: ID!) {
                 repository(owner: $owner, name: $name) {
                   pullRequest(number: $pr) {
@@ -416,9 +408,17 @@ jobs:
                     reactions(last: 50, content: THUMBS_UP) { nodes { user { login } createdAt } }
                   }
                 }
-              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" \
-              | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
-                def is_error_shaped: test("(quota exceeded|rate.?limit exceeded|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
+              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" 2>/tmp/poll-err.log) || true
+            # gh's own failure must not abort this `bash -e` step outright —
+            # `|| true` above lets a failed gh call fall through as an empty
+            # $gh_poll_raw, which then fails the jq parse below exactly like
+            # any other malformed-input case, routing it through the SAME
+            # content-based transient/non-transient classification against
+            # /tmp/poll-err.log rather than bypassing it (a bare unprotected
+            # assignment here would abort the whole step on the first gh
+            # hiccup instead of ever reaching that classification).
+            if ! poll=$(echo "$gh_poll_raw" | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
+                def is_error_shaped: test("((quota|rate.?limit).{0,30}exceeded|exceeded.{0,30}(quota|rate.?limit)|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
                 # Codex'"'"'s clean-pass response on a re-push can ALSO land as a
                 # plain issue comment (not a formal review, not a reaction) whose
                 # body embeds "**Reviewed commit:** `<10-hex-char prefix>`" — a
@@ -444,16 +444,20 @@ jobs:
                     thumbsup: ([$p.reactions.nodes[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
                     comment_thumbsup: ([(.data.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
                   }'); then
-              consecutive_failures=$((consecutive_failures+1))
-              if [ "$consecutive_failures" -ge 10 ]; then
-                echo "::error::10 consecutive polling failures — this looks permanent (bad token scope, a broken query, or similar), not a transient blip. Failing now instead of spinning to the 70-minute timeout."
-                exit 1
+              # Only the specific read-after-write shape (node($commentId)
+              # briefly 404ing right after the comment was posted) is known
+              # transient — anything else (bad/revoked token, invalid query,
+              # a real API outage) can never resolve by waiting, so it fails
+              # fast instead of retrying blind for the full 70-minute window
+              # (Codex P2, flagged reviewing this file on widdershins#114).
+              if grep -qi "could not resolve to a node" /tmp/poll-err.log 2>/dev/null; then
+                echo "::warning::Transient error polling for a Codex signal — retrying in 20s. $(cat /tmp/poll-err.log 2>/dev/null)"
+                sleep 20
+                continue
               fi
-              echo "::warning::Transient error polling for a Codex signal ($consecutive_failures/10) — retrying in 20s."
-              sleep 20
-              continue
+              echo "::error::Non-transient error polling for a Codex signal — failing fast: $(cat /tmp/poll-err.log 2>/dev/null)"
+              exit 1
             fi
-            consecutive_failures=0
             comments=$(echo "$poll" | jq '.comments')
             comment_head_tied=$(echo "$poll" | jq '.comment_head_tied')
             error_comments=$(echo "$poll" | jq '.error_comments')
@@ -738,6 +742,32 @@ jobs:
                 }
               }' -f id="$thread_id" -f body="Auto-resolved: Codex re-reviewed commit $HEAD_SHA after this push and raised no new concerns." 2>/tmp/reply-err.log; then
               echo "::warning::Could not reply to thread $thread_id — leaving unresolved: $(cat /tmp/reply-err.log)"
+              continue
+            fi
+
+            # A second live recheck, immediately before the resolve mutation
+            # below: the first recheck above only covers the gap up to THIS
+            # loop iteration reaching it, but two more network round-trips
+            # (the reply just posted, and the resolve call next) each give a
+            # human another window to reply before the thread is actually
+            # marked resolved — the single recheck above doesn't close that
+            # (Codex P2, flagged reviewing this file on watchfinder#33). Our
+            # own just-posted reply is authored "github-actions", which the
+            # purity test already treats as ignorable, so it doesn't trip
+            # live_pure on its own.
+            live2=$(gh api graphql -f query='
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on PullRequestReviewThread {
+                    isResolved
+                    comments(first: 50) { nodes { author { login } createdAt } }
+                  }
+                }
+              }' -f id="$thread_id")
+            live2_resolved=$(echo "$live2" | jq -r '.data.node.isResolved')
+            live2_pure=$(echo "$live2" | jq '[.data.node.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions")')
+            if [ "$live2_resolved" != "false" ] || [ "$live2_pure" != "true" ]; then
+              echo "Skipping resolve for thread $thread_id — became ineligible between reply and resolve (left the reply in place)."
               continue
             fi
             # GITHUB_TOKEN (github-actions[bot]) reliably fails this specific
