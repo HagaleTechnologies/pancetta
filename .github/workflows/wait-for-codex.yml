@@ -1,10 +1,5 @@
 name: Wait for Codex
 
-# Testing whether the classic personal access token (repo scope) fixes
-# resolveReviewThread, which failed under both GITHUB_TOKEN and the prior
-# fine-grained PAT with "Resource not accessible by integration/personal
-# access token" respectively. No logic changed.
-#
 # INTERIM VARIANT — pull_request, not pull_request_target, deliberately.
 # This repo has no wait-for-codex.yml on main yet, and pull_request_target
 # always reads its definition from the BASE branch — switching to it on a
@@ -17,13 +12,37 @@ name: Wait for Codex
 # could otherwise exfiltrate CODEX_REVIEW_PAT or self-resolve its own
 # review threads before human review — see HagaleTechnologies/harbor#59/#60).
 on:
-  # `reopened` dropped: Codex's own docs describe automatic review as firing
-  # when a PR is newly opened for review, with re-requests done explicitly
-  # via `@codex review` — a reopen gets neither, so gating merge on it meant
-  # 70 minutes of passive polling for a signal that was never coming (Codex
-  # P2, flagged reviewing this file).
+  # `reopened` included, but routed through the explicit re-review request
+  # path below (same as synchronize), not treated as an implicit-review
+  # trigger: Codex's own docs say automatic review fires on opened/
+  # ready_for_review only, never on reopened, so a bare `reopened` listed
+  # here with no explicit request would just poll 70 minutes for a signal
+  # that never comes (Codex P2, flagged reviewing an earlier version of
+  # this file — the reason reopened was dropped originally). But dropping
+  # it entirely left a WORSE gap: no event here re-runs this required check
+  # on reopen at all, so a PR reopened with a new head (commits pushed
+  # while it was closed) stays permanently stuck on a stale/absent result
+  # with no path forward except another push (Codex P2, flagged reviewing
+  # THIS file on cqdx#259). Explicitly requesting a review on reopen (like
+  # synchronize does) fixes both gaps at once.
   pull_request:
-    types: [opened, ready_for_review, synchronize]
+    types: [opened, ready_for_review, synchronize, reopened]
+  # merge_group: repos using a GitHub merge queue re-evaluate every required
+  # check against a temporary merge-group SHA that has no associated PR
+  # context — this workflow's PR-specific job never matches that event, so
+  # a required "Wait for Codex Review" check would sit permanently pending
+  # on the queue SHA and stall the queue (Codex P1, flagged reviewing this
+  # file on skimmer, the first repo in this rollout using a merge queue).
+  # Handled by an event-gated pass-through step in the job below (not a
+  # separate job — an earlier version split this into two jobs sharing the
+  # same check name, which Codex flagged as relying on undocumented
+  # same-name multi-run matching semantics for a REQUIRED check; see the
+  # job-level comment) — the merge-group SHA already represents code that
+  # passed a real Codex review during its own PR phase; re-reviewing a
+  # synthetic integration commit is neither meaningful nor possible (there
+  # is no PR to post a comment on or resolve threads against).
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -35,17 +54,57 @@ permissions:
 # no longer HEAD — cancelling is simpler and stronger than re-verifying HEAD
 # right before the mutation (Codex P2, this file's own auto-merge rollout).
 concurrency:
-  group: wait-for-codex-${{ github.event.pull_request.number }}
+  # pull_request.number is absent on a merge_group event — falling back to
+  # merge_group.head_sha keeps concurrent merge-queue entries in DISTINCT
+  # groups. Without this, every merge-group evaluation shared the same
+  # empty-suffixed group, so cancel-in-progress could cancel one queue
+  # entry's required check the moment another one started (Codex P2,
+  # flagged reviewing this file after the merge_group job was added).
+  group: wait-for-codex-${{ github.event.pull_request.number || github.event.merge_group.head_sha }}
   cancel-in-progress: true
 
 jobs:
   wait-for-codex:
     name: Wait for Codex Review
-    if: github.event.pull_request.draft == false
+    # dependabot[bot] excluded outright, not just from the re-review-request
+    # step: GitHub withholds Actions secrets (and downgrades GITHUB_TOKEN) for
+    # Dependabot-triggered events, so CODEX_REVIEW_PAT is empty on every
+    # Dependabot push — but the poll step below has no way to see that and
+    # would still wait out the full 75-minute timeout for a Codex response
+    # that structurally cannot arrive, failing every weekly Dependabot PR
+    # this repo's own dependabot-auto-merge workflow is supposed to handle
+    # (Codex P2, flagged reviewing this file). A skipped required check
+    # satisfies branch protection the same as the existing draft-PR no-op.
+    #
+    # github.actor (not pull_request.user.login) is the deliberate test: a
+    # maintainer manually pushing to a Dependabot-authored branch makes THAT
+    # actor the triggering identity for the run, and GitHub's secret
+    # withholding is keyed to the triggering actor, not the PR's persistent
+    # author field — so secrets ARE available on that push, and gating on
+    # the PR's original author would wrongly skip Codex review for it
+    # (considered and rejected reviewing this file — the suggested
+    # pull_request.user.login alternative would be a regression, not a fix).
+    #
+    # Consolidated into ONE job with event-gated steps, not two jobs
+    # sharing this check name (the earlier split): GitHub still creates a
+    # check-run for a job whose `if:` evaluates false and reports it
+    # "skipped" within seconds — with two same-named check-runs per run,
+    # relying on undocumented same-name multi-run matching semantics for a
+    # REQUIRED check is exactly the kind of ambiguity worth avoiding
+    # outright rather than trusting (Codex P1, flagged reviewing this
+    # file). One job publishing exactly one check-run per run removes the
+    # ambiguity entirely.
+    if: github.event_name == 'merge_group' || (github.event.pull_request.draft == false && github.actor != 'dependabot[bot]')
     runs-on: ubuntu-latest
     timeout-minutes: 75
     steps:
+      - name: Pass through for merge-queue evaluation
+        if: github.event_name == 'merge_group'
+        run: |
+          echo "Merge-group evaluation — the constituent PR already passed a real Wait for Codex Review during its own PR phase; nothing further to review on this synthetic integration commit."
+
       - name: Record run start
+        if: github.event_name == 'pull_request'
         env:
           # Seed from the PR event's OWN updated_at (set by GitHub at dispatch
           # time), not a runner-observed "now". A queued or slow-starting
@@ -61,8 +120,75 @@ jobs:
           RUN_STARTED=$(date -u -d "$PR_UPDATED_AT - 15 seconds" +%Y-%m-%dT%H:%M:%SZ)
           echo "$RUN_STARTED" > /tmp/codex-run-started.txt
 
+      - name: Skip if this run's head no longer matches the PR's current head
+        id: head-check
+        if: github.event_name == 'pull_request'
+        # ACCEPTED LIMITATION, not fixed here: this step no-ops a stale
+        # rerun's OWN remaining steps, but concurrency (`cancel-in-progress`
+        # keyed on PR number) is evaluated by GitHub before any step runs —
+        # so if a human manually reruns an old attempt while the current
+        # head's run is still executing, that stale rerun starting can
+        # itself cancel the run actually gating the current head, and
+        # nothing here recreates it (Codex P2, flagged reviewing this
+        # file). Keying concurrency by head SHA instead of PR number would
+        # fix this narrow case but reopen the exact problem concurrency
+        # exists to prevent (a superseded PUSH's run no longer getting
+        # cancelled by the next push, since each push already has its own
+        # SHA). This failure mode is narrow (requires a human to
+        # deliberately rerun a stale, non-current attempt) and fails SAFE,
+        # not open: the required check ends up cancelled/pending, which
+        # blocks merge — it never lets a stale result satisfy the gate. A
+        # human noticing and rerunning the CURRENT head's own job (or just
+        # pushing again) recovers it.
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          EVENT_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          # A manual rerun of an old attempt replays the ORIGINAL event
+          # payload, including its now-stale head SHA — the PR-scoped
+          # concurrency group can let that stale rerun cancel the run
+          # actually gating the current head, and if it proceeds anyway it
+          # reconstructs the same stale cutoff and rediscovers the same old
+          # signal/error rather than gating the commit that's actually
+          # about to merge (Codex P2, flagged reviewing this file). Compare
+          # against the PR's LIVE head at run time and no-op if this run is
+          # for a superseded commit — a fresh run already exists (or will
+          # exist) for the real current head and is the one that should gate.
+          # Bounded retry, not a bare assignment: a transient REST/auth/
+          # rate-limit failure here would otherwise abort the whole required
+          # check before polling even begins, under this step's default
+          # `bash -e` (Codex P2, flagged reviewing this file). 3 attempts
+          # over ~15s is enough to absorb a genuine blip; if it's still
+          # failing after that, proceed as if not stale rather than crash —
+          # the downstream checks (reviewed_head, new_count, per-thread live
+          # rechecks) are the real safety net regardless of this step's
+          # own verdict.
+          CURRENT_HEAD_SHA=""
+          for _ in 1 2 3; do
+            CURRENT_HEAD_SHA=$(gh api "repos/$REPO/pulls/$PR" --jq '.head.sha' 2>/tmp/head-lookup-err.log) && break
+            echo "::warning::Transient error looking up the PR's current head — retrying in 5s: $(cat /tmp/head-lookup-err.log)"
+            sleep 5
+          done
+          if [ -z "$CURRENT_HEAD_SHA" ]; then
+            echo "::warning::Could not confirm the PR's current head after 3 attempts — proceeding as if this run's head is current."
+            CURRENT_HEAD_SHA="$EVENT_HEAD_SHA"
+          fi
+          if [ "$EVENT_HEAD_SHA" != "$CURRENT_HEAD_SHA" ]; then
+            echo "::notice::This run's head ($EVENT_HEAD_SHA) no longer matches the PR's current head ($CURRENT_HEAD_SHA) — skipping as superseded."
+            echo "stale=true" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Request re-review on a re-push
-        if: github.event.action == 'synchronize'
+        # Also fires on reopened (see the trigger-level comment above) and
+        # on any rerun (run_attempt > 1), not just synchronize: a
+        # maintainer rerunning a failed opened/ready_for_review attempt
+        # (e.g. after a transient Codex quota/auth error) reuses the SAME
+        # event and, without this, would reconstruct the same stale cutoff
+        # and rediscover the identical old error forever rather than asking
+        # Codex to look again (Codex P2, flagged reviewing this file).
+        if: github.event_name == 'pull_request' && steps.head-check.outputs.stale != 'true' && (github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1)
         env:
           # Codex only auto-reviews on opened/ready_for_review, not on every
           # push (this repo's own AGENTS.md: "not every push. After a
@@ -216,6 +342,7 @@ jobs:
           echo "$request_comment" | jq -r '.created_at' > /tmp/codex-run-started.txt
 
       - name: Poll for a terminal Codex signal on this revision
+        if: github.event_name == 'pull_request' && steps.head-check.outputs.stale != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Only for the reply+resolve mutations at the end of this step —
@@ -233,7 +360,34 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          IS_SYNC: ${{ github.event.action == 'synchronize' }}
+          # reopened and a manual rerun (run_attempt>1) both post a fresh
+          # @codex review request (see the step above) — IS_SYNC drives the
+          # poll's re-review-vs-initial-review branch downstream, so it must
+          # recognize the same three cases the request step does, or a
+          # reopened/rerun round wrongly follows the initial-review branch:
+          # an unrelated fresh comment/reaction could satisfy the check
+          # without being tied to the new head, and a genuine clean
+          # re-review could fail on baselined threads it should auto-resolve
+          # instead (Codex P1, flagged reviewing this file — the reopened
+          # case; run_attempt extended proactively to close the identical
+          # gap there before it needed its own separate finding).
+          IS_SYNC: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1 }}
+          # Narrower than IS_SYNC on purpose: a reopened event or a rerun of
+          # opened/ready_for_review has no new commit, so a clean re-review
+          # of the SAME code must not auto-resolve baseline threads still
+          # describing that same code — only a genuine synchronize proves
+          # the head actually changed (Codex P1, flagged reviewing this
+          # file). IS_SYNC stays broadened for poll-branch selection (which
+          # signal shape counts as "responded"); this only gates whether
+          # auto-resolution is allowed to run at all.
+          # run_attempt == 1 required too, not just action == synchronize:
+          # GitHub replays the ORIGINAL event payload on a manual rerun, so
+          # a rerun of a synchronize attempt still reports action ==
+          # 'synchronize' even though no new commit landed — the same
+          # no-new-commit case already excluded for opened/ready_for_review
+          # reruns, just reachable through a different event type (Codex
+          # P1, flagged reviewing this file).
+          IS_GENUINE_SYNC: ${{ github.event.action == 'synchronize' && github.run_attempt == 1 }}
         run: |
           set -o pipefail
           # Only count signals created at/after this run started, and reviews
@@ -264,7 +418,17 @@ jobs:
           HAS_COMMENT="false"
           [ -n "$COMMENT_ID" ] && HAS_COMMENT="true"
           while [ $SECONDS -lt $END ]; do
-            poll=$(gh api graphql -f query='
+            # A transient GraphQL read-after-write gap can make node($commentId)
+            # briefly 404 right after the comment was posted via REST — this
+            # loop's own retry cadence is the right place to absorb that, not
+            # a hard crash. Guarding with `if !` (rather than a bare
+            # assignment) is required under this step's default `bash -e`:
+            # an unguarded failing command here kills the whole step instantly
+            # instead of reaching the next iteration (observed live on
+            # skimmer#45: the very first poll hit "Could not resolve to a
+            # node" for a comment created less than a second earlier, and the
+            # required check failed in 6 seconds instead of retrying).
+            gh_poll_raw=$(gh api graphql -f query='
               query($owner: String!, $name: String!, $pr: Int!, $hasComment: Boolean!, $commentId: ID!) {
                 repository(owner: $owner, name: $name) {
                   pullRequest(number: $pr) {
@@ -278,9 +442,17 @@ jobs:
                     reactions(last: 50, content: THUMBS_UP) { nodes { user { login } createdAt } }
                   }
                 }
-              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" \
-              | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
-                def is_error_shaped: test("(quota|rate.?limit|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
+              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" -F hasComment="$HAS_COMMENT" -f commentId="${COMMENT_ID:-placeholder}" 2>/tmp/poll-err.log) || true
+            # gh's own failure must not abort this `bash -e` step outright —
+            # `|| true` above lets a failed gh call fall through as an empty
+            # $gh_poll_raw, which then fails the jq parse below exactly like
+            # any other malformed-input case, routing it through the SAME
+            # content-based transient/non-transient classification against
+            # /tmp/poll-err.log rather than bypassing it (a bare unprotected
+            # assignment here would abort the whole step on the first gh
+            # hiccup instead of ever reaching that classification).
+            if ! poll=$(echo "$gh_poll_raw" | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
+                def is_error_shaped: test("((quota|rate.?limit).{0,30}exceeded|exceeded.{0,30}(quota|rate.?limit)|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
                 # Codex'"'"'s clean-pass response on a re-push can ALSO land as a
                 # plain issue comment (not a formal review, not a reaction) whose
                 # body embeds "**Reviewed commit:** `<10-hex-char prefix>`" — a
@@ -304,8 +476,26 @@ jobs:
                     error_comments: ([$fresh_comments[] | select(.body | is_error_shaped)] | length),
                     reviews: ([$p.reviews.nodes[] | select(.author.login=="chatgpt-codex-connector" and .commit.oid==$sha and .submittedAt >= $since)] | length),
                     thumbsup: ([$p.reactions.nodes[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
-                    comment_thumbsup: ([(.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
-                  }')
+                    comment_thumbsup: ([(.data.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
+                  }'); then
+              # The read-after-write shape (node($commentId) briefly
+              # 404ing right after the comment was posted) plus generic
+              # network/server-side transients (timeouts, 5xx, rate-limit
+              # responses) all resolve by waiting; a narrower match on only
+              # the read-after-write message missed those other transient
+              # shapes entirely and fell straight to fail-fast on them
+              # (Codex P2, flagged reviewing this file, direct follow-up
+              # to widdershins#114). Bad/revoked tokens, invalid queries,
+              # and other genuinely permanent errors still don't match any
+              # of these and correctly fail fast below.
+              if grep -qiE "could not resolve to a node|(^|[^0-9])5[0-9]{2}([^0-9]|$)|timeout|timed out|rate limit|temporarily unavailable|connection reset|EOF" /tmp/poll-err.log 2>/dev/null; then
+                echo "::warning::Transient error polling for a Codex signal — retrying in 20s. $(cat /tmp/poll-err.log 2>/dev/null)"
+                sleep 20
+                continue
+              fi
+              echo "::error::Non-transient error polling for a Codex signal — failing fast: $(cat /tmp/poll-err.log 2>/dev/null)"
+              exit 1
+            fi
             comments=$(echo "$poll" | jq '.comments')
             comment_head_tied=$(echo "$poll" | jq '.comment_head_tied')
             error_comments=$(echo "$poll" | jq '.error_comments')
@@ -449,6 +639,11 @@ jobs:
             exit 0
           fi
 
+          if [ "$IS_GENUINE_SYNC" != "true" ]; then
+            echo "This round is a reopened/rerun, not a genuine synchronize — the code hasn't changed, so not auto-resolving baseline threads that may still describe it."
+            exit 0
+          fi
+
           OWNER="${REPO%%/*}"
           NAME="${REPO##*/}"
           baseline=$(cat /tmp/codex-baseline-threads.json 2>/dev/null || echo '[]')
@@ -539,6 +734,83 @@ jobs:
 
           echo "$result" | jq -r '.resolvable[]' | while read -r thread_id; do
             [ -z "$thread_id" ] && continue
+            # Re-check PR-WIDE for a new Codex concern before touching THIS
+            # thread — the $new_count check above ran once before this loop
+            # started, but Codex can open a brand-new thread while this loop
+            # is still walking earlier baseline threads (each iteration costs
+            # 2-3 network round-trips), and a thread-scoped live recheck can
+            # never see a concern that landed in a DIFFERENT thread (Codex
+            # P2, flagged reviewing this file). Bails the whole loop, not
+            # just this thread — a fresh concern means "leave everything for
+            # human review" exactly as the pre-loop new_count check already
+            # means.
+            if ! fresh_check=$(gh api graphql -f query='
+              query($owner: String!, $name: String!, $pr: Int!) {
+                repository(owner: $owner, name: $name) {
+                  pullRequest(number: $pr) {
+                    reviewThreads(first: 100) {
+                      nodes { isResolved comments(first: 1) { nodes { author { login } } } }
+                    }
+                  }
+                }
+              }' -f owner="$OWNER" -f name="$NAME" -F pr="$PR" 2>/tmp/fresh-check-err.log               | jq --argjson baselineInitiated "$baseline_initiated" '
+                [.data.repository.pullRequest.reviewThreads.nodes[]
+                  | select(.isResolved == false)
+                  | select(.comments.nodes[0].author.login == "chatgpt-codex-connector")
+                  | .id
+                ] as $codex_unresolved
+                | ($codex_unresolved - $baselineInitiated) | length'); then
+              echo "::warning::Could not re-check for new PR-wide concerns — leaving remaining threads as-is: $(cat /tmp/fresh-check-err.log)"
+              break
+            fi
+            if [ "$fresh_check" -gt 0 ]; then
+              echo "Codex raised a new concern elsewhere on the PR while this loop was running — leaving all remaining threads as-is for human review."
+              break
+            fi
+            # Re-check this thread's LIVE state immediately before mutating
+            # it — the $result snapshot above is a single point-in-time
+            # query, and a human can reply to (or a maintainer can resolve)
+            # a specific thread in the gap between that snapshot and this
+            # loop iteration reaching it, especially with many threads to
+            # walk. Trusting the stale snapshot would let this loop silently
+            # override a human's concern that arrived moments earlier —
+            # violating this workflow's own stated invariant that a
+            # human-joined thread is never auto-resolved (Codex P2, flagged
+            # reviewing this file). Freshness (no comment since RUN_STARTED)
+            # is re-checked here too, not just authorship/resolved-state —
+            # the earlier version of this live recheck only re-verified
+            # authorship purity, so Codex restating a concern IN this same
+            # thread (rather than opening a new one) between the snapshot
+            # and this loop reaching it stayed invisible: same authors,
+            # still unresolved, but with a fresh comment the loop never
+            # looked for (Codex P2, direct follow-up flagged reviewing this
+            # file's own live-recheck fix).
+            # Guarded like the reply/resolve mutations below it (skip this
+            # thread, don't abort the step): an unguarded assignment here
+            # would let one transient GraphQL/auth/rate-limit failure crash
+            # the whole required check before any thread gets processed,
+            # even though the polling query above already treats the exact
+            # same failure class as retry-worthy (Codex P2, flagged
+            # reviewing this file).
+            if ! live=$(gh api graphql -f query='
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on PullRequestReviewThread {
+                    isResolved
+                    comments(first: 50) { nodes { author { login } createdAt } }
+                  }
+                }
+              }' -f id="$thread_id" 2>/tmp/live-check-err.log); then
+              echo "::warning::Could not re-check thread $thread_id's live state — leaving unresolved: $(cat /tmp/live-check-err.log)"
+              continue
+            fi
+            live_resolved=$(echo "$live" | jq -r '.data.node.isResolved')
+            live_pure=$(echo "$live" | jq '[.data.node.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions")')
+            live_fresh=$(echo "$live" | jq --arg since "$RUN_STARTED" '[.data.node.comments.nodes[] | select(.createdAt >= $since)] | length == 0')
+            if [ "$live_resolved" != "false" ] || [ "$live_pure" != "true" ] || [ "$live_fresh" != "true" ]; then
+              echo "Skipping thread $thread_id — no longer eligible (resolved, human-touched, or a fresh comment landed since the snapshot)."
+              continue
+            fi
             if ! gh api graphql -f query='
               mutation($id: ID!, $body: String!) {
                 addPullRequestReviewThreadReply(input: {pullRequestReviewThreadId: $id, body: $body}) {
@@ -546,6 +818,50 @@ jobs:
                 }
               }' -f id="$thread_id" -f body="Auto-resolved: Codex re-reviewed commit $HEAD_SHA after this push and raised no new concerns." 2>/tmp/reply-err.log; then
               echo "::warning::Could not reply to thread $thread_id — leaving unresolved: $(cat /tmp/reply-err.log)"
+              continue
+            fi
+
+            # A second live recheck, immediately before the resolve mutation
+            # below: the first recheck above only covers the gap up to THIS
+            # loop iteration reaching it, but two more network round-trips
+            # (the reply just posted, and the resolve call next) each give a
+            # human another window to reply before the thread is actually
+            # marked resolved — the single recheck above doesn't close that
+            # (Codex P2, flagged reviewing this file on watchfinder#33). Our
+            # own just-posted reply is authored "github-actions", which the
+            # purity test already treats as ignorable, so it doesn't trip
+            # live_pure on its own.
+            # Guarded the same skip-not-crash way as the first live check —
+            # this is a newly added second read, and an unguarded assignment
+            # here would abort the whole required check on a transient
+            # failure instead of just leaving this one thread's reply in
+            # place (Codex P2, flagged reviewing this file).
+            if ! live2=$(gh api graphql -f query='
+              query($id: ID!) {
+                node(id: $id) {
+                  ... on PullRequestReviewThread {
+                    isResolved
+                    comments(first: 50) { nodes { author { login } createdAt } }
+                  }
+                }
+              }' -f id="$thread_id" 2>/tmp/live2-check-err.log); then
+              echo "::warning::Could not re-check thread $thread_id's post-reply state — leaving unresolved: $(cat /tmp/live2-check-err.log)"
+              continue
+            fi
+            live2_resolved=$(echo "$live2" | jq -r '.data.node.isResolved')
+            live2_pure=$(echo "$live2" | jq '[.data.node.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions")')
+            # Freshness, not just purity: Codex is an "ignorable" author for
+            # purity (it's allowed to have started the thread), so Codex
+            # RESTATING the same concern in this thread between the first
+            # live check and now would leave live2_pure true even though a
+            # current-round concern now exists — the first live check tests
+            # freshness for exactly this reason, and this second check had
+            # silently dropped it (Codex P2, flagged reviewing this file).
+            # Excludes only this workflow's own just-posted reply (authored
+            # "github-actions"), which is expected and not a concern.
+            live2_fresh=$(echo "$live2" | jq --arg since "$RUN_STARTED" '[.data.node.comments.nodes[] | select(.author.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length == 0')
+            if [ "$live2_resolved" != "false" ] || [ "$live2_pure" != "true" ] || [ "$live2_fresh" != "true" ]; then
+              echo "Skipping resolve for thread $thread_id — became ineligible between reply and resolve (left the reply in place)."
               continue
             fi
             # GITHUB_TOKEN (github-actions[bot]) reliably fails this specific
