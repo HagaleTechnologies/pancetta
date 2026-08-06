@@ -123,6 +123,23 @@ jobs:
       - name: Skip if this run's head no longer matches the PR's current head
         id: head-check
         if: github.event_name == 'pull_request'
+        # ACCEPTED LIMITATION, not fixed here: this step no-ops a stale
+        # rerun's OWN remaining steps, but concurrency (`cancel-in-progress`
+        # keyed on PR number) is evaluated by GitHub before any step runs —
+        # so if a human manually reruns an old attempt while the current
+        # head's run is still executing, that stale rerun starting can
+        # itself cancel the run actually gating the current head, and
+        # nothing here recreates it (Codex P2, flagged reviewing this
+        # file). Keying concurrency by head SHA instead of PR number would
+        # fix this narrow case but reopen the exact problem concurrency
+        # exists to prevent (a superseded PUSH's run no longer getting
+        # cancelled by the next push, since each push already has its own
+        # SHA). This failure mode is narrow (requires a human to
+        # deliberately rerun a stale, non-current attempt) and fails SAFE,
+        # not open: the required check ends up cancelled/pending, which
+        # blocks merge — it never lets a stale result satisfy the gate. A
+        # human noticing and rerunning the CURRENT head's own job (or just
+        # pushing again) recovers it.
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -325,7 +342,13 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          IS_SYNC: ${{ github.event.action == 'synchronize' }}
+          # Must mirror the Request-re-review step's own `if:` exactly — a
+          # reopened event or a run_attempt>1 rerun also posts a fresh
+          # @codex review request, so the poll below needs the same strict
+          # head-tied branch those rounds get; leaving this synchronize-only
+          # let those rounds take the looser initial-review branch instead
+          # (Codex P2, flagged reviewing this file).
+          IS_SYNC: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1 }}
         run: |
           set -o pipefail
           # Only count signals created at/after this run started, and reviews
@@ -355,6 +378,19 @@ jobs:
           COMMENT_ID=$(cat /tmp/codex-review-comment-id.json 2>/dev/null || echo "")
           HAS_COMMENT="false"
           [ -n "$COMMENT_ID" ] && HAS_COMMENT="true"
+          # A permanent failure (bad token scope, a broken query after a
+          # schema change, a consistently-failing jq expression) looks
+          # IDENTICAL to a transient one from this loop's point of view —
+          # both are a nonzero exit. Without a cap, this would retry a
+          # permanent failure every 20s for the full 70-minute budget and
+          # surface only the misleading "Codex did not respond" timeout
+          # message instead of the real, immediately-diagnosable error
+          # (Codex P2, flagged reviewing this file). 10 consecutive
+          # failures (~200s) is generous enough to absorb a real transient
+          # blip (the read-after-write gap this retry exists for resolves
+          # in low single-digit seconds) while still failing fast on
+          # anything that isn't.
+          consecutive_failures=0
           while [ $SECONDS -lt $END ]; do
             # A transient GraphQL read-after-write gap can make node($commentId)
             # briefly 404 right after the comment was posted via REST — this
@@ -408,10 +444,16 @@ jobs:
                     thumbsup: ([$p.reactions.nodes[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length),
                     comment_thumbsup: ([(.data.commentNode.reactions.nodes // [])[] | select(.user.login=="chatgpt-codex-connector" and .createdAt >= $since)] | length)
                   }'); then
-              echo "::warning::Transient error polling for a Codex signal — retrying in 20s."
+              consecutive_failures=$((consecutive_failures+1))
+              if [ "$consecutive_failures" -ge 10 ]; then
+                echo "::error::10 consecutive polling failures — this looks permanent (bad token scope, a broken query, or similar), not a transient blip. Failing now instead of spinning to the 70-minute timeout."
+                exit 1
+              fi
+              echo "::warning::Transient error polling for a Codex signal ($consecutive_failures/10) — retrying in 20s."
               sleep 20
               continue
             fi
+            consecutive_failures=0
             comments=$(echo "$poll" | jq '.comments')
             comment_head_tied=$(echo "$poll" | jq '.comment_head_tied')
             error_comments=$(echo "$poll" | jq '.error_comments')
@@ -663,7 +705,14 @@ jobs:
             # still unresolved, but with a fresh comment the loop never
             # looked for (Codex P2, direct follow-up flagged reviewing this
             # file's own live-recheck fix).
-            live=$(gh api graphql -f query='
+            # Guarded like the reply/resolve mutations below it (skip this
+            # thread, don't abort the step): an unguarded assignment here
+            # would let one transient GraphQL/auth/rate-limit failure crash
+            # the whole required check before any thread gets processed,
+            # even though the polling query above already treats the exact
+            # same failure class as retry-worthy (Codex P2, flagged
+            # reviewing this file).
+            if ! live=$(gh api graphql -f query='
               query($id: ID!) {
                 node(id: $id) {
                   ... on PullRequestReviewThread {
@@ -671,7 +720,10 @@ jobs:
                     comments(first: 50) { nodes { author { login } createdAt } }
                   }
                 }
-              }' -f id="$thread_id")
+              }' -f id="$thread_id" 2>/tmp/live-check-err.log); then
+              echo "::warning::Could not re-check thread $thread_id's live state — leaving unresolved: $(cat /tmp/live-check-err.log)"
+              continue
+            fi
             live_resolved=$(echo "$live" | jq -r '.data.node.isResolved')
             live_pure=$(echo "$live" | jq '[.data.node.comments.nodes[].author.login] | all(. == "chatgpt-codex-connector" or . == "github-actions")')
             live_fresh=$(echo "$live" | jq --arg since "$RUN_STARTED" '[.data.node.comments.nodes[] | select(.createdAt >= $since)] | length == 0')
