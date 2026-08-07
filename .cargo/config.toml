@@ -1,0 +1,6 @@
+[env]
+# PAN-7: the full workspace test suite (pancetta-ft8's ft8_lib FFI bridge +
+# decoder benchmarks) OOM-killed the host running it twice in a row.
+# RUST_TEST_THREADS caps how many test binaries `cargo test` runs
+# concurrently — lower peak RSS at the cost of wall-clock time.
+RUST_TEST_THREADS = "2"
