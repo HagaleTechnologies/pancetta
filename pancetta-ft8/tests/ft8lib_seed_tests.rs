@@ -281,7 +281,8 @@ fn seed_survival_is_capped_out_on_busy_audio_at_the_default_gate() {
          so no ft8_lib-sourced position may survive on busy audio"
     );
     assert_eq!(
-        kept_raised, 0,
+        kept_raised,
+        0,
         "doubling the cap to {} does not rescue the mechanism either — the native \
          sweep saturates that too. This is the measured fact behind the arm-C \
          expectation in research/experiments/2026-08-03-ft8lib-sync-seed-union*.md",
@@ -385,12 +386,13 @@ fn seeded_decode_is_a_noop_on_pass_gt_zero() {
                 // `cargo test`'s default thread fan-out on a loaded machine the
                 // budget expires first, no residual pass runs, and the liveness
                 // assert below fails for a reason that has nothing to do with
-                // seeding. At cap 40 pass 0 costs ~0.5-0.7 s — a ~4x margin —
-                // and all three fixtures reach pass 1 deterministically. The
+                // seeding. At cap 10 pass 0 stays comfortably below the budget
+                // even while the rest of this crate's test suite is running,
+                // and these strong fixtures still reach pass 1. The
                 // cap does not affect the invariant under test: attribution is
                 // keyed on the per-pass `ft8lib_seed_keys` set, not on list
                 // length.
-                max_sync_candidates: 40,
+                max_sync_candidates: 10,
                 ..Ft8Config::default()
             },
             &tx,
