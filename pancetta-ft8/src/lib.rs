@@ -125,6 +125,7 @@ pub mod neural_osd_weights;
 pub mod osd;
 pub mod signal_processing;
 pub mod sync;
+pub mod syndrome;
 
 // ft8_lib reference implementation (FFI)
 pub mod ft8_lib_ffi;
