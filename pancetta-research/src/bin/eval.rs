@@ -6,7 +6,7 @@
 use anyhow::Context;
 use chrono::Utc;
 use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus, load_synth_pair_corpus};
-use pancetta_research::curated::{load_curated_corpus, CuratedEntry};
+use pancetta_research::curated::{load_curated_corpus, preflight_curated_corpus, CuratedEntry};
 use pancetta_research::decoder::{DecoderUnderTest, Ft8Decoder};
 use pancetta_research::metrics::{
     compute_regression_flags, default_weights, populate_composite, saturation_aware_composite,
@@ -35,6 +35,7 @@ struct Args {
     /// "set depth to d". `None` means "no override; use the production
     /// default."
     osd_depth: Option<Option<u8>>,
+    neural_osd: Option<bool>,
     ldpc_iterations: Option<usize>,
     llr_target_variance: Option<f32>,
     nms_enabled: Option<bool>,
@@ -285,6 +286,7 @@ impl Args {
         let mut max_sync_candidates: Option<usize> = None;
         let mut max_candidates: Option<usize> = None;
         let mut osd_depth: Option<Option<u8>> = None;
+        let mut neural_osd: Option<bool> = None;
         let mut ldpc_iterations: Option<usize> = None;
         let mut llr_target_variance: Option<f32> = None;
         let mut nms_enabled: Option<bool> = None;
@@ -411,6 +413,19 @@ impl Args {
                     } else {
                         Some(s.parse()?)
                     });
+                }
+                "--neural-osd" => {
+                    neural_osd = Some(
+                        match iter
+                            .next()
+                            .context("--neural-osd needs on or off")?
+                            .as_str()
+                        {
+                            "on" => true,
+                            "off" => false,
+                            value => anyhow::bail!("--neural-osd must be on or off, got {value}"),
+                        },
+                    );
                 }
                 "--ldpc-iters" => {
                     ldpc_iterations =
@@ -962,6 +977,7 @@ impl Args {
             max_sync_candidates,
             max_candidates,
             osd_depth,
+            neural_osd,
             ldpc_iterations,
             llr_target_variance,
             nms_enabled,
@@ -1693,6 +1709,7 @@ fn run_curated_tier(
     novel_classifier: Option<&pancetta_research::FpFilter>,
 ) -> anyhow::Result<TierResult> {
     let entries: Vec<CuratedEntry> = load_curated_corpus(manifest_path)?;
+    preflight_curated_corpus(&entries, &workspace.join("research/baselines/ft8"))?;
     let total = entries.len() as u32;
     if total == 0 {
         return Ok(TierResult {
@@ -1987,6 +2004,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(depth) = args.osd_depth {
         d = d.with_osd_depth(depth);
+    }
+    if let Some(enabled) = args.neural_osd {
+        d = d.with_neural_osd(enabled);
     }
     if let Some(n) = args.ldpc_iterations {
         d = d.with_ldpc_iterations(n);

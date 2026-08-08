@@ -256,6 +256,12 @@ impl Ft8Decoder {
         self
     }
 
+    /// Toggle learned ordering independently of OSD depth for attribution.
+    pub fn with_neural_osd(mut self, enabled: bool) -> Self {
+        self.config.neural_osd_enabled = enabled;
+        self
+    }
+
     /// Override `osd_input` on the wrapped config — Task W2.3 [A/B]:
     /// which LLR array drives OSD's search (BP-posterior vs. channel vs.
     /// offset-subtracted).

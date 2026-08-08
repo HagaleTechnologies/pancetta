@@ -71,3 +71,62 @@ pub fn load_curated_corpus(manifest_path: &Path) -> anyhow::Result<Vec<CuratedEn
     let manifest = CuratedManifest::load(manifest_path)?;
     Ok(manifest.entries)
 }
+
+/// Refuse to score unless every WAV and corresponding jt9 cache exists.
+pub fn preflight_curated_corpus(
+    entries: &[CuratedEntry],
+    baseline_dir: &Path,
+) -> anyhow::Result<()> {
+    let mut missing = Vec::new();
+    for entry in entries {
+        if !entry.wav_path.is_file() {
+            missing.push(format!("missing WAV: {}", entry.wav_path.display()));
+        }
+        let baseline = baseline_dir.join(format!("{}.json", entry.wav_sha256));
+        if !baseline.is_file() {
+            missing.push(format!("missing baseline cache: {}", baseline.display()));
+        }
+    }
+    anyhow::ensure!(
+        missing.is_empty(),
+        "curated corpus preflight failed:\n{}",
+        missing.join("\n")
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(wav_path: PathBuf, sha: &str) -> CuratedEntry {
+        CuratedEntry {
+            wav_path,
+            wav_sha256: sha.into(),
+            interest_score: 0.0,
+            score_breakdown: ScoreBreakdown::default(),
+        }
+    }
+
+    #[test]
+    fn preflight_names_missing_wav_and_baseline() {
+        let temp = tempfile::tempdir().unwrap();
+        let error = preflight_curated_corpus(
+            &[entry(temp.path().join("absent.wav"), "deadbeef")],
+            temp.path(),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("absent.wav"));
+        assert!(error.contains("deadbeef.json"));
+    }
+
+    #[test]
+    fn preflight_accepts_complete_pair() {
+        let temp = tempfile::tempdir().unwrap();
+        let wav = temp.path().join("sample.wav");
+        std::fs::write(&wav, b"wav").unwrap();
+        std::fs::write(temp.path().join("abc.json"), b"{}").unwrap();
+        preflight_curated_corpus(&[entry(wav, "abc")], temp.path()).unwrap();
+    }
+}

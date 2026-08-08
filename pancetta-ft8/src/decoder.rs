@@ -239,10 +239,14 @@ pub struct Ft8Config {
     /// improvement makes multi-pass productive again.
     pub max_decode_passes: usize,
 
-    /// OSD depth (0, 1, or 2). Set to None to disable OSD. Default: Some(1).
+    /// OSD depth (0, 1, or 2). Set to None to disable OSD. Default: Some(0).
     /// Note: OSD-2 (4,187 trials) has a high CRC-14 false positive rate without
     /// additional validation. OSD-1 (92 trials) is the safe default.
     pub osd_depth: Option<u8>,
+
+    /// Whether the neural model may replace |LLR| ordering at OSD depth >= 1.
+    /// Default true; exposed for offline depth-only attribution.
+    pub neural_osd_enabled: bool,
 
     /// WSJT-X mainline-style npre2 OSD preprocessing — hash-table-driven
     /// complementary-bit-pair warm start ahead of the OSD-3 trial loop.
@@ -1807,6 +1811,7 @@ impl Default for Ft8Config {
             // signal-fidelity case where it might help. Spec:
             // `research/experiments/2026-06-09-batch-72.md`.
             osd_depth: Some(0),
+            neural_osd_enabled: true,
             // WSJT-X mainline-style npre2 OSD preprocessing: DEFAULT OFF
             // pending hard-200 measurement validation. Active only at
             // `osd_depth >= 3`. Spec:
@@ -2676,6 +2681,7 @@ impl Ft8Decoder {
                 ..Default::default()
             }),
         )?
+        .with_neural_osd(config.neural_osd_enabled)
         .with_max_parity_errors_for_osd(config.max_parity_errors_for_osd)
         .with_bp_offset_subtract(config.bp_offset_subtract)
         .with_osd_input(config.osd_input)
@@ -13797,6 +13803,7 @@ struct LdpcDecoder {
     algorithm: LdpcAlgorithm,
     /// Optional OSD fallback decoder
     osd: Option<OsdDecoder>,
+    neural_osd_enabled: bool,
     /// Max unsatisfied parity checks tolerated before invoking OSD.
     /// 4 = production default; sweep candidate.
     max_parity_errors_for_osd: usize,
@@ -14075,6 +14082,7 @@ impl LdpcDecoder {
             var_positions,
             algorithm: LdpcAlgorithm::SumProduct,
             osd: None,
+            neural_osd_enabled: true,
             max_parity_errors_for_osd: 4,
             bp_offset_subtract: 0.0,
             osd_input: OsdInput::BpPosterior,
@@ -14093,6 +14101,11 @@ impl LdpcDecoder {
 
     fn with_max_parity_errors_for_osd(mut self, n: usize) -> Self {
         self.max_parity_errors_for_osd = n;
+        self
+    }
+
+    fn with_neural_osd(mut self, enabled: bool) -> Self {
+        self.neural_osd_enabled = enabled;
         self
     }
 
@@ -14413,7 +14426,7 @@ impl LdpcDecoder {
                 // dereference, no ~300M-op CNN forward pass per failed
                 // frame.
                 #[cfg(feature = "neural_osd")]
-                let neural_ordering = if osd.max_depth() >= 1 {
+                let neural_ordering = if self.neural_osd_enabled && osd.max_depth() >= 1 {
                     trajectory.as_deref().map(|trajectory| {
                         let mut input = [[0.0f32; 174]; crate::neural_osd::IN_CHANNELS];
                         input[..crate::neural_osd::BP_ITERS].copy_from_slice(trajectory);
