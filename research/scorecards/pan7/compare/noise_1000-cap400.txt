@@ -1,0 +1,11 @@
+A: research/scorecards/pan7/noise_1000-cap400-control.json (sha 0574f727, score 0.0000)
+B: research/scorecards/pan7/noise_1000-seeded-cap400.json (sha 0574f727, score 0.0000 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI:
+  (skipped: neither scorecard carries `per_wav_records`. Re-eval with the Phase-B build to enable.)
+
+CONFIG DIFF:
+  decoder.decoder.ft8lib_sync_seeds_enabled        false → true
