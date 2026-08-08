@@ -14459,6 +14459,24 @@ impl LdpcDecoder {
                         None => (false, None),
                     };
                     let traj = trajectory.as_deref().copied().unwrap_or([[0.0; 174]; 25]);
+                    // PAN-9 schema v2: carry the MRB permutation OSD just
+                    // used and the per-bit syndrome counts at BP exit. The
+                    // permutation comes from the decoder's own `mrb_basis`
+                    // via `mrb_permutation` — deriving it anywhere else
+                    // would risk labels in a basis OSD never reprocessed.
+                    // Both are computed only under `capture_enabled`, so the
+                    // production path pays nothing.
+                    let mrb_perm = osd.mrb_permutation(llr_arr, neural_ordering.as_ref()).map(
+                        |perm| {
+                            let mut out = [0u16; 174];
+                            for (slot, &p) in out.iter_mut().zip(perm.iter()) {
+                                *slot = p as u16;
+                            }
+                            out
+                        },
+                    );
+                    let syndrome_counts =
+                        crate::syndrome::unsatisfied_check_counts_from_llrs(llr_arr);
                     crate::bp_trajectory_capture::record(
                         crate::bp_trajectory_capture::CapturedTrajectory {
                             channel_llrs: captured_channel_llrs.unwrap_or([0.0; 174]),
@@ -14467,6 +14485,8 @@ impl LdpcDecoder {
                             osd_recovered,
                             osd_codeword,
                             bp_iters_run: self.max_iterations.min(25) as u16,
+                            mrb_perm,
+                            syndrome_counts,
                         },
                     );
                 }
@@ -14500,6 +14520,16 @@ impl LdpcDecoder {
                         osd_recovered: false,
                         osd_codeword: None,
                         bp_iters_run: self.max_iterations.min(25) as u16,
+                        // The parity gate rejected this candidate, so OSD
+                        // never built a basis — there is no permutation to
+                        // record, and inventing one (the identity, say)
+                        // would be worse than `None`. The syndrome counts
+                        // ARE meaningful here: they are precisely why the
+                        // gate rejected it.
+                        mrb_perm: None,
+                        syndrome_counts: crate::syndrome::unsatisfied_check_counts_from_llrs(
+                            llr_arr,
+                        ),
                     },
                 );
             }
