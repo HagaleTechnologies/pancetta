@@ -1,12 +1,12 @@
 {
   "schema_version": 1,
-  "generated_at": "2026-08-08T01:39:03.445276Z",
+  "generated_at": "2026-08-08T01:47:30.650342Z",
   "mode": "ft8",
   "git": {
     "branch": "PAN-7",
-    "head_sha": "0574f727e98b7b3be4eda08545fd73e73f6c93cc",
+    "head_sha": "d1b3d39996946692d5c6615dc6fb9e843485a1f0",
     "main_merge_base": "5356372cea40aa90784523e7d732d6d87b9bc875",
-    "dirty": true
+    "dirty": false
   },
   "build": {
     "rustc_version": "rustc 1.94.1 (e408947bf 2026-03-25)",
@@ -19,7 +19,7 @@
     "harness_version": "0.9.5",
     "host": "macos/aarch64",
     "cores_used": 10,
-    "elapsed_seconds": 610.399122333
+    "elapsed_seconds": 555.877113166
   },
   "config": {
     "decoder": {

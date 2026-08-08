@@ -50,12 +50,12 @@ Phase 1 pins FFI seed ordering/budget, coordinate identity, negative-row rejecti
 
 Each tier was evaluated independently with `eval`, using explicit `--ft8lib-sync-seeds` / `--no-ft8lib-sync-seeds` arms at `max_sync_candidates` 200 and 400. All sixteen scorecards are under `research/scorecards/pan7/`; the eight tier-for-tier `compare --bootstrap` transcripts and exit codes are in `compare-results.txt`.
 
-### Results (git sha `0574f727`, all arms)
+### Results (implementation sha `0574f727`; one clean provenance refresh at `d1b3d399`)
 
 - Fixed cap: all four comparisons exited 0. Curated recall and novel bootstrap deltas were exactly 0 with 95% CI `[0,0]`.
 - Raised cap: all four comparisons exited 0, again with exact `[0,0]` curated deltas.
 - `curated-hard-200` control reproduced 2001 truths as required.
-- Scorecards record `git.dirty=true` because a resumed phase worker and this worker wrote the same intended, untracked `research/scorecards/pan7/` directory concurrently. All arms identify the same committed SHA, configs match their filenames, and no source file was dirty during measurement; the provenance blemish is retained rather than rewritten.
+- Most scorecards record `git.dirty=true` because a resumed phase worker and this worker wrote the same intended, untracked `research/scorecards/pan7/` directory concurrently. Their implementation SHA is `0574f727`, configs match their filenames, and no source file was dirty during measurement. A later clean refresh of `synth-pair-200-cap400-control.json` at documentation SHA `d1b3d399` reproduced the identical counts and records `dirty=false`; the remaining provenance blemishes are retained rather than rewritten.
 
 ## Decision
 
