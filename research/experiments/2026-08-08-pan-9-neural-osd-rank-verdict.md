@@ -8,7 +8,9 @@
 - Schema-v2 capture with the exact Rust MRB permutation and per-bit syndrome counts.
 - A 26-channel inference contract with a behavior-preserving zero-row migration.
 - A T0/T1 corpus generator and grouped split keys.
-- Differentiable expected-reprocessing-order training in the MRB basis.
+- Differentiable expected-reprocessing-order training over the natural systematic-bit output
+  indices consumed by Rust. The captured MRB permutation remains diagnostic data; using it to
+  remap `[91]` targets would make the output contract circular and mismatch production indexing.
 - Curated-corpus preflight plus independent depth/neural attribution controls.
 
 This host has no operator recording corpus or jt9 baseline cache. The production gate therefore

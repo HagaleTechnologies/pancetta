@@ -2975,13 +2975,17 @@ mod novel_classification_tests {
     fn curated_tier_classification_is_report_only_and_correct() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path();
-        let sha = "aaaa1111";
+        // SHA-256 of setup_curated's exact `b"not real audio"` fixture.
+        let sha = "963b1b883c546e5e0a383c7152e64f11439ebe42b9fa3f0fd14e444aab955f57";
         // jt9 found K1ABC's CQ; pancetta finds it too PLUS two novels.
         let manifest_path = setup_curated(
             workspace,
             sha,
             &["CQ K1ABC FN42"],
-            Some(("bbbb2222", &["W1AW K5ARH FN20"])), // seeds K5ARH into the reference set
+            Some((
+                "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+                &["W1AW K5ARH FN20"],
+            )), // seeds K5ARH into the reference set
         );
 
         let mut responses = HashMap::new();

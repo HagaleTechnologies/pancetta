@@ -1,8 +1,15 @@
 import json
+import tempfile
 import unittest
 from pathlib import Path
 
-from train_rank import apply_mrb_permutation, invert_permutation, soft_rank_loss
+from train_rank import (
+    apply_mrb_permutation,
+    invert_permutation,
+    load_corpus,
+    soft_rank_loss,
+    soft_rank_loss_tensor,
+)
 
 
 class SoftRankLossTests(unittest.TestCase):
@@ -26,6 +33,44 @@ class SoftRankLossTests(unittest.TestCase):
         labels = [[0.0, 1.0, 1.0]]
         # The design's all-j formulation is half-offset: [0.5, 2.5, 1.5].
         self.assertAlmostEqual(soft_rank_loss(scores, labels, tau=1e-3), 2.0, places=3)
+
+    def test_tensor_loss_matches_reference_direction_and_value(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        scores = [[3.0, 1.0, 2.0]]
+        labels = [[0.0, 1.0, 1.0]]
+        expected = soft_rank_loss(scores, labels, tau=0.25)
+        actual = soft_rank_loss_tensor(
+            torch.tensor(scores), torch.tensor(labels), tau=0.25
+        ).item()
+        self.assertAlmostEqual(actual, expected, places=6)
+
+    def test_loader_preserves_natural_systematic_output_indices(self):
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("NumPy is not installed")
+        codeword = [0] * 174
+        codeword[0] = 1
+        row = {
+            "schema_version": 2,
+            "osd_recovered": True,
+            "mrb_perm": list(range(173, -1, -1)),
+            "osd_codeword": codeword,
+            "final_llrs": [1.0] * 174,
+            "trajectory_flat": [0.0] * (25 * 174),
+            "syndrome_counts": [0] * 174,
+            "split_key": "natural-index-contract",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Path(directory) / "capture.jsonl"
+            corpus.write_text(json.dumps(row) + "\n")
+            splits = load_corpus(corpus)
+        labels = next(values[1] for values in splits.values() if len(values[1]))
+        self.assertEqual(labels[0, 0], 1.0)
+        self.assertEqual(labels[0].sum(), 1.0)
 
     def test_permutation_then_inverse_is_identity(self):
         values = list(range(174))

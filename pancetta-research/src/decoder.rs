@@ -1332,4 +1332,12 @@ mod jt9_tests {
         let d = Jt9Decoder::default().with_executable_path(PathBuf::from("/usr/local/bin/jt9"));
         assert!(d.identity().contains("/usr/local/bin/jt9"));
     }
+
+    #[test]
+    fn neural_osd_attribution_toggle_reaches_production_config() {
+        let enabled = Ft8Decoder::with_default_config().with_neural_osd(true);
+        let disabled = Ft8Decoder::with_default_config().with_neural_osd(false);
+        assert!(enabled.config.neural_osd_enabled);
+        assert!(!disabled.config.neural_osd_enabled);
+    }
 }
