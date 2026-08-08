@@ -9,13 +9,13 @@
 //!
 //! Design notes:
 //!
-//! * **Thread-local sink.** BP runs single-threaded inside one decoder
-//!   call, but Pancetta uses Rayon for inter-candidate parallelism — each
-//!   worker thread gets its own sink. Callers must drain every thread
-//!   that participated. See [`drain_local`].
-//! * **Opt-in.** Capture is OFF by default (the thread-local atomic flag
-//!   starts `false`); production decoding pays no overhead beyond a
-//!   single relaxed load + branch per OSD-eligible BP failure.
+//! * **Local and global sinks.** Unit-scale callers can use the thread-local
+//!   sink. The corpus miner uses the global sink because candidate decoding
+//!   runs on Rayon workers; it can drain all participating threads from the
+//!   coordinator after the window completes.
+//! * **Opt-in.** Both capture modes are OFF by default; production decoding
+//!   pays no overhead beyond a relaxed atomic load plus branch per
+//!   OSD-eligible BP failure.
 //! * **No allocation on the hot path while disabled.** The recorder only
 //!   appends to its `Vec` when the flag is true.
 //! * **The captured shape mirrors the neural OSD model contract**
@@ -31,6 +31,8 @@
 //! `pancetta` crate or any release binary.
 
 use std::cell::RefCell;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Bumped when the captured-payload format changes in a
 /// backward-incompatible way.
@@ -141,6 +143,13 @@ thread_local! {
     static SINK: RefCell<Vec<CapturedTrajectory>> = const { RefCell::new(Vec::new()) };
 }
 
+static GLOBAL_ENABLED: AtomicBool = AtomicBool::new(false);
+static GLOBAL_SINK: OnceLock<Mutex<Vec<CapturedTrajectory>>> = OnceLock::new();
+
+fn global_sink() -> &'static Mutex<Vec<CapturedTrajectory>> {
+    GLOBAL_SINK.get_or_init(|| Mutex::new(Vec::new()))
+}
+
 /// Enable trajectory capture on the current thread. Disabled by
 /// default. Safe to call multiple times; subsequent records append to
 /// the existing sink without clearing it.
@@ -157,7 +166,29 @@ pub fn disable_local() {
 /// True iff trajectory capture is currently enabled on this thread.
 #[inline]
 pub fn is_enabled() -> bool {
-    ENABLED.with(|e| *e.borrow())
+    GLOBAL_ENABLED.load(Ordering::Relaxed) || ENABLED.with(|e| *e.borrow())
+}
+
+/// Enable process-wide trajectory capture, including work dispatched to
+/// Rayon worker threads. This is intended for the offline corpus miner;
+/// production callers should continue to leave capture disabled.
+pub fn enable_global() {
+    GLOBAL_ENABLED.store(true, Ordering::Release);
+}
+
+/// Disable process-wide trajectory capture. Existing records remain until
+/// [`drain_global`] is called.
+pub fn disable_global() {
+    GLOBAL_ENABLED.store(false, Ordering::Release);
+}
+
+/// Drain trajectories recorded by any thread while global capture was on.
+pub fn drain_global() -> Vec<CapturedTrajectory> {
+    std::mem::take(
+        &mut *global_sink()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner),
+    )
 }
 
 /// Drain and return all captured samples for the current thread.
@@ -171,10 +202,14 @@ pub fn drain_local() -> Vec<CapturedTrajectory> {
 /// failure / OSD-fallback path — successful BP convergence carries no
 /// trajectory signal and is uninteresting for training.
 pub fn record(sample: CapturedTrajectory) {
-    if !is_enabled() {
-        return;
+    if GLOBAL_ENABLED.load(Ordering::Acquire) {
+        global_sink()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(sample);
+    } else if ENABLED.with(|e| *e.borrow()) {
+        SINK.with(|s| s.borrow_mut().push(sample));
     }
-    SINK.with(|s| s.borrow_mut().push(sample));
 }
 
 #[cfg(test)]

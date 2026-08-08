@@ -28,7 +28,9 @@ def apply_mrb_permutation(values, perm):
 def soft_rank_loss(scores, labels, tau=0.1):
     """Dependency-free reference for the design's all-j soft-rank formula."""
     losses = []
-    for sample_scores, sample_labels in zip(scores, labels, strict=True):
+    if len(scores) != len(labels):
+        raise ValueError("scores and labels must contain the same number of samples")
+    for sample_scores, sample_labels in zip(scores, labels):
         positives = sum(sample_labels)
         if positives <= 0:
             continue
@@ -78,7 +80,9 @@ def load_corpus(path):
         if not perm or not codeword:
             continue
         hard = [int(value < 0.0) for value in row["final_llrs"]]
-        errors = [float(a != b) for a, b in zip(codeword, hard, strict=True)]
+        if len(codeword) != len(hard):
+            raise ValueError("osd_codeword and final_llrs lengths differ")
+        errors = [float(a != b) for a, b in zip(codeword, hard)]
         if sorted(perm) != list(range(N_CODEWORD)):
             raise ValueError("mrb_perm is not a permutation of 0..173")
         # Rust consumes output slot i as natural systematic bit i.

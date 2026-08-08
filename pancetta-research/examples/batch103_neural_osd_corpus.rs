@@ -149,17 +149,18 @@ fn decode(wav: &Path, root: &Path) -> Result<Vec<CorpusRecord>> {
     config.neural_osd_enabled = false;
     let mut decoder = pancetta_ft8::Ft8Decoder::new(config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    capture::enable_local();
-    decoder
+    capture::enable_global();
+    let decode_result = decoder
         .decode_window(&samples)
-        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
-    capture::disable_local();
+        .map_err(|error| anyhow::anyhow!(error.to_string()));
+    capture::disable_global();
+    decode_result?;
     let relative = wav
         .strip_prefix(root)
         .unwrap_or(wav)
         .to_string_lossy()
         .into_owned();
-    Ok(capture::drain_local()
+    Ok(capture::drain_global()
         .into_iter()
         .map(|sample| CorpusRecord {
             schema_version: capture::CAPTURE_SCHEMA_VERSION,
@@ -188,6 +189,23 @@ mod tests {
             .unwrap()
             .to_path_buf();
         assert!(!wav_pool(&root, "t0").unwrap().is_empty());
+    }
+
+    #[test]
+    fn t0_fixture_runs_capture_pipeline_and_emits_schema_v2_records() {
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        let fixture = wav_pool(&root, "t0").unwrap().remove(0);
+        let records = decode(&fixture, &root).unwrap();
+        assert!(!records.is_empty(), "fixture capture must not be empty");
+        assert!(records
+            .iter()
+            .all(|record| record.schema_version == capture::CAPTURE_SCHEMA_VERSION));
+        assert!(records
+            .iter()
+            .all(|record| record.syndrome_counts.len() == 174));
     }
 
     #[test]

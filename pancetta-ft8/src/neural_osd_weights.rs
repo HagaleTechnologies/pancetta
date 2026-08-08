@@ -156,6 +156,11 @@ mod tests {
                 .expect("valid neural OSD provenance JSON");
         assert_eq!(provenance["total_len"], TOTAL_LEN);
         assert_eq!(provenance["byte_length"], RAW_BYTES.len());
+        assert_eq!(provenance["input_channels"], crate::neural_osd::IN_CHANNELS);
+        assert_eq!(
+            provenance["syndrome_normalization_divisor"],
+            crate::syndrome::MAX_INCIDENT_CHECKS
+        );
         let digest = format!("{:x}", Sha256::digest(RAW_BYTES));
         assert_eq!(provenance["sha256"], digest);
         let lengths: Vec<usize> = provenance["tensors"]
