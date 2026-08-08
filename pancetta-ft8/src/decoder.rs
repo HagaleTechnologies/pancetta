@@ -14414,9 +14414,14 @@ impl LdpcDecoder {
                 // frame.
                 #[cfg(feature = "neural_osd")]
                 let neural_ordering = if osd.max_depth() >= 1 {
-                    trajectory
-                        .as_deref()
-                        .map(crate::neural_osd::predict_error_bits)
+                    trajectory.as_deref().map(|trajectory| {
+                        let mut input = [[0.0f32; 174]; crate::neural_osd::IN_CHANNELS];
+                        input[..crate::neural_osd::BP_ITERS].copy_from_slice(trajectory);
+                        input[crate::neural_osd::BP_ITERS] = crate::syndrome::normalize_counts(
+                            &crate::syndrome::unsatisfied_check_counts_from_llrs(llr_arr),
+                        );
+                        crate::neural_osd::predict_error_bits(&input)
+                    })
                 } else {
                     None
                 };
@@ -14466,15 +14471,15 @@ impl LdpcDecoder {
                     // would risk labels in a basis OSD never reprocessed.
                     // Both are computed only under `capture_enabled`, so the
                     // production path pays nothing.
-                    let mrb_perm = osd.mrb_permutation(llr_arr, neural_ordering.as_ref()).map(
-                        |perm| {
-                            let mut out = [0u16; 174];
-                            for (slot, &p) in out.iter_mut().zip(perm.iter()) {
-                                *slot = p as u16;
-                            }
-                            out
-                        },
-                    );
+                    let mrb_perm =
+                        osd.mrb_permutation(llr_arr, neural_ordering.as_ref())
+                            .map(|perm| {
+                                let mut out = [0u16; 174];
+                                for (slot, &p) in out.iter_mut().zip(perm.iter()) {
+                                    *slot = p as u16;
+                                }
+                                out
+                            });
                     let syndrome_counts =
                         crate::syndrome::unsatisfied_check_counts_from_llrs(llr_arr);
                     crate::bp_trajectory_capture::record(

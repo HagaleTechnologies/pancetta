@@ -18,7 +18,7 @@
 
 use std::sync::OnceLock;
 
-const CONV1_WEIGHT_LEN: usize = 32 * 25 * 3; // 2400
+const CONV1_WEIGHT_LEN: usize = 32 * 26 * 3; // 2496
 const CONV1_BIAS_LEN: usize = 32;
 const CONV2_WEIGHT_LEN: usize = 16 * 32 * 3; // 1536
 const CONV2_BIAS_LEN: usize = 16;
@@ -33,7 +33,7 @@ const TOTAL_LEN: usize = CONV1_WEIGHT_LEN
     + CONV3_WEIGHT_LEN
     + CONV3_BIAS_LEN
     + LINEAR_WEIGHT_LEN
-    + LINEAR_BIAS_LEN; // 19926
+    + LINEAR_BIAS_LEN; // 20022
 
 const RAW_BYTES: &[u8] = include_bytes!("../assets/neural_osd_weights.bin");
 
@@ -135,6 +135,7 @@ pub fn linear_bias() -> &'static [f32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn weights_load_with_expected_dimensions() {
@@ -149,11 +150,32 @@ mod tests {
     }
 
     #[test]
-    fn checksum_matches_dumper() {
-        // Sentinel values printed by examples/dump_neural_weights.rs.
-        // If the binary blob is regenerated, these may shift; update both.
-        assert!((conv1_weight()[0] - -7.682037e-3).abs() < 1e-9);
-        assert!((conv1_bias()[0] - -3.2619007e-2).abs() < 1e-9);
-        assert!((linear_bias()[0] - 1.7349027e-2).abs() < 1e-9);
+    fn provenance_matches_compiled_blob_schema_and_hash() {
+        let provenance: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/neural_osd_weights.provenance.json"))
+                .expect("valid neural OSD provenance JSON");
+        assert_eq!(provenance["total_len"], TOTAL_LEN);
+        assert_eq!(provenance["byte_length"], RAW_BYTES.len());
+        let digest = format!("{:x}", Sha256::digest(RAW_BYTES));
+        assert_eq!(provenance["sha256"], digest);
+        let lengths: Vec<usize> = provenance["tensors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["length"].as_u64().unwrap() as usize)
+            .collect();
+        assert_eq!(
+            lengths,
+            vec![
+                CONV1_WEIGHT_LEN,
+                CONV1_BIAS_LEN,
+                CONV2_WEIGHT_LEN,
+                CONV2_BIAS_LEN,
+                CONV3_WEIGHT_LEN,
+                CONV3_BIAS_LEN,
+                LINEAR_WEIGHT_LEN,
+                LINEAR_BIAS_LEN,
+            ]
+        );
     }
 }

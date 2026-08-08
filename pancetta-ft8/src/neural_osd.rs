@@ -16,7 +16,8 @@ use crate::neural_osd_weights::{
 
 const N_CODEWORD: usize = 174;
 const K_INFO: usize = 91;
-const BP_ITERS: usize = 25;
+pub const BP_ITERS: usize = 25;
+pub const IN_CHANNELS: usize = BP_ITERS + 1;
 const CONV1_OUT: usize = 32;
 const CONV2_OUT: usize = 16;
 
@@ -24,7 +25,7 @@ const CONV2_OUT: usize = 16;
 ///
 /// Input: LLR trajectory from 25 BP iterations (trajectory[iter][bit]).
 /// Output: 91 probabilities — higher means more likely wrong.
-pub fn predict_error_bits(trajectory: &[[f32; N_CODEWORD]; BP_ITERS]) -> [f32; K_INFO] {
+pub fn predict_error_bits(input: &[[f32; N_CODEWORD]; IN_CHANNELS]) -> [f32; K_INFO] {
     // Borrow the weight slices once at the top so the inner loops avoid
     // re-resolving the OnceLock on every access. The OnceLock load itself
     // is cheap, but the inner loop runs hundreds of millions of times per
@@ -43,12 +44,12 @@ pub fn predict_error_bits(trajectory: &[[f32; N_CODEWORD]; BP_ITERS]) -> [f32; K
     for out_ch in 0..CONV1_OUT {
         for pos in 0..N_CODEWORD {
             let mut sum = conv1_b[out_ch];
-            for in_ch in 0..BP_ITERS {
+            for in_ch in 0..IN_CHANNELS {
                 for k in 0..3usize {
                     let p = pos as isize + k as isize - 1;
                     if p >= 0 && (p as usize) < N_CODEWORD {
-                        sum += trajectory[in_ch][p as usize]
-                            * conv1_w[out_ch * BP_ITERS * 3 + in_ch * 3 + k];
+                        sum += input[in_ch][p as usize]
+                            * conv1_w[out_ch * IN_CHANNELS * 3 + in_ch * 3 + k];
                     }
                 }
             }
@@ -106,7 +107,7 @@ mod tests {
 
     #[test]
     fn test_predict_error_bits_runs() {
-        let mut trajectory = [[0.0f32; N_CODEWORD]; BP_ITERS];
+        let mut trajectory = [[0.0f32; N_CODEWORD]; IN_CHANNELS];
         for iter in 0..BP_ITERS {
             for bit in 0..N_CODEWORD {
                 trajectory[iter][bit] = (iter as f32 - 12.0) * 0.1;
@@ -122,9 +123,24 @@ mod tests {
 
     #[test]
     fn test_predict_deterministic() {
-        let trajectory = [[1.0f32; N_CODEWORD]; BP_ITERS];
+        let trajectory = [[1.0f32; N_CODEWORD]; 26];
         let p1 = predict_error_bits(&trajectory);
         let p2 = predict_error_bits(&trajectory);
         assert_eq!(p1, p2, "Forward pass should be deterministic");
+    }
+
+    #[test]
+    fn migrated_zero_weight_syndrome_channel_is_inert() {
+        let mut zero_syndrome = [[0.25f32; N_CODEWORD]; IN_CHANNELS];
+        zero_syndrome[BP_ITERS] = [0.0; N_CODEWORD];
+        let mut nonzero_syndrome = zero_syndrome;
+        for (bit, value) in nonzero_syndrome[BP_ITERS].iter_mut().enumerate() {
+            *value = bit as f32 / N_CODEWORD as f32;
+        }
+        assert_eq!(
+            predict_error_bits(&zero_syndrome),
+            predict_error_bits(&nonzero_syndrome),
+            "the migrated blob must keep the new syndrome channel zero-weighted",
+        );
     }
 }
