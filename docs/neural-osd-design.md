@@ -270,6 +270,6 @@ When built (separately, per the brief — this doc stops here):
   captured trajectories for training-distribution fidelity; keep synth only for
   volume/coverage, and verify the two BP implementations produce comparable
   trajectories (a silent divergence would poison synth labels).
-- `neural_osd_weights_ensemble_si.bin` is a **dormant** S3 artifact next to the live
-  blob; the loader reads only `neural_osd_weights.bin`. Remove or clearly quarantine
-  it to avoid confusion.
+- The former `neural_osd_weights_ensemble_si.bin` dormant S3 artifact was removed by PAN-9;
+  the loader reads only `neural_osd_weights.bin`, so retaining the unused blob only caused
+  confusion.

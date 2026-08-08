@@ -1006,10 +1006,10 @@ current_ratio: 0.051
     Follow-ups: hb-067 (mBP offset), hb-065 (adaptive GE — profile first),
     hb-064 (DIA trajectory features — could retrain OSD on layered trajs).
 
-### hb-064 — DIA-augmented OSD with iteration-trajectory features  [PRIORITY: 0.42, Session 2 SHELVED 2026-05-31; Session 3 deferred]
+### hb-064 — DIA-augmented OSD with iteration-trajectory features  [PRIORITY: 0.42, Session 2 SHELVED 2026-05-31; Session 3 complete/A-B pending]
   mode: ft8
   status_2026_05_31_session2: SHELVED — Session 2 retrained the existing DIA CNN (20K params) on the Session 1 production-config trajectory JSONL (545 OSD-recovered samples, focal loss γ=2, MPS, 60-epoch cosine schedule). Offline: model beats |LLR|-ordering baseline 5.3× on sample-level top-T recovery (0.291 vs 0.055). A/B on hard-200: composite −0.00022 (4942→4938 rec, 1970→1835 novel), elapsed −7.4% (183.0s→169.5s). Composite regression is the binding SHELVE condition; the −135 novels indicates mild OOD drift (training pool was 33 WAVs incl. only 25 hard-200 head). Defer to Session 3 (bigger corpus and/or different architecture). See commit afd5921 (iter/2026-05-31-hb-064-session2 branch, not merged) + research/experiments/2026-05-31-hb-064-dia-osd-session2.md.
-  status: pending Session 3 — plan-sized (priority preserved at 0.42 since Session 2 produced a real but insufficient signal; Session 3 has clear levers).
+  status: Session 3 complete/A-B pending — the 708-WAV sweep captured 113,340 trajectories and 2,029 labels before its time budget; all eight shared-init fine-tunes regressed offline sample recovery (0.337 to 0.19–0.23), and the production A/B did not finish under extreme host contention. PAN-9 replaces the per-bit objective and provides a preflighted depth-1 attribution gate.
   priority_score: 0.42
   estimated_effort: 2-3 sessions remaining (bigger training corpus, possibly new architecture)
   expected_delta: paper reports 97% TEP-enumeration reduction at SNR=2dB on CCSDS (128,64); Session 2 hit −7.4% wall-clock elapsed with a composite regression
@@ -1030,17 +1030,11 @@ current_ratio: 0.051
       research/experiments/2026-05-31-hb-064-dia-osd-session1.md.
     Session 2: retrain + A/B — see
       research/experiments/2026-05-31-hb-064-dia-osd-session2.md.
-    Session 3 levers (NOT YET STARTED):
-      a) Scale the training corpus from 33 WAVs (25 hard-200 head) to full
-         hard-200 + hard-1000. Expect ~5-10× more recovered positives, less
-         OOD drift, possibly enough to flip the composite to +.
-      b) Try a wider model: transformer-style bit-attention over the
-         trajectory, or hand-add the 7 scalar features as a wide path
-         alongside the convolutions.
-      c) Train + evaluate against a different OSD operating point (e.g.
-         disable parity gate, allow OSD on more BP failures) — Session 2's
-         metric was confined to gate-pass samples, missing the bulk of the
-         BP-failure population.
+    Session 3 completed 2026-06-02; its journal is authoritative. It scaled
+    capture to 708 WAVs (stopping at 113,340 trajectories / 2,029 labels),
+    verified the shared-init ensemble mechanism, and found a strong negative
+    offline prior. The A/B was incomplete because concurrent eval load exceeded
+    120. See research/experiments/2026-06-02-hb-064-session3.md.
 
 ### hb-065 — Adaptive Gaussian-Elimination removal in OSD  [SHELVED 2026-05-25 — batch 11]
   mode: ft8
