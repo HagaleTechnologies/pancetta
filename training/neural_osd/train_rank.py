@@ -53,6 +53,8 @@ def soft_rank_loss_tensor(scores, labels, tau=0.1):
     soft_ranks = torch.sigmoid(pairwise).sum(dim=2)
     positives = labels.sum(dim=1)
     valid = positives > 0
+    if not valid.any():
+        raise ValueError("soft-rank minibatch has no positive labels")
     return ((soft_ranks * labels).sum(dim=1)[valid] / positives[valid]).mean()
 
 
@@ -77,7 +79,12 @@ def load_corpus(path):
             continue
         hard = [int(value < 0.0) for value in row["final_llrs"]]
         errors = [float(a != b) for a, b in zip(codeword, hard, strict=True)]
-        labels = apply_mrb_permutation(errors, perm)[:K_INFO]
+        if sorted(perm) != list(range(N_CODEWORD)):
+            raise ValueError("mrb_perm is not a permutation of 0..173")
+        # Rust consumes output slot i as natural systematic bit i.
+        labels = errors[:K_INFO]
+        if not any(labels):
+            continue
         trajectory = np.asarray(row["trajectory_flat"], dtype=np.float32).reshape(BP_ITERS, N_CODEWORD)
         syndrome = np.asarray(row["syndrome_counts"], dtype=np.float32) / divisor
         model_input = np.concatenate([trajectory, syndrome[None, :]], axis=0)

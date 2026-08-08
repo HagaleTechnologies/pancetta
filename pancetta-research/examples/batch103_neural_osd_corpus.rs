@@ -144,10 +144,15 @@ fn decode(wav: &Path, root: &Path) -> Result<Vec<CorpusRecord>> {
             .samples::<f32>()
             .collect::<std::result::Result<_, _>>()?,
     };
-    let mut decoder = pancetta_ft8::Ft8Decoder::new(pancetta_ft8::Ft8Config::default())
+    let mut config = pancetta_ft8::Ft8Config::default();
+    config.osd_depth = Some(1);
+    config.neural_osd_enabled = false;
+    let mut decoder = pancetta_ft8::Ft8Decoder::new(config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     capture::enable_local();
-    let _ = decoder.decode_window(&samples);
+    decoder
+        .decode_window(&samples)
+        .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     capture::disable_local();
     let relative = wav
         .strip_prefix(root)

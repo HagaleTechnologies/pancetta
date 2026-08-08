@@ -4,6 +4,7 @@
 //! WAVs live in `~/.pancetta/recordings/` and are never committed.
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -79,12 +80,32 @@ pub fn preflight_curated_corpus(
 ) -> anyhow::Result<()> {
     let mut missing = Vec::new();
     for entry in entries {
+        anyhow::ensure!(
+            entry.wav_sha256.len() == 64
+                && entry
+                    .wav_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit()),
+            "invalid WAV SHA-256: {}",
+            entry.wav_sha256
+        );
         if !entry.wav_path.is_file() {
             missing.push(format!("missing WAV: {}", entry.wav_path.display()));
         }
         let baseline = baseline_dir.join(format!("{}.json", entry.wav_sha256));
         if !baseline.is_file() {
             missing.push(format!("missing baseline cache: {}", baseline.display()));
+        }
+        if entry.wav_path.is_file() {
+            let actual = format!("{:x}", Sha256::digest(std::fs::read(&entry.wav_path)?));
+            if !actual.eq_ignore_ascii_case(&entry.wav_sha256) {
+                missing.push(format!(
+                    "WAV SHA-256 mismatch: {} expected {} got {}",
+                    entry.wav_path.display(),
+                    entry.wav_sha256,
+                    actual
+                ));
+            }
         }
     }
     anyhow::ensure!(
@@ -111,14 +132,13 @@ mod tests {
     #[test]
     fn preflight_names_missing_wav_and_baseline() {
         let temp = tempfile::tempdir().unwrap();
-        let error = preflight_curated_corpus(
-            &[entry(temp.path().join("absent.wav"), "deadbeef")],
-            temp.path(),
-        )
-        .unwrap_err()
-        .to_string();
+        let sha = "deadbeef".repeat(8);
+        let error =
+            preflight_curated_corpus(&[entry(temp.path().join("absent.wav"), &sha)], temp.path())
+                .unwrap_err()
+                .to_string();
         assert!(error.contains("absent.wav"));
-        assert!(error.contains("deadbeef.json"));
+        assert!(error.contains(&format!("{sha}.json")));
     }
 
     #[test]
@@ -126,7 +146,8 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let wav = temp.path().join("sample.wav");
         std::fs::write(&wav, b"wav").unwrap();
-        std::fs::write(temp.path().join("abc.json"), b"{}").unwrap();
-        preflight_curated_corpus(&[entry(wav, "abc")], temp.path()).unwrap();
+        let sha = "61e25c2cdda1758ce167dbeb7e6d776c5cd6c2f12168f190ef0dca674ff60e6c";
+        std::fs::write(temp.path().join(format!("{sha}.json")), b"{}").unwrap();
+        preflight_curated_corpus(&[entry(wav, sha)], temp.path()).unwrap();
     }
 }

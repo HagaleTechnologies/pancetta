@@ -1556,7 +1556,9 @@ fn run_chrono_replay_tier(
         wsjtx_total += baseline_decodes.len() as u32;
         truth_decodes_total += baseline_decodes.len() as u32;
 
-        let mut our_decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        let mut our_decodes = decoder
+            .decode_wav(&entry.wav_path)
+            .with_context(|| format!("decode {}", entry.wav_path.display()))?;
         apply_fp_filter(fp_filter, &mut our_decodes);
 
         if let Some(min_ttfd) = our_decodes
@@ -1759,7 +1761,9 @@ fn run_curated_tier(
         wsjtx_total += baseline_decodes.len() as u32;
         truth_decodes_total += baseline_decodes.len() as u32;
 
-        let mut our_decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        let mut our_decodes = decoder
+            .decode_wav(&entry.wav_path)
+            .with_context(|| format!("decode {}", entry.wav_path.display()))?;
         apply_fp_filter(fp_filter, &mut our_decodes);
         // hb-129: per-WAV TTFD — min decode_time_into_window_s over decodes.
         // WAVs with zero stamped decodes don't contribute to the distribution.
