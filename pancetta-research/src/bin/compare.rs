@@ -12,6 +12,10 @@
 //! - `--no-bootstrap` disables (e.g. for legacy scorecards).
 //! - `--bootstrap-n N` sets the number of resamples (default 1000).
 //! - `--bootstrap-seed S` sets the deterministic seed (default 0xb007).
+//!   Accepts decimal or `0x`-prefixed hexadecimal.
+//! - `--max-elapsed-regression-pct P` sets the elapsed-time budget (default
+//!   20 %). Enforced as a hard gate when both runs share a host and core
+//!   count; reported but not enforced otherwise.
 
 use anyhow::Context;
 use pancetta_research::bootstrap_ci::{bootstrap_novel_delta, bootstrap_recall_delta, DeltaCi};
@@ -26,6 +30,7 @@ struct Args {
     bootstrap: bool,
     bootstrap_n: usize,
     bootstrap_seed: u64,
+    max_elapsed_regression_pct: f64,
 }
 
 impl Args {
@@ -33,6 +38,7 @@ impl Args {
         let mut bootstrap = true;
         let mut bootstrap_n: usize = 1000;
         let mut bootstrap_seed: u64 = 0xb007;
+        let mut max_elapsed_regression_pct: f64 = 20.0;
         let mut positional: Vec<PathBuf> = Vec::new();
         let mut iter = std::env::args().skip(1);
         while let Some(arg) = iter.next() {
@@ -47,15 +53,26 @@ impl Args {
                         .context("--bootstrap-n must be a positive integer")?;
                 }
                 "--bootstrap-seed" => {
-                    bootstrap_seed = iter
+                    let raw = iter.next().context("--bootstrap-seed requires a value")?;
+                    bootstrap_seed = parse_u64_auto(&raw)
+                        .with_context(|| format!("--bootstrap-seed must be a u64 (got {raw:?})"))?;
+                }
+                "--max-elapsed-regression-pct" => {
+                    let raw = iter
                         .next()
-                        .context("--bootstrap-seed requires a value")?
-                        .parse()
-                        .context("--bootstrap-seed must be a u64")?;
+                        .context("--max-elapsed-regression-pct requires a value")?;
+                    max_elapsed_regression_pct = raw.parse().with_context(|| {
+                        format!("--max-elapsed-regression-pct must be a number (got {raw:?})")
+                    })?;
+                    anyhow::ensure!(
+                        max_elapsed_regression_pct.is_finite() && max_elapsed_regression_pct >= 0.0,
+                        "--max-elapsed-regression-pct must be a finite, non-negative percentage"
+                    );
                 }
                 "-h" | "--help" => {
                     println!(
-                        "usage: compare A.json B.json [--no-bootstrap] [--bootstrap-n N] [--bootstrap-seed S]"
+                        "usage: compare A.json B.json [--no-bootstrap] [--bootstrap-n N] \
+                         [--bootstrap-seed S] [--max-elapsed-regression-pct P]"
                     );
                     std::process::exit(0);
                 }
@@ -72,8 +89,30 @@ impl Args {
             bootstrap,
             bootstrap_n,
             bootstrap_seed,
+            max_elapsed_regression_pct,
         })
     }
+}
+
+/// Parse a u64 in either decimal or `0x`-prefixed hexadecimal.
+///
+/// The seed's own default is documented as `0xb007`, so an operator copying
+/// that literal back onto `--bootstrap-seed` must not be rejected by a
+/// decimal-only parser. Underscores are permitted as digit separators.
+fn parse_u64_auto(raw: &str) -> anyhow::Result<u64> {
+    let trimmed = raw.trim();
+    let cleaned: String = trimmed.replace('_', "");
+    let parsed = match cleaned
+        .strip_prefix("0x")
+        .or_else(|| cleaned.strip_prefix("0X"))
+    {
+        Some(hex) => {
+            anyhow::ensure!(!hex.is_empty(), "hexadecimal literal has no digits");
+            u64::from_str_radix(hex, 16)?
+        }
+        None => cleaned.parse::<u64>()?,
+    };
+    Ok(parsed)
 }
 
 fn fmt_pct(x: f64) -> String {
@@ -339,6 +378,59 @@ fn fp_on_noise_hard_gate(a: &Scorecard, b: &Scorecard) -> Vec<String> {
 ///
 /// Returns `Vec::new()` when the gate passes (including when neither
 /// scorecard carries any `novels_unverified` data — nothing to gate on).
+/// Outcome of the elapsed-time gate (PAN-9 A/B runbook).
+#[derive(Debug, PartialEq)]
+enum ElapsedGate {
+    /// Not comparable — different host or core count, or a non-positive
+    /// baseline. `elapsed_seconds` is wall-clock and host-bound, so comparing
+    /// across machines would be meaningless; report and do not enforce.
+    Skipped(String),
+    /// Comparable and within budget.
+    Passed(String),
+    /// Comparable and over budget — a hard failure.
+    Failed(String),
+}
+
+/// PAN-9 (2026-08-11) — the elapsed-time gate the depth-1 A/B runbook cites.
+///
+/// The runbook makes "clears the elapsed gate" a ship condition, so the
+/// threshold behind it has to be defined and enforced rather than left to the
+/// operator's eye. A candidate that recovers more messages but costs a large
+/// runtime regression is not automatically shippable.
+///
+/// Enforcement is conditional on comparability: `HarnessInfo::elapsed_seconds`
+/// is wall-clock, so it is only meaningful between runs on the same host with
+/// the same core count.
+fn elapsed_regression_gate(a: &Scorecard, b: &Scorecard, max_pct: f64) -> ElapsedGate {
+    let (base, cand) = (a.harness.elapsed_seconds, b.harness.elapsed_seconds);
+    if a.harness.host != b.harness.host {
+        return ElapsedGate::Skipped(format!(
+            "  (skipped: host differs — {} vs {}; wall-clock is not comparable across machines)",
+            a.harness.host, b.harness.host
+        ));
+    }
+    if a.harness.cores_used != b.harness.cores_used {
+        return ElapsedGate::Skipped(format!(
+            "  (skipped: cores_used differs — {} vs {})",
+            a.harness.cores_used, b.harness.cores_used
+        ));
+    }
+    if !base.is_finite() || !cand.is_finite() || base <= 0.0 {
+        return ElapsedGate::Skipped(format!(
+            "  (skipped: baseline elapsed_seconds is {base}; nothing to compare against)"
+        ));
+    }
+    let delta_pct = (cand - base) / base * 100.0;
+    let line = format!(
+        "  elapsed_seconds        {base:.1} → {cand:.1}  ({delta_pct:+.1}%, budget +{max_pct:.1}%)"
+    );
+    if delta_pct > max_pct {
+        ElapsedGate::Failed(line)
+    } else {
+        ElapsedGate::Passed(line)
+    }
+}
+
 fn unverified_novel_standing_gate(a: &Scorecard, b: &Scorecard) -> Vec<String> {
     let tier_keys: Vec<&String> = a
         .tiers
@@ -553,6 +645,26 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
+    // PAN-9 (2026-08-11) — the elapsed-time gate. Always reported so the
+    // runbook's "clears the elapsed gate" step has a defined pass/fail, and
+    // enforced with a nonzero exit when the two runs are actually comparable.
+    let elapsed_gate = elapsed_regression_gate(&a, &b, args.max_elapsed_regression_pct);
+    println!("ELAPSED GATE:");
+    match &elapsed_gate {
+        ElapsedGate::Skipped(line) | ElapsedGate::Passed(line) => println!("{line}"),
+        ElapsedGate::Failed(line) => println!("{line}"),
+    }
+    println!();
+    if let ElapsedGate::Failed(line) = &elapsed_gate {
+        println!("############################################################");
+        println!("# HARD GATE FAILURE — ELAPSED TIME REGRESSED BEYOND BUDGET");
+        println!("# Raise --max-elapsed-regression-pct only with an explicit rationale.");
+        println!("############################################################");
+        println!("{line}");
+        println!();
+        std::process::exit(1);
+    }
+
     // Task W0.3 (2026-07-06) — the unverified-novel standing-gate term.
     // Same enforcement style as the FP-on-noise gate above (prominent
     // banner + nonzero exit), extending the standing A/B gate per the
@@ -573,4 +685,111 @@ fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use pancetta_research::scorecard::{
+        BuildInfo, CompositeInfo, ConfigInfo, GitInfo, HarnessInfo, RegressionFlags,
+    };
+
+    fn card(host: &str, cores: usize, elapsed: f64) -> Scorecard {
+        Scorecard {
+            schema_version: Scorecard::CURRENT_SCHEMA_VERSION,
+            generated_at: chrono::Utc::now(),
+            mode: pancetta_research::Mode::Ft8,
+            git: GitInfo {
+                branch: "test".into(),
+                head_sha: "0000000".into(),
+                main_merge_base: "0000000".into(),
+                dirty: false,
+            },
+            build: BuildInfo {
+                rustc_version: "1.85.0".into(),
+                release: true,
+                features: vec![],
+            },
+            harness: HarnessInfo {
+                harness_version: "test".into(),
+                host: host.into(),
+                cores_used: cores,
+                elapsed_seconds: elapsed,
+            },
+            config: ConfigInfo {
+                decoder: serde_json::json!({}),
+                seed: 0,
+                tiers_run: vec![],
+                fp_filter_active: false,
+            },
+            tiers: BTreeMap::new(),
+            composite: CompositeInfo {
+                weights: BTreeMap::new(),
+                score: 0.0,
+                main_baseline_score: None,
+                delta_vs_main: None,
+            },
+            regressions: RegressionFlags::default(),
+            notes: String::new(),
+        }
+    }
+
+    #[test]
+    fn bootstrap_seed_accepts_the_hex_literal_the_docs_advertise() {
+        // The documented default is 0xb007; an operator passing it back must
+        // not be rejected by a decimal-only parser.
+        assert_eq!(parse_u64_auto("0xb007").unwrap(), 0xb007);
+        assert_eq!(parse_u64_auto("0XB007").unwrap(), 0xb007);
+        assert_eq!(parse_u64_auto("45063").unwrap(), 0xb007);
+        assert_eq!(parse_u64_auto("0xb_007").unwrap(), 0xb007);
+    }
+
+    #[test]
+    fn bootstrap_seed_rejects_garbage() {
+        assert!(parse_u64_auto("0x").is_err());
+        assert!(parse_u64_auto("zzz").is_err());
+        assert!(parse_u64_auto("-1").is_err());
+    }
+
+    #[test]
+    fn elapsed_gate_fails_when_regression_exceeds_budget() {
+        let a = card("h", 8, 100.0);
+        let b = card("h", 8, 130.0); // +30 % against a 20 % budget
+        assert!(matches!(
+            elapsed_regression_gate(&a, &b, 20.0),
+            ElapsedGate::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn elapsed_gate_passes_within_budget_and_on_improvement() {
+        let a = card("h", 8, 100.0);
+        assert!(matches!(
+            elapsed_regression_gate(&a, &card("h", 8, 110.0), 20.0),
+            ElapsedGate::Passed(_)
+        ));
+        assert!(matches!(
+            elapsed_regression_gate(&a, &card("h", 8, 80.0), 20.0),
+            ElapsedGate::Passed(_)
+        ));
+    }
+
+    #[test]
+    fn elapsed_gate_skips_when_runs_are_not_comparable() {
+        let a = card("host-a", 8, 100.0);
+        // Wall-clock across different machines or core counts is meaningless.
+        assert!(matches!(
+            elapsed_regression_gate(&a, &card("host-b", 8, 500.0), 20.0),
+            ElapsedGate::Skipped(_)
+        ));
+        assert!(matches!(
+            elapsed_regression_gate(&a, &card("host-a", 4, 500.0), 20.0),
+            ElapsedGate::Skipped(_)
+        ));
+        // A zero baseline has no meaningful percentage.
+        assert!(matches!(
+            elapsed_regression_gate(&card("host-a", 8, 0.0), &card("host-a", 8, 5.0), 20.0),
+            ElapsedGate::Skipped(_)
+        ));
+    }
 }

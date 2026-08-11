@@ -71,32 +71,49 @@ def load_corpus(path):
     contract = load_contract()
     divisor = float(contract["syndrome_normalization_divisor"])
     groups = {"train": ([], []), "val": ([], []), "test": ([], [])}
-    for line in Path(path).read_text().splitlines():
-        row = json.loads(line)
-        if row.get("schema_version") != 2 or not row.get("osd_recovered"):
-            continue
-        perm = row.get("mrb_perm")
-        codeword = row.get("osd_codeword")
-        if not perm or not codeword:
-            continue
-        hard = [int(value < 0.0) for value in row["final_llrs"]]
-        if len(codeword) != len(hard):
-            raise ValueError("osd_codeword and final_llrs lengths differ")
-        errors = [float(a != b) for a, b in zip(codeword, hard)]
-        if sorted(perm) != list(range(N_CODEWORD)):
-            raise ValueError("mrb_perm is not a permutation of 0..173")
-        # Rust consumes output slot i as natural systematic bit i.
-        labels = errors[:K_INFO]
-        if not any(labels):
-            continue
-        trajectory = np.asarray(row["trajectory_flat"], dtype=np.float32).reshape(BP_ITERS, N_CODEWORD)
-        syndrome = np.asarray(row["syndrome_counts"], dtype=np.float32) / divisor
-        model_input = np.concatenate([trajectory, syndrome[None, :]], axis=0)
-        split_key = row["split_key"]
-        bucket = int(hashlib.sha256(split_key.encode()).hexdigest()[:8], 16) % 10
-        split = "train" if bucket < 8 else "val" if bucket == 8 else "test"
-        groups[split][0].append(model_input)
-        groups[split][1].append(labels)
+    # Stream the JSONL: a T1 corpus is 100k-1M records and multi-gigabyte, so
+    # materializing every line up front costs several times the corpus size in
+    # peak RSS before a single sample is decoded.
+    with open(path, "r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            # A non-v2 row is a corpus-construction error, not something to skip:
+            # silently dropping schema-v1 captures trains on an unnoticed subset
+            # and reports plausible but misleading metrics.
+            schema_version = row.get("schema_version")
+            if schema_version != 2:
+                raise ValueError(
+                    f"{path}:{line_number}: unsupported schema_version "
+                    f"{schema_version!r} (expected 2); regenerate the corpus "
+                    "with the schema-v2 generator"
+                )
+            if not row.get("osd_recovered"):
+                continue
+            perm = row.get("mrb_perm")
+            codeword = row.get("osd_codeword")
+            if not perm or not codeword:
+                continue
+            hard = [int(value < 0.0) for value in row["final_llrs"]]
+            if len(codeword) != len(hard):
+                raise ValueError("osd_codeword and final_llrs lengths differ")
+            errors = [float(a != b) for a, b in zip(codeword, hard)]
+            if sorted(perm) != list(range(N_CODEWORD)):
+                raise ValueError("mrb_perm is not a permutation of 0..173")
+            # Rust consumes output slot i as natural systematic bit i.
+            labels = errors[:K_INFO]
+            if not any(labels):
+                continue
+            trajectory = np.asarray(row["trajectory_flat"], dtype=np.float32).reshape(BP_ITERS, N_CODEWORD)
+            syndrome = np.asarray(row["syndrome_counts"], dtype=np.float32) / divisor
+            model_input = np.concatenate([trajectory, syndrome[None, :]], axis=0)
+            split_key = row["split_key"]
+            bucket = int(hashlib.sha256(split_key.encode()).hexdigest()[:8], 16) % 10
+            split = "train" if bucket < 8 else "val" if bucket == 8 else "test"
+            groups[split][0].append(model_input)
+            groups[split][1].append(labels)
     return {
         name: (np.asarray(values[0], dtype=np.float32), np.asarray(values[1], dtype=np.float32))
         for name, values in groups.items()

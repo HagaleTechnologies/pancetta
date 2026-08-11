@@ -71,6 +71,18 @@ fn main() -> Result<()> {
         "tier {tier} wrote zero records from {} WAVs",
         wavs.len()
     );
+    // A record count alone does not make a trainable corpus: `load_corpus` keeps
+    // only OSD-recovered rows, so a long T1 run with zero recoveries would exit
+    // successfully and publish a corpus that later filters to an empty split.
+    // T0 is a pipeline proof, not a training tier, so it only warns.
+    if tier == "t1" {
+        anyhow::ensure!(
+            labels > 0,
+            "tier t1 captured {records} records from {} WAVs but zero OSD-recovered \
+             labels; the corpus has no trainable positives",
+            wavs.len()
+        );
+    }
     println!(
         "tier={tier} wavs={} records={records} labeled={labels} output={}",
         wavs.len(),
@@ -78,6 +90,9 @@ fn main() -> Result<()> {
     );
     if tier == "t0" {
         println!("T0 PIPELINE CHECK ONLY — too little label yield for a shippable model");
+        if labels == 0 {
+            println!("WARNING: zero OSD-recovered labels — capture pipeline ran but produced no positives");
+        }
     }
     Ok(())
 }
@@ -136,10 +151,23 @@ fn decode(wav: &Path, root: &Path) -> Result<Vec<CorpusRecord>> {
         wav.display()
     );
     let samples: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Int => reader
-            .samples::<i16>()
-            .map(|v| v.map(|v| v as f32 / 32768.0))
-            .collect::<std::result::Result<_, _>>()?,
+        // Decode integer PCM at its declared width. The recursive T1 scan over
+        // ~/.pancetta/recordings routinely meets 24- and 32-bit captures, which
+        // `samples::<i16>()` rejects as too wide — aborting the whole corpus run
+        // — while narrower PCM would silently get a fixed 16-bit scale.
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample;
+            anyhow::ensure!(
+                (1..=32).contains(&bits),
+                "{} declares an unsupported integer bit depth of {bits}",
+                wav.display()
+            );
+            let scale = (1i64 << (bits - 1)) as f32;
+            reader
+                .samples::<i32>()
+                .map(|v| v.map(|v| v as f32 / scale))
+                .collect::<std::result::Result<_, _>>()?
+        }
         hound::SampleFormat::Float => reader
             .samples::<f32>()
             .collect::<std::result::Result<_, _>>()?,

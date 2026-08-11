@@ -36,7 +36,10 @@ TENSOR_ORDER = [
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=str, default="model.pt")
+    # Must match train_rank.py's --output default: a mismatch either fails the
+    # export outright in a clean directory or silently packages a stale legacy
+    # model.pt from a reused one, invalidating the A/B.
+    parser.add_argument("--model", type=str, default="rank_model.pt")
     parser.add_argument(
         "--output",
         type=str,

@@ -72,6 +72,53 @@ class SoftRankLossTests(unittest.TestCase):
         self.assertEqual(labels[0, 0], 1.0)
         self.assertEqual(labels[0].sum(), 1.0)
 
+    def test_loader_rejects_unsupported_schema_versions(self):
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("NumPy is not installed")
+        # A schema-v1 row must abort the load rather than be skipped: silently
+        # dropping legacy captures trains on an unnoticed subset of the corpus.
+        row = {
+            "schema_version": 1,
+            "osd_recovered": True,
+            "mrb_perm": list(range(174)),
+            "osd_codeword": [0] * 174,
+            "final_llrs": [1.0] * 174,
+            "trajectory_flat": [0.0] * (25 * 174),
+            "syndrome_counts": [0] * 174,
+            "split_key": "legacy-row",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Path(directory) / "capture.jsonl"
+            corpus.write_text(json.dumps(row) + "\n")
+            with self.assertRaises(ValueError) as caught:
+                load_corpus(corpus)
+        self.assertIn("schema_version", str(caught.exception))
+
+    def test_loader_tolerates_blank_trailing_lines(self):
+        try:
+            import numpy  # noqa: F401
+        except ImportError:
+            self.skipTest("NumPy is not installed")
+        codeword = [0] * 174
+        codeword[0] = 1
+        row = {
+            "schema_version": 2,
+            "osd_recovered": True,
+            "mrb_perm": list(range(174)),
+            "osd_codeword": codeword,
+            "final_llrs": [1.0] * 174,
+            "trajectory_flat": [0.0] * (25 * 174),
+            "syndrome_counts": [0] * 174,
+            "split_key": "blank-line-tolerance",
+        }
+        with tempfile.TemporaryDirectory() as directory:
+            corpus = Path(directory) / "capture.jsonl"
+            corpus.write_text(json.dumps(row) + "\n\n")
+            splits = load_corpus(corpus)
+        self.assertTrue(any(len(values[1]) for values in splits.values()))
+
     def test_permutation_then_inverse_is_identity(self):
         values = list(range(174))
         perm = list(range(173, -1, -1))
