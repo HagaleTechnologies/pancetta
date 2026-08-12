@@ -1768,10 +1768,12 @@ impl QsoManager {
 
     /// Two-strike confirm-before-relatch at an explicit time (for testability,
     /// mirroring [`Self::check_timeouts_at`]'s pattern): track a pending off-latch
-    /// frequency candidate per QSO, and only relatch (mutate both `metadata.frequency`
-    /// and the active state's own embedded `frequency` field) once a SECOND message
-    /// from the same identified partner repeats at the same new frequency AT LEAST 5
-    /// real seconds after the candidate was FIRST noted. Runs BEFORE the existing
+    /// frequency candidate per QSO, and only relatch once a SECOND message from the
+    /// same identified partner repeats at the same new frequency AT LEAST 5 real
+    /// seconds after the candidate was FIRST noted. Ordinary Tx=Rx QSOs relatch both
+    /// `metadata.frequency` and the active state's embedded `frequency`; non-Hound
+    /// split-TX QSOs relatch only `metadata.partner_freq`, preserving our deliberate
+    /// TX offset. Runs BEFORE the existing
     /// `find_qsos_for_message`/`is_message_relevant` routing, which stays completely
     /// unmodified — see
     /// `docs/superpowers/specs/2026-07-27-qso-frequency-relatch-v2-design.md`.
@@ -1840,15 +1842,11 @@ impl QsoManager {
             if !progress.state.is_active() {
                 continue;
             }
-            if progress.metadata.partner_freq.is_some() {
-                // Any split-TX QSO -- not just Hound/Fox. `partner_freq` is also set by
-                // `compute_manual_tx_offset` for a manually-deconflicted TX offset (e.g.
-                // a MIN_TX_SEPARATION_HZ collision nudge, or a DX heard beyond
-                // TX_OFFSET_MAX_HZ clamped down for our own reply). Every such QSO
-                // already tracks the DX's real RX frequency separately from our own TX
-                // offset via `partner_freq`/`is_message_relevant`'s own routing (see that
-                // function's Hound-mode branch) -- this drift-confirm mechanism is scoped
-                // to the ordinary Tx=Rx case only and deliberately does not touch these.
+            if progress.metadata.hound {
+                // Genuine Hound/Fox only. The Fox's RX offset is protocol-fixed for
+                // the QSO's life and Hound has its own one-shot QSY mechanism.
+                // `partner_freq` alone is not a Hound discriminator: ordinary manual
+                // QSOs also set it after an offset hold, collision nudge, or clamp.
                 continue;
             }
             let Some(their_callsign) = progress.state.their_callsign().map(|s| s.to_string())
@@ -1861,7 +1859,11 @@ impl QsoManager {
             let Some(qso_freq) = progress.state.frequency() else {
                 continue;
             };
-            let distance = (qso_freq - frequency).abs();
+            // Where we expect to hear the DX. This is deliberately identical to
+            // is_message_relevant's baseline so both gates agree on their location.
+            let split_tx = progress.metadata.partner_freq;
+            let match_freq = split_tx.unwrap_or(qso_freq);
+            let distance = (match_freq - frequency).abs();
 
             if distance <= ESTABLISHED_FREQ_TOLERANCE_HZ {
                 progress.metadata.pending_freq_drift = None;
@@ -1878,59 +1880,91 @@ impl QsoManager {
             });
 
             if confirmed {
-                let old_state = progress.state.clone();
-                progress.metadata.frequency = frequency;
                 progress.metadata.pending_freq_drift = None;
-                match &mut progress.state {
-                    QsoState::RespondingToCq {
-                        frequency: state_freq,
-                        ..
+                if split_tx.is_some() {
+                    progress.metadata.partner_freq = Some(frequency);
+                    info!(
+                        target: "qso.freq_gate",
+                        partner = %their_callsign,
+                        old_partner_freq = match_freq,
+                        new_partner_freq = frequency,
+                        our_tx_freq = qso_freq,
+                        "confirmed partner drift on a split-TX QSO (2 consistent sightings, \
+                         >=5s apart) — relatching partner_freq; our TX offset is unchanged"
+                    );
+                    // The QSO state itself is deliberately untouched here (only
+                    // where we HEAR the DX moved; our TX offset did not), so
+                    // old_state == new_state. We still emit, because the
+                    // coordinator refreshes its scoped/AP decoder hint
+                    // (`active_qso_freq_hz`) only in its `StateChanged` handler,
+                    // re-reading `metadata.partner_freq` there. Without this the
+                    // decoder stays centred on the obsolete partner offset while
+                    // the relevance gate has already moved to the new one —
+                    // a confirmation arriving on a frame that leaves the state
+                    // unchanged (e.g. a repeated `SignalReport` in
+                    // `SendingReport`) has no other transition to piggyback on,
+                    // so weak replies at the relatched frequency would lose
+                    // narrow-band/AP recovery until some unrelated transition.
+                    // The handler is idempotent for a same-state event: it
+                    // re-inserts into `active_tx_qsos`/`active_tx_offsets` (both
+                    // keyed on the unchanged TX offset), recomputes AP context,
+                    // and re-pushes the TUI snapshot. It triggers no TX.
+                    let state = progress.state.clone();
+                    self.emit_state_change(qso_id, state.clone(), state).await;
+                } else {
+                    let old_state = progress.state.clone();
+                    progress.metadata.frequency = frequency;
+                    match &mut progress.state {
+                        QsoState::RespondingToCq {
+                            frequency: state_freq,
+                            ..
+                        }
+                        | QsoState::WaitingForReport {
+                            frequency: state_freq,
+                            ..
+                        }
+                        | QsoState::SendingReport {
+                            frequency: state_freq,
+                            ..
+                        }
+                        | QsoState::WaitingForConfirmation {
+                            frequency: state_freq,
+                            ..
+                        }
+                        | QsoState::SendingConfirmation {
+                            frequency: state_freq,
+                            ..
+                        }
+                        | QsoState::Contest(ContestState::ExchangingInfo {
+                            frequency: state_freq,
+                            ..
+                        })
+                        | QsoState::Contest(ContestState::ContestCompleted {
+                            frequency: state_freq,
+                            ..
+                        }) => {
+                            *state_freq = frequency;
+                        }
+                        _ => {
+                            debug_assert!(
+                                false,
+                                "confirmed drift relatch has no frequency-field mutation arm for \
+                                 this QsoState variant — metadata.frequency and the state's own \
+                                 frequency field are now desynced"
+                            );
+                        }
                     }
-                    | QsoState::WaitingForReport {
-                        frequency: state_freq,
-                        ..
-                    }
-                    | QsoState::SendingReport {
-                        frequency: state_freq,
-                        ..
-                    }
-                    | QsoState::WaitingForConfirmation {
-                        frequency: state_freq,
-                        ..
-                    }
-                    | QsoState::SendingConfirmation {
-                        frequency: state_freq,
-                        ..
-                    }
-                    | QsoState::Contest(ContestState::ExchangingInfo {
-                        frequency: state_freq,
-                        ..
-                    })
-                    | QsoState::Contest(ContestState::ContestCompleted {
-                        frequency: state_freq,
-                        ..
-                    }) => {
-                        *state_freq = frequency;
-                    }
-                    _ => {
-                        debug_assert!(
-                            false,
-                            "confirmed drift relatch has no frequency-field mutation arm for \
-                             this QsoState variant — metadata.frequency and the state's own \
-                             frequency field are now desynced"
-                        );
-                    }
+                    info!(
+                        target: "qso.freq_gate",
+                        partner = %their_callsign,
+                        old_freq = qso_freq,
+                        new_freq = frequency,
+                        "confirmed frequency drift (2 consistent sightings, >=5s apart) — \
+                         relatching QSO"
+                    );
+                    self.emit_state_change(qso_id, old_state, progress.state.clone())
+                        .await;
                 }
-                info!(
-                    target: "qso.freq_gate",
-                    partner = %their_callsign,
-                    old_freq = qso_freq,
-                    new_freq = frequency,
-                    "confirmed frequency drift (2 consistent sightings, >=5s apart) — \
-                     relatching QSO"
-                );
-                self.emit_state_change(qso_id, old_state, progress.state.clone())
-                    .await;
             } else {
                 // Only start (or leave untouched) a pending candidate — see the
                 // "duplicate delivery" doc comment above for why an existing
@@ -1945,7 +1979,7 @@ impl QsoManager {
                         target: "qso.freq_gate",
                         partner = %their_callsign,
                         candidate_freq = frequency,
-                        latched_freq = qso_freq,
+                        latched_freq = match_freq,
                         "identity-verified message outside tolerance — noting drift candidate \
                          (needs 1 more confirming sighting >=5s later)"
                     );
@@ -3899,13 +3933,12 @@ impl QsoManager {
         // established QSO is one where we already know the contra callsign
         // (i.e. not CallingCq/Idle) — `their_callsign()` is Some.
         //
-        // Hound mode: when `metadata.partner_freq` is `Some`, the Fox transmits
-        // on a *different* frequency than we do (Hound calls low; Fox replies
-        // somewhere in [1000, 4000] Hz). We must match the incoming Fox frame
-        // against the Fox's RX offset (`partner_freq`), NOT our TX offset
-        // (`state.frequency()`). When `partner_freq` is `None` (every normal
-        // QSO) `unwrap_or(qso_freq)` falls back to the latched `qso_freq`,
-        // producing byte-identical behavior to before this change.
+        // Split-TX: when `metadata.partner_freq` is `Some`, the DX transmits on
+        // a different frequency than we do. This includes Hound/Fox as well as
+        // ordinary manual offset holds, collision nudges, and passband clamps.
+        // Match incoming frames against where we hear the DX (`partner_freq`),
+        // not our TX offset. When it is `None`, `unwrap_or(qso_freq)` preserves
+        // the ordinary Tx=Rx path byte-for-byte.
         if let Some(qso_freq) = state.frequency() {
             let match_freq = metadata.partner_freq.unwrap_or(qso_freq);
             let tolerance = if state.their_callsign().is_some() {
@@ -8090,6 +8123,258 @@ mod sender_verification_tests {
             progress.metadata.pending_freq_drift, None,
             "an implausible decode must never even become a pending candidate"
         );
+    }
+
+    /// PAN-12 / issue #245: an ordinary split-TX QSO created by the TX ceiling
+    /// clamp relatches where it hears the DX while preserving our TX offset.
+    #[tokio::test]
+    async fn clamped_split_tx_qso_relatches_partner_freq_on_confirmed_drift() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K6L".into(),
+                2700.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                CallInitiation::Manual,
+                Some(2931.0),
+                false,
+            )
+            .await
+            .unwrap();
+
+        for (frequency, snr) in [(855.0, -19.0), (856.0, -17.0)] {
+            manager
+                .process_message(
+                    MessageType::SignalReport {
+                        to_station: "K5ARH".into(),
+                        from_station: "K6L".into(),
+                        report: -11,
+                    },
+                    "K5ARH K6L -11".into(),
+                    frequency,
+                    Some(snr),
+                )
+                .await
+                .unwrap();
+
+            if frequency == 855.0 {
+                let progress = manager.get_qso(qso_id).await.unwrap();
+                assert!(
+                    matches!(progress.metadata.pending_freq_drift, Some((f, _)) if f == 855.0),
+                    "a clamped split-TX QSO must note a drift candidate"
+                );
+                assert_eq!(progress.metadata.partner_freq, Some(2931.0));
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            }
+        }
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.partner_freq, Some(856.0));
+        assert_eq!(progress.metadata.frequency, 2700.0);
+        assert_eq!(progress.metadata.pending_freq_drift, None);
+        assert!(matches!(progress.state, QsoState::SendingReport { .. }));
+        if let QsoState::SendingReport { frequency, .. } = progress.state {
+            assert_eq!(frequency, 2700.0);
+        }
+    }
+
+    /// A split-TX relatch must announce itself on the event bus.
+    ///
+    /// The coordinator refreshes its scoped/AP decoder hint
+    /// (`active_qso_freq_hz`) only inside the `QsoEvent::StateChanged` arm,
+    /// where it re-reads `metadata.partner_freq`. A relatch that mutated
+    /// `partner_freq` silently therefore left the decoder centred on the
+    /// obsolete partner offset — while the relevance gate had already moved to
+    /// the new one — until some unrelated transition happened to fire. Two
+    /// repeated `SignalReport` frames leave the QSO in `SendingReport`, so
+    /// there is no such transition to piggyback on.
+    #[tokio::test]
+    async fn split_tx_relatch_emits_state_change_for_decoder_refresh() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K6L".into(),
+                2700.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                CallInitiation::Manual,
+                Some(2931.0),
+                false,
+            )
+            .await
+            .unwrap();
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "K6L".into(),
+            report: -11,
+        };
+
+        // Subscribe AFTER establishment so only relatch-driven events are seen.
+        let mut events = manager.subscribe();
+        let t0 = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 855.0, t0)
+            .await;
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 856.0, t0 + chrono::Duration::seconds(6))
+            .await;
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.partner_freq, Some(856.0));
+
+        let mut saw_state_change = false;
+        loop {
+            match events.try_recv() {
+                Ok(QsoEvent::StateChanged {
+                    qso_id: changed, ..
+                }) => {
+                    if changed == qso_id {
+                        saw_state_change = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        assert!(
+            saw_state_change,
+            "a confirmed split-TX relatch must emit StateChanged so the coordinator \
+             re-reads partner_freq into its decoder hint"
+        );
+    }
+
+    /// Once split-TX drift relatches, the relevance gate follows the new
+    /// partner location and rejects the obsolete one.
+    #[tokio::test]
+    async fn relatched_partner_freq_routes_subsequent_frames() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K6L".into(),
+                2700.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                CallInitiation::Manual,
+                Some(2931.0),
+                false,
+            )
+            .await
+            .unwrap();
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "K6L".into(),
+            report: -11,
+        };
+        let t0 = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 855.0, t0)
+            .await;
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 856.0, t0 + chrono::Duration::seconds(6))
+            .await;
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(manager.is_message_relevant(&progress.state, &progress.metadata, &report, 856.0));
+        assert!(!manager.is_message_relevant(&progress.state, &progress.metadata, &report, 2931.0));
+    }
+
+    /// A healthy held-offset QSO measures drift from partner_freq, not our TX.
+    #[tokio::test]
+    async fn held_offset_qso_with_dx_on_partner_freq_never_drifts() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_with(
+                "VK4DX".into(),
+                1500.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                CallInitiation::Manual,
+                Some(700.0),
+                false,
+            )
+            .await
+            .unwrap();
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "VK4DX".into(),
+            report: -11,
+        };
+        let t0 = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 700.0, t0)
+            .await;
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 700.0, t0 + chrono::Duration::seconds(6))
+            .await;
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.pending_freq_drift, None);
+        assert_eq!(progress.metadata.partner_freq, Some(700.0));
+        assert_eq!(progress.metadata.frequency, 1500.0);
+    }
+
+    /// Genuine Hound/Fox retains its protocol-specific drift carve-out.
+    #[tokio::test]
+    async fn genuine_hound_qso_is_still_skipped_by_drift_confirm() {
+        let manager = manager_with_call("K5ARH");
+        let mut events = manager.subscribe();
+        let qso_id = manager
+            .engage_hound(
+                "D2UY".into(),
+                1800.0,
+                Some("JI64".into()),
+                Some(pancetta_core::slot::SlotParity::Even),
+            )
+            .await
+            .unwrap();
+        while events.try_recv().is_ok() {}
+
+        for snr in [-19.0, -17.0] {
+            manager
+                .process_message(
+                    MessageType::SignalReport {
+                        to_station: "K5ARH".into(),
+                        from_station: "D2UY".into(),
+                        report: -12,
+                    },
+                    "K5ARH D2UY -12".into(),
+                    900.0,
+                    Some(snr),
+                )
+                .await
+                .unwrap();
+            if snr == -19.0 {
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            }
+        }
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.pending_freq_drift, None);
+        assert_eq!(progress.metadata.partner_freq, Some(1800.0));
+        assert!(!progress.metadata.hound_qsyed);
+        assert!(matches!(progress.state, QsoState::RespondingToCq { .. }));
+        assert!(
+            events.try_recv().is_err(),
+            "off-Fox frames must not advance, QSY, or emit a TX event"
+        );
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "D2UY".into(),
+                    report: -12,
+                },
+                "K5ARH D2UY -12".into(),
+                1800.0,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(progress.metadata.hound_qsyed);
+        assert_eq!(progress.metadata.partner_freq, Some(1800.0));
+        assert!(matches!(progress.state, QsoState::SendingReport { .. }));
     }
 
     #[tokio::test]

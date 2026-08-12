@@ -1862,6 +1862,51 @@ async fn held_offset_honored_keys_at_held_not_dx_freq() {
     sim.timeline.assert_all_released();
 }
 
+/// PAN-12 / issue #245: a manual QSO whose TX was ceiling-clamped recovers
+/// after two consistent replies at the DX's new offset, without moving our TX.
+#[tokio::test]
+async fn clamped_manual_qso_recovers_when_dx_replies_off_frequency() {
+    let (tx_off, partner) = compute_manual_tx_offset(2931.0, false, 0, &[]);
+    assert_eq!(tx_off, 2700.0);
+    assert_eq!(partner, Some(2931.0));
+
+    let mut sim = CoordSim::new("K5ARH").await;
+    let qso_id = sim
+        .manager
+        .respond_to_cq_with(
+            "K6L".to_string(),
+            tx_off,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            partner,
+            false,
+        )
+        .await
+        .expect("respond_to_cq_with with clamped offset");
+
+    let opening = sim.pump_qso_events();
+    sim.drive_slot(opening).await;
+    sim.inject_decode("K5ARH K6L -11", 855.0).await;
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    sim.inject_decode("K5ARH K6L -11", 856.0).await;
+
+    let pending = sim.pump_qso_events();
+    assert!(!pending.is_empty(), "confirmed relatch must emit a reply");
+    assert!(
+        pending
+            .iter()
+            .all(|p| (p.frequency_offset - 2700.0).abs() < 1.0),
+        "every TX must stay at 2700 Hz, got {:?}",
+        pending
+            .iter()
+            .map(|p| p.frequency_offset)
+            .collect::<Vec<_>>()
+    );
+    sim.drive_slot(pending).await;
+    sim.timeline
+        .assert_keyed_at_offset(&qso_id.to_string(), 2700.0);
+}
+
 /// **Multi-TX de-confliction:** opening a second QSO whose DX offset (1540 Hz)
 /// lands within `MIN_TX_SEPARATION_HZ` (75 Hz) of an already-active QSO's TX
 /// offset (1500 Hz) must produce a de-conflicted TX offset ≥ 75 Hz away, so
