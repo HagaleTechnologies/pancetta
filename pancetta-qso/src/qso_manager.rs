@@ -1892,6 +1892,25 @@ impl QsoManager {
                         "confirmed partner drift on a split-TX QSO (2 consistent sightings, \
                          >=5s apart) — relatching partner_freq; our TX offset is unchanged"
                     );
+                    // The QSO state itself is deliberately untouched here (only
+                    // where we HEAR the DX moved; our TX offset did not), so
+                    // old_state == new_state. We still emit, because the
+                    // coordinator refreshes its scoped/AP decoder hint
+                    // (`active_qso_freq_hz`) only in its `StateChanged` handler,
+                    // re-reading `metadata.partner_freq` there. Without this the
+                    // decoder stays centred on the obsolete partner offset while
+                    // the relevance gate has already moved to the new one —
+                    // a confirmation arriving on a frame that leaves the state
+                    // unchanged (e.g. a repeated `SignalReport` in
+                    // `SendingReport`) has no other transition to piggyback on,
+                    // so weak replies at the relatched frequency would lose
+                    // narrow-band/AP recovery until some unrelated transition.
+                    // The handler is idempotent for a same-state event: it
+                    // re-inserts into `active_tx_qsos`/`active_tx_offsets` (both
+                    // keyed on the unchanged TX offset), recomputes AP context,
+                    // and re-pushes the TUI snapshot. It triggers no TX.
+                    let state = progress.state.clone();
+                    self.emit_state_change(qso_id, state.clone(), state).await;
                 } else {
                     let old_state = progress.state.clone();
                     progress.metadata.frequency = frequency;
@@ -8157,6 +8176,73 @@ mod sender_verification_tests {
         if let QsoState::SendingReport { frequency, .. } = progress.state {
             assert_eq!(frequency, 2700.0);
         }
+    }
+
+    /// A split-TX relatch must announce itself on the event bus.
+    ///
+    /// The coordinator refreshes its scoped/AP decoder hint
+    /// (`active_qso_freq_hz`) only inside the `QsoEvent::StateChanged` arm,
+    /// where it re-reads `metadata.partner_freq`. A relatch that mutated
+    /// `partner_freq` silently therefore left the decoder centred on the
+    /// obsolete partner offset — while the relevance gate had already moved to
+    /// the new one — until some unrelated transition happened to fire. Two
+    /// repeated `SignalReport` frames leave the QSO in `SendingReport`, so
+    /// there is no such transition to piggyback on.
+    #[tokio::test]
+    async fn split_tx_relatch_emits_state_change_for_decoder_refresh() {
+        use tokio::sync::broadcast::error::TryRecvError;
+
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K6L".into(),
+                2700.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                CallInitiation::Manual,
+                Some(2931.0),
+                false,
+            )
+            .await
+            .unwrap();
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "K6L".into(),
+            report: -11,
+        };
+
+        // Subscribe AFTER establishment so only relatch-driven events are seen.
+        let mut events = manager.subscribe();
+        let t0 = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 855.0, t0)
+            .await;
+        manager
+            .maybe_confirm_frequency_drift_at(&report, 856.0, t0 + chrono::Duration::seconds(6))
+            .await;
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(progress.metadata.partner_freq, Some(856.0));
+
+        let mut saw_state_change = false;
+        loop {
+            match events.try_recv() {
+                Ok(QsoEvent::StateChanged {
+                    qso_id: changed, ..
+                }) => {
+                    if changed == qso_id {
+                        saw_state_change = true;
+                    }
+                }
+                Ok(_) => {}
+                Err(TryRecvError::Empty) | Err(TryRecvError::Closed) => break,
+                Err(TryRecvError::Lagged(_)) => continue,
+            }
+        }
+        assert!(
+            saw_state_change,
+            "a confirmed split-TX relatch must emit StateChanged so the coordinator \
+             re-reads partner_freq into its decoder hint"
+        );
     }
 
     /// Once split-TX drift relatches, the relevance gate follows the new
