@@ -3914,13 +3914,12 @@ impl QsoManager {
         // established QSO is one where we already know the contra callsign
         // (i.e. not CallingCq/Idle) — `their_callsign()` is Some.
         //
-        // Hound mode: when `metadata.partner_freq` is `Some`, the Fox transmits
-        // on a *different* frequency than we do (Hound calls low; Fox replies
-        // somewhere in [1000, 4000] Hz). We must match the incoming Fox frame
-        // against the Fox's RX offset (`partner_freq`), NOT our TX offset
-        // (`state.frequency()`). When `partner_freq` is `None` (every normal
-        // QSO) `unwrap_or(qso_freq)` falls back to the latched `qso_freq`,
-        // producing byte-identical behavior to before this change.
+        // Split-TX: when `metadata.partner_freq` is `Some`, the DX transmits on
+        // a different frequency than we do. This includes Hound/Fox as well as
+        // ordinary manual offset holds, collision nudges, and passband clamps.
+        // Match incoming frames against where we hear the DX (`partner_freq`),
+        // not our TX offset. When it is `None`, `unwrap_or(qso_freq)` preserves
+        // the ordinary Tx=Rx path byte-for-byte.
         if let Some(qso_freq) = state.frequency() {
             let match_freq = metadata.partner_freq.unwrap_or(qso_freq);
             let tolerance = if state.their_callsign().is_some() {

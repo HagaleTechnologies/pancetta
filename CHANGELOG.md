@@ -32,6 +32,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Manual split-TX QSOs whose offset was held, collision-nudged, or passband-clamped now recover after two consistent DX replies at a new frequency without moving the station's chosen TX offset ([#245](https://github.com/HagaleTechnologies/pancetta/issues/245)). Genuine Hound/Fox behavior is unchanged.
+
 - Decode-pipeline crashes now recover automatically: the coordinator restarts DSP and FT8 decoder
   tasks under the existing bounded supervisor policy, keeps adjacent stages alive during backoff,
   and records stranded in-flight QSOs as `SupervisorRestart` failures.

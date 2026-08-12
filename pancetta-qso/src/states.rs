@@ -484,14 +484,18 @@ pub struct QsoMetadata {
     pub dx_repeat_count: u32,
 
     /// Hound (DXpedition chaser) mode: this QSO calls a Fox low and QSYs up on
-    /// the Fox's report. `false` for every normal QSO.
+    /// the Fox's report. `false` for every normal QSO. This flag, rather than
+    /// `partner_freq.is_some()`, is the Hound/Fox discriminator used by the
+    /// frequency-drift carve-out.
     #[serde(default)]
     pub hound: bool,
 
-    /// The Fox's RX audio offset (Hz) — where we HEAR the Fox. Used by the
-    /// relevance gate instead of `frequency` (our TX offset) when set, because a
-    /// Hound transmits on a different offset than it listens. `None` for normal
-    /// QSOs (the gate falls back to `frequency`, unchanged behavior).
+    /// Where we hear the DX when it differs from our TX offset. Hound sets this
+    /// to the protocol-fixed Fox offset; ordinary manual QSOs set it after an
+    /// operator hold, collision nudge, or `[300, 2700]` TX clamp. The relevance
+    /// gate uses it instead of `frequency`, and non-Hound drift confirmation may
+    /// relatch it without moving our TX. Use `hound`, not presence of this field,
+    /// to identify the Hound/Fox procedure.
     #[serde(default)]
     pub partner_freq: Option<f64>,
 

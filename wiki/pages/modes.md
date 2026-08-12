@@ -36,8 +36,9 @@ periods, band dial tables, and offset regions are normative in the code and
 - **Runtime switch** — `try_switch_operating_mode` is the single gate; it
   refuses while any QSO is active (synchronous lock, zero `.await` in the
   critical section) and only then mutates the shared protocol + timing atomics.
-- **Hound** — a manual `Tx≠Rx` procedure using `QsoMetadata.partner_freq`; mode
-  stays FT8, flagged in ADIF.
+- **Hound** — a manual `Tx≠Rx` procedure flagged by `QsoMetadata.hound`; mode
+  stays FT8 and is flagged in ADIF. `partner_freq` supplies the Fox's fixed
+  receive location but is a generic split-TX field, not the Hound discriminator.
 
 ## Key invariant
 

@@ -46,6 +46,11 @@ this whole engine end to end and shipped 5 batches of fixes — see that doc and
   transition guard. Unrelated band traffic stays silent to avoid flooding the
   retained diagnostics ring. Origin: Security Review C-1/I-1
   (`docs/security-review-2026-04-29.md`); operator visibility: PAN-3.
+- **Split-TX drift recovery** — `partner_freq` means “where we hear the DX,”
+  including manual holds, collision nudges, and passband clamps as well as
+  Hound/Fox. Two consistent off-frequency frames may relatch this receive-side
+  location without moving our TX; only `metadata.hound` invokes the Hound/Fox
+  carve-out and its protocol-specific QSY behavior.
 - **Compound-callsign equivalence** — `exchange.rs::{base_callsign,
   callsigns_match}` treat a compound call and its bare base as the same operator
   mid-QSO, where WSJT-X/JTDX stall; conservative so impostors still reject.

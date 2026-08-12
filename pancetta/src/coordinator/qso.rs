@@ -225,6 +225,11 @@ const DX_ACTIVITY_TTL: chrono::Duration = chrono::Duration::seconds(150);
 ///   offset) are still routed to this QSO. `None` means Tx=Rx (unchanged
 ///   from today's behavior).
 ///
+/// Divergence can come from an operator-held offset, a collision nudge, or the
+/// passband floor/ceiling clamp. All three retain two-strike drift protection
+/// on `partner_freq`; confirmation moves where we listen for the DX but never
+/// moves the deliberately selected `tx_off`.
+///
 /// **Regression invariant:** with `TxFreqMode::Auto` (or held=0) AND no
 /// occupied collision, `candidate = dx_freq`, `deconflict` returns it
 /// unchanged, `partner_freq = None` — byte-identical to today's Tx=Rx.
