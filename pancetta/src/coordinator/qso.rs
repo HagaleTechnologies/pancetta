@@ -4429,7 +4429,7 @@ fn snapshot_item_from_progress(
 
 #[cfg(test)]
 mod pending_manual_tests {
-    use super::{partition_pending_calls, PendingManualCall};
+    use super::{compute_manual_tx_offset, partition_pending_calls, PendingManualCall};
     use pancetta_core::slot::SlotParity;
     use std::collections::VecDeque;
 
@@ -4455,6 +4455,20 @@ mod pending_manual_tests {
 
     fn names(v: &[PendingManualCall]) -> Vec<String> {
         v.iter().map(|p| p.callsign.clone()).collect()
+    }
+
+    #[test]
+    fn dx_above_ceiling_clamps_tx_and_sets_partner_freq() {
+        let (tx_off, partner) = compute_manual_tx_offset(2931.0, false, 0, &[]);
+        assert_eq!(tx_off, pancetta_qso::TX_OFFSET_MAX_HZ);
+        assert_eq!(partner, Some(2931.0));
+    }
+
+    #[test]
+    fn dx_below_floor_clamps_tx_and_sets_partner_freq() {
+        let (tx_off, partner) = compute_manual_tx_offset(180.0, false, 0, &[]);
+        assert_eq!(tx_off, pancetta_qso::TX_OFFSET_MIN_HZ);
+        assert_eq!(partner, Some(180.0));
     }
 
     // Build a RespondToCaller-shaped pending call (non-Grid step) whose DX is
@@ -4648,8 +4662,6 @@ mod pending_manual_tests {
     // compute_manual_tx_offset produces the expected offset when called with
     // those values at promotion time (mirroring what promote_pending_manual_calls
     // does in the non-Hound branch).
-
-    use super::compute_manual_tx_offset;
 
     /// A queued call with held_hz=1500 / hold_mode=true opens at the held
     /// offset (1500 Hz) when promoted with no active concurrent QSOs.
