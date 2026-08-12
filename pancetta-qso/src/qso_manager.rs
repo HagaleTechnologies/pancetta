@@ -8231,6 +8231,7 @@ mod sender_verification_tests {
     #[tokio::test]
     async fn genuine_hound_qso_is_still_skipped_by_drift_confirm() {
         let manager = manager_with_call("K5ARH");
+        let mut events = manager.subscribe();
         let qso_id = manager
             .engage_hound(
                 "D2UY".into(),
@@ -8240,22 +8241,54 @@ mod sender_verification_tests {
             )
             .await
             .unwrap();
-        let report = MessageType::SignalReport {
-            to_station: "K5ARH".into(),
-            from_station: "D2UY".into(),
-            report: -12,
-        };
-        let t0 = Utc::now();
-        manager
-            .maybe_confirm_frequency_drift_at(&report, 900.0, t0)
-            .await;
-        manager
-            .maybe_confirm_frequency_drift_at(&report, 900.0, t0 + chrono::Duration::seconds(6))
-            .await;
+        while events.try_recv().is_ok() {}
+
+        for snr in [-19.0, -17.0] {
+            manager
+                .process_message(
+                    MessageType::SignalReport {
+                        to_station: "K5ARH".into(),
+                        from_station: "D2UY".into(),
+                        report: -12,
+                    },
+                    "K5ARH D2UY -12".into(),
+                    900.0,
+                    Some(snr),
+                )
+                .await
+                .unwrap();
+            if snr == -19.0 {
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+            }
+        }
 
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert_eq!(progress.metadata.pending_freq_drift, None);
         assert_eq!(progress.metadata.partner_freq, Some(1800.0));
+        assert!(!progress.metadata.hound_qsyed);
+        assert!(matches!(progress.state, QsoState::RespondingToCq { .. }));
+        assert!(
+            events.try_recv().is_err(),
+            "off-Fox frames must not advance, QSY, or emit a TX event"
+        );
+
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "D2UY".into(),
+                    report: -12,
+                },
+                "K5ARH D2UY -12".into(),
+                1800.0,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(progress.metadata.hound_qsyed);
+        assert_eq!(progress.metadata.partner_freq, Some(1800.0));
+        assert!(matches!(progress.state, QsoState::SendingReport { .. }));
     }
 
     #[tokio::test]
