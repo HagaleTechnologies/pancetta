@@ -1,24 +1,31 @@
 name: Wait for Codex
 
-# TRANSITIONAL DUAL-TRIGGER STATE (phase 1/2) — this file listens on BOTH
-# pull_request and pull_request_target during this rollout window. A
-# single-step swap straight to pull_request_target can't validate itself:
-# GitHub won't run a PR's own modified copy under pull_request once its
-# `on:` no longer lists pull_request, and pull_request_target won't fire
-# either since base doesn't yet declare it — this file's own required
-# "Wait for Codex Review" check would sit permanently unsatisfied and block
-# merge (proved live on HagaleTechnologies/widdershins#135, closed without
-# merging in favor of this two-phase approach). Landing BOTH triggers here
-# first keeps this PR validated under the still-live pull_request check; a
-# fast follow-up PR then drops pull_request once main carries
-# pull_request_target, closing the real security gap this rollout exists
-# for: under plain pull_request, a same-repo PR editing this file runs its
-# own modified copy with CODEX_REVIEW_PAT/GITHUB_TOKEN in scope before any
-# human reviews it, letting PR-controlled code exfiltrate the PAT or
-# self-resolve its own review threads. pull_request_target always reads the
-# workflow definition from the base branch, closing that hole — safe here
-# because this job never checks out or executes the PR's own code, only
-# gh api / gh api graphql calls against event metadata.
+# pull_request_target, not pull_request, deliberately. A same-repo PR that
+# edits THIS file could, under pull_request, run its OWN modified copy with
+# CODEX_REVIEW_PAT still in scope — able to exfiltrate the PAT or
+# self-resolve its own Codex review threads before a human ever looks.
+# pull_request_target always reads its workflow definition from the BASE
+# branch, never the PR's own copy, closing that hole. Safe here specifically
+# because this job never runs actions/checkout or executes anything from the
+# PR's own tree — every step only talks to the GitHub API (gh api / gh api
+# graphql) against event metadata (PR number, head SHA, review threads).
+#
+# Landed as a direct single-step swap, not a dual-trigger transition: an
+# earlier attempt at a transitional phase (both pull_request and
+# pull_request_target live simultaneously, to let the switch-over PR
+# validate itself under the still-active pull_request check before dropping
+# it) turned out to have its own unbounded tail of races — duplicate
+# "@codex review" comments, comment-adoption logic that could misattribute
+# a stale prior-head request to a new head, and non-atomic ordering under a
+# shared concurrency group, each fix uncovering the next issue on review.
+# Not worth the complexity: this repo's admin bypass (already configured on
+# every HagaleTechnologies ruleset, and precedented on HagaleTechnologies/
+# coppa#79, which landed this identical single-step swap the same way)
+# merges this past the one known bootstrap gap — the switch-over PR's own
+# "Wait for Codex Review" can't validate itself, since GitHub evaluates
+# pull_request_target against the BASE branch's `on:` block, which doesn't
+# declare it until this PR lands. Every subsequent PR validates normally
+# once this is on main.
 on:
   # `reopened` included, but routed through the explicit re-review request
   # path below (same as synchronize), not treated as an implicit-review
@@ -33,11 +40,6 @@ on:
   # with no path forward except another push (Codex P2, flagged reviewing
   # THIS file on cqdx#259). Explicitly requesting a review on reopen (like
   # synchronize does) fixes both gaps at once.
-  pull_request:
-    types: [opened, ready_for_review, synchronize, reopened]
-  # Transitional (phase 1/2, see file header) — same types as pull_request
-  # above. Once main carries this trigger, a phase-2 follow-up drops
-  # pull_request entirely, leaving this as the sole trigger.
   pull_request_target:
     types: [opened, ready_for_review, synchronize, reopened]
   # merge_group: repos using a GitHub merge queue re-evaluate every required
@@ -130,7 +132,7 @@ jobs:
           echo "Merge-group evaluation — the constituent PR already passed a real Wait for Codex Review during its own PR phase; nothing further to review on this synthetic integration commit."
 
       - name: Record run start
-        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name)
+        if: github.event_name == 'pull_request_target'
         env:
           # Seed from the PR event's OWN updated_at (set by GitHub at dispatch
           # time), not a runner-observed "now". A queued or slow-starting
@@ -148,7 +150,7 @@ jobs:
 
       - name: Skip if this run's head no longer matches the PR's current head
         id: head-check
-        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name)
+        if: github.event_name == 'pull_request_target'
         # ACCEPTED LIMITATION, not fixed here: this step no-ops a stale
         # rerun's OWN remaining steps, but concurrency (`cancel-in-progress`
         # keyed on PR number) is evaluated by GitHub before any step runs —
@@ -214,7 +216,7 @@ jobs:
         # event and, without this, would reconstruct the same stale cutoff
         # and rediscover the identical old error forever rather than asking
         # Codex to look again (Codex P2, flagged reviewing this file).
-        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) && steps.head-check.outputs.stale != 'true' && (github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1)
+        if: github.event_name == 'pull_request_target' && steps.head-check.outputs.stale != 'true' && (github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1)
         env:
           # Codex only auto-reviews on opened/ready_for_review, not on every
           # push (this repo's own AGENTS.md: "not every push. After a
@@ -368,7 +370,7 @@ jobs:
           echo "$request_comment" | jq -r '.created_at' > /tmp/codex-run-started.txt
 
       - name: Poll for a terminal Codex signal on this revision
-        if: contains(fromJSON('["pull_request","pull_request_target"]'), github.event_name) && steps.head-check.outputs.stale != 'true'
+        if: github.event_name == 'pull_request_target' && steps.head-check.outputs.stale != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           # Only for the reply+resolve mutations at the end of this step —
