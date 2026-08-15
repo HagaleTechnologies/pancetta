@@ -33,7 +33,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - A station calling our CQ while it already has a separate, established active QSO with us (e.g. we just called their CQ and are awaiting their report) no longer opens a second, parallel QSO object for that same station. Message routing previously let a `CallingCq` QSO's "any station" relevance arms accept a frame that also belonged to the other QSO, producing two independently-cadenced active QSOs for one real station — each keying its own TX, which could put two frames on the air for the same station in one TX window (PAN-14). Two follow-on gaps in the same routing path, found in code review, are closed alongside it: (1) two still-unpartnered `CallingCq` QSOs (from repeated `c` presses, or Fox mode engaging while a CQ is already live) could both claim the same reply — now only the earliest-created CQ advances; (2) a station whose QSO with us just completed could be immediately re-claimed by an unrelated `CallingCq` QSO on a stray/duplicate frame — now reserved for `COMPLETED_QSO_REWORK_GRACE` (45 s), mirroring the existing active-or-recently-completed pattern used elsewhere.
+- FT8's unresolved-hashed-callsign placeholder `"<...>"` (an i3=4 nonstandard-callsign
+  frame whose 12-bit hash has no local hash-table entry) no longer appears as a
+  DX-Hunter/Callers entry, and `is_needed_dxcc` no longer scores that exact literal
+  placeholder as a needed DXCC entity — it previously fell through to the scorer's
+  largest weight and consistently outranked real, workable stations. The guard is
+  scoped to the literal placeholder only, so a real callsign whose prefix is simply
+  absent from the bundled offline BigCTY table (e.g. newer than the table, but
+  confirmed needed by cqdx) still scores normally; the resolved hash form
+  `<CALLSIGN>` is likewise unaffected and keeps listing/scoring normally. (PAN-16)
 - Manual split-TX QSOs whose offset was held, collision-nudged, or passband-clamped now recover after two consistent DX replies at a new frequency without moving the station's chosen TX offset ([#245](https://github.com/HagaleTechnologies/pancetta/issues/245)). Genuine Hound/Fox behavior is unchanged.
+- PAN-12 follow-up (PAN-15): `engage_hound` now clears any `pending_freq_drift`
+  candidate that could accumulate in the window between QSO construction and
+  the `metadata.hound` stamp, so it can no longer get permanently stuck for a
+  Hound QSO's life; a confirmed split-TX `partner_freq` relatch that lands
+  within `MIN_TX_SEPARATION_HZ` of our own TX offset now logs a warn instead
+  of silently keying on top of the station we're trying to hear; the
+  frequency-gate tolerance constants used by `is_message_relevant`,
+  `classify_relevance`, and `maybe_confirm_frequency_drift_at` are now a
+  single shared definition instead of three independently-hardcoded copies.
 
 - Decode-pipeline crashes now recover automatically: the coordinator restarts DSP and FT8 decoder
   tasks under the existing bounded supervisor policy, keeps adjacent stages alive during backoff,

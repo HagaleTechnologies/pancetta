@@ -117,6 +117,27 @@ pub(crate) fn hound_offset_for(seed: &str, lo: f64, hi: f64) -> f64 {
 /// overlap; this matches criterion #7 in `SmartFrequencyAllocator`.
 pub const MIN_TX_SEPARATION_HZ: f64 = 75.0;
 
+/// Tight frequency-match tolerance (Hz) for INITIAL / ambiguous matching
+/// (`CallingCq`, `Idle`, and any non-matching message), used by
+/// [`QsoManager::is_message_relevant`], [`QsoManager::classify_relevance`],
+/// and [`QsoManager::maybe_confirm_frequency_drift_at`]. Frequency tolerance
+/// tightened from 50 Hz → 15 Hz to reduce cross-QSO message bleed-through in
+/// multi-QSO mode: FT8 frame-to-frame drift is typically < 6 Hz on a stable
+/// transceiver, so 15 Hz covers normal operation while shrinking the window
+/// an attacker can exploit. (Security review 2026-04-29 C-1.)
+///
+/// These three sites must agree on the same tolerances — this constant (and
+/// [`ESTABLISHED_FREQ_TOLERANCE_HZ`]) is the single shared definition so a
+/// future tolerance change can't silently desync one site from the others
+/// (PAN-15 item 6).
+const FREQ_TOLERANCE_HZ: f64 = 15.0;
+
+/// Wide frequency-match tolerance (Hz) once a QSO is ESTABLISHED (we know the
+/// contra callsign and are past `CallingCq`/`Idle`) — an actively-answering
+/// DX that has drifted beyond [`FREQ_TOLERANCE_HZ`] is not dropped. See
+/// [`FREQ_TOLERANCE_HZ`] for the shared-definition rationale (PAN-15 item 6).
+const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
+
 /// FIX B (one-QSO-per-(callsign,band) close idempotency,
 /// docs/qso-tx-deep-review-2026-07-18.md): how long after a manual QSO
 /// COMPLETES a subsequent close-step (`Rr73`/`SeventyThree`) reply for the
@@ -1175,18 +1196,7 @@ impl QsoManager {
             .await?;
 
         // Stamp the hound=true flag (partner_freq is now set via the ctor param).
-        {
-            let mut qsos = self.qsos.write().await;
-            if let Some(progress) = qsos.get_mut(&qso_id) {
-                progress.metadata.hound = true;
-                // NOTE: do NOT insert "HOUND" into metadata.tags — that would
-                // produce a bare `<HOUND:4>true` ADIF field, which is not a
-                // valid ADIF name (must be `APP_`-prefixed per the ADIF spec)
-                // and can trip LoTW. The human-readable COMMENT "HOUND" and the
-                // machine-readable `APP_PANCETTA_HOUND` field are both written
-                // by `AdifProcessor::qso_to_adif` from `metadata.hound` directly.
-            }
-        }
+        self.stamp_hound_flag(qso_id).await;
 
         info!(
             "Hound: engaging Fox {} on partner_freq={:.1} Hz, calling low @ {:.1} Hz: {}",
@@ -1194,6 +1204,47 @@ impl QsoManager {
         );
 
         Ok(qso_id)
+    }
+
+    /// Atomically stamp `metadata.hound = true` on an already-created QSO and
+    /// clear any `pending_freq_drift` candidate that accumulated in the
+    /// window between construction (`respond_to_cq_with`, which releases the
+    /// write lock after insertion) and this call.
+    ///
+    /// `metadata.hound` is the sole discriminator `maybe_confirm_frequency_drift_at`
+    /// uses to skip genuine Hound/Fox QSOs (Hound has its own one-shot QSY
+    /// mechanism and the Fox's RX offset is protocol-fixed for the QSO's
+    /// life). Before this QSO is stamped `hound=true`, a decode landing in
+    /// that window sees `hound=false` + `partner_freq=Some` and is eligible
+    /// to record a drift candidate — it can't relatch alone (two sightings at
+    /// least 5 seconds apart are required), but without clearing it here the
+    /// candidate is never cleared afterwards either: once `hound=true`, the
+    /// skip at the top of `maybe_confirm_frequency_drift_at` `continue`s
+    /// before reaching the in-tolerance reset, so a stale `pending_freq_drift`
+    /// would persist in serialized metadata for the QSO's life (PAN-15 item 2).
+    async fn stamp_hound_flag(&self, qso_id: QsoId) {
+        let mut qsos = self.qsos.write().await;
+        if let Some(progress) = qsos.get_mut(&qso_id) {
+            progress.metadata.hound = true;
+            progress.metadata.pending_freq_drift = None;
+            // NOTE: do NOT insert "HOUND" into metadata.tags — that would
+            // produce a bare `<HOUND:4>true` ADIF field, which is not a
+            // valid ADIF name (must be `APP_`-prefixed per the ADIF spec)
+            // and can trip LoTW. The human-readable COMMENT "HOUND" and the
+            // machine-readable `APP_PANCETTA_HOUND` field are both written
+            // by `AdifProcessor::qso_to_adif` from `metadata.hound` directly.
+        }
+    }
+
+    /// PAN-15 item 3: returns `Some(separation)` when a candidate relatched
+    /// `partner_freq` has drifted within [`MIN_TX_SEPARATION_HZ`] of our own
+    /// TX offset — the caller should warn, since we may now be keying
+    /// directly on top of the station we're trying to hear. Returns `None`
+    /// when the separation is still adequate. Pure so the boundary can be
+    /// unit-tested without a `QsoManager` instance.
+    fn tx_separation_warning(new_partner_freq: f64, our_tx_freq: f64) -> Option<f64> {
+        let separation = (new_partner_freq - our_tx_freq).abs();
+        (separation < MIN_TX_SEPARATION_HZ).then_some(separation)
     }
 
     /// Respond to a CQ call, explicitly choosing the initiation mode.
@@ -1805,12 +1856,15 @@ impl QsoManager {
         frequency: f64,
         now: DateTime<Utc>,
     ) {
-        // Must match is_message_relevant's ESTABLISHED_FREQ_TOLERANCE_HZ (100.0) and
-        // the concept of FREQ_TOLERANCE_HZ (15.0) for "counts as the same spot" —
-        // redeclared here as local constants rather than shared, since this fix
-        // deliberately does not touch is_message_relevant at all.
-        const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
-        const DRIFT_CONFIRM_TOLERANCE_HZ: f64 = 15.0;
+        // Reuses the module-level `ESTABLISHED_FREQ_TOLERANCE_HZ`/
+        // `FREQ_TOLERANCE_HZ` shared with `is_message_relevant`/
+        // `classify_relevance` (PAN-15 item 6 hoisted all three sites onto
+        // one definition — previously each redeclared its own local copy of
+        // the same values). `DRIFT_CONFIRM_TOLERANCE_HZ` keeps its own name
+        // here since it means something distinct ("counts as the same spot"
+        // for two-strike confirmation) even though the value matches
+        // `FREQ_TOLERANCE_HZ`.
+        const DRIFT_CONFIRM_TOLERANCE_HZ: f64 = FREQ_TOLERANCE_HZ;
         // Confirming sighting must land >=5 real seconds after the ORIGINAL candidate
         // timestamp — comfortably below FT4's 7.5s slot period, so two genuinely
         // separate transmissions always clear it while two decode-pipeline copies of
@@ -1892,6 +1946,29 @@ impl QsoManager {
                         "confirmed partner drift on a split-TX QSO (2 consistent sightings, \
                          >=5s apart) — relatching partner_freq; our TX offset is unchanged"
                     );
+                    // PAN-15 item 3: the relatched partner_freq is bounded only
+                    // by the RX-plausibility window above — it's never checked
+                    // against our own TX offset (`metadata.frequency`) or other
+                    // active TX offsets. A DX that drifts onto (or within
+                    // MIN_TX_SEPARATION_HZ of) our latched TX offset would have
+                    // us keying directly on top of the station we're trying to
+                    // hear, silently defeating whatever collision nudge/clamp
+                    // separated them originally. No re-deconfliction is
+                    // performed (stretch goal); this is the minimum-bar warn.
+                    if let Some(tx_separation) =
+                        Self::tx_separation_warning(frequency, progress.metadata.frequency)
+                    {
+                        warn!(
+                            target: "qso.freq_gate",
+                            partner = %their_callsign,
+                            new_partner_freq = frequency,
+                            our_tx_freq = progress.metadata.frequency,
+                            separation_hz = tx_separation,
+                            "relatched partner_freq drifted within MIN_TX_SEPARATION_HZ of our \
+                             own TX offset — we may now be keying on top of the station we're \
+                             trying to hear; no re-deconfliction performed"
+                        );
+                    }
                     // The QSO state itself is deliberately untouched here (only
                     // where we HEAR the DX moved; our TX offset did not), so
                     // old_state == new_state. We still emit, because the
@@ -3769,9 +3846,9 @@ impl QsoManager {
         let within_frequency_gate = state.frequency().is_none_or(|qso_frequency| {
             let match_frequency = metadata.partner_freq.unwrap_or(qso_frequency);
             let tolerance = if state.their_callsign().is_some() {
-                100.0
+                ESTABLISHED_FREQ_TOLERANCE_HZ
             } else {
-                15.0
+                FREQ_TOLERANCE_HZ
             };
             (match_frequency - frequency).abs() <= tolerance
         });
@@ -3869,27 +3946,12 @@ impl QsoManager {
         frequency: f64,
         sender_has_other_active_or_recent_partner: bool,
     ) -> bool {
-        // Frequency tolerance tightened from 50 Hz → 15 Hz to reduce
-        // cross-QSO message bleed-through in multi-QSO mode. FT8 frame-to-
-        // frame drift is typically < 6 Hz on a stable transceiver, so 15 Hz
-        // covers normal operation while shrinking the window an attacker
-        // can exploit. (Security review 2026-04-29 C-1.)
-        const FREQ_TOLERANCE_HZ: f64 = 15.0;
-        // B15 fix: once a QSO is ESTABLISHED (we know the contra callsign and
-        // are past CallingCq/Idle), allow a wider drift so an actively-
-        // answering DX that has drifted beyond the tight window is NOT dropped.
-        // The match arms below already require from == DX && to == us && the
-        // state-appropriate message, which unambiguously identifies our partner
-        // — at that point callsign+state continuity wins over the freq window
-        // (catalog B15). We WIDEN the gate (to 100 Hz) rather than re-latch the
-        // QSO's stored frequency here: `is_message_relevant` takes `&self` and
-        // holds only a read lock, so it cannot mutate state; 100 Hz comfortably
-        // covers realistic transceiver drift / micro-QSY within a contact while
-        // still bounding how far a stray station can be from our partner's
-        // latched offset. The tight 15 Hz gate is kept for INITIAL / ambiguous
-        // matching (CallingCq, Idle, and any non-matching message) so two
-        // different stations are never merged into one QSO.
-        const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
+        // Tolerances are module-level shared consts (`FREQ_TOLERANCE_HZ`,
+        // `ESTABLISHED_FREQ_TOLERANCE_HZ`) — see their doc comments for the
+        // security-review rationale (C-1) and the B15 established-QSO
+        // widening rationale. `classify_relevance` and
+        // `maybe_confirm_frequency_drift_at` must match these values; PAN-15
+        // item 6 hoisted all three sites onto one definition.
 
         let matched = match (state, message_type) {
             // We're calling CQ. The responder's callsign is whoever is in the
@@ -8709,6 +8771,12 @@ mod sender_verification_tests {
             .unwrap();
         while events.try_recv().is_ok() {}
 
+        // PAN-15 item 4: no real-time sleep between these two off-Fox frames.
+        // The Hound skip in `maybe_confirm_frequency_drift_at` returns before
+        // any drift candidate is ever recorded (`pending_freq_drift` stays
+        // `None` throughout), so the >=5s two-strike confirmation gap can't
+        // influence the outcome here — a sleep between the frames was
+        // provably dead time.
         for snr in [-19.0, -17.0] {
             manager
                 .process_message(
@@ -8723,9 +8791,6 @@ mod sender_verification_tests {
                 )
                 .await
                 .unwrap();
-            if snr == -19.0 {
-                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
-            }
         }
 
         let progress = manager.get_qso(qso_id).await.unwrap();
@@ -8755,6 +8820,146 @@ mod sender_verification_tests {
         assert!(progress.metadata.hound_qsyed);
         assert_eq!(progress.metadata.partner_freq, Some(1800.0));
         assert!(matches!(progress.state, QsoState::SendingReport { .. }));
+    }
+
+    /// PAN-15 item 2 regression: `engage_hound` calls `respond_to_cq_with`
+    /// (which sets `partner_freq` but leaves `hound=false`) and only stamps
+    /// `hound=true` in a SEPARATE later write-lock acquisition
+    /// (`stamp_hound_flag`). A decode landing in that window sees
+    /// `hound=false` + `partner_freq=Some` and is eligible to record a drift
+    /// candidate — this reproduces that window directly (bypassing
+    /// `engage_hound`'s single atomic call, exactly as a concurrent decode
+    /// would) and proves `stamp_hound_flag` clears the candidate rather than
+    /// leaving it stuck forever (the Hound skip in
+    /// `maybe_confirm_frequency_drift_at` `continue`s before ever reaching
+    /// the in-tolerance reset once `hound=true`, so an uncleared candidate
+    /// would otherwise persist in serialized metadata for the QSO's life).
+    #[tokio::test]
+    async fn stamp_hound_flag_clears_pending_freq_drift_from_the_construction_window() {
+        let manager = manager_with_call("K5ARH");
+
+        // Mirrors exactly what `engage_hound` does internally before it stamps
+        // `hound=true`: a Manual QSO with `partner_freq` set atomically at
+        // construction, `hound` still at its default `false`.
+        let qso_id = manager
+            .respond_to_cq_with(
+                "D2UY".into(),
+                700.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                CallInitiation::Manual,
+                Some(1800.0), // Fox's RX offset
+                false,
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(!progress.metadata.hound, "sanity: hound not yet stamped");
+
+        // Simulate a decode landing in the window between construction and
+        // the hound stamp: still `hound=false`, so this is NOT skipped and
+        // records a drift candidate.
+        manager
+            .maybe_confirm_frequency_drift(
+                &MessageType::SignalReport {
+                    to_station: "K5ARH".into(),
+                    from_station: "D2UY".into(),
+                    report: -12,
+                },
+                1950.0, // 150 Hz from the Fox's 1800 Hz — beyond ESTABLISHED_FREQ_TOLERANCE_HZ
+            )
+            .await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            progress.metadata.pending_freq_drift.is_some(),
+            "sanity: the construction window must be able to record a drift candidate"
+        );
+
+        // The fix: stamping the hound flag must clear it atomically.
+        manager.stamp_hound_flag(qso_id).await;
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(progress.metadata.hound, "hound flag must now be stamped");
+        assert_eq!(
+            progress.metadata.pending_freq_drift, None,
+            "stamp_hound_flag must clear any drift candidate accumulated in the window, \
+             otherwise it can never be cleared again for this Hound QSO's life"
+        );
+    }
+
+    /// PAN-15 item 3: `tx_separation_warning` boundary behavior — the pure
+    /// predicate behind the "relatched partner_freq too close to our own TX
+    /// offset" warn.
+    #[test]
+    fn tx_separation_warning_flags_separations_below_min_tx_separation() {
+        assert_eq!(
+            QsoManager::tx_separation_warning(2680.0, 2700.0),
+            Some(20.0)
+        );
+        assert_eq!(
+            QsoManager::tx_separation_warning(2626.0, 2700.0),
+            Some(74.0),
+            "1 Hz inside the MIN_TX_SEPARATION_HZ boundary must still warn"
+        );
+    }
+
+    #[test]
+    fn tx_separation_warning_allows_adequate_separations() {
+        assert_eq!(
+            QsoManager::tx_separation_warning(2625.0, 2700.0),
+            None,
+            "exactly MIN_TX_SEPARATION_HZ apart is adequate separation"
+        );
+        assert_eq!(QsoManager::tx_separation_warning(2600.0, 2700.0), None);
+    }
+
+    /// PAN-15 item 3 (behavioral): a confirmed relatch that drifts the
+    /// partner's RX offset to within `MIN_TX_SEPARATION_HZ` of our own TX
+    /// offset still relatches (the ticket's minimum bar is a warn, not a
+    /// block) — this proves the warn path doesn't alter the relatch outcome
+    /// or panic.
+    #[tokio::test]
+    async fn relatch_within_min_tx_separation_of_our_own_tx_offset_still_relatches() {
+        let manager = manager_with_call("K5ARH");
+        let qso_id = manager
+            .respond_to_cq_with(
+                "K6L".into(),
+                2700.0,
+                Some(pancetta_core::slot::SlotParity::Even),
+                CallInitiation::Manual,
+                Some(2931.0),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // K6L drifts to 2680 Hz — only 20 Hz from our own 2700 Hz TX offset,
+        // well inside MIN_TX_SEPARATION_HZ (75 Hz). Two sightings >=5s apart
+        // are required to confirm-and-relatch.
+        let report = MessageType::SignalReport {
+            to_station: "K5ARH".into(),
+            from_station: "K6L".into(),
+            report: -11,
+        };
+        manager
+            .process_message(report.clone(), "K5ARH K6L -11".into(), 2680.0, Some(-19.0))
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+        manager
+            .process_message(report, "K5ARH K6L -11".into(), 2680.0, Some(-17.0))
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.partner_freq,
+            Some(2680.0),
+            "the relatch still occurs even when it lands within MIN_TX_SEPARATION_HZ of our TX \
+             offset — the ticket's minimum bar is a warn, not a block"
+        );
+        assert_eq!(
+            progress.metadata.frequency, 2700.0,
+            "our TX offset itself is never touched by a partner_freq relatch"
+        );
     }
 
     #[tokio::test]
