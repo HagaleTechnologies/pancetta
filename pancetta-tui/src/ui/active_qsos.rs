@@ -45,6 +45,28 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
     let selected_id = app.selected_qso_id();
     let mark_selection = qsos.len() > 1;
 
+    // Round-2 remediation: the render loop below stops once the row's width
+    // budget runs out, so on a narrow terminal or a large pileup the
+    // newest-first sort could place the selected/pinned QSO past the point
+    // where anything more still fits — silently dropping it (and its "▶"
+    // marker) off the visible slice entirely, even though `k` still targets
+    // it. The loop's very first entry is always rendered unconditionally
+    // (the budget check below is gated on `shown > 0`), so guarantee the
+    // selected QSO occupies that slot whenever there's more than one QSO —
+    // it can never be the one truncated. This deliberately trades strict
+    // newest-first ordering for "the abort target is always visible," which
+    // is the property that actually matters here.
+    if mark_selection {
+        if let Some(id) = selected_id.as_deref() {
+            if let Some(pos) = qsos.iter().position(|q| q.qso_id == id) {
+                if pos != 0 {
+                    let selected = qsos.remove(pos);
+                    qsos.insert(0, selected);
+                }
+            }
+        }
+    }
+
     let now = chrono::Utc::now();
     let mut spans: Vec<Span> = Vec::new();
     spans.push(Span::styled(
@@ -188,7 +210,11 @@ mod tests {
     }
 
     fn render(app: &App) -> String {
-        let mut term = Terminal::new(TestBackend::new(100, 1)).unwrap();
+        render_at_width(app, 100)
+    }
+
+    fn render_at_width(app: &App, width: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(width, 1)).unwrap();
         term.draw(|f| render_active_qsos(f, f.area(), app)).unwrap();
         let buf = term.backend().buffer();
         (0..buf.area.width)
@@ -257,6 +283,47 @@ mod tests {
             "marker should have followed the pin to W1AW: {rendered2}"
         );
         assert!(!rendered2.contains("▶K5ARH"));
+    }
+
+    /// Round-2 remediation (Codex P1): on a narrow terminal (or a large
+    /// pileup), the render loop's width budget can run out before it
+    /// reaches the selected/pinned QSO in newest-first order — the old
+    /// code would silently drop it (and its marker) off the visible slice.
+    /// Pin the OLDEST of several QSOs (so it would sort dead last) and
+    /// render into an area that only fits a single entry: the selected one
+    /// must still be the one shown, marked, not truncated away.
+    #[tokio::test]
+    async fn selected_qso_is_never_truncated_off_a_narrow_banner() {
+        let mut app = App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        // Newest-first display order would be: NEWEST, MID, OLDEST — so
+        // OLDEST is the one that overflow truncation would drop first.
+        app.apply_active_qsos(
+            vec![
+                banner("OLDEST", "qso-oldest", 120),
+                banner("MID", "qso-mid", 60),
+                banner("NEWEST", "qso-newest", 0),
+            ],
+            Vec::new(),
+        );
+        // Pin OLDEST (index 0 of the vec passed to apply_active_qsos).
+        assert_eq!(app.selected_qso_callsign().as_deref(), Some("OLDEST"));
+
+        // Wide enough for "QSO: " plus exactly one entry, not two.
+        let rendered = render_at_width(&app, 45);
+        assert!(
+            rendered.contains("OLDEST"),
+            "selected QSO must never be truncated off the banner: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("▶OLDEST"),
+            "selected QSO must still carry its marker when forced into view: {rendered:?}"
+        );
+        assert!(
+            !rendered.contains("NEWEST") && !rendered.contains("MID"),
+            "sanity check: the area really is too narrow for more than one entry: {rendered:?}"
+        );
     }
 
     /// The fix must actually show up in Monitor view specifically — the

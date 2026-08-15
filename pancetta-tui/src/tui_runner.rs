@@ -1209,7 +1209,9 @@ impl TuiRunner {
                     let max = app.diagnostic_events.len().saturating_sub(1);
                     app.diagnostics_scroll = (app.diagnostics_scroll + 1).min(max);
                 }
-                KeyCode::Char('k') => {
+                // Bare `k` only — see the modifier-guard comment on the
+                // global abort handler below for why.
+                KeyCode::Char('k') if key.modifiers.is_empty() => {
                     self.abort_selected_qso(&mut app)?;
                 }
                 _ => {} // swallow other keys while the overlay is open
@@ -1228,7 +1230,9 @@ impl TuiRunner {
                 KeyCode::Esc | KeyCode::Char('S') => {
                     app.show_health = false;
                 }
-                KeyCode::Char('k') => {
+                // Bare `k` only — see the modifier-guard comment on the
+                // global abort handler below for why.
+                KeyCode::Char('k') if key.modifiers.is_empty() => {
                     self.abort_selected_qso(&mut app)?;
                 }
                 _ => {} // swallow other keys while the overlay is open
@@ -1253,7 +1257,9 @@ impl TuiRunner {
                     let max = app.recent_qsos.len().saturating_sub(1);
                     app.recent_qsos_scroll = (app.recent_qsos_scroll + 1).min(max);
                 }
-                KeyCode::Char('k') => {
+                // Bare `k` only — see the modifier-guard comment on the
+                // global abort handler below for why.
+                KeyCode::Char('k') if key.modifiers.is_empty() => {
                     self.abort_selected_qso(&mut app)?;
                 }
                 _ => {} // swallow other keys while the overlay is open
@@ -1613,7 +1619,20 @@ impl TuiRunner {
             // whenever more than one QSO is active. So there's always a
             // stable, visible answer to "what does k hit," even in the
             // views that have no QSO Status table on screen at all.
-            KeyCode::Char('k') => {
+            //
+            // Guarded to a BARE `k` (`key.modifiers.is_empty()`, PAN-21
+            // round-2 remediation): crossterm reports Ctrl+K / Alt+K as the
+            // same `KeyCode::Char('k')` with the modifier carried separately
+            // in `key.modifiers`, so without this guard an operator's
+            // Ctrl+K readline/terminal muscle memory (kill-line — nothing to
+            // do with this app) would ALSO abort the QSO. That's exactly the
+            // accidental-trigger foot-gun the old QsoStatus-only gating
+            // existed to prevent, just via a different physical input than
+            // vim-scroll. Modified k falls through to the catch-all `_ => {}`
+            // below (a no-op), matching every other unguarded single-key
+            // binding in this match — none of which are destructive, so k is
+            // the one that needed the explicit guard.
+            KeyCode::Char('k') if key.modifiers.is_empty() => {
                 self.abort_selected_qso(&mut app)?;
             }
             // r pressed outside the QSO Status panel: hint, don't act.
@@ -2393,6 +2412,19 @@ mod key_tests {
 
     fn key_shift(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    /// crossterm reports Ctrl+<letter> as the SAME `KeyCode::Char(<letter>)`
+    /// as a bare press, with the modifier carried separately in
+    /// `key.modifiers` — used by the PAN-21 round-2 modifier-guard
+    /// regression tests below.
+    fn key_ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Same as `key_ctrl` but for Alt+<letter>.
+    fn key_alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
     }
 
     #[tokio::test]
@@ -3576,6 +3608,72 @@ mod key_tests {
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
         ));
         assert!(app.read().await.status_message.contains("W1AW"));
+    }
+
+    /// PAN-21 round-2 remediation (Codex P1): crossterm reports Ctrl+K /
+    /// Alt+K as the SAME `KeyCode::Char('k')` as a bare press, with the
+    /// modifier carried separately — so an operator's Ctrl+K
+    /// readline/terminal muscle memory (kill-line, unrelated to this app)
+    /// must NOT abort the QSO. Only a bare, unmodified `k` may.
+    #[tokio::test]
+    async fn ctrl_k_and_alt_k_do_not_abort_from_any_panel() {
+        for modified_key in [key_ctrl('k'), key_alt('k')] {
+            let (mut r, cmd_rx, app) = make_runner().await;
+            {
+                let mut a = app.write().await;
+                a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+                a.active_panel = crate::app::ActivePanel::QsoStatus;
+            }
+            r.handle_key_event(modified_key).await.unwrap();
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "{modified_key:?} must not abort the QSO"
+            );
+            assert!(
+                !app.read().await.status_message.contains("Aborting"),
+                "{modified_key:?} must not even attempt an abort status update"
+            );
+        }
+
+        // A bare, unmodified k in the same setup still aborts — proves the
+        // guard is specific to modifiers, not a blanket regression of k.
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+            a.active_panel = crate::app::ActivePanel::QsoStatus;
+        }
+        r.handle_key_event(key('k')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+    }
+
+    /// Same modifier guard, exercised from the Diagnostics, Recent-QSOs, and
+    /// station-health overlays (the fall-through sites added by the round-1
+    /// remediation) — Ctrl+K/Alt+K must not abort there either.
+    #[tokio::test]
+    async fn ctrl_k_and_alt_k_do_not_abort_through_overlays() {
+        for set_overlay in [
+            (|a: &mut crate::app::App| a.show_diagnostics = true) as fn(&mut crate::app::App),
+            |a: &mut crate::app::App| a.show_recent_qsos = true,
+            |a: &mut crate::app::App| a.show_health = true,
+        ] {
+            for modified_key in [key_ctrl('k'), key_alt('k')] {
+                let (mut r, cmd_rx, app) = make_runner().await;
+                {
+                    let mut a = app.write().await;
+                    a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+                    set_overlay(&mut a);
+                }
+                r.handle_key_event(modified_key).await.unwrap();
+                assert!(
+                    cmd_rx.try_recv().is_err(),
+                    "{modified_key:?} must not abort through an overlay"
+                );
+            }
+        }
     }
 
     /// Acceptance scenario 2: with no active QSO, `k` from any panel shows

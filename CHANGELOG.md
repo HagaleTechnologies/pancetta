@@ -52,7 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   view and while zoomed, including Monitor view and zoom on a panel other
   than QSO Status) now marks the pinned/selected QSO with `▶` whenever
   more than one QSO is active, so the abort target stays visible in the
-  views that don't render the QSO Status table at all.
+  views that don't render the QSO Status table at all — and that QSO is
+  now guaranteed a slot in the banner's visible slice even on a narrow
+  terminal or a large pileup, rather than only being marked if it
+  happened to fit before the row's width budget ran out. `k` also now
+  requires a bare, unmodified keypress: Ctrl+K/Alt+K (e.g. an operator's
+  readline "kill line" muscle memory) report the same `KeyCode::Char('k')`
+  as a bare press in crossterm, and no longer abort the QSO.
 
 ### Fixed
 
