@@ -1089,6 +1089,10 @@ fn failure_reason_text(reason: &pancetta_qso::QsoFailureReason) -> String {
         R::ProtocolError(e) => format!("protocol error: {e}"),
         R::SupervisorRestart => "dropped by an internal restart".to_string(),
         R::ComponentCrash(component) => format!("{component} crashed mid-QSO"),
+        // PAN-17: distinct from "watchdog timeout" (the DX never answered) —
+        // this QSO's outgoing message could never be transmitted at all, so
+        // the watchdog retired it fast instead of waiting on the DX.
+        R::MessageUnencodable(detail) => format!("cannot transmit this message: {detail}"),
     }
 }
 

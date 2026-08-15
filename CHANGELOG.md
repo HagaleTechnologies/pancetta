@@ -32,6 +32,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Compound-callsign QSOs (e.g. `YS/WE9G`, `8G81PA`, `3E40CDW`) now actually
+  transmit instead of queuing and silently re-arming every slot for the full
+  5-minute watchdog window (PAN-17). The FT8 encoder gained an i3=4
+  nonstandard-callsign path (58-bit exact pack + 12-bit hash, mirroring the
+  decoder's existing i3=4 support) alongside the standard/free-text paths;
+  a grid square or numeric report can't fit alongside a compound callsign
+  (only 2 report bits — blank/RRR/RR73/73), so it's dropped rather than
+  failing the whole message. Separately, a QSO whose DX callsign can never
+  be represented in any FT8 format (invalid characters or >11 chars — e.g.
+  the decoder's own `<...>` hash-miss placeholder leaking into the partner
+  field) is now retired immediately with a distinct "cannot transmit this
+  message" reason instead of being indistinguishable from a plain
+  DX-never-answered timeout.
+
 - Manual split-TX QSOs whose offset was held, collision-nudged, or passband-clamped now recover after two consistent DX replies at a new frequency without moving the station's chosen TX offset ([#245](https://github.com/HagaleTechnologies/pancetta/issues/245)). Genuine Hound/Fox behavior is unchanged.
 
 - Decode-pipeline crashes now recover automatically: the coordinator restarts DSP and FT8 decoder

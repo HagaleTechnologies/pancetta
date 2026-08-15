@@ -15,11 +15,12 @@
 #![allow(clippy::needless_range_loop)]
 
 use crate::ldpc::{binary_to_gray, binary_to_gray_4fsk, LdpcEncoder};
-use crate::message::{calculate_crc14, CRC_BITS, PAYLOAD_BITS};
+use crate::message::{calculate_crc14, hash12, pack58, CRC_BITS, PAYLOAD_BITS};
 use crate::protocol::ProtocolParams;
 use crate::{Ft8Error, Ft8Result, NUM_SYMBOLS};
 use bitvec::prelude::*;
 use serde::{Deserialize, Serialize};
+use tracing::debug;
 
 /// Maximum length for free text messages
 pub const MAX_FREETEXT_LENGTH: usize = 13;
@@ -99,6 +100,14 @@ impl Ft8Encoder {
 
         // Try standard message encoding first
         if let Ok(payload) = self.try_encode_standard(text) {
+            return self.payload_to_symbols(&payload);
+        }
+
+        // PAN-17: fall back to the i3=4 nonstandard-callsign path for
+        // compound prefix/homecall forms (e.g. "YS/WE9G") that `pack28`
+        // can't represent, before giving up to free text (which has a
+        // 13-char cap most "<call> <call> <grid>" exchanges blow past).
+        if let Ok(payload) = self.try_encode_nonstandard(text) {
             return self.payload_to_symbols(&payload);
         }
 
@@ -207,6 +216,10 @@ impl Ft8Encoder {
         let text = text.trim();
 
         if let Ok(payload) = self.try_encode_standard(text) {
+            return self.payload_to_symbols_protocol(&payload);
+        }
+        // PAN-17: see `encode_message`'s matching fallback for rationale.
+        if let Ok(payload) = self.try_encode_nonstandard(text) {
             return self.payload_to_symbols_protocol(&payload);
         }
         if let Ok(payload) = self.encode_free_text(text) {
@@ -468,6 +481,164 @@ impl Ft8Encoder {
 
             Ok((call_to, call_de, extra))
         }
+    }
+
+    // ========================================================================
+    // Nonstandard callsign encoding (i3=4)
+    // ========================================================================
+
+    /// Try to encode as a nonstandard-callsign message (Type 4, i3=4).
+    ///
+    /// `pack28` (the i3=1 standard path) can only represent callsigns that
+    /// fit its fixed 6-character mixed-radix scheme plus a bare `/R` or `/P`
+    /// suffix flag — it has no path for an arbitrary compound prefix/homecall
+    /// form (e.g. `YS/WE9G`, `3E40CDW`, `8G81PA`). Those need i3=4: one
+    /// callsign is packed exactly into a 58-bit base-38 field (up to 11
+    /// characters, charset `HASH_CALL_CHARSET`), the other is represented by
+    /// a lossy 12-bit hash (recoverable by the receiver only if it has
+    /// previously seen that callsign's plain text — true in practice, since
+    /// a station's own callsign appears in every standard-format frame it
+    /// sends). Mirrors the decode side, `MessageParser::parse_nonstd_call`
+    /// (message.rs) — same bit layout: n12(12) + n58(58) + iflip(1) +
+    /// nrpt(2) + icq(1) + i3(3) = 77 bits.
+    ///
+    /// PAN-17: the 2-bit `nrpt` field only has room for four values — blank,
+    /// RRR, RR73, 73 — there is no bit budget left for a grid square or a
+    /// numeric dB report once one callsign already needs the compound-call
+    /// slot. An `extra` that isn't one of those four tokens is degraded to
+    /// blank rather than failing the whole message: the alternative (never
+    /// transmitting anything at all to a compound-call station, which is the
+    /// live bug this path exists to fix) is worse, and an FT8 QSO can
+    /// complete without ever exchanging a grid/numeric report with such a
+    /// station — only the RRR/RR73/73 handshake is load-bearing.
+    fn try_encode_nonstandard(&self, text: &str) -> Ft8Result<[u8; 10]> {
+        let parts: Vec<&str> = text.split_whitespace().collect();
+        if parts.is_empty() {
+            return Err(Ft8Error::MessageDecodingError("Empty message".to_string()));
+        }
+
+        // "CQ <compound-call>" — the only CQ shape type 4 can carry (no room
+        // for a CQ modifier or a grid alongside a compound callsign).
+        if parts[0] == "CQ" {
+            if parts.len() != 2 {
+                return Err(Ft8Error::MessageDecodingError(
+                    "Nonstandard CQ must be exactly 'CQ <callsign>'".to_string(),
+                ));
+            }
+            let call = parts[1];
+            if !looks_like_callsign(call) {
+                // Not callsign-shaped at all (e.g. a two-word free-text
+                // message like "CQ SOMETHING") — this path is only for
+                // actual compound callsigns; let free text handle the rest.
+                return Err(Ft8Error::MessageDecodingError(format!(
+                    "'{}' is not callsign-shaped",
+                    call
+                )));
+            }
+            if pack28(call).is_ok() {
+                // Standard-packable — try_encode_standard already covers it.
+                return Err(Ft8Error::MessageDecodingError(
+                    "Callsign is standard-encodable".to_string(),
+                ));
+            }
+            let n58 = pack58(call).ok_or_else(|| {
+                Ft8Error::MessageDecodingError(format!(
+                    "Callsign '{}' does not fit the 58-bit hash-callsign field \
+                     (>11 chars or invalid character)",
+                    call
+                ))
+            })?;
+            return Ok(pack_nonstandard(0, n58, 0, 0, 1));
+        }
+
+        if parts.len() < 2 {
+            return Err(Ft8Error::MessageDecodingError(
+                "Nonstandard message needs at least 2 callsigns".to_string(),
+            ));
+        }
+        let call_to = parts[0];
+        let call_de = parts[1];
+        let extra = parts.get(2).copied().unwrap_or("");
+
+        // This path is only for actual compound callsigns, not arbitrary
+        // two-word text (e.g. "HELLO WORLD" would otherwise pack28-fail on
+        // both "words" and get mistaken for a nonstandard-callsign
+        // exchange) — a real callsign always has both a digit and a letter.
+        // This also correctly rejects the decode-side hash-miss placeholder
+        // `<...>` (no alphanumeric characters at all), so a QSO whose
+        // partner callsign somehow ended up as that literal string fails
+        // cleanly here rather than transmitting a hash of it.
+        if !looks_like_callsign(call_to) || !looks_like_callsign(call_de) {
+            return Err(Ft8Error::MessageDecodingError(format!(
+                "'{}' / '{}' is not callsign-shaped",
+                call_to, call_de
+            )));
+        }
+
+        let to_std = pack28(call_to).is_ok();
+        let de_std = pack28(call_de).is_ok();
+
+        // The callsign that FAILED pack28 is the one that actually needs
+        // exact (58-bit) representation — the whole point of this path.
+        // Deliberately does NOT fall back to putting the pack28-successful
+        // callsign in the exact slot when the nonstandard one can't fit
+        // pack58 either: that would silently address the frame with a hash
+        // of garbage input (e.g. the decode-side hash-miss placeholder
+        // `<...>`) rather than the intended station, which is worse than
+        // failing loudly and letting the QSO-layer watchdog retire it.
+        let (exact_call, hashed_call, iflip): (&str, &str, u8) = match (to_std, de_std) {
+            (true, true) => {
+                // Nothing for this path to add — try_encode_standard
+                // already covers a message where both callsigns pack28 fine.
+                return Err(Ft8Error::MessageDecodingError(
+                    "Both callsigns are standard-encodable".to_string(),
+                ));
+            }
+            (false, true) => (call_to, call_de, 1),
+            (true, false) => (call_de, call_to, 0),
+            (false, false) => {
+                // Both compound (e.g. two DXpedition-style calls working
+                // each other) — pick whichever fits the 58-bit field,
+                // preferring call_to for determinism if both do.
+                if pack58(call_to).is_some() {
+                    (call_to, call_de, 1)
+                } else if pack58(call_de).is_some() {
+                    (call_de, call_to, 0)
+                } else {
+                    return Err(Ft8Error::MessageDecodingError(format!(
+                        "Neither '{}' nor '{}' fits the 58-bit hash-callsign field",
+                        call_to, call_de
+                    )));
+                }
+            }
+        };
+
+        let n58 = pack58(exact_call).ok_or_else(|| {
+            Ft8Error::MessageDecodingError(format!(
+                "Callsign '{}' does not fit the 58-bit hash-callsign field \
+                 (>11 chars or invalid character)",
+                exact_call
+            ))
+        })?;
+        let n12 = hash12(hashed_call) & 0xFFF;
+
+        let nrpt: u8 = match extra {
+            "" => 0,
+            "RRR" => 1,
+            "RR73" => 2,
+            "73" => 3,
+            _ => {
+                debug!(
+                    "i3=4 encode: dropping unrepresentable extra field '{}' \
+                     (grid/report can't fit the 2-bit nonstandard-call report \
+                     field) for '{}'",
+                    extra, text
+                );
+                0
+            }
+        };
+
+        Ok(pack_nonstandard(n12, n58, iflip, nrpt, 0))
     }
 
     // ========================================================================
@@ -1089,6 +1260,52 @@ fn pack_eu_vhf_14bit(exchange: &str) -> u16 {
     0 // fallback
 }
 
+/// Coarse "is this token shaped like a callsign" check, guarding the i3=4
+/// nonstandard-callsign path against being triggered by arbitrary two-word
+/// free text ("HELLO WORLD" would otherwise pack28-fail on both words and
+/// get mistaken for a compound-callsign exchange). Mirrors the definition
+/// `pancetta-qso::exchange::base_callsign` already uses elsewhere in this
+/// workspace for the same purpose: at least 3 characters, with at least one
+/// digit AND at least one letter (every real amateur-radio callsign has
+/// both; this is a prefix/rule-of-thumb check, not full validation).
+fn looks_like_callsign(s: &str) -> bool {
+    s.len() >= 3
+        && s.chars().any(|c| c.is_ascii_digit())
+        && s.chars().any(|c| c.is_ascii_alphabetic())
+}
+
+// ============================================================================
+// Type-4 (nonstandard callsign) message packing
+// ============================================================================
+
+/// Pack an i3=4 nonstandard-callsign message into a 10-byte, 77-bit payload.
+///
+/// Layout (mirrors `MessageParser::parse_nonstd_call` in message.rs):
+/// n12(12) + n58(58) + iflip(1) + nrpt(2) + icq(1) + i3(3) = 77 bits.
+fn pack_nonstandard(n12: u32, n58: u64, iflip: u8, nrpt: u8, icq: u8) -> [u8; 10] {
+    let mut bits: BitVec<u8, Msb0> = BitVec::with_capacity(80);
+    for i in (0..12).rev() {
+        bits.push((n12 >> i) & 1 != 0);
+    }
+    for i in (0..58).rev() {
+        bits.push((n58 >> i) & 1 != 0);
+    }
+    bits.push(iflip != 0);
+    for i in (0..2).rev() {
+        bits.push((nrpt >> i) & 1 != 0);
+    }
+    bits.push(icq != 0);
+    for i in (0..3).rev() {
+        bits.push((4u8 >> i) & 1 != 0); // i3 = 4
+    }
+    while bits.len() < 80 {
+        bits.push(false);
+    }
+    let mut payload = [0u8; 10];
+    payload.copy_from_slice(bits.as_raw_slice());
+    payload
+}
+
 /// Look up ARRL section name → code (0-83)
 fn encode_arrl_section(section: &str) -> Ft8Result<u8> {
     const SECTIONS: [&str; 84] = [
@@ -1694,5 +1911,159 @@ mod tests {
         assert_eq!(ft4_syms.len(), 105);
 
         // Data content should differ due to XOR scrambling and different Gray code
+    }
+
+    // ========================================================================
+    // PAN-17: nonstandard/compound-callsign encoding (i3=4)
+    // ========================================================================
+
+    /// Decode a raw 10-byte 77-bit payload back through `MessageParser`,
+    /// exactly like `test_ft4_xor_scramble_unscramble_roundtrip` above does
+    /// for the standard path — the round-trip check that actually proves
+    /// the encoder and decoder agree on the wire format.
+    fn decode_payload(payload: &[u8; 10]) -> crate::message::Ft8Message {
+        decode_payload_with(payload, |_| {})
+    }
+
+    fn decode_payload_with(
+        payload: &[u8; 10],
+        setup: impl FnOnce(&mut crate::message::MessageParser),
+    ) -> crate::message::Ft8Message {
+        let mut bits = BitVec::with_capacity(PAYLOAD_BITS);
+        for i in 0..PAYLOAD_BITS {
+            bits.push(payload[i / 8] & (0x80u8 >> (i % 8)) != 0);
+        }
+        let mut parser = crate::message::MessageParser::new();
+        setup(&mut parser);
+        parser.parse_payload(&bits).expect("payload must parse")
+    }
+
+    #[test]
+    fn test_encode_message_compound_callsign_cq_no_longer_errors() {
+        // PAN-17 root cause: encode_message had zero path for a compound
+        // prefix/homecall callsign (pack28 has no representation for
+        // arbitrary "<prefix>/<homecall>" forms) and always returned Err.
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_message("CQ YS/WE9G", None);
+        assert!(
+            result.is_ok(),
+            "compound-callsign CQ failed to encode: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_compound_callsign_cq() {
+        let encoder = Ft8Encoder::new();
+        let payload = encoder.try_encode_nonstandard("CQ YS/WE9G").unwrap();
+        let msg = decode_payload(&payload);
+        assert_eq!(msg.to_callsign, Some("CQ".to_string()));
+        assert_eq!(msg.from_callsign, Some("YS/WE9G".to_string()));
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_compound_callsign_reply_no_report() {
+        // "YS/WE9G K5ARH" — reply to a compound-call CQ carrying neither
+        // grid nor report (see the grid-degradation test below for why).
+        let encoder = Ft8Encoder::new();
+        let payload = encoder.try_encode_nonstandard("YS/WE9G K5ARH").unwrap();
+        let msg = decode_payload_with(&payload, |p| p.add_callsign("K5ARH"));
+        assert_eq!(msg.to_callsign, Some("YS/WE9G".to_string()));
+        assert_eq!(msg.from_callsign, Some("<K5ARH>".to_string()));
+    }
+
+    #[test]
+    fn test_encode_decode_roundtrip_compound_callsign_rr73() {
+        let encoder = Ft8Encoder::new();
+        let payload = encoder
+            .try_encode_nonstandard("YS/WE9G K5ARH RR73")
+            .unwrap();
+        let msg = decode_payload_with(&payload, |p| p.add_callsign("K5ARH"));
+        assert_eq!(msg.to_callsign, Some("YS/WE9G".to_string()));
+        assert_eq!(msg.from_callsign, Some("<K5ARH>".to_string()));
+        assert_eq!(msg.contest_exchange, Some("RR73".to_string()));
+    }
+
+    #[test]
+    fn test_encode_message_compound_callsign_with_grid_degrades_gracefully() {
+        // PAN-17 live repro (YS/WE9G, 2026-08-13): pancetta tried to send
+        // "YS/WE9G K5ARH EM10" (the grid-carrying reply-to-CQ message) and
+        // encode_message always returned Err, so the QSO queued a TX every
+        // slot for the full watchdog window but never actually keyed the
+        // radio. The i3=4 wire format has no room for a grid alongside a
+        // compound callsign (only 2 report bits: blank/RRR/RR73/73), so the
+        // grid is dropped rather than failing the whole message — this is
+        // what actually unblocks the QSO on air.
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_message("YS/WE9G K5ARH EM10", None);
+        assert!(
+            result.is_ok(),
+            "compound-callsign grid reply failed to encode: {:?}",
+            result.err()
+        );
+
+        let payload = encoder
+            .try_encode_nonstandard("YS/WE9G K5ARH EM10")
+            .unwrap();
+        let msg = decode_payload_with(&payload, |p| p.add_callsign("K5ARH"));
+        assert_eq!(msg.to_callsign, Some("YS/WE9G".to_string()));
+        assert_eq!(msg.from_callsign, Some("<K5ARH>".to_string()));
+        // The grid could not be carried — nrpt degrades to blank.
+        assert_eq!(msg.contest_exchange, None);
+    }
+
+    #[test]
+    fn test_encode_message_other_compound_forms_from_pan17_incident() {
+        // Other compound-call classes cited in the PAN-17 live incident log
+        // (all previously failed to encode for the same reason as YS/WE9G).
+        let mut encoder = Ft8Encoder::new();
+        for msg in [
+            "CQ 8G81PA",
+            "CQ 3E40CDW",
+            "8G81PA K5ARH EM10",
+            "3E40CDW K5ARH EM10",
+        ] {
+            assert!(
+                encoder.encode_message(msg, None).is_ok(),
+                "'{}' failed to encode",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_encode_nonstandard_rejects_when_compound_call_exceeds_hash_field() {
+        // A callsign that fails BOTH pack28 and pack58 (invalid characters —
+        // e.g. the decode-side hash-miss placeholder "<...>", or >11 chars)
+        // genuinely cannot be represented on the wire. This must stay a
+        // clean Err (not silently address the frame using a hash of K5ARH
+        // as if it were the DX), so the QSO-layer watchdog can retire the
+        // QSO instead of retrying an unencodable message for minutes.
+        let encoder = Ft8Encoder::new();
+        let result = encoder.try_encode_nonstandard("<...> K5ARH EM10");
+        assert!(result.is_err());
+
+        // And the overall encode_message also fails cleanly (free text is
+        // too long for this text, too, so this remains an honest Err).
+        let mut encoder = Ft8Encoder::new();
+        assert!(encoder.encode_message("<...> K5ARH EM10", None).is_err());
+    }
+
+    #[test]
+    fn test_try_encode_nonstandard_both_compound() {
+        // Two compound calls working each other (e.g. two DXpeditions) —
+        // rare, but the picking rule must still be deterministic and
+        // produce a valid payload rather than a panic.
+        let encoder = Ft8Encoder::new();
+        let payload = encoder
+            .try_encode_nonstandard("YS/WE9G PJ4/KA1ABC RR73")
+            .unwrap();
+        let msg = decode_payload(&payload);
+        // call_to ("YS/WE9G") wins the exact slot per the deterministic
+        // preference; call_de is hashed (unresolvable without a prior
+        // add_callsign, so it renders as the hash-miss placeholder).
+        assert_eq!(msg.to_callsign, Some("YS/WE9G".to_string()));
+        assert_eq!(msg.from_callsign, Some("<...>".to_string()));
+        assert_eq!(msg.contest_exchange, Some("RR73".to_string()));
     }
 }

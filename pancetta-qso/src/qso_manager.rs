@@ -92,6 +92,23 @@ fn stuck_hopped_offset(current: f64) -> f64 {
     .clamp(TX_OFFSET_MIN_HZ, TX_OFFSET_MAX_HZ)
 }
 
+/// PAN-17: is `callsign` representable in *any* FT8 wire format the encoder
+/// supports? Mirrors `pancetta_ft8::encoder`'s i3=4 nonstandard-callsign
+/// "exact" field constraint (a 58-bit base-38 pack: at most 11 characters
+/// from `" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/"`) without pulling in a
+/// runtime dependency on pancetta-ft8 (which pancetta-qso only depends on
+/// optionally, for the `sim-hifi` harness). `pack28`'s standard-callsign
+/// charset is a strict subset of this one, so a callsign failing this check
+/// cannot be encoded by EITHER path — it genuinely can never be
+/// transmitted, which is what lets [`QsoManager::check_timeouts_at`] retire
+/// a QSO stuck on one immediately instead of waiting on the generic
+/// timeout/watchdog timers (see the PAN-17 check there for why).
+fn callsign_is_wire_representable(callsign: &str) -> bool {
+    const HASH_CALL_CHARSET: &str = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
+    let upper = callsign.to_ascii_uppercase();
+    upper.len() <= 11 && upper.chars().all(|c| HASH_CALL_CHARSET.contains(c))
+}
+
 /// Pick an audio offset in `[lo, hi]` deterministically from `seed` (e.g. a
 /// callsign), spreading distinct seeds across the region so concurrent Hound
 /// QSOs don't stack on one offset. Deterministic: same seed → same offset.
@@ -4764,14 +4781,6 @@ impl QsoManager {
         let mut timeouts = Vec::new();
 
         for (&qso_id, progress) in qsos.iter_mut() {
-            // Repetitive-TX watchdog (operator request): if a QSO has sat in the
-            // same active TX state — i.e. we've been re-sending the SAME message
-            // without the DX advancing us — longer than repetitive_tx_timeout_secs,
-            // retire it. Applies to BOTH manual and auto QSOs and is checked first
-            // so it bounds "stuck sending the same thing" even while the manual
-            // keep-call watchdog (below) would otherwise keep re-arming. A forward
-            // state advance resets the state's `started_at`, so a healthy,
-            // progressing QSO never trips this.
             let active_tx_state = matches!(
                 progress.state,
                 QsoState::CallingCq { .. }
@@ -4781,6 +4790,42 @@ impl QsoManager {
                     | QsoState::WaitingForConfirmation { .. }
                     | QsoState::SendingConfirmation { .. }
             );
+
+            // PAN-17: an outbound message that embeds a DX callsign the FT8
+            // encoder can never represent (neither pack28's fixed 6-char
+            // scheme nor the i3=4 nonstandard-callsign hash/58-bit path —
+            // see `callsign_is_wire_representable`) would otherwise re-arm
+            // and silently fail to transmit every slot for the full
+            // watchdog window before self-retiring as a plain Timeout,
+            // indistinguishable from "the DX never answered" (the live
+            // incident this ticket fixes). Encoding is a pure function of
+            // the callsign text, so there is nothing to gain by waiting or
+            // retrying — retire on the first watchdog pass that observes
+            // it, with a reason distinct from Timeout so the operator sees
+            // "cannot transmit this message" rather than a bogus no-reply.
+            if active_tx_state {
+                if let Some(their) = progress.metadata.their_callsign.as_deref() {
+                    if !callsign_is_wire_representable(their) {
+                        timeouts.push((
+                            qso_id,
+                            QsoFailureReason::MessageUnencodable(format!(
+                                "callsign '{}' cannot be represented in any FT8 message format",
+                                their
+                            )),
+                        ));
+                        continue;
+                    }
+                }
+            }
+
+            // Repetitive-TX watchdog (operator request): if a QSO has sat in the
+            // same active TX state — i.e. we've been re-sending the SAME message
+            // without the DX advancing us — longer than repetitive_tx_timeout_secs,
+            // retire it. Applies to BOTH manual and auto QSOs and is checked first
+            // (of the time-based watchdogs) so it bounds "stuck sending the same
+            // thing" even while the manual keep-call watchdog (below) would
+            // otherwise keep re-arming. A forward state advance resets the
+            // state's `started_at`, so a healthy, progressing QSO never trips this.
             if active_tx_state {
                 if let Some(dur) = progress.state.state_duration(now) {
                     if dur.num_seconds() > self.config.timeouts.repetitive_tx_timeout_secs as i64 {
@@ -4924,7 +4969,9 @@ impl QsoManager {
                 // previously never emitted QsoFailed, so the coordinator's
                 // priority-scoring failure backoff (`record_failure`) never
                 // fired for a timed-out QSO. `reason` here is
-                // QsoFailureReason::Timeout for every push site above.
+                // QsoFailureReason::Timeout for every timing-based push site
+                // above, or QsoFailureReason::MessageUnencodable for the
+                // PAN-17 unencodable-callsign check.
                 self.emit_event(QsoEvent::QsoFailed {
                     qso_id,
                     reason,
@@ -5965,6 +6012,101 @@ mod tests {
             manager.get_qso(qso_id).await,
             Err(QsoManagerError::QsoNotFound { .. })
         ));
+    }
+
+    /// PAN-17: a QSO whose DX callsign can never be encoded onto the FT8
+    /// wire (here, the decoder's own hash-miss placeholder `<...>` leaking
+    /// into the partner field — invalid characters, not just "long") must
+    /// be retired on the very first watchdog pass, with a reason distinct
+    /// from `Timeout`, instead of consuming the full manual-call watchdog
+    /// window re-arming an identical message that will never transmit.
+    #[tokio::test]
+    async fn unencodable_dx_callsign_retires_immediately_not_via_manual_watchdog() {
+        let mut config = test_config();
+        // Both generic watchdogs set very long, so a pass at PAN-17's
+        // near-immediate retirement can only be explained by the new check.
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_cq_manual("<...>".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        // A single watchdog pass, one second later, is enough.
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
+
+        let mut reason = None;
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::QsoFailed {
+                qso_id: id,
+                reason: r,
+                ..
+            } = ev
+            {
+                if id == qso_id {
+                    reason = Some(r);
+                }
+            }
+        }
+        assert!(
+            matches!(reason, Some(QsoFailureReason::MessageUnencodable(_))),
+            "expected MessageUnencodable, got {:?}",
+            reason
+        );
+    }
+
+    /// A genuinely encodable compound callsign (PAN-17's primary fix covers
+    /// this on the encoder side) must NOT be caught by the new fast-fail
+    /// watchdog — only callsigns that can never be represented on the wire
+    /// at all are retired early.
+    #[tokio::test]
+    async fn encodable_compound_callsign_is_not_retired_by_unencodable_watchdog() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("YS/WE9G".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(
+            manager.get_qso(qso_id).await.is_ok(),
+            "a genuinely encodable compound callsign must not be retired by the \
+             unencodable-message watchdog"
+        );
+    }
+
+    /// A callsign that's merely long-but-valid up to the 11-char hash-field
+    /// limit is representable; only exceeding it (or using an invalid
+    /// character) trips the new watchdog.
+    #[test]
+    fn callsign_is_wire_representable_boundary() {
+        assert!(callsign_is_wire_representable("K1ABC")); // plain standard
+        assert!(callsign_is_wire_representable("YS/WE9G")); // compound, fits
+        assert!(callsign_is_wire_representable("PJ4/KA1ABC")); // 10 chars, fits
+        assert!(callsign_is_wire_representable("ABCDEFGHIJK")); // exactly 11
+        assert!(!callsign_is_wire_representable("ABCDEFGHIJKL")); // 12: too long
+        assert!(!callsign_is_wire_representable("<...>")); // invalid chars
     }
 
     /// Repetitive-TX watchdog: a QSO stuck in the same active TX state (we keep

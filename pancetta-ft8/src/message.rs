@@ -1370,6 +1370,45 @@ impl Default for HashTable {
     }
 }
 
+/// Character set for the i3=4 nonstandard-callsign 58-bit "exact" field and
+/// the underlying hash (mirrors `HashTable::calculate_n22`'s local table).
+/// " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/" (38 chars). Exposed so
+/// `encoder.rs` can pack the TX-side counterpart of [`MessageParser::unpack58`]
+/// / [`HashTable::calculate_hash_12bit`] without duplicating the charset.
+pub(crate) const HASH_CALL_CHARSET: &[u8; 38] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
+
+/// Pack a callsign into the 58-bit base-38 "exact" field used by i3=4
+/// nonstandard-callsign messages — the encode-side mirror of
+/// [`MessageParser::unpack58`]. Returns `None` if the callsign is too long
+/// (>11 chars) or contains a character outside [`HASH_CALL_CHARSET`]; such a
+/// callsign cannot occupy this field (it can still go in the 12-bit hash
+/// field via [`hash12`], which accepts any string).
+pub(crate) fn pack58(callsign: &str) -> Option<u64> {
+    let upper = callsign.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    if bytes.len() > 11 {
+        return None;
+    }
+    let mut n58: u64 = 0;
+    for &b in bytes {
+        let j = HASH_CALL_CHARSET.iter().position(|&c| c == b)?;
+        n58 = n58 * 38 + j as u64;
+    }
+    for _ in bytes.len()..11 {
+        n58 *= 38;
+    }
+    Some(n58)
+}
+
+/// Compute the 12-bit hash of a callsign for the i3=4 "hashed" field —
+/// the encode-side mirror of `HashTable::calculate_hash_12bit`. Unlike
+/// [`pack58`] this never fails: any string hashes, the same way real FT8
+/// traffic can hash a callsign the receiver's table has never seen (the
+/// receiver just can't reverse it back to text — it renders `<...>`).
+pub(crate) fn hash12(callsign: &str) -> u32 {
+    HashTable::calculate_n22(callsign) >> 10
+}
+
 /// FT8 message parser
 pub struct MessageParser {
     /// Hash table for worked stations (10/12/22-bit hashes)
