@@ -1207,6 +1207,10 @@ impl super::ApplicationCoordinator {
             let poll_client_keys = client_keys.clone();
             let poll_key_dir = key_dir.clone();
             let poll_agent_key_id = paired.agent_key_id.clone();
+            // PAN-18 round-2: the shared arm + audit log so the poll task can
+            // disarm-on-revocation (see `poll_authorizations_loop` doc).
+            let poll_arm = arm.clone();
+            let poll_audit = audit.clone();
             let poll_shutdown = self.shutdown_signal.clone();
             let poll_interval = Duration::from_secs(cqdx_cfg.authorizations_poll_interval_secs);
             let poll_handle = tokio::spawn(async move {
@@ -1217,6 +1221,8 @@ impl super::ApplicationCoordinator {
                     poll_tx_allow_list,
                     poll_tx_arm_allow_list,
                     poll_client_keys,
+                    poll_arm,
+                    poll_audit,
                     poll_shutdown,
                     poll_interval,
                 )
@@ -1337,6 +1343,15 @@ fn load_client_device_keys(
 /// (who legitimately carries this station's `agentKeyId` on their edge) may
 /// connect but must never pass the TX-arm check. A poll failure leaves BOTH
 /// sets untouched.
+///
+/// PAN-18 round-2 review fix (Codex finding on PR #253): `verify_and_arm`'s
+/// `tx_arm_allow_list` gate only runs at ARM time — it does nothing for an
+/// arm that is already live when a LATER poll revokes its controller's
+/// eligibility (edge dropped entirely, or newly delegated). The frozen
+/// e2e-auth.v1 §6-revocation invariant is "the cloud may only ever reduce
+/// station-local TX authority", so a live arm whose controller falls out of
+/// the freshly-computed `tx_arm_allow_list` is disarmed immediately here,
+/// rather than left to run out its grant TTL (up to 60 minutes).
 #[allow(clippy::too_many_arguments)]
 async fn poll_authorizations_loop(
     cqdx_cfg: pancetta_config::network::CqdxConfig,
@@ -1345,6 +1360,8 @@ async fn poll_authorizations_loop(
     tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
     tx_arm_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
     client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
+    arm: Arc<Mutex<ArmState>>,
+    audit: AuditLog,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     interval: Duration,
 ) {
@@ -1367,6 +1384,31 @@ async fn poll_authorizations_loop(
                 let new_keys = load_client_device_keys(&key_dir, &new_allow);
                 let allow_len = new_allow.len();
                 let tx_arm_len = new_tx_arm_allow.len();
+
+                // Disarm-on-revocation: if a live arm's controller is no
+                // longer in the freshly-computed TX-arm-eligible set,
+                // disarm it NOW rather than let it run out its TTL. Single
+                // lock acquisition (read the identity, decide, and disarm
+                // under the same guard) so a concurrent re-arm by a
+                // DIFFERENT, still-eligible client can never be raced and
+                // wrongly disarmed by this check.
+                if let Ok(mut st) = arm.lock() {
+                    let should_disarm = st
+                        .armed_client_key_id()
+                        .is_some_and(|cur| !new_tx_arm_allow.contains(cur));
+                    if should_disarm {
+                        let effects =
+                            st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_ms());
+                        drop(st);
+                        apply_arm_effects(&audit, &effects);
+                        warn!(
+                            target: "agent.tx",
+                            "remote TX disarmed: an authorization refresh revoked the \
+                             current controller's TX-arm eligibility"
+                        );
+                    }
+                }
+
                 *tx_allow_list.write().unwrap() = new_allow;
                 *tx_arm_allow_list.write().unwrap() = new_tx_arm_allow;
                 *client_keys.write().unwrap() = new_keys;
@@ -3890,6 +3932,8 @@ mod tests {
         let tx_arm_allow_list =
             Arc::new(std::sync::RwLock::new(HashSet::from(["seed".to_string()])));
         let client_keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let arm = Arc::new(Mutex::new(ArmState::new()));
+        let audit = AuditLog::new(audit_tmp());
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cqdx_cfg = pancetta_config::network::CqdxConfig {
             enabled: true,
@@ -3906,6 +3950,8 @@ mod tests {
             tx_allow_list.clone(),
             tx_arm_allow_list.clone(),
             client_keys.clone(),
+            arm,
+            audit,
             shutdown_clone,
             Duration::from_millis(50),
         ));
@@ -3921,6 +3967,131 @@ mod tests {
             *tx_arm_allow_list.read().unwrap(),
             HashSet::from(["seed".to_string()]),
             "a failing poll must never clear the pre-seeded TX-arm-allow-list"
+        );
+    }
+
+    /// PAN-18 round-2 review fix (Codex finding on PR #253): when a client is
+    /// ALREADY ARMED and a subsequent authorization poll comes back WITHOUT
+    /// that client in the TX-arm-eligible set (here: the edge is now
+    /// delegated), the live arm must be disarmed immediately — not left to
+    /// run out its TTL. `verify_and_arm`'s gate alone is insufficient because
+    /// it only runs at arm time; this exercises the REAL
+    /// `poll_authorizations_loop` end to end (a genuine mock cqdx HTTP
+    /// server, not just the pure `split_authorization_edges` predicate),
+    /// since round 1's gap was specifically about threading the shared `arm`
+    /// into this task, not the filtering logic itself.
+    ///
+    /// RED evidence: before this fix, `poll_authorizations_loop` never
+    /// touched `arm` at all — `is_armed()` stayed `true` after the poll ran
+    /// (confirmed by temporarily deleting the disarm-on-revocation block).
+    #[tokio::test]
+    async fn poll_authorizations_loop_disarms_when_armed_clients_eligibility_is_revoked() {
+        // Mock cqdx: every request returns ONE edge for CLIENT_KEY_ID with a
+        // non-null delegatedBy — i.e. this refresh says CLIENT_KEY_ID is no
+        // longer TX-arm-eligible (still admitted as a peer, though).
+        let app = axum::Router::new().route(
+            "/api/v1/authorizations",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "authorizations": [{
+                        "id": "auth_1",
+                        "agentKeyId": "agent_this",
+                        "clientKeyId": CLIENT_KEY_ID,
+                        "scopes": ["status", "qsy"],
+                        "createdAt": "2026-08-15T00:00:00Z",
+                        "role": "owner",
+                        "delegatedBy": "some_owner_user_id"
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tx_allow_list = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(HashSet::from([
+            CLIENT_KEY_ID.to_string()
+        ])));
+        let client_keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let arm = Arc::new(Mutex::new(ArmState::new()));
+        let audit = AuditLog::new(audit_tmp());
+        let audit_path = audit.path().clone();
+
+        // Pre-arm as CLIENT_KEY_ID — simulates a client that armed BEFORE its
+        // edge became delegated.
+        {
+            let mut st = arm.lock().unwrap();
+            st.set_local_consent(true, NOW);
+            st.arm(
+                pancetta_agent::arm::VerifiedArmGrant {
+                    operator_callsign: "K5ARH".to_string(),
+                    ttl_ms: 3_600_000, // 1h — long enough that only the poll-driven disarm can end it
+                    scope_tx: true,
+                    jti: "revocation-test-jti".to_string(),
+                    client_key_id: CLIENT_KEY_ID.to_string(),
+                },
+                NOW,
+            );
+        }
+        assert!(
+            arm.lock().unwrap().is_armed(),
+            "setup sanity: must be armed before the poll runs"
+        );
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cqdx_cfg = pancetta_config::network::CqdxConfig {
+            enabled: true,
+            base_url: format!("http://{addr}"),
+            token: Some("pat_test_token_0000000000".to_string()),
+            poll_interval_secs: 30,
+            authorizations_poll_interval_secs: 45,
+        };
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(poll_authorizations_loop(
+            cqdx_cfg,
+            "agent_this".to_string(),
+            std::env::temp_dir(),
+            tx_allow_list.clone(),
+            tx_arm_allow_list.clone(),
+            client_keys.clone(),
+            arm.clone(),
+            audit,
+            shutdown_clone,
+            Duration::from_millis(50),
+        ));
+        // Give the poll loop time to complete at least one successful cycle
+        // against the mock server.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert!(
+            tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID),
+            "the now-delegated client must still be admitted as a peer"
+        );
+        assert!(
+            !tx_arm_allow_list.read().unwrap().contains(CLIENT_KEY_ID),
+            "the now-delegated client must no longer be TX-arm-eligible"
+        );
+        assert!(
+            !arm.lock().unwrap().is_armed(),
+            "a live arm whose controller's TX-arm eligibility was just revoked \
+             by a poll must be disarmed immediately, not left to run out its TTL"
+        );
+
+        let log = std::fs::read_to_string(&audit_path).unwrap_or_default();
+        let disarmed = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<AuditEvent>(l).ok())
+            .any(|ev| {
+                ev.kind == AuditKind::Disarmed && ev.detail.contains("authorization-revoked")
+            });
+        assert!(
+            disarmed,
+            "the revocation-driven disarm must be audited with the AuthorizationRevoked reason"
         );
     }
 
