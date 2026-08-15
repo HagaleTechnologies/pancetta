@@ -380,6 +380,32 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_needed_dxcc(&self, callsign: &str) -> bool {
+        // PAN-16: an unresolvable callsign (no matching prefix in the
+        // offline DXCC table) can never be scored as "needed" — there's no
+        // entity to need. Without this guard, FT8's `"<...>"` placeholder
+        // for an unresolved i3=4 nonstandard-callsign hash (message.rs's
+        // `parse_nonstd_call`, used when the local hash table has no entry
+        // for the 12-bit hash) falls through every branch below into
+        // "needed" (the historical-default branch treats anything
+        // non-excluded as needed; the exclusion-set branch treats anything
+        // that doesn't match a *real* prefix as automatically outside the
+        // excluded set too) and picks up `needed_dxcc`'s weight — the
+        // scorer's single largest term — ranking an uncallable placeholder
+        // above real, workable stations. Mirrors the same guard
+        // `is_dxcc_needed_on_band` already applies.
+        //
+        // Bracket-strip first: FT8's *resolved* hash form renders as
+        // `<CALLSIGN>` (a real, identifiable callsign the local hash table
+        // did map) and must keep resolving/scoring normally — only the
+        // literal `<...>` (no callsign inside) is actually unresolvable.
+        let unbracketed = callsign
+            .strip_prefix('<')
+            .and_then(|s| s.strip_suffix('>'))
+            .unwrap_or(callsign);
+        if pancetta_tui::dxcc::entity_for_callsign(unbracketed).is_none() {
+            return false;
+        }
+
         let needed = self.needed_dxcc.read();
         let upper = callsign.to_uppercase();
         if needed.is_empty() {
@@ -901,6 +927,39 @@ mod tests {
         assert!(!lookup.is_needed_dxcc("JA1ABC"));
         // 3Y/B1234 — is in cqdx-needed
         assert!(lookup.is_needed_dxcc("3Y/B1234"));
+    }
+
+    /// PAN-16: an unresolvable callsign string (no matching prefix in the
+    /// offline DXCC table — e.g. FT8's unresolved-hash placeholder
+    /// `"<...>"`) must never be scored as "needed", in any of
+    /// `is_needed_dxcc`'s three branches (default "everything needed",
+    /// exclusion fallback, cqdx-populated needed set). Mirrors the
+    /// unresolvable-callsign guard `is_dxcc_needed_on_band` already has.
+    #[test]
+    fn test_unresolvable_callsign_never_needed() {
+        // Branch 1: no needed set, no exclusions — historical default
+        // would otherwise treat this as "everything needed".
+        let lookup = CachedStationLookup::new();
+        assert!(!lookup.is_needed_dxcc("<...>"));
+
+        // Branch 2: no needed set, exclusions populated.
+        let mut excluded = HashSet::new();
+        excluded.insert("K".to_string());
+        lookup.set_excluded_dxcc_prefixes(excluded);
+        assert!(!lookup.is_needed_dxcc("<...>"));
+
+        // Branch 3: cqdx-populated needed set (prefix-match branch) — an
+        // unresolvable string can never legitimately match a real DXCC
+        // prefix, but guard explicitly rather than relying on that.
+        let mut needed = HashSet::new();
+        needed.insert("3Y/B".to_string());
+        lookup.update_needed_dxcc(needed);
+        assert!(!lookup.is_needed_dxcc("<...>"));
+
+        // A resolved hash form (real callsign in brackets) is out of scope
+        // for this ticket and must still resolve/score normally.
+        let lookup2 = CachedStationLookup::new();
+        assert!(lookup2.is_needed_dxcc("<K1ABC>"));
     }
 
     #[test]
