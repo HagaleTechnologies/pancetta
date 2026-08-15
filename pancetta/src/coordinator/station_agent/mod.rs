@@ -163,7 +163,12 @@ struct ArmContext {
     /// check and as the `allow_list` argument to
     /// `CapabilityVerifier::verify_arm_grant`. When cqdx auto-populate is
     /// disabled (no delegation concept in the pure-config path), this
-    /// permanently equals `tx_allow_list`.
+    /// permanently equals `tx_allow_list`. FAIL-CLOSED seed: when cqdx
+    /// auto-populate IS enabled, this starts EMPTY (see
+    /// `seed_tx_arm_allow_list`) — nobody can arm TX until the first
+    /// successful poll proves who's non-delegated, even though
+    /// `tx_allow_list` (peer admission) is seeded from the static config list
+    /// immediately.
     tx_arm_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
     /// Arm-time **best-effort** revocation deny-list, keyed by the
     /// capabilityToken's `jti` (frozen e2e-auth.v1 §6-revocation). **EMPTY in
@@ -983,6 +988,33 @@ pub(crate) fn station_agent_active(
     has_relay_config(cfg) && (!cfg.tx_allow_list.is_empty() || cqdx_will_populate)
 }
 
+/// The initial seed for `tx_arm_allow_list` (PAN-18 round-1 review fix,
+/// Codex finding on PR #253): FAIL-CLOSED, not fail-open.
+///
+/// When `cqdx_will_poll` (cqdx auto-populate enabled with a token — the same
+/// condition that gates spawning `poll_authorizations_loop`), TX-arm
+/// eligibility starts EMPTY: nobody can arm TX until a successful poll
+/// establishes the non-delegated subset. A client statically listed in
+/// `tx_allow_list` must NOT be able to arm before the first poll completes,
+/// nor indefinitely if cqdx stays unreachable — that would let a client whose
+/// edge has since become delegated reuse a still-valid enabled token after a
+/// restart, defeating the whole peer-admission/TX-arm split.
+///
+/// When cqdx auto-populate is NOT going to run, there is no delegation
+/// concept at all in the pure-config path, so `tx_arm_allow_list` clones
+/// `static_tx_allow_list` and (absent a poll task to ever diverge it) stays
+/// permanently equal to it — this is pre-PAN-18 behavior, unchanged.
+fn seed_tx_arm_allow_list(
+    static_tx_allow_list: &HashSet<String>,
+    cqdx_will_poll: bool,
+) -> HashSet<String> {
+    if cqdx_will_poll {
+        HashSet::new()
+    } else {
+        static_tx_allow_list.clone()
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Definitively close the shared remote-TX arm after StationAgent loss.
     ///
@@ -1098,13 +1130,26 @@ impl super::ApplicationCoordinator {
         // checked, so an un-registered client fails closed at verify time.
         let tx_allow_list: HashSet<String> = cfg.tx_allow_list.iter().cloned().collect();
         let client_keys = load_client_device_keys(&key_dir, &tx_allow_list);
-        // PAN-18: seed the TX-arm-eligible set identically to the
-        // peer-admission set — the pure-config path has no delegation
-        // concept, so nothing should be pre-emptively excluded before live
-        // cqdx data (if any) arrives via the poll task below. When cqdx
-        // auto-populate is disabled, this stays permanently equal to
-        // `tx_allow_list` (no poll task ever spawns to diverge it).
-        let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(tx_allow_list.clone()));
+        // PAN-18 (round-1 review fix): the TX-arm-eligible seed must be
+        // FAIL-CLOSED, not fail-open. This condition mirrors the poll-task
+        // spawn gate below EXACTLY (`cqdx_cfg.enabled` + a non-empty token) —
+        // when cqdx auto-populate WILL run, `tx_arm_allow_list` starts EMPTY:
+        // nobody can arm TX until a successful poll proves who's
+        // non-delegated. Cloning the static list here (the original, wrong
+        // approach) would let every statically-listed client arm before the
+        // first poll succeeds — and indefinitely if cqdx stays unreachable,
+        // including reusing a still-valid enabled token after a restart for
+        // a client whose edge has since become delegated. `tx_allow_list`
+        // (peer admission) is UNCHANGED — a delegated guest can still
+        // connect from the first second, just never arm. Only the
+        // cqdx-DISABLED path (no delegation concept at all) clones the
+        // static list, matching pre-PAN-18 behavior permanently.
+        let cqdx_will_poll =
+            cqdx_cfg.enabled && cqdx_cfg.token.as_ref().is_some_and(|t| !t.is_empty());
+        let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(seed_tx_arm_allow_list(
+            &tx_allow_list,
+            cqdx_will_poll,
+        )));
         let tx_allow_list = Arc::new(std::sync::RwLock::new(tx_allow_list));
         let client_keys = Arc::new(std::sync::RwLock::new(client_keys));
 
@@ -1153,7 +1198,10 @@ impl super::ApplicationCoordinator {
             .get_or_create_channel(ComponentId::StationAgent)
             .await?;
 
-        if cqdx_cfg.enabled && cqdx_cfg.token.as_ref().is_some_and(|t| !t.is_empty()) {
+        // Same condition as `cqdx_will_poll` above (kept as one boolean, not
+        // recomputed, so the seed-fail-closed decision and the spawn
+        // decision can never drift apart).
+        if cqdx_will_poll {
             let poll_tx_allow_list = tx_allow_list.clone();
             let poll_tx_arm_allow_list = tx_arm_allow_list.clone();
             let poll_client_keys = client_keys.clone();
@@ -3913,5 +3961,49 @@ mod tests {
         cfg.tx_allow_list = vec!["some_client_key".to_string()];
         let cqdx_cfg = pancetta_config::network::CqdxConfig::default();
         assert!(station_agent_active(&cfg, &cqdx_cfg));
+    }
+
+    // --- seed_tx_arm_allow_list: PAN-18 round-1 review fix (fail-closed seed) ---
+
+    /// PAN-18 round-1 Codex finding on PR #253: with cqdx auto-populate
+    /// enabled (so `poll_authorizations_loop` WILL be spawned), a client
+    /// present in the static `tx_allow_list` must NOT be present in the
+    /// seeded `tx_arm_allow_list` — i.e. must NOT be able to arm TX — until a
+    /// poll actually succeeds. Seeding it from the static list (cloning, the
+    /// original wrong approach) is fail-OPEN: it trusts every statically
+    /// listed client by default instead of trusting none until cqdx proves
+    /// who's non-delegated. Before this fix, this test failed (confirmed by
+    /// reverting `seed_tx_arm_allow_list`'s `cqdx_will_poll` branch to clone
+    /// `static_tx_allow_list` unconditionally — the assertion below then
+    /// flips to non-empty).
+    #[test]
+    fn cqdx_enabled_seeds_tx_arm_allow_list_empty_regardless_of_static_list() {
+        let static_list = HashSet::from(["some_client_key".to_string()]);
+        let seeded = seed_tx_arm_allow_list(&static_list, /* cqdx_will_poll */ true);
+        assert!(
+            seeded.is_empty(),
+            "cqdx-enabled must seed tx_arm_allow_list EMPTY (fail-closed) even when the \
+             static tx_allow_list is non-empty — nobody may arm TX until a poll succeeds"
+        );
+    }
+
+    /// Companion: `tx_allow_list` (peer admission) itself is NOT affected by
+    /// this fail-closed seed — it stays seeded from the static config list
+    /// (unchanged, PAN-18's peer-admission set is out of scope for this
+    /// fix), so a delegated guest can still connect from the first second,
+    /// just never arm. This is exercised at the `start_station_agent_component`
+    /// call site (`tx_allow_list` is seeded from `cfg.tx_allow_list`
+    /// unconditionally); this test pins `seed_tx_arm_allow_list` itself only
+    /// returning the TX-arm value, confirming it never mutates or otherwise
+    /// depends on a separate peer-admission seed.
+    #[test]
+    fn cqdx_disabled_seeds_tx_arm_allow_list_from_static_list() {
+        let static_list = HashSet::from(["some_client_key".to_string()]);
+        let seeded = seed_tx_arm_allow_list(&static_list, /* cqdx_will_poll */ false);
+        assert_eq!(
+            seeded, static_list,
+            "cqdx-disabled must seed tx_arm_allow_list identically to the static list — \
+             no delegation concept exists in the pure-config path"
+        );
     }
 }
