@@ -13,6 +13,39 @@ use tracing::{debug, error, info, span, warn, Level};
 /// may stamp the wrong band.
 const RIG_INITIAL_READ_TIMEOUT: Duration = Duration::from_secs(8);
 
+/// PAN-19 HIGH follow-up (round 3, Codex P1): maximum ADDITIONAL time to
+/// wait -- on top of whatever `RIG_INITIAL_READ_TIMEOUT` above already
+/// spent -- for the Hamlib task's message loop to confirm it has actually
+/// started consuming commands, before `start_hamlib_component` returns.
+///
+/// `TxInhibitGuard` (health.rs) releases the moment `restart_component`'s
+/// await -- which bottoms out in this function returning -- completes.
+/// Since the HIGH fix above made `children_tx` fire BEFORE the connect/
+/// PTT-off/frequency-read sequence (correctly, to stop a slow rig from
+/// bailing startup), "children published" no longer implies "the message
+/// loop exists to consume a `SetPtt` command" -- that sequence still
+/// budgets ~11s worst case (5s connect + 3s PTT-off retry + 3s
+/// frequency-read retry). Without this wait, TX could be un-inhibited up
+/// to that ~11s BEFORE a queued PTT-on command can actually be consumed,
+/// leaving it stuck unprocessed while TX starts keying audio.
+///
+/// This is independent of, and stacks after, `RIG_INITIAL_READ_TIMEOUT`
+/// (both wait on the same underlying "connect/ptt/freq sequence finished"
+/// moment, signaled by two separate oneshots fired together -- see
+/// `loop_ready_tx`/`initial_read_tx` -- so in the common case this second
+/// wait resolves instantly once the first one already did). 15s gives a
+/// combined worst-case budget of up to 23s, comfortably past the
+/// documented ~11s, before conceding.
+///
+/// Mirrors `RIG_INITIAL_READ_TIMEOUT`'s fail-safe shape: on timeout, log
+/// and continue -- this must NEVER bail/fail the restart (that would
+/// reintroduce the exact regression the HIGH fix closed: a slow rig must
+/// never hard-fail startup). Being LATE to un-inhibit is safe (TX stays
+/// inhibited a few seconds longer than ideal); being EARLY is not (TX
+/// could un-mute with a queued PTT-on command still unprocessed) -- this
+/// fails safe in the correct direction.
+const HAMLIB_LOOP_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
 pub(crate) struct HamlibChildren {
     pub(crate) poll: tokio::task::AbortHandle,
     pub(crate) watchdog: tokio::task::AbortHandle,
@@ -595,6 +628,16 @@ impl super::ApplicationCoordinator {
         // completion to log the wrong band.
         let (initial_read_tx, initial_read_rx) = tokio::sync::oneshot::channel::<()>();
         let (children_tx, children_rx) = tokio::sync::oneshot::channel();
+        // PAN-19 HIGH follow-up (round 3, Codex P1): a SEPARATE oneshot from
+        // `initial_read_tx` -- both fire together, right as the spawned
+        // task's message loop is about to start (see `loop_ready_tx.send`
+        // below), but `initial_read_rx` is already consumed by its own
+        // `tokio::time::timeout(...)` call further down (a `oneshot::
+        // Receiver` can't be awaited twice, and a timeout drops the future
+        // it wraps), so gating the SEPARATE "safe to un-inhibit TX" wait on
+        // it directly isn't possible. See `HAMLIB_LOOP_READY_TIMEOUT` above
+        // for why this wait exists at all.
+        let (loop_ready_tx, loop_ready_rx) = tokio::sync::oneshot::channel::<()>();
 
         let hamlib_handle = {
             let shutdown = self.shutdown_signal.clone();
@@ -1000,6 +1043,15 @@ impl super::ApplicationCoordinator {
                 // with a bounded timeout; send errors are harmless (timeout
                 // already elapsed).
                 let _ = initial_read_tx.send(());
+                // PAN-19 HIGH follow-up (round 3, Codex P1): signal that the
+                // message loop is about to start consuming commands off the
+                // bus -- see `HAMLIB_LOOP_READY_TIMEOUT` for why a second,
+                // separate signal is needed here alongside `initial_read_tx`
+                // above (same moment, different consumer/purpose). Fired
+                // unconditionally (mock rig and disabled-rig paths reach
+                // here just as fast as the real-rig success path), right
+                // before the loop below that actually starts consuming.
+                let _ = loop_ready_tx.send(());
 
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
@@ -1175,6 +1227,34 @@ impl super::ApplicationCoordinator {
                 }
             },
         );
+
+        // PAN-19 HIGH follow-up (round 3, Codex P1): don't return (and thus
+        // don't let the caller's `TxInhibitGuard` release) until the
+        // message loop has actually confirmed it can consume commands, or
+        // this generous, NON-fatal timeout elapses -- see
+        // `HAMLIB_LOOP_READY_TIMEOUT`'s doc comment for the full reasoning.
+        // In the common case (rig responded before/around
+        // `RIG_INITIAL_READ_TIMEOUT` above already elapsed, or the mock/
+        // disabled-rig path) `loop_ready_tx` has already fired by now, so
+        // this resolves immediately with no added latency. NEVER bail/fail
+        // here on timeout -- a slow rig must still start up successfully;
+        // it just means TX stays inhibited a little longer than ideal,
+        // which is the safe direction to be wrong in.
+        if rig_enabled {
+            match tokio::time::timeout(HAMLIB_LOOP_READY_TIMEOUT, loop_ready_rx).await {
+                Ok(_) => {
+                    info!(target: "rig", "Hamlib message loop ready to consume commands");
+                }
+                Err(_) => {
+                    warn!(
+                        target: "rig",
+                        "Hamlib message loop not confirmed ready within an additional {}s -- \
+                         proceeding anyway; a queued PTT command may be processed late",
+                        HAMLIB_LOOP_READY_TIMEOUT.as_secs()
+                    );
+                }
+            }
+        }
 
         // PAN-19 MEDIUM #2: `teardown_hamlib` only drains+aborts
         // `hamlib_orphans` at the START of the NEXT teardown call. A
@@ -1442,6 +1522,77 @@ mod children_publish_race_tests {
                      rig.connect() takes",
             )
             .expect("children_tx sender must not have been dropped without sending");
+    }
+
+    /// PAN-19 HIGH follow-up (round 3, Codex P1) regression guard.
+    ///
+    /// The HIGH fix above closed the original bug (children publishing
+    /// gated on a slow connect), but that also decoupled "children
+    /// published" from "the message loop actually exists to consume a
+    /// `SetPtt` command" -- `TxInhibitGuard` (health.rs) releases the
+    /// moment `start_hamlib_component` returns, which used to happen
+    /// shortly after children published. This pins the GAP between the two
+    /// events that `HAMLIB_LOOP_READY_TIMEOUT`'s wait (in the real
+    /// `start_hamlib_component`, just above this test module) exists to
+    /// respect: children publish immediately, but the separate
+    /// "loop ready" signal must NOT fire until AFTER the slow connect
+    /// sequence completes -- proving a caller that gates TX un-inhibit on
+    /// the LATTER (not just the former) stays correctly blocked for the
+    /// whole gap, not just for the ~instant children-publish window.
+    #[tokio::test]
+    async fn loop_ready_signal_does_not_fire_until_after_a_slow_rig_connect_completes() {
+        let rig = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 300,
+            ..Default::default()
+        }));
+        let (children_tx, children_rx) = tokio::sync::oneshot::channel::<()>();
+        let (loop_ready_tx, mut loop_ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let rig_for_task = rig.clone();
+        tokio::spawn(async move {
+            let poll_stub = tokio::spawn(async { std::future::pending::<()>().await });
+            let watchdog_stub = tokio::spawn(async { std::future::pending::<()>().await });
+            let _ = children_tx.send(());
+            poll_stub.abort();
+            watchdog_stub.abort();
+
+            // The slow part -- mirrors the real connect/PTT-off/frequency
+            // -read sequence in `start_hamlib_component`'s spawned task.
+            let _ = rig_for_task.connect().await;
+
+            // Fires only after that slow sequence -- mirrors
+            // `initial_read_tx`/`loop_ready_tx` firing together right
+            // before the real message loop starts.
+            let _ = loop_ready_tx.send(());
+        });
+
+        // Children publish promptly -- unaffected by this follow-up fix
+        // (the HIGH fix's own guarantee still holds).
+        tokio::time::timeout(Duration::from_millis(100), children_rx)
+            .await
+            .expect("children handles must still publish promptly")
+            .expect("children_tx sender must not have been dropped without sending");
+
+        // At this point the slow connect (300ms) is still in flight. A
+        // caller gating TX un-inhibit on `loop_ready_rx` (rather than on
+        // `children_rx`, which already fired) must still see it NOT
+        // ready -- this is the exact gap the round-3 fix exists to
+        // respect rather than race past.
+        assert!(
+            matches!(
+                loop_ready_rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ),
+            "loop_ready_rx must not have fired yet -- children publishing must not imply \
+             the message loop is ready to consume commands"
+        );
+
+        // ...and it DOES eventually fire, once the slow connect finishes --
+        // proving the gap closes rather than the signal never arriving.
+        tokio::time::timeout(Duration::from_secs(1), loop_ready_rx)
+            .await
+            .expect("loop_ready_rx must eventually fire once the slow connect finishes")
+            .expect("loop_ready_tx sender must not have been dropped without sending");
     }
 }
 
