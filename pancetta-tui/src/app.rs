@@ -1703,7 +1703,20 @@ impl App {
         // the `if let` simply not match for our own call, skipping the update.
         // (#42; unified via is_our_call which also catches compound forms like
         // K5ARH/P or EA8/K5ARH)
-        if let Some(call_sign) = message.call_sign.as_ref().filter(|c| !self.is_our_call(c)) {
+        //
+        // PAN-16: also never list `"<...>"`, FT8's literal placeholder for an
+        // i3=4 nonstandard-callsign hash the local hash table couldn't
+        // resolve (pancetta-ft8's `parse_nonstd_call`). It's a legitimate,
+        // correctly decoded frame — not filtered from `decoded_messages`
+        // above — but it isn't a callsign at all and can never actually be
+        // called, so it must not become a DX-Hunter/Callers entry. The
+        // *resolved* hash form `<CALLSIGN>` (hash found in the table) is a
+        // real, identifiable callsign and is deliberately NOT filtered here.
+        if let Some(call_sign) = message
+            .call_sign
+            .as_ref()
+            .filter(|c| !self.is_our_call(c) && c.as_str() != "<...>")
+        {
             // Preserve existing grid if new message doesn't have one
             // (e.g., RR73/73 messages don't carry grid info)
             let grid_square = message.grid_square.clone().or_else(|| {
@@ -5285,6 +5298,43 @@ mod tests {
             .await
             .unwrap();
         assert!(app.dx_stations.contains_key("JA1ABC"));
+    }
+
+    /// PAN-16: `"<...>"` is FT8's literal placeholder for an i3=4
+    /// nonstandard-callsign hash that had no local hash-table entry to
+    /// resolve it back to a real callsign. It's a legitimate, correctly
+    /// decoded frame — not a bad decode — so it must stay in band-activity
+    /// history, but it is not a callable station and must never appear in
+    /// the DX-Hunter/Callers list.
+    #[tokio::test]
+    async fn unresolved_hash_placeholder_not_added_to_dx_hunter() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+
+        app.add_decoded_message(fixture_view("<...>", -10))
+            .await
+            .unwrap();
+        assert!(
+            !app.dx_stations.contains_key("<...>"),
+            "unresolved hash placeholder must never be listed as a workable station"
+        );
+        assert!(
+            app.decoded_messages
+                .iter()
+                .any(|m| m.call_sign.as_deref() == Some("<...>")),
+            "the decode itself must still be retained for logs/QSO context"
+        );
+
+        // Out of scope / must NOT regress: a *resolved* hash form (a real
+        // callsign the hash table successfully mapped) still looks and
+        // scores like any other identifiable callsign.
+        app.add_decoded_message(fixture_view("<K1ABC>", -10))
+            .await
+            .unwrap();
+        assert!(
+            app.dx_stations.contains_key("<K1ABC>"),
+            "a resolved hash form is a real, identifiable callsign and must still be listed"
+        );
     }
 
     /// #42 extension: add_dx_spot (PSKReporter/local path) must not insert our

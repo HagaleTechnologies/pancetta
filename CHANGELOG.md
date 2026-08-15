@@ -30,6 +30,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   progress/status) over the relay, sharing the same translation pump the
   localhost remote gateway uses.
 
+### Changed
+
+- `k` (abort the selected QSO) now fires from any TUI panel — DX Hunter,
+  Band Activity, Callers, wherever focus currently is — instead of only
+  when the QSO Status panel is focused (PAN-21). The abort target is
+  whatever is pinned/highlighted in the QSO Status panel (independent of
+  which panel has focus), and that highlight is already visible regardless
+  of focus, so the operator can always see what `k` would hit before
+  pressing it. `r` (re-send) is unchanged and still gated to the QSO
+  Status panel. To make `k` safe to use globally, the `j`/`k` vim-scroll
+  aliases were removed from the Diagnostics (Shift+D) and Recent-QSOs
+  (Shift+R) overlays — Up/Down arrows are now the only way to scroll
+  them — since those were the only two places `j`/`k` collided with
+  anything. `k` still aborts the selected QSO even while one of those
+  overlays is open (plus the Shift+S station-health panel, a third
+  read-only overlay with the same shape), since they're read-only
+  informational views rather than modals the operator is editing — their
+  titles now say so instead of advertising the removed `jk` scroll keys.
+  The always-visible active-QSO banner (`ui::active_qsos`, shown in every
+  view and while zoomed, including Monitor view and zoom on a panel other
+  than QSO Status) now marks the pinned/selected QSO with `▶` whenever
+  more than one QSO is active, so the abort target stays visible in the
+  views that don't render the QSO Status table at all — and that QSO is
+  now guaranteed a slot in the banner's visible slice even on a narrow
+  terminal or a large pileup, rather than only being marked if it
+  happened to fit before the row's width budget ran out. `k` also now
+  requires a bare, unmodified keypress: Ctrl+K/Alt+K (e.g. an operator's
+  readline "kill line" muscle memory) report the same `KeyCode::Char('k')`
+  as a bare press in crossterm, and no longer abort the QSO.
+
 ### Fixed
 
 - Compound-callsign QSOs (e.g. `YS/WE9G`, `8G81PA`, `3E40CDW`) now actually
@@ -62,7 +92,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   immediately with a distinct "cannot transmit this message" reason instead
   of being indistinguishable from a plain DX-never-answered timeout.
 
+- FT8's unresolved-hashed-callsign placeholder `"<...>"` (an i3=4 nonstandard-callsign
+  frame whose 12-bit hash has no local hash-table entry) no longer appears as a
+  DX-Hunter/Callers entry, and `is_needed_dxcc` no longer scores that exact literal
+  placeholder as a needed DXCC entity — it previously fell through to the scorer's
+  largest weight and consistently outranked real, workable stations. The guard is
+  scoped to the literal placeholder only, so a real callsign whose prefix is simply
+  absent from the bundled offline BigCTY table (e.g. newer than the table, but
+  confirmed needed by cqdx) still scores normally; the resolved hash form
+  `<CALLSIGN>` is likewise unaffected and keeps listing/scoring normally. (PAN-16)
 - Manual split-TX QSOs whose offset was held, collision-nudged, or passband-clamped now recover after two consistent DX replies at a new frequency without moving the station's chosen TX offset ([#245](https://github.com/HagaleTechnologies/pancetta/issues/245)). Genuine Hound/Fox behavior is unchanged.
+- PAN-12 follow-up (PAN-15): `engage_hound` now clears any `pending_freq_drift`
+  candidate that could accumulate in the window between QSO construction and
+  the `metadata.hound` stamp, so it can no longer get permanently stuck for a
+  Hound QSO's life; a confirmed split-TX `partner_freq` relatch that lands
+  within `MIN_TX_SEPARATION_HZ` of our own TX offset now logs a warn instead
+  of silently keying on top of the station we're trying to hear; the
+  frequency-gate tolerance constants used by `is_message_relevant`,
+  `classify_relevance`, and `maybe_confirm_frequency_drift_at` are now a
+  single shared definition instead of three independently-hardcoded copies.
 
 - Decode-pipeline crashes now recover automatically: the coordinator restarts DSP and FT8 decoder
   tasks under the existing bounded supervisor policy, keeps adjacent stages alive during backoff,

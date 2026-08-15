@@ -24,7 +24,7 @@ Press `?` inside the TUI for the same list as an overlay.
 | `/` | Compose free-text TX (Enter sends, Esc cancels) |
 | `Enter` | Callers: reply at shown step; TX Placement: park at selected slice |
 | `c / s` | Start / stop CQ |
-| `k` | Abort selected QSO (QSO Status panel only) |
+| `k` | Abort selected QSO (any panel) |
 | `r` | Re-send last TX (QSO Status panel only) |
 | `Shift+H` | Engage Hound on selected DX Hunter station |
 

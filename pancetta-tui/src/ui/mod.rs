@@ -1351,7 +1351,7 @@ pub fn render_diagnostics_overlay(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(
-            " Diagnostics ({}/{}) — \u{2191}\u{2193}/jk scroll, Esc/D close ",
+            " Diagnostics ({}/{}) — \u{2191}\u{2193} scroll, k aborts QSO, Esc/D close ",
             app.diagnostic_events.len().min(app.diagnostics_scroll + 1),
             app.diagnostic_events.len()
         ))
@@ -1519,6 +1519,28 @@ mod diagnostics_overlay_tests {
         term.draw(|f| render_diagnostics_overlay(f, f.area(), &app))
             .unwrap();
     }
+
+    /// PAN-21 round-1 remediation (Codex P1): `k` now aborts the selected
+    /// QSO instead of scrolling here, so the title must stop advertising
+    /// `jk` as a scroll key (an operator following the on-screen instruction
+    /// would abort instead of scroll) and should say what `k` actually does.
+    #[tokio::test]
+    async fn overlay_title_no_longer_advertises_jk_scroll_and_mentions_k_aborts() {
+        let mut term = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let app = app_with(vec![]).await;
+
+        term.draw(|f| render_diagnostics_overlay(f, f.area(), &app))
+            .unwrap();
+        let rendered = buffer_to_string(term.backend().buffer());
+        assert!(
+            !rendered.contains("jk"),
+            "title must not advertise j/k as scroll keys anymore: {rendered}"
+        );
+        assert!(
+            rendered.contains("k aborts"),
+            "title should say what k does here: {rendered}"
+        );
+    }
 }
 
 /// Color a `Failed` row by how actionable/severe the reason is — mirrors the
@@ -1567,7 +1589,7 @@ pub fn render_recent_qsos_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
     let block = Block::default()
         .borders(Borders::ALL)
         .title(format!(
-            " Recent QSOs ({}/{}) — \u{2191}\u{2193}/jk scroll, Esc/R close ",
+            " Recent QSOs ({}/{}) — \u{2191}\u{2193} scroll, k aborts QSO, Esc/R close ",
             app.recent_qsos.len().min(app.recent_qsos_scroll + 1),
             app.recent_qsos.len()
         ))
@@ -1659,7 +1681,7 @@ pub fn render_health_panel(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" Station Health — Esc/S close ")
+        .title(" Station Health — k aborts QSO, Esc/S close ")
         .border_style(Style::default().fg(Color::Cyan));
     let inner = block.inner(modal_area);
     f.render_widget(block, modal_area);
@@ -2279,6 +2301,10 @@ mod view_render_tests {
         let buf = term.backend().buffer().clone();
         assert!(buffer_contains(&buf, "Station Health"));
         assert!(buffer_contains(&buf, "Waiting for first health tick"));
+        // PAN-21 round-1 remediation (Codex P2): k aborts here too now, so
+        // the title documents it (same convention as the Diagnostics/
+        // Recent-QSOs overlay titles).
+        assert!(buffer_contains(&buf, "k aborts QSO"));
 
         // Populated pipeline_health plus session counters — must not panic,
         // and shows the aggregated signals.
@@ -2416,6 +2442,29 @@ mod view_render_tests {
             term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
                 .unwrap();
         }
+    }
+
+    /// PAN-21 round-1 remediation (Codex P1): same title fix as the
+    /// Diagnostics overlay — `k` aborts here now instead of scrolling, so
+    /// `jk` must be gone from the title and the abort behavior documented.
+    #[tokio::test]
+    async fn recent_qsos_title_no_longer_advertises_jk_scroll_and_mentions_k_aborts() {
+        let app = crate::app::App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+        let backend = TestBackend::new(80, 20);
+        let mut term = Terminal::new(backend).unwrap();
+        term.draw(|f| render_recent_qsos_panel(f, f.area(), &app))
+            .unwrap();
+        let buf = term.backend().buffer().clone();
+        assert!(
+            !buffer_contains(&buf, "jk"),
+            "title must not advertise j/k as scroll keys anymore"
+        );
+        assert!(
+            buffer_contains(&buf, "k aborts"),
+            "title should say what k does here"
+        );
     }
 
     #[tokio::test]

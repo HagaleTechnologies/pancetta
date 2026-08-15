@@ -905,6 +905,26 @@ impl TuiRunner {
         Ok(())
     }
 
+    /// Abort the currently selected/pinned QSO (`App::selected_qso_id`),
+    /// echoing the target callsign, or fall back to the standard "nothing to
+    /// abort" hint when no QSO is active. Shared by `k`'s global handler (any
+    /// panel) and the Diagnostics/Recent-QSOs/station-health overlays, which
+    /// all let `k` fall through to this even while open (PAN-21) since
+    /// they're read-only informational views, not modals the operator is
+    /// editing.
+    fn abort_selected_qso(&self, app: &mut App) -> Result<()> {
+        match (app.selected_qso_id(), app.selected_qso_callsign()) {
+            (Some(qso_id), Some(call)) => {
+                self.message_tx.send(TuiCommand::AbortQso { qso_id })?;
+                app.status_message = format!("Aborting QSO with {}", call);
+            }
+            _ => {
+                app.status_message = "No active QSO to abort".to_string();
+            }
+        }
+        Ok(())
+    }
+
     /// Handle keyboard events
     async fn handle_key_event(&mut self, key: KeyEvent) -> Result<bool> {
         // Operator-presence stamp (FCC §97.221): ANY key the operator presses is
@@ -1171,18 +1191,28 @@ impl TuiRunner {
         // Diagnostics overlay (docs/observability-diagnostics-plan.md). A
         // read-only scrollback of retained DiagnosticEvents, so unlike the
         // input modals above there is no text-entry surface — just dismiss
-        // (Esc or the same Shift+D toggle) and scroll (Up/Down/j/k).
+        // (Esc or the same Shift+D toggle) and scroll (Up/Down). PAN-21
+        // dropped the j/k vim-scroll aliases (the only real `k`-collision in
+        // the app — see the global-abort comment below) so `k` here falls
+        // through to the same global QSO-abort as everywhere else: this is a
+        // read-only informational view, not a modal the operator is editing,
+        // so "abort from any panel" should include "abort while this is open".
         if app.show_diagnostics {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('D') => {
                     app.show_diagnostics = false;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     app.diagnostics_scroll = app.diagnostics_scroll.saturating_sub(1);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     let max = app.diagnostic_events.len().saturating_sub(1);
                     app.diagnostics_scroll = (app.diagnostics_scroll + 1).min(max);
+                }
+                // Bare `k` only — see the modifier-guard comment on the
+                // global abort handler below for why.
+                KeyCode::Char('k') if key.modifiers.is_empty() => {
+                    self.abort_selected_qso(&mut app)?;
                 }
                 _ => {} // swallow other keys while the overlay is open
             }
@@ -1191,11 +1221,19 @@ impl TuiRunner {
 
         // Station-health panel (docs/observability-diagnostics-plan.md Layer
         // 3). A read-only snapshot, so — unlike the Diagnostics overlay —
-        // there is no scroll state; just dismiss.
+        // there is no scroll state; just dismiss. Same as the Diagnostics/
+        // Recent-QSOs overlays, it's a read-only informational view rather
+        // than a modal the operator is editing, so `k` falls through to the
+        // global QSO-abort here too (PAN-21 round-1 remediation).
         if app.show_health {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('S') => {
                     app.show_health = false;
+                }
+                // Bare `k` only — see the modifier-guard comment on the
+                // global abort handler below for why.
+                KeyCode::Char('k') if key.modifiers.is_empty() => {
+                    self.abort_selected_qso(&mut app)?;
                 }
                 _ => {} // swallow other keys while the overlay is open
             }
@@ -1205,18 +1243,24 @@ impl TuiRunner {
         // Recent-QSOs panel (docs/observability-diagnostics-plan.md Layer
         // 2). Same read-only-scrollback shape as the Diagnostics overlay
         // above — dismiss (Esc or the same Shift+R toggle) and scroll
-        // (Up/Down/j/k).
+        // (Up/Down); j/k dropped and `k` falls through to global QSO-abort,
+        // same rationale as the Diagnostics overlay above.
         if app.show_recent_qsos {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('R') => {
                     app.show_recent_qsos = false;
                 }
-                KeyCode::Up | KeyCode::Char('k') => {
+                KeyCode::Up => {
                     app.recent_qsos_scroll = app.recent_qsos_scroll.saturating_sub(1);
                 }
-                KeyCode::Down | KeyCode::Char('j') => {
+                KeyCode::Down => {
                     let max = app.recent_qsos.len().saturating_sub(1);
                     app.recent_qsos_scroll = (app.recent_qsos_scroll + 1).min(max);
+                }
+                // Bare `k` only — see the modifier-guard comment on the
+                // global abort handler below for why.
+                KeyCode::Char('k') if key.modifiers.is_empty() => {
+                    self.abort_selected_qso(&mut app)?;
                 }
                 _ => {} // swallow other keys while the overlay is open
             }
@@ -1539,10 +1583,9 @@ impl TuiRunner {
             }
 
             // === QSO management (operate on the selected QSO) ===
-            // r / k are gated to the QSO Status panel so the operator can't
-            // accidentally re-send or abort the selected QSO while scrolling
-            // Band Activity or DX Hunter (the historic foot-gun: `k` aborting a
-            // QSO from an unrelated panel). Both echo the target callsign.
+            // r stays gated to the QSO Status panel so the operator can't
+            // accidentally re-send the selected QSO's last TX while scrolling
+            // Band Activity or DX Hunter. Echoes the target callsign.
             // r - re-send our most recent message in the selected QSO.
             KeyCode::Char('r')
                 if matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) =>
@@ -1557,24 +1600,44 @@ impl TuiRunner {
                     }
                 }
             }
-            // k - kill/abort the selected QSO.
-            KeyCode::Char('k')
-                if matches!(app.active_panel, crate::app::ActivePanel::QsoStatus) =>
-            {
-                match (app.selected_qso_id(), app.selected_qso_callsign()) {
-                    (Some(qso_id), Some(call)) => {
-                        self.message_tx.send(TuiCommand::AbortQso { qso_id })?;
-                        app.status_message = format!("Aborting QSO with {}", call);
-                    }
-                    _ => {
-                        app.status_message = "No active QSO to abort".to_string();
-                    }
-                }
+            // k - kill/abort the selected QSO, from ANY panel (PAN-21). The
+            // old panel-gating was a defense against `k`-as-vim-scroll muscle
+            // memory firing an accidental abort while browsing an unrelated
+            // list — but that vim overload only ever existed in the
+            // Diagnostics/Recent-QSOs/station-health overlays (all handled
+            // above, and dropped there too), never on the everyday
+            // tab-focused panels, which use Up/Down only. The abort target
+            // is `App::selected_qso_id` (pinned via
+            // `qso_cursor`/`qso_pinned_id`), which is independent of
+            // `active_panel`. Two things keep it visible no matter where
+            // focus currently is: the QSO Status panel's own table
+            // highlights the pin regardless of focus when it's on screen,
+            // and `ui::active_qsos::render_active_qsos` — the persistent
+            // one-line banner rendered in EVERY view and while zoomed,
+            // including Monitor view (which drops QSO Status entirely) and
+            // zooming any other panel — marks the same pin with a "▶"
+            // whenever more than one QSO is active. So there's always a
+            // stable, visible answer to "what does k hit," even in the
+            // views that have no QSO Status table on screen at all.
+            //
+            // Guarded to a BARE `k` (`key.modifiers.is_empty()`, PAN-21
+            // round-2 remediation): crossterm reports Ctrl+K / Alt+K as the
+            // same `KeyCode::Char('k')` with the modifier carried separately
+            // in `key.modifiers`, so without this guard an operator's
+            // Ctrl+K readline/terminal muscle memory (kill-line — nothing to
+            // do with this app) would ALSO abort the QSO. That's exactly the
+            // accidental-trigger foot-gun the old QsoStatus-only gating
+            // existed to prevent, just via a different physical input than
+            // vim-scroll. Modified k falls through to the catch-all `_ => {}`
+            // below (a no-op), matching every other unguarded single-key
+            // binding in this match — none of which are destructive, so k is
+            // the one that needed the explicit guard.
+            KeyCode::Char('k') if key.modifiers.is_empty() => {
+                self.abort_selected_qso(&mut app)?;
             }
-            // r / k pressed outside the QSO Status panel: hint, don't act.
-            KeyCode::Char('r') | KeyCode::Char('k') => {
-                app.status_message =
-                    "Focus the QSO Status panel (2) to re-send (r) / abort (k)".to_string();
+            // r pressed outside the QSO Status panel: hint, don't act.
+            KeyCode::Char('r') => {
+                app.status_message = "Focus the QSO Status panel (2) to re-send (r)".to_string();
             }
 
             // === Tune / clear-offset (case-sensitive) ===
@@ -2349,6 +2412,19 @@ mod key_tests {
 
     fn key_shift(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::SHIFT)
+    }
+
+    /// crossterm reports Ctrl+<letter> as the SAME `KeyCode::Char(<letter>)`
+    /// as a bare press, with the modifier carried separately in
+    /// `key.modifiers` — used by the PAN-21 round-2 modifier-guard
+    /// regression tests below.
+    fn key_ctrl(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL)
+    }
+
+    /// Same as `key_ctrl` but for Alt+<letter>.
+    fn key_alt(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT)
     }
 
     #[tokio::test]
@@ -3464,25 +3540,68 @@ mod key_tests {
         assert!(app.read().await.status_message.contains("Can't tune"));
     }
 
-    /// `k` aborts ONLY when the QSO Status panel is focused, and echoes the
-    /// target callsign.
+    // === PAN-21: global `k` abort ===================================
+
+    /// Acceptance scenario 1: pressing `k` from the DX Hunter panel (not
+    /// QSO Status) aborts the selected/pinned QSO, echoes the callsign, and
+    /// leaves focus exactly where it was — no forced panel switch.
     #[tokio::test]
-    async fn key_k_gated_to_qso_status_panel() {
+    async fn key_k_aborts_from_dx_hunter_panel() {
         let (mut r, cmd_rx, app) = make_runner().await;
         {
             let mut a = app.write().await;
             a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
-            a.active_panel = crate::app::ActivePanel::BandActivity;
+            a.active_panel = crate::app::ActivePanel::DxHunter;
         }
-        // Wrong panel: no abort, just a hint.
         r.handle_key_event(key('k')).await.unwrap();
-        assert!(
-            cmd_rx.try_recv().is_err(),
-            "k must not abort while not on QSO Status panel"
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+        let a = app.read().await;
+        assert!(a.status_message.contains("W1AW"));
+        assert_eq!(
+            a.active_panel,
+            crate::app::ActivePanel::DxHunter,
+            "k must not force a panel switch"
         );
+    }
 
-        // Focus QSO Status, then k aborts with callsign echo.
-        app.write().await.active_panel = crate::app::ActivePanel::QsoStatus;
+    /// `k` aborts from every everyday panel, not just DX Hunter — Band
+    /// Activity and Callers too.
+    #[tokio::test]
+    async fn key_k_aborts_from_band_activity_and_callers_panels() {
+        for panel in [
+            crate::app::ActivePanel::BandActivity,
+            crate::app::ActivePanel::Callers,
+        ] {
+            let (mut r, cmd_rx, app) = make_runner().await;
+            {
+                let mut a = app.write().await;
+                a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+                a.active_panel = panel;
+            }
+            r.handle_key_event(key('k')).await.unwrap();
+            assert!(
+                matches!(
+                    cmd_rx.try_recv(),
+                    Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+                ),
+                "k must abort from {panel:?}"
+            );
+        }
+    }
+
+    /// `k` still aborts when QSO Status itself is focused (unchanged from
+    /// before PAN-21).
+    #[tokio::test]
+    async fn key_k_aborts_from_qso_status_panel() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+            a.active_panel = crate::app::ActivePanel::QsoStatus;
+        }
         r.handle_key_event(key('k')).await.unwrap();
         assert!(matches!(
             cmd_rx.try_recv(),
@@ -3491,7 +3610,195 @@ mod key_tests {
         assert!(app.read().await.status_message.contains("W1AW"));
     }
 
-    /// `r` (re-send) is likewise gated to the QSO Status panel.
+    /// PAN-21 round-2 remediation (Codex P1): crossterm reports Ctrl+K /
+    /// Alt+K as the SAME `KeyCode::Char('k')` as a bare press, with the
+    /// modifier carried separately — so an operator's Ctrl+K
+    /// readline/terminal muscle memory (kill-line, unrelated to this app)
+    /// must NOT abort the QSO. Only a bare, unmodified `k` may.
+    #[tokio::test]
+    async fn ctrl_k_and_alt_k_do_not_abort_from_any_panel() {
+        for modified_key in [key_ctrl('k'), key_alt('k')] {
+            let (mut r, cmd_rx, app) = make_runner().await;
+            {
+                let mut a = app.write().await;
+                a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+                a.active_panel = crate::app::ActivePanel::QsoStatus;
+            }
+            r.handle_key_event(modified_key).await.unwrap();
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "{modified_key:?} must not abort the QSO"
+            );
+            assert!(
+                !app.read().await.status_message.contains("Aborting"),
+                "{modified_key:?} must not even attempt an abort status update"
+            );
+        }
+
+        // A bare, unmodified k in the same setup still aborts — proves the
+        // guard is specific to modifiers, not a blanket regression of k.
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+            a.active_panel = crate::app::ActivePanel::QsoStatus;
+        }
+        r.handle_key_event(key('k')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+    }
+
+    /// Same modifier guard, exercised from the Diagnostics, Recent-QSOs, and
+    /// station-health overlays (the fall-through sites added by the round-1
+    /// remediation) — Ctrl+K/Alt+K must not abort there either.
+    #[tokio::test]
+    async fn ctrl_k_and_alt_k_do_not_abort_through_overlays() {
+        for set_overlay in [
+            (|a: &mut crate::app::App| a.show_diagnostics = true) as fn(&mut crate::app::App),
+            |a: &mut crate::app::App| a.show_recent_qsos = true,
+            |a: &mut crate::app::App| a.show_health = true,
+        ] {
+            for modified_key in [key_ctrl('k'), key_alt('k')] {
+                let (mut r, cmd_rx, app) = make_runner().await;
+                {
+                    let mut a = app.write().await;
+                    a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+                    set_overlay(&mut a);
+                }
+                r.handle_key_event(modified_key).await.unwrap();
+                assert!(
+                    cmd_rx.try_recv().is_err(),
+                    "{modified_key:?} must not abort through an overlay"
+                );
+            }
+        }
+    }
+
+    /// Acceptance scenario 2: with no active QSO, `k` from any panel shows
+    /// the "no active QSO" hint and sends nothing to the coordinator.
+    #[tokio::test]
+    async fn key_k_no_active_qso_shows_hint_from_any_panel() {
+        for panel in [
+            crate::app::ActivePanel::BandActivity,
+            crate::app::ActivePanel::DxHunter,
+            crate::app::ActivePanel::Callers,
+            crate::app::ActivePanel::QsoStatus,
+        ] {
+            let (mut r, cmd_rx, app) = make_runner().await;
+            app.write().await.active_panel = panel;
+            r.handle_key_event(key('k')).await.unwrap();
+            assert!(
+                cmd_rx.try_recv().is_err(),
+                "k with no active QSO must not send a command from {panel:?}"
+            );
+            assert!(
+                app.read()
+                    .await
+                    .status_message
+                    .contains("No active QSO to abort"),
+                "expected the no-active-QSO hint from {panel:?}"
+            );
+        }
+    }
+
+    /// Acceptance scenario 3 (Diagnostics half) + overlay-abort decision:
+    /// with the Diagnostics overlay open, `j`/`k` no longer scroll it (only
+    /// Up/Down do), and `k` instead falls through to abort the selected QSO
+    /// — the operator chose to let the global abort work even over this
+    /// read-only overlay, per PAN-21.
+    #[tokio::test]
+    async fn diagnostics_overlay_drops_jk_scroll_and_k_falls_through_to_abort() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+            a.show_diagnostics = true;
+            a.diagnostics_scroll = 5;
+        }
+        // `j` no longer scrolls (nor does anything else diagnostics-scroll
+        // related) — scroll cursor unchanged.
+        r.handle_key_event(key('j')).await.unwrap();
+        assert_eq!(app.read().await.diagnostics_scroll, 5, "j must not scroll");
+
+        // Up still scrolls.
+        r.handle_key_event(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert_eq!(
+            app.read().await.diagnostics_scroll,
+            4,
+            "Up must still scroll"
+        );
+
+        // `k` no longer scrolls either — it falls through to abort, and the
+        // overlay stays open (k is not its dismiss key).
+        r.handle_key_event(key('k')).await.unwrap();
+        assert_eq!(
+            app.read().await.diagnostics_scroll,
+            4,
+            "k must not scroll the diagnostics overlay"
+        );
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+        assert!(app.read().await.show_diagnostics, "overlay stays open");
+    }
+
+    /// Same overlay-abort behavior for the Recent-QSOs overlay.
+    #[tokio::test]
+    async fn recent_qsos_overlay_drops_jk_scroll_and_k_falls_through_to_abort() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+            a.show_recent_qsos = true;
+            a.recent_qsos_scroll = 5;
+        }
+        r.handle_key_event(key('j')).await.unwrap();
+        assert_eq!(app.read().await.recent_qsos_scroll, 5, "j must not scroll");
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        // recent_qsos is empty in this test, so Down clamps to 0 (max index
+        // of an empty deque), confirming Down is still wired up.
+        assert_eq!(app.read().await.recent_qsos_scroll, 0);
+
+        r.handle_key_event(key('k')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+        assert!(app.read().await.show_recent_qsos, "overlay stays open");
+    }
+
+    /// PAN-21 round-1 remediation (Codex P2): the station-health (Shift+S)
+    /// panel is a third read-only informational overlay with the same
+    /// early-return-and-swallow shape as Diagnostics/Recent-QSOs, and had
+    /// been left out of the `k`-falls-through wiring. `k` must abort there
+    /// too, and Esc/`S` must remain the only way to dismiss it.
+    #[tokio::test]
+    async fn station_health_panel_lets_k_fall_through_to_abort() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+            a.show_health = true;
+        }
+        r.handle_key_event(key('k')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+        assert!(app.read().await.show_health, "overlay stays open");
+    }
+
+    /// `r` (re-send) is still gated to the QSO Status panel — out of scope
+    /// for PAN-21 — and its hint no longer mentions `k`/abort now that k
+    /// works from anywhere.
     #[tokio::test]
     async fn key_r_gated_to_qso_status_panel() {
         let (mut r, cmd_rx, app) = make_runner().await;
@@ -3502,6 +3809,15 @@ mod key_tests {
         }
         r.handle_key_event(key('r')).await.unwrap();
         assert!(cmd_rx.try_recv().is_err(), "r gated off DX Hunter panel");
+        let msg = app.read().await.status_message.clone();
+        assert!(
+            msg.contains("re-send"),
+            "hint should mention re-send: {msg}"
+        );
+        assert!(
+            !msg.contains('k') && !msg.to_lowercase().contains("abort"),
+            "r hint must no longer mention k/abort now that k works from any panel: {msg}"
+        );
 
         app.write().await.active_panel = crate::app::ActivePanel::QsoStatus;
         r.handle_key_event(key('r')).await.unwrap();
