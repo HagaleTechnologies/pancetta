@@ -112,31 +112,61 @@ impl super::ApplicationCoordinator {
                     }
                     Err(error) => {
                         warn!("Hamlib teardown PTT-off attempt {attempt} failed: {error}");
-                        // PAN-19 LOW: this loop runs on the coordinator's main
-                        // supervision task (`run_main_loop`'s `select!` ->
-                        // `check_task_handles` -> `handle_finished_task` ->
-                        // `teardown_component` -> here), so all 3 attempts x
-                        // up to 3s send + this 500ms sleep (up to ~10s worst
-                        // case) stalls that task's own re-entry into
-                        // `select!` -- a second, concurrent component
-                        // failure sits undiscovered in `named_task_handles`
-                        // until this returns. A full concurrency restructure
-                        // (spawning this loop off the supervision task) risks
-                        // the PTT-off-before-next-generation TX-safety
-                        // ordering guarantee this loop exists to provide, so
-                        // instead: skip only this inter-attempt sleep when
-                        // another component's task has ALREADY finished
-                        // (visible right now in `named_task_handles`) --
-                        // that failure gets discovered and processed that
-                        // much sooner, without touching PTT-off retry
-                        // semantics or ordering at all.
-                        let another_failure_pending = self
+                        // PAN-19 LOW / round-2 review (Codex P1): this loop
+                        // runs on the coordinator's main supervision task
+                        // (`run_main_loop`'s `select!` -> `check_task_handles`
+                        // -> `handle_finished_task` -> `teardown_component` ->
+                        // here), so all 3 attempts x up to 3s send + this
+                        // 500ms sleep (up to ~10s worst case) stalls that
+                        // task's own re-entry into `select!` -- a second,
+                        // concurrent component failure sits undiscovered in
+                        // `named_task_handles` until this returns.
+                        //
+                        // An earlier version of this fix skipped this sleep
+                        // whenever another component's task had already
+                        // finished, to shorten that stall. Codex's round-2
+                        // review correctly flagged that as a regression: it
+                        // let an unrelated failure elsewhere burn through all
+                        // 3 PTT-off attempts back-to-back, with no pause for
+                        // a transiently-unavailable rig link to recover
+                        // between tries -- weakening the very confirmed-unkey
+                        // guarantee this retry loop exists to provide. If the
+                        // failure was the watchdog child itself, the
+                        // retained-orphan path means nothing can retry later
+                        // either, so the radio could stay keyed into the
+                        // restart backoff. That's a correctness regression
+                        // that outweighs the latency win, so it's reverted:
+                        // this sleep is now unconditional again, regardless
+                        // of what else is happening in the coordinator.
+                        //
+                        // Decoupling this loop from the supervision task
+                        // properly (spawning it independently and having
+                        // `start_hamlib_component` await its completion
+                        // before a new generation's connect sequence, rather
+                        // than the direct call chain awaiting it here) would
+                        // require `hamlib_orphans`/`hamlib_children` to
+                        // become thread-safely shared state so a spawned
+                        // task can mutate them without `&mut self` -- a
+                        // broader, riskier change to this same TX-safety
+                        // -critical surface (including the MEDIUM #2 orphan
+                        // -draining fix immediately below) than is
+                        // justified for a latency-only improvement. Left as
+                        // a read-only, non-mutating diagnostic instead: log
+                        // (don't act on) a concurrent failure so it's at
+                        // least VISIBLE in the log/diagnostic stream sooner,
+                        // without shortening this loop's own pacing at all.
+                        if self
                             .named_task_handles
                             .iter()
-                            .any(|(id, handle)| *id != ComponentId::Hamlib && handle.is_finished());
-                        if !another_failure_pending {
-                            tokio::time::sleep(Duration::from_millis(500)).await;
+                            .any(|(id, handle)| *id != ComponentId::Hamlib && handle.is_finished())
+                        {
+                            warn!(
+                                "Hamlib teardown PTT-off retry {attempt}/3: another component's \
+                                 task has also finished and is waiting to be processed once \
+                                 this teardown completes"
+                            );
                         }
+                        tokio::time::sleep(Duration::from_millis(500)).await;
                     }
                 }
             }
@@ -179,23 +209,111 @@ impl super::ApplicationCoordinator {
                 }
             }
             for message in safe_messages {
-                // PAN-19 LOW: `Sender::send` on a bounded crossbeam channel
-                // BLOCKS the current thread if the channel is full. The
-                // drain above just freed the same number of slots this
-                // replays, so normally there's room -- but a concurrent
-                // producer filling the channel in between (this whole
-                // sequence has `.await` points in it) could still leave it
-                // full by the time we get here, which would block this
-                // async fn's underlying executor thread instead of
-                // yielding. Use `try_send` and drop-with-a-warning on
-                // `Full` instead of blocking.
-                if let Err(e) = sender.try_send(message) {
-                    warn!(
-                        "Hamlib teardown: dropping a replayed message, channel still full: {}",
-                        e
-                    );
+                self.replay_or_fallback(&sender, message).await;
+            }
+        }
+    }
+
+    /// Replay one drained-and-preserved Hamlib message back onto its
+    /// channel, with a bounded retry (never an unbounded block) and,
+    /// specifically for a preserved `SetPtt { state: false }` unkey, a
+    /// last-resort fallback that commands the rig directly rather than
+    /// silently dropping it.
+    ///
+    /// PAN-19 LOW / round-2 review (Codex P1): `Sender::send` on a bounded
+    /// crossbeam channel BLOCKS the current thread if the channel is full.
+    /// `teardown_hamlib`'s drain (immediately before this is called) just
+    /// freed the same number of slots this replays, so normally there's
+    /// room -- but a concurrent producer filling the channel in between
+    /// (this whole sequence has `.await` points in it) could still leave it
+    /// full by the time we get here, which would block this async fn's
+    /// underlying executor thread instead of yielding.
+    ///
+    /// An earlier version of this fix used a single `try_send`, silently
+    /// dropping the message on `Full`. Codex's round-2 review correctly
+    /// flagged that as unsafe: the message being dropped can be a preserved
+    /// `SetPtt { state: false }` unkey, or frequency/split state, and
+    /// dropping it means the restarted consumer never receives it /
+    /// operates with stale rig state. Fix (bounded, not unbounded, so this
+    /// still can't reintroduce the original blocking risk): a few short
+    /// `try_send` attempts with brief waits give a transient producer race
+    /// a real chance to clear, so the common case still delivers the
+    /// message rather than dropping on the first contention. `SetPtt {
+    /// state: false }` additionally gets a last-resort fallback that
+    /// bypasses the channel entirely -- these bounded attempts don't just
+    /// preserve a MESSAGE, they preserve the actual safety property (the
+    /// rig getting the unkey command), so if the channel still won't take
+    /// it, command PTT off DIRECTLY via `self.rig_handle` (exactly what the
+    /// direct retry loop in `teardown_hamlib` already does) rather than
+    /// give up. Only non-safety-critical message types (frequency/mode/
+    /// split) are allowed to log-and-drop as an absolute last resort.
+    async fn replay_or_fallback(
+        &mut self,
+        sender: &crossbeam_channel::Sender<ComponentMessage>,
+        message: ComponentMessage,
+    ) {
+        const REPLAY_RETRY_ATTEMPTS: u32 = 5;
+        const REPLAY_RETRY_DELAY: Duration = Duration::from_millis(20);
+
+        let is_ptt_off = matches!(
+            message.message_type,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state: false })
+        );
+
+        let mut delivered = false;
+        let mut pending = message;
+        for attempt in 1..=REPLAY_RETRY_ATTEMPTS {
+            match sender.try_send(pending) {
+                Ok(()) => {
+                    delivered = true;
+                    break;
+                }
+                Err(crossbeam_channel::TrySendError::Full(returned)) => {
+                    pending = returned;
+                    if attempt < REPLAY_RETRY_ATTEMPTS {
+                        tokio::time::sleep(REPLAY_RETRY_DELAY).await;
+                    }
+                }
+                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                    // No receiver at all -- retrying can't help.
+                    break;
                 }
             }
+        }
+
+        if delivered {
+            return;
+        }
+
+        if is_ptt_off {
+            warn!(
+                "Hamlib teardown: replay channel stayed full for a preserved PTT-off command -- \
+                 commanding PTT off directly instead of dropping it"
+            );
+            if let Some(rig) = self.rig_handle.as_ref() {
+                match rig
+                    .set_ptt(
+                        pancetta_hamlib::Vfo::Current,
+                        pancetta_hamlib::PttState::Off,
+                    )
+                    .await
+                {
+                    Ok(()) => {
+                        self.ptt_active.store(false, Ordering::Release);
+                    }
+                    Err(e) => {
+                        error!(
+                            "Hamlib teardown: direct PTT-off fallback also failed: {}",
+                            e
+                        );
+                    }
+                }
+            }
+        } else {
+            warn!(
+                "Hamlib teardown: dropping a replayed message, channel still full after \
+                 {REPLAY_RETRY_ATTEMPTS} attempts"
+            );
         }
     }
 
@@ -1407,14 +1525,24 @@ mod restart_orphan_tests {
 
 #[cfg(all(test, feature = "pancetta-hamlib"))]
 mod teardown_stall_tests {
-    //! PAN-19 LOW: `teardown_hamlib`'s PTT-off retry loop runs on the
-    //! coordinator's main supervision task, so its up-to-~10s worst case
-    //! (3 attempts x up to 3s send + a 500ms inter-attempt sleep) stalls
-    //! `check_task_handles`'s own re-entry -- a second concurrent component
-    //! failure sits undiscovered in `named_task_handles` until teardown
-    //! returns. These tests cover the safer, smaller fix that was chosen
-    //! over a full concurrency restructure: skip the inter-attempt sleep
-    //! specifically when another component's task has already finished.
+    //! PAN-19 LOW / round-2 review (Codex P1): `teardown_hamlib`'s PTT-off
+    //! retry loop runs on the coordinator's main supervision task, so its
+    //! up-to-~10s worst case (3 attempts x up to 3s send + a 500ms
+    //! inter-attempt sleep) stalls `check_task_handles`'s own re-entry -- a
+    //! second concurrent component failure sits undiscovered in
+    //! `named_task_handles` until teardown returns.
+    //!
+    //! An earlier version of this fix skipped the inter-attempt sleep
+    //! whenever another component's task had already finished, to shorten
+    //! that stall. Codex's round-2 review correctly flagged that as a
+    //! regression: it let an unrelated failure elsewhere burn through all 3
+    //! PTT-off attempts back-to-back, with no pause for a
+    //! transiently-unavailable rig link to recover between tries --
+    //! weakening the confirmed-unkey guarantee. These tests now cover the
+    //! reverted (correct) behavior: the retry loop's own pacing stays fully
+    //! intact and uninterrupted regardless of what else is happening
+    //! elsewhere in the coordinator -- the fix only adds a read-only
+    //! diagnostic log, it never shortens or skips a wait.
     use super::*;
     use pancetta_config::Config;
     use pancetta_hamlib::{MockRig, RigControl};
@@ -1442,19 +1570,21 @@ mod teardown_stall_tests {
 
     /// An UNconnected `MockRig`'s `set_ptt` deterministically fails every
     /// time ("Mock rig not connected"), so this exercises all 3 retry
-    /// attempts (and, absent the fix, both inter-attempt sleeps) every run.
+    /// attempts (and both inter-attempt sleeps) every run.
     fn disconnected_mock_rig() -> Arc<MockRig> {
         Arc::new(MockRig::default())
     }
 
+    /// The regression guard: a concurrent, unrelated component failure
+    /// (already sitting finished in `named_task_handles` before teardown
+    /// even starts -- the most favorable case for the reverted
+    /// "skip the sleep" optimization to have kicked in) must NOT shorten or
+    /// skip the PTT-off retry pacing at all.
     #[tokio::test]
-    async fn skips_inter_attempt_sleep_when_another_failure_is_already_pending() {
+    async fn concurrent_unrelated_failure_does_not_shorten_ptt_off_retry_pacing() {
         let mut coordinator = test_coordinator().await;
         coordinator.rig_handle = Some(disconnected_mock_rig());
 
-        // Simulate a second component's task having already finished,
-        // sitting undiscovered in `named_task_handles` -- the scenario this
-        // fix targets.
         let finished: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async { Ok(()) });
         for _ in 0..1000 {
             if finished.is_finished() {
@@ -1471,10 +1601,13 @@ mod teardown_stall_tests {
         coordinator.teardown_hamlib().await;
         let elapsed = start.elapsed();
 
+        // 2 inter-attempt sleeps x 500ms between the 3 (always-failing)
+        // attempts -- this must hold even with another component's
+        // finished task already sitting in `named_task_handles`.
         assert!(
-            elapsed < Duration::from_millis(400),
-            "teardown_hamlib should skip its inter-attempt sleeps once another component's \
-             finished task is already pending -- took {elapsed:?}"
+            elapsed >= Duration::from_millis(900),
+            "a concurrent unrelated-component failure must not shorten or skip the PTT-off \
+             retry loop's own pacing -- took {elapsed:?}"
         );
     }
 
@@ -1487,40 +1620,46 @@ mod teardown_stall_tests {
         coordinator.teardown_hamlib().await;
         let elapsed = start.elapsed();
 
-        // 2 inter-attempt sleeps x 500ms between the 3 (always-failing)
-        // attempts -- this must NOT have been skipped when nothing else
-        // needs attention, preserving the existing retry pacing.
         assert!(
             elapsed >= Duration::from_millis(900),
-            "teardown_hamlib should still sleep between PTT-off retry attempts when nothing \
-             else is pending -- took {elapsed:?}"
+            "teardown_hamlib should sleep between PTT-off retry attempts -- took {elapsed:?}"
         );
     }
 }
 
 #[cfg(all(test, feature = "pancetta-hamlib"))]
 mod teardown_replay_tests {
-    //! PAN-19 LOW: the message re-injection loop at the end of
-    //! `teardown_hamlib` used a *blocking* `crossbeam_channel::Sender::send`
-    //! inside an async fn. Normally harmless -- the drain immediately above
-    //! it just freed exactly as many slots as it collected messages to
-    //! replay, so a fresh `teardown_hamlib` call can never itself construct
-    //! a full channel at replay time (replay count is provably <= drain
-    //! count <= channel capacity, with no `.await` between the two loops
-    //! for anything else to interleave through). The real risk is a
-    //! genuinely concurrent producer on another OS thread racing into that
-    //! gap -- which, being a true multi-thread race on a single-instruction
-    //! -wide window, isn't reliably reproducible by a test driving real
+    //! PAN-19 LOW / round-2 review (Codex P1): the message re-injection
+    //! loop at the end of `teardown_hamlib` originally used a *blocking*
+    //! `crossbeam_channel::Sender::send` inside an async fn. Normally
+    //! harmless -- `teardown_hamlib`'s drain immediately before it just
+    //! freed exactly as many slots as it collected messages to replay, so
+    //! a fresh `teardown_hamlib` call can never itself construct a full
+    //! channel at replay time (replay count is provably <= drain count <=
+    //! channel capacity, with no `.await` between the two loops for
+    //! anything else to interleave through). The real risk is a genuinely
+    //! concurrent producer on another OS thread racing into that gap --
+    //! which, being a true multi-thread race on a single-instruction-wide
+    //! window, isn't reliably reproducible by a test driving real
     //! wall-clock timing (confirmed: an earlier version of this test tried
     //! exactly that with a sustained background "saturator" task and did
-    //! not manage to trigger the blocking path even once). So instead of
-    //! chasing that race, this tests the actual mechanism the fix relies
-    //! on directly and deterministically: a full bounded `crossbeam_channel`
-    //! `try_send` returns `Err` immediately rather than blocking -- the
-    //! exact call `teardown_hamlib`'s replay loop now makes (see the
-    //! `sender.try_send(message)` call right above `teardown_hamlib`'s
-    //! final `}` in this file) -- plus a normal-path integration test
-    //! proving `teardown_hamlib` itself still completes fast end to end.
+    //! not manage to trigger the blocking path even once).
+    //!
+    //! The fix (round 1) replaced the blocking `send` with a single
+    //! `try_send`, dropping the message on `Full`. Round-2 review correctly
+    //! flagged unconditional dropping as unsafe for a preserved `SetPtt {
+    //! state: false }` unkey, so the replay step is now its own method,
+    //! `replay_or_fallback` (bounded retry, plus a direct-rig fallback
+    //! specifically for PTT-off) -- see its own doc comment for the full
+    //! reasoning. Extracting it as a standalone method also makes the
+    //! "channel stays full for the whole retry window" scenario
+    //! deterministically testable in isolation from `teardown_hamlib`'s own
+    //! drain (which otherwise structurally guarantees room, as above): a
+    //! channel pre-filled by the TEST, then handed directly to
+    //! `replay_or_fallback`, stays full for that entire isolated call since
+    //! nothing else ever touches it -- no race needed. See
+    //! `replay_or_fallback_commands_ptt_off_directly_when_channel_stays_full`
+    //! and its sibling below.
     use super::*;
     use pancetta_config::Config;
 
@@ -1609,6 +1748,121 @@ mod teardown_replay_tests {
         assert!(
             receiver.try_recv().is_ok(),
             "the safe SetFrequency message should have been replayed back onto the channel"
+        );
+    }
+
+    /// PAN-19 round-2 review (Codex P1) regression guard: a preserved
+    /// `SetPtt { state: false }` unkey must NOT be silently dropped when
+    /// the replay channel stays full -- it must reach the rig via the
+    /// direct fallback.
+    ///
+    /// Tests `replay_or_fallback` directly rather than through the full
+    /// `teardown_hamlib` drain+replay sequence: as established in the
+    /// module doc comment above, a channel's own capacity is a hard,
+    /// single limit -- draining it and replaying the SAME count back in
+    /// can never itself overflow the channel it just emptied, so
+    /// constructing "channel stays full for the entire replay window"
+    /// deterministically requires isolating the replay call from the drain
+    /// that would otherwise guarantee room. Pre-filling a fresh channel
+    /// with an unrelated message BEFORE calling `replay_or_fallback`
+    /// directly does exactly that: nothing else touches this channel
+    /// during the isolated call, so it's provably full for the entire
+    /// ~100ms bounded retry window -- no race required.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn replay_or_fallback_commands_ptt_off_directly_when_channel_stays_full() {
+        use pancetta_hamlib::{PttState, RigControl, Vfo};
+
+        let mut coordinator = test_coordinator().await;
+        let mock = Arc::new(pancetta_hamlib::MockRig::default());
+        mock.connect().await.expect("test rig should connect");
+        // Start keyed, so "ends up Off" is a meaningful assertion below,
+        // not just an already-Off default.
+        mock.set_ptt(Vfo::Current, PttState::On)
+            .await
+            .expect("test rig should key");
+        mock.reset_operation_count();
+        coordinator.rig_handle = Some(mock.clone());
+
+        // Capacity 1, pre-filled -- stays full for the whole isolated call
+        // below since nothing else ever drains it.
+        let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        sender
+            .try_send(set_freq_msg())
+            .expect("pre-fill the one slot");
+
+        let ptt_off_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state: false }),
+            Instant::now(),
+        );
+
+        let start = std::time::Instant::now();
+        coordinator.replay_or_fallback(&sender, ptt_off_msg).await;
+        let elapsed = start.elapsed();
+
+        // 5 attempts x 20ms between them -- a bounded retry window, not an
+        // unbounded block.
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "replay_or_fallback must not block indefinitely -- took {elapsed:?}"
+        );
+        assert_eq!(
+            mock.get_operation_count(),
+            1,
+            "the direct PTT-off fallback must have fired exactly once when the channel \
+             stayed full for the entire retry window"
+        );
+        assert_eq!(
+            mock.get_ptt(Vfo::Current).await.expect("PTT state"),
+            PttState::Off,
+            "the rig must end up unkeyed via the fallback rather than silently left keyed"
+        );
+        assert!(
+            !coordinator.ptt_active.load(Ordering::Acquire),
+            "ptt_active must reflect the fallback's successful unkey"
+        );
+    }
+
+    /// The flip side: a non-safety-critical message (frequency/split/mode)
+    /// still logs-and-drops as a last resort when the channel stays full
+    /// for the entire retry window -- it must not block indefinitely
+    /// either, and it must not spuriously touch the rig (no PTT-off
+    /// fallback for a non-PTT message).
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn replay_or_fallback_drops_non_ptt_messages_after_exhausting_retries() {
+        let mut coordinator = test_coordinator().await;
+        let mock = Arc::new(pancetta_hamlib::MockRig::default());
+        coordinator.rig_handle = Some(mock.clone());
+        // Deliberately NOT connected -- if this path incorrectly tried to
+        // touch the rig, `get_operation_count()` would still read 0
+        // (set_ptt on a disconnected mock fails without incrementing the
+        // counter), so this alone doesn't prove non-interference, but a
+        // disconnected rig at least ensures nothing here could succeed
+        // silently.
+
+        let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        sender
+            .try_send(set_freq_msg())
+            .expect("pre-fill the one slot");
+
+        let start = std::time::Instant::now();
+        coordinator
+            .replay_or_fallback(&sender, set_freq_msg())
+            .await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "replay_or_fallback must not block indefinitely on a non-PTT message either -- \
+             took {elapsed:?}"
+        );
+        assert_eq!(
+            mock.get_operation_count(),
+            0,
+            "a non-PTT message must never trigger the PTT-off rig fallback"
         );
     }
 }
