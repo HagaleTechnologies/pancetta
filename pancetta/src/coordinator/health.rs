@@ -545,8 +545,25 @@ impl super::ApplicationCoordinator {
 
         let degradation = degradation_message(component_id);
 
-        let _tx_inhibit =
+        let tx_inhibit =
             TxInhibitGuard::for_component(component_id, self.tx_restart_inhibit.clone());
+        // PAN-19 MEDIUM #3: `tx_inhibit`'s `Drop` un-inhibits TX -- correct
+        // for a normal successful restart, but WRONG whenever this function
+        // ends in a terminal Hamlib failure (hard restart error, budget
+        // exhausted, or a non-restartable policy): in every one of those
+        // cases Hamlib is dead for good and no task is left consuming the
+        // Hamlib bus channel, so `SetPtt` will never reach the rig again.
+        // Releasing the inhibit there would un-mute TX with zero PTT
+        // control -- contradicting "TX stays inhibited throughout a Hamlib
+        // restart window" (AGENTS.md), and this isn't even a bounded
+        // "window" in that case, it's permanent. Each terminal-failure arm
+        // below sets this so the guard is leaked (never decremented)
+        // instead of dropped normally; the one arm that DOES represent a
+        // real recovery (`Ok(())` from `restart_component`) leaves it
+        // false, so the guard still releases normally there. For any
+        // component other than Hamlib the guard is already a documented
+        // no-op (`counter: None`), so leaking it is harmless.
+        let mut leak_tx_inhibit = false;
 
         // Task 6 (task-supervision): a crashed Qso-component task drops
         // whatever QSOs were in-flight at that moment -- the fresh
@@ -623,6 +640,9 @@ impl super::ApplicationCoordinator {
                             }
                         }
                         self.notify_tui_of_failure(component_id, degradation).await;
+                        // Terminal: the restart itself failed, no further
+                        // automatic attempt follows from here.
+                        leak_tx_inhibit = true;
                     }
                 }
             }
@@ -657,6 +677,9 @@ impl super::ApplicationCoordinator {
                 )
                 .await;
                 self.notify_tui_of_failure(component_id, degradation).await;
+                // Terminal: budget exhausted, no further automatic restart
+                // will ever be attempted for this component.
+                leak_tx_inhibit = true;
             }
             RestartPolicy::DegradeOnly | RestartPolicy::FatalAbort => {
                 // ComponentCriticality-based log-level split, preserved
@@ -686,7 +709,16 @@ impl super::ApplicationCoordinator {
                 )
                 .await;
                 self.notify_tui_of_failure(component_id, degradation).await;
+                // Terminal: not restartable at all. Not currently reachable
+                // for Hamlib (`component_restart_policy` always returns
+                // `Restartable` for it), but included for defense-in-depth
+                // should that policy ever change.
+                leak_tx_inhibit = true;
             }
+        }
+
+        if leak_tx_inhibit {
+            std::mem::forget(tx_inhibit);
         }
     }
 
@@ -929,6 +961,11 @@ mod supervisor_tests {
             .store(true, std::sync::atomic::Ordering::Release);
     }
 
+    /// `TxInhibitGuard`'s OWN Drop semantics in isolation (increments on
+    /// construction, decrements on drop) -- unrelated to whether
+    /// `handle_finished_task` chooses to leak it on a terminal Hamlib
+    /// failure (see `hamlib_restart_budget_exhausted_leaves_tx_permanently_
+    /// inhibited` below for that caller-level behavior, PAN-19 MEDIUM #3).
     #[test]
     fn budget_exhausted_degrade_still_clears_the_tx_inhibit() {
         let inhibit = Arc::new(AtomicU32::new(0));
@@ -937,6 +974,63 @@ mod supervisor_tests {
             assert_eq!(inhibit.load(Ordering::Acquire), 1);
         }
         assert_eq!(inhibit.load(Ordering::Acquire), 0);
+    }
+
+    /// PAN-19 MEDIUM #3: once Hamlib's restart budget is exhausted,
+    /// `handle_finished_task` degrades it to `Failed` permanently -- no
+    /// further automatic restart will ever be attempted, so nothing is
+    /// left to consume the Hamlib bus channel and `SetPtt` will never
+    /// reach the rig again. `TxInhibitGuard`'s `Drop` un-inhibiting TX in
+    /// that case would un-mute TX with zero PTT control. Pre-fill the
+    /// restart budget so `handle_finished_task` takes the budget-exhausted
+    /// branch deterministically, without needing a real restart attempt or
+    /// backoff sleep.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn hamlib_restart_budget_exhausted_leaves_tx_permanently_inhibited() {
+        let mut coordinator = test_coordinator().await;
+        assert_eq!(coordinator.tx_restart_inhibit.load(Ordering::Acquire), 0);
+
+        let now = std::time::Instant::now();
+        for _ in 0..5 {
+            coordinator
+                .restart_budget
+                .record_attempt_and_backoff(ComponentId::Hamlib, now);
+        }
+        assert!(
+            !coordinator
+                .restart_budget
+                .may_restart(ComponentId::Hamlib, now),
+            "test setup: restart budget must actually be exhausted"
+        );
+
+        let handle: tokio::task::JoinHandle<anyhow::Result<()>> =
+            tokio::spawn(async { Err(anyhow::anyhow!("simulated hamlib crash")) });
+        coordinator
+            .named_task_handles
+            .push((ComponentId::Hamlib, handle));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        coordinator.check_task_handles().await;
+
+        assert!(
+            matches!(
+                coordinator
+                    .component_status
+                    .read()
+                    .await
+                    .get(&ComponentId::Hamlib)
+                    .map(|s| &s.state),
+                Some(super::ComponentState::Failed(_))
+            ),
+            "Hamlib should be Failed once its restart budget is exhausted"
+        );
+        assert!(
+            coordinator.tx_restart_inhibit.load(Ordering::Acquire) > 0,
+            "TX must stay inhibited once Hamlib's restart budget is exhausted -- Hamlib is \
+             dead for good and nothing will restart it further, so un-muting TX here means \
+             modulating audio with zero PTT control"
+        );
     }
 
     #[cfg(feature = "pancetta-hamlib")]
