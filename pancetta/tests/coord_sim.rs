@@ -1891,7 +1891,22 @@ async fn clamped_manual_qso_recovers_when_dx_replies_off_frequency() {
     sim.inject_decode("K5ARH K6L -11", 856.0).await;
 
     let pending = sim.pump_qso_events();
-    assert!(!pending.is_empty(), "confirmed relatch must emit a reply");
+    // PAN-15 item 5: assert the specific emitted content, not just
+    // "something was emitted" — the old `!pending.is_empty()` check was
+    // satisfiable by a keep-calling repeat of the opening `CqResponse`
+    // and never proved the confirmed relatch actually advanced the QSO.
+    assert!(
+        // NOTE: `render_message` (this harness's stand-in for the coordinator's
+        // real FT8-text renderer) only carries the `MessageType` variant name
+        // through `PendingTx.text` (see its doc comment), not the actual
+        // "K6L K5ARH R-11" wire string — so "ReportAck" is the strongest
+        // available proxy that the confirmed relatch's DX report actually
+        // advanced the QSO to send our R-report, not a keep-calling repeat of
+        // the opening `CqResponse`.
+        pending.iter().any(|p| p.text == "ReportAck"),
+        "confirmed relatch must emit our R-report (ReportAck), got {:?}",
+        pending.iter().map(|p| p.text.clone()).collect::<Vec<_>>()
+    );
     assert!(
         pending
             .iter()
@@ -1902,6 +1917,23 @@ async fn clamped_manual_qso_recovers_when_dx_replies_off_frequency() {
             .map(|p| p.frequency_offset)
             .collect::<Vec<_>>()
     );
+
+    let progress = sim
+        .manager
+        .get_qso(qso_id)
+        .await
+        .expect("QSO must still exist after confirmed relatch");
+    assert_eq!(
+        progress.metadata.partner_freq,
+        Some(856.0),
+        "confirmed relatch must have moved partner_freq to the DX's new offset"
+    );
+    assert!(
+        matches!(progress.state, QsoState::SendingReport { .. }),
+        "confirmed relatch's DX report must have advanced the QSO to SendingReport, got {:?}",
+        progress.state
+    );
+
     sim.drive_slot(pending).await;
     sim.timeline
         .assert_keyed_at_offset(&qso_id.to_string(), 2700.0);

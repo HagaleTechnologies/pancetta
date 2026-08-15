@@ -60,8 +60,12 @@ Add a new method, `QsoManager::maybe_confirm_frequency_drift`, called from
 `process_message_with_parity` **before** the existing `find_qsos_for_message` routing call
 (which stays completely unmodified). For each active QSO:
 
-1. Skip if `metadata.partner_freq.is_some()` (Hound/Fox — untouched, has its own dedicated
-   QSY mechanism already).
+1. **[Updated by PAN-12, 2026-08-14 — see "Hound-only skip, not partner_freq" below]** Skip
+   if `metadata.hound` is `true` (genuine Hound/Fox — untouched, has its own dedicated QSY
+   mechanism already). `metadata.partner_freq.is_some()` alone is **not** the discriminator:
+   ordinary manual QSOs also set `partner_freq` after an offset hold, a collision nudge, or a
+   TX-ceiling clamp, and PAN-12 (PR #247, "relatch split-TX partner frequency") extended this
+   mechanism to relatch those too — see step 4's split-TX branch below.
 2. Determine identity match using the SAME generic checks the codebase already has —
    not a per-arm enumeration:
    - `message_type.sender_callsign()` must equal (via `QsoManager::is_partner`, case-
@@ -91,11 +95,23 @@ Add a new method, `QsoManager::maybe_confirm_frequency_drift`, called from
        (reusing the existing `FREQ_TOLERANCE_HZ` constant), **and** the confirming
        sighting's timestamp is at least `DRIFT_CONFIRM_MIN_GAP` (5 real seconds) after
        `t` — **confirmed**: this is a second, genuinely separate transmission at the
-       same new frequency. Relatch:
-       - `metadata.frequency = frequency`
-       - Reach into `progress.state` and overwrite whichever variant's own embedded
-         `frequency` field is present — mirrors exactly the existing Hound-QSY block's
-         technique (`pancetta-qso/src/qso_manager.rs`, search `hound_qsyed`, the
+       same new frequency. Relatch, branching on whether this is a split-TX QSO
+       (**[Updated by PAN-12]** — `metadata.partner_freq.is_some()` at the time of the
+       relatch, independent of `metadata.hound`, since step 1's skip only excludes genuine
+       Hound/Fox, not every `partner_freq.is_some()` QSO):
+       - **Split-TX (`metadata.partner_freq.is_some()`, non-Hound)**: relatch **only**
+         `metadata.partner_freq = Some(frequency)` — our own TX offset
+         (`metadata.frequency` and the state's embedded `frequency` field) is
+         **deliberately left untouched**, since split-TX means we intentionally TX and RX
+         on different offsets (an operator's offset hold, a collision nudge, or a
+         TX-ceiling clamp) and this mechanism only tracks where we *hear* the DX, never
+         where we key. `old_state == new_state` is passed to `emit_state_change` (see
+         below) since nothing in the state enum changed.
+       - **Ordinary Tx=Rx (`metadata.partner_freq.is_none()`)**: relatch both
+         `metadata.frequency = frequency` **and** reach into `progress.state` to overwrite
+         whichever variant's own embedded `frequency` field is present — mirrors exactly
+         the existing Hound-QSY block's technique (`pancetta-qso/src/qso_manager.rs`,
+         search `hound_qsyed`, the
          `if let QsoState::SendingReport { frequency: ref mut state_freq, .. } = ...`
          pattern) — generalized to whichever state variant is actually active. Only
          `RespondingToCq`, `WaitingForReport`, `SendingReport`, `WaitingForConfirmation`,
@@ -109,17 +125,20 @@ Add a new method, `QsoManager::maybe_confirm_frequency_drift`, called from
          `state.frequency()` (the state enum's own field), not `metadata.frequency` —
          the two are separate storage that must be kept in sync manually, exactly as
          the Hound QSY code already has to do.
-       - Clear `pending_freq_drift` to `None`.
-       - `info!(target: "qso.freq_gate", ...)` — this is an operationally significant,
+       - Both branches: clear `pending_freq_drift` to `None`;
+         `info!(target: "qso.freq_gate", ...)` — this is an operationally significant,
          visible event (a QSO's tracked frequency just moved), unlike v1's buried
-         `debug!`.
-       - Emit `QsoEvent::StateChanged` (capture the pre-mutation state as `old_state`,
-         call `self.emit_state_change(qso_id, old_state, new_state)` after mutating).
-         This is load-bearing, not cosmetic: the coordinator's `StateChanged` handler
-         refreshes `active_tx_offsets` and the hb-091 scoped fast-path's own decoder
-         frequency hint (`qso_freq_state`) from the QSO's current frequency — without
-         this emission, a relatched QSO would leave the scoped decoder pointed at the
-         stale pre-relatch offset.
+         `debug!`; emit `QsoEvent::StateChanged` (capture the pre-mutation state as
+         `old_state`, call `self.emit_state_change(qso_id, old_state, new_state)` after
+         mutating — for the split-TX branch `old_state`/`new_state` are identical). This
+         is load-bearing, not cosmetic, in both branches: the coordinator's
+         `StateChanged` handler refreshes `active_tx_offsets` and the hb-091 scoped
+         fast-path's own decoder frequency hint (`qso_freq_state` /
+         `active_qso_freq_hz`) by re-reading the QSO's current frequency
+         (`metadata.partner_freq` for split-TX, `metadata.frequency` otherwise) —
+         without this emission, a relatched QSO would leave the scoped decoder pointed
+         at the stale pre-relatch offset even though the relevance gate has already
+         moved.
      - Else (no pending candidate, or a different frequency than the pending one):
        set `pending_freq_drift = Some((frequency, now))` (start or reset the candidate).
        **If the pending candidate already has this SAME frequency** (within 15 Hz) but
@@ -180,8 +199,12 @@ passes with **zero changes to the test itself**, which is the real proof this de
 
 - `is_message_relevant()` — byte-for-byte unchanged from before v1 ever touched it.
 - `determine_state_transition()` — byte-for-byte unchanged.
-- Hound/Fox mode — untouched (`partner_freq.is_some()` guard skips the new mechanism
-  entirely; Hound already has its own working QSY mechanism for exactly this problem).
+- Genuine Hound/Fox mode — untouched (**[Updated by PAN-12]** the skip guard is
+  `metadata.hound`, not `partner_freq.is_some()` — see step 1 above; Hound already has its
+  own working QSY mechanism for exactly this problem). Ordinary non-Hound split-TX QSOs
+  (offset holds, collision nudges, TX-ceiling clamps) are **not** excluded — PAN-12 extended
+  this mechanism to relatch `metadata.partner_freq` for those too, leaving our own TX offset
+  untouched (see step 4's split-TX branch above).
 - No new config surface, no operator-facing control.
 
 ### Real-incident validation
@@ -214,9 +237,17 @@ exchange for closing the spoofing hole completely.
   at 937.5 sets the candidate; a garbage decode at e.g. -50 Hz arrives next — candidate must
   remain `Some(937.5)` (not overwritten by the out-of-band noise); a genuine repeat at 937.5
   after that must still confirm.
-- **Hound QSOs untouched**: `is_message_relevant_hound_keys_on_partner_freq` and
+- **Genuine Hound QSOs untouched**: `is_message_relevant_hound_keys_on_partner_freq` and
   `hound_qsy_on_fox_report_full_exchange` — zero changes, both must stay green (proves the
-  `partner_freq.is_some()` guard works and the new mechanism never runs for Hound).
+  `metadata.hound` guard works and the new mechanism never runs for genuine Hound/Fox).
+  **[Added by PAN-12]** `genuine_hound_qso_is_still_skipped_by_drift_confirm` covers the same
+  property directly against `maybe_confirm_frequency_drift_at`.
+- **[Added by PAN-12] Non-Hound split-TX QSOs relatch `partner_freq` only**:
+  `clamped_split_tx_qso_relatches_partner_freq_on_confirmed_drift` and
+  `held_offset_qso_with_dx_on_partner_freq_never_drifts` — a split-TX QSO created by a
+  TX-ceiling clamp or an offset hold confirms a drift in where we *hear* the DX
+  (`metadata.partner_freq`) while `metadata.frequency` (our TX offset) and the state's own
+  embedded `frequency` field are never touched.
 - **Duplicate-delivery does not confirm**: two sightings at the same off-latch frequency,
   milliseconds apart (via `maybe_confirm_frequency_drift_at` with explicit timestamps) —
   must NOT relatch, and the pending candidate's timestamp must remain the ORIGINAL one, not

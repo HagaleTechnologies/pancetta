@@ -33,6 +33,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Fixed
 
 - Manual split-TX QSOs whose offset was held, collision-nudged, or passband-clamped now recover after two consistent DX replies at a new frequency without moving the station's chosen TX offset ([#245](https://github.com/HagaleTechnologies/pancetta/issues/245)). Genuine Hound/Fox behavior is unchanged.
+- PAN-12 follow-up (PAN-15): `engage_hound` now clears any `pending_freq_drift`
+  candidate that could accumulate in the window between QSO construction and
+  the `metadata.hound` stamp, so it can no longer get permanently stuck for a
+  Hound QSO's life; a confirmed split-TX `partner_freq` relatch that lands
+  within `MIN_TX_SEPARATION_HZ` of our own TX offset now logs a warn instead
+  of silently keying on top of the station we're trying to hear; the
+  frequency-gate tolerance constants used by `is_message_relevant`,
+  `classify_relevance`, and `maybe_confirm_frequency_drift_at` are now a
+  single shared definition instead of three independently-hardcoded copies.
 
 - Decode-pipeline crashes now recover automatically: the coordinator restarts DSP and FT8 decoder
   tasks under the existing bounded supervisor policy, keeps adjacent stages alive during backoff,
