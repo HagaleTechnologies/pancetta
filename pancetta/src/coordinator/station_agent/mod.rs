@@ -237,18 +237,37 @@ fn now_ms() -> i64 {
 /// before session state is constructed and therefore disarms during unwinding
 /// from any panic in the session loop. Drop must remain synchronous and
 /// panic-free: it can itself run while another panic is already unwinding.
+///
+/// `shutdown` lets `Drop` tell an ordinary, requested shutdown apart from an
+/// actual crash/unwind (PAN-19 MEDIUM #4): `run_session_loop` already calls
+/// `disarm_on_loss` (reason `OperatorDisarm`) on every ordinary exit path,
+/// including its own "final safety" call right before it returns -- so on a
+/// clean shutdown this guard's `Drop` is normally a no-op (the arm is
+/// already disarmed, and `disarm_with_reason` no-ops when nothing is armed).
+/// But if that prior disarm silently gave up (e.g. a poisoned `arm` mutex),
+/// the session could still be armed when this `Drop` runs even though
+/// nothing crashed -- attributing that disarm to `ComponentCrash`
+/// unconditionally would misattribute a routine shutdown as a crash in the
+/// audit log, exactly the failure mode `DisarmReason` exists to prevent (see
+/// its doc comment), just in the opposite direction. Attribute to
+/// `OperatorDisarm` ("the operator (or coordinator) explicitly disarmed")
+/// whenever `shutdown` is set, and only to `ComponentCrash` otherwise.
 struct RemoteTxDisarmGuard {
     arm: Arc<Mutex<ArmState>>,
     audit: AuditLog,
+    shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for RemoteTxDisarmGuard {
     fn drop(&mut self) {
+        let reason = if self.shutdown.load(Ordering::Acquire) {
+            DisarmReason::OperatorDisarm
+        } else {
+            DisarmReason::ComponentCrash
+        };
         let effects = match self.arm.lock() {
-            Ok(mut state) => state.disarm_with_reason(DisarmReason::ComponentCrash, now_ms()),
-            Err(poisoned) => poisoned
-                .into_inner()
-                .disarm_with_reason(DisarmReason::ComponentCrash, now_ms()),
+            Ok(mut state) => state.disarm_with_reason(reason, now_ms()),
+            Err(poisoned) => poisoned.into_inner().disarm_with_reason(reason, now_ms()),
         };
         apply_arm_effects(&self.audit, &effects);
     }
@@ -1322,6 +1341,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
     let _disarm_guard = RemoteTxDisarmGuard {
         arm: cfg.arm.clone(),
         audit: cfg.audit.clone(),
+        shutdown: cfg.shutdown.clone(),
     };
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut ctx = ArmContext {
@@ -1715,6 +1735,81 @@ mod tests {
 
     fn with_consent(ctx: &ArmContext, on: bool) {
         ctx.arm.lock().unwrap().set_local_consent(on, NOW);
+    }
+
+    /// An `ArmState` that is currently armed, so `RemoteTxDisarmGuard`'s
+    /// `Drop` has something to disarm.
+    fn armed_state() -> ArmState {
+        let mut st = ArmState::new();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: OPERATOR.to_string(),
+                ttl_ms: 300_000,
+                scope_tx: true,
+                jti: "test-jti".to_string(),
+            },
+            NOW,
+        );
+        st
+    }
+
+    /// PAN-19 MEDIUM #4: `RemoteTxDisarmGuard::drop` used to attribute
+    /// EVERY disarm to `DisarmReason::ComponentCrash`, unconditionally --
+    /// including on an ordinary, requested shutdown (`run_session_loop`
+    /// returning normally, not via panic/unwind). Simulate that: construct
+    /// the guard with `shutdown` already set and the arm still armed (as it
+    /// could be if `disarm_on_loss`'s own prior disarm silently gave up on
+    /// a poisoned mutex), drop it, and confirm the audit log attributes the
+    /// disarm to the shutdown path, not a crash.
+    #[test]
+    fn drop_during_ordinary_shutdown_does_not_audit_a_component_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(true));
+
+        {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm.clone(),
+                audit: audit.clone(),
+                shutdown: shutdown.clone(),
+            };
+        }
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            !log.contains("component-crash"),
+            "an ordinary shutdown must never be audited as a component crash: {log:?}"
+        );
+        assert!(
+            log.contains("operator-disarm"),
+            "expected the shutdown-path disarm to be attributed to operator-disarm: {log:?}"
+        );
+    }
+
+    /// The flip side of the test above: outside of shutdown (a real
+    /// panic/unwind), the guard must still correctly attribute the disarm
+    /// to `ComponentCrash` -- this is the scenario `RemoteTxDisarmGuard`
+    /// exists for in the first place.
+    #[test]
+    fn drop_outside_shutdown_still_audits_a_component_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm.clone(),
+                audit: audit.clone(),
+                shutdown: shutdown.clone(),
+            };
+        }
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            log.contains("component-crash"),
+            "a disarm outside of shutdown (panic/unwind) must still be attributed to a \
+             component crash: {log:?}"
+        );
     }
 
     // ── Case 2: a validly-signed Arm from an allow-listed client permits TX ──
