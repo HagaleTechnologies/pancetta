@@ -6614,6 +6614,113 @@ mod tests {
         }
     }
 
+    /// PAN-17 round 4 (Codex re-review of #248): "resolve first-time
+    /// callers before filtering type-4 replies."
+    ///
+    /// Investigated and determined to be an INHERENT i3=4 protocol
+    /// limitation, not a pancetta bug: a 12-bit hash is a one-way
+    /// compression of a callsign into 4096 buckets. Reversing it requires
+    /// having independently learned the plaintext from a standard-format
+    /// decode -- if a station's very first-ever transmission we've heard
+    /// (ever, on this band, this session) is itself an i3=4 reply that
+    /// puts them in the hash slot (structurally forced whenever the OTHER
+    /// party -- us -- is compound, since the pack28-failing callsign
+    /// always wins the exact slot), there are no other bits anywhere in
+    /// that 77-bit payload encoding their plaintext. Round 3's seeding
+    /// (`Ft8Decoder`'s per-window loop over every decoded
+    /// `MessageType::Standard`, `pancetta-ft8/src/decoder.rs`) already
+    /// seeds from ANY standard-format decode this station makes, whenever
+    /// and wherever heard, not just frames addressed to us -- there is no
+    /// earlier opportunity pancetta's code is failing to use; WSJT-X has
+    /// the identical limitation for the identical reason.
+    ///
+    /// What this test proves instead: the QSO-layer behavior for this
+    /// case is a clean, BOUNDED failure, not a hang or a silent full-
+    /// watchdog-window loop. `their_callsign` latches as the literal
+    /// unresolved placeholder `"<...>"` (`is_message_relevant`'s
+    /// `CallingCq`/`CqResponse` arm does not itself validate the sender's
+    /// identity, only that the response is addressed to us -- by design,
+    /// since at that point we don't yet know who will answer). The
+    /// EXISTING `callsign_is_wire_representable` watchdog check (PAN-17
+    /// round 2) then retires it on the very next pass: `"<...>"` contains
+    /// `<`/`.`/`>`, all outside the wire charset, so it can never be
+    /// transmitted regardless of report-bearing status.
+    #[tokio::test]
+    async fn genuinely_unresolvable_caller_hash_retires_fast_not_a_hang() {
+        let mut config = test_config();
+        config.our_callsign = "YS/WE9G".to_string(); // compound operator
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+        let mut events = manager.subscribe();
+
+        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        // A standard-callsign station replies to our compound CQ, but we
+        // (this decoder, this session) have NEVER heard their plaintext
+        // callsign in any standard-format frame before -- their hash
+        // genuinely cannot resolve. This is exactly what
+        // `MessageExchange::parse_message`/`normalize_callsign_token`
+        // hands the QSO engine for that case: the literal placeholder,
+        // left untouched (there is no real callsign to normalize it to).
+        let parsed = MessageType::CqResponse {
+            calling_station: "YS/WE9G".to_string(),
+            responding_station: "<...>".to_string(),
+            grid: Some("EM10".to_string()),
+        };
+
+        manager
+            .process_message(
+                parsed,
+                "YS/WE9G <...> EM10".to_string(),
+                14074000.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+
+        // The QSO advances and latches the unresolved placeholder -- relevance
+        // routing for a not-yet-partnered CallingCq QSO only verifies the
+        // response is addressed to us, not who the sender claims to be.
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(&progress.state, QsoState::WaitingForReport { their_callsign, .. } if their_callsign == "<...>"),
+            "expected their_callsign latched as the unresolved placeholder, got: {:?}",
+            progress.state
+        );
+
+        // The very next watchdog pass retires it -- bounded, fast, not a
+        // hang and not a full 5-minute silent loop.
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
+
+        let mut reason = None;
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::QsoFailed {
+                qso_id: id,
+                reason: r,
+                ..
+            } = ev
+            {
+                if id == qso_id {
+                    reason = Some(r);
+                }
+            }
+        }
+        assert!(
+            matches!(reason, Some(QsoFailureReason::MessageUnencodable(_))),
+            "expected a fast, distinct MessageUnencodable retirement, got {:?}",
+            reason
+        );
+    }
+
     /// PAN-17 round 3 (Codex re-review of #248, finding 1): a QSO that
     /// reaches a report-bearing rung (here, `SendingReport`) against a
     /// still-compound partner must retire immediately with

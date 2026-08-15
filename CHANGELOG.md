@@ -90,7 +90,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (invalid characters or >11 chars — e.g. the decoder's own `<...>`
   hash-miss placeholder leaking into the partner field) is retired
   immediately with a distinct "cannot transmit this message" reason instead
-  of being indistinguishable from a plain DX-never-answered timeout.
+  of being indistinguishable from a plain DX-never-answered timeout. This
+  also covers a compound-callsign station's caller whose plaintext
+  callsign we've never otherwise heard: their hash genuinely cannot
+  resolve (an inherent i3=4 protocol limitation, matching WSJT-X — not a
+  pancetta gap; see `docs/DECISIONS/qso-engine.md`'s "Round 4" note), and
+  now retires cleanly on the next watchdog pass instead of hanging.
 
 - A station calling our CQ while it already has a separate, established active QSO with us (e.g. we just called their CQ and are awaiting their report) no longer opens a second, parallel QSO object for that same station. Message routing previously let a `CallingCq` QSO's "any station" relevance arms accept a frame that also belonged to the other QSO, producing two independently-cadenced active QSOs for one real station — each keying its own TX, which could put two frames on the air for the same station in one TX window (PAN-14). Two follow-on gaps in the same routing path, found in code review, are closed alongside it: (1) two still-unpartnered `CallingCq` QSOs (from repeated `c` presses, or Fox mode engaging while a CQ is already live) could both claim the same reply — now only the earliest-created CQ advances; (2) a station whose QSO with us just completed could be immediately re-claimed by an unrelated `CallingCq` QSO on a stray/duplicate frame — now reserved for `COMPLETED_QSO_REWORK_GRACE` (45 s), mirroring the existing active-or-recently-completed pattern used elsewhere.
 - FT8's unresolved-hashed-callsign placeholder `"<...>"` (an i3=4 nonstandard-callsign
