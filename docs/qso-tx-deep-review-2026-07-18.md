@@ -355,14 +355,37 @@ in one window, 2026-08-11) and reproduced deterministically in
 `qso_manager::tests::calling_cq_and_established_qso_both_accept_same_partners_frame`
 (`pancetta-qso/src/qso_manager.rs`): a `CallingCq` QSO's two "any station"
 relevance arms (`CqResponse`/bare `SignalReport` addressed to us) now also
-require the sender have no OTHER established active QSO
-(`sender_has_other_active_partner`, computed once per incoming message in
-`find_qsos_for_message` from `metadata.their_callsign` across all active
-QSOs, compound-callsign-aware via `callsigns_match`). Effects (a)/(b) — the
-fully general default-arm case for state/message-type combinations with no
-explicit arm — are UNFIXED; still open, narrower in practice than (c) since
-most CallingCq/established-state × message-type pairs already have explicit
-arms.
+require the sender have no OTHER established-or-recent active QSO
+(`sender_has_other_active_or_recent_partner`, computed once per incoming
+message in `find_qsos_for_message` from `metadata.their_callsign` across all
+active QSOs, compound-callsign-aware via `callsigns_match`). Effects (a)/(b)
+— the fully general default-arm case for state/message-type combinations with
+no explicit arm — are UNFIXED; still open, narrower in practice than (c)
+since most CallingCq/established-state × message-type pairs already have
+explicit arms.
+
+**PAN-14 round-1 review update (2026-08-15):** Codex's first review of PR
+#250 found two adjacent gaps in the same guard, both fixed and covered by
+regression tests in the same commit:
+- **P1 — two unpartnered `CallingCq` QSOs.** The guard above is keyed on an
+  ESTABLISHED partner (`metadata.their_callsign` latched); it has no
+  visibility into a conflict between two still-`CallingCq` QSOs (both
+  `their_callsign == None`) — e.g. from repeated `StartCq`/`start_cq_manual`
+  calls or Fox mode engaging while a CQ is already live (neither path
+  supersedes an existing `CallingCq` QSO). A single reply could independently
+  satisfy both QSOs' "any station" arms. Fixed in `find_qsos_for_message`:
+  when more than one `CallingCq` QSO survives relevance matching for the same
+  message, only the earliest-created (`metadata.start_time`) is kept — first
+  CQ up, first CQ answered. Test:
+  `one_reply_can_only_advance_the_earliest_calling_cq_not_multiple`.
+- **P2 — recently-completed QSOs were invisible to the guard.** The original
+  guard's predicate was `p.state.is_active()` only, so a QSO that just
+  `Completed` dropped out immediately — a stray/duplicate frame from that
+  exact station could be re-claimed by an unrelated `CallingCq` QSO. Fixed by
+  extending the guard to also count a `Completed` QSO with the same partner
+  within `COMPLETED_QSO_REWORK_GRACE` (45 s), mirroring
+  `has_active_or_recent_qso_with`'s existing active-or-recent pattern. Test:
+  `recently_completed_qso_reserves_the_sender_from_an_unrelated_calling_cq`.
 
 **SM-F8 — Re-send paths bypass the rearm's anti-double-send stamps. CONFIRMED.
 MED.**

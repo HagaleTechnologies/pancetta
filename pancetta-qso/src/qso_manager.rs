@@ -3629,14 +3629,38 @@ impl QsoManager {
             // failure mode — see AGENTS.md "at most one QSO object exists
             // per (callsign, band)". Computed once per incoming message
             // (not per-QSO) since it doesn't depend on the candidate QSO.
-            let sender_has_other_active_partner =
+            //
+            // P2 (Codex round-1 review of PR #250): also treat a QSO that
+            // COMPLETED with this exact sender within
+            // `COMPLETED_QSO_REWORK_GRACE` as "already accounted for" —
+            // mirrors `has_active_or_recent_qso_with`'s active-or-recent
+            // pattern (and the coordinator's matching 45 s completed-TX
+            // grace). Without this, the `is_active()`-only predicate goes
+            // false the instant a QSO completes, so a station whose contact
+            // with us just finished could be immediately re-claimed by an
+            // unrelated CallingCq QSO's "any station" arm on a stray/
+            // duplicate frame, opening a second QSO object for a station we
+            // just worked seconds ago.
+            let now = Utc::now();
+            let sender_has_other_active_or_recent_partner =
                 message_type.sender_callsign().is_some_and(|sender| {
                     qsos.values().any(|p| {
-                        p.state.is_active()
-                            && p.metadata
-                                .their_callsign
-                                .as_deref()
-                                .is_some_and(|c| crate::exchange::callsigns_match(c, sender))
+                        let same_sender = p
+                            .metadata
+                            .their_callsign
+                            .as_deref()
+                            .is_some_and(|c| crate::exchange::callsigns_match(c, sender));
+                        if !same_sender {
+                            return false;
+                        }
+                        if p.state.is_active() {
+                            return true;
+                        }
+                        if let QsoState::Completed { completed_at, .. } = &p.state {
+                            return now.signed_duration_since(*completed_at).num_seconds()
+                                <= COMPLETED_QSO_REWORK_GRACE.num_seconds();
+                        }
+                        false
                     })
                 });
 
@@ -3650,7 +3674,7 @@ impl QsoManager {
                     &progress.metadata,
                     message_type,
                     frequency,
-                    sender_has_other_active_partner,
+                    sender_has_other_active_or_recent_partner,
                 );
                 if verdict.relevant {
                     matching_qsos.push(qso_id);
@@ -3669,6 +3693,38 @@ impl QsoManager {
                         to_callsign: message_type.addressee_callsign().map(str::to_string),
                     });
                 }
+            }
+
+            // P1 (Codex round-1 review of PR #250): a reply can independently
+            // satisfy MULTIPLE unpartnered `CallingCq` QSOs' relevance arms —
+            // e.g. via repeated `StartCq`/`start_cq_manual` calls, or Fox
+            // mode engaging while a CQ is already live, both of which insert
+            // another `CallingCq` QSO with no guard against one already
+            // existing. Every `CallingCq` QSO has `metadata.their_callsign ==
+            // None`, so the guard above (keyed on an ESTABLISHED partner)
+            // cannot see a conflict between two still-unpartnered `CallingCq`
+            // QSOs — both independently pass their "any station" arm and
+            // both would advance, again leaving one real station partnered
+            // with two `qso_id`s. Restrict to the single earliest-created
+            // (`metadata.start_time`) `CallingCq` match — first CQ up, first
+            // CQ answered — dropping any others so only ONE advances.
+            let calling_cq_matches: Vec<QsoId> = matching_qsos
+                .iter()
+                .copied()
+                .filter(|id| {
+                    matches!(
+                        qsos.get(id).map(|p| &p.state),
+                        Some(QsoState::CallingCq { .. })
+                    )
+                })
+                .collect();
+            if calling_cq_matches.len() > 1 {
+                let earliest = calling_cq_matches
+                    .iter()
+                    .copied()
+                    .min_by_key(|id| qsos.get(id).map(|p| p.metadata.start_time))
+                    .expect("calling_cq_matches is non-empty");
+                matching_qsos.retain(|id| *id == earliest || !calling_cq_matches.contains(id));
             }
         }
 
@@ -3690,14 +3746,14 @@ impl QsoManager {
         metadata: &QsoMetadata,
         message_type: &MessageType,
         frequency: f64,
-        sender_has_other_active_partner: bool,
+        sender_has_other_active_or_recent_partner: bool,
     ) -> Relevance {
         let relevant = self.is_message_relevant(
             state,
             metadata,
             message_type,
             frequency,
-            sender_has_other_active_partner,
+            sender_has_other_active_or_recent_partner,
         );
         if relevant {
             return Relevance {
@@ -3811,7 +3867,7 @@ impl QsoManager {
         metadata: &QsoMetadata,
         message_type: &MessageType,
         frequency: f64,
-        sender_has_other_active_partner: bool,
+        sender_has_other_active_or_recent_partner: bool,
     ) -> bool {
         // Frequency tolerance tightened from 50 Hz → 15 Hz to reduce
         // cross-QSO message bleed-through in multi-QSO mode. FT8 frame-to-
@@ -3848,7 +3904,7 @@ impl QsoManager {
                 MessageType::CqResponse {
                     calling_station, ..
                 },
-            ) => self.is_us(calling_station) && !sender_has_other_active_partner,
+            ) => self.is_us(calling_station) && !sender_has_other_active_or_recent_partner,
 
             // A4 (routing half): a caller answered our CQ with a bare signal
             // report (grid skipped) — "<us> <them> -NN". Route it to this
@@ -3857,7 +3913,7 @@ impl QsoManager {
             // yet know who will answer) — UNLESS that from_station already has
             // a different established active QSO (PAN-14/SM-F7, see above).
             (QsoState::CallingCq { .. }, MessageType::SignalReport { to_station, .. }) => {
-                self.is_us(to_station) && !sender_has_other_active_partner
+                self.is_us(to_station) && !sender_has_other_active_or_recent_partner
             }
 
             // CQer flow: we called CQ, the caller answered, and we sent our
@@ -6764,6 +6820,176 @@ mod tests {
                 .iter()
                 .map(|(id, p)| (*id, p.state.clone()))
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// PAN-14 P1 (Codex round-1 review of PR #250): TWO unpartnered
+    /// `CallingCq` QSOs can coexist — nothing supersedes an existing
+    /// `CallingCq` QSO when `start_cq`/`start_cq_manual` opens another one
+    /// (repeated manual `c` presses, or Fox mode engaging while a CQ is
+    /// already live). Both have `metadata.their_callsign == None`, so the
+    /// `sender_has_other_active_or_recent_partner` guard — keyed on an
+    /// ESTABLISHED partner — cannot see a conflict between them: a single
+    /// incoming reply independently satisfies both QSOs' "any station"
+    /// relevance arms. Without a fix, both would advance and partner the
+    /// SAME real station with two different `qso_id`s (the same failure
+    /// class PAN-14 exists to close, via a different pair of states).
+    #[tokio::test]
+    async fn one_reply_can_only_advance_the_earliest_calling_cq_not_multiple() {
+        let manager = QsoManager::new(test_config());
+
+        // Two independent, still-unpartnered CallingCq QSOs, 5 Hz apart —
+        // both well within the CallingCq arm's 15 Hz gate for the same
+        // incoming decode.
+        let qso_x = manager.start_cq(1500.0, None, false).await.unwrap();
+        // Sleep so `metadata.start_time` orders deterministically (real
+        // `Utc::now()` calls back-to-back could otherwise tie).
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        let qso_y = manager.start_cq(1505.0, None, false).await.unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_x).await.unwrap().state,
+            QsoState::CallingCq { .. }
+        ));
+        assert!(matches!(
+            manager.get_qso(qso_y).await.unwrap().state,
+            QsoState::CallingCq { .. }
+        ));
+
+        // K1DEF answers with a bare report (grid skipped), addressed to us —
+        // the A4 CallingCq routing arm, which accepts ANY from_station.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -9,
+                },
+                "W1ABC K1DEF -09".to_string(),
+                1500.0,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+
+        let active = manager.get_active_qsos().await;
+        let k1def_partners: Vec<_> = active
+            .iter()
+            .filter(|(_, p)| p.metadata.their_callsign.as_deref() == Some("K1DEF"))
+            .collect();
+        assert_eq!(
+            k1def_partners.len(),
+            1,
+            "K1DEF must become the partner of exactly ONE CallingCq QSO, not {}: {:#?}",
+            k1def_partners.len(),
+            k1def_partners
+                .iter()
+                .map(|(id, p)| (*id, p.state.clone()))
+                .collect::<Vec<_>>()
+        );
+
+        // The earliest-created CQ must be the one that claimed it; the
+        // later one must remain un-advanced (available for its own future
+        // caller).
+        let p_x = manager.get_qso(qso_x).await.unwrap();
+        assert!(
+            matches!(p_x.state, QsoState::WaitingForReport { .. }),
+            "earliest CQ (qso_x) should advance, got {:?}",
+            p_x.state
+        );
+        let p_y = manager.get_qso(qso_y).await.unwrap();
+        assert!(
+            matches!(p_y.state, QsoState::CallingCq { .. }),
+            "later CQ (qso_y) must remain un-advanced, got {:?}",
+            p_y.state
+        );
+    }
+
+    /// PAN-14 P2 (Codex round-1 review of PR #250): the routing guard only
+    /// checked `p.state.is_active()`, so a QSO that just COMPLETED goes
+    /// invisible to it the instant it terminates — a stray/duplicate frame
+    /// from that exact station (or a fresh CQ-answer attempt) landing
+    /// within an unrelated CallingCq QSO's frequency gate could open a
+    /// SECOND active QSO for a station we finished working seconds ago.
+    /// Mirrors the existing `has_active_or_recent_qso_with` /
+    /// `COMPLETED_QSO_REWORK_GRACE` (45 s) "active-or-recently-completed"
+    /// pattern used elsewhere in this file.
+    #[tokio::test]
+    async fn recently_completed_qso_reserves_the_sender_from_an_unrelated_calling_cq() {
+        let manager = QsoManager::new(test_config());
+        let freq = 14074000.0;
+
+        // Complete a full CQ exchange with K1DEF (mirrors
+        // cqer_full_sequence_completes_and_logs_grid).
+        let qso_a = manager.start_cq(freq, None, false).await.unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                freq,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -12,
+                },
+                "W1ABC K1DEF R-12".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                },
+                "W1ABC K1DEF 73".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_a).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
+
+        // Immediately start a NEW, unrelated CQ 5 Hz away — well within the
+        // CallingCq arm's 15 Hz gate for a frame decoded at qso_b's offset.
+        let qso_b = manager.start_cq(freq + 5.0, None, false).await.unwrap();
+
+        // K1DEF sends a stray/duplicate CqResponse-shaped frame again,
+        // within the completed-QSO grace window (this test runs in
+        // milliseconds, well under COMPLETED_QSO_REWORK_GRACE's 45 s).
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                freq + 5.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+
+        let p_b = manager.get_qso(qso_b).await.unwrap();
+        assert!(
+            matches!(p_b.state, QsoState::CallingCq { .. }),
+            "qso_b must remain un-advanced — K1DEF is reserved by its recent completion, got {:?}",
+            p_b.state
         );
     }
 
