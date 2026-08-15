@@ -392,7 +392,31 @@ impl Ft8Message {
             | MessageType::FieldDay
             | MessageType::RTTYRoundup
             | MessageType::DXpedition => false,
-            MessageType::Standard | MessageType::NonStdCall | MessageType::Extended => {
+            // PAN-17 round 2 (Codex review #248, finding 2): i3=4
+            // (NonStdCall) does NOT use pack28's packed encoding at all —
+            // one callsign is an up-to-11-char base-38 exact pack (e.g.
+            // "YS/WE9G", "3E40CDW"; see `pancetta_ft8::encoder`), the
+            // other is a 12-bit hash render ("<K5ARH>" resolved, "<...>"
+            // unresolved — see `parse_nonstd_call` below). The Standard-
+            // type `looks_like_callsign` shape check (3-6 chars, single
+            // digit-position pattern) is the WRONG rule for either of
+            // those forms — it rejected real, correctly-decoded compound
+            // callsigns, meaning a compound-callsign station's reply could
+            // be decoded but never reached the QSO engine (the "TX-only,
+            // not a working QSO" gap). NonStdCall gets its own shape check.
+            MessageType::NonStdCall => {
+                let calls: Vec<&str> = [&self.from_callsign, &self.to_callsign]
+                    .iter()
+                    .filter_map(|opt| opt.as_deref())
+                    .collect();
+                if calls.is_empty() {
+                    return false;
+                }
+                calls
+                    .iter()
+                    .all(|call| Self::looks_like_nonstandard_callsign(call))
+            }
+            MessageType::Standard | MessageType::Extended => {
                 // ALL present callsigns must look valid.
                 let calls: Vec<&str> = [&self.from_callsign, &self.to_callsign]
                     .iter()
@@ -959,6 +983,49 @@ impl Ft8Message {
             None => false, // no digits at all
         }
     }
+
+    /// Plausibility check for a callsign field inside an i3=4
+    /// (`NonStdCall`) message — PAN-17 round 2 (Codex review #248, finding
+    /// 2). `looks_like_callsign` enforces `pack28`'s packed-encoding shape
+    /// (3-6 chars, exactly one digit "block" in the first 3 positions),
+    /// which is simply the wrong rule here: i3=4 doesn't use that encoding
+    /// at all. A field is plausible if it's one of:
+    ///   - `"CQ"` — the addressee-less token `parse_nonstd_call`'s icq
+    ///     branch uses,
+    ///   - a hash-render form, `"<K5ARH>"` (resolved 12-bit hash) or
+    ///     `"<...>"` (unresolved hash-miss placeholder) — anything
+    ///     bracketed is accepted here; a *resolved* one is exactly as
+    ///     trustworthy as any other decoded callsign, and an *unresolved*
+    ///     one still identifies a real (if unknown) callsign occupying the
+    ///     OTHER slot, so the surrounding message (report/RR73/73) can
+    ///     still plausibly be a real frame — downstream identity checks
+    ///     (`pancetta_core::callsign::callsigns_match`) refuse to actually
+    ///     match `<...>` against anything, so accepting the SHAPE here
+    ///     doesn't relax who a message can be treated as addressed to,
+    ///   - the exact 58-bit base-38 form: up to 11 characters, all from
+    ///     the hash-callsign charset (`encoder::HASH_CALL_CHARSET`), with
+    ///     both a digit and a letter present (the same coarse "is this
+    ///     shaped like a real callsign" sanity check the ENCODE side uses,
+    ///     `encoder::looks_like_callsign` — keeping the two in agreement).
+    fn looks_like_nonstandard_callsign(s: &str) -> bool {
+        if s == "CQ" {
+            return true;
+        }
+        if s.starts_with('<') && s.ends_with('>') && s.len() >= 2 {
+            return true;
+        }
+        let len = s.chars().count();
+        if !(3..=11).contains(&len) {
+            return false;
+        }
+        if !s
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == ' ')
+        {
+            return false;
+        }
+        s.chars().any(|c| c.is_ascii_digit()) && s.chars().any(|c| c.is_ascii_alphabetic())
+    }
 }
 
 /// Decoded FT8 message with metadata
@@ -1368,6 +1435,45 @@ impl Default for HashTable {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Character set for the i3=4 nonstandard-callsign 58-bit "exact" field and
+/// the underlying hash (mirrors `HashTable::calculate_n22`'s local table).
+/// " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/" (38 chars). Exposed so
+/// `encoder.rs` can pack the TX-side counterpart of [`MessageParser::unpack58`]
+/// / [`HashTable::calculate_hash_12bit`] without duplicating the charset.
+pub(crate) const HASH_CALL_CHARSET: &[u8; 38] = b" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
+
+/// Pack a callsign into the 58-bit base-38 "exact" field used by i3=4
+/// nonstandard-callsign messages — the encode-side mirror of
+/// [`MessageParser::unpack58`]. Returns `None` if the callsign is too long
+/// (>11 chars) or contains a character outside [`HASH_CALL_CHARSET`]; such a
+/// callsign cannot occupy this field (it can still go in the 12-bit hash
+/// field via [`hash12`], which accepts any string).
+pub(crate) fn pack58(callsign: &str) -> Option<u64> {
+    let upper = callsign.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    if bytes.len() > 11 {
+        return None;
+    }
+    let mut n58: u64 = 0;
+    for &b in bytes {
+        let j = HASH_CALL_CHARSET.iter().position(|&c| c == b)?;
+        n58 = n58 * 38 + j as u64;
+    }
+    for _ in bytes.len()..11 {
+        n58 *= 38;
+    }
+    Some(n58)
+}
+
+/// Compute the 12-bit hash of a callsign for the i3=4 "hashed" field —
+/// the encode-side mirror of `HashTable::calculate_hash_12bit`. Unlike
+/// [`pack58`] this never fails: any string hashes, the same way real FT8
+/// traffic can hash a callsign the receiver's table has never seen (the
+/// receiver just can't reverse it back to text — it renders `<...>`).
+pub(crate) fn hash12(callsign: &str) -> u32 {
+    HashTable::calculate_n22(callsign) >> 10
 }
 
 /// FT8 message parser

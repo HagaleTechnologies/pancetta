@@ -87,22 +87,34 @@ lazy_static! {
     /// Grid square validation regex (4 or 6 characters)
     static ref GRID_REGEX: Regex = Regex::new(r"^[A-R]{2}[0-9]{2}([A-X]{2})?$").unwrap();
 
+    /// A callsign TOKEN as it can appear inside a decoded FT8 message's
+    /// rendered text: either a normal (possibly compound) callsign, or an
+    /// i3=4 hash-rendered callsign — `"<K5ARH>"` (resolved 12-bit hash) or
+    /// `"<...>"` (unresolved hash-miss placeholder), exactly as
+    /// `Ft8Message`'s `Display` impl (pancetta-ft8/src/message.rs) renders
+    /// them. PAN-17 round 2 (Codex review #248, finding 2): without the
+    /// bracketed alternative, a reply FROM a compound-callsign station
+    /// whose OTHER call renders as a hash never matched any pattern below,
+    /// fell through to `NonStandard`, and never reached the QSO state
+    /// machine.
+    static ref CALL_TOKEN: &'static str = r"(?:[A-Z0-9/]+|<[.A-Z0-9/]*>)";
+
     /// CQ message patterns
     static ref CQ_PATTERNS: Vec<Regex> = vec![
-        Regex::new(r"^CQ\s+([A-Z0-9/]+)(?:\s+([A-R]{2}[0-9]{2}(?:[A-X]{2})?))?$").unwrap(),
-        Regex::new(r"^CQ\s+([A-Z]+)\s+([A-Z0-9/]+)(?:\s+([A-R]{2}[0-9]{2}(?:[A-X]{2})?))?$").unwrap(),
+        Regex::new(&format!(r"^CQ\s+({t})(?:\s+([A-R]{{2}}[0-9]{{2}}(?:[A-X]{{2}})?))?$", t = *CALL_TOKEN)).unwrap(),
+        Regex::new(&format!(r"^CQ\s+([A-Z]+)\s+({t})(?:\s+([A-R]{{2}}[0-9]{{2}}(?:[A-X]{{2}})?))?$", t = *CALL_TOKEN)).unwrap(),
     ];
 
     /// Standard QSO message patterns
     static ref QSO_PATTERNS: Vec<Regex> = vec![
         // Response to CQ: "W1ABC K1DEF FN31"
-        Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)(?:\s+([A-R]{2}[0-9]{2}(?:[A-X]{2})?))?$").unwrap(),
+        Regex::new(&format!(r"^({t})\s+({t})(?:\s+([A-R]{{2}}[0-9]{{2}}(?:[A-X]{{2}})?))?$", t = *CALL_TOKEN)).unwrap(),
         // Signal report: "K1DEF W1ABC -15" or "K1DEF W1ABC R-12"
-        Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)\s+(R? ?[+-]?\d{1,2})$").unwrap(),
+        Regex::new(&format!(r"^({t})\s+({t})\s+(R? ?[+-]?\d{{1,2}})$", t = *CALL_TOKEN)).unwrap(),
         // Final confirmation: "W1ABC K1DEF RR73" / "W1ABC K1DEF RRR" / "W1ABC K1DEF 73"
-        Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)\s+(RR73|RRR|73)$").unwrap(),
+        Regex::new(&format!(r"^({t})\s+({t})\s+(RR73|RRR|73)$", t = *CALL_TOKEN)).unwrap(),
         // Contest exchange: "W1ABC K1DEF 599 001"
-        Regex::new(r"^([A-Z0-9/]+)\s+([A-Z0-9/]+)\s+(\d{3})\s+(\d{3,4})$").unwrap(),
+        Regex::new(&format!(r"^({t})\s+({t})\s+(\d{{3}})\s+(\d{{3,4}})$", t = *CALL_TOKEN)).unwrap(),
     ];
 }
 
@@ -139,6 +151,33 @@ fn split_compound(callsign: &str) -> (String, Vec<String>) {
 /// rejected.
 fn is_recognized_affix_token(token: &str) -> bool {
     !token.is_empty() && token.len() <= 4 && token.bytes().all(|b| b.is_ascii_alphanumeric())
+}
+
+/// Normalize a callsign token as it appears in decoded FT8 message text.
+///
+/// A RESOLVED i3=4 hash render (`"<K5ARH>"` — see `Ft8Message`'s Display
+/// impl, pancetta-ft8/src/message.rs) is unwrapped to the plain callsign it
+/// represents (`"K5ARH"`) so it flows into `MessageType` — and from there
+/// into latched QSO state (`their_callsign`), sender verification, and
+/// outgoing message generation — exactly like any other decoded callsign.
+///
+/// PAN-17 round 3 (Codex re-review of PR #248, finding 3): without this,
+/// the STILL-bracketed literal got latched as `their_callsign`. The
+/// round-2 unencodable-message watchdog
+/// (`pancetta-qso::qso_manager::callsign_is_wire_representable`) correctly
+/// treats `<`/`>` as outside the wire charset — so a resolved hash
+/// callsign was self-sabotaging its own QSO via that very watchdog.
+///
+/// The UNRESOLVED hash-miss placeholder `"<...>"` is left untouched — there
+/// is no real callsign to normalize it to; callers still route/validate it
+/// via the bracket-shape branch (`MessageExchange::validate_callsign`), and
+/// `pancetta_core::callsign::callsigns_match` still refuses to match it
+/// against anything.
+fn normalize_callsign_token(token: &str) -> String {
+    match token.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        Some(inner) if !inner.is_empty() && !inner.bytes().all(|b| b == b'.') => inner.to_string(),
+        _ => token.to_string(),
+    }
 }
 
 /// Decide whether `candidate` may safely *upgrade* the latched logged
@@ -354,6 +393,22 @@ impl MessageExchange {
 
         // Fast path: a plain callsign.
         if CALLSIGN_REGEX.is_match(&upper) {
+            return Ok(());
+        }
+
+        // i3=4 hash-rendered callsign (PAN-17 round 2, Codex review #248
+        // finding 2): "<K5ARH>" (resolved 12-bit hash) or "<...>"
+        // (unresolved hash-miss placeholder), exactly as `Ft8Message`'s
+        // Display renders them (pancetta-ft8/src/message.rs). These aren't
+        // real callsign text — they're inherently unverifiable
+        // placeholders — but the QSO engine still needs to route the
+        // surrounding message (report/RR73/73) instead of dropping it to
+        // `NonStandard`. Higher-level sender verification
+        // (`pancetta_core::callsign::callsigns_match`) is what actually
+        // decides whether a hash render may be treated as matching a
+        // specific station; this just accepts the shape so parsing doesn't
+        // reject it outright.
+        if upper.starts_with('<') && upper.ends_with('>') && upper.len() >= 2 {
             return Ok(());
         }
 
@@ -635,13 +690,21 @@ impl MessageExchange {
     fn parse_cq_message(&self, message: &str) -> Result<MessageType, ExchangeError> {
         for pattern in CQ_PATTERNS.iter() {
             if let Some(captures) = pattern.captures(message) {
-                let callsign = captures
-                    .get(1)
-                    .ok_or_else(|| ExchangeError::ParseError {
-                        details: "Missing callsign in CQ".to_string(),
-                    })?
-                    .as_str()
-                    .to_string();
+                // See parse_qso_message's matching comment: normalize a
+                // resolved hash render before it flows into MessageType.
+                // (In practice a CQ's callsign is always the i3=4 exact
+                // 58-bit form, never hashed — `parse_nonstd_call`'s icq
+                // branch only ever sets `from_callsign` to the decoded
+                // exact form — but normalizing defensively costs nothing
+                // and keeps this path consistent with parse_qso_message.)
+                let callsign = normalize_callsign_token(
+                    captures
+                        .get(1)
+                        .ok_or_else(|| ExchangeError::ParseError {
+                            details: "Missing callsign in CQ".to_string(),
+                        })?
+                        .as_str(),
+                );
 
                 self.validate_callsign(&callsign)?;
 
@@ -672,21 +735,34 @@ impl MessageExchange {
         message: &str,
         captures: regex::Captures,
     ) -> Result<MessageType, ExchangeError> {
-        let station1 = captures
-            .get(1)
-            .ok_or_else(|| ExchangeError::ParseError {
-                details: "Missing first callsign".to_string(),
-            })?
-            .as_str()
-            .to_string();
+        // PAN-17 round 3 (Codex re-review of #248, finding 3): normalize a
+        // RESOLVED i3=4 hash render ("<K5ARH>") to the plain callsign it
+        // represents ("K5ARH") right here, at parse time — before it flows
+        // into `MessageType` and from there into latched QSO state
+        // (`their_callsign`) and outgoing message generation. Without this,
+        // the still-bracketed literal got latched, which the round-2
+        // unencodable-message watchdog (correctly) flags as containing
+        // invalid characters — self-sabotaging a QSO whose hash resolved
+        // just fine. The UNRESOLVED placeholder "<...>" is left as-is (no
+        // real callsign to normalize it to); `validate_callsign`'s
+        // bracket-shape branch still accepts it.
+        let station1 = normalize_callsign_token(
+            captures
+                .get(1)
+                .ok_or_else(|| ExchangeError::ParseError {
+                    details: "Missing first callsign".to_string(),
+                })?
+                .as_str(),
+        );
 
-        let station2 = captures
-            .get(2)
-            .ok_or_else(|| ExchangeError::ParseError {
-                details: "Missing second callsign".to_string(),
-            })?
-            .as_str()
-            .to_string();
+        let station2 = normalize_callsign_token(
+            captures
+                .get(2)
+                .ok_or_else(|| ExchangeError::ParseError {
+                    details: "Missing second callsign".to_string(),
+                })?
+                .as_str(),
+        );
 
         self.validate_callsign(&station1)?;
         self.validate_callsign(&station2)?;
@@ -1232,5 +1308,100 @@ mod tests {
             grid: Some(String::new()),
         };
         assert_eq!(exchange.generate_message(&empty).unwrap(), "PY2GIG K5ARH");
+    }
+
+    // ========================================================================
+    // PAN-17 round 2 (Codex review #248, finding 2): i3=4 hash-render
+    // routing — a decoded reply from a compound-callsign station whose
+    // OTHER call renders as a hash ("<K5ARH>"/"<...>") must still parse
+    // into a real MessageType, not fall through to NonStandard.
+    // ========================================================================
+
+    #[test]
+    fn validate_callsign_accepts_hash_render_forms() {
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        assert!(exchange.validate_callsign("<K5ARH>").is_ok());
+        assert!(exchange.validate_callsign("<...>").is_ok());
+        assert!(exchange.validate_callsign("<k5arh>").is_ok());
+    }
+
+    #[test]
+    fn parse_message_routes_resolved_hash_reply_with_report() {
+        // "<K5ARH> YS/WE9G -12" -- a compound-call DX sending us a report,
+        // with OUR callsign rendered via a resolved hash (the wire form
+        // this produces when the DX's decoder has previously seen our
+        // plain-text callsign).
+        //
+        // PAN-17 round 3 (Codex re-review of #248, finding 3): the parsed
+        // `to_station` must be the NORMALIZED plain callsign ("K5ARH"), not
+        // the still-bracketed literal ("<K5ARH>") -- the bracketed form
+        // would otherwise flow into latched QSO state and self-sabotage via
+        // the unencodable-message watchdog (`<`/`>` are outside the wire
+        // charset).
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let result = exchange
+            .parse_message("<K5ARH> YS/WE9G -12")
+            .expect("must parse, not error");
+        match result {
+            MessageType::SignalReport {
+                to_station,
+                from_station,
+                report,
+            } => {
+                assert_eq!(to_station, "K5ARH");
+                assert_eq!(from_station, "YS/WE9G");
+                assert_eq!(report, -12);
+            }
+            other => panic!("expected SignalReport, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn normalize_callsign_token_unwraps_resolved_hash_only() {
+        assert_eq!(normalize_callsign_token("<K5ARH>"), "K5ARH");
+        assert_eq!(normalize_callsign_token("<k5arh>"), "k5arh"); // case preserved; caller uppercases
+                                                                  // Unresolved hash-miss placeholder: no real callsign, left as-is.
+        assert_eq!(normalize_callsign_token("<...>"), "<...>");
+        // Plain / compound callsigns: unaffected.
+        assert_eq!(normalize_callsign_token("K5ARH"), "K5ARH");
+        assert_eq!(normalize_callsign_token("YS/WE9G"), "YS/WE9G");
+        // Degenerate empty-bracket form: nothing to normalize to, left as-is.
+        assert_eq!(normalize_callsign_token("<>"), "<>");
+    }
+
+    #[test]
+    fn parse_message_routes_unresolved_hash_reply_with_rr73() {
+        // "<...> YS/WE9G RR73" -- the hash-miss placeholder for whichever
+        // call occupies the hashed slot; the surrounding message shape
+        // must still parse as a real FinalConfirmation, not NonStandard.
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let result = exchange
+            .parse_message("<...> YS/WE9G RR73")
+            .expect("must parse, not error");
+        assert!(matches!(result, MessageType::FinalConfirmation { .. }));
+    }
+
+    #[test]
+    fn parse_message_routes_compound_call_cq_response_no_hash_needed() {
+        // The exact 58-bit compound form ("YS/WE9G") was already accepted
+        // by the pre-existing [A-Z0-9/]+ character class -- this is a
+        // baseline sanity check that the CALL_TOKEN change didn't disturb
+        // the non-hash path.
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let result = exchange
+            .parse_message("YS/WE9G K5ARH EM10")
+            .expect("must parse");
+        match result {
+            MessageType::CqResponse {
+                calling_station,
+                responding_station,
+                grid,
+            } => {
+                assert_eq!(calling_station, "YS/WE9G");
+                assert_eq!(responding_station, "K5ARH");
+                assert_eq!(grid, Some("EM10".to_string()));
+            }
+            other => panic!("expected CqResponse, got {:?}", other),
+        }
     }
 }

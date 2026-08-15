@@ -92,6 +92,75 @@ fn stuck_hopped_offset(current: f64) -> f64 {
     .clamp(TX_OFFSET_MIN_HZ, TX_OFFSET_MAX_HZ)
 }
 
+/// PAN-17: is `callsign` representable in *any* FT8 wire format the encoder
+/// supports? Mirrors `pancetta_ft8::encoder`'s i3=4 nonstandard-callsign
+/// "exact" field constraint (a 58-bit base-38 pack: at most 11 characters
+/// from `" 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/"`) without pulling in a
+/// runtime dependency on pancetta-ft8 (which pancetta-qso only depends on
+/// optionally, for the `sim-hifi` harness). `pack28`'s standard-callsign
+/// charset is a strict subset of this one, so a callsign failing this check
+/// cannot be encoded by EITHER path — it genuinely can never be
+/// transmitted, which is what lets [`QsoManager::check_timeouts_at`] retire
+/// a QSO stuck on one immediately instead of waiting on the generic
+/// timeout/watchdog timers (see the PAN-17 check there for why).
+fn callsign_is_wire_representable(callsign: &str) -> bool {
+    const HASH_CALL_CHARSET: &str = " 0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ/";
+    let upper = callsign.to_ascii_uppercase();
+    upper.len() <= 11 && upper.chars().all(|c| HASH_CALL_CHARSET.contains(c))
+}
+
+/// PAN-17 round 3 (Codex re-review of #248, finding 1): is `callsign`
+/// *plausibly* representable via `pack28` (the i3=1 standard path — the
+/// ONLY path that can carry a numeric report/ack; the i3=4 nonstandard-
+/// callsign path's 2-bit report field only has room for
+/// blank/RRR/RR73/73, never a real dB value — see
+/// `pancetta_ft8::encoder::try_encode_nonstandard`'s doc)?
+///
+/// A loose mirror of `pack28`'s real acceptance shape — length 3-6 after
+/// stripping a bare `/P` or `/R` suffix, and no OTHER `/` component —
+/// without depending on pancetta-ft8 at runtime (see
+/// `callsign_is_wire_representable`'s doc for why pancetta-qso can't call
+/// `pack28` directly). Deliberately conservative in the SAFE direction:
+/// this can return `true` for a callsign that would actually fail
+/// `pack28`'s finer digit-position rules (e.g. `"8G81PA"` — 6 chars, no
+/// other `/`, but position 3 is a digit where `pack28` requires a letter)
+/// — an accepted false positive: it only costs speed (the QSO falls back
+/// to the slower pre-existing generic timeout instead of this fast
+/// watchdog check), never wrongly retires a QSO with a genuinely standard
+/// callsign. It must NEVER return `false` for a callsign `pack28` would
+/// actually accept.
+fn callsign_is_plausibly_pack28_standard(callsign: &str) -> bool {
+    let upper = callsign.to_ascii_uppercase();
+    let base = upper
+        .strip_suffix("/P")
+        .or_else(|| upper.strip_suffix("/R"))
+        .unwrap_or(upper.as_str());
+    // Any OTHER '/' (a compound prefix, or a portable suffix other than a
+    // bare /P or /R — pack28's ONLY two special-cased suffixes) is
+    // definitely not pack28-representable.
+    !base.contains('/') && (3..=6).contains(&base.len())
+}
+
+/// PAN-17 round 3 (Codex re-review of #248, finding 1): the DX callsign a
+/// QSO's outgoing message would embed, ONLY for the rungs whose associated
+/// message is a genuine numeric dB report/ack (`SignalReport`/`ReportAck`)
+/// — never just a token (RRR/RR73/73) or a droppable grid. `None` for every
+/// other state (nothing report-shaped to check).
+///
+/// `SendingReport`/`WaitingForReport` always transmit or re-send our own
+/// numeric `SignalReport`; `WaitingForConfirmation` re-sends our numeric
+/// `ReportAck` (`R±NN`) if the DX repeats their report. `SendingConfirmation`
+/// is deliberately excluded — it only ever sends RR73/73, both representable
+/// via i3=4 regardless of callsign shape.
+fn report_stage_partner_callsign(state: &QsoState) -> Option<&str> {
+    match state {
+        QsoState::SendingReport { their_callsign, .. }
+        | QsoState::WaitingForReport { their_callsign, .. }
+        | QsoState::WaitingForConfirmation { their_callsign, .. } => Some(their_callsign.as_str()),
+        _ => None,
+    }
+}
+
 /// Pick an audio offset in `[lo, hi]` deterministically from `seed` (e.g. a
 /// callsign), spreading distinct seeds across the region so concurrent Hound
 /// QSOs don't stack on one offset. Deterministic: same seed → same offset.
@@ -4924,14 +4993,6 @@ impl QsoManager {
         let mut timeouts = Vec::new();
 
         for (&qso_id, progress) in qsos.iter_mut() {
-            // Repetitive-TX watchdog (operator request): if a QSO has sat in the
-            // same active TX state — i.e. we've been re-sending the SAME message
-            // without the DX advancing us — longer than repetitive_tx_timeout_secs,
-            // retire it. Applies to BOTH manual and auto QSOs and is checked first
-            // so it bounds "stuck sending the same thing" even while the manual
-            // keep-call watchdog (below) would otherwise keep re-arming. A forward
-            // state advance resets the state's `started_at`, so a healthy,
-            // progressing QSO never trips this.
             let active_tx_state = matches!(
                 progress.state,
                 QsoState::CallingCq { .. }
@@ -4941,6 +5002,113 @@ impl QsoManager {
                     | QsoState::WaitingForConfirmation { .. }
                     | QsoState::SendingConfirmation { .. }
             );
+
+            // PAN-17: an outbound message that embeds a callsign the FT8
+            // encoder can never represent (neither pack28's fixed 6-char
+            // scheme nor the i3=4 nonstandard-callsign hash/58-bit path —
+            // see `callsign_is_wire_representable`) would otherwise re-arm
+            // and silently fail to transmit every slot for the full
+            // watchdog window before self-retiring as a plain Timeout,
+            // indistinguishable from "the DX never answered" (the live
+            // incident this ticket fixes). Encoding is a pure function of
+            // the callsign text, so there is nothing to gain by waiting or
+            // retrying — retire on the first watchdog pass that observes
+            // it, with a reason distinct from Timeout so the operator sees
+            // "cannot transmit this message" rather than a bogus no-reply.
+            //
+            // Round 2 (Codex review #248, finding 4): checks BOTH sides of
+            // the exchange, not just the DX's. Every directed frame also
+            // embeds `config.our_callsign` — `StationConfig` permits an
+            // arbitrarily long compound call there with no length cap, so a
+            // misconfigured `our_callsign` (e.g. `VK9/W1XYZ/MM`, >11 chars)
+            // would otherwise leave every QSO against a perfectly normal DX
+            // stuck on the generic timeout — the exact PAN-17 symptom just
+            // moved to the other callsign.
+            //
+            // Round 3 (Codex re-review, finding 1): ALSO fast-fails a
+            // report-bearing rung (SendingReport / WaitingForReport /
+            // WaitingForConfirmation — see `report_stage_partner_callsign`)
+            // whose partner isn't plausibly pack28-standard
+            // (`callsign_is_plausibly_pack28_standard`), even though the
+            // partner's callsign passes the plain wire-representability
+            // check above (fits the i3=4 hash field fine). The round-1
+            // encoder fix (`pancetta_ft8::encoder::try_encode_nonstandard`'s
+            // doc) makes a numeric report/ack to such a partner fail
+            // LOUDLY rather than silently blanking — correct — but nothing
+            // stopped the QSO from re-arming that exact doomed encode every
+            // slot once it reached this rung, which is the original PAN-17
+            // "burns the watchdog window retrying an unencodable message"
+            // symptom relocated to the report stage.
+            //
+            // Round 2 deliberately omitted this check because a naive
+            // version (keyed on `metadata.their_callsign`, the "most
+            // complete form ever seen") falsely retired healthy QSOs in
+            // `adversarial_compound_calls.rs`'s compound-then-base
+            // scenarios. That risk doesn't apply here: `report_stage_
+            // partner_callsign` reads the STATE's own `their_callsign`
+            // field, which is exactly the value `MessageExchange::
+            // generate_response` embeds in the real outgoing
+            // SignalReport/ReportAck (`to_station`/`from_station` come
+            // straight from this same field — see exchange.rs) — so this
+            // check fires if and only if the message the QSO is actually
+            // about to (re-)send is genuinely unencodable, not on a
+            // heuristic guess. `compound_first_then_base_completes` and
+            // `cqer_caller_compound_then_base_completes` were updated to
+            // assert the (now correct) fast MessageUnencodable retirement
+            // — those scenarios need a real numeric report addressed to a
+            // compound-form callsign, which round 1's encoder fix already
+            // made impossible over real FT8; the tests just never
+            // exercised the real encoder before, so they didn't notice.
+            if active_tx_state {
+                let our = self.config.our_callsign.as_str();
+                let their = progress.metadata.their_callsign.as_deref();
+
+                let unencodable_reason = if !callsign_is_wire_representable(our) {
+                    Some(format!(
+                        "our configured callsign '{}' cannot be represented in any FT8 message format",
+                        our
+                    ))
+                } else if let Some(their) = their {
+                    if !callsign_is_wire_representable(their) {
+                        Some(format!(
+                            "callsign '{}' cannot be represented in any FT8 message format",
+                            their
+                        ))
+                    } else if let Some(report_partner) =
+                        report_stage_partner_callsign(&progress.state)
+                    {
+                        if !callsign_is_plausibly_pack28_standard(report_partner)
+                            || !callsign_is_plausibly_pack28_standard(our)
+                        {
+                            Some(format!(
+                                "cannot send a numeric report/ack to '{}' — i3=4 (required \
+                                 because a compound callsign is involved) has no field for one",
+                                report_partner
+                            ))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                if let Some(reason) = unencodable_reason {
+                    timeouts.push((qso_id, QsoFailureReason::MessageUnencodable(reason)));
+                    continue;
+                }
+            }
+
+            // Repetitive-TX watchdog (operator request): if a QSO has sat in the
+            // same active TX state — i.e. we've been re-sending the SAME message
+            // without the DX advancing us — longer than repetitive_tx_timeout_secs,
+            // retire it. Applies to BOTH manual and auto QSOs and is checked first
+            // (of the time-based watchdogs) so it bounds "stuck sending the same
+            // thing" even while the manual keep-call watchdog (below) would
+            // otherwise keep re-arming. A forward state advance resets the
+            // state's `started_at`, so a healthy, progressing QSO never trips this.
             if active_tx_state {
                 if let Some(dur) = progress.state.state_duration(now) {
                     if dur.num_seconds() > self.config.timeouts.repetitive_tx_timeout_secs as i64 {
@@ -5084,7 +5252,9 @@ impl QsoManager {
                 // previously never emitted QsoFailed, so the coordinator's
                 // priority-scoring failure backoff (`record_failure`) never
                 // fired for a timed-out QSO. `reason` here is
-                // QsoFailureReason::Timeout for every push site above.
+                // QsoFailureReason::Timeout for every timing-based push site
+                // above, or QsoFailureReason::MessageUnencodable for the
+                // PAN-17 unencodable-callsign check.
                 self.emit_event(QsoEvent::QsoFailed {
                     qso_id,
                     reason,
@@ -6125,6 +6295,556 @@ mod tests {
             manager.get_qso(qso_id).await,
             Err(QsoManagerError::QsoNotFound { .. })
         ));
+    }
+
+    /// PAN-17: a QSO whose DX callsign can never be encoded onto the FT8
+    /// wire (here, the decoder's own hash-miss placeholder `<...>` leaking
+    /// into the partner field — invalid characters, not just "long") must
+    /// be retired on the very first watchdog pass, with a reason distinct
+    /// from `Timeout`, instead of consuming the full manual-call watchdog
+    /// window re-arming an identical message that will never transmit.
+    #[tokio::test]
+    async fn unencodable_dx_callsign_retires_immediately_not_via_manual_watchdog() {
+        let mut config = test_config();
+        // Both generic watchdogs set very long, so a pass at PAN-17's
+        // near-immediate retirement can only be explained by the new check.
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+        let mut events = manager.subscribe();
+
+        let qso_id = manager
+            .respond_to_cq_manual("<...>".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        // A single watchdog pass, one second later, is enough.
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
+
+        let mut reason = None;
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::QsoFailed {
+                qso_id: id,
+                reason: r,
+                ..
+            } = ev
+            {
+                if id == qso_id {
+                    reason = Some(r);
+                }
+            }
+        }
+        assert!(
+            matches!(reason, Some(QsoFailureReason::MessageUnencodable(_))),
+            "expected MessageUnencodable, got {:?}",
+            reason
+        );
+    }
+
+    /// A genuinely encodable compound callsign (PAN-17's primary fix covers
+    /// this on the encoder side) must NOT be caught by the new fast-fail
+    /// watchdog — only callsigns that can never be represented on the wire
+    /// at all are retired early.
+    #[tokio::test]
+    async fn encodable_compound_callsign_is_not_retired_by_unencodable_watchdog() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("YS/WE9G".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(
+            manager.get_qso(qso_id).await.is_ok(),
+            "a genuinely encodable compound callsign must not be retired by the \
+             unencodable-message watchdog"
+        );
+    }
+
+    /// A callsign that's merely long-but-valid up to the 11-char hash-field
+    /// limit is representable; only exceeding it (or using an invalid
+    /// character) trips the new watchdog.
+    #[test]
+    fn callsign_is_wire_representable_boundary() {
+        assert!(callsign_is_wire_representable("K1ABC")); // plain standard
+        assert!(callsign_is_wire_representable("YS/WE9G")); // compound, fits
+        assert!(callsign_is_wire_representable("PJ4/KA1ABC")); // 10 chars, fits
+        assert!(callsign_is_wire_representable("ABCDEFGHIJK")); // exactly 11
+        assert!(!callsign_is_wire_representable("ABCDEFGHIJKL")); // 12: too long
+        assert!(!callsign_is_wire_representable("<...>")); // invalid chars
+    }
+
+    /// PAN-17 round 2 (Codex review #248, finding 4): the unencodable-
+    /// message watchdog only checked `their_callsign`. `StationConfig`
+    /// permits an arbitrarily long compound `our_callsign` with no length
+    /// cap, so a misconfigured station callsign would leave every QSO --
+    /// even against a perfectly normal, plain-callsign DX -- stuck
+    /// re-arming an unencodable TX until the slow generic timeout. Must
+    /// now retire fast too.
+    #[tokio::test]
+    async fn unencodable_our_callsign_retires_immediately() {
+        let mut config = test_config();
+        config.our_callsign = "VK9/W1XYZ/MM/EXTRA".to_string(); // >11 chars
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+        let mut events = manager.subscribe();
+
+        // The DX side is perfectly ordinary -- proves this is caught even
+        // when `their_callsign` alone would pass every existing check.
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
+
+        let mut reason = None;
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::QsoFailed {
+                qso_id: id,
+                reason: r,
+                ..
+            } = ev
+            {
+                if id == qso_id {
+                    reason = Some(r);
+                }
+            }
+        }
+        assert!(
+            matches!(reason, Some(QsoFailureReason::MessageUnencodable(_))),
+            "expected MessageUnencodable, got {:?}",
+            reason
+        );
+    }
+
+    #[test]
+    fn callsign_is_plausibly_pack28_standard_boundary() {
+        assert!(callsign_is_plausibly_pack28_standard("K1ABC"));
+        assert!(callsign_is_plausibly_pack28_standard("W1AW"));
+        assert!(callsign_is_plausibly_pack28_standard("K1ABC/P"));
+        assert!(callsign_is_plausibly_pack28_standard("K1ABC/R"));
+        // Accepted false positive (see the fn's doc): fails pack28's real
+        // digit-position rule but this loose check can't detect that.
+        assert!(callsign_is_plausibly_pack28_standard("8G81PA"));
+        // Unambiguously compound / not pack28-shaped.
+        assert!(!callsign_is_plausibly_pack28_standard("YS/WE9G"));
+        assert!(!callsign_is_plausibly_pack28_standard("EA8/G8BCG"));
+        assert!(!callsign_is_plausibly_pack28_standard("VP2/W1XYZ"));
+        assert!(!callsign_is_plausibly_pack28_standard("PJ4/KA1ABC"));
+        assert!(!callsign_is_plausibly_pack28_standard("3E40CDW")); // 7 chars
+        assert!(!callsign_is_plausibly_pack28_standard("AB")); // 2 chars
+    }
+
+    #[test]
+    fn report_stage_partner_callsign_extracts_from_report_bearing_states_only() {
+        let now = Utc::now();
+        assert_eq!(
+            report_stage_partner_callsign(&QsoState::SendingReport {
+                their_callsign: "YS/WE9G".to_string(),
+                their_report: None,
+                our_report: -10,
+                frequency: 14074000.0,
+                started_at: now,
+            }),
+            Some("YS/WE9G")
+        );
+        assert_eq!(
+            report_stage_partner_callsign(&QsoState::WaitingForReport {
+                their_callsign: "YS/WE9G".to_string(),
+                frequency: 14074000.0,
+                started_at: now,
+                their_grid: None,
+                our_report: -10,
+            }),
+            Some("YS/WE9G")
+        );
+        assert_eq!(
+            report_stage_partner_callsign(&QsoState::WaitingForConfirmation {
+                their_callsign: "YS/WE9G".to_string(),
+                their_report: -10,
+                our_report: -10,
+                frequency: 14074000.0,
+                grid_square: None,
+                started_at: now,
+            }),
+            Some("YS/WE9G")
+        );
+        // SendingConfirmation only ever sends RR73/73 (both representable
+        // via i3=4 regardless of callsign shape) -- deliberately excluded.
+        assert_eq!(
+            report_stage_partner_callsign(&QsoState::SendingConfirmation {
+                their_callsign: "YS/WE9G".to_string(),
+                their_report: -10,
+                our_report: -10,
+                frequency: 14074000.0,
+                grid_square: None,
+                started_at: now,
+            }),
+            None
+        );
+        assert_eq!(report_stage_partner_callsign(&QsoState::Idle), None);
+    }
+
+    /// PAN-17 round 3 (Codex re-review of #248, finding 3): a resolved i3=4
+    /// hash render ("<K1DEF>") must be normalized to the plain callsign
+    /// ("K1DEF") before it flows into latched QSO state -- otherwise the
+    /// still-bracketed literal self-sabotages via the unencodable-message
+    /// watchdog (`<`/`>` are outside the wire charset). Exercises the full
+    /// parse -> process_message -> latch path (the normalization itself
+    /// lives in `exchange.rs::normalize_callsign_token`; this proves it's
+    /// wired end-to-end into the QSO engine, not just unit-tested in
+    /// isolation).
+    #[tokio::test]
+    async fn resolved_hash_render_reply_latches_plain_callsign_not_bracketed() {
+        let mut config = test_config();
+        config.our_callsign = "YS/WE9G".to_string(); // compound operator
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        // K1DEF (a standard callsign) replies to our compound CQ; their own
+        // callsign lands in the i3=4 hash slot and, having resolved,
+        // decodes as "<K1DEF>" -- exactly the wire text
+        // `MessageExchange::parse_message` would receive from the decoder.
+        let raw_text = "YS/WE9G <K1DEF> EM10";
+        let parsed = crate::utils::parse_ft8_message(raw_text, "YS/WE9G").unwrap();
+        assert!(
+            matches!(&parsed, MessageType::CqResponse { responding_station, .. } if responding_station == "K1DEF"),
+            "parse_ft8_message must normalize the resolved hash render, got: {:?}",
+            parsed
+        );
+
+        manager
+            .process_message(parsed, raw_text.to_string(), 14074000.0, Some(-10.0))
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(&progress.state, QsoState::WaitingForReport { their_callsign, .. } if their_callsign == "K1DEF"),
+            "expected their_callsign latched as the plain 'K1DEF', got: {:?}",
+            progress.state
+        );
+
+        // The QSO has landed directly on a report-bearing rung
+        // (WaitingForReport) needing a numeric report addressed to OUR
+        // OWN compound callsign -- symmetric to finding 1, that
+        // genuinely cannot be encoded via real FT8 regardless of which
+        // side is compound, so round 3's report-stage check correctly
+        // retires it. What this test isolates is WHY: the failure reason
+        // must be the report-stage wording (proving K1DEF already passed
+        // the plain wire-representability check first) and must NOT
+        // mention invalid characters or contain the raw "<" / ">"
+        // brackets -- if normalization had NOT happened, the round-2
+        // wire-representability check (which runs BEFORE the round-3
+        // report-stage check) would have rejected "<K1DEF>" outright on
+        // its invalid characters instead.
+        let mut events = manager.subscribe();
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
+
+        let mut reason = None;
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::QsoFailed {
+                qso_id: id,
+                reason: r,
+                ..
+            } = ev
+            {
+                if id == qso_id {
+                    reason = Some(r);
+                }
+            }
+        }
+        match reason {
+            Some(QsoFailureReason::MessageUnencodable(detail)) => {
+                assert!(
+                    detail.contains("numeric report"),
+                    "expected the report-stage reason, got: {detail}"
+                );
+                assert!(
+                    !detail.contains('<') && !detail.contains('>'),
+                    "failure reason must reference the plain callsign, not a \
+                     bracketed hash render: {detail}"
+                );
+                assert!(
+                    detail.contains("K1DEF") && !detail.contains("<K1DEF>"),
+                    "failure reason must name the plain 'K1DEF', not '<K1DEF>': {detail}"
+                );
+            }
+            other => panic!("expected MessageUnencodable, got {:?}", other),
+        }
+    }
+
+    /// PAN-17 round 4 (Codex re-review of #248): "resolve first-time
+    /// callers before filtering type-4 replies."
+    ///
+    /// Investigated and determined to be an INHERENT i3=4 protocol
+    /// limitation, not a pancetta bug: a 12-bit hash is a one-way
+    /// compression of a callsign into 4096 buckets. Reversing it requires
+    /// having independently learned the plaintext from a standard-format
+    /// decode -- if a station's very first-ever transmission we've heard
+    /// (ever, on this band, this session) is itself an i3=4 reply that
+    /// puts them in the hash slot (structurally forced whenever the OTHER
+    /// party -- us -- is compound, since the pack28-failing callsign
+    /// always wins the exact slot), there are no other bits anywhere in
+    /// that 77-bit payload encoding their plaintext. Round 3's seeding
+    /// (`Ft8Decoder`'s per-window loop over every decoded
+    /// `MessageType::Standard`, `pancetta-ft8/src/decoder.rs`) already
+    /// seeds from ANY standard-format decode this station makes, whenever
+    /// and wherever heard, not just frames addressed to us -- there is no
+    /// earlier opportunity pancetta's code is failing to use; WSJT-X has
+    /// the identical limitation for the identical reason.
+    ///
+    /// What this test proves instead: the QSO-layer behavior for this
+    /// case is a clean, BOUNDED failure, not a hang or a silent full-
+    /// watchdog-window loop. `their_callsign` latches as the literal
+    /// unresolved placeholder `"<...>"` (`is_message_relevant`'s
+    /// `CallingCq`/`CqResponse` arm does not itself validate the sender's
+    /// identity, only that the response is addressed to us -- by design,
+    /// since at that point we don't yet know who will answer). The
+    /// EXISTING `callsign_is_wire_representable` watchdog check (PAN-17
+    /// round 2) then retires it on the very next pass: `"<...>"` contains
+    /// `<`/`.`/`>`, all outside the wire charset, so it can never be
+    /// transmitted regardless of report-bearing status.
+    #[tokio::test]
+    async fn genuinely_unresolvable_caller_hash_retires_fast_not_a_hang() {
+        let mut config = test_config();
+        config.our_callsign = "YS/WE9G".to_string(); // compound operator
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+        let mut events = manager.subscribe();
+
+        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        // A standard-callsign station replies to our compound CQ, but we
+        // (this decoder, this session) have NEVER heard their plaintext
+        // callsign in any standard-format frame before -- their hash
+        // genuinely cannot resolve. This is exactly what
+        // `MessageExchange::parse_message`/`normalize_callsign_token`
+        // hands the QSO engine for that case: the literal placeholder,
+        // left untouched (there is no real callsign to normalize it to).
+        let parsed = MessageType::CqResponse {
+            calling_station: "YS/WE9G".to_string(),
+            responding_station: "<...>".to_string(),
+            grid: Some("EM10".to_string()),
+        };
+
+        manager
+            .process_message(
+                parsed,
+                "YS/WE9G <...> EM10".to_string(),
+                14074000.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+
+        // The QSO advances and latches the unresolved placeholder -- relevance
+        // routing for a not-yet-partnered CallingCq QSO only verifies the
+        // response is addressed to us, not who the sender claims to be.
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(&progress.state, QsoState::WaitingForReport { their_callsign, .. } if their_callsign == "<...>"),
+            "expected their_callsign latched as the unresolved placeholder, got: {:?}",
+            progress.state
+        );
+
+        // The very next watchdog pass retires it -- bounded, fast, not a
+        // hang and not a full 5-minute silent loop.
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
+
+        let mut reason = None;
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::QsoFailed {
+                qso_id: id,
+                reason: r,
+                ..
+            } = ev
+            {
+                if id == qso_id {
+                    reason = Some(r);
+                }
+            }
+        }
+        assert!(
+            matches!(reason, Some(QsoFailureReason::MessageUnencodable(_))),
+            "expected a fast, distinct MessageUnencodable retirement, got {:?}",
+            reason
+        );
+    }
+
+    /// PAN-17 round 3 (Codex re-review of #248, finding 1): a QSO that
+    /// reaches a report-bearing rung (here, `SendingReport`) against a
+    /// still-compound partner must retire immediately with
+    /// `MessageUnencodable`, instead of re-arming an encode that
+    /// `try_encode_nonstandard` (pancetta-ft8) will always refuse — the
+    /// original PAN-17 symptom relocated to the report stage. `YS/WE9G`
+    /// alone passes `callsign_is_wire_representable` (it fits the 58-bit
+    /// hash field fine), so this specifically exercises the NEW
+    /// report-stage check, not the pre-existing wire-representability one.
+    #[tokio::test]
+    async fn report_stage_watchdog_retires_compound_partner() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("YS/WE9G".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            progress.state = QsoState::SendingReport {
+                their_callsign: "YS/WE9G".to_string(),
+                their_report: Some(-10),
+                our_report: -10,
+                frequency: 14074000.0,
+                started_at: start,
+            };
+        }
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(
+            matches!(
+                manager.get_qso(qso_id).await,
+                Err(QsoManagerError::QsoNotFound { .. })
+            ),
+            "a report-bearing rung against a compound-callsign partner must retire fast"
+        );
+    }
+
+    /// The report-stage watchdog must NOT trip for a perfectly ordinary
+    /// standard-callsign partner at the same rung -- no false positives.
+    #[tokio::test]
+    async fn report_stage_watchdog_does_not_retire_standard_partner() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            progress.state = QsoState::SendingReport {
+                their_callsign: "K1DEF".to_string(),
+                their_report: Some(-10),
+                our_report: -10,
+                frequency: 14074000.0,
+                started_at: start,
+            };
+        }
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(
+            manager.get_qso(qso_id).await.is_ok(),
+            "a report-bearing rung against a standard-callsign partner must NOT retire early"
+        );
+    }
+
+    /// A bare `/P` or `/R` suffix is genuinely pack28-representable (the
+    /// ONLY two suffixes `pack28` special-cases) -- the report-stage
+    /// watchdog must not treat it as unencodable. Regression guard for
+    /// `adversarial_compound_calls.rs::base_first_then_portable_suffix_completes`.
+    #[tokio::test]
+    async fn report_stage_watchdog_does_not_retire_portable_suffix_partner() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("G8BCG/P".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            progress.state = QsoState::SendingReport {
+                their_callsign: "G8BCG/P".to_string(),
+                their_report: Some(-5),
+                our_report: -5,
+                frequency: 14074000.0,
+                started_at: start,
+            };
+        }
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(
+            manager.get_qso(qso_id).await.is_ok(),
+            "a /P-suffix partner is pack28-representable and must NOT retire early"
+        );
     }
 
     /// Repetitive-TX watchdog: a QSO stuck in the same active TX state (we keep

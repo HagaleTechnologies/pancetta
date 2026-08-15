@@ -92,10 +92,38 @@ pub fn callsigns_match(a: &str, b: &str) -> bool {
         // side into matching a real station.
         return au == bu;
     }
+
+    // PAN-17 round 2 (Codex review #248, finding 2): an i3=4 nonstandard-
+    // callsign message represents ONE of its two callsigns as a resolved
+    // 12-bit hash render, "<K5ARH>" (see `Ft8Message`'s Display impl,
+    // pancetta-ft8/src/message.rs) — resolve it and compare like any other
+    // callsign. The UNRESOLVED hash-miss placeholder "<...>" carries no
+    // identity information at all (any station's hash could have produced
+    // it): it must never match anything, including another "<...>" —
+    // treating "unknown" as "definitely this station" would let unrelated
+    // traffic spoof as whichever partner/our-call is being checked.
+    let (Some(au), Some(bu)) = (resolve_hash_render(&au), resolve_hash_render(&bu)) else {
+        return false;
+    };
+
     if au == bu {
         return true;
     }
-    base_callsign(&au) == base_callsign(&bu)
+    base_callsign(au) == base_callsign(bu)
+}
+
+/// Resolve an i3=4 hash-render token to the plain callsign it represents,
+/// for [`callsigns_match`]. Returns the input unchanged for a normal
+/// (non-bracketed) callsign, `Some(inner)` for a resolved render
+/// (`"<K5ARH>"` -> `"K5ARH"`), and `None` for the unresolved hash-miss
+/// placeholder `"<...>"` (or any other bracketed form that isn't a real
+/// resolved callsign) — callers must treat `None` as "cannot match".
+fn resolve_hash_render(call: &str) -> Option<&str> {
+    match call.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
+        Some(inner) if inner.is_empty() || inner.bytes().all(|b| b == b'.') => None,
+        Some(inner) => Some(inner),
+        None => Some(call),
+    }
 }
 
 #[cfg(test)]
@@ -165,5 +193,33 @@ mod tests {
         assert!(!callsigns_match("", "G8BCG"));
         assert!(!callsigns_match("G8BCG", ""));
         assert!(callsigns_match("", ""));
+    }
+
+    // --- PAN-17 round 2: i3=4 hash-render matching -----------------------
+
+    #[test]
+    fn callsigns_match_resolved_hash_render() {
+        // "<K5ARH>" is how Ft8Message renders a RESOLVED 12-bit hash --
+        // exactly as trustworthy as any other decoded callsign.
+        assert!(callsigns_match("<K5ARH>", "K5ARH"));
+        assert!(callsigns_match("K5ARH", "<K5ARH>"), "must be symmetric");
+        assert!(callsigns_match("<k5arh>", "K5ARH"), "case-insensitive");
+        // Compound equivalence still applies through the resolved render.
+        assert!(callsigns_match("<G8BCG>", "EA8/G8BCG"));
+    }
+
+    #[test]
+    fn callsigns_match_rejects_unresolved_hash_placeholder() {
+        // "<...>" carries no identity information -- must never match
+        // anything, including a real callsign, our own callsign, or
+        // another "<...>".
+        assert!(!callsigns_match("<...>", "K5ARH"));
+        assert!(!callsigns_match("K5ARH", "<...>"));
+        assert!(!callsigns_match("<...>", "<...>"));
+    }
+
+    #[test]
+    fn callsigns_match_hash_render_rejects_wrong_station() {
+        assert!(!callsigns_match("<K5ARH>", "K5ARG"));
     }
 }

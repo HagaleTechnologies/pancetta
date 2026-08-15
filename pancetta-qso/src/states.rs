@@ -179,6 +179,20 @@ pub enum QsoFailureReason {
     /// means the QSO engine's own task died) so the Recent-QSOs panel misattributes
     /// neither as a Timeout.
     ComponentCrash(String),
+
+    /// PAN-17: the DX's callsign (or, defensively, our own) cannot be
+    /// represented in any FT8 wire format the encoder supports -- neither
+    /// `pack28` (the fixed 6-char standard scheme) nor the i3=4
+    /// nonstandard-callsign hash/58-bit path (>11 chars, or a character
+    /// outside the hash-callsign charset -- e.g. the decoder's own
+    /// `<...>` hash-miss placeholder leaking into a QSO's partner field).
+    /// The payload is a short human-readable detail (the offending
+    /// callsign). Distinct from `Timeout` ("the DX never answered") --
+    /// this QSO can never transmit anything at all, so the watchdog
+    /// retires it immediately instead of re-arming the identical
+    /// unencodable message for the full manual-call-watchdog window (see
+    /// `QsoManager::check_timeouts_at`).
+    MessageUnencodable(String),
 }
 
 /// Why the QSO engine refused a decoded frame on sender-verification grounds.

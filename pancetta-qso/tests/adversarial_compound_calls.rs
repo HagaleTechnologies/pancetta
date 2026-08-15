@@ -18,7 +18,7 @@
 //! Run: `cargo test -p pancetta-qso --test adversarial_compound_calls`.
 
 use pancetta_qso::sim::Sim;
-use pancetta_qso::{base_callsign, callsigns_match};
+use pancetta_qso::{base_callsign, callsigns_match, QsoFailureReason};
 
 const US: &str = "K5ARH";
 const GRID: &str = "EM10";
@@ -29,12 +29,31 @@ async fn sim() -> Sim {
 }
 
 // =====================================================================
-// 1. POSITIVE — compound FIRST, then bare base mid-QSO.
-//    We call EA8/G8BCG; the DX opens as EA8/G8BCG, then sends its report and
-//    RR73 as the bare base G8BCG. The QSO must complete as ONE QSO, no stall.
+// 1. compound FIRST, then bare base mid-QSO, reaching a report-bearing rung.
+//
+//    PAN-17 round 3 (Codex re-review of PR #248, finding 1): this scenario
+//    used to assert the QSO COMPLETED, logged under the compound form
+//    "EA8/G8BCG" — but that was never actually verified against the real
+//    FT8 wire format. `MessageExchange::generate_response`'s
+//    (RespondingToCq, CqResponse) arm addresses the outgoing SignalReport
+//    using the LATCHED `target_callsign` ("EA8/G8BCG", compound), and the
+//    real encoder (`pancetta_ft8::encoder::try_encode_nonstandard`, PAN-17
+//    round 2) correctly REFUSES to send a numeric report to a compound-form
+//    callsign — there's no bit budget for one once i3=4 is required. So this
+//    exchange was never actually completable over real FT8; the sim harness
+//    just never exercised the real encoder, so it didn't notice. The QSO
+//    now correctly fails FAST (round 3's report-stage watchdog check,
+//    `report_stage_partner_callsign` / `callsign_is_plausibly_pack28_
+//    standard` in qso_manager.rs) instead of either completing on a lie or
+//    silently spinning to the generic timeout. The C18 compound↔base
+//    equivalence itself is still exercised and still holds — the DX's
+//    later bare-base frames still match the latched compound partner and
+//    keep advancing the SAME QSO right up to the point where a real report
+//    is needed; this test's original regression guard (no duplicate QSO
+//    spawned by the compound↔base switch) is unchanged.
 // =====================================================================
 #[tokio::test]
-async fn compound_first_then_base_completes() {
+async fn compound_first_then_base_reaches_report_stage_then_fails_fast() {
     let mut sim = sim().await;
 
     // Slot 0: DX is CQing as a compound (prefix-portable) call; we call them.
@@ -42,26 +61,32 @@ async fn compound_first_then_base_completes() {
     sim.call_station("EA8/G8BCG", FREQ).await;
     sim.tick().await; // we send our grid: "EA8/G8BCG K5ARH EM10"
 
-    // Slot 1: DX returns our call as the compound, no report yet — we step to
-    // sending our report (stuck-at-grid arm).
+    // Slot 1: DX returns our call as the compound, no report yet — the
+    // stuck-at-grid arm steps us toward sending our report, which is
+    // exactly the report-bearing rung that can't be encoded for a
+    // still-compound partner. The watchdog retires the QSO here.
     sim.inject_decode("K5ARH EA8/G8BCG", FREQ, -9.0, 0.1);
     sim.tick().await;
 
-    // Slot 2: DX now signs with the BARE BASE call and sends our report. This is
-    // the C18 case: from = G8BCG, but our latched partner is EA8/G8BCG. Must
-    // still match and advance.
+    // Slot 2: DX signs with the BARE BASE call — arrives too late, the QSO
+    // already retired. (Kept to document that this frame is what a real
+    // DX might still send; it's simply moot once the QSO is gone.)
     sim.inject_decode("K5ARH G8BCG -11", FREQ, -9.0, 0.1);
     sim.tick().await;
 
-    // Slot 3: DX closes with RR73, still as the bare base.
-    sim.inject_decode("K5ARH G8BCG RR73", FREQ, -9.0, 0.1);
-    sim.tick().await;
-
     let tl = sim.into_timeline();
-    // The QSO completed — and is logged under the MOST-COMPLETE form seen
-    // (the compound carries DX info; we never downgrade to the bare base).
-    tl.assert_completed_with("EA8/G8BCG");
+    tl.assert_not_completed_with("EA8/G8BCG");
     tl.assert_not_completed_with("G8BCG");
+    assert!(
+        tl.failures
+            .iter()
+            .any(|f| matches!(f.reason, QsoFailureReason::MessageUnencodable(_))),
+        "expected a MessageUnencodable failure once the QSO reached the \
+         report-bearing rung against a still-compound partner.\n{tl}"
+    );
+    // No duplicate QSO was spawned by the compound↔base switch before the
+    // report-stage watchdog fired — the original regression this test
+    // guards against.
     tl.assert_no_duplicate_qsos();
 }
 
@@ -99,31 +124,44 @@ async fn base_first_then_portable_suffix_completes() {
 }
 
 // =====================================================================
-// 3. POSITIVE (CQer flow) — we CQ; a station answers as a compound, then
-//    rogers as the bare base. One QSO, completes.
+// 3. (CQer flow) — we CQ; a station answers as a compound, reaching a
+//    report-bearing rung addressed to that compound form.
+//
+//    PAN-17 round 3 (Codex re-review of PR #248, finding 1): same
+//    reasoning as scenario 1 above. `generate_response`'s
+//    `(CallingCq, CqResponse)` arm addresses our reply using the
+//    responder's own compound callsign directly ("VP2/W1XYZ") — a real
+//    numeric SignalReport to a compound-form callsign, which
+//    `try_encode_nonstandard` correctly refuses to encode (no i3=4 report
+//    field). This was never actually completable over real FT8; the QSO
+//    now fails fast via the report-stage watchdog instead of completing
+//    on a lie or spinning to the generic timeout. This test's original
+//    regression guard — the DX's later bare-base frames would still match
+//    the latched compound partner, not spawn a duplicate QSO — is
+//    unaffected by how the QSO ultimately terminates.
 // =====================================================================
 #[tokio::test]
-async fn cqer_caller_compound_then_base_completes() {
+async fn cqer_caller_compound_reaches_report_stage_then_fails_fast() {
     let mut sim = sim().await;
 
     sim.cq(FREQ).await;
     sim.tick().await; // "CQ K5ARH EM10"
 
-    // A station answers our CQ as a compound (prefix-portable) call.
+    // A station answers our CQ as a compound (prefix-portable) call. We'd
+    // auto-send our report addressed to that compound form — the
+    // report-stage watchdog retires the QSO here instead.
     sim.inject_decode("K5ARH VP2/W1XYZ FK87", FREQ, -10.0, 0.1);
-    sim.tick().await; // we auto-send our report to the latched compound
-
-    // They roger our report as the BARE BASE call — must still match + advance.
-    sim.inject_decode("K5ARH W1XYZ R-09", FREQ, -10.0, 0.1);
-    sim.tick().await;
-
-    // They close as the bare base.
-    sim.inject_decode("K5ARH W1XYZ 73", FREQ, -10.0, 0.1);
     sim.tick().await;
 
     let tl = sim.into_timeline();
-    // Logged under the most-complete form (the opening compound).
-    tl.assert_completed_with("VP2/W1XYZ");
+    tl.assert_not_completed_with("VP2/W1XYZ");
+    assert!(
+        tl.failures
+            .iter()
+            .any(|f| matches!(f.reason, QsoFailureReason::MessageUnencodable(_))),
+        "expected a MessageUnencodable failure once the QSO reached the \
+         report-bearing rung against a compound-form partner.\n{tl}"
+    );
     tl.assert_no_duplicate_qsos();
 }
 

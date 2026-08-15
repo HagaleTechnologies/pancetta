@@ -62,6 +62,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- Compound-callsign QSOs (e.g. `YS/WE9G`, `8G81PA`, `3E40CDW`) now actually
+  complete instead of queuing and silently re-arming every slot for the full
+  5-minute watchdog window (PAN-17). The FT8 encoder gained an i3=4
+  nonstandard-callsign path (58-bit exact pack + 12-bit hash, mirroring the
+  decoder's existing i3=4 support) alongside the standard/free-text paths; a
+  grid square can't fit alongside a compound callsign (only 2 report bits —
+  blank/RRR/RR73/73), so it's dropped rather than failing the whole message,
+  while a numeric report/ack — which would otherwise silently become a
+  DIFFERENT, misleading message — now fails loudly instead. A
+  compound-callsign operator can call CQ with their own grid too. The
+  decode side now recognizes and routes a reply FROM a compound-callsign
+  station (previously TX-only: the message would key the radio but a reply
+  could never be decoded back into the QSO engine) — the decoder seeds its
+  i3=4 hash table both from our own callsign and from every standard-format
+  callsign it decodes (not just our own), so a compound-call DX's reply, or
+  a standard-callsign caller replying to a compound-callsign operator's own
+  CQ, resolves instead of rendering as the unrecoverable `<...>` placeholder;
+  a resolved hash render (`<CALL>`) is normalized to the plain callsign
+  before it flows into QSO state, so it can't self-sabotage the very
+  watchdog that checks callsign representability. A QSO that reaches a
+  report-bearing stage (a genuine numeric SignalReport/ReportAck, never
+  just RRR/RR73/73) against a still-compound partner now also retires
+  immediately instead of re-arming a doomed encode — the same PAN-17
+  symptom relocated to the report stage. Separately, a QSO whose DX or
+  configured OWN callsign can never be represented in any FT8 format
+  (invalid characters or >11 chars — e.g. the decoder's own `<...>`
+  hash-miss placeholder leaking into the partner field) is retired
+  immediately with a distinct "cannot transmit this message" reason instead
+  of being indistinguishable from a plain DX-never-answered timeout. This
+  also covers a compound-callsign station's caller whose plaintext
+  callsign we've never otherwise heard: their hash genuinely cannot
+  resolve (an inherent i3=4 protocol limitation, matching WSJT-X — not a
+  pancetta gap; see `docs/DECISIONS/qso-engine.md`'s "Round 4" note), and
+  now retires cleanly on the next watchdog pass instead of hanging.
+
 - A station calling our CQ while it already has a separate, established active QSO with us (e.g. we just called their CQ and are awaiting their report) no longer opens a second, parallel QSO object for that same station. Message routing previously let a `CallingCq` QSO's "any station" relevance arms accept a frame that also belonged to the other QSO, producing two independently-cadenced active QSOs for one real station — each keying its own TX, which could put two frames on the air for the same station in one TX window (PAN-14). Two follow-on gaps in the same routing path, found in code review, are closed alongside it: (1) two still-unpartnered `CallingCq` QSOs (from repeated `c` presses, or Fox mode engaging while a CQ is already live) could both claim the same reply — now only the earliest-created CQ advances; (2) a station whose QSO with us just completed could be immediately re-claimed by an unrelated `CallingCq` QSO on a stray/duplicate frame — now reserved for `COMPLETED_QSO_REWORK_GRACE` (45 s), mirroring the existing active-or-recently-completed pattern used elsewhere.
 - FT8's unresolved-hashed-callsign placeholder `"<...>"` (an i3=4 nonstandard-callsign
   frame whose 12-bit hash has no local hash-table entry) no longer appears as a

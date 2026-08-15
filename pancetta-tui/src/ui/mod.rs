@@ -1558,7 +1558,10 @@ fn recent_qso_failure_color(reason: &pancetta_qso::QsoFailureReason) -> Color {
         | R::StationQrt
         | R::SupervisorRestart
         | R::ComponentCrash(_) => Color::Yellow,
-        R::InvalidCallsign | R::FrequencyConflict | R::ProtocolError(_) => Color::Red,
+        R::InvalidCallsign
+        | R::FrequencyConflict
+        | R::ProtocolError(_)
+        | R::MessageUnencodable(_) => Color::Red,
         R::Duplicate | R::UserCancelled | R::Superseded => Color::Gray,
     }
 }
