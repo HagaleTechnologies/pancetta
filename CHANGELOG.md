@@ -32,6 +32,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- A station calling our CQ while it already has a separate, established active QSO with us (e.g. we just called their CQ and are awaiting their report) no longer opens a second, parallel QSO object for that same station. Message routing previously let a `CallingCq` QSO's "any station" relevance arms accept a frame that also belonged to the other QSO, producing two independently-cadenced active QSOs for one real station — each keying its own TX, which could put two frames on the air for the same station in one TX window (PAN-14).
 - Manual split-TX QSOs whose offset was held, collision-nudged, or passband-clamped now recover after two consistent DX replies at a new frequency without moving the station's chosen TX offset ([#245](https://github.com/HagaleTechnologies/pancetta/issues/245)). Genuine Hound/Fox behavior is unchanged.
 
 - Decode-pipeline crashes now recover automatically: the coordinator restarts DSP and FT8 decoder

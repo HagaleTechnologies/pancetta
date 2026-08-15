@@ -3613,6 +3613,33 @@ impl QsoManager {
         let mut rejections = Vec::new();
         {
             let qsos = self.qsos.read().await;
+
+            // PAN-14 / SM-F7 (docs/qso-tx-deep-review-2026-07-18.md §A.3):
+            // a station that already has an ESTABLISHED active QSO (i.e. its
+            // `their_callsign` is latched — every state past CallingCq/Idle)
+            // must not ALSO be accepted as a fresh answerer by an UNRELATED
+            // CallingCq QSO's "any station" relevance arms. Without this, the
+            // same decoded frame (e.g. that station's report of us) can
+            // independently satisfy both QSOs' relevance arms —
+            // `find_qsos_for_message` then advances BOTH, producing two
+            // simultaneously-active QSO objects partnered with the same
+            // real-world station. Each generates its own TX cadence
+            // (possibly at a different audio offset), which is the "two
+            // very-high-amplitude signals for one station in one TX window"
+            // failure mode — see AGENTS.md "at most one QSO object exists
+            // per (callsign, band)". Computed once per incoming message
+            // (not per-QSO) since it doesn't depend on the candidate QSO.
+            let sender_has_other_active_partner =
+                message_type.sender_callsign().is_some_and(|sender| {
+                    qsos.values().any(|p| {
+                        p.state.is_active()
+                            && p.metadata
+                                .their_callsign
+                                .as_deref()
+                                .is_some_and(|c| crate::exchange::callsigns_match(c, sender))
+                    })
+                });
+
             for (&qso_id, progress) in qsos.iter() {
                 if !progress.state.is_active() {
                     continue;
@@ -3623,6 +3650,7 @@ impl QsoManager {
                     &progress.metadata,
                     message_type,
                     frequency,
+                    sender_has_other_active_partner,
                 );
                 if verdict.relevant {
                     matching_qsos.push(qso_id);
@@ -3662,8 +3690,15 @@ impl QsoManager {
         metadata: &QsoMetadata,
         message_type: &MessageType,
         frequency: f64,
+        sender_has_other_active_partner: bool,
     ) -> Relevance {
-        let relevant = self.is_message_relevant(state, metadata, message_type, frequency);
+        let relevant = self.is_message_relevant(
+            state,
+            metadata,
+            message_type,
+            frequency,
+            sender_has_other_active_partner,
+        );
         if relevant {
             return Relevance {
                 relevant: true,
@@ -3776,6 +3811,7 @@ impl QsoManager {
         metadata: &QsoMetadata,
         message_type: &MessageType,
         frequency: f64,
+        sender_has_other_active_partner: bool,
     ) -> bool {
         // Frequency tolerance tightened from 50 Hz → 15 Hz to reduce
         // cross-QSO message bleed-through in multi-QSO mode. FT8 frame-to-
@@ -3802,20 +3838,26 @@ impl QsoManager {
         let matched = match (state, message_type) {
             // We're calling CQ. The responder's callsign is whoever is in the
             // `responding_station` field; the message must be addressed to us.
+            // PAN-14/SM-F7: a CallingCq QSO has no established partner yet,
+            // so it would otherwise accept a frame from ANY station — even
+            // one that already has a different, established active QSO with
+            // us. Excluding that case here stops the same real station from
+            // becoming the partner of two simultaneously-active QSO objects.
             (
                 QsoState::CallingCq { .. },
                 MessageType::CqResponse {
                     calling_station, ..
                 },
-            ) => self.is_us(calling_station),
+            ) => self.is_us(calling_station) && !sender_has_other_active_partner,
 
             // A4 (routing half): a caller answered our CQ with a bare signal
             // report (grid skipped) — "<us> <them> -NN". Route it to this
             // CallingCq QSO so the transition arm can step CQ → report. Only
             // addressed-to-us reports qualify (any from_station, since we don't
-            // yet know who will answer).
+            // yet know who will answer) — UNLESS that from_station already has
+            // a different established active QSO (PAN-14/SM-F7, see above).
             (QsoState::CallingCq { .. }, MessageType::SignalReport { to_station, .. }) => {
-                self.is_us(to_station)
+                self.is_us(to_station) && !sender_has_other_active_partner
             }
 
             // CQer flow: we called CQ, the caller answered, and we sent our
@@ -6625,6 +6667,106 @@ mod tests {
         assert!(p.metadata.end_time.is_some());
     }
 
+    /// PAN-14: a single station must never end up as the partner of TWO
+    /// simultaneously-active QSO objects — that produces two independent
+    /// TX cadences (two different `qso_id`s, potentially two different
+    /// frequency offsets) for the SAME real-world station, which is exactly
+    /// the "two very-high-amplitude signals for one station in one TX
+    /// window" symptom reported on-air 2026-08-11.
+    ///
+    /// Reproduction (mirrors deep-review finding SM-F7,
+    /// docs/qso-tx-deep-review-2026-07-18.md §A.3): `find_qsos_for_message`
+    /// routes a message to EVERY active QSO whose `classify_relevance` arm
+    /// matches, and `process_message_with_parity` then advances ALL of
+    /// them independently. A `CallingCq` QSO's routing arms accept a
+    /// SignalReport/CqResponse from ANY station addressed to us (correct —
+    /// we don't yet know who will answer our CQ). But if we ALSO already
+    /// have a separate, already-partnered QSO with that exact station
+    /// (e.g. we just called their CQ and are `RespondingToCq`, waiting for
+    /// their report), and that station's report happens to land within the
+    /// CallingCq QSO's frequency gate, the SAME decoded frame satisfies
+    /// BOTH QSOs' relevance arms. Unlike the create-time paths
+    /// (`respond_to_cq_with`/`respond_to_caller`), this message-routing
+    /// path never calls `supersede_active_qsos_for` — nothing in
+    /// `find_qsos_for_message` excludes a station that already has an
+    /// active partner elsewhere. Both QSOs advance, and now K1DEF is the
+    /// active partner of two different `qso_id`s.
+    #[tokio::test]
+    async fn calling_cq_and_established_qso_both_accept_same_partners_frame() {
+        let manager = QsoManager::new(test_config());
+
+        // QSO A: we already called K1DEF's CQ (e.g. a manual/auto answer)
+        // and are RespondingToCq, waiting for K1DEF's own report of us.
+        // K1DEF's real TX frequency is 1500.0 Hz.
+        let qso_a = manager
+            .respond_to_cq_with(
+                "K1DEF".to_string(),
+                1500.0,
+                None,
+                CallInitiation::Manual,
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_a).await.unwrap().state,
+            QsoState::RespondingToCq { .. }
+        ));
+
+        // QSO B: completely independent — we are also running our own CQ
+        // loop, TXing at 1505.0 Hz (5 Hz from K1DEF's real frequency — well
+        // within the CallingCq arm's 15 Hz gate; a routine coincidence on a
+        // busy band, not an attacker-crafted collision).
+        let qso_b = manager.start_cq(1505.0, None, false).await.unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_b).await.unwrap().state,
+            QsoState::CallingCq { .. }
+        ));
+
+        // K1DEF sends their report of us, addressed to us, decoded at their
+        // real 1500.0 Hz frequency: "W1ABC K1DEF -09". This is EXACTLY the
+        // frame QSO A is waiting for (RespondingToCq + SignalReport{from
+        // K1DEF, to us}). It is ALSO, independently, a bare-report answer
+        // to QSO B's CQ (CallingCq + SignalReport{to us} — any from_station
+        // qualifies, since a CallingCq QSO doesn't know who will answer).
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -9,
+                },
+                "W1ABC K1DEF -09".to_string(),
+                1500.0,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+
+        let active = manager.get_active_qsos().await;
+        let k1def_partners: Vec<_> = active
+            .iter()
+            .filter(|(_, p)| p.metadata.their_callsign.as_deref() == Some("K1DEF"))
+            .collect();
+
+        // BUG (if reproduced): both qso_a and qso_b are active AND both are
+        // now partnered with K1DEF — two independent qso_ids that will each
+        // generate their own TX cadence for the same real station. The
+        // invariant is exactly one active QSO per (callsign, band) —
+        // AGENTS.md, "At most one QSO object exists per (callsign, band)".
+        assert_eq!(
+            k1def_partners.len(),
+            1,
+            "K1DEF must be the active partner of exactly ONE QSO object, not {}: {:#?}",
+            k1def_partners.len(),
+            k1def_partners
+                .iter()
+                .map(|(id, p)| (*id, p.state.clone()))
+                .collect::<Vec<_>>()
+        );
+    }
+
     /// Layer 2 timeline persistence (docs/observability-diagnostics-plan.md):
     /// the `QsoEvent::QsoCompleted` broadcast at the end of a real multi-step
     /// exchange must carry the QSO's ACTUAL state_history/messages, not the
@@ -7399,7 +7541,7 @@ mod sender_verification_tests {
         };
         // partner_freq = None → regression path (normal QSO behavior unchanged).
         let md = normal_metadata("K5ARH", 1500.0);
-        assert!(!manager.is_message_relevant(&state, &md, &spoof, 1500.0));
+        assert!(!manager.is_message_relevant(&state, &md, &spoof, 1500.0, false));
     }
 
     #[test]
@@ -7416,7 +7558,7 @@ mod sender_verification_tests {
             from_station: "NF4KE".into(),
             report: -12,
         };
-        let verdict = manager.classify_relevance(&state, &metadata, &impostor, 1500.0);
+        let verdict = manager.classify_relevance(&state, &metadata, &impostor, 1500.0, false);
         assert!(!verdict.relevant);
         assert_eq!(verdict.reason, Some(RejectionReason::SenderNotPartner));
 
@@ -7431,7 +7573,7 @@ mod sender_verification_tests {
                 report: -12,
             };
             let verdict =
-                manager.classify_relevance(&state, &metadata, &ordinary_traffic, frequency);
+                manager.classify_relevance(&state, &metadata, &ordinary_traffic, frequency, false);
             assert!(!verdict.relevant, "{description}");
             assert_eq!(verdict.reason, None, "{description} must stay silent");
         }
@@ -7471,7 +7613,7 @@ mod sender_verification_tests {
         };
         // partner_freq = None → regression path (normal QSO behavior unchanged).
         let md = normal_metadata("K5ARH", 1500.0);
-        assert!(manager.is_message_relevant(&state, &md, &legit, 1500.0));
+        assert!(manager.is_message_relevant(&state, &md, &legit, 1500.0, false));
     }
 
     #[test]
@@ -7496,9 +7638,9 @@ mod sender_verification_tests {
         // partner_freq = None → regression path (normal QSO behavior unchanged).
         let md = normal_metadata("K5ARH", 1500.0);
         // 16 Hz off, no partner latched yet → rejected (tight gate).
-        assert!(!manager.is_message_relevant(&state, &md, &legit, 1516.0));
+        assert!(!manager.is_message_relevant(&state, &md, &legit, 1516.0, false));
         // 14 Hz off → accepted.
-        assert!(manager.is_message_relevant(&state, &md, &legit, 1514.0));
+        assert!(manager.is_message_relevant(&state, &md, &legit, 1514.0, false));
     }
 
     #[test]
@@ -7524,11 +7666,11 @@ mod sender_verification_tests {
         // partner_freq = None → regression path (normal QSO behavior unchanged).
         let md = normal_metadata("K5ARH", 1500.0);
         // 16 Hz, 45 Hz, 100 Hz drift from an established partner → accepted.
-        assert!(manager.is_message_relevant(&state, &md, &legit, 1516.0));
-        assert!(manager.is_message_relevant(&state, &md, &legit, 1545.0));
-        assert!(manager.is_message_relevant(&state, &md, &legit, 1600.0));
+        assert!(manager.is_message_relevant(&state, &md, &legit, 1516.0, false));
+        assert!(manager.is_message_relevant(&state, &md, &legit, 1545.0, false));
+        assert!(manager.is_message_relevant(&state, &md, &legit, 1600.0, false));
         // Beyond the 100 Hz established bound → rejected (still bounded).
-        assert!(!manager.is_message_relevant(&state, &md, &legit, 1601.0));
+        assert!(!manager.is_message_relevant(&state, &md, &legit, 1601.0, false));
     }
 
     // ── Hound partner_freq routing ───────────────────────────────────────────
@@ -7559,23 +7701,23 @@ mod sender_verification_tests {
         // Frame at the Fox's offset (1800 Hz) — within ESTABLISHED tolerance.
         // The gate must match against partner_freq (1800), NOT our TX freq (600).
         assert!(
-            manager.is_message_relevant(&state, &md, &fox_report, 1800.0),
+            manager.is_message_relevant(&state, &md, &fox_report, 1800.0, false),
             "Hound: frame at Fox's offset must be relevant"
         );
         // Frame at 1810 Hz — still within 100 Hz ESTABLISHED bound of 1800.
         assert!(
-            manager.is_message_relevant(&state, &md, &fox_report, 1810.0),
+            manager.is_message_relevant(&state, &md, &fox_report, 1810.0, false),
             "Hound: frame 10 Hz from Fox's offset must be relevant (within established tolerance)"
         );
         // Frame at OUR TX offset (600 Hz) but far from the Fox's RX offset —
         // must be rejected because 600 Hz is not close to partner_freq 1800 Hz.
         assert!(
-            !manager.is_message_relevant(&state, &md, &fox_report, 600.0),
+            !manager.is_message_relevant(&state, &md, &fox_report, 600.0, false),
             "Hound: frame at our TX offset (far from Fox) must NOT be relevant"
         );
         // Frame beyond even the ESTABLISHED bound from partner_freq — rejected.
         assert!(
-            !manager.is_message_relevant(&state, &md, &fox_report, 1901.0),
+            !manager.is_message_relevant(&state, &md, &fox_report, 1901.0, false),
             "Hound: frame >100 Hz from Fox's offset must NOT be relevant"
         );
     }
@@ -7601,12 +7743,12 @@ mod sender_verification_tests {
         let md = normal_metadata("K5ARH", 1500.0);
         // Frame at the QSO frequency → relevant (unchanged from pre-Hound).
         assert!(
-            manager.is_message_relevant(&state, &md, &legit, 1500.0),
+            manager.is_message_relevant(&state, &md, &legit, 1500.0, false),
             "regression: frame at state.frequency must be relevant when partner_freq=None"
         );
         // Frame far from QSO frequency → not relevant (unchanged).
         assert!(
-            !manager.is_message_relevant(&state, &md, &legit, 2000.0),
+            !manager.is_message_relevant(&state, &md, &legit, 2000.0, false),
             "regression: frame far from state.frequency must NOT be relevant when partner_freq=None"
         );
     }
@@ -8275,8 +8417,20 @@ mod sender_verification_tests {
             .await;
 
         let progress = manager.get_qso(qso_id).await.unwrap();
-        assert!(manager.is_message_relevant(&progress.state, &progress.metadata, &report, 856.0));
-        assert!(!manager.is_message_relevant(&progress.state, &progress.metadata, &report, 2931.0));
+        assert!(manager.is_message_relevant(
+            &progress.state,
+            &progress.metadata,
+            &report,
+            856.0,
+            false
+        ));
+        assert!(!manager.is_message_relevant(
+            &progress.state,
+            &progress.metadata,
+            &report,
+            2931.0,
+            false
+        ));
     }
 
     /// A healthy held-offset QSO measures drift from partner_freq, not our TX.

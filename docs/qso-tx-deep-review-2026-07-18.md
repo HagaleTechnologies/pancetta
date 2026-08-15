@@ -336,7 +336,7 @@ actively repeats. Phase-5 extended only forward replies to Auto (1917-1928).
 Largest completion-rate loss for live autonomous operation.
 
 **SM-F7 — Message routing can fan one frame into multiple QSOs / pollute logs.
-CONFIRMED. MED.**
+CONFIRMED. MED. Partially FIXED 2026-08-14 (PAN-14).**
 `find_qsos_for_message` (2904) loops all active QSOs; default relevance arm
 `_ => message_type.is_addressed_to(our_callsign)` (3078-3081) routes any to-us
 frame into any active QSO lacking an explicit arm, gated only by the 100 Hz
@@ -348,6 +348,21 @@ frame within 100 Hz can trigger a spurious offset hop in `TxFreqMode::Auto`;
 partner that supersede never sees (runs only at creation). Fix: require
 `is_partner` in the default arm when partner latched; exclude stations with an
 existing active QSO from the CallingCq accept.
+
+**PAN-14 update (2026-08-14):** effect (c) was root-caused as the mechanism
+behind an on-air double-TX report (two high-amplitude signals for one station
+in one window, 2026-08-11) and reproduced deterministically in
+`qso_manager::tests::calling_cq_and_established_qso_both_accept_same_partners_frame`
+(`pancetta-qso/src/qso_manager.rs`): a `CallingCq` QSO's two "any station"
+relevance arms (`CqResponse`/bare `SignalReport` addressed to us) now also
+require the sender have no OTHER established active QSO
+(`sender_has_other_active_partner`, computed once per incoming message in
+`find_qsos_for_message` from `metadata.their_callsign` across all active
+QSOs, compound-callsign-aware via `callsigns_match`). Effects (a)/(b) — the
+fully general default-arm case for state/message-type combinations with no
+explicit arm — are UNFIXED; still open, narrower in practice than (c) since
+most CallingCq/established-state × message-type pairs already have explicit
+arms.
 
 **SM-F8 — Re-send paths bypass the rearm's anti-double-send stamps. CONFIRMED.
 MED.**
