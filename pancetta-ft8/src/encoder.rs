@@ -505,24 +505,37 @@ impl Ft8Encoder {
     /// PAN-17: the 2-bit `nrpt` field only has room for four values — blank,
     /// RRR, RR73, 73 — there is no bit budget left for a grid square or a
     /// numeric dB report once one callsign already needs the compound-call
-    /// slot. An `extra` that isn't one of those four tokens is degraded to
-    /// blank rather than failing the whole message: the alternative (never
-    /// transmitting anything at all to a compound-call station, which is the
-    /// live bug this path exists to fix) is worse, and an FT8 QSO can
-    /// complete without ever exchanging a grid/numeric report with such a
-    /// station — only the RRR/RR73/73 handshake is load-bearing.
+    /// slot. A grid-shaped `extra` (the CqResponse reply-to-CQ step) is
+    /// degraded to blank rather than failing the whole message: dropping a
+    /// grid still produces a valid, distinct "bare pairing" frame, and an
+    /// FT8 QSO can complete without ever exchanging a grid with a
+    /// compound-call station. A *report*-shaped `extra` (a numeric dB value,
+    /// with or without an `R` prefix — the SignalReport/ReportAck steps) is
+    /// NOT degraded: blanking it would produce a DIFFERENT, misleading
+    /// message (indistinguishable on the wire from a bare pairing frame),
+    /// which is worse than an honest encode failure — PAN-17 round 2 (Codex
+    /// review). Callers must not schedule a report/ack TX to a compound-call
+    /// partner expecting it to silently degrade; see
+    /// `pancetta-qso::qso_manager::callsign_is_wire_representable`'s
+    /// report-aware watchdog check, which retires such a QSO instead of
+    /// looping on this Err.
     fn try_encode_nonstandard(&self, text: &str) -> Ft8Result<[u8; 10]> {
         let parts: Vec<&str> = text.split_whitespace().collect();
         if parts.is_empty() {
             return Err(Ft8Error::MessageDecodingError("Empty message".to_string()));
         }
 
-        // "CQ <compound-call>" — the only CQ shape type 4 can carry (no room
-        // for a CQ modifier or a grid alongside a compound callsign).
+        // "CQ <compound-call> [grid]" — icq mode has no field at all for a
+        // CQ modifier ("CQ DX ...") or a report, but a trailing grid token
+        // (the shape `Ft8Encoder::encode_cq`/`MessageExchange::generate_message`
+        // render for a non-DX CQ) is accepted syntactically and dropped —
+        // same "can't fit it, drop gracefully" pattern as the directed
+        // branch below — so a compound-callsign OPERATOR can still call CQ
+        // (PAN-17 round 2: previously rejected outright, `parts.len() != 2`).
         if parts[0] == "CQ" {
-            if parts.len() != 2 {
+            if parts.len() < 2 || parts.len() > 3 {
                 return Err(Ft8Error::MessageDecodingError(
-                    "Nonstandard CQ must be exactly 'CQ <callsign>'".to_string(),
+                    "Nonstandard CQ must be 'CQ <callsign>' or 'CQ <callsign> <grid>'".to_string(),
                 ));
             }
             let call = parts[1];
@@ -548,6 +561,13 @@ impl Ft8Encoder {
                     call
                 ))
             })?;
+            if let Some(grid) = parts.get(2) {
+                debug!(
+                    "i3=4 CQ encode: dropping grid '{}' (icq shape has no room \
+                     for it) for '{}'",
+                    grid, text
+                );
+            }
             return Ok(pack_nonstandard(0, n58, 0, 0, 1));
         }
 
@@ -627,14 +647,42 @@ impl Ft8Encoder {
             "RRR" => 1,
             "RR73" => 2,
             "73" => 3,
-            _ => {
+            _ if extra_is_grid_locator(extra) => {
+                // Grid square (the CqResponse reply-to-CQ step): dropping it
+                // still produces a valid, distinct "bare pairing" frame — an
+                // honest degrade, not a different message in disguise.
                 debug!(
-                    "i3=4 encode: dropping unrepresentable extra field '{}' \
-                     (grid/report can't fit the 2-bit nonstandard-call report \
-                     field) for '{}'",
+                    "i3=4 encode: dropping grid '{}' (nonstandard-call report \
+                     field has no room for it) for '{}'",
                     extra, text
                 );
                 0
+            }
+            _ if extra_is_numeric_report(extra) => {
+                // PAN-17 round 2 (Codex review): a numeric dB report or
+                // R+report ack CANNOT be represented — there is no bit
+                // budget left once one callsign needs the compound slot.
+                // Blanking it would silently produce a DIFFERENT, valid-
+                // looking message (indistinguishable from a bare pairing
+                // frame) instead of the report the QSO actually needs to
+                // advance. Fail loudly instead of transmitting the wrong
+                // thing; the caller (the QSO layer) must not schedule this.
+                return Err(Ft8Error::MessageDecodingError(format!(
+                    "Cannot represent report '{}' for a compound-callsign \
+                     message: i3=4 has no numeric-report field, and dropping \
+                     it would silently send a different, misleading message",
+                    extra
+                )));
+            }
+            _ => {
+                // Anything else unrecognized: same reasoning as the report
+                // case — do not guess. Fail rather than silently drop
+                // unknown content.
+                return Err(Ft8Error::MessageDecodingError(format!(
+                    "Cannot represent exchange field '{}' for a \
+                     compound-callsign message",
+                    extra
+                )));
             }
         };
 
@@ -1260,18 +1308,63 @@ fn pack_eu_vhf_14bit(exchange: &str) -> u16 {
     0 // fallback
 }
 
-/// Coarse "is this token shaped like a callsign" check, guarding the i3=4
-/// nonstandard-callsign path against being triggered by arbitrary two-word
-/// free text ("HELLO WORLD" would otherwise pack28-fail on both words and
-/// get mistaken for a compound-callsign exchange). Mirrors the definition
-/// `pancetta-qso::exchange::base_callsign` already uses elsewhere in this
-/// workspace for the same purpose: at least 3 characters, with at least one
-/// digit AND at least one letter (every real amateur-radio callsign has
-/// both; this is a prefix/rule-of-thumb check, not full validation).
+/// "Is this token shaped like a real callsign" check, guarding the i3=4
+/// nonstandard-callsign path against being triggered by arbitrary free text.
+///
+/// PAN-17 round 2 (Codex review): the original version of this check (≥3
+/// chars, has a digit AND a letter, in any position) was too loose —
+/// `"HELLO1 WORLD2"` is valid 13-char free text, but both tokens pass that
+/// check and fit the 58-bit hash-callsign field, so `encode_message` would
+/// silently transmit a WRONG type-4 frame instead of the requested free
+/// text. Real callsigns (including compound forms) always have their digit
+/// "block" with letters on BOTH sides — a prefix before it and a suffix
+/// after it (`K1ABC`, `WE9G`, `8G81PA`, `3E40CDW`) — never a bare trailing
+/// digit with no suffix letters (`HELLO1`, `WORLD2`). This mirrors the
+/// decode side's own shape rule, `Ft8Message::looks_like_callsign`
+/// (message.rs's suffix-letters-after-the-last-digit check), so the two
+/// paths agree on what a plausible callsign looks like.
 fn looks_like_callsign(s: &str) -> bool {
-    s.len() >= 3
-        && s.chars().any(|c| c.is_ascii_digit())
-        && s.chars().any(|c| c.is_ascii_alphabetic())
+    let bytes = s.as_bytes();
+    if bytes.len() < 3 {
+        return false;
+    }
+    let Some(last_digit_pos) = bytes.iter().rposition(u8::is_ascii_digit) else {
+        return false; // no digit at all
+    };
+    // At least one suffix letter after the last digit.
+    if last_digit_pos + 1 >= bytes.len()
+        || !bytes[last_digit_pos + 1..]
+            .iter()
+            .all(u8::is_ascii_alphabetic)
+    {
+        return false;
+    }
+    // At least one prefix letter before the digit block.
+    bytes[..last_digit_pos].iter().any(u8::is_ascii_alphabetic)
+}
+
+/// Does `s` look like a 4-character Maidenhead grid locator (`AA00`..`RR99`)?
+/// Mirrors `packgrid`'s own grid-shape check — used by `try_encode_nonstandard`
+/// to decide whether an unrepresentable `extra` field is safe to drop
+/// (a grid) vs. must fail loudly (a report — see `extra_is_numeric_report`).
+fn extra_is_grid_locator(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() == 4
+        && (b'A'..=b'R').contains(&bytes[0])
+        && (b'A'..=b'R').contains(&bytes[1])
+        && bytes[2].is_ascii_digit()
+        && bytes[3].is_ascii_digit()
+}
+
+/// Does `s` look like a numeric signal report, with or without the `R`
+/// acknowledgment prefix (`"-12"`, `"+05"`, `"R-12"`)? Mirrors
+/// `packgrid`/`parse_report`'s own report-shape parsing. `try_encode_nonstandard`
+/// uses this to recognize a report/ack `extra` that i3=4 genuinely cannot
+/// represent, so it can fail loudly instead of silently sending a blank
+/// exchange that looks like a different, valid message on the wire.
+fn extra_is_numeric_report(s: &str) -> bool {
+    let body = s.strip_prefix('R').unwrap_or(s);
+    !body.is_empty() && body.parse::<i32>().is_ok()
 }
 
 // ============================================================================
@@ -2065,5 +2158,118 @@ mod tests {
         assert_eq!(msg.to_callsign, Some("YS/WE9G".to_string()));
         assert_eq!(msg.from_callsign, Some("<...>".to_string()));
         assert_eq!(msg.contest_exchange, Some("RR73".to_string()));
+    }
+
+    // ========================================================================
+    // PAN-17 round 2 (Codex review #248): P1/P2 remediation
+    // ========================================================================
+
+    #[test]
+    fn test_try_encode_nonstandard_rejects_numeric_report_instead_of_blanking() {
+        // P1 #1: a numeric dB report to a compound-call partner cannot be
+        // represented (no bit budget) — must fail loudly, NOT silently
+        // degrade to a blank exchange (which would look like a different,
+        // valid message: a bare CqResponse/pairing frame, not a report).
+        let encoder = Ft8Encoder::new();
+        for msg in ["YS/WE9G K5ARH -12", "YS/WE9G K5ARH +05"] {
+            let result = encoder.try_encode_nonstandard(msg);
+            assert!(
+                result.is_err(),
+                "'{}' (numeric report) must fail, not silently blank",
+                msg
+            );
+        }
+    }
+
+    #[test]
+    fn test_try_encode_nonstandard_rejects_report_ack_instead_of_blanking() {
+        // P1 #1: an R+report acknowledgment is likewise unrepresentable.
+        let encoder = Ft8Encoder::new();
+        let result = encoder.try_encode_nonstandard("YS/WE9G K5ARH R-12");
+        assert!(
+            result.is_err(),
+            "R+report ack must fail, not silently blank"
+        );
+    }
+
+    #[test]
+    fn test_encode_message_report_to_compound_call_fails_cleanly_overall() {
+        // The full encode_message fallback chain: standard fails (compound
+        // call), nonstandard now correctly refuses the report, and free
+        // text also fails (too long / contains characters outside its
+        // charset is irrelevant here — length is the blocker: "YS/WE9G
+        // K5ARH -12" is 17 chars, over the 13-char free-text cap). The
+        // overall result must be an honest Err, never a silently-wrong TX.
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_message("YS/WE9G K5ARH -12", None);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_encode_cq_grid_bearing_from_compound_operator() {
+        // P1 #3: a compound-callsign OPERATOR must still be able to call CQ
+        // with their own grid — `encode_cq`/`generate_message` render this
+        // as a 3-token "CQ <call> <grid>" message. Previously rejected
+        // outright (`parts.len() != 2`); now accepted, dropping the grid.
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_cq("YS/WE9G", "EM10", false);
+        assert!(
+            result.is_ok(),
+            "grid-bearing CQ from a compound-callsign operator must encode: {:?}",
+            result.err()
+        );
+
+        let payload = encoder.try_encode_nonstandard("CQ YS/WE9G EM10").unwrap();
+        let msg = decode_payload(&payload);
+        assert_eq!(msg.to_callsign, Some("CQ".to_string()));
+        assert_eq!(msg.from_callsign, Some("YS/WE9G".to_string()));
+    }
+
+    #[test]
+    fn test_looks_like_callsign_rejects_trailing_digit_free_text() {
+        // P2 #5: "HELLO1"/"WORLD2" have a digit and a letter but are NOT
+        // callsign-shaped — real callsigns always have a suffix letter
+        // after the digit block; a bare trailing digit is not a callsign.
+        assert!(!looks_like_callsign("HELLO1"));
+        assert!(!looks_like_callsign("WORLD2"));
+        // Sanity: genuine callsign shapes still pass.
+        assert!(looks_like_callsign("K1ABC"));
+        assert!(looks_like_callsign("YS/WE9G"));
+        assert!(looks_like_callsign("8G81PA"));
+        assert!(looks_like_callsign("3E40CDW"));
+    }
+
+    #[test]
+    fn test_encode_message_preserves_digit_bearing_free_text() {
+        // P2 #5 regression (Codex review #248): "HELLO1 WORLD2" is valid
+        // 13-char free text. Before the looks_like_callsign fix, both
+        // tokens failed pack28, passed the old (loose) heuristic, and fit
+        // pack58 — so encode_message silently transmitted a WRONG type-4
+        // callsign-hash frame instead of the requested free text. It must
+        // now round-trip as FreeText, not NonStdCall.
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("HELLO1 WORLD2", None)
+            .expect("valid 13-char free text must encode");
+
+        // Decode it back and confirm it landed as FreeText, not a mangled
+        // nonstandard-callsign frame.
+        let payload = encoder.encode_free_text("HELLO1 WORLD2").unwrap();
+        let expected_symbols = encoder.payload_to_symbols(&payload).unwrap();
+        assert_eq!(
+            symbols, expected_symbols,
+            "encode_message must choose the free-text encoding, not i3=4"
+        );
+
+        let msg = decode_payload(&payload);
+        assert_eq!(msg.message_type, crate::message::MessageType::FreeText);
+    }
+
+    #[test]
+    fn test_try_encode_nonstandard_still_rejects_plain_free_text() {
+        // Existing free-text safety net still holds for text with no digit
+        // at all.
+        let encoder = Ft8Encoder::new();
+        assert!(encoder.try_encode_nonstandard("HELLO WORLD").is_err());
     }
 }

@@ -455,6 +455,14 @@ impl super::ApplicationCoordinator {
                 },
             )
         };
+        // PAN-17 round 2 (Codex review #248, finding 2): seed our own
+        // callsign into this decoder's i3=4 hash table so a compound-call
+        // DX replying to us resolves our callsign back to plain text
+        // instead of the unresolvable "<...>" placeholder — see
+        // `Ft8Decoder::seed_hash_callsign`'s doc for why this is required
+        // (not just polish) for a compound-callsign QSO to ever advance
+        // past our opening call.
+        decoder.seed_hash_callsign(&station_callsign);
         // Same Arc<CachedStationLookup> the QSO component's active-QSO
         // ranking and the TUI's display scorer read — an in-memory
         // RwLock-backed snapshot the decoder thread reads via its own
@@ -698,11 +706,19 @@ impl super::ApplicationCoordinator {
                                 let new_cfg = cfg_guard.clone();
                                 drop(cfg_guard);
                                 match Ft8Decoder::new(new_cfg) {
-                                    Ok(d) => {
+                                    Ok(mut d) => {
                                         info!(
                                             "FT8 decoder rebuilt: max_decode_passes={}, osd_depth={:?}, protocol={}",
                                             cur_max, cur_osd, cur_protocol
                                         );
+                                        // PAN-17 round 2: a rebuild is a
+                                        // fresh Ft8Decoder with an empty
+                                        // hash table — re-seed our own
+                                        // callsign or a compound-call DX's
+                                        // reply silently stops resolving
+                                        // after the next tier/protocol
+                                        // config change.
+                                        d.seed_hash_callsign(&station_callsign);
                                         decoder = d;
                                         last_max_passes = cur_max;
                                         last_osd_depth = cur_osd;

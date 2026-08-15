@@ -2574,6 +2574,30 @@ impl Ft8Decoder {
         Self::with_message_handler(config, Box::new(NullMessageHandler))
     }
 
+    /// Seed a callsign into the decoder's i3=4 hash table (PAN-17 round 2,
+    /// Codex review #248 finding 2).
+    ///
+    /// An i3=4 (nonstandard-callsign) message represents one of its two
+    /// callsigns as a 12-bit hash — recoverable back to plain text ONLY if
+    /// this decoder has previously seen that callsign's plain-text form
+    /// (see `MessageParser::add_callsign`). A compound-call DX replying to
+    /// OUR station always puts OUR callsign in that lossy hash slot (our
+    /// callsign is the "standard" one in the exchange, so it never needs
+    /// the exact 58-bit field) — without seeding, every such reply resolves
+    /// to the unresolvable `"<...>"` placeholder instead of our own
+    /// callsign, so the QSO engine can never recognize the frame as
+    /// addressed to us at all.
+    ///
+    /// Every decode call path on this decoder (`self.message_parser` and
+    /// the parallel/rayon decode contexts, which hold `&MessageParser`
+    /// references into this SAME field, not independent copies) shares one
+    /// hash table, so seeding once here reaches all of them. Call this at
+    /// decoder construction (and again if the operator's configured
+    /// callsign changes) with the station's own callsign.
+    pub fn seed_hash_callsign(&mut self, callsign: &str) {
+        self.message_parser.add_callsign(callsign);
+    }
+
     /// Create a new decoder with custom message handler
     pub fn with_message_handler(
         config: Ft8Config,

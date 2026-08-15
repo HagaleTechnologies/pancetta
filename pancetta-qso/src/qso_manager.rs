@@ -4791,7 +4791,7 @@ impl QsoManager {
                     | QsoState::SendingConfirmation { .. }
             );
 
-            // PAN-17: an outbound message that embeds a DX callsign the FT8
+            // PAN-17: an outbound message that embeds a callsign the FT8
             // encoder can never represent (neither pack28's fixed 6-char
             // scheme nor the i3=4 nonstandard-callsign hash/58-bit path —
             // see `callsign_is_wire_representable`) would otherwise re-arm
@@ -4803,18 +4803,61 @@ impl QsoManager {
             // retrying — retire on the first watchdog pass that observes
             // it, with a reason distinct from Timeout so the operator sees
             // "cannot transmit this message" rather than a bogus no-reply.
+            //
+            // Round 2 (Codex review #248, finding 4): checks BOTH sides of
+            // the exchange, not just the DX's. Every directed frame also
+            // embeds `config.our_callsign` — `StationConfig` permits an
+            // arbitrarily long compound call there with no length cap, so a
+            // misconfigured `our_callsign` (e.g. `VK9/W1XYZ/MM`, >11 chars)
+            // would otherwise leave every QSO against a perfectly normal DX
+            // stuck on the generic timeout — the exact PAN-17 symptom just
+            // moved to the other callsign.
+            //
+            // Deliberately does NOT also fast-fail a report-bearing rung
+            // (SendingReport / WaitingForReport / WaitingForConfirmation)
+            // just because `their_callsign` isn't pack28-plausible: the
+            // compound-callsign-equivalence feature (catalog C18,
+            // `pancetta_core::callsign::callsigns_match`,
+            // `pancetta-qso/tests/adversarial_compound_calls.rs`)
+            // deliberately LATCHES the most-complete callsign form ever
+            // seen (e.g. `EA8/G8BCG`) even after the DX starts signing its
+            // bare base (`G8BCG`) — so `their_callsign` staying compound
+            // does not reliably predict which form the actual outgoing
+            // report will address. A heuristic here risked retiring
+            // healthy, actively-progressing QSOs (confirmed against
+            // `adversarial_compound_calls.rs`'s compound-then-base
+            // scenarios). The encoder's own refusal to silently blank an
+            // unrepresentable report (see
+            // `pancetta_ft8::encoder::try_encode_nonstandard`'s doc) still
+            // stands — that residual case falls back to the slower
+            // pre-existing generic timeout instead of this fast watchdog,
+            // which is the safe direction (see
+            // `callsign_is_plausibly_pack28_standard`'s doc).
             if active_tx_state {
-                if let Some(their) = progress.metadata.their_callsign.as_deref() {
+                let our = self.config.our_callsign.as_str();
+                let their = progress.metadata.their_callsign.as_deref();
+
+                let unencodable_reason = if !callsign_is_wire_representable(our) {
+                    Some(format!(
+                        "our configured callsign '{}' cannot be represented in any FT8 message format",
+                        our
+                    ))
+                } else if let Some(their) = their {
                     if !callsign_is_wire_representable(their) {
-                        timeouts.push((
-                            qso_id,
-                            QsoFailureReason::MessageUnencodable(format!(
-                                "callsign '{}' cannot be represented in any FT8 message format",
-                                their
-                            )),
-                        ));
-                        continue;
+                        Some(format!(
+                            "callsign '{}' cannot be represented in any FT8 message format",
+                            their
+                        ))
+                    } else {
+                        None
                     }
+                } else {
+                    None
+                };
+
+                if let Some(reason) = unencodable_reason {
+                    timeouts.push((qso_id, QsoFailureReason::MessageUnencodable(reason)));
+                    continue;
                 }
             }
 
@@ -6107,6 +6150,60 @@ mod tests {
         assert!(callsign_is_wire_representable("ABCDEFGHIJK")); // exactly 11
         assert!(!callsign_is_wire_representable("ABCDEFGHIJKL")); // 12: too long
         assert!(!callsign_is_wire_representable("<...>")); // invalid chars
+    }
+
+    /// PAN-17 round 2 (Codex review #248, finding 4): the unencodable-
+    /// message watchdog only checked `their_callsign`. `StationConfig`
+    /// permits an arbitrarily long compound `our_callsign` with no length
+    /// cap, so a misconfigured station callsign would leave every QSO --
+    /// even against a perfectly normal, plain-callsign DX -- stuck
+    /// re-arming an unencodable TX until the slow generic timeout. Must
+    /// now retire fast too.
+    #[tokio::test]
+    async fn unencodable_our_callsign_retires_immediately() {
+        let mut config = test_config();
+        config.our_callsign = "VK9/W1XYZ/MM/EXTRA".to_string(); // >11 chars
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+        let mut events = manager.subscribe();
+
+        // The DX side is perfectly ordinary -- proves this is caught even
+        // when `their_callsign` alone would pass every existing check.
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
+
+        let mut reason = None;
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::QsoFailed {
+                qso_id: id,
+                reason: r,
+                ..
+            } = ev
+            {
+                if id == qso_id {
+                    reason = Some(r);
+                }
+            }
+        }
+        assert!(
+            matches!(reason, Some(QsoFailureReason::MessageUnencodable(_))),
+            "expected MessageUnencodable, got {:?}",
+            reason
+        );
     }
 
     /// Repetitive-TX watchdog: a QSO stuck in the same active TX state (we keep

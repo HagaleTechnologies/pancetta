@@ -1185,3 +1185,197 @@ fn test_six_char_grid_encodes_standard_callgrid() {
         decoded.iter().map(|m| &m.text).collect::<Vec<_>>()
     );
 }
+
+/// PAN-17 round 2 (Codex review #248, finding 2): a compound-callsign QSO
+/// must be a WORKING QSO, not just a TX-only feature. Before this fix, the
+/// encoder alone gained i3=4 support but three separate decode-side layers
+/// still blocked a reply from ever reaching the QSO engine:
+///   (a) `Ft8Message::is_plausible` rejected a decoded compound callsign
+///       outright (assumed the 3-6-char packed-encoding shape),
+///   (b) `MessageExchange`'s regex patterns / `validate_callsign` couldn't
+///       match a hash-rendered callsign ("<K5ARH>"),
+///   (c) the decoder's i3=4 hash table was never seeded with our own
+///       callsign, so a compound-call DX addressing us always resolved to
+///       the unrecoverable "<...>" placeholder instead of our plain text.
+///
+/// This test drives the SAME real encode -> modulate -> decode -> parse ->
+/// QSO-engine pipeline `test_loopback_state_machine_driven_qso` uses above,
+/// but with the CQer signing a compound prefix/homecall callsign
+/// ("YS/WE9G", the PAN-17 live-incident callsign), and asserts the
+/// responder's reply — where OUR callsign lands in the lossy 12-bit hash
+/// slot (see `try_encode_nonstandard`'s doc: the pack28-failing callsign
+/// always wins the exact slot) — is correctly decoded and ADVANCES the
+/// CQer's own QSO state machine, not just successfully transmitted.
+#[tokio::test]
+async fn test_loopback_compound_callsign_qso_advances_state_machine() {
+    use pancetta_qso::{utils, QsoManager};
+
+    let freq = 500.0;
+
+    let mut dx_codec = Station::new("YS/WE9G", "EM10");
+    let mut us_codec = Station::new("K5ARH", "FN42");
+    // PAN-17 round 2: the DX's decoder must have previously seen OUR
+    // plain-text callsign to resolve the hash slot our reply puts it in —
+    // exactly what `Ft8Decoder::seed_hash_callsign` (wired into the real
+    // coordinator at decoder construction) provides in production.
+    dx_codec.decoder.seed_hash_callsign("K5ARH");
+
+    let config_dx = QsoManagerConfig {
+        our_callsign: "YS/WE9G".to_string(),
+        our_grid: Some("EM10".to_string()),
+        timeouts: TimeoutConfig {
+            cq_timeout: 120,
+            report_timeout: 120,
+            confirmation_timeout: 120,
+            max_qso_duration: 600,
+            cleanup_interval: 600,
+            manual_call_watchdog_minutes: 5,
+            manual_call_max_calls: 10,
+            repetitive_tx_timeout_secs: 100_000,
+        },
+        contest_mode: None,
+        auto_sequence: AutoSequenceConfig {
+            enabled: false,
+            auto_respond_cq: false,
+            auto_send_reports: false,
+            auto_send_confirmations: false,
+            action_delay_ms: 0,
+        },
+        duplicate_checking: DuplicateCheckConfig {
+            enabled: false,
+            ..DuplicateCheckConfig::default()
+        },
+        ..Default::default()
+    };
+    let config_us = QsoManagerConfig {
+        our_callsign: "K5ARH".to_string(),
+        our_grid: Some("FN42".to_string()),
+        timeouts: config_dx.timeouts.clone(),
+        contest_mode: None,
+        auto_sequence: config_dx.auto_sequence.clone(),
+        duplicate_checking: config_dx.duplicate_checking.clone(),
+        ..Default::default()
+    };
+
+    let manager_dx = QsoManager::new(config_dx);
+    let manager_us = QsoManager::new(config_us);
+    manager_dx.start().await.unwrap();
+    manager_us.start().await.unwrap();
+
+    let mut rx_dx = manager_dx.subscribe();
+    let mut rx_us = manager_us.subscribe();
+
+    // === Step 1: the compound-callsign DX calls CQ ===
+    let qso_id_dx = manager_dx.start_cq(freq, None, false).await.unwrap();
+    let cq_message_type = loop {
+        match rx_dx.recv().await.unwrap() {
+            QsoEvent::MessageToSend { message, .. } => break message,
+            _ => continue,
+        }
+    };
+    let cq_text = utils::generate_ft8_message(&cq_message_type, "YS/WE9G").unwrap();
+    assert_eq!(cq_text, "CQ YS/WE9G EM10");
+
+    // Real encode -> modulate -> decode. Before PAN-17 this failed outright
+    // at encode_message; the CQ-with-grid shape additionally needed the
+    // round-2 fix (finding 3) since `encode_cq` always renders the grid.
+    let audio = dx_codec.encode_and_modulate(&cq_text, freq);
+    let decoded = us_codec.decode(&audio);
+    assert!(!decoded.is_empty(), "must decode the compound-call CQ");
+    let decoded_cq = &decoded[0].text;
+    // The i3=4 CQ shape has no room for a grid (see try_encode_nonstandard's
+    // doc) -- it is dropped on the wire, so the round-tripped text omits it.
+    assert_eq!(decoded_cq, "CQ YS/WE9G");
+
+    // Finding 2(a): `is_plausible` must accept the decoded compound
+    // callsign instead of rejecting it as implausible (this is implicit in
+    // `decoded` being non-empty above -- an implausible decode is filtered
+    // out before it ever becomes a `DecodedMessage`).
+    let parsed_cq = utils::parse_ft8_message(decoded_cq, "K5ARH").unwrap();
+    assert!(
+        matches!(parsed_cq, MessageType::Cq { ref callsign, .. } if callsign == "YS/WE9G"),
+        "parsed message should be CQ from YS/WE9G, got: {:?}",
+        parsed_cq
+    );
+
+    // === Step 2: we respond to the compound-call CQ ===
+    let qso_id_us = manager_us
+        .respond_to_cq("YS/WE9G".to_string(), freq, None)
+        .await
+        .unwrap();
+    let response_message_type = loop {
+        match rx_us.recv().await.unwrap() {
+            QsoEvent::MessageToSend { message, .. } => break message,
+            _ => continue,
+        }
+    };
+    assert!(matches!(
+        manager_us.get_qso(qso_id_us).await.unwrap().state,
+        QsoState::RespondingToCq { .. }
+    ));
+
+    let response_text = utils::generate_ft8_message(&response_message_type, "K5ARH").unwrap();
+    assert_eq!(response_text, "YS/WE9G K5ARH FN42");
+
+    // Real encode -> modulate -> decode of OUR reply, exactly as Codex's
+    // review asked: "encode a compound-call CQ response as this station,
+    // decode it back". The grid can't fit i3=4's report field either (only
+    // one callsign can occupy the exact 58-bit slot; the other -- ours,
+    // K5ARH -- lands in the lossy 12-bit hash slot), so it degrades to
+    // blank on the wire, same as the CQ leg above.
+    let audio = us_codec.encode_and_modulate(&response_text, freq);
+    let decoded = dx_codec.decode(&audio);
+    assert!(!decoded.is_empty(), "DX must decode our CqResponse");
+    let decoded_response = &decoded[0].text;
+    // Finding 2(c): our callsign resolves via the seeded hash table
+    // instead of rendering as the unrecoverable "<...>" placeholder. A
+    // RESOLVED hash still renders bracketed ("<K5ARH>", matching WSJT-X
+    // convention -- it was recovered from a 12-bit hash, not decoded
+    // directly) -- `callsigns_match`'s hash-render resolution (finding 2,
+    // `pancetta_core::callsign`) is what lets this still route correctly
+    // below despite the brackets.
+    assert_eq!(decoded_response, "YS/WE9G <K5ARH>");
+
+    // Finding 2(a)+(b): the decoded reply must parse into a real
+    // MessageType (not fall through to NonStandard) even though it
+    // contains a compound callsign and no hash bracket is even needed on
+    // THIS leg (the exact-58-bit form round-trips as plain text).
+    let parsed_response = utils::parse_ft8_message(decoded_response, "YS/WE9G").unwrap();
+    assert!(
+        matches!(parsed_response, MessageType::CqResponse { .. }),
+        "parsed message should be CqResponse, got: {:?}",
+        parsed_response
+    );
+
+    // === Step 3: feed the DX's decoded reply into ITS OWN QSO engine and
+    // confirm the compound-callsign station's QSO actually ADVANCES --
+    // this is the crux of finding 2: not just "transmits", but "a working
+    // QSO". ===
+    manager_dx
+        .process_message(parsed_response, decoded_response.clone(), freq, Some(-10.0))
+        .await
+        .unwrap();
+
+    let progress_dx = manager_dx.get_qso(qso_id_dx).await.unwrap();
+    // The latched partner callsign is whatever form the decoded frame
+    // carried ("<K5ARH>", the resolved-hash render) -- `callsigns_match`'s
+    // hash-render resolution (finding 2) is what lets a LATER frame
+    // signing bare "K5ARH" still match this latched partner, the same way
+    // it already does for compound<->base equivalence.
+    assert!(
+        matches!(progress_dx.state, QsoState::WaitingForReport { ref their_callsign, .. } if their_callsign == "<K5ARH>"),
+        "compound-callsign DX's QSO should advance CallingCq -> WaitingForReport \
+         on receiving our reply, got: {:?}",
+        progress_dx.state
+    );
+    assert!(
+        pancetta_core::callsign::callsigns_match(
+            match &progress_dx.state {
+                QsoState::WaitingForReport { their_callsign, .. } => their_callsign,
+                _ => unreachable!(),
+            },
+            "K5ARH"
+        ),
+        "the latched hash-rendered partner must still match our plain callsign"
+    );
+}
