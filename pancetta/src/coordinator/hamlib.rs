@@ -29,11 +29,24 @@ pub(crate) struct HamlibChildren {
 /// crash: `teardown_hamlib()` runs (up to ~10s of PTT-off retries) and a
 /// Hamlib restart gets dispatched while the process is shutting down
 /// (PAN-19 MEDIUM #1).
+///
+/// Order matters here (PAN-19 round-1 review, Codex P2): evaluate
+/// `is_finished()` FIRST and only THEN re-check `shutdown`, not the other
+/// way around. Checking `shutdown` before `is_finished()` still leaves a
+/// gap -- if `shutdown` flips true immediately after that read returns
+/// `false`, a child can observe the flip, exit because of it, and have
+/// `is_finished()` see that exit, but the bail decision would still be
+/// gated on the STALE pre-flip `shutdown` read, so it fires anyway. By
+/// checking `is_finished()` first (a child must actually be finished for
+/// the `&&` to even reach the second operand) and re-reading `shutdown`
+/// only at that point -- as close in time to the observed exit as
+/// possible -- the second read is far more likely to already reflect a
+/// flip that caused it.
 pub(crate) fn child_task_crashed(
     shutdown: &std::sync::atomic::AtomicBool,
     spawned_handles: &[tokio::task::JoinHandle<()>],
 ) -> bool {
-    !shutdown.load(Ordering::Acquire) && spawned_handles.iter().any(|handle| handle.is_finished())
+    spawned_handles.iter().any(|handle| handle.is_finished()) && !shutdown.load(Ordering::Acquire)
 }
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
@@ -1177,6 +1190,89 @@ mod child_task_crashed_tests {
             std::slice::from_ref(&handle)
         ));
         handle.abort();
+    }
+
+    /// PAN-19 round-1 review (Codex P2): the two tests above don't actually
+    /// distinguish CHECK ORDER -- `shutdown` is already fully settled to its
+    /// final value before `child_task_crashed` is ever called, so both the
+    /// old (`!shutdown.load() && is_finished()`) and new
+    /// (`is_finished() && !shutdown.load()`) orderings return the same
+    /// answer. The real bug only shows up in the tiny window where
+    /// `shutdown` flips (and a child exits because of it) concurrently WITH
+    /// the check itself: reading `shutdown` first can observe the stale
+    /// `false` moments before the flip, then `is_finished()` (checked
+    /// second, further "downstream" of the flip) observes the now-exited
+    /// child -- misclassifying an expected shutdown exit as a crash. Reading
+    /// `is_finished()` first closes this: a child can only be observed
+    /// finished once its exit (and everything causally before it, including
+    /// whatever flipped `shutdown`) is visible, so the SECOND read
+    /// (`shutdown`, checked only once a finished child is already known)
+    /// reliably sees the fresh value.
+    ///
+    /// This races a real background task -- which stores `shutdown = true`
+    /// and then returns -- against a tight polling loop, for many
+    /// independent trials, comparing the ACTUAL (fixed) `child_task_crashed`
+    /// against a locally reimplemented OLD-ordered formula under identical
+    /// conditions. The fixed function must never misfire; the old-ordered
+    /// formula is expected to misfire at least once across enough trials,
+    /// demonstrating the race is real and that check order is what closes
+    /// it (not just re-checking `shutdown` at all, which the MEDIUM #1 fix
+    /// already did in either order).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn check_order_closes_the_shutdown_flip_race_that_the_old_order_missed() {
+        const TRIALS: usize = 20_000;
+        let mut old_order_misfired = false;
+
+        for _ in 0..TRIALS {
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let shutdown_for_task = shutdown.clone();
+            let handle = tokio::spawn(async move {
+                // Simulates the real shutdown sequence: flip the flag, THEN
+                // exit -- exactly the "child observes shutdown and returns"
+                // path both orderings are trying to classify correctly.
+                shutdown_for_task.store(true, Ordering::Release);
+            });
+
+            // Race a tight, non-yielding poll against the task above on a
+            // different worker thread (multi_thread runtime, no `.await`
+            // in this loop body so this thread doesn't voluntarily give up
+            // its slot) -- maximizing the chance of observing the handles
+            // in whatever intermediate states are actually reachable.
+            let handles = [handle];
+            loop {
+                let old_order_result =
+                    !shutdown.load(Ordering::Acquire) && handles.iter().any(|h| h.is_finished());
+                let new_order_result = child_task_crashed(&shutdown, &handles);
+
+                // The fixed function's core invariant: NEVER misclassify a
+                // shutdown-caused exit as a crash. Checked every iteration,
+                // not just at the end -- this must hold at every observed
+                // instant, not merely once settled.
+                assert!(
+                    !new_order_result,
+                    "child_task_crashed (fixed order) misclassified a shutdown-caused exit \
+                     as a crash"
+                );
+
+                if old_order_result {
+                    old_order_misfired = true;
+                }
+
+                if handles[0].is_finished() {
+                    break;
+                }
+            }
+        }
+
+        assert!(
+            old_order_misfired,
+            "expected the OLD check order (shutdown read before is_finished()) to \
+             misclassify at least one shutdown-caused exit as a crash across {TRIALS} trials \
+             -- if this never triggers, either the race genuinely isn't reachable on this \
+             platform/scheduler or TRIALS needs to be higher; the fixed order's own \
+             never-misfires assertion above already ran unconditionally every iteration \
+             regardless of whether this one fires"
+        );
     }
 }
 
