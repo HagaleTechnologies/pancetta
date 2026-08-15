@@ -18,6 +18,24 @@ pub(crate) struct HamlibChildren {
     pub(crate) watchdog: tokio::task::AbortHandle,
 }
 
+/// Whether a spawned Hamlib child task (poll loop or PTT watchdog)
+/// terminated unexpectedly and the outer message-loop task should treat
+/// that as a crash.
+///
+/// Both children exit cleanly (and expectedly) once `shutdown` flips. A
+/// child can observe `shutdown` and return between the outer loop's own
+/// `!shutdown.load(...)` guard and this check running -- without
+/// re-checking `shutdown` here too, that race gets misclassified as a
+/// crash: `teardown_hamlib()` runs (up to ~10s of PTT-off retries) and a
+/// Hamlib restart gets dispatched while the process is shutting down
+/// (PAN-19 MEDIUM #1).
+pub(crate) fn child_task_crashed(
+    shutdown: &std::sync::atomic::AtomicBool,
+    spawned_handles: &[tokio::task::JoinHandle<()>],
+) -> bool {
+    !shutdown.load(Ordering::Acquire) && spawned_handles.iter().any(|handle| handle.is_finished())
+}
+
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
 
 /// Rig connection state surfaced to the TUI as a station-panel badge.
@@ -81,7 +99,31 @@ impl super::ApplicationCoordinator {
                     }
                     Err(error) => {
                         warn!("Hamlib teardown PTT-off attempt {attempt} failed: {error}");
-                        tokio::time::sleep(Duration::from_millis(500)).await;
+                        // PAN-19 LOW: this loop runs on the coordinator's main
+                        // supervision task (`run_main_loop`'s `select!` ->
+                        // `check_task_handles` -> `handle_finished_task` ->
+                        // `teardown_component` -> here), so all 3 attempts x
+                        // up to 3s send + this 500ms sleep (up to ~10s worst
+                        // case) stalls that task's own re-entry into
+                        // `select!` -- a second, concurrent component
+                        // failure sits undiscovered in `named_task_handles`
+                        // until this returns. A full concurrency restructure
+                        // (spawning this loop off the supervision task) risks
+                        // the PTT-off-before-next-generation TX-safety
+                        // ordering guarantee this loop exists to provide, so
+                        // instead: skip only this inter-attempt sleep when
+                        // another component's task has ALREADY finished
+                        // (visible right now in `named_task_handles`) --
+                        // that failure gets discovered and processed that
+                        // much sooner, without touching PTT-off retry
+                        // semantics or ordering at all.
+                        let another_failure_pending = self
+                            .named_task_handles
+                            .iter()
+                            .any(|(id, handle)| *id != ComponentId::Hamlib && handle.is_finished());
+                        if !another_failure_pending {
+                            tokio::time::sleep(Duration::from_millis(500)).await;
+                        }
                     }
                 }
             }
@@ -124,7 +166,22 @@ impl super::ApplicationCoordinator {
                 }
             }
             for message in safe_messages {
-                let _ = sender.send(message);
+                // PAN-19 LOW: `Sender::send` on a bounded crossbeam channel
+                // BLOCKS the current thread if the channel is full. The
+                // drain above just freed the same number of slots this
+                // replays, so normally there's room -- but a concurrent
+                // producer filling the channel in between (this whole
+                // sequence has `.await` points in it) could still leave it
+                // full by the time we get here, which would block this
+                // async fn's underlying executor thread instead of
+                // yielding. Use `try_send` and drop-with-a-warning on
+                // `Full` instead of blocking.
+                if let Err(e) = sender.try_send(message) {
+                    warn!(
+                        "Hamlib teardown: dropping a replayed message, channel still full: {}",
+                        e
+                    );
+                }
             }
         }
     }
@@ -412,67 +469,42 @@ impl super::ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                match rig.connect().await {
-                    Ok(_) => {
-                        info!("Rig connected successfully");
-                        if let Err(e) = rig
-                            .set_ptt(
-                                pancetta_hamlib::Vfo::Current,
-                                pancetta_hamlib::PttState::Off,
-                            )
-                            .await
-                        {
-                            warn!("Startup PTT-off failed: {e}");
-                        }
-                        // Only flag a *real* CAT link as Connected — a mock rig
-                        // (rig control disabled) stays NotConnected so the TUI
-                        // badge never claims a radio is attached when none is.
-                        if rig_enabled {
-                            rig_conn_state
-                                .store(RigConnState::Connected.as_u8(), Ordering::Relaxed);
-                        }
-                        // Read the rig's current frequency immediately so we start
-                        // on whatever band the radio is already tuned to, rather
-                        // than assuming 20m.
-                        match rig.get_frequency(pancetta_hamlib::Vfo::Current).await {
-                            Ok(freq) => {
-                                operating_frequency_hz.store(freq, Ordering::Relaxed);
-                                info!(
-                                    "Rig initial frequency: {} Hz ({:.3} MHz)",
-                                    freq,
-                                    freq as f64 / 1_000_000.0
-                                );
-                            }
-                            Err(e) => {
-                                warn!("Could not read initial rig frequency: {}", e);
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error!("Failed to connect to rig: {}. Continuing without.", e);
-                        rig_conn_state.store(RigConnState::NotConnected.as_u8(), Ordering::Relaxed);
-                        if rig_enabled {
-                            report_rig_error(
-                                &message_bus,
-                                format!(
-                                    "Rig connect failed ({e}) — RIG badge is ✗. Check the radio \
-                                     is powered on and the USB cable; verify with \
-                                     `pancetta test-rig`, then restart pancetta."
-                                ),
-                            )
-                            .await;
-                        }
-                    }
-                }
-
-                // Signal that the initial connect + read sequence is done (or
-                // gave up).  The receiver in start_hamlib_component is waiting
-                // with a bounded timeout; send errors are harmless (timeout
-                // already elapsed).
-                let _ = initial_read_tx.send(());
-
-                // Polling task
-                let rig_poll = rig;
+                // PAN-19 HIGH: the poll + PTT-watchdog child tasks are spawned
+                // and their abort handles published via `children_tx` FIRST,
+                // BEFORE the initial `rig.connect()` / PTT-off / frequency-read
+                // sequence below -- deliberately, not incidentally. Spawning
+                // them doesn't need a live connection: `rig_poll` is a cheap
+                // `Arc::clone` of the same `Arc<dyn RigControl>` `rig` (no
+                // network I/O to construct), and the poll loop already
+                // tolerates a not-yet-connected rig fine (`get_status()`
+                // returns `Disconnected` gracefully rather than erroring, so
+                // the first tick or two just count as a `consecutive_failures`
+                // poll miss, same as any other transient failure).
+                //
+                // Previously `children_tx.send` happened AFTER the connect
+                // sequence, at essentially the same wall-clock time as
+                // `initial_read_tx.send` (only a few non-blocking lines
+                // later). Worst case that sequence budgets ~5s (rig connect)
+                // + 3s (`set_ptt` retry) + 3s (`get_frequency` retry) ≈ 11s.
+                // The caller first awaits `initial_read_rx` with an 8s
+                // timeout (`RIG_INITIAL_READ_TIMEOUT`) and, on timeout, logs
+                // a warning and continues (fine, working as intended) --
+                // but it THEN awaits `children_rx` with a hardcoded 1s
+                // timeout starting from t=8s. If T ≈ 11s, `children_tx`
+                // fires outside that 8s-9s window, so the 1s wait times out
+                // too -- and THAT timeout aborts the task and bails out of
+                // `start_hamlib_component` entirely, failing startup (or
+                // burning a restart attempt) on exactly the "rig is slow"
+                // condition Hamlib restart exists to recover from. Spawning
+                // the children up front means `children_tx` fires almost
+                // immediately on task start, independent of how long
+                // `rig.connect()`/`get_frequency()` take.
+                // `message_bus` itself gets moved into the poll task below
+                // (it's used there directly, not via a separately-named
+                // clone); the connect sequence -- now running AFTER that
+                // spawn -- needs its own clone to report a connect failure.
+                let message_bus_for_connect = message_bus.clone();
+                let rig_poll = Arc::clone(&rig);
                 let rig_for_polling = Arc::clone(&rig_poll);
                 let shutdown_for_polling = shutdown.clone();
                 let op_freq_for_polling = operating_frequency_hz.clone();
@@ -773,9 +805,74 @@ impl super::ApplicationCoordinator {
                     watchdog: spawned_handles[1].abort_handle(),
                 });
 
+                // Initial connect + PTT-off + frequency-read sequence. Uses
+                // `rig` directly (not `rig_poll`) -- both are clones of the
+                // same underlying `Arc<dyn RigControl>`, so this is
+                // equivalent, but keeps the polling task's own capture
+                // (`rig_poll`/`rig_for_polling`) visibly separate from this
+                // one-shot startup sequence.
+                match rig.connect().await {
+                    Ok(_) => {
+                        info!("Rig connected successfully");
+                        if let Err(e) = rig
+                            .set_ptt(
+                                pancetta_hamlib::Vfo::Current,
+                                pancetta_hamlib::PttState::Off,
+                            )
+                            .await
+                        {
+                            warn!("Startup PTT-off failed: {e}");
+                        }
+                        // Only flag a *real* CAT link as Connected — a mock rig
+                        // (rig control disabled) stays NotConnected so the TUI
+                        // badge never claims a radio is attached when none is.
+                        if rig_enabled {
+                            rig_conn_state
+                                .store(RigConnState::Connected.as_u8(), Ordering::Relaxed);
+                        }
+                        // Read the rig's current frequency immediately so we start
+                        // on whatever band the radio is already tuned to, rather
+                        // than assuming 20m.
+                        match rig.get_frequency(pancetta_hamlib::Vfo::Current).await {
+                            Ok(freq) => {
+                                operating_frequency_hz.store(freq, Ordering::Relaxed);
+                                info!(
+                                    "Rig initial frequency: {} Hz ({:.3} MHz)",
+                                    freq,
+                                    freq as f64 / 1_000_000.0
+                                );
+                            }
+                            Err(e) => {
+                                warn!("Could not read initial rig frequency: {}", e);
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        error!("Failed to connect to rig: {}. Continuing without.", e);
+                        rig_conn_state.store(RigConnState::NotConnected.as_u8(), Ordering::Relaxed);
+                        if rig_enabled {
+                            report_rig_error(
+                                &message_bus_for_connect,
+                                format!(
+                                    "Rig connect failed ({e}) — RIG badge is ✗. Check the radio \
+                                     is powered on and the USB cable; verify with \
+                                     `pancetta test-rig`, then restart pancetta."
+                                ),
+                            )
+                            .await;
+                        }
+                    }
+                }
+
+                // Signal that the initial connect + read sequence is done (or
+                // gave up).  The receiver in start_hamlib_component is waiting
+                // with a bounded timeout; send errors are harmless (timeout
+                // already elapsed).
+                let _ = initial_read_tx.send(());
+
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
-                    if spawned_handles.iter().any(|handle| handle.is_finished()) {
+                    if child_task_crashed(&shutdown, &spawned_handles) {
                         anyhow::bail!("Hamlib polling or PTT-watchdog child terminated");
                     }
                     match hamlib_rx.try_recv() {
@@ -948,6 +1045,20 @@ impl super::ApplicationCoordinator {
             },
         );
 
+        // PAN-19 MEDIUM #2: `teardown_hamlib` only drains+aborts
+        // `hamlib_orphans` at the START of the NEXT teardown call. A
+        // watchdog orphaned by a teardown whose 3 PTT-off attempts all
+        // failed (see `teardown_hamlib` below) would otherwise survive
+        // past THIS successful restart, holding a stale `ptt_on_since`
+        // from the OLD generation and capable of firing `set_ptt(Off)` on
+        // the NEW generation's rig client mid-transmission. Now that this
+        // new generation has successfully started (children handles
+        // published above), any such orphan is definitely stale -- abort
+        // it here too, rather than waiting for a subsequent teardown.
+        for orphan in self.hamlib_orphans.drain(..) {
+            orphan.abort();
+        }
+
         info!("Hamlib component started");
         Ok(())
     }
@@ -995,6 +1106,415 @@ async fn report_rig_error(message_bus: &MessageBus, text: String) {
         Instant::now(),
     );
     let _ = message_bus.send_message(diag).await;
+}
+
+#[cfg(test)]
+mod child_task_crashed_tests {
+    use super::*;
+    use std::sync::atomic::AtomicBool;
+
+    /// PAN-19 MEDIUM #1: a child that has already exited (expectedly, once
+    /// `shutdown` is observed) must NOT be classified as a crash once
+    /// `shutdown` is set -- even though the OUTER loop's own
+    /// `!shutdown.load(...)` guard may have already been checked (and
+    /// passed) before the child actually exited, this function is the
+    /// second, authoritative check and must re-confirm `shutdown` itself.
+    #[tokio::test]
+    async fn ignores_a_child_that_exited_once_shutdown_is_set() {
+        let shutdown = AtomicBool::new(true);
+        let handle = tokio::spawn(async {});
+        // Let the trivial task actually finish.
+        for _ in 0..1000 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            handle.is_finished(),
+            "test setup: child should have finished"
+        );
+
+        assert!(
+            !child_task_crashed(&shutdown, std::slice::from_ref(&handle)),
+            "a child observed exiting during shutdown must not be treated as a crash"
+        );
+    }
+
+    /// The flip side: outside of shutdown, a finished child IS a real crash
+    /// and must still be flagged.
+    #[tokio::test]
+    async fn flags_a_real_crash_when_not_shutting_down() {
+        let shutdown = AtomicBool::new(false);
+        let handle = tokio::spawn(async {});
+        for _ in 0..1000 {
+            if handle.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            handle.is_finished(),
+            "test setup: child should have finished"
+        );
+
+        assert!(
+            child_task_crashed(&shutdown, std::slice::from_ref(&handle)),
+            "a child that exits outside of shutdown must still be flagged as a crash"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_crash_when_all_children_still_running() {
+        let shutdown = AtomicBool::new(false);
+        let handle = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        assert!(!handle.is_finished());
+
+        assert!(!child_task_crashed(
+            &shutdown,
+            std::slice::from_ref(&handle)
+        ));
+        handle.abort();
+    }
+}
+
+#[cfg(all(test, feature = "pancetta-hamlib"))]
+mod children_publish_race_tests {
+    //! PAN-19 HIGH regression guard.
+    //!
+    //! `start_hamlib_component` doesn't accept an injectable rig, so these
+    //! tests can't drive a genuinely slow connect through the real function
+    //! end to end. Instead this mirrors the exact concurrency SHAPE the fix
+    //! establishes -- spawn the child tasks and publish their abort handles
+    //! via a oneshot FIRST, then await the (possibly slow) rig connect --
+    //! using a real `pancetta_hamlib::MockRig` configured with a multi-second
+    //! connect delay, so the "does the children publish depend on connect
+    //! completing" property is exercised with genuine async timing, not
+    //! just asserted by inspection.
+    use super::*;
+    use pancetta_hamlib::{MockRig, MockRigConfig, RigControl};
+
+    #[tokio::test]
+    async fn children_handles_publish_before_a_slow_rig_connect_completes() {
+        let rig = Arc::new(MockRig::new(MockRigConfig {
+            // Comfortably past the old hardcoded 1s `children_rx` timeout
+            // that used to fire (and bail) under this exact condition, but
+            // well under this test's own bound.
+            connection_delay_ms: 1_500,
+            ..Default::default()
+        }));
+        let (children_tx, children_rx) = tokio::sync::oneshot::channel::<()>();
+
+        let rig_for_task = rig.clone();
+        tokio::spawn(async move {
+            // Fixed shape: children published BEFORE the connect sequence,
+            // not after.
+            let poll_stub = tokio::spawn(async { std::future::pending::<()>().await });
+            let watchdog_stub = tokio::spawn(async { std::future::pending::<()>().await });
+            let _ = children_tx.send(());
+            poll_stub.abort();
+            watchdog_stub.abort();
+
+            // The slow part -- must NOT gate the send above.
+            let _ = rig_for_task.connect().await;
+        });
+
+        tokio::time::timeout(Duration::from_millis(300), children_rx)
+            .await
+            .expect(
+                "children handles must publish promptly, independent of how long \
+                     rig.connect() takes",
+            )
+            .expect("children_tx sender must not have been dropped without sending");
+    }
+}
+
+#[cfg(all(test, feature = "pancetta-hamlib"))]
+mod restart_orphan_tests {
+    //! PAN-19 MEDIUM #2: a watchdog orphaned by a teardown whose 3 PTT-off
+    //! attempts all failed (see `teardown_hamlib`'s `hamlib_orphans.push`)
+    //! must not survive past the NEXT successful restart -- it would carry
+    //! a stale `ptt_on_since` from the OLD generation and could still fire
+    //! `set_ptt(Off)` on the NEW generation's rig client mid-transmission.
+    use super::*;
+    use pancetta_config::Config;
+    use std::sync::atomic::AtomicBool;
+
+    /// Local copy of the same direct-construction pattern used by
+    /// `mod.rs`'s `test_coordinator_creation` / `health.rs`'s
+    /// `test_coordinator` -- no shared helper exists yet for this module.
+    async fn test_coordinator() -> super::super::ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    #[tokio::test]
+    async fn successful_start_aborts_a_watchdog_orphaned_by_a_prior_failed_teardown() {
+        let mut coordinator = test_coordinator().await;
+
+        // Simulate a PRIOR teardown whose 3 PTT-off attempts all failed:
+        // `teardown_hamlib` pushed the (still running) watchdog's
+        // `AbortHandle` onto `hamlib_orphans` instead of aborting it.
+        let orphan_task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        coordinator.hamlib_orphans.push(orphan_task.abort_handle());
+        assert!(!orphan_task.is_finished());
+
+        // Config::default() has rig control disabled, so this takes the
+        // mock-rig path -- no real hardware/rigctld needed, and it
+        // completes quickly and deterministically.
+        coordinator
+            .start_hamlib_component()
+            .await
+            .expect("mock-rig hamlib start should succeed");
+
+        assert!(
+            coordinator.hamlib_orphans.is_empty(),
+            "orphans must be drained once the new Hamlib generation successfully starts"
+        );
+
+        for _ in 0..1000 {
+            if orphan_task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            orphan_task.is_finished(),
+            "the watchdog orphaned by a prior failed teardown must be aborted once the new \
+             generation starts, not left running with a stale ptt_on_since from the old one"
+        );
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(all(test, feature = "pancetta-hamlib"))]
+mod teardown_stall_tests {
+    //! PAN-19 LOW: `teardown_hamlib`'s PTT-off retry loop runs on the
+    //! coordinator's main supervision task, so its up-to-~10s worst case
+    //! (3 attempts x up to 3s send + a 500ms inter-attempt sleep) stalls
+    //! `check_task_handles`'s own re-entry -- a second concurrent component
+    //! failure sits undiscovered in `named_task_handles` until teardown
+    //! returns. These tests cover the safer, smaller fix that was chosen
+    //! over a full concurrency restructure: skip the inter-attempt sleep
+    //! specifically when another component's task has already finished.
+    use super::*;
+    use pancetta_config::Config;
+    use pancetta_hamlib::{MockRig, RigControl};
+    use std::sync::atomic::AtomicBool;
+
+    async fn test_coordinator() -> super::super::ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// An UNconnected `MockRig`'s `set_ptt` deterministically fails every
+    /// time ("Mock rig not connected"), so this exercises all 3 retry
+    /// attempts (and, absent the fix, both inter-attempt sleeps) every run.
+    fn disconnected_mock_rig() -> Arc<MockRig> {
+        Arc::new(MockRig::default())
+    }
+
+    #[tokio::test]
+    async fn skips_inter_attempt_sleep_when_another_failure_is_already_pending() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.rig_handle = Some(disconnected_mock_rig());
+
+        // Simulate a second component's task having already finished,
+        // sitting undiscovered in `named_task_handles` -- the scenario this
+        // fix targets.
+        let finished: tokio::task::JoinHandle<anyhow::Result<()>> = tokio::spawn(async { Ok(()) });
+        for _ in 0..1000 {
+            if finished.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(finished.is_finished(), "test setup: should have finished");
+        coordinator
+            .named_task_handles
+            .push((ComponentId::DxCluster, finished));
+
+        let start = std::time::Instant::now();
+        coordinator.teardown_hamlib().await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed < Duration::from_millis(400),
+            "teardown_hamlib should skip its inter-attempt sleeps once another component's \
+             finished task is already pending -- took {elapsed:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn still_sleeps_between_attempts_when_nothing_else_is_pending() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.rig_handle = Some(disconnected_mock_rig());
+
+        let start = std::time::Instant::now();
+        coordinator.teardown_hamlib().await;
+        let elapsed = start.elapsed();
+
+        // 2 inter-attempt sleeps x 500ms between the 3 (always-failing)
+        // attempts -- this must NOT have been skipped when nothing else
+        // needs attention, preserving the existing retry pacing.
+        assert!(
+            elapsed >= Duration::from_millis(900),
+            "teardown_hamlib should still sleep between PTT-off retry attempts when nothing \
+             else is pending -- took {elapsed:?}"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "pancetta-hamlib"))]
+mod teardown_replay_tests {
+    //! PAN-19 LOW: the message re-injection loop at the end of
+    //! `teardown_hamlib` used a *blocking* `crossbeam_channel::Sender::send`
+    //! inside an async fn. Normally harmless -- the drain immediately above
+    //! it just freed exactly as many slots as it collected messages to
+    //! replay, so a fresh `teardown_hamlib` call can never itself construct
+    //! a full channel at replay time (replay count is provably <= drain
+    //! count <= channel capacity, with no `.await` between the two loops
+    //! for anything else to interleave through). The real risk is a
+    //! genuinely concurrent producer on another OS thread racing into that
+    //! gap -- which, being a true multi-thread race on a single-instruction
+    //! -wide window, isn't reliably reproducible by a test driving real
+    //! wall-clock timing (confirmed: an earlier version of this test tried
+    //! exactly that with a sustained background "saturator" task and did
+    //! not manage to trigger the blocking path even once). So instead of
+    //! chasing that race, this tests the actual mechanism the fix relies
+    //! on directly and deterministically: a full bounded `crossbeam_channel`
+    //! `try_send` returns `Err` immediately rather than blocking -- the
+    //! exact call `teardown_hamlib`'s replay loop now makes (see the
+    //! `sender.try_send(message)` call right above `teardown_hamlib`'s
+    //! final `}` in this file) -- plus a normal-path integration test
+    //! proving `teardown_hamlib` itself still completes fast end to end.
+    use super::*;
+    use pancetta_config::Config;
+
+    async fn test_coordinator() -> super::super::ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    fn set_freq_msg() -> ComponentMessage {
+        ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: 14_074_000,
+            }),
+            Instant::now(),
+        )
+    }
+
+    /// The exact mechanism: `try_send` on a full bounded channel returns
+    /// `Err(Full)` immediately rather than blocking the calling thread.
+    #[test]
+    fn try_send_on_a_full_channel_returns_immediately_instead_of_blocking() {
+        let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        sender
+            .try_send(set_freq_msg())
+            .expect("first send fills the one slot");
+
+        let start = std::time::Instant::now();
+        let result = sender.try_send(set_freq_msg());
+        let elapsed = start.elapsed();
+
+        assert!(
+            matches!(result, Err(crossbeam_channel::TrySendError::Full(_))),
+            "try_send on a full channel must return Err(Full), not succeed or panic"
+        );
+        assert!(
+            elapsed < Duration::from_millis(50),
+            "try_send must return immediately rather than blocking -- took {elapsed:?}"
+        );
+    }
+
+    /// Normal-path integration coverage: `teardown_hamlib`'s replay of a
+    /// drained "safe" message back onto a freshly-emptied channel must
+    /// still work and complete quickly (the drain-then-replay sequence can
+    /// never itself overflow the channel it just emptied -- see the module
+    /// doc comment above).
+    #[tokio::test]
+    async fn teardown_replays_a_safe_message_and_completes_quickly() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.rig_handle = None; // skip the PTT-off retry loop entirely
+
+        let (sender, receiver) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Hamlib)
+            .await
+            .unwrap();
+        sender.try_send(set_freq_msg()).unwrap();
+
+        let start = std::time::Instant::now();
+        let result =
+            tokio::time::timeout(Duration::from_secs(2), coordinator.teardown_hamlib()).await;
+        let elapsed = start.elapsed();
+
+        assert!(
+            result.is_ok(),
+            "teardown_hamlib should not hang on the normal path"
+        );
+        assert!(elapsed < Duration::from_millis(500), "took {elapsed:?}");
+        assert!(
+            receiver.try_recv().is_ok(),
+            "the safe SetFrequency message should have been replayed back onto the channel"
+        );
+    }
 }
 
 #[cfg(test)]
