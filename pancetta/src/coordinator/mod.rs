@@ -608,6 +608,27 @@ pub struct ApplicationCoordinator {
     pub(crate) hamlib_children: Option<hamlib::HamlibChildren>,
     #[cfg(feature = "pancetta-hamlib")]
     pub(crate) hamlib_orphans: Vec<tokio::task::AbortHandle>,
+    /// PAN-19 round-5 (Codex P1): the LATEST `SetFrequency`/`SetSplit`
+    /// command that failed to replay during a Hamlib teardown (the replay
+    /// channel stayed full through `replay_or_fallback`'s bounded retry).
+    /// Delivered to the NEXT Hamlib generation once its message loop
+    /// confirms readiness (`LoopReadyOutcome::Ready`), instead of being
+    /// silently dropped. `SetFrequency` is largely self-healing (the poll
+    /// loop re-reads and re-publishes the rig's actual frequency every
+    /// 500ms regardless), but `SetSplit` is NOT -- nothing else in this
+    /// codebase re-asserts or re-polls split state, so a dropped
+    /// `SetSplit` could leave the rig silently holding stale split config
+    /// (e.g. still split-on with an old TX frequency) with nothing to
+    /// notice or correct it -- a real off-frequency-TX risk, not just
+    /// cosmetic staleness. Only the latest of each type is kept (no need
+    /// to replay a stale sequence of intermediate changes, just the final
+    /// desired state), and `SetPtt` never lands here -- it uses the
+    /// direct-rig fallback in `replay_or_fallback` instead, since PTT-off
+    /// must never wait for a future restart to complete.
+    #[cfg(feature = "pancetta-hamlib")]
+    pub(crate) hamlib_pending_frequency: Option<ComponentMessage>,
+    #[cfg(feature = "pancetta-hamlib")]
+    pub(crate) hamlib_pending_split: Option<ComponentMessage>,
     /// Authorization refresh child owned by the current StationAgent generation.
     pub(crate) station_agent_poll: Option<tokio::task::AbortHandle>,
 
@@ -1573,6 +1594,10 @@ impl ApplicationCoordinator {
             hamlib_children: None,
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_orphans: Vec::new(),
+            #[cfg(feature = "pancetta-hamlib")]
+            hamlib_pending_frequency: None,
+            #[cfg(feature = "pancetta-hamlib")]
+            hamlib_pending_split: None,
             station_agent_poll: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),

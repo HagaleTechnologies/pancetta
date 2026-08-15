@@ -51,6 +51,87 @@ pub(crate) struct HamlibChildren {
     pub(crate) watchdog: tokio::task::AbortHandle,
 }
 
+/// How the wait for the Hamlib message loop's readiness signal
+/// (`loop_ready_rx`, wrapped in a `tokio::time::timeout`) resolved.
+///
+/// PAN-19 round-5 review (Codex P1): a oneshot `Receiver<()>`'s `.await`
+/// output is `Result<(), RecvError>`, so wrapped in `timeout()` the full
+/// type is `Result<Result<(), RecvError>, Elapsed>`. An earlier version of
+/// this fix matched a bare `Ok(_)` on the OUTER `Result` as "ready" --
+/// which also matches `Ok(Err(RecvError))` (the timeout did NOT elapse,
+/// but the sender was dropped WITHOUT sending -- e.g. the spawned Hamlib
+/// task panicked or was cancelled after publishing its child handles but
+/// before reaching the message loop). Extracted as a small, pure,
+/// directly-testable classification so the three outcomes can't be
+/// conflated again: only `Ready` is genuine readiness; `SenderDropped` and
+/// `TimedOut` are both non-ready, but are NOT interchangeable --
+/// `start_hamlib_component` treats a dropped sender as a hard failure
+/// (bail; the generation is provably dead) and a timeout as a soft one
+/// (log and proceed; the generation may just be slow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LoopReadyOutcome {
+    /// The message loop confirmed it's actually consuming commands.
+    Ready,
+    /// The sender was dropped without sending -- the task is gone
+    /// (panicked/cancelled) and will never reach its message loop.
+    SenderDropped,
+    /// Neither happened within the bounded wait; genuinely unknown.
+    TimedOut,
+}
+
+pub(crate) fn classify_loop_ready(
+    result: Result<Result<(), tokio::sync::oneshot::error::RecvError>, tokio::time::error::Elapsed>,
+) -> LoopReadyOutcome {
+    match result {
+        Ok(Ok(())) => LoopReadyOutcome::Ready,
+        Ok(Err(_)) => LoopReadyOutcome::SenderDropped,
+        Err(_) => LoopReadyOutcome::TimedOut,
+    }
+}
+
+#[cfg(test)]
+mod classify_loop_ready_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ready_when_the_signal_is_genuinely_received() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let _ = tx.send(());
+        let result = tokio::time::timeout(Duration::from_millis(50), rx).await;
+        assert_eq!(classify_loop_ready(result), LoopReadyOutcome::Ready);
+    }
+
+    /// PAN-19 round-5 review (Codex P1): the exact bug this guards
+    /// against -- a dropped sender (the spawned Hamlib task panicked or
+    /// was cancelled before it could signal ready) must NOT be classified
+    /// as `Ready`. This is the discriminator `start_hamlib_component`'s
+    /// match now relies on to bail (keeping TX inhibited) instead of
+    /// reporting a dead generation as ready to un-inhibit TX.
+    #[tokio::test]
+    async fn sender_dropped_is_not_confused_with_ready() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        drop(tx);
+        let result = tokio::time::timeout(Duration::from_millis(50), rx).await;
+        assert_eq!(
+            classify_loop_ready(result),
+            LoopReadyOutcome::SenderDropped,
+            "a dropped sender must be classified as SenderDropped, distinct from Ready"
+        );
+    }
+
+    /// The flip side: a genuine timeout (sender alive, never sent) must
+    /// classify separately from a dropped sender -- `start_hamlib_component`
+    /// treats the two very differently (bail vs. soft log-and-continue).
+    #[tokio::test]
+    async fn genuine_timeout_is_classified_separately_from_a_dropped_sender() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<()>();
+        // `_tx` stays alive (not dropped, not sent) -- the wait must
+        // genuinely time out rather than resolve early for either reason.
+        let result = tokio::time::timeout(Duration::from_millis(20), rx).await;
+        assert_eq!(classify_loop_ready(result), LoopReadyOutcome::TimedOut);
+    }
+}
+
 /// Whether a spawned Hamlib child task (poll loop or PTT watchdog)
 /// terminated unexpectedly and the outer message-loop task should treat
 /// that as a crash.
@@ -293,22 +374,37 @@ impl super::ApplicationCoordinator {
             MessageType::RigControl(crate::message_bus::RigControlMessage::SetPtt { state: false })
         );
 
+        // `Option` (not a bare `ComponentMessage`) so the borrow checker
+        // can see that "not delivered" always leaves a value here to fall
+        // back on, across every loop exit path (the `Ok(())` arm consumes
+        // it with nothing to give back, but that path always sets
+        // `delivered = true`, which we check before ever touching
+        // `pending` again below).
         let mut delivered = false;
-        let mut pending = message;
+        let mut pending = Some(message);
         for attempt in 1..=REPLAY_RETRY_ATTEMPTS {
-            match sender.try_send(pending) {
+            let attempted = pending.take().expect(
+                "pending is always Some at the top of each iteration: only the Ok(()) arm \
+                 leaves it None, and that arm always breaks the loop",
+            );
+            match sender.try_send(attempted) {
                 Ok(()) => {
                     delivered = true;
                     break;
                 }
                 Err(crossbeam_channel::TrySendError::Full(returned)) => {
-                    pending = returned;
+                    pending = Some(returned);
                     if attempt < REPLAY_RETRY_ATTEMPTS {
                         tokio::time::sleep(REPLAY_RETRY_DELAY).await;
                     }
                 }
-                Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
-                    // No receiver at all -- retrying can't help.
+                Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
+                    // No receiver at all on THIS channel -- retrying here
+                    // can't help, but `pending` is still reassigned so the
+                    // fallback below (direct PTT-off command, or queuing
+                    // SetFrequency/SetSplit for the NEXT generation) still
+                    // has the message to work with.
+                    pending = Some(returned);
                     break;
                 }
             }
@@ -317,6 +413,9 @@ impl super::ApplicationCoordinator {
         if delivered {
             return;
         }
+
+        let pending = pending
+            .expect("not delivered implies the Full/Disconnected arm above reassigned pending");
 
         if is_ptt_off {
             warn!(
@@ -343,10 +442,90 @@ impl super::ApplicationCoordinator {
                 }
             }
         } else {
-            warn!(
-                "Hamlib teardown: dropping a replayed message, channel still full after \
-                 {REPLAY_RETRY_ATTEMPTS} attempts"
-            );
+            // PAN-19 round-5 review (Codex P1): don't just log-and-drop
+            // `SetFrequency`/`SetSplit` here -- stash the LATEST of each
+            // into a supervisor-owned pending slot (`self.
+            // hamlib_pending_frequency`/`hamlib_pending_split`, living on
+            // `self`, not inside the spawned task, so it survives this
+            // generation's teardown) and deliver it to the NEXT Hamlib
+            // generation once its message loop confirms readiness (see
+            // the `LoopReadyOutcome::Ready` arm in `start_hamlib_component`
+            // below). `SetFrequency` is largely self-healing (the poll
+            // loop re-reads/re-publishes the rig's actual frequency every
+            // 500ms), but `SetSplit` is NOT -- nothing else in this
+            // codebase re-asserts split state, so silently dropping it
+            // could leave the rig holding stale split config (e.g. still
+            // split-on with an old TX frequency) with nothing to notice or
+            // correct it, a real off-frequency-TX risk. Only the latest of
+            // each type is kept (overwrite, not append) -- no need to
+            // replay a stale sequence of intermediate changes, just the
+            // final desired state. Anything else that reaches here (in
+            // practice nothing else survives the drain's safe-message
+            // filter and this loop's own message-type handling) still
+            // logs-and-drops as a last resort.
+            match &pending.message_type {
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                    ..
+                }) => {
+                    warn!(
+                        "Hamlib teardown: replay channel stayed full for a SetFrequency \
+                         command -- queuing it for the next Hamlib generation instead of \
+                         dropping it"
+                    );
+                    self.hamlib_pending_frequency = Some(pending);
+                }
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                    ..
+                }) => {
+                    warn!(
+                        "Hamlib teardown: replay channel stayed full for a SetSplit command -- \
+                         queuing it for the next Hamlib generation instead of dropping it \
+                         (a dropped SetSplit is not self-healing and could leave the rig \
+                         holding stale split state)"
+                    );
+                    self.hamlib_pending_split = Some(pending);
+                }
+                _ => {
+                    warn!(
+                        "Hamlib teardown: dropping a replayed message, channel still full \
+                         after {REPLAY_RETRY_ATTEMPTS} attempts"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Deliver any pending `SetFrequency`/`SetSplit` command left over from
+    /// a prior generation's failed teardown replay (see `replay_or_fallback`)
+    /// to THIS generation's now-confirmed-ready message loop, instead of
+    /// leaving it silently lost. Best-effort: a `try_send` failure here
+    /// just means the new channel is somehow already under pressure right
+    /// at startup -- log and move on rather than retrying indefinitely,
+    /// since these are best-effort freshness commands, not the PTT-off
+    /// safety path (which never goes through this queue at all).
+    fn deliver_pending_hamlib_state(
+        &mut self,
+        sender: &crossbeam_channel::Sender<ComponentMessage>,
+    ) {
+        for (label, pending) in [
+            ("SetFrequency", self.hamlib_pending_frequency.take()),
+            ("SetSplit", self.hamlib_pending_split.take()),
+        ] {
+            if let Some(message) = pending {
+                if let Err(e) = sender.try_send(message) {
+                    warn!(
+                        "Hamlib restart: failed to deliver pending {label} command to the new \
+                         generation: {}",
+                        e
+                    );
+                } else {
+                    info!(
+                        target: "rig",
+                        "Hamlib restart: delivered pending {label} command carried over from \
+                         a prior failed teardown replay"
+                    );
+                }
+            }
         }
     }
 
@@ -435,7 +614,7 @@ impl super::ApplicationCoordinator {
             self.rigctld_process.take();
         }
 
-        let (_hamlib_tx, hamlib_rx) = self
+        let (hamlib_tx, hamlib_rx) = self
             .message_bus
             .get_or_create_channel(ComponentId::Hamlib)
             .await?;
@@ -1241,11 +1420,37 @@ impl super::ApplicationCoordinator {
         // it just means TX stays inhibited a little longer than ideal,
         // which is the safe direction to be wrong in.
         if rig_enabled {
-            match tokio::time::timeout(HAMLIB_LOOP_READY_TIMEOUT, loop_ready_rx).await {
-                Ok(_) => {
+            // PAN-19 round-5 review (Codex P1): see `classify_loop_ready`'s
+            // doc comment for why the three outcomes are handled
+            // differently. `SenderDropped` (the generation is provably
+            // dead) mirrors `children_rx`'s own `Ok(Err(_))` arm just
+            // above and bails the same way; that propagates through
+            // `restart_component`'s `Err(e)` branch in `health.rs`, where
+            // `TxInhibitGuard` is leaked (PAN-19 MEDIUM #3) rather than
+            // released for a generation that was never alive to consume
+            // anything. `self.hamlib_children`/`self.rig_handle` are left
+            // set to this (now-dead) generation's stale values on that
+            // path; that's fine -- `hamlib_handle` is already registered
+            // in `named_task_handles`, so the supervisor's own next
+            // `check_task_handles` tick will notice it finished, run
+            // `teardown_hamlib()` to clean up properly, and dispatch a
+            // fresh restart through the normal crash-recovery path.
+            // `TimedOut` stays the soft, non-bailing path -- a slow rig
+            // must never hard-fail startup (the regression the HIGH fix
+            // closed, which must stay closed).
+            match classify_loop_ready(
+                tokio::time::timeout(HAMLIB_LOOP_READY_TIMEOUT, loop_ready_rx).await,
+            ) {
+                LoopReadyOutcome::Ready => {
                     info!(target: "rig", "Hamlib message loop ready to consume commands");
                 }
-                Err(_) => {
+                LoopReadyOutcome::SenderDropped => {
+                    hamlib_abort.abort();
+                    anyhow::bail!(
+                        "Hamlib task exited before its message loop could confirm readiness"
+                    );
+                }
+                LoopReadyOutcome::TimedOut => {
                     warn!(
                         target: "rig",
                         "Hamlib message loop not confirmed ready within an additional {}s -- \
@@ -1255,6 +1460,21 @@ impl super::ApplicationCoordinator {
                 }
             }
         }
+
+        // PAN-19 round-5 review (Codex P1): deliver any `SetFrequency`/
+        // `SetSplit` command a PRIOR generation's teardown couldn't
+        // replay (see `replay_or_fallback`) to THIS generation now that
+        // its message loop has either confirmed readiness or we're
+        // proceeding best-effort past `HAMLIB_LOOP_READY_TIMEOUT` -- in
+        // both cases `hamlib_tx` is a fresh channel the new loop will
+        // drain, so a `try_send` here either lands immediately or sits
+        // ready for the loop to pick up. Not reached on the
+        // `LoopReadyOutcome::SenderDropped` bail path above (this
+        // generation is dead; the pending item stays queued for the NEXT
+        // restart attempt instead), nor on the mock/disabled-rig path's
+        // own equally-fast startup -- called unconditionally here so
+        // both get it.
+        self.deliver_pending_hamlib_state(&hamlib_tx);
 
         // PAN-19 MEDIUM #2: `teardown_hamlib` only drains+aborts
         // `hamlib_orphans` at the START of the NEXT teardown call. A
@@ -2014,6 +2234,181 @@ mod teardown_replay_tests {
             mock.get_operation_count(),
             0,
             "a non-PTT message must never trigger the PTT-off rig fallback"
+        );
+    }
+
+    /// PAN-19 round-5 review (Codex P1): a `SetFrequency` that exhausts its
+    /// bounded retry (channel stayed full) must NOT be silently dropped --
+    /// it must be queued in `self.hamlib_pending_frequency` for delivery
+    /// to the next Hamlib generation (see `deliver_pending_hamlib_state`
+    /// below).
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn replay_or_fallback_queues_a_stuck_set_frequency_instead_of_dropping_it() {
+        let mut coordinator = test_coordinator().await;
+        assert!(coordinator.hamlib_pending_frequency.is_none());
+
+        let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        sender
+            .try_send(set_freq_msg())
+            .expect("pre-fill the one slot");
+
+        coordinator
+            .replay_or_fallback(&sender, set_freq_msg())
+            .await;
+
+        assert!(
+            coordinator.hamlib_pending_frequency.is_some(),
+            "a SetFrequency that couldn't be replayed must be queued, not dropped"
+        );
+    }
+
+    /// The `SetSplit` sibling of the test above -- the non-self-healing
+    /// case Codex specifically flagged: nothing else in this codebase
+    /// re-asserts split state, so a dropped `SetSplit` could leave the rig
+    /// silently holding stale split config.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn replay_or_fallback_queues_a_stuck_set_split_instead_of_dropping_it() {
+        let mut coordinator = test_coordinator().await;
+        assert!(coordinator.hamlib_pending_split.is_none());
+
+        let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        sender
+            .try_send(set_freq_msg())
+            .expect("pre-fill the one slot");
+
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+
+        coordinator.replay_or_fallback(&sender, split_msg).await;
+
+        assert!(
+            coordinator.hamlib_pending_split.is_some(),
+            "a SetSplit that couldn't be replayed must be queued, not dropped -- it isn't \
+             self-healing like SetFrequency"
+        );
+    }
+
+    /// PAN-19 round-5 review (Codex P1): a queued pending command must
+    /// actually be DELIVERED once the next generation's message loop is
+    /// ready -- not just held forever. Covers both `SetFrequency` and
+    /// `SetSplit`, and confirms the pending slots are cleared (drained,
+    /// not duplicated on a later call) once delivered.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_sends_queued_commands_to_the_new_generation() {
+        let mut coordinator = test_coordinator().await;
+
+        coordinator.hamlib_pending_frequency = Some(set_freq_msg());
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        coordinator.hamlib_pending_split = Some(split_msg);
+
+        let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
+        coordinator.deliver_pending_hamlib_state(&sender);
+
+        assert!(
+            coordinator.hamlib_pending_frequency.is_none(),
+            "the pending frequency slot must be drained once delivered"
+        );
+        assert!(
+            coordinator.hamlib_pending_split.is_none(),
+            "the pending split slot must be drained once delivered"
+        );
+
+        let mut delivered_types: Vec<bool> = Vec::new(); // true = SetFrequency, false = SetSplit
+        while let Ok(msg) = receiver.try_recv() {
+            match msg.message_type {
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                    ..
+                }) => delivered_types.push(true),
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                    ..
+                }) => delivered_types.push(false),
+                other => panic!("unexpected message delivered: {other:?}"),
+            }
+        }
+        assert_eq!(
+            delivered_types.len(),
+            2,
+            "both the pending SetFrequency and SetSplit must have been delivered onto the \
+             new generation's channel"
+        );
+        assert!(
+            delivered_types.contains(&true),
+            "SetFrequency must be delivered"
+        );
+        assert!(
+            delivered_types.contains(&false),
+            "SetSplit must be delivered"
+        );
+    }
+
+    /// End-to-end shape of the fix: a `SetSplit` that fails to replay
+    /// during one generation's teardown is later delivered once the NEXT
+    /// generation's channel is available -- not lost in between.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn a_stuck_set_split_survives_to_be_delivered_to_the_next_generation() {
+        let mut coordinator = test_coordinator().await;
+
+        // Simulate a failed teardown replay: the OLD generation's channel
+        // stays full for the whole bounded retry.
+        let (old_sender, _old_receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        old_sender
+            .try_send(set_freq_msg())
+            .expect("pre-fill the one slot");
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        coordinator.replay_or_fallback(&old_sender, split_msg).await;
+        assert!(
+            coordinator.hamlib_pending_split.is_some(),
+            "test setup: the SetSplit must have been queued, not delivered"
+        );
+
+        // The NEXT generation's (fresh, empty) channel -- delivery must
+        // land here once it's confirmed ready.
+        let (new_sender, new_receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
+        coordinator.deliver_pending_hamlib_state(&new_sender);
+
+        let delivered = new_receiver
+            .try_recv()
+            .expect("the queued SetSplit must have been delivered to the new generation");
+        assert!(
+            matches!(
+                delivered.message_type,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                    enabled: true,
+                    tx_frequency: 14_078_000
+                })
+            ),
+            "the delivered message must be the SAME SetSplit that failed to replay earlier"
+        );
+        assert!(
+            coordinator.hamlib_pending_split.is_none(),
+            "the pending slot must be cleared once delivered"
         );
     }
 }
