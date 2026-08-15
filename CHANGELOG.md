@@ -30,6 +30,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   progress/status) over the relay, sharing the same translation pump the
   localhost remote gateway uses.
 
+### Changed
+
+- `k` (abort the selected QSO) now fires from any TUI panel — DX Hunter,
+  Band Activity, Callers, wherever focus currently is — instead of only
+  when the QSO Status panel is focused (PAN-21). The abort target is
+  whatever is pinned/highlighted in the QSO Status panel (independent of
+  which panel has focus), and that highlight is already visible regardless
+  of focus, so the operator can always see what `k` would hit before
+  pressing it. `r` (re-send) is unchanged and still gated to the QSO
+  Status panel. To make `k` safe to use globally, the `j`/`k` vim-scroll
+  aliases were removed from the Diagnostics (Shift+D) and Recent-QSOs
+  (Shift+R) overlays — Up/Down arrows are now the only way to scroll
+  them — since those were the only two places `j`/`k` collided with
+  anything. `k` still aborts the selected QSO even while one of those
+  overlays is open, since they're read-only informational views rather
+  than modals the operator is editing.
+
 ### Fixed
 
 - Manual split-TX QSOs whose offset was held, collision-nudged, or passband-clamped now recover after two consistent DX replies at a new frequency without moving the station's chosen TX offset ([#245](https://github.com/HagaleTechnologies/pancetta/issues/245)). Genuine Hound/Fox behavior is unchanged.
