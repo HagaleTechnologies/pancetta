@@ -109,6 +109,58 @@ fn callsign_is_wire_representable(callsign: &str) -> bool {
     upper.len() <= 11 && upper.chars().all(|c| HASH_CALL_CHARSET.contains(c))
 }
 
+/// PAN-17 round 3 (Codex re-review of #248, finding 1): is `callsign`
+/// *plausibly* representable via `pack28` (the i3=1 standard path — the
+/// ONLY path that can carry a numeric report/ack; the i3=4 nonstandard-
+/// callsign path's 2-bit report field only has room for
+/// blank/RRR/RR73/73, never a real dB value — see
+/// `pancetta_ft8::encoder::try_encode_nonstandard`'s doc)?
+///
+/// A loose mirror of `pack28`'s real acceptance shape — length 3-6 after
+/// stripping a bare `/P` or `/R` suffix, and no OTHER `/` component —
+/// without depending on pancetta-ft8 at runtime (see
+/// `callsign_is_wire_representable`'s doc for why pancetta-qso can't call
+/// `pack28` directly). Deliberately conservative in the SAFE direction:
+/// this can return `true` for a callsign that would actually fail
+/// `pack28`'s finer digit-position rules (e.g. `"8G81PA"` — 6 chars, no
+/// other `/`, but position 3 is a digit where `pack28` requires a letter)
+/// — an accepted false positive: it only costs speed (the QSO falls back
+/// to the slower pre-existing generic timeout instead of this fast
+/// watchdog check), never wrongly retires a QSO with a genuinely standard
+/// callsign. It must NEVER return `false` for a callsign `pack28` would
+/// actually accept.
+fn callsign_is_plausibly_pack28_standard(callsign: &str) -> bool {
+    let upper = callsign.to_ascii_uppercase();
+    let base = upper
+        .strip_suffix("/P")
+        .or_else(|| upper.strip_suffix("/R"))
+        .unwrap_or(upper.as_str());
+    // Any OTHER '/' (a compound prefix, or a portable suffix other than a
+    // bare /P or /R — pack28's ONLY two special-cased suffixes) is
+    // definitely not pack28-representable.
+    !base.contains('/') && (3..=6).contains(&base.len())
+}
+
+/// PAN-17 round 3 (Codex re-review of #248, finding 1): the DX callsign a
+/// QSO's outgoing message would embed, ONLY for the rungs whose associated
+/// message is a genuine numeric dB report/ack (`SignalReport`/`ReportAck`)
+/// — never just a token (RRR/RR73/73) or a droppable grid. `None` for every
+/// other state (nothing report-shaped to check).
+///
+/// `SendingReport`/`WaitingForReport` always transmit or re-send our own
+/// numeric `SignalReport`; `WaitingForConfirmation` re-sends our numeric
+/// `ReportAck` (`R±NN`) if the DX repeats their report. `SendingConfirmation`
+/// is deliberately excluded — it only ever sends RR73/73, both representable
+/// via i3=4 regardless of callsign shape.
+fn report_stage_partner_callsign(state: &QsoState) -> Option<&str> {
+    match state {
+        QsoState::SendingReport { their_callsign, .. }
+        | QsoState::WaitingForReport { their_callsign, .. }
+        | QsoState::WaitingForConfirmation { their_callsign, .. } => Some(their_callsign.as_str()),
+        _ => None,
+    }
+}
+
 /// Pick an audio offset in `[lo, hi]` deterministically from `seed` (e.g. a
 /// callsign), spreading distinct seeds across the region so concurrent Hound
 /// QSOs don't stack on one offset. Deterministic: same seed → same offset.
@@ -4813,26 +4865,40 @@ impl QsoManager {
             // stuck on the generic timeout — the exact PAN-17 symptom just
             // moved to the other callsign.
             //
-            // Deliberately does NOT also fast-fail a report-bearing rung
-            // (SendingReport / WaitingForReport / WaitingForConfirmation)
-            // just because `their_callsign` isn't pack28-plausible: the
-            // compound-callsign-equivalence feature (catalog C18,
-            // `pancetta_core::callsign::callsigns_match`,
-            // `pancetta-qso/tests/adversarial_compound_calls.rs`)
-            // deliberately LATCHES the most-complete callsign form ever
-            // seen (e.g. `EA8/G8BCG`) even after the DX starts signing its
-            // bare base (`G8BCG`) — so `their_callsign` staying compound
-            // does not reliably predict which form the actual outgoing
-            // report will address. A heuristic here risked retiring
-            // healthy, actively-progressing QSOs (confirmed against
+            // Round 3 (Codex re-review, finding 1): ALSO fast-fails a
+            // report-bearing rung (SendingReport / WaitingForReport /
+            // WaitingForConfirmation — see `report_stage_partner_callsign`)
+            // whose partner isn't plausibly pack28-standard
+            // (`callsign_is_plausibly_pack28_standard`), even though the
+            // partner's callsign passes the plain wire-representability
+            // check above (fits the i3=4 hash field fine). The round-1
+            // encoder fix (`pancetta_ft8::encoder::try_encode_nonstandard`'s
+            // doc) makes a numeric report/ack to such a partner fail
+            // LOUDLY rather than silently blanking — correct — but nothing
+            // stopped the QSO from re-arming that exact doomed encode every
+            // slot once it reached this rung, which is the original PAN-17
+            // "burns the watchdog window retrying an unencodable message"
+            // symptom relocated to the report stage.
+            //
+            // Round 2 deliberately omitted this check because a naive
+            // version (keyed on `metadata.their_callsign`, the "most
+            // complete form ever seen") falsely retired healthy QSOs in
             // `adversarial_compound_calls.rs`'s compound-then-base
-            // scenarios). The encoder's own refusal to silently blank an
-            // unrepresentable report (see
-            // `pancetta_ft8::encoder::try_encode_nonstandard`'s doc) still
-            // stands — that residual case falls back to the slower
-            // pre-existing generic timeout instead of this fast watchdog,
-            // which is the safe direction (see
-            // `callsign_is_plausibly_pack28_standard`'s doc).
+            // scenarios. That risk doesn't apply here: `report_stage_
+            // partner_callsign` reads the STATE's own `their_callsign`
+            // field, which is exactly the value `MessageExchange::
+            // generate_response` embeds in the real outgoing
+            // SignalReport/ReportAck (`to_station`/`from_station` come
+            // straight from this same field — see exchange.rs) — so this
+            // check fires if and only if the message the QSO is actually
+            // about to (re-)send is genuinely unencodable, not on a
+            // heuristic guess. `compound_first_then_base_completes` and
+            // `cqer_caller_compound_then_base_completes` were updated to
+            // assert the (now correct) fast MessageUnencodable retirement
+            // — those scenarios need a real numeric report addressed to a
+            // compound-form callsign, which round 1's encoder fix already
+            // made impossible over real FT8; the tests just never
+            // exercised the real encoder before, so they didn't notice.
             if active_tx_state {
                 let our = self.config.our_callsign.as_str();
                 let their = progress.metadata.their_callsign.as_deref();
@@ -4848,6 +4914,20 @@ impl QsoManager {
                             "callsign '{}' cannot be represented in any FT8 message format",
                             their
                         ))
+                    } else if let Some(report_partner) =
+                        report_stage_partner_callsign(&progress.state)
+                    {
+                        if !callsign_is_plausibly_pack28_standard(report_partner)
+                            || !callsign_is_plausibly_pack28_standard(our)
+                        {
+                            Some(format!(
+                                "cannot send a numeric report/ack to '{}' — i3=4 (required \
+                                 because a compound callsign is involved) has no field for one",
+                                report_partner
+                            ))
+                        } else {
+                            None
+                        }
                     } else {
                         None
                     }
@@ -6203,6 +6283,300 @@ mod tests {
             matches!(reason, Some(QsoFailureReason::MessageUnencodable(_))),
             "expected MessageUnencodable, got {:?}",
             reason
+        );
+    }
+
+    #[test]
+    fn callsign_is_plausibly_pack28_standard_boundary() {
+        assert!(callsign_is_plausibly_pack28_standard("K1ABC"));
+        assert!(callsign_is_plausibly_pack28_standard("W1AW"));
+        assert!(callsign_is_plausibly_pack28_standard("K1ABC/P"));
+        assert!(callsign_is_plausibly_pack28_standard("K1ABC/R"));
+        // Accepted false positive (see the fn's doc): fails pack28's real
+        // digit-position rule but this loose check can't detect that.
+        assert!(callsign_is_plausibly_pack28_standard("8G81PA"));
+        // Unambiguously compound / not pack28-shaped.
+        assert!(!callsign_is_plausibly_pack28_standard("YS/WE9G"));
+        assert!(!callsign_is_plausibly_pack28_standard("EA8/G8BCG"));
+        assert!(!callsign_is_plausibly_pack28_standard("VP2/W1XYZ"));
+        assert!(!callsign_is_plausibly_pack28_standard("PJ4/KA1ABC"));
+        assert!(!callsign_is_plausibly_pack28_standard("3E40CDW")); // 7 chars
+        assert!(!callsign_is_plausibly_pack28_standard("AB")); // 2 chars
+    }
+
+    #[test]
+    fn report_stage_partner_callsign_extracts_from_report_bearing_states_only() {
+        let now = Utc::now();
+        assert_eq!(
+            report_stage_partner_callsign(&QsoState::SendingReport {
+                their_callsign: "YS/WE9G".to_string(),
+                their_report: None,
+                our_report: -10,
+                frequency: 14074000.0,
+                started_at: now,
+            }),
+            Some("YS/WE9G")
+        );
+        assert_eq!(
+            report_stage_partner_callsign(&QsoState::WaitingForReport {
+                their_callsign: "YS/WE9G".to_string(),
+                frequency: 14074000.0,
+                started_at: now,
+                their_grid: None,
+                our_report: -10,
+            }),
+            Some("YS/WE9G")
+        );
+        assert_eq!(
+            report_stage_partner_callsign(&QsoState::WaitingForConfirmation {
+                their_callsign: "YS/WE9G".to_string(),
+                their_report: -10,
+                our_report: -10,
+                frequency: 14074000.0,
+                grid_square: None,
+                started_at: now,
+            }),
+            Some("YS/WE9G")
+        );
+        // SendingConfirmation only ever sends RR73/73 (both representable
+        // via i3=4 regardless of callsign shape) -- deliberately excluded.
+        assert_eq!(
+            report_stage_partner_callsign(&QsoState::SendingConfirmation {
+                their_callsign: "YS/WE9G".to_string(),
+                their_report: -10,
+                our_report: -10,
+                frequency: 14074000.0,
+                grid_square: None,
+                started_at: now,
+            }),
+            None
+        );
+        assert_eq!(report_stage_partner_callsign(&QsoState::Idle), None);
+    }
+
+    /// PAN-17 round 3 (Codex re-review of #248, finding 3): a resolved i3=4
+    /// hash render ("<K1DEF>") must be normalized to the plain callsign
+    /// ("K1DEF") before it flows into latched QSO state -- otherwise the
+    /// still-bracketed literal self-sabotages via the unencodable-message
+    /// watchdog (`<`/`>` are outside the wire charset). Exercises the full
+    /// parse -> process_message -> latch path (the normalization itself
+    /// lives in `exchange.rs::normalize_callsign_token`; this proves it's
+    /// wired end-to-end into the QSO engine, not just unit-tested in
+    /// isolation).
+    #[tokio::test]
+    async fn resolved_hash_render_reply_latches_plain_callsign_not_bracketed() {
+        let mut config = test_config();
+        config.our_callsign = "YS/WE9G".to_string(); // compound operator
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager.start_cq(14074000.0, None, false).await.unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        // K1DEF (a standard callsign) replies to our compound CQ; their own
+        // callsign lands in the i3=4 hash slot and, having resolved,
+        // decodes as "<K1DEF>" -- exactly the wire text
+        // `MessageExchange::parse_message` would receive from the decoder.
+        let raw_text = "YS/WE9G <K1DEF> EM10";
+        let parsed = crate::utils::parse_ft8_message(raw_text, "YS/WE9G").unwrap();
+        assert!(
+            matches!(&parsed, MessageType::CqResponse { responding_station, .. } if responding_station == "K1DEF"),
+            "parse_ft8_message must normalize the resolved hash render, got: {:?}",
+            parsed
+        );
+
+        manager
+            .process_message(parsed, raw_text.to_string(), 14074000.0, Some(-10.0))
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(&progress.state, QsoState::WaitingForReport { their_callsign, .. } if their_callsign == "K1DEF"),
+            "expected their_callsign latched as the plain 'K1DEF', got: {:?}",
+            progress.state
+        );
+
+        // The QSO has landed directly on a report-bearing rung
+        // (WaitingForReport) needing a numeric report addressed to OUR
+        // OWN compound callsign -- symmetric to finding 1, that
+        // genuinely cannot be encoded via real FT8 regardless of which
+        // side is compound, so round 3's report-stage check correctly
+        // retires it. What this test isolates is WHY: the failure reason
+        // must be the report-stage wording (proving K1DEF already passed
+        // the plain wire-representability check first) and must NOT
+        // mention invalid characters or contain the raw "<" / ">"
+        // brackets -- if normalization had NOT happened, the round-2
+        // wire-representability check (which runs BEFORE the round-3
+        // report-stage check) would have rejected "<K1DEF>" outright on
+        // its invalid characters instead.
+        let mut events = manager.subscribe();
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+        assert!(matches!(
+            manager.get_qso(qso_id).await,
+            Err(QsoManagerError::QsoNotFound { .. })
+        ));
+
+        let mut reason = None;
+        while let Ok(ev) = events.try_recv() {
+            if let QsoEvent::QsoFailed {
+                qso_id: id,
+                reason: r,
+                ..
+            } = ev
+            {
+                if id == qso_id {
+                    reason = Some(r);
+                }
+            }
+        }
+        match reason {
+            Some(QsoFailureReason::MessageUnencodable(detail)) => {
+                assert!(
+                    detail.contains("numeric report"),
+                    "expected the report-stage reason, got: {detail}"
+                );
+                assert!(
+                    !detail.contains('<') && !detail.contains('>'),
+                    "failure reason must reference the plain callsign, not a \
+                     bracketed hash render: {detail}"
+                );
+                assert!(
+                    detail.contains("K1DEF") && !detail.contains("<K1DEF>"),
+                    "failure reason must name the plain 'K1DEF', not '<K1DEF>': {detail}"
+                );
+            }
+            other => panic!("expected MessageUnencodable, got {:?}", other),
+        }
+    }
+
+    /// PAN-17 round 3 (Codex re-review of #248, finding 1): a QSO that
+    /// reaches a report-bearing rung (here, `SendingReport`) against a
+    /// still-compound partner must retire immediately with
+    /// `MessageUnencodable`, instead of re-arming an encode that
+    /// `try_encode_nonstandard` (pancetta-ft8) will always refuse — the
+    /// original PAN-17 symptom relocated to the report stage. `YS/WE9G`
+    /// alone passes `callsign_is_wire_representable` (it fits the 58-bit
+    /// hash field fine), so this specifically exercises the NEW
+    /// report-stage check, not the pre-existing wire-representability one.
+    #[tokio::test]
+    async fn report_stage_watchdog_retires_compound_partner() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("YS/WE9G".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            progress.state = QsoState::SendingReport {
+                their_callsign: "YS/WE9G".to_string(),
+                their_report: Some(-10),
+                our_report: -10,
+                frequency: 14074000.0,
+                started_at: start,
+            };
+        }
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(
+            matches!(
+                manager.get_qso(qso_id).await,
+                Err(QsoManagerError::QsoNotFound { .. })
+            ),
+            "a report-bearing rung against a compound-callsign partner must retire fast"
+        );
+    }
+
+    /// The report-stage watchdog must NOT trip for a perfectly ordinary
+    /// standard-callsign partner at the same rung -- no false positives.
+    #[tokio::test]
+    async fn report_stage_watchdog_does_not_retire_standard_partner() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            progress.state = QsoState::SendingReport {
+                their_callsign: "K1DEF".to_string(),
+                their_report: Some(-10),
+                our_report: -10,
+                frequency: 14074000.0,
+                started_at: start,
+            };
+        }
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(
+            manager.get_qso(qso_id).await.is_ok(),
+            "a report-bearing rung against a standard-callsign partner must NOT retire early"
+        );
+    }
+
+    /// A bare `/P` or `/R` suffix is genuinely pack28-representable (the
+    /// ONLY two suffixes `pack28` special-cases) -- the report-stage
+    /// watchdog must not treat it as unencodable. Regression guard for
+    /// `adversarial_compound_calls.rs::base_first_then_portable_suffix_completes`.
+    #[tokio::test]
+    async fn report_stage_watchdog_does_not_retire_portable_suffix_partner() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("G8BCG/P".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            progress.state = QsoState::SendingReport {
+                their_callsign: "G8BCG/P".to_string(),
+                their_report: Some(-5),
+                our_report: -5,
+                frequency: 14074000.0,
+                started_at: start,
+            };
+        }
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(
+            manager.get_qso(qso_id).await.is_ok(),
+            "a /P-suffix partner is pack28-representable and must NOT retire early"
         );
     }
 

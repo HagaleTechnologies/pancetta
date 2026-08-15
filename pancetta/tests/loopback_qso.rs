@@ -1186,10 +1186,10 @@ fn test_six_char_grid_encodes_standard_callgrid() {
     );
 }
 
-/// PAN-17 round 2 (Codex review #248, finding 2): a compound-callsign QSO
-/// must be a WORKING QSO, not just a TX-only feature. Before this fix, the
-/// encoder alone gained i3=4 support but three separate decode-side layers
-/// still blocked a reply from ever reaching the QSO engine:
+/// PAN-17 rounds 2-3 (Codex review #248): a compound-callsign QSO must be
+/// a WORKING QSO, not just a TX-only feature. Before round 2, the encoder
+/// alone had i3=4 support but three separate decode-side layers still
+/// blocked a reply from ever reaching the QSO engine:
 ///   (a) `Ft8Message::is_plausible` rejected a decoded compound callsign
 ///       outright (assumed the 3-6-char packed-encoding shape),
 ///   (b) `MessageExchange`'s regex patterns / `validate_callsign` couldn't
@@ -1197,6 +1197,17 @@ fn test_six_char_grid_encodes_standard_callgrid() {
 ///   (c) the decoder's i3=4 hash table was never seeded with our own
 ///       callsign, so a compound-call DX addressing us always resolved to
 ///       the unrecoverable "<...>" placeholder instead of our plain text.
+/// Round 3 closed two residual gaps (c) left: the production hash table
+/// was still only ever seeded with OUR OWN callsign (`seed_hash_callsign`),
+/// never a caller we hadn't directly worked — `decoder.rs` now seeds it
+/// from every decoded `MessageType::Standard` callsign, which is what this
+/// test's `dx_codec.decoder.seed_hash_callsign("K5ARH")` line stands in
+/// for (in production, decoding OUR earlier standard-format traffic would
+/// have seeded it the same way). And even once resolved, the render stays
+/// BRACKETED ("<K5ARH>") — `MessageExchange::parse_message` now normalizes
+/// it to plain "K5ARH" (`normalize_callsign_token`, exchange.rs) before it
+/// flows into `MessageType`/latched QSO state, so it doesn't self-sabotage
+/// via the unencodable-message watchdog on its own brackets.
 ///
 /// This test drives the SAME real encode -> modulate -> decode -> parse ->
 /// QSO-engine pipeline `test_loopback_state_machine_driven_qso` uses above,
@@ -1204,8 +1215,9 @@ fn test_six_char_grid_encodes_standard_callgrid() {
 /// ("YS/WE9G", the PAN-17 live-incident callsign), and asserts the
 /// responder's reply — where OUR callsign lands in the lossy 12-bit hash
 /// slot (see `try_encode_nonstandard`'s doc: the pack28-failing callsign
-/// always wins the exact slot) — is correctly decoded and ADVANCES the
-/// CQer's own QSO state machine, not just successfully transmitted.
+/// always wins the exact slot) — is correctly decoded, normalized, and
+/// ADVANCES the CQer's own QSO state machine, not just successfully
+/// transmitted.
 #[tokio::test]
 async fn test_loopback_compound_callsign_qso_advances_state_machine() {
     use pancetta_qso::{utils, QsoManager};
@@ -1328,12 +1340,13 @@ async fn test_loopback_compound_callsign_qso_advances_state_machine() {
     assert!(!decoded.is_empty(), "DX must decode our CqResponse");
     let decoded_response = &decoded[0].text;
     // Finding 2(c): our callsign resolves via the seeded hash table
-    // instead of rendering as the unrecoverable "<...>" placeholder. A
-    // RESOLVED hash still renders bracketed ("<K5ARH>", matching WSJT-X
-    // convention -- it was recovered from a 12-bit hash, not decoded
-    // directly) -- `callsigns_match`'s hash-render resolution (finding 2,
-    // `pancetta_core::callsign`) is what lets this still route correctly
-    // below despite the brackets.
+    // instead of rendering as the unrecoverable "<...>" placeholder. The
+    // RAW decoded text still renders a resolved hash bracketed
+    // ("<K5ARH>", matching WSJT-X convention -- it was recovered from a
+    // 12-bit hash, not decoded directly); round 3's `parse_ft8_message`
+    // (via `normalize_callsign_token`, exchange.rs) strips the brackets
+    // before the parsed `MessageType`/latched QSO state ever sees it --
+    // asserted below.
     assert_eq!(decoded_response, "YS/WE9G <K5ARH>");
 
     // Finding 2(a)+(b): the decoded reply must parse into a real
@@ -1357,25 +1370,19 @@ async fn test_loopback_compound_callsign_qso_advances_state_machine() {
         .unwrap();
 
     let progress_dx = manager_dx.get_qso(qso_id_dx).await.unwrap();
-    // The latched partner callsign is whatever form the decoded frame
-    // carried ("<K5ARH>", the resolved-hash render) -- `callsigns_match`'s
-    // hash-render resolution (finding 2) is what lets a LATER frame
-    // signing bare "K5ARH" still match this latched partner, the same way
-    // it already does for compound<->base equivalence.
+    // PAN-17 round 3 (Codex re-review of #248, finding 3): the RAW decoded
+    // text carries the bracketed resolved-hash render ("<K5ARH>", asserted
+    // above), but `MessageExchange::parse_message` normalizes it to the
+    // plain callsign BEFORE constructing the `MessageType` --
+    // `normalize_callsign_token`, exchange.rs -- so the latched partner
+    // callsign is the plain "K5ARH", not the bracketed literal. Without
+    // this, the still-bracketed form would self-sabotage via the
+    // unencodable-message watchdog (`<`/`>` are outside the wire charset)
+    // the moment it was latched.
     assert!(
-        matches!(progress_dx.state, QsoState::WaitingForReport { ref their_callsign, .. } if their_callsign == "<K5ARH>"),
+        matches!(progress_dx.state, QsoState::WaitingForReport { ref their_callsign, .. } if their_callsign == "K5ARH"),
         "compound-callsign DX's QSO should advance CallingCq -> WaitingForReport \
-         on receiving our reply, got: {:?}",
+         on receiving our reply, with the partner normalized to plain \"K5ARH\", got: {:?}",
         progress_dx.state
-    );
-    assert!(
-        pancetta_core::callsign::callsigns_match(
-            match &progress_dx.state {
-                QsoState::WaitingForReport { their_callsign, .. } => their_callsign,
-                _ => unreachable!(),
-            },
-            "K5ARH"
-        ),
-        "the latched hash-rendered partner must still match our plain callsign"
     );
 }

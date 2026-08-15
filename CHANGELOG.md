@@ -44,14 +44,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   compound-callsign operator can call CQ with their own grid too. The
   decode side now recognizes and routes a reply FROM a compound-callsign
   station (previously TX-only: the message would key the radio but a reply
-  could never be decoded back into the QSO engine) — the decoder's own
-  callsign is seeded into its i3=4 hash table so a compound-call DX's reply
-  resolves instead of rendering as the unrecoverable `<...>` placeholder,
-  and callsign matching/plausibility checks now understand both the exact
-  compound form and the resolved-hash `<CALL>` render. Separately, a QSO
-  whose DX or configured OWN callsign can never be represented in any FT8
-  format (invalid characters or >11 chars — e.g. the decoder's own `<...>`
-  hash-miss placeholder leaking into the partner field) is now retired
+  could never be decoded back into the QSO engine) — the decoder seeds its
+  i3=4 hash table both from our own callsign and from every standard-format
+  callsign it decodes (not just our own), so a compound-call DX's reply, or
+  a standard-callsign caller replying to a compound-callsign operator's own
+  CQ, resolves instead of rendering as the unrecoverable `<...>` placeholder;
+  a resolved hash render (`<CALL>`) is normalized to the plain callsign
+  before it flows into QSO state, so it can't self-sabotage the very
+  watchdog that checks callsign representability. A QSO that reaches a
+  report-bearing stage (a genuine numeric SignalReport/ReportAck, never
+  just RRR/RR73/73) against a still-compound partner now also retires
+  immediately instead of re-arming a doomed encode — the same PAN-17
+  symptom relocated to the report stage. Separately, a QSO whose DX or
+  configured OWN callsign can never be represented in any FT8 format
+  (invalid characters or >11 chars — e.g. the decoder's own `<...>`
+  hash-miss placeholder leaking into the partner field) is retired
   immediately with a distinct "cannot transmit this message" reason instead
   of being indistinguishable from a plain DX-never-answered timeout.
 

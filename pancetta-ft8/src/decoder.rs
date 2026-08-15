@@ -26,7 +26,9 @@
 
 use crate::{
     budget::{DecodeBudget, DecodeBudgetReport},
-    message::{calculate_crc14, DecodedMessage, MessageParser, CRC_BITS, PAYLOAD_BITS},
+    message::{
+        calculate_crc14, DecodedMessage, MessageParser, MessageType, CRC_BITS, PAYLOAD_BITS,
+    },
     osd::{OsdConfig, OsdDecoder},
     protocol::ProtocolParams,
     signal_processing::{FftProcessor, WindowFunction},
@@ -4139,6 +4141,46 @@ impl Ft8Decoder {
             sync_quality: (best_sync_score / 12.0).min(1.0) as f32,
             timestamp: SystemTime::now(),
         };
+
+        // PAN-17 round 3 (Codex re-review of #248, finding 2): seed the
+        // i3=4 hash table with EVERY callsign seen in a decoded STANDARD-
+        // format frame this window, not just our own (`seed_hash_callsign`,
+        // called once at decoder construction/rebuild) — mirrors how
+        // WSJT-X/ft8_lib populate their hash tables from any successfully
+        // decoded plain callsign, not only the operator's own. Without
+        // this, a caller we've never directly worked (only heard, or first
+        // seen replying to OUR compound callsign) resolves to the
+        // unrecoverable "<...>" placeholder the first time their callsign
+        // lands in an i3=4 hash slot — e.g. a standard-callsign station
+        // answering a compound-callsign operator's CQ puts the OPERATOR in
+        // the exact 58-bit slot and the CALLER in the lossy hash slot.
+        // `self.message_parser` is the SAME instance every decode call
+        // path this window borrowed a `&MessageParser` reference into (see
+        // `seed_hash_callsign`'s doc), so writing here — back in a plain
+        // `&mut self` context, after every parallel/rayon pass has
+        // finished — reaches every future decode on this decoder for the
+        // rest of the session. Only `MessageType::Standard` frames qualify
+        // (their callsigns came from `pack28`/`unpack28`, i.e. are real,
+        // structurally-verified plain text); CQ/DE/QRZ tokens and
+        // nonstandard-form or hash-rendered callsigns are skipped — the
+        // former carry no station identity, the latter would just
+        // re-hash an already-hashed or already-exact value.
+        for msg in &all_decoded_messages {
+            if msg.message.message_type != MessageType::Standard {
+                continue;
+            }
+            for call in [
+                msg.message.to_callsign.as_deref(),
+                msg.message.from_callsign.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if call != "CQ" && call != "DE" && call != "QRZ" && !call.starts_with("CQ ") {
+                    self.message_parser.add_callsign(call);
+                }
+            }
+        }
 
         for message in &all_decoded_messages {
             self.message_handler
@@ -14745,6 +14787,73 @@ mod tests {
         // succeed and at least one decode should match the plant.
         let hit = decoded.iter().any(|d| d.text == "CQ K5ARH EM10");
         assert!(hit, "clean signal decode_window should recover plant");
+    }
+
+    /// PAN-17 round 3 (Codex re-review of PR #248, finding 2): production
+    /// only ever seeded the decoder's own configured callsign
+    /// (`seed_hash_callsign`, called once at decoder construction/rebuild
+    /// in `pancetta/src/coordinator/ft8.rs`). A caller we've never
+    /// directly worked -- only heard decoding a standard-format frame --
+    /// must ALSO resolve when their callsign later lands in an i3=4 hash
+    /// slot (e.g. replying to a compound-callsign operator's CQ, which
+    /// puts the operator in the exact 58-bit slot and the caller in the
+    /// lossy 12-bit hash slot). `decode_window_with_ap_scoped_partner_impl`
+    /// (the single choke point every public decode entry point funnels
+    /// through) now seeds the hash table from every `MessageType::Standard`
+    /// decode's callsigns, not just the one passed to `seed_hash_callsign`.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn decoder_seeds_hash_table_from_any_standard_decode_not_just_own_callsign() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let cfg = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(cfg).expect("decoder");
+        // Deliberately do NOT call seed_hash_callsign at all -- the fix
+        // must work purely from decoding a standard-format frame.
+
+        // Step 1: decode a perfectly ordinary standard-format CQ from
+        // K1DEF. Nothing about this involves our own callsign or a
+        // compound-callsign operator -- it's just normal band traffic
+        // K1DEF happened to have transmitted, heard in an earlier slot.
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ K1DEF FN20", None)
+            .expect("encode CQ");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        let decoded = decoder.decode_window(&tx).expect("decode CQ");
+        assert!(
+            decoded.iter().any(|d| d.text == "CQ K1DEF FN20"),
+            "must decode K1DEF's standard CQ"
+        );
+
+        // Step 2: K1DEF (a standard callsign) replies to a compound-
+        // callsign operator's CQ. TO=YS/WE9G (exact 58-bit slot,
+        // compound), FROM=K1DEF (12-bit hash slot, standard) -- exactly
+        // the shape `try_encode_nonstandard` produces (the pack28-failing
+        // callsign always wins the exact slot).
+        let symbols2 = encoder
+            .encode_message("YS/WE9G K1DEF RR73", None)
+            .expect("encode i3=4 reply");
+        let mut tx2 = modulator
+            .modulate_symbols(&symbols2, 800.0)
+            .expect("modulate");
+        tx2.resize(WINDOW_SAMPLES, 0.0);
+        let decoded2 = decoder.decode_window(&tx2).expect("decode i3=4 reply");
+
+        let hit = decoded2
+            .iter()
+            .find(|d| d.message.to_callsign.as_deref() == Some("YS/WE9G"))
+            .expect("must decode the i3=4 reply addressed to YS/WE9G");
+        assert_eq!(
+            hit.message.from_callsign.as_deref(),
+            Some("<K1DEF>"),
+            "K1DEF must resolve via the hash table seeded from step 1's \
+             standard decode, not render as the unrecoverable <...> placeholder"
+        );
     }
 
     #[test]
