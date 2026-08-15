@@ -136,6 +136,20 @@ pub struct LiveSpotsResponse {
 /// (cqdx, 2026-07-24, dispensa Q-0043) — per-item fields match the original
 /// proposal; field casing (camelCase) matches ADR-0003, same as every other
 /// endpoint in this file.
+///
+/// `role` and `delegated_by` were added for PAN-18 (dispensa Q-0052 #4/#4(b),
+/// PRs #105/#106/#107, 2026-08-15) — peer admission (`tx_allow_list`) and
+/// TX-arm eligibility (`tx_arm_allow_list`) must NOT share one filter. See
+/// `pancetta::coordinator::station_agent`'s `poll_authorizations_loop` for the
+/// consumer: `role` is always `"owner"` within the subset a station polls for
+/// its own `agentKeyId` (a station is always the grantor of every edge it
+/// granted, delegated or not), so it carries zero discriminating signal here
+/// and must NOT be used as a filter predicate — `delegated_by` is the correct
+/// one (`None` on a direct owner edge, `Some(owner_user_id)` on a delegated
+/// edge). Both fields are optional/absent-safe: a response may omit either
+/// key rather than send an explicit `null`, and `Option<T>` via serde already
+/// treats a missing key and an explicit JSON `null` identically as `None` —
+/// no `#[serde(default)]` needed.
 #[derive(Debug, Clone, Deserialize)]
 pub struct AuthorizationEdge {
     pub id: String,
@@ -146,6 +160,16 @@ pub struct AuthorizationEdge {
     pub scopes: Vec<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    /// Which side of the edge the CALLER is (`"owner"` / `"delegate"`).
+    /// Deliberately unused as a TX-arm-eligibility filter (see struct doc) —
+    /// present for wire-contract completeness / future consumers.
+    #[serde(rename = "role")]
+    pub role: Option<String>,
+    /// The delegating owner's opaque user id on a delegated edge; `None` on a
+    /// direct (non-delegated) owner edge. THE correct TX-arm-eligibility
+    /// filter: `edge.delegated_by.is_none()`.
+    #[serde(rename = "delegatedBy")]
+    pub delegated_by: Option<String>,
 }
 
 /// Envelope for `GET /api/v1/authorizations`. Envelope key is `authorizations`

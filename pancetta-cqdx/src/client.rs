@@ -670,6 +670,43 @@ mod tests {
         assert_eq!(edges[0].agent_key_id, "agent_abc");
         assert_eq!(edges[0].client_key_id, "client_xyz");
         assert_eq!(edges[0].scopes, vec!["status", "qsy"]);
+        // `role` and `delegatedBy` are absent from this fixture's JSON body —
+        // PAN-18: absence must deserialize to `None`, never a deserialize
+        // error (both fields are optional on the wire).
+        assert_eq!(edges[0].role, None);
+        assert_eq!(edges[0].delegated_by, None);
+    }
+
+    /// PAN-18: a delegated edge (this station granted status/qsy to a guest
+    /// on another owner's behalf) carries a non-null `delegatedBy` naming the
+    /// delegating owner's opaque user id. This is the field
+    /// `poll_authorizations_loop` uses to exclude the edge from TX-arm
+    /// eligibility while still admitting it as a peer.
+    #[tokio::test]
+    async fn test_fetch_authorizations_delegated_edge_deserializes_delegated_by() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/authorizations"))
+            .and(header("Authorization", "Bearer pat_test_token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorizations": [{
+                    "id": "auth_2",
+                    "agentKeyId": "agent_abc",
+                    "clientKeyId": "client_guest",
+                    "scopes": ["status", "qsy"],
+                    "createdAt": "2026-07-20T00:00:00Z",
+                    "role": "owner",
+                    "delegatedBy": "owner_user_id_123"
+                }]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let edges = client.fetch_authorizations().await.unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].role.as_deref(), Some("owner"));
+        assert_eq!(edges[0].delegated_by.as_deref(), Some("owner_user_id_123"));
     }
 
     #[tokio::test]
