@@ -44,8 +44,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (Shift+R) overlays — Up/Down arrows are now the only way to scroll
   them — since those were the only two places `j`/`k` collided with
   anything. `k` still aborts the selected QSO even while one of those
-  overlays is open, since they're read-only informational views rather
-  than modals the operator is editing.
+  overlays is open (plus the Shift+S station-health panel, a third
+  read-only overlay with the same shape), since they're read-only
+  informational views rather than modals the operator is editing — their
+  titles now say so instead of advertising the removed `jk` scroll keys.
+  The always-visible active-QSO banner (`ui::active_qsos`, shown in every
+  view and while zoomed, including Monitor view and zoom on a panel other
+  than QSO Status) now marks the pinned/selected QSO with `▶` whenever
+  more than one QSO is active, so the abort target stays visible in the
+  views that don't render the QSO Status table at all.
 
 ### Fixed
 

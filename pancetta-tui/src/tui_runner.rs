@@ -908,9 +908,10 @@ impl TuiRunner {
     /// Abort the currently selected/pinned QSO (`App::selected_qso_id`),
     /// echoing the target callsign, or fall back to the standard "nothing to
     /// abort" hint when no QSO is active. Shared by `k`'s global handler (any
-    /// panel) and the Diagnostics/Recent-QSOs overlays, which let `k` fall
-    /// through to this even while open (PAN-21) since they're read-only
-    /// informational views, not modals the operator is editing.
+    /// panel) and the Diagnostics/Recent-QSOs/station-health overlays, which
+    /// all let `k` fall through to this even while open (PAN-21) since
+    /// they're read-only informational views, not modals the operator is
+    /// editing.
     fn abort_selected_qso(&self, app: &mut App) -> Result<()> {
         match (app.selected_qso_id(), app.selected_qso_callsign()) {
             (Some(qso_id), Some(call)) => {
@@ -1218,11 +1219,17 @@ impl TuiRunner {
 
         // Station-health panel (docs/observability-diagnostics-plan.md Layer
         // 3). A read-only snapshot, so — unlike the Diagnostics overlay —
-        // there is no scroll state; just dismiss.
+        // there is no scroll state; just dismiss. Same as the Diagnostics/
+        // Recent-QSOs overlays, it's a read-only informational view rather
+        // than a modal the operator is editing, so `k` falls through to the
+        // global QSO-abort here too (PAN-21 round-1 remediation).
         if app.show_health {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('S') => {
                     app.show_health = false;
+                }
+                KeyCode::Char('k') => {
+                    self.abort_selected_qso(&mut app)?;
                 }
                 _ => {} // swallow other keys while the overlay is open
             }
@@ -1591,14 +1598,21 @@ impl TuiRunner {
             // old panel-gating was a defense against `k`-as-vim-scroll muscle
             // memory firing an accidental abort while browsing an unrelated
             // list — but that vim overload only ever existed in the
-            // Diagnostics/Recent-QSOs overlays (handled above, and dropped
-            // there too), never on the everyday tab-focused panels, which
-            // use Up/Down only. The abort target is `App::selected_qso_id`
-            // (pinned via `qso_cursor`/`qso_pinned_id`), which is independent
-            // of `active_panel` and is always visible highlighted in the QSO
-            // Status panel regardless of which panel currently has focus, so
-            // there is a stable, visible answer to "what does k hit" no
-            // matter where the operator's focus is.
+            // Diagnostics/Recent-QSOs/station-health overlays (all handled
+            // above, and dropped there too), never on the everyday
+            // tab-focused panels, which use Up/Down only. The abort target
+            // is `App::selected_qso_id` (pinned via
+            // `qso_cursor`/`qso_pinned_id`), which is independent of
+            // `active_panel`. Two things keep it visible no matter where
+            // focus currently is: the QSO Status panel's own table
+            // highlights the pin regardless of focus when it's on screen,
+            // and `ui::active_qsos::render_active_qsos` — the persistent
+            // one-line banner rendered in EVERY view and while zoomed,
+            // including Monitor view (which drops QSO Status entirely) and
+            // zooming any other panel — marks the same pin with a "▶"
+            // whenever more than one QSO is active. So there's always a
+            // stable, visible answer to "what does k hit," even in the
+            // views that have no QSO Status table on screen at all.
             KeyCode::Char('k') => {
                 self.abort_selected_qso(&mut app)?;
             }
@@ -3661,6 +3675,27 @@ mod key_tests {
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
         ));
         assert!(app.read().await.show_recent_qsos, "overlay stays open");
+    }
+
+    /// PAN-21 round-1 remediation (Codex P2): the station-health (Shift+S)
+    /// panel is a third read-only informational overlay with the same
+    /// early-return-and-swallow shape as Diagnostics/Recent-QSOs, and had
+    /// been left out of the `k`-falls-through wiring. `k` must abort there
+    /// too, and Esc/`S` must remain the only way to dismiss it.
+    #[tokio::test]
+    async fn station_health_panel_lets_k_fall_through_to_abort() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+            a.show_health = true;
+        }
+        r.handle_key_event(key('k')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+        assert!(app.read().await.show_health, "overlay stays open");
     }
 
     /// `r` (re-send) is still gated to the QSO Status panel — out of scope
