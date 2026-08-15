@@ -380,29 +380,31 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_needed_dxcc(&self, callsign: &str) -> bool {
-        // PAN-16: an unresolvable callsign (no matching prefix in the
-        // offline DXCC table) can never be scored as "needed" — there's no
-        // entity to need. Without this guard, FT8's `"<...>"` placeholder
-        // for an unresolved i3=4 nonstandard-callsign hash (message.rs's
-        // `parse_nonstd_call`, used when the local hash table has no entry
-        // for the 12-bit hash) falls through every branch below into
+        // PAN-16: FT8's `"<...>"` placeholder for an unresolved i3=4
+        // nonstandard-callsign hash (message.rs's `parse_nonstd_call`, used
+        // when the local hash table has no entry for the 12-bit hash) is
+        // not a callsign at all — it can never be scored as "needed".
+        // Without this guard it fell through every branch below into
         // "needed" (the historical-default branch treats anything
         // non-excluded as needed; the exclusion-set branch treats anything
         // that doesn't match a *real* prefix as automatically outside the
-        // excluded set too) and picks up `needed_dxcc`'s weight — the
+        // excluded set too) and picked up `needed_dxcc`'s weight — the
         // scorer's single largest term — ranking an uncallable placeholder
-        // above real, workable stations. Mirrors the same guard
-        // `is_dxcc_needed_on_band` already applies.
+        // above real, workable stations.
         //
-        // Bracket-strip first: FT8's *resolved* hash form renders as
-        // `<CALLSIGN>` (a real, identifiable callsign the local hash table
-        // did map) and must keep resolving/scoring normally — only the
-        // literal `<...>` (no callsign inside) is actually unresolvable.
-        let unbracketed = callsign
-            .strip_prefix('<')
-            .and_then(|s| s.strip_suffix('>'))
-            .unwrap_or(callsign);
-        if pancetta_tui::dxcc::entity_for_callsign(unbracketed).is_none() {
+        // Deliberately narrow: reject only this exact literal, not "any
+        // callsign whose prefix doesn't resolve in the bundled offline DXCC
+        // table" (unlike `is_dxcc_needed_on_band`'s broader
+        // `entity_for_callsign` guard). cqdx's `needed_dxcc` set can name a
+        // prefix that's newer than, or otherwise absent from, the bundled
+        // static BigCTY table — a real, valid, cqdx-confirmed-needed
+        // callsign with that prefix must still win via the branches below,
+        // not be silently zeroed here just because the local table has a
+        // gap. The resolved hash form `<CALLSIGN>` (a real, identifiable
+        // callsign the local hash table did map) is also a real callsign
+        // and must keep resolving/scoring normally — it never equals this
+        // literal.
+        if callsign == "<...>" {
             return false;
         }
 
@@ -929,14 +931,12 @@ mod tests {
         assert!(lookup.is_needed_dxcc("3Y/B1234"));
     }
 
-    /// PAN-16: an unresolvable callsign string (no matching prefix in the
-    /// offline DXCC table — e.g. FT8's unresolved-hash placeholder
-    /// `"<...>"`) must never be scored as "needed", in any of
-    /// `is_needed_dxcc`'s three branches (default "everything needed",
-    /// exclusion fallback, cqdx-populated needed set). Mirrors the
-    /// unresolvable-callsign guard `is_dxcc_needed_on_band` already has.
+    /// PAN-16: the literal unresolved-hash placeholder `"<...>"` must never
+    /// be scored as "needed", in any of `is_needed_dxcc`'s three branches
+    /// (default "everything needed", exclusion fallback, cqdx-populated
+    /// needed set).
     #[test]
-    fn test_unresolvable_callsign_never_needed() {
+    fn test_unresolved_placeholder_never_needed() {
         // Branch 1: no needed set, no exclusions — historical default
         // would otherwise treat this as "everything needed".
         let lookup = CachedStationLookup::new();
@@ -948,18 +948,43 @@ mod tests {
         lookup.set_excluded_dxcc_prefixes(excluded);
         assert!(!lookup.is_needed_dxcc("<...>"));
 
-        // Branch 3: cqdx-populated needed set (prefix-match branch) — an
-        // unresolvable string can never legitimately match a real DXCC
-        // prefix, but guard explicitly rather than relying on that.
+        // Branch 3: cqdx-populated needed set (prefix-match branch).
         let mut needed = HashSet::new();
         needed.insert("3Y/B".to_string());
         lookup.update_needed_dxcc(needed);
         assert!(!lookup.is_needed_dxcc("<...>"));
 
         // A resolved hash form (real callsign in brackets) is out of scope
-        // for this ticket and must still resolve/score normally.
+        // for this ticket and must still resolve/score normally — it never
+        // equals the "<...>" literal.
         let lookup2 = CachedStationLookup::new();
         assert!(lookup2.is_needed_dxcc("<K1ABC>"));
+    }
+
+    /// PAN-16 round-2 (Codex P2): the guard must reject only the literal
+    /// `"<...>"` placeholder, not "any callsign whose prefix isn't in the
+    /// bundled offline BigCTY table." cqdx's `needed_dxcc` set can name a
+    /// prefix that's newer than, or otherwise missing from, that static
+    /// table — a real, valid, cqdx-confirmed-needed callsign with such a
+    /// prefix must still score as needed via the branches below, not be
+    /// silently zeroed just because the local table has a gap. "QQ" is used
+    /// here as a stand-in for a locally-unresolvable-but-valid-shaped
+    /// prefix (confirmed absent from `pancetta_tui::dxcc_table::PREFIX_TABLE`
+    /// and not covered by its K/W/N/AA-AL US safety net).
+    #[test]
+    fn test_locally_unresolvable_prefix_not_wrongly_zeroed() {
+        assert_eq!(pancetta_tui::dxcc::entity_for_callsign("QQ9XYZ"), None);
+
+        // Historical default (no needed set, no exclusions): still needed.
+        let lookup = CachedStationLookup::new();
+        assert!(lookup.is_needed_dxcc("QQ9XYZ"));
+
+        // cqdx explicitly names this prefix as needed — must not be
+        // overridden by a blanket local-table-resolvability guard.
+        let mut needed = HashSet::new();
+        needed.insert("QQ".to_string());
+        lookup.update_needed_dxcc(needed);
+        assert!(lookup.is_needed_dxcc("QQ9XYZ"));
     }
 
     #[test]

@@ -34,10 +34,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - FT8's unresolved-hashed-callsign placeholder `"<...>"` (an i3=4 nonstandard-callsign
   frame whose 12-bit hash has no local hash-table entry) no longer appears as a
-  DX-Hunter/Callers entry, and `is_needed_dxcc` no longer scores an unresolvable
-  callsign as a needed DXCC entity — it previously fell through to the scorer's
-  largest weight and consistently outranked real, workable stations. The resolved
-  hash form `<CALLSIGN>` is unaffected and keeps listing/scoring normally. (PAN-16)
+  DX-Hunter/Callers entry, and `is_needed_dxcc` no longer scores that exact literal
+  placeholder as a needed DXCC entity — it previously fell through to the scorer's
+  largest weight and consistently outranked real, workable stations. The guard is
+  scoped to the literal placeholder only, so a real callsign whose prefix is simply
+  absent from the bundled offline BigCTY table (e.g. newer than the table, but
+  confirmed needed by cqdx) still scores normally; the resolved hash form
+  `<CALLSIGN>` is likewise unaffected and keeps listing/scoring normally. (PAN-16)
 - Manual split-TX QSOs whose offset was held, collision-nudged, or passband-clamped now recover after two consistent DX replies at a new frequency without moving the station's chosen TX offset ([#245](https://github.com/HagaleTechnologies/pancetta/issues/245)). Genuine Hound/Fox behavior is unchanged.
 
 - Decode-pipeline crashes now recover automatically: the coordinator restarts DSP and FT8 decoder
