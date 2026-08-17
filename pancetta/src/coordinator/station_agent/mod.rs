@@ -137,13 +137,41 @@ struct ArmContext {
     /// allow-list without its verifying key loaded here fails signature
     /// verification, so the two must never update independently.
     client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
-    /// Station-local TX-allow-list. Shared and periodically refreshed by the
-    /// Q-0043 auto-populate poll task (Task 4) when cqdx integration is
-    /// enabled — a fail-closed poll failure never clears this, only a
+    /// Station-local **connection-admission** allow-list: scope-blind, this
+    /// is the general peer-admission gate `MultiPeerSession` checks before
+    /// allocating ANY Noise handshake state, for every peer regardless of
+    /// what scope they'll eventually use. Shared and periodically refreshed
+    /// by the Q-0043 auto-populate poll task (Task 4) when cqdx integration
+    /// is enabled — a fail-closed poll failure never clears this, only a
     /// successful poll replaces its contents. When cqdx integration is
     /// disabled, this is seeded once from config and never changes (today's
     /// original behavior, preserved).
+    ///
+    /// CRITICAL (CQD-11 / dispensa Q-0052): a client-key-id appearing here
+    /// does NOT mean it may arm TX — a cross-user delegated `status`/`qsy`
+    /// guest edge (CQD-4) legitimately belongs in this set (it must be able
+    /// to CONNECT) but must never be able to arm TX. See `tx_arm_allow_list`
+    /// below for the TX-eligible subset; `verify_and_arm` MUST gate on that
+    /// set, never on this one.
     tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
+    /// Station-local **TX-arm-eligible** subset of `tx_allow_list` (CQD-11 /
+    /// dispensa Q-0052): every client keyId here is also in `tx_allow_list`,
+    /// but `tx_allow_list` may contain additional keyIds (delegated
+    /// `status`/`qsy` guests, CQD-4) that are NOT in this set. Populated by
+    /// the same Q-0043 auto-populate poll task, filtered additionally on
+    /// `delegated_by.is_none()` (an edge with no `delegatedBy` is the station
+    /// owner's own client edge, not a delegated one — `role` is NOT usable
+    /// for this, see `AuthorizationEdge::role`'s doc). `verify_and_arm` is the
+    /// ONLY reader; this is defense-in-depth on top of the independent,
+    /// IdP-signed `capabilityToken` check there (cqdx's capability-mint
+    /// endpoint already hard-refuses to mint a `tx`-scoped token for a
+    /// delegated edge) — never a replacement for it. When cqdx integration is
+    /// disabled, this is seeded once from config identically to
+    /// `tx_allow_list` (no delegation concept exists in static-config mode,
+    /// so every statically-configured client stays TX-eligible, preserving
+    /// today's original behavior byte-for-byte for non-cqdx-integrated
+    /// stations).
+    tx_arm_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
     /// Arm-time **best-effort** revocation deny-list, keyed by the
     /// capabilityToken's `jti` (frozen e2e-auth.v1 §6-revocation). **EMPTY in
     /// v1** — the station-local TX-allow-list is the authoritative revoke, and
@@ -777,10 +805,14 @@ fn verify_and_arm(
             "grant clientKeyId {client_key_id} does not match the sending peer {peer}"
         ));
     }
-    let allow_list = ctx.tx_allow_list.read().unwrap();
+    // CQD-11 / dispensa Q-0052: gate on the TX-ARM-ELIGIBLE subset, not the
+    // (scope-blind) connection-admission `tx_allow_list` — a delegated
+    // `status`/`qsy` guest edge (CQD-4) belongs in the admission set (it must
+    // be able to connect) but must NEVER reach this point successfully.
+    let allow_list = ctx.tx_arm_allow_list.read().unwrap();
     if !allow_list.contains(client_key_id) {
         return Err(format!(
-            "client {client_key_id} not in station-local TX-allow-list"
+            "client {client_key_id} not in station-local TX-arm-allow-list"
         ));
     }
     let client_keys = ctx.client_keys.read().unwrap();
@@ -1073,6 +1105,14 @@ impl super::ApplicationCoordinator {
         // checked, so an un-registered client fails closed at verify time.
         let tx_allow_list: HashSet<String> = cfg.tx_allow_list.iter().cloned().collect();
         let client_keys = load_client_device_keys(&key_dir, &tx_allow_list);
+        // CQD-11 / dispensa Q-0052: seed the TX-arm-eligible set identically
+        // to the connection-admission set. Static config (this branch, before
+        // any cqdx poll runs) has no delegation concept — every
+        // operator-configured client stays TX-eligible, matching today's
+        // original behavior byte-for-byte. If cqdx integration is enabled
+        // below, `poll_authorizations_loop` narrows this set on every
+        // successful poll to exclude delegated edges.
+        let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(tx_allow_list.clone()));
         let tx_allow_list = Arc::new(std::sync::RwLock::new(tx_allow_list));
         let client_keys = Arc::new(std::sync::RwLock::new(client_keys));
 
@@ -1123,6 +1163,7 @@ impl super::ApplicationCoordinator {
 
         if cqdx_cfg.enabled && cqdx_cfg.token.as_ref().is_some_and(|t| !t.is_empty()) {
             let poll_tx_allow_list = tx_allow_list.clone();
+            let poll_tx_arm_allow_list = tx_arm_allow_list.clone();
             let poll_client_keys = client_keys.clone();
             let poll_key_dir = key_dir.clone();
             let poll_agent_key_id = paired.agent_key_id.clone();
@@ -1134,6 +1175,7 @@ impl super::ApplicationCoordinator {
                     poll_agent_key_id,
                     poll_key_dir,
                     poll_tx_allow_list,
+                    poll_tx_arm_allow_list,
                     poll_client_keys,
                     poll_shutdown,
                     poll_interval,
@@ -1150,6 +1192,7 @@ impl super::ApplicationCoordinator {
                 verifier,
                 client_keys,
                 tx_allow_list,
+                tx_arm_allow_list,
                 audit,
                 bus,
                 events,
@@ -1232,10 +1275,11 @@ fn load_client_device_keys(
     out
 }
 
-/// Periodically refresh the shared `tx_allow_list`/`client_keys` from cqdx's
-/// live authorization data (dispensa Q-0043 auto-populate). Runs for the
-/// lifetime of the station-agent component; only spawned when cqdx
-/// integration is enabled with a token configured (see
+/// Periodically refresh the shared `tx_allow_list`/`tx_arm_allow_list`/
+/// `client_keys` from cqdx's live authorization data (dispensa Q-0043
+/// auto-populate; the `tx_arm_allow_list` split is CQD-11 / dispensa Q-0052).
+/// Runs for the lifetime of the station-agent component; only spawned when
+/// cqdx integration is enabled with a token configured (see
 /// `start_station_agent_component`).
 ///
 /// Fail-safe: any poll failure (network error, non-2xx status including a
@@ -1250,6 +1294,7 @@ async fn poll_authorizations_loop(
     agent_key_id: String,
     key_dir: std::path::PathBuf,
     tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
+    tx_arm_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
     client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     interval: Duration,
@@ -1268,25 +1313,42 @@ async fn poll_authorizations_loop(
     while !shutdown.load(Ordering::Acquire) {
         match client.fetch_authorizations().await {
             Ok(edges) => {
+                // Connection-admission set: scope-blind, `agentKeyId` only —
+                // a delegated status/qsy guest edge (CQD-4) legitimately
+                // belongs here (it must be able to connect).
                 let new_allow: HashSet<String> = edges
                     .iter()
                     .filter(|e| e.agent_key_id == agent_key_id)
                     .map(|e| e.client_key_id.clone())
                     .collect();
+                // TX-arm-eligible subset (CQD-11 / dispensa Q-0052): the SAME
+                // `agentKeyId` filter, PLUS `delegated_by.is_none()` — an edge
+                // with no `delegatedBy` is the station owner's own client
+                // edge, never a cross-user-delegated one. `role` is
+                // deliberately NOT used here (see `AuthorizationEdge::role`'s
+                // doc — it reads "owner" on every row this poll's own
+                // `agentKeyId` filter keeps, so it distinguishes nothing).
+                let new_tx_arm_allow: HashSet<String> = edges
+                    .iter()
+                    .filter(|e| e.agent_key_id == agent_key_id && e.delegated_by.is_none())
+                    .map(|e| e.client_key_id.clone())
+                    .collect();
                 let new_keys = load_client_device_keys(&key_dir, &new_allow);
                 let allow_len = new_allow.len();
+                let tx_arm_len = new_tx_arm_allow.len();
                 *tx_allow_list.write().unwrap() = new_allow;
+                *tx_arm_allow_list.write().unwrap() = new_tx_arm_allow;
                 *client_keys.write().unwrap() = new_keys;
                 debug!(
                     target: "agent",
-                    "authorizations poll: refreshed tx_allow_list ({} client(s) authorized for this agent)",
-                    allow_len
+                    "authorizations poll: refreshed tx_allow_list ({} client(s) admitted for this agent, {} TX-arm-eligible)",
+                    allow_len, tx_arm_len
                 );
             }
             Err(e) => {
                 warn!(
                     target: "agent",
-                    "authorizations poll failed: {e} — keeping last-known-good tx_allow_list, retrying in {:?}",
+                    "authorizations poll failed: {e} — keeping last-known-good tx_allow_list/tx_arm_allow_list, retrying in {:?}",
                     interval
                 );
             }
@@ -1302,6 +1364,7 @@ struct RunConfig {
     verifier: CapabilityVerifier,
     client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
     tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
+    tx_arm_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
     audit: AuditLog,
     bus: MessageBus,
     /// The shared display-feed subscription (Task 6), if the feed was
@@ -1329,6 +1392,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
         verifier: cfg.verifier,
         client_keys: cfg.client_keys,
         tx_allow_list: cfg.tx_allow_list,
+        tx_arm_allow_list: cfg.tx_arm_allow_list,
         // v1: no cqdx-fed deny-list yet (empty ⇒ inert; the station-local
         // TX-allow-list is the authoritative revoke). Future seam: populate
         // this from a cqdx revocation feed on (re)connect.
@@ -1684,6 +1748,11 @@ mod tests {
         if have_device_key {
             client_keys.insert(CLIENT_KEY_ID.to_string(), client_key().verifying_key());
         }
+        // `allow_client` here always means an OWNER edge (not a delegated
+        // one) — every existing caller of `ctx_with` predates delegation and
+        // expects the client to be both connection-admitted AND TX-arm
+        // eligible, so both sets get the same contents.
+        let tx_arm_allow = allow.clone();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
             verifier: CapabilityVerifier {
@@ -1695,6 +1764,7 @@ mod tests {
             },
             client_keys: Arc::new(std::sync::RwLock::new(client_keys)),
             tx_allow_list: Arc::new(std::sync::RwLock::new(allow)),
+            tx_arm_allow_list: Arc::new(std::sync::RwLock::new(tx_arm_allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
@@ -1736,6 +1806,98 @@ mod tests {
         assert!(
             ctx.arm.lock().unwrap().tx_permitted(NOW),
             "a valid arm + consent must permit remote TX"
+        );
+    }
+
+    // ── CQD-11 / dispensa Q-0052: connection-admission vs. TX-arm-eligible ──
+
+    /// (a) An owner's own edge (no delegation involved) ends up in BOTH the
+    /// connection-admission set AND the TX-arm-eligible set — `ctx_with`
+    /// seeds both identically for an allow-listed client, and this proves it
+    /// end-to-end through the real dispatch/arm path, not just by inspecting
+    /// the sets directly.
+    #[tokio::test]
+    async fn owner_edge_is_both_admitted_and_tx_arm_eligible() {
+        let ctx = ctx_with(true, true);
+        assert!(
+            ctx.tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID),
+            "an owner's client keyId must be in the connection-admission set"
+        );
+        assert!(
+            ctx.tx_arm_allow_list
+                .read()
+                .unwrap()
+                .contains(CLIENT_KEY_ID),
+            "an owner's client keyId must ALSO be in the TX-arm-eligible set"
+        );
+        drop(ctx);
+
+        // And the arm path itself succeeds end-to-end (mirrors
+        // `arm_from_allowlisted_client_permits_tx` — kept as an explicit,
+        // separately-named CQD-11 regression pin).
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        let d = dispatch_action(
+            arm_action("arm-jti-owner"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert_eq!(d.flow, Dispatch::Continue);
+        assert!(
+            ctx.arm.lock().unwrap().tx_permitted(NOW),
+            "an owner edge present in both sets must be able to arm TX"
+        );
+    }
+
+    /// (b) A delegated `status`/`qsy` edge (CQD-4) — present in the
+    /// connection-admission set (it must be able to CONNECT) but absent from
+    /// the TX-arm-eligible set — must be refused at `verify_and_arm` even
+    /// with a perfectly valid token/grant/signature/session and consent ON.
+    /// This is the exact gap CQD-11 closes: before this change, `ArmContext`
+    /// had only one set and this same setup would have armed successfully.
+    #[tokio::test]
+    async fn delegated_edge_is_admitted_but_not_tx_arm_eligible() {
+        let mut ctx = ctx_with(true, true);
+        // Simulate the poll having classified CLIENT_KEY_ID as a delegated
+        // edge: still connection-admitted (and its device key still loaded —
+        // admission doesn't change), but removed from the TX-arm-eligible set.
+        ctx.tx_arm_allow_list.write().unwrap().clear();
+        assert!(
+            ctx.tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID),
+            "a delegated guest must remain connection-admitted"
+        );
+        with_consent(&ctx, true);
+        let bus = MessageBus::new(64).unwrap();
+        let d = dispatch_action(
+            arm_action("arm-jti-delegate"),
+            CLIENT_KEY_ID,
+            &mut ctx,
+            &bus,
+            SESSION_ID,
+            NOW,
+        )
+        .await;
+        assert_eq!(d.flow, Dispatch::Continue);
+        assert!(
+            !ctx.arm.lock().unwrap().tx_permitted(NOW),
+            "a delegated edge must never be able to arm TX, even with an \
+             otherwise perfectly valid token/grant/signature/session"
+        );
+
+        let log = std::fs::read_to_string(ctx.audit.path()).unwrap_or_default();
+        let denied = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<AuditEvent>(l).ok())
+            .any(|ev| ev.kind == AuditKind::TxDenied && ev.detail.contains("TX-arm-allow-list"));
+        assert!(
+            denied,
+            "a delegated edge's rejected arm attempt must record a TxDenied \
+             audit event naming the TX-arm-allow-list gate specifically"
         );
     }
 
@@ -2614,6 +2776,13 @@ mod tests {
             .write()
             .unwrap()
             .insert(PEER_B.to_string());
+        // PEER_B is a genuinely admitted AND TX-arm-eligible (non-delegated)
+        // second client — the sender-binding check is the only thing tested
+        // here, so B must not be excluded by the CQD-11 delegation gate too.
+        ctx.tx_arm_allow_list
+            .write()
+            .unwrap()
+            .insert(PEER_B.to_string());
         ctx.client_keys
             .write()
             .unwrap()
@@ -3237,6 +3406,10 @@ mod tests {
         if allow.contains(connecting_client) {
             client_keys.insert(connecting_client.to_string(), client_key().verifying_key());
         }
+        // This helper exercises connection admission only (never arming), so
+        // the TX-arm-eligible set mirrors the admission set — no test using
+        // it depends on the two diverging.
+        let tx_arm_allow = allow.clone();
         let mut ctx = ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
             verifier: CapabilityVerifier {
@@ -3248,6 +3421,7 @@ mod tests {
             },
             client_keys: Arc::new(std::sync::RwLock::new(client_keys)),
             tx_allow_list: Arc::new(std::sync::RwLock::new(allow)),
+            tx_arm_allow_list: Arc::new(std::sync::RwLock::new(tx_arm_allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
@@ -3316,6 +3490,10 @@ mod tests {
     /// `ctx_with`) — used by the Task 6 read-stream tests, which only care
     /// about peer establishment + the display feed, never about arming.
     fn fresh_ctx(agent_kid: &str, allow: HashSet<String>) -> ArmContext {
+        // Read-stream/peer-establishment tests only — arming is never
+        // exercised through this helper, so the TX-arm-eligible set mirrors
+        // the admission set.
+        let tx_arm_allow = allow.clone();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
             verifier: CapabilityVerifier {
@@ -3327,6 +3505,7 @@ mod tests {
             },
             client_keys: Arc::new(std::sync::RwLock::new(std::collections::HashMap::new())),
             tx_allow_list: Arc::new(std::sync::RwLock::new(allow)),
+            tx_arm_allow_list: Arc::new(std::sync::RwLock::new(tx_arm_allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
@@ -3555,6 +3734,8 @@ mod tests {
         if have_device_key {
             client_keys.insert(CLIENT_KEY_ID.to_string(), client_key().verifying_key());
         }
+        // `allow_client` means an OWNER edge here too — see `ctx_with`.
+        let tx_arm_allow = allow.clone();
         ArmContext {
             arm: Arc::new(Mutex::new(ArmState::new())),
             verifier: CapabilityVerifier {
@@ -3566,6 +3747,7 @@ mod tests {
             },
             client_keys: Arc::new(std::sync::RwLock::new(client_keys)),
             tx_allow_list: Arc::new(std::sync::RwLock::new(allow)),
+            tx_arm_allow_list: Arc::new(std::sync::RwLock::new(tx_arm_allow)),
             revoked_jtis: HashSet::new(),
             seen_jtis: HashSet::new(),
             audit: AuditLog::new(audit_tmp()),
@@ -3583,6 +3765,8 @@ mod tests {
                 client_key_id: "client_a".to_string(),
                 scopes: vec!["status".to_string()],
                 created_at: "2026-07-20T00:00:00Z".to_string(),
+                role: None,
+                delegated_by: None,
             },
             pancetta_cqdx::AuthorizationEdge {
                 id: "2".to_string(),
@@ -3590,6 +3774,8 @@ mod tests {
                 client_key_id: "client_b".to_string(),
                 scopes: vec!["status".to_string()],
                 created_at: "2026-07-20T00:00:00Z".to_string(),
+                role: None,
+                delegated_by: None,
             },
         ];
         let filtered: HashSet<String> = edges
@@ -3600,12 +3786,86 @@ mod tests {
         assert_eq!(filtered, HashSet::from(["client_a".to_string()]));
     }
 
+    /// CQD-11 / dispensa Q-0052: the TX-arm-eligible filter must admit an
+    /// owner edge whose `delegated_by` is `None` — regardless of whether that
+    /// `None` came from a wholly ABSENT `delegatedBy` field or an explicit
+    /// JSON `null` (both deserialize to `None` via `AuthorizationEdge`'s
+    /// `#[serde(default)]` — see `pancetta-cqdx`'s own coverage of that) — and
+    /// must EXCLUDE a delegated edge (`delegated_by: Some(..)`), while the
+    /// connection-admission filter (`agentKeyId` only) keeps ALL THREE.
+    #[test]
+    fn tx_arm_filter_excludes_delegated_edges_but_admission_filter_keeps_them() {
+        let edges = vec![
+            // Owner edge, delegatedBy field entirely absent from the wire —
+            // deserializes to `None` (mirrors `pancetta-cqdx`'s absent-field
+            // fixture).
+            pancetta_cqdx::AuthorizationEdge {
+                id: "1".to_string(),
+                agent_key_id: "agent_this".to_string(),
+                client_key_id: "client_owner_absent".to_string(),
+                scopes: vec!["status".to_string(), "qsy".to_string(), "tx".to_string()],
+                created_at: "2026-07-20T00:00:00Z".to_string(),
+                role: None,
+                delegated_by: None,
+            },
+            // Delegated status/qsy guest edge — must be admitted but NOT
+            // TX-arm-eligible.
+            pancetta_cqdx::AuthorizationEdge {
+                id: "2".to_string(),
+                agent_key_id: "agent_this".to_string(),
+                client_key_id: "client_delegate".to_string(),
+                scopes: vec!["status".to_string(), "qsy".to_string()],
+                created_at: "2026-07-20T00:00:00Z".to_string(),
+                role: Some("owner".to_string()),
+                delegated_by: Some("user_owner_123".to_string()),
+            },
+            // A different agent's edge entirely — excluded from both sets by
+            // the pre-existing `agentKeyId` filter.
+            pancetta_cqdx::AuthorizationEdge {
+                id: "3".to_string(),
+                agent_key_id: "agent_other".to_string(),
+                client_key_id: "client_unrelated".to_string(),
+                scopes: vec!["status".to_string()],
+                created_at: "2026-07-20T00:00:00Z".to_string(),
+                role: None,
+                delegated_by: None,
+            },
+        ];
+
+        let admission: HashSet<String> = edges
+            .iter()
+            .filter(|e| e.agent_key_id == "agent_this")
+            .map(|e| e.client_key_id.clone())
+            .collect();
+        let tx_arm_eligible: HashSet<String> = edges
+            .iter()
+            .filter(|e| e.agent_key_id == "agent_this" && e.delegated_by.is_none())
+            .map(|e| e.client_key_id.clone())
+            .collect();
+
+        assert_eq!(
+            admission,
+            HashSet::from([
+                "client_owner_absent".to_string(),
+                "client_delegate".to_string(),
+            ]),
+            "connection admission must be scope-blind and include the delegated guest"
+        );
+        assert_eq!(
+            tx_arm_eligible,
+            HashSet::from(["client_owner_absent".to_string()]),
+            "TX-arm eligibility must exclude the delegated guest"
+        );
+    }
+
     #[tokio::test]
     async fn poll_authorizations_loop_keeps_last_known_good_on_failure() {
         // A cqdx client pointed at a URL with nothing listening fails every
-        // request — confirms the poll loop's fail-safe leaves a pre-seeded
-        // allow-list untouched rather than clearing it.
+        // request — confirms the poll loop's fail-safe leaves pre-seeded
+        // allow-lists untouched rather than clearing them.
         let tx_allow_list = Arc::new(std::sync::RwLock::new(HashSet::from(["seed".to_string()])));
+        let tx_arm_allow_list =
+            Arc::new(std::sync::RwLock::new(HashSet::from(["seed".to_string()])));
         let client_keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cqdx_cfg = pancetta_config::network::CqdxConfig {
@@ -3621,6 +3881,7 @@ mod tests {
             "agent_this".to_string(),
             std::env::temp_dir(),
             tx_allow_list.clone(),
+            tx_arm_allow_list.clone(),
             client_keys.clone(),
             shutdown_clone,
             Duration::from_millis(50),
@@ -3631,7 +3892,12 @@ mod tests {
         assert_eq!(
             *tx_allow_list.read().unwrap(),
             HashSet::from(["seed".to_string()]),
-            "a failing poll must never clear the pre-seeded allow-list"
+            "a failing poll must never clear the pre-seeded admission allow-list"
+        );
+        assert_eq!(
+            *tx_arm_allow_list.read().unwrap(),
+            HashSet::from(["seed".to_string()]),
+            "a failing poll must never clear the pre-seeded TX-arm-eligible allow-list"
         );
     }
 
