@@ -670,6 +670,72 @@ mod tests {
         assert_eq!(edges[0].agent_key_id, "agent_abc");
         assert_eq!(edges[0].client_key_id, "client_xyz");
         assert_eq!(edges[0].scopes, vec!["status", "qsy"]);
+        // `role`/`delegatedBy` are absent from this fixture entirely (an older
+        // cqdx server shape) — CQD-11 / dispensa Q-0052: both must still
+        // deserialize to `None` via `#[serde(default)]`, not error out.
+        assert_eq!(edges[0].role, None);
+        assert_eq!(edges[0].delegated_by, None);
+    }
+
+    /// CQD-11 / dispensa Q-0052: `delegatedBy` must deserialize to `None` for
+    /// BOTH an absent field and an explicit JSON `null` — the contract's
+    /// `delegatedBy == null` (loose-equality) predicate depends on serde
+    /// treating the two identically, not just on a strict `=== null` check
+    /// that only catches the explicit case.
+    #[tokio::test]
+    async fn test_fetch_authorizations_delegated_by_absent_and_null_both_deserialize_to_none() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/authorizations"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "authorizations": [
+                    {
+                        "id": "auth_absent",
+                        "agentKeyId": "agent_abc",
+                        "clientKeyId": "client_owner",
+                        "scopes": ["status", "qsy", "tx"],
+                        "createdAt": "2026-07-20T00:00:00Z"
+                        // delegatedBy field entirely absent — an owner edge.
+                    },
+                    {
+                        "id": "auth_null",
+                        "agentKeyId": "agent_abc",
+                        "clientKeyId": "client_owner_explicit_null",
+                        "scopes": ["status", "qsy", "tx"],
+                        "createdAt": "2026-07-20T00:00:00Z",
+                        "delegatedBy": null
+                    },
+                    {
+                        "id": "auth_delegated",
+                        "agentKeyId": "agent_abc",
+                        "clientKeyId": "client_guest",
+                        "scopes": ["status", "qsy"],
+                        "createdAt": "2026-07-20T00:00:00Z",
+                        "role": "owner",
+                        "delegatedBy": "user_owner_123"
+                    }
+                ]
+            })))
+            .mount(&server)
+            .await;
+
+        let client = test_client(&server.uri());
+        let edges = client.fetch_authorizations().await.unwrap();
+        assert_eq!(edges.len(), 3);
+        assert_eq!(
+            edges[0].delegated_by, None,
+            "an absent delegatedBy field must deserialize to None"
+        );
+        assert_eq!(
+            edges[1].delegated_by, None,
+            "an explicit JSON null delegatedBy must also deserialize to None"
+        );
+        assert_eq!(
+            edges[2].delegated_by,
+            Some("user_owner_123".to_string()),
+            "a present, non-null delegatedBy must deserialize to Some"
+        );
+        assert_eq!(edges[2].role, Some("owner".to_string()));
     }
 
     #[tokio::test]
