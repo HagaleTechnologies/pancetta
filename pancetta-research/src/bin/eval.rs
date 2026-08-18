@@ -131,6 +131,11 @@ struct Args {
     /// primary sweep with a per-`freq_bin` top-K cut). See
     /// `Ft8Config::per_bin_candidate_selection`.
     per_bin_candidate_selection: Option<bool>,
+    /// PAN-7 [A/B]: seed the pass-0 sync-candidate list from ft8_lib's own
+    /// `ftx_find_candidates` output, re-scored on pancetta's spectrogram and
+    /// unioned before the `max_sync_candidates` re-truncation. See
+    /// `Ft8Config::ft8lib_sync_seeds_enabled`.
+    ft8lib_sync_seeds_enabled: Option<bool>,
     /// Task W5.2 [A/B]: master switch for the percentile-normalized
     /// wide-lag two-baseline sync mechanism. See
     /// `Ft8Config::costas_two_baseline_enabled`.
@@ -315,6 +320,7 @@ impl Args {
         let mut deep_iters: Option<usize> = None;
         let mut escalation_parity_max: Option<usize> = None;
         let mut per_bin_candidate_selection: Option<bool> = None;
+        let mut ft8lib_sync_seeds_enabled: Option<bool> = None;
         let mut costas_two_baseline_enabled: Option<bool> = None;
         let mut costas_partial_metric_enabled: Option<bool> = None;
         let mut relaxed_sync_near_partner_hz_radius: Option<f64> = None;
@@ -600,6 +606,12 @@ impl Args {
                 }
                 "--no-per-bin-candidate-selection" => {
                     per_bin_candidate_selection = Some(false);
+                }
+                "--ft8lib-sync-seeds" => {
+                    ft8lib_sync_seeds_enabled = Some(true);
+                }
+                "--no-ft8lib-sync-seeds" => {
+                    ft8lib_sync_seeds_enabled = Some(false);
                 }
                 "--costas-two-baseline-enabled" => {
                     costas_two_baseline_enabled = Some(true);
@@ -923,6 +935,7 @@ impl Args {
                     eprintln!("  --ap4-full-mask / --no-ap4-full-mask: decoder-TP-sensitivity Task W2.6 [A/B] — extend AP4 from a message-TYPE-only prior (i3=1) to a full message-CONTENT mask, trying the RR73/RRR/73 ir+igrid4 fields (production default: off). See Ft8Config::ap4_full_message_mask_enabled.");
                     eprintln!("  --ap-post-normalize / --no-ap-post-normalize: decoder-TP-sensitivity Task W2.6 [A/B] — normalize LLRs BEFORE injecting AP bits (not after) at every AP injection site, so the injected magnitude never distorts the channel-evidence scale (production default: off = inject-then-normalize). See Ft8Config::ap_injection_post_normalization.");
                     eprintln!("  --per-bin-candidate-selection / --no-per-bin-candidate-selection: decoder-TP-sensitivity Task W5.1 [A/B] — per-bin (freq_bin) top-K candidate thinning on the main Costas sweep, replacing the flat top-max_sync_candidates cap (production default: off, DECLINED — real regression on hard-200). See Ft8Config::per_bin_candidate_selection.");
+                    eprintln!("  --ft8lib-sync-seeds / --no-ft8lib-sync-seeds: PAN-7 [A/B] — union ft8_lib's own ftx_find_candidates output into the pass-0 sync-candidate list as additional seeds, re-scored on pancetta's spectrogram (production default: off, research opt-in). See Ft8Config::ft8lib_sync_seeds_enabled.");
                     eprintln!("  --costas-two-baseline-enabled / --no-costas-two-baseline-enabled: decoder-TP-sensitivity Task W5.2 [A/B] — percentile-normalized wide-lag two-baseline (tight+wide) sync candidate emission (production default: off). See Ft8Config::costas_two_baseline_enabled.");
                     eprintln!("  --costas-partial-metric-enabled / --no-costas-partial-metric-enabled: decoder-TP-sensitivity Task W5.4 [A/B] — sync_bc partial-Costas (blocks B+C only) parallel score, rescuing slot-edge negative-dt candidates whose block A falls outside the window (production default: off). See Ft8Config::costas_partial_metric_enabled.");
                     eprintln!("  --relaxed-sync-near-partner-hz-radius V / --relaxed-sync-near-partner-score-delta V: decoder-TP-sensitivity Task W5.4 [A/B] — JTDX-style relaxed Costas acceptance threshold inside ±V Hz of the QSO partner audio freq (production default: radius=None, delta=0.0, i.e. inert). See Ft8Config::relaxed_sync_near_partner_hz_radius / _score_delta.");
@@ -984,6 +997,7 @@ impl Args {
             deep_iters,
             escalation_parity_max,
             per_bin_candidate_selection,
+            ft8lib_sync_seeds_enabled,
             costas_two_baseline_enabled,
             costas_partial_metric_enabled,
             relaxed_sync_near_partner_hz_radius,
@@ -2078,6 +2092,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(on) = args.per_bin_candidate_selection {
         d = d.with_per_bin_candidate_selection(on);
+    }
+    if let Some(on) = args.ft8lib_sync_seeds_enabled {
+        d = d.with_ft8lib_sync_seeds_enabled(on);
     }
     if let Some(on) = args.costas_two_baseline_enabled {
         d = d.with_costas_two_baseline_enabled(on);

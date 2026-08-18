@@ -597,6 +597,15 @@ impl Ft8Decoder {
         self
     }
 
+    /// PAN-7 [A/B]: seed the pass-0 sync-candidate list from ft8_lib's own
+    /// `ftx_find_candidates` output. Default OFF; this builder plus the
+    /// `--ft8lib-sync-seeds` / `--no-ft8lib-sync-seeds` eval flags are what make
+    /// the ship gate measurable at all.
+    pub fn with_ft8lib_sync_seeds_enabled(mut self, on: bool) -> Self {
+        self.config.ft8lib_sync_seeds_enabled = on;
+        self
+    }
+
     /// Decoder-TP-sensitivity Task W5.2 [A/B]: master switch for the
     /// percentile-normalized wide-lag two-baseline sync mechanism. See
     /// `Ft8Config::costas_two_baseline_enabled`.
