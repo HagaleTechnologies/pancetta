@@ -104,9 +104,9 @@ You are never alone in this repo — other agents may work concurrently in other
 
 ## Code review convergence
 
-Every review round fixes P1 findings inline. From round 2 onward, P2-and-
-lower findings are not fixed inline — they're captured verbatim into a
-follow-up ticket instead, so the PR converges instead of chasing
-progressively finer findings across rounds. Round 1 is unrestricted (fix
-everything reasonable). Full policy:
+Rounds 1-5 (per reviewer) fix everything reasonable. Rounds 6-15 fix P1
+inline, ticket new P2-or-lower. Rounds 16-25 ticket P1 too unless
+critical/blocking. Round 25 is a hard stop — escalate to a human. Run a
+local review pass before each push; check for a concurrent session
+working the same PR before starting a round. Full policy:
 docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md.
