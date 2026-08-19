@@ -426,6 +426,7 @@ impl CoordSim {
                 ttl_ms: 120_000,
                 scope_tx: true,
                 jti: "sim-arm-jti".to_string(),
+                client_key_id: "sim-client-key-id".to_string(),
             },
             now_ms,
         );

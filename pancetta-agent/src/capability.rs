@@ -659,6 +659,7 @@ impl CapabilityVerifier {
             ttl_ms,
             scope_tx: true,
             jti,
+            client_key_id: client_key_id.to_string(),
         })
     }
 }

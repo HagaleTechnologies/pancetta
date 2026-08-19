@@ -752,6 +752,27 @@ fn dispatch_hello(capability_token: Option<String>, peer: &str, ctx: &mut ArmCon
     }
 }
 
+/// Whether `client_key_id` is CURRENTLY present in `tx_arm_allow_list` — a
+/// live `RwLock` read, never a cached/stale value. Factored out so
+/// `verify_and_arm`'s authoritative re-check (taken while holding
+/// `ctx.arm`'s lock, immediately before `st.arm(...)`) is unit-testable in
+/// isolation for the "a write lands between two calls is observed by the
+/// second call" property — `verify_and_arm` itself has no `.await`/yield
+/// point between its top-of-function check and this re-check, so an
+/// external test cannot practically win a real race against a single call
+/// to it. The actual atomicity guarantee instead comes from BOTH this
+/// re-check and `poll_authorizations_loop`'s `tx_arm_allow_list` publish
+/// serializing through the same `ctx.arm` mutex (see both call sites' doc
+/// comments for the full linearization argument). Named `is_tx_arm_eligible`
+/// (not `tx_arm_eligible`) to avoid shadowing the local variable of that
+/// name in this module's own tests.
+fn is_tx_arm_eligible(
+    tx_arm_allow_list: &Arc<std::sync::RwLock<HashSet<String>>>,
+    client_key_id: &str,
+) -> bool {
+    tx_arm_allow_list.read().unwrap().contains(client_key_id)
+}
+
 /// Verify the SIBLING `capabilityToken` + client-signed `txArmGrant` and arm the
 /// shared `ArmState`.
 ///
@@ -842,9 +863,48 @@ fn verify_and_arm(
         )
         .map_err(|e| format!("arm grant: {e}"))?;
 
+    // CRITICAL (deadlock avoidance): drop the top-of-function
+    // `tx_arm_allow_list` read guard NOW, before acquiring `ctx.arm`'s lock
+    // below. NLL lets the compiler treat `allow_list` as "no longer
+    // borrowed" after its last use above, but that is a BORROW-CHECK
+    // relaxation only — it does NOT change when the guard's `Drop` actually
+    // runs, which is still tied to lexical scope (function end) unless
+    // dropped explicitly. Left implicit, this guard would stay held while
+    // the re-check below calls `is_tx_arm_eligible`, which tries to acquire
+    // a SECOND (recursive) read lock on the SAME `RwLock` on this same
+    // thread. `std::sync::RwLock` is not guaranteed reentrant, and —
+    // critically — is writer-preferring enough on common platforms
+    // (Darwin's pthread_rwlock among them) that once a writer
+    // (`poll_authorizations_loop`'s publish) is queued waiting for this
+    // thread's first read to release, a SECOND read from the SAME thread
+    // blocks behind that queued writer too, which itself is waiting on the
+    // first read to release — a genuine self-deadlock.
+    drop(allow_list);
+
     // Arm the shared state (audits Armed, or refuses a no-scope grant).
     let effects = match ctx.arm.lock() {
-        Ok(mut st) => st.arm(verified, now),
+        Ok(mut st) => {
+            // CQD-11 / dispensa Q-0052 follow-up (atomicity fix): the
+            // top-of-function `tx_arm_allow_list` read above (and the copy
+            // `verify_arm_grant` just checked internally) can be STALE by
+            // the time we get here — token/grant verification takes no
+            // lock, so a concurrent `poll_authorizations_loop` cycle could
+            // revoke this exact client's eligibility in the meantime.
+            // `poll_authorizations_loop` publishes its refreshed
+            // `tx_arm_allow_list` WHILE STILL HOLDING `ctx.arm`'s lock (see
+            // there), so re-checking membership here — under the SAME lock
+            // we just acquired — is what makes "top check, then arm" atomic
+            // with "disarm-check, then publish": whichever side acquires
+            // `arm` second always observes the other's fully-published
+            // result, never a stale in-between state.
+            if !is_tx_arm_eligible(&ctx.tx_arm_allow_list, client_key_id) {
+                return Err(format!(
+                    "client {client_key_id} not in station-local TX-arm-allow-list \
+                     (revoked by a concurrent authorization refresh)"
+                ));
+            }
+            st.arm(verified, now)
+        }
         Err(_) => return Err("arm mutex poisoned".to_string()),
     };
     apply_arm_effects(&ctx.audit, &effects);
@@ -990,6 +1050,35 @@ pub(crate) fn station_agent_active(
     has_relay_config(cfg) && (!cfg.tx_allow_list.is_empty() || cqdx_will_populate)
 }
 
+/// The initial seed for `tx_arm_allow_list` — FAIL-CLOSED, not fail-open
+/// (CQD-11 / dispensa Q-0052 follow-up: PR #259 shipped the split with a
+/// fail-open seed; this closes that gap).
+///
+/// When `cqdx_will_poll` (cqdx auto-populate enabled with a token — the same
+/// condition that gates spawning `poll_authorizations_loop`), TX-arm
+/// eligibility starts EMPTY: nobody can arm TX until a successful poll
+/// establishes the non-delegated subset. A client statically listed in
+/// `tx_allow_list` must NOT be able to arm before the first poll completes,
+/// nor indefinitely if cqdx stays unreachable — that would let a client whose
+/// edge has since become delegated reuse a still-valid enabled token after a
+/// restart, defeating the whole connection-admission/TX-arm split.
+///
+/// When cqdx auto-populate is NOT going to run, there is no delegation
+/// concept at all in the pure-config path, so `tx_arm_allow_list` clones
+/// `static_tx_allow_list` and (absent a poll task to ever diverge it) stays
+/// permanently equal to it — this is the pre-existing, intended behavior for
+/// non-cqdx-integrated stations, unchanged.
+fn seed_tx_arm_allow_list(
+    static_tx_allow_list: &HashSet<String>,
+    cqdx_will_poll: bool,
+) -> HashSet<String> {
+    if cqdx_will_poll {
+        HashSet::new()
+    } else {
+        static_tx_allow_list.clone()
+    }
+}
+
 impl super::ApplicationCoordinator {
     /// Definitively close the shared remote-TX arm after StationAgent loss.
     ///
@@ -1105,14 +1194,27 @@ impl super::ApplicationCoordinator {
         // checked, so an un-registered client fails closed at verify time.
         let tx_allow_list: HashSet<String> = cfg.tx_allow_list.iter().cloned().collect();
         let client_keys = load_client_device_keys(&key_dir, &tx_allow_list);
-        // CQD-11 / dispensa Q-0052: seed the TX-arm-eligible set identically
-        // to the connection-admission set. Static config (this branch, before
-        // any cqdx poll runs) has no delegation concept — every
-        // operator-configured client stays TX-eligible, matching today's
-        // original behavior byte-for-byte. If cqdx integration is enabled
-        // below, `poll_authorizations_loop` narrows this set on every
-        // successful poll to exclude delegated edges.
-        let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(tx_allow_list.clone()));
+        // CQD-11 / dispensa Q-0052 follow-up: the TX-arm-eligible seed must
+        // be FAIL-CLOSED, not fail-open. This condition mirrors the poll-task
+        // spawn gate below EXACTLY (`cqdx_cfg.enabled` + a non-empty token) —
+        // when cqdx auto-populate WILL run, `tx_arm_allow_list` starts EMPTY:
+        // nobody can arm TX until a successful poll proves who's
+        // non-delegated. Cloning the static list here (the original PR #259
+        // approach) lets every statically-listed client arm before the first
+        // poll succeeds — and indefinitely if cqdx stays unreachable,
+        // including reusing a still-valid enabled token after a restart for
+        // a client whose edge has since become delegated. `tx_allow_list`
+        // (connection admission) is UNCHANGED — a delegated guest can still
+        // connect from the first second, just never arm. Only the
+        // cqdx-DISABLED path (no delegation concept at all) clones the
+        // static list, matching pre-existing behavior for non-cqdx-
+        // integrated stations, permanently.
+        let cqdx_will_poll =
+            cqdx_cfg.enabled && cqdx_cfg.token.as_ref().is_some_and(|t| !t.is_empty());
+        let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(seed_tx_arm_allow_list(
+            &tx_allow_list,
+            cqdx_will_poll,
+        )));
         let tx_allow_list = Arc::new(std::sync::RwLock::new(tx_allow_list));
         let client_keys = Arc::new(std::sync::RwLock::new(client_keys));
 
@@ -1161,12 +1263,21 @@ impl super::ApplicationCoordinator {
             .get_or_create_channel(ComponentId::StationAgent)
             .await?;
 
-        if cqdx_cfg.enabled && cqdx_cfg.token.as_ref().is_some_and(|t| !t.is_empty()) {
+        // Same condition as `cqdx_will_poll` above (kept as one boolean, not
+        // recomputed, so the seed-fail-closed decision and the spawn
+        // decision can never drift apart).
+        if cqdx_will_poll {
             let poll_tx_allow_list = tx_allow_list.clone();
             let poll_tx_arm_allow_list = tx_arm_allow_list.clone();
             let poll_client_keys = client_keys.clone();
             let poll_key_dir = key_dir.clone();
             let poll_agent_key_id = paired.agent_key_id.clone();
+            // Disarm-on-revocation: the shared arm + audit log so the poll
+            // task can disarm immediately when a refresh revokes the live
+            // controller's TX-arm eligibility (see `poll_authorizations_loop`
+            // doc).
+            let poll_arm = arm.clone();
+            let poll_audit = audit.clone();
             let poll_shutdown = self.shutdown_signal.clone();
             let poll_interval = Duration::from_secs(cqdx_cfg.authorizations_poll_interval_secs);
             let poll_handle = tokio::spawn(async move {
@@ -1177,6 +1288,8 @@ impl super::ApplicationCoordinator {
                     poll_tx_allow_list,
                     poll_tx_arm_allow_list,
                     poll_client_keys,
+                    poll_arm,
+                    poll_audit,
                     poll_shutdown,
                     poll_interval,
                 )
@@ -1289,6 +1402,23 @@ fn load_client_device_keys(
 /// already-admitted, connected client. Only a successful poll (a 200 with a
 /// parseable body, even if `authorizations` is genuinely empty) replaces
 /// the shared contents.
+///
+/// Disarm-on-revocation + atomic publish (CQD-11 / dispensa Q-0052
+/// follow-up): `verify_and_arm`'s `tx_arm_allow_list` gate only runs at ARM
+/// time — it does nothing for an arm that is already live when a LATER poll
+/// revokes its controller's eligibility (edge dropped entirely, or newly
+/// delegated). The frozen e2e-auth.v1 §6-revocation invariant is "the cloud
+/// may only ever reduce station-local TX authority", so a live arm whose
+/// controller falls out of the freshly-computed `tx_arm_allow_list` is
+/// disarmed immediately here, rather than left to run out its grant TTL (up
+/// to 60 minutes). The disarm-check AND the `tx_arm_allow_list` publish
+/// happen under ONE `arm.lock()` critical section — matching
+/// `verify_and_arm`'s own re-check under that SAME lock (see there) — so a
+/// `verify_and_arm` call that read the OLD list at its top can never race to
+/// acquire `arm.lock()` in a window between this section's disarm-check and
+/// the publish and arm a just-revoked client with nothing left to revisit it
+/// until the NEXT poll cycle.
+#[allow(clippy::too_many_arguments)]
 async fn poll_authorizations_loop(
     cqdx_cfg: pancetta_config::network::CqdxConfig,
     agent_key_id: String,
@@ -1296,6 +1426,8 @@ async fn poll_authorizations_loop(
     tx_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
     tx_arm_allow_list: Arc<std::sync::RwLock<HashSet<String>>>,
     client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
+    arm: Arc<Mutex<ArmState>>,
+    audit: AuditLog,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     interval: Duration,
 ) {
@@ -1336,8 +1468,36 @@ async fn poll_authorizations_loop(
                 let new_keys = load_client_device_keys(&key_dir, &new_allow);
                 let allow_len = new_allow.len();
                 let tx_arm_len = new_tx_arm_allow.len();
+
+                // Disarm-on-revocation + atomic publish: see the fn-level
+                // doc above. Poisoned-lock handling mirrors
+                // `RemoteTxDisarmGuard::drop` — a poisoned arm mutex must
+                // never block publishing the refreshed TX-arm-eligible set.
+                {
+                    let mut st = match arm.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    let should_disarm = st
+                        .armed_client_key_id()
+                        .is_some_and(|cur| !new_tx_arm_allow.contains(cur));
+                    if should_disarm {
+                        let effects =
+                            st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_ms());
+                        apply_arm_effects(&audit, &effects);
+                        warn!(
+                            target: "agent.tx",
+                            "remote TX disarmed: an authorization refresh revoked the \
+                             current controller's TX-arm eligibility"
+                        );
+                    }
+                    // Published WHILE STILL HOLDING `arm`'s lock — this is
+                    // the atomicity guarantee `verify_and_arm`'s re-check
+                    // relies on.
+                    *tx_arm_allow_list.write().unwrap() = new_tx_arm_allow;
+                }
+
                 *tx_allow_list.write().unwrap() = new_allow;
-                *tx_arm_allow_list.write().unwrap() = new_tx_arm_allow;
                 *client_keys.write().unwrap() = new_keys;
                 debug!(
                     target: "agent",
@@ -3867,6 +4027,8 @@ mod tests {
         let tx_arm_allow_list =
             Arc::new(std::sync::RwLock::new(HashSet::from(["seed".to_string()])));
         let client_keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let arm = Arc::new(Mutex::new(ArmState::new()));
+        let audit = AuditLog::new(audit_tmp());
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cqdx_cfg = pancetta_config::network::CqdxConfig {
             enabled: true,
@@ -3883,6 +4045,8 @@ mod tests {
             tx_allow_list.clone(),
             tx_arm_allow_list.clone(),
             client_keys.clone(),
+            arm,
+            audit,
             shutdown_clone,
             Duration::from_millis(50),
         ));
@@ -3938,5 +4102,315 @@ mod tests {
         cfg.tx_allow_list = vec!["some_client_key".to_string()];
         let cqdx_cfg = pancetta_config::network::CqdxConfig::default();
         assert!(station_agent_active(&cfg, &cqdx_cfg));
+    }
+
+    // --- seed_tx_arm_allow_list: CQD-11 / Q-0052 follow-up (fail-closed seed) ---
+
+    /// PR #259 shipped the split with a fail-open seed: with cqdx
+    /// auto-populate enabled (so `poll_authorizations_loop` WILL be
+    /// spawned), a client present in the static `tx_allow_list` must NOT be
+    /// present in the seeded `tx_arm_allow_list` — i.e. must NOT be able to
+    /// arm TX — until a poll actually succeeds. Seeding it from the static
+    /// list (cloning, PR #259's approach) is fail-OPEN: it trusts every
+    /// statically listed client by default instead of trusting none until
+    /// cqdx proves who's non-delegated.
+    #[test]
+    fn cqdx_enabled_seeds_tx_arm_allow_list_empty_regardless_of_static_list() {
+        let static_list = HashSet::from(["some_client_key".to_string()]);
+        let seeded = seed_tx_arm_allow_list(&static_list, /* cqdx_will_poll */ true);
+        assert!(
+            seeded.is_empty(),
+            "cqdx-enabled must seed tx_arm_allow_list EMPTY (fail-closed) even when the \
+             static tx_allow_list is non-empty — nobody may arm TX until a poll succeeds"
+        );
+    }
+
+    /// Companion: `tx_allow_list` (connection admission) itself is NOT
+    /// affected by this fail-closed seed — it stays seeded from the static
+    /// config list (unchanged, out of scope for this fix), so a delegated
+    /// guest can still connect from the first second, just never arm. When
+    /// cqdx is disabled entirely, `tx_arm_allow_list` must still equal the
+    /// static list — no delegation concept exists in the pure-config path.
+    #[test]
+    fn cqdx_disabled_seeds_tx_arm_allow_list_from_static_list() {
+        let static_list = HashSet::from(["some_client_key".to_string()]);
+        let seeded = seed_tx_arm_allow_list(&static_list, /* cqdx_will_poll */ false);
+        assert_eq!(
+            seeded, static_list,
+            "cqdx-disabled must seed tx_arm_allow_list identically to the static list — \
+             no delegation concept exists in the pure-config path"
+        );
+    }
+
+    // --- Disarm-on-revocation + atomicity: CQD-11 / Q-0052 follow-up (PR #259 gap) ---
+
+    /// `is_tx_arm_eligible` is a live read, never a cached/stale snapshot: a
+    /// write landing between two calls IS observed by the second call. This
+    /// is the property `verify_and_arm`'s authoritative re-check (taken
+    /// while holding `ctx.arm`'s lock, immediately before `st.arm(...)`)
+    /// depends on. `verify_and_arm` itself has no `.await`/yield point
+    /// between its top-of-function check and this re-check, so an external
+    /// test cannot practically force a real race to land inside a single
+    /// call — see `concurrent_poll_and_arm_attempts_settle_with_client_disarmed`
+    /// below for the genuine end-to-end concurrency test instead.
+    #[test]
+    fn is_tx_arm_eligible_reflects_the_latest_write_not_a_stale_snapshot() {
+        let list = Arc::new(std::sync::RwLock::new(HashSet::from([
+            CLIENT_KEY_ID.to_string()
+        ])));
+        // Simulates verify_and_arm's top-of-function check: passes.
+        assert!(is_tx_arm_eligible(&list, CLIENT_KEY_ID));
+        // Simulates a concurrent poll cycle revoking eligibility BETWEEN the
+        // top-of-function check and the final re-check under arm's lock.
+        list.write().unwrap().remove(CLIENT_KEY_ID);
+        // The re-check — literally the same function, called again, exactly
+        // as verify_and_arm does right before st.arm(...) — must now see the
+        // revocation.
+        assert!(!is_tx_arm_eligible(&list, CLIENT_KEY_ID));
+    }
+
+    /// A client that is ALREADY ARMED and a subsequent authorization poll
+    /// comes back WITHOUT that client in the TX-arm-eligible set (here: the
+    /// edge is now delegated) must be disarmed immediately — not left to run
+    /// out its TTL. `verify_and_arm`'s gate alone is insufficient because it
+    /// only runs at arm time; this exercises the REAL
+    /// `poll_authorizations_loop` end to end (a genuine mock cqdx HTTP
+    /// server, not just a pure-predicate test), since the gap this closes is
+    /// specifically about threading the shared `arm` into this task.
+    #[tokio::test]
+    async fn poll_authorizations_loop_disarms_when_armed_clients_eligibility_is_revoked() {
+        // Mock cqdx: every request returns ONE edge for CLIENT_KEY_ID with a
+        // non-null delegatedBy — i.e. this refresh says CLIENT_KEY_ID is no
+        // longer TX-arm-eligible (still admitted as a peer, though).
+        let app = axum::Router::new().route(
+            "/api/v1/authorizations",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "authorizations": [{
+                        "id": "auth_1",
+                        "agentKeyId": "agent_this",
+                        "clientKeyId": CLIENT_KEY_ID,
+                        "scopes": ["status", "qsy"],
+                        "createdAt": "2026-08-15T00:00:00Z",
+                        "role": "owner",
+                        "delegatedBy": "some_owner_user_id"
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let tx_allow_list = Arc::new(std::sync::RwLock::new(HashSet::new()));
+        let tx_arm_allow_list = Arc::new(std::sync::RwLock::new(HashSet::from([
+            CLIENT_KEY_ID.to_string()
+        ])));
+        let client_keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
+        let arm = Arc::new(Mutex::new(ArmState::new()));
+        let audit = AuditLog::new(audit_tmp());
+        let audit_path = audit.path().clone();
+
+        // Pre-arm as CLIENT_KEY_ID — simulates a client that armed BEFORE
+        // its edge became delegated.
+        {
+            let mut st = arm.lock().unwrap();
+            st.set_local_consent(true, NOW);
+            st.arm(
+                pancetta_agent::arm::VerifiedArmGrant {
+                    operator_callsign: "K5ARH".to_string(),
+                    ttl_ms: 3_600_000, // 1h — long enough that only the poll-driven disarm can end it
+                    scope_tx: true,
+                    jti: "revocation-test-jti".to_string(),
+                    client_key_id: CLIENT_KEY_ID.to_string(),
+                },
+                NOW,
+            );
+        }
+        assert!(
+            arm.lock().unwrap().is_armed(),
+            "setup sanity: must be armed before the poll runs"
+        );
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cqdx_cfg = pancetta_config::network::CqdxConfig {
+            enabled: true,
+            base_url: format!("http://{addr}"),
+            token: Some("pat_test_token_0000000000".to_string()),
+            poll_interval_secs: 30,
+            authorizations_poll_interval_secs: 45,
+        };
+        let shutdown_clone = shutdown.clone();
+        let handle = tokio::spawn(poll_authorizations_loop(
+            cqdx_cfg,
+            "agent_this".to_string(),
+            std::env::temp_dir(),
+            tx_allow_list.clone(),
+            tx_arm_allow_list.clone(),
+            client_keys.clone(),
+            arm.clone(),
+            audit,
+            shutdown_clone,
+            Duration::from_millis(50),
+        ));
+        // Give the poll loop time to complete at least one successful cycle
+        // against the mock server.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
+
+        assert!(
+            tx_allow_list.read().unwrap().contains(CLIENT_KEY_ID),
+            "the now-delegated client must still be admitted as a peer"
+        );
+        assert!(
+            !tx_arm_allow_list.read().unwrap().contains(CLIENT_KEY_ID),
+            "the now-delegated client must no longer be TX-arm-eligible"
+        );
+        assert!(
+            !arm.lock().unwrap().is_armed(),
+            "a live arm whose controller's TX-arm eligibility was just revoked \
+             by a poll must be disarmed immediately, not left to run out its TTL"
+        );
+
+        let log = std::fs::read_to_string(&audit_path).unwrap_or_default();
+        let disarmed = log
+            .lines()
+            .filter_map(|l| serde_json::from_str::<AuditEvent>(l).ok())
+            .any(|ev| {
+                ev.kind == AuditKind::Disarmed && ev.detail.contains("authorization-revoked")
+            });
+        assert!(
+            disarmed,
+            "the revocation-driven disarm must be audited with the AuthorizationRevoked reason"
+        );
+    }
+
+    /// End-to-end concurrent stress test on a multi-threaded runtime. Runs
+    /// the REAL `poll_authorizations_loop` — against a mock cqdx server that
+    /// reports CLIENT_KEY_ID's edge as delegated (revoked) on EVERY response
+    /// — concurrently with a task repeatedly attempting to arm as
+    /// CLIENT_KEY_ID through the REAL `dispatch_action`/`verify_and_arm`
+    /// path. These are the exact same two tasks (session loop vs. poll
+    /// task) that race in production, sharing the exact same `Arc<Mutex<
+    /// ArmState>>` / `Arc<RwLock<HashSet<String>>>` handles. Once both
+    /// settle, the client must not be left armed.
+    ///
+    /// Honesty check on what this DOES and DOES NOT prove: the atomicity
+    /// race this fix closes is a genuine *thread*-level race over a handful
+    /// of CPU instructions between two lock acquisitions inside a single
+    /// poll iteration (there is no `.await` — no task-scheduling yield point
+    /// — between `poll_authorizations_loop`'s disarm-check and its publish,
+    /// nor between `verify_and_arm`'s top-of-function check and its
+    /// `arm.lock()` acquisition). This test demonstrates real end-to-end
+    /// soundness under concurrent load (a genuine regression test for the
+    /// disarm-on-revocation + arm pipeline working together) but does NOT
+    /// reliably land inside that microsecond-scale window —
+    /// `is_tx_arm_eligible_reflects_the_latest_write_not_a_stale_snapshot`
+    /// above is the test that actually pins the mechanism (live re-read, not
+    /// a stale snapshot) the fix depends on. This test IS, however, the one
+    /// that caught a genuine self-deadlock while this fix was being written
+    /// (an un-dropped `tx_arm_allow_list` read guard in `verify_and_arm`
+    /// before its re-check tried to acquire the same `RwLock` again — see
+    /// the `drop(allow_list)` comment there) — real concurrency exercise
+    /// remains valuable even when it can't pin a specific micro-race.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_poll_and_arm_attempts_settle_with_client_disarmed() {
+        let app = axum::Router::new().route(
+            "/api/v1/authorizations",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "authorizations": [{
+                        "id": "auth_1",
+                        "agentKeyId": AGENT_KEY_ID,
+                        "clientKeyId": CLIENT_KEY_ID,
+                        "scopes": ["status", "qsy", "tx"],
+                        "createdAt": "2026-08-15T00:00:00Z",
+                        "role": "owner",
+                        "delegatedBy": "some_owner_user_id"
+                    }]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        let mut ctx = ctx_with(true, true);
+        with_consent(&ctx, true);
+        let poll_arm = ctx.arm.clone();
+        let poll_tx_arm_allow_list = ctx.tx_arm_allow_list.clone();
+        let poll_tx_allow_list = ctx.tx_allow_list.clone();
+        let poll_client_keys = ctx.client_keys.clone();
+        let poll_audit = ctx.audit.clone();
+
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let cqdx_cfg = pancetta_config::network::CqdxConfig {
+            enabled: true,
+            base_url: format!("http://{addr}"),
+            token: Some("pat_test_token_0000000000".to_string()),
+            poll_interval_secs: 30,
+            authorizations_poll_interval_secs: 45,
+        };
+        let shutdown_clone = shutdown.clone();
+        // Fast poll interval so MANY cycles run during the arm-attempt loop
+        // below, maximizing the chance of actually landing inside the race
+        // window on any given test run — the final assertion holds
+        // regardless, but this makes the test exercise the interesting
+        // interleavings, not just the trivially-safe ones.
+        let poll_handle = tokio::spawn(poll_authorizations_loop(
+            cqdx_cfg,
+            AGENT_KEY_ID.to_string(),
+            std::env::temp_dir(),
+            poll_tx_allow_list,
+            poll_tx_arm_allow_list,
+            poll_client_keys,
+            poll_arm,
+            poll_audit,
+            shutdown_clone,
+            Duration::from_millis(5),
+        ));
+
+        let bus = MessageBus::new(64).unwrap();
+        // Repeatedly attempt to arm as CLIENT_KEY_ID, racing the poll above.
+        // A fresh jti each time (single-use jti gate is unrelated to this
+        // race). `yield_now` gives the poll task's OS thread real chances to
+        // interleave on the multi-threaded runtime.
+        for i in 0..100 {
+            dispatch_action(
+                arm_action(&format!("race-jti-{i}")),
+                CLIENT_KEY_ID,
+                &mut ctx,
+                &bus,
+                SESSION_ID,
+                NOW,
+            )
+            .await;
+            tokio::task::yield_now().await;
+        }
+
+        // Give the poll loop several more cycles to run AFTER the last arm
+        // attempt, so its disarm-check has a final chance to react to any
+        // residual armed state before we assert.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(Duration::from_secs(2), poll_handle).await;
+
+        assert!(
+            !ctx.tx_arm_allow_list
+                .read()
+                .unwrap()
+                .contains(CLIENT_KEY_ID),
+            "setup sanity: the poll must have published CLIENT_KEY_ID's revocation by now"
+        );
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "regardless of how the arm-attempt loop interleaved with the poll's \
+             revocation, the client must never be left armed once both settle"
+        );
     }
 }
