@@ -676,6 +676,35 @@ pub struct ApplicationCoordinator {
     /// Number of active supervisor-owned hard mutes. Non-zero while Hamlib is
     /// being torn down and reacquired; separate from operator TX policy.
     pub(crate) tx_restart_inhibit: Arc<AtomicU32>,
+    /// PAN-19 round-7 review (Codex P1): whether the CURRENT Hamlib
+    /// generation's message loop has confirmed it's actually consuming
+    /// commands. Independent of, and orthogonal to, `tx_restart_inhibit`
+    /// above: `TxInhibitGuard` (health.rs) releases the moment
+    /// `start_hamlib_component` RETURNS -- which happens even on a
+    /// `LoopReadyOutcome::TimedOut` (round-5's `classify_loop_ready` in
+    /// hamlib.rs), because that path must stay non-bailing to preserve the
+    /// HIGH fix (a slow rig must never hard-fail startup). But "startup
+    /// didn't hard-fail" and "TX may now be un-inhibited" are NOT the same
+    /// property -- conflating them was the round-7 bug. This flag gates
+    /// PTT directly at TX key-time (`tx_hard_mute_reason` in `tx.rs`),
+    /// independent of the restart-supervision counter, so a `TimedOut`
+    /// startup still keeps PTT blocked until the loop genuinely confirms
+    /// readiness, without ever making a slow rig fail startup.
+    ///
+    /// Defaults to `true` (i.e. un-gated by this mechanism) so a build
+    /// with the `pancetta-hamlib` feature disabled -- where
+    /// `start_hamlib_component` never runs at all and Hamlib provides no
+    /// PTT safety watchdog by design (see the `warn!` in `start_pipeline`:
+    /// "Transmit at your own risk") -- behaves exactly as before, never
+    /// gated by a flag nothing would ever set. `start_hamlib_component`
+    /// resets this to `false` at the very start of every call (first boot
+    /// AND every restart) and only sets it back to `true` once the
+    /// message loop genuinely confirms readiness (or, on the mock/
+    /// disabled-rig path, immediately -- that path's connect/PTT/
+    /// frequency-read sequence and message-loop start are local and fast
+    /// enough that there's no meaningful "is the loop actually ready" gap
+    /// to guard there).
+    pub(crate) hamlib_command_loop_ready: Arc<AtomicBool>,
 
     /// Operator TX-frequency mode (`pancetta_core::TxFreqMode` as `u8`),
     /// default `Hold`. Shared with the QSO engine (gates the stuck-DX TX-offset
@@ -1513,6 +1542,7 @@ impl ApplicationCoordinator {
                 pancetta_core::TxPolicy::default().as_u8(),
             )),
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
+            hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
             // Default TX-frequency mode = Hold (operator's picked offset is
             // sticky; pancetta never moves it autonomously). Operator switches
             // to Auto from the TUI (`f`).

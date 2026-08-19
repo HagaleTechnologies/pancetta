@@ -1022,16 +1022,100 @@ fn current_tx_policy(
     pancetta_core::TxPolicy::from_u8(tx_policy.load(Ordering::Acquire))
 }
 
+/// PAN-19 round-7 review (Codex P1): `hamlib_loop_ready` is checked as an
+/// ADDITIONAL, orthogonal condition alongside `restart_inhibit` -- not a
+/// replacement for it. `restart_inhibit` (`tx_restart_inhibit`) reflects
+/// the coordinator's restart-supervision bookkeeping (`TxInhibitGuard`),
+/// which releases the instant `start_hamlib_component` RETURNS -- even on
+/// a `LoopReadyOutcome::TimedOut`, which must stay non-bailing so a slow
+/// rig never hard-fails startup (the HIGH-fix invariant). `hamlib_loop_ready`
+/// instead reflects whether the message loop has genuinely confirmed it's
+/// consuming commands, set independently by `start_hamlib_component`
+/// (`coordinator/hamlib.rs`) and never touched by the restart-supervision
+/// counter machinery at all -- so a `TimedOut` startup still blocks PTT
+/// here even after `TxInhibitGuard` has already released.
 fn tx_hard_mute_reason(
     tx_policy: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     restart_inhibit: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    hamlib_loop_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<&'static str> {
     if restart_inhibit.load(Ordering::Acquire) != 0 {
         Some("rig control is restarting")
+    } else if !hamlib_loop_ready.load(Ordering::Acquire) {
+        Some("Hamlib command loop is not yet ready")
     } else if current_tx_policy(tx_policy) == pancetta_core::TxPolicy::Disabled {
         Some("TX policy is Disabled")
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tx_hard_mute_reason_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+    use std::sync::Arc;
+
+    fn policy(p: pancetta_core::TxPolicy) -> Arc<AtomicU8> {
+        Arc::new(AtomicU8::new(p.as_u8()))
+    }
+
+    #[test]
+    fn permits_tx_when_everything_is_ready() {
+        let policy = policy(pancetta_core::TxPolicy::Full);
+        let restart_inhibit = Arc::new(AtomicU32::new(0));
+        let hamlib_loop_ready = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            tx_hard_mute_reason(&policy, &restart_inhibit, &hamlib_loop_ready),
+            None
+        );
+    }
+
+    #[test]
+    fn restart_inhibit_still_mutes_independent_of_loop_readiness() {
+        let policy = policy(pancetta_core::TxPolicy::Full);
+        let restart_inhibit = Arc::new(AtomicU32::new(1));
+        let hamlib_loop_ready = Arc::new(AtomicBool::new(true));
+        assert!(tx_hard_mute_reason(&policy, &restart_inhibit, &hamlib_loop_ready).is_some());
+    }
+
+    /// PAN-19 round-7 review (Codex P1): the actual bug this guards
+    /// against. A `LoopReadyOutcome::TimedOut` startup still returns
+    /// `Ok(())` from `start_hamlib_component` (must not bail -- the
+    /// HIGH-fix invariant), which releases `TxInhibitGuard`
+    /// (`tx_restart_inhibit` back to 0) in `health.rs`. Simulate exactly
+    /// that end state -- `tx_restart_inhibit == 0` (already released) but
+    /// `hamlib_command_loop_ready == false` (never confirmed, because
+    /// `TimedOut` never sets it true) -- and confirm PTT is STILL refused
+    /// at this gate, independent of the restart-supervision counter having
+    /// already released.
+    #[test]
+    fn hamlib_loop_not_ready_mutes_tx_even_after_restart_inhibit_has_released() {
+        let policy = policy(pancetta_core::TxPolicy::Full);
+        // The exact post-`TimedOut` state: the restart-supervision inhibit
+        // has ALREADY been released (0), simulating `TxInhibitGuard`
+        // having dropped normally once `start_hamlib_component` returned
+        // `Ok(())` on a timeout.
+        let restart_inhibit = Arc::new(AtomicU32::new(0));
+        let hamlib_loop_ready = Arc::new(AtomicBool::new(false));
+
+        let reason = tx_hard_mute_reason(&policy, &restart_inhibit, &hamlib_loop_ready);
+        assert!(
+            reason.is_some(),
+            "TX must stay muted when the Hamlib command loop hasn't confirmed readiness, even \
+             though the restart-supervision inhibit counter has already released"
+        );
+    }
+
+    #[test]
+    fn tx_policy_disabled_still_mutes_when_everything_else_is_ready() {
+        let policy = policy(pancetta_core::TxPolicy::Disabled);
+        let restart_inhibit = Arc::new(AtomicU32::new(0));
+        let hamlib_loop_ready = Arc::new(AtomicBool::new(true));
+        assert_eq!(
+            tx_hard_mute_reason(&policy, &restart_inhibit, &hamlib_loop_ready),
+            Some("TX policy is Disabled")
+        );
     }
 }
 
@@ -2260,6 +2344,9 @@ impl super::ApplicationCoordinator {
             // initiation sources) so in-progress QSOs keep flowing here.
             let tx_policy = self.tx_policy.clone();
             let tx_restart_inhibit = self.tx_restart_inhibit.clone();
+            // PAN-19 round-7 (Codex P1): orthogonal to `tx_restart_inhibit`
+            // above -- see `tx_hard_mute_reason`'s doc comment.
+            let hamlib_command_loop_ready = self.hamlib_command_loop_ready.clone();
             // Drop-stale-TX gate: the QSO component keeps this set in sync;
             // the worker refuses to key PTT for a request whose `qso_id` is no
             // longer present (superseded / cancelled / completed-past-grace).
@@ -2654,9 +2741,11 @@ impl super::ApplicationCoordinator {
                                     // report a failed TransmitComplete so any awaiting
                                     // QSO state machine doesn't hang. This is the
                                     // catch-all hard gate for every TX source.
-                                    if let Some(reason) =
-                                        tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
-                                    {
+                                    if let Some(reason) = tx_hard_mute_reason(
+                                        &tx_policy,
+                                        &tx_restart_inhibit,
+                                        &hamlib_command_loop_ready,
+                                    ) {
                                         info!(
                                             target: "pancetta::tx.policy",
                                             "TX blocked ({}): '{}' at {:.0} Hz (qso: {:?})",
@@ -3104,9 +3193,11 @@ impl super::ApplicationCoordinator {
                                             continue 'worker;
                                         }
 
-                                        if let Some(reason) =
-                                            tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
-                                        {
+                                        if let Some(reason) = tx_hard_mute_reason(
+                                            &tx_policy,
+                                            &tx_restart_inhibit,
+                                            &hamlib_command_loop_ready,
+                                        ) {
                                             emit_diagnostic(
                                                 &message_bus,
                                                 "tx.policy",
@@ -3814,9 +3905,11 @@ impl super::ApplicationCoordinator {
                                     // modulate. Consume the bundle, clear the TUI TX
                                     // view, and report each item failed so any awaiting
                                     // state doesn't hang.
-                                    if let Some(reason) =
-                                        tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
-                                    {
+                                    if let Some(reason) = tx_hard_mute_reason(
+                                        &tx_policy,
+                                        &tx_restart_inhibit,
+                                        &hamlib_command_loop_ready,
+                                    ) {
                                         info!(
                                             target: "pancetta::tx.policy",
                                             "TX blocked ({}): multi-TX bundle of {} items",
@@ -4703,9 +4796,11 @@ impl super::ApplicationCoordinator {
                                         continue;
                                     }
 
-                                    if let Some(reason) =
-                                        tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
-                                    {
+                                    if let Some(reason) = tx_hard_mute_reason(
+                                        &tx_policy,
+                                        &tx_restart_inhibit,
+                                        &hamlib_command_loop_ready,
+                                    ) {
                                         emit_diagnostic(
                                             &message_bus,
                                             "tx.policy",
@@ -5063,9 +5158,11 @@ impl super::ApplicationCoordinator {
                                     // TransmitRequest / MultiTransmitRequest
                                     // arms — defends against any TuneRequest
                                     // source, not just the TUI relay.
-                                    if let Some(reason) =
-                                        tx_hard_mute_reason(&tx_policy, &tx_restart_inhibit)
-                                    {
+                                    if let Some(reason) = tx_hard_mute_reason(
+                                        &tx_policy,
+                                        &tx_restart_inhibit,
+                                        &hamlib_command_loop_ready,
+                                    ) {
                                         info!(
                                             target: "pancetta::tx.policy",
                                             "TX blocked ({}): tune ({}s @ {} Hz)",

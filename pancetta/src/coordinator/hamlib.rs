@@ -507,23 +507,53 @@ impl super::ApplicationCoordinator {
         &mut self,
         sender: &crossbeam_channel::Sender<ComponentMessage>,
     ) {
-        for (label, pending) in [
-            ("SetFrequency", self.hamlib_pending_frequency.take()),
-            ("SetSplit", self.hamlib_pending_split.take()),
-        ] {
-            if let Some(message) = pending {
-                if let Err(e) = sender.try_send(message) {
-                    warn!(
-                        "Hamlib restart: failed to deliver pending {label} command to the new \
-                         generation: {}",
-                        e
-                    );
-                } else {
+        // PAN-19 round-7 review (Codex P1): an earlier version of this
+        // function `take()`'d each pending slot, tried `try_send`, and on
+        // failure only logged the generic error -- discarding the
+        // `TrySendError`'s carried-back message entirely, so a command
+        // that arrived here right as another producer happened to fill
+        // the brand-new channel was lost for good on a single unlucky
+        // instant, defeating the whole point of queuing it in the first
+        // place. Both error variants (`Full` and `Disconnected`) carry the
+        // message back; put it back into its `Option` slot on failure so
+        // it survives to be retried on the NEXT delivery attempt (the
+        // next restart, or wherever else this gets called) instead of
+        // being silently gone.
+        if let Some(message) = self.hamlib_pending_frequency.take() {
+            match sender.try_send(message) {
+                Ok(()) => {
                     info!(
                         target: "rig",
-                        "Hamlib restart: delivered pending {label} command carried over from \
+                        "Hamlib restart: delivered pending SetFrequency command carried over \
+                         from a prior failed teardown replay"
+                    );
+                }
+                Err(crossbeam_channel::TrySendError::Full(returned))
+                | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
+                    warn!(
+                        "Hamlib restart: failed to deliver pending SetFrequency command to the \
+                         new generation -- keeping it queued for the next attempt"
+                    );
+                    self.hamlib_pending_frequency = Some(returned);
+                }
+            }
+        }
+        if let Some(message) = self.hamlib_pending_split.take() {
+            match sender.try_send(message) {
+                Ok(()) => {
+                    info!(
+                        target: "rig",
+                        "Hamlib restart: delivered pending SetSplit command carried over from \
                          a prior failed teardown replay"
                     );
+                }
+                Err(crossbeam_channel::TrySendError::Full(returned))
+                | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
+                    warn!(
+                        "Hamlib restart: failed to deliver pending SetSplit command to the new \
+                         generation -- keeping it queued for the next attempt"
+                    );
+                    self.hamlib_pending_split = Some(returned);
                 }
             }
         }
@@ -605,6 +635,16 @@ impl super::ApplicationCoordinator {
         let _enter = span.enter();
 
         info!("Starting Hamlib component");
+
+        // PAN-19 round-7 review (Codex P1): reset the independent
+        // TX-key-time readiness flag at the START of every call (first
+        // boot AND every restart) -- PTT stays blocked (via
+        // `tx_hard_mute_reason` in `tx.rs`) until it's explicitly set back
+        // to `true` below, regardless of what `tx_restart_inhibit`/
+        // `TxInhibitGuard` are doing. See `hamlib_command_loop_ready`'s
+        // doc comment in `coordinator/mod.rs` for the full reasoning.
+        self.hamlib_command_loop_ready
+            .store(false, Ordering::Release);
 
         if self
             .rigctld_process
@@ -1443,6 +1483,17 @@ impl super::ApplicationCoordinator {
             ) {
                 LoopReadyOutcome::Ready => {
                     info!(target: "rig", "Hamlib message loop ready to consume commands");
+                    // PAN-19 round-7 review (Codex P1): the ONLY place this
+                    // flag is set true for the real-rig path -- see
+                    // `hamlib_command_loop_ready`'s doc comment. Deliberately
+                    // NOT set in the `TimedOut` arm below: `start_hamlib_component`
+                    // still returns `Ok(())` there (must not bail, or the
+                    // HIGH-fix regression comes back), but that must not be
+                    // conflated with "safe to un-inhibit TX" -- this flag is
+                    // what actually gates PTT at key-time, independent of
+                    // `start_hamlib_component`'s return value.
+                    self.hamlib_command_loop_ready
+                        .store(true, Ordering::Release);
                 }
                 LoopReadyOutcome::SenderDropped => {
                     hamlib_abort.abort();
@@ -1454,11 +1505,24 @@ impl super::ApplicationCoordinator {
                     warn!(
                         target: "rig",
                         "Hamlib message loop not confirmed ready within an additional {}s -- \
-                         proceeding anyway; a queued PTT command may be processed late",
+                         proceeding anyway; a queued PTT command may be processed late, and \
+                         PTT stays gated at TX key-time until the loop confirms readiness",
                         HAMLIB_LOOP_READY_TIMEOUT.as_secs()
                     );
                 }
             }
+        } else {
+            // Mock/disabled-rig path: `rig_enabled` is false, so the wait
+            // above never runs (`loop_ready_tx` still fires unconditionally
+            // from the spawned task, but nothing here awaits it) -- the
+            // connect/PTT/frequency-read sequence and message-loop start
+            // are both local and effectively instant (no real I/O), so
+            // there's no meaningful "is the loop actually ready" gap to
+            // guard against here. Mark ready immediately rather than
+            // leaving PTT permanently gated on a signal nothing will ever
+            // await.
+            self.hamlib_command_loop_ready
+                .store(true, Ordering::Release);
         }
 
         // PAN-19 round-5 review (Codex P1): deliver any `SetFrequency`/
@@ -2356,6 +2420,67 @@ mod teardown_replay_tests {
         assert!(
             delivered_types.contains(&false),
             "SetSplit must be delivered"
+        );
+    }
+
+    /// PAN-19 round-7 review (Codex P1): an earlier version of
+    /// `deliver_pending_hamlib_state` `take()`'d the pending slot, tried
+    /// `try_send`, and on failure only logged -- discarding the
+    /// `TrySendError`'s carried-back message entirely, so a command that
+    /// arrived here right as another producer happened to fill the
+    /// brand-new channel was permanently lost. This pins the fix: a full
+    /// channel at delivery time must leave the pending command still
+    /// queued afterward (not silently gone), and it must succeed once
+    /// delivered again with room in the channel.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_requeues_on_a_full_channel_and_delivers_later() {
+        let mut coordinator = test_coordinator().await;
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        coordinator.hamlib_pending_split = Some(split_msg);
+
+        // A full channel at delivery time.
+        let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        sender
+            .try_send(set_freq_msg())
+            .expect("pre-fill the one slot");
+
+        coordinator.deliver_pending_hamlib_state(&sender);
+
+        assert!(
+            coordinator.hamlib_pending_split.is_some(),
+            "a failed delivery (channel full) must leave the pending command still queued, \
+             not silently dropped"
+        );
+
+        // Drain the blocker, then retry delivery with room -- must succeed.
+        receiver.try_recv().expect("drain the blocker");
+        coordinator.deliver_pending_hamlib_state(&sender);
+
+        assert!(
+            coordinator.hamlib_pending_split.is_none(),
+            "the pending slot must be cleared once delivery succeeds"
+        );
+        let delivered = receiver
+            .try_recv()
+            .expect("the queued SetSplit must have been delivered once the channel had room");
+        assert!(
+            matches!(
+                delivered.message_type,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                    enabled: true,
+                    tx_frequency: 14_078_000
+                })
+            ),
+            "the delivered message must be the SAME SetSplit that failed to deliver earlier"
         );
     }
 
