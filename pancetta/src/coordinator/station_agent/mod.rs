@@ -204,6 +204,24 @@ struct ArmContext {
     /// from ANY established peer regardless (fail-safe TX-OFF, rule 5). Cleared
     /// when the controller leaves (rule 6) or on any session teardown.
     controller: Option<String>,
+    /// Set by `poll_authorizations_loop` (round-1 review fix, PR #261) the
+    /// instant a live authorization refresh disarms the current controller
+    /// (`DisarmReason::AuthorizationRevoked`) — the poll task runs in a
+    /// SEPARATE tokio task from the session loop that owns the actual
+    /// websocket sends, so it cannot call `control_state_sends`/
+    /// `deliver_sends` itself; it can only flag the transition and let the
+    /// session loop's own tick pick it up. `run_one_session` checks (and
+    /// clears) this once per tick and, if set, broadcasts the CURRENT
+    /// (already-disarmed) control state to every established peer — every
+    /// OTHER arm transition in this module already does this immediately as
+    /// part of the transition itself; this is what makes a poll-driven
+    /// revocation match that same rule instead of leaving already-connected
+    /// peers holding a stale `transmitArmed: true` until their next
+    /// heartbeat/TX request happens to refresh it. Purely a display-
+    /// freshness signal — the TX worker enforces the real gate by reading
+    /// `ArmState::tx_permitted` live, so this flag never affects whether TX
+    /// is actually permitted, only how promptly connected peers are told.
+    revocation_pending: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Per-established-peer session state (Task 4: one entry per demuxed peer,
@@ -1248,6 +1266,10 @@ impl super::ApplicationCoordinator {
         let bus = self.message_bus.clone();
         let shutdown = self.shutdown_signal.clone();
         let arm = self.remote_tx_arm.clone();
+        // Round-1 review fix (PR #261): shared with `poll_authorizations_loop`
+        // so a poll-driven disarm can flag the session loop to broadcast the
+        // updated control state (see `ArmContext::revocation_pending`).
+        let revocation_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Task 6: subscribe to the shared display feed (if the localhost
         // gateway or this component's own gating started it — see
@@ -1278,6 +1300,7 @@ impl super::ApplicationCoordinator {
             // doc).
             let poll_arm = arm.clone();
             let poll_audit = audit.clone();
+            let poll_revocation_pending = revocation_pending.clone();
             let poll_shutdown = self.shutdown_signal.clone();
             let poll_interval = Duration::from_secs(cqdx_cfg.authorizations_poll_interval_secs);
             let poll_handle = tokio::spawn(async move {
@@ -1290,6 +1313,7 @@ impl super::ApplicationCoordinator {
                     poll_client_keys,
                     poll_arm,
                     poll_audit,
+                    poll_revocation_pending,
                     poll_shutdown,
                     poll_interval,
                 )
@@ -1310,6 +1334,7 @@ impl super::ApplicationCoordinator {
                 bus,
                 events,
                 arm,
+                revocation_pending,
                 shutdown,
             })
             .await;
@@ -1418,6 +1443,15 @@ fn load_client_device_keys(
 /// acquire `arm.lock()` in a window between this section's disarm-check and
 /// the publish and arm a just-revoked client with nothing left to revisit it
 /// until the NEXT poll cycle.
+///
+/// Round-1 review fix (PR #261): this task runs in a SEPARATE tokio task
+/// from the session loop that owns the actual websocket sends, so it cannot
+/// call `control_state_sends`/`deliver_sends` itself when it disarms. It
+/// instead flags `revocation_pending` (mirrors `ArmContext::
+/// revocation_pending` — the SAME `Arc`), which `run_one_session` checks and
+/// clears once per tick, broadcasting the updated control state to every
+/// established peer then — matching this module's existing rule that every
+/// arm transition fans `control_state_sends` out immediately.
 #[allow(clippy::too_many_arguments)]
 async fn poll_authorizations_loop(
     cqdx_cfg: pancetta_config::network::CqdxConfig,
@@ -1428,6 +1462,7 @@ async fn poll_authorizations_loop(
     client_keys: Arc<std::sync::RwLock<std::collections::HashMap<String, VerifyingKey>>>,
     arm: Arc<Mutex<ArmState>>,
     audit: AuditLog,
+    revocation_pending: Arc<std::sync::atomic::AtomicBool>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
     interval: Duration,
 ) {
@@ -1485,6 +1520,12 @@ async fn poll_authorizations_loop(
                         let effects =
                             st.disarm_with_reason(DisarmReason::AuthorizationRevoked, now_ms());
                         apply_arm_effects(&audit, &effects);
+                        // Flag the session loop (a SEPARATE tokio task, so it
+                        // cannot be signaled by directly calling
+                        // control_state_sends/deliver_sends here) to
+                        // broadcast the updated control state on its next
+                        // tick — see the fn-level doc above.
+                        revocation_pending.store(true, Ordering::Release);
                         warn!(
                             target: "agent.tx",
                             "remote TX disarmed: an authorization refresh revoked the \
@@ -1534,6 +1575,8 @@ struct RunConfig {
     /// (`drain_read_stream` no-ops on `None`).
     events: Option<tokio::sync::broadcast::Receiver<pancetta_protocol::ServerEvent>>,
     arm: Arc<Mutex<ArmState>>,
+    /// Threaded into `ArmContext::revocation_pending` — see there.
+    revocation_pending: Arc<std::sync::atomic::AtomicBool>,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -1566,6 +1609,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
         peers: std::collections::HashMap::new(),
         // No controller until a peer grabs it (explicitly or implicitly).
         controller: None,
+        revocation_pending: cfg.revocation_pending,
     };
 
     while !cfg.shutdown.load(Ordering::Acquire) {
@@ -1759,6 +1803,23 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                 return;
             }
         }
+
+        // Round-1 review fix (PR #261): a concurrent `poll_authorizations_loop`
+        // cycle may have just disarmed the live controller
+        // (`DisarmReason::AuthorizationRevoked`) — it flags this here via
+        // `ctx.revocation_pending` because it runs in a separate tokio task
+        // and cannot call `deliver_sends` itself. Check (and clear) the flag
+        // once per tick, same granularity as every other per-tick concern in
+        // this loop, and broadcast the CURRENT (already-disarmed) control
+        // state to every established peer — matching this module's existing
+        // rule that every arm transition fans `control_state_sends` out
+        // immediately, so an already-connected peer's `transmitArmed` never
+        // goes stale until its next heartbeat/TX request happens to refresh
+        // it.
+        if ctx.revocation_pending.swap(false, Ordering::AcqRel) {
+            let sends = control_state_sends(ctx, now_ms(), None);
+            deliver_sends(&mut sess, &sends);
+        }
     }
 }
 
@@ -1933,6 +1994,7 @@ mod tests {
             // already-established peer with no granted scope yet.
             peers: peers_with(CLIENT_KEY_ID, None),
             controller: None,
+            revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -3313,6 +3375,53 @@ mod tests {
         }
     }
 
+    /// Wraps a `MockWs`, running a one-shot side effect right before its
+    /// `recv_text_within`-triggering `recv_text` call number `trigger_after`
+    /// returns. Lets a test deterministically place "a concurrent event
+    /// happened here" at an EXACT point in the tick sequence — without
+    /// needing genuine thread concurrency, which `run_one_session`'s
+    /// MockWs-driven tick loop has no reliable yield point for (it is
+    /// entirely synchronous except inside `dispatch_action`'s own internal
+    /// awaits). Used to simulate "a concurrent `poll_authorizations_loop`
+    /// cycle disarmed the live arm and set `revocation_pending` between two
+    /// specific ticks."
+    struct TriggerAfterWs {
+        inner: MockWs,
+        trigger_after: usize,
+        calls: usize,
+        on_trigger: Option<Box<dyn FnOnce() + Send>>,
+    }
+
+    impl TriggerAfterWs {
+        fn new(
+            inner: MockWs,
+            trigger_after: usize,
+            on_trigger: impl FnOnce() + Send + 'static,
+        ) -> Self {
+            Self {
+                inner,
+                trigger_after,
+                calls: 0,
+                on_trigger: Some(Box::new(on_trigger)),
+            }
+        }
+    }
+
+    impl WsConn for TriggerAfterWs {
+        fn send_text(&mut self, s: String) -> Result<(), RelayError> {
+            self.inner.send_text(s)
+        }
+        fn recv_text(&mut self) -> Result<Option<String>, RelayError> {
+            self.calls += 1;
+            if self.calls == self.trigger_after {
+                if let Some(f) = self.on_trigger.take() {
+                    f();
+                }
+            }
+            self.inner.recv_text()
+        }
+    }
+
     /// A test-only Noise IK initiator (the client side), mirroring session.rs.
     struct TestInitiator {
         inner: snow::HandshakeState,
@@ -3587,6 +3696,7 @@ mod tests {
             audit: AuditLog::new(audit_tmp()),
             peers: std::collections::HashMap::new(),
             controller: None,
+            revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         };
         let bus = MessageBus::new(64).unwrap();
         run_one_session(ws, identity, &mut ctx, &bus, &mut None).await;
@@ -3671,6 +3781,7 @@ mod tests {
             audit: AuditLog::new(audit_tmp()),
             peers: std::collections::HashMap::new(),
             controller: None,
+            revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -3913,6 +4024,7 @@ mod tests {
             audit: AuditLog::new(audit_tmp()),
             peers: peers_with(CLIENT_KEY_ID, None),
             controller: None,
+            revocation_pending: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         }
     }
 
@@ -4029,6 +4141,7 @@ mod tests {
         let client_keys = Arc::new(std::sync::RwLock::new(std::collections::HashMap::new()));
         let arm = Arc::new(Mutex::new(ArmState::new()));
         let audit = AuditLog::new(audit_tmp());
+        let revocation_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cqdx_cfg = pancetta_config::network::CqdxConfig {
             enabled: true,
@@ -4047,6 +4160,7 @@ mod tests {
             client_keys.clone(),
             arm,
             audit,
+            revocation_pending,
             shutdown_clone,
             Duration::from_millis(50),
         ));
@@ -4212,6 +4326,7 @@ mod tests {
         let arm = Arc::new(Mutex::new(ArmState::new()));
         let audit = AuditLog::new(audit_tmp());
         let audit_path = audit.path().clone();
+        let revocation_pending = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         // Pre-arm as CLIENT_KEY_ID — simulates a client that armed BEFORE
         // its edge became delegated.
@@ -4252,6 +4367,7 @@ mod tests {
             client_keys.clone(),
             arm.clone(),
             audit,
+            revocation_pending.clone(),
             shutdown_clone,
             Duration::from_millis(50),
         ));
@@ -4274,6 +4390,11 @@ mod tests {
             "a live arm whose controller's TX-arm eligibility was just revoked \
              by a poll must be disarmed immediately, not left to run out its TTL"
         );
+        assert!(
+            revocation_pending.load(Ordering::Acquire),
+            "a poll-driven disarm must flag revocation_pending so the session loop \
+             broadcasts the updated control state on its next tick (round-1 review fix)"
+        );
 
         let log = std::fs::read_to_string(&audit_path).unwrap_or_default();
         let disarmed = log
@@ -4285,6 +4406,165 @@ mod tests {
         assert!(
             disarmed,
             "the revocation-driven disarm must be audited with the AuthorizationRevoked reason"
+        );
+    }
+
+    /// Round-1 review fix (PR #261, P2 finding): the disarm-on-revocation
+    /// path is not just an `ArmState`/audit-log mutation — it must reach
+    /// already-connected peers the same way every OTHER arm transition in
+    /// this module does, via a broadcast `controlState { transmitArmed:
+    /// false }` frame (rule 7). This drives a REAL session
+    /// (`run_one_session`, a real Noise handshake, a real established peer)
+    /// and decrypts the actual wire bytes delivered to that peer — not just
+    /// `ArmContext`/`ArmState` state or the audit log — proving the poll's
+    /// `revocation_pending` flag genuinely reaches the transport layer.
+    ///
+    /// `run_one_session`'s MockWs-driven tick loop is entirely synchronous
+    /// (no task-scheduling yield point outside `dispatch_action`'s own
+    /// internal awaits), so a real concurrent poll task cannot be reliably
+    /// interleaved at a precise tick boundary in a test. `TriggerAfterWs`
+    /// deterministically places "the poll fired here" immediately before the
+    /// THIRD scripted frame is served — i.e. AFTER the peer has already
+    /// established (so its stale `transmitArmed: true` greeting is on the
+    /// wire) but BEFORE the next tick, exactly modeling "a poll disarmed the
+    /// live controller between two ticks."
+    #[tokio::test]
+    async fn poll_driven_disarm_broadcasts_updated_control_state_to_connected_peers() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let agent_pub = identity.agreement_public_raw();
+
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        let mut ctx = fresh_ctx(&agent_kid, allow);
+
+        // Pre-arm as CLIENT_KEY_ID (consent + a live grant) BEFORE the
+        // session starts — so the peer's establishment greeting shows
+        // `transmitArmed: true`, giving the later broadcast a real
+        // true→false transition to prove. `run_one_session`'s internal
+        // `control_state_sends` calls always use the REAL wall clock
+        // (`now_ms()`), not this module's fixed `NOW` test constant, so the
+        // grant must be armed against real "now" too or it reads as already
+        // TTL-expired.
+        let real_now = now_ms();
+        ctx.arm.lock().unwrap().set_local_consent(true, real_now);
+        ctx.arm.lock().unwrap().arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: OPERATOR.to_string(),
+                ttl_ms: 3_600_000,
+                scope_tx: true,
+                jti: "broadcast-test-jti".to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
+            },
+            real_now,
+        );
+        assert!(
+            ctx.arm.lock().unwrap().tx_permitted(real_now),
+            "setup sanity: must be armed+permitted before the peer establishes"
+        );
+
+        // Clones of the shared state a concurrent poll task would hold —
+        // moved into the trigger closure below to simulate its disarm.
+        let poll_arm = ctx.arm.clone();
+        let poll_revocation_pending = ctx.revocation_pending.clone();
+
+        let bus = MessageBus::new(64).unwrap();
+        let mut initiator = fresh_initiator(&agent_pub);
+        let msg1 = initiator.write_msg1(b"");
+
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[7u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let env_msg1 = RelayFrame::Env {
+            dst: agent_kid.clone(),
+            payload: b64url(&msg1),
+            src: Some(CLIENT_KEY_ID.to_string()),
+        }
+        .to_json()
+        .unwrap();
+        // A benign frame that produces a `Poll::Idle` tick without touching
+        // `ctx.peers` — the tick on which the trigger fires and this
+        // module's new post-tick `revocation_pending` check runs.
+        let idle_tick = RelayFrame::Presence {
+            peer: "irrelevant-peer".to_string(),
+            state: "up".to_string(),
+        }
+        .to_json()
+        .unwrap();
+
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        let mock = MockWs::new(vec![hello, env_msg1, idle_tick], outbound.clone());
+        // Fires right before the 3rd scripted frame (idle_tick) is served —
+        // i.e. AFTER CLIENT_KEY_ID has already established.
+        let ws = TriggerAfterWs::new(mock, 3, move || {
+            let effects = poll_arm
+                .lock()
+                .unwrap()
+                .disarm_with_reason(DisarmReason::AuthorizationRevoked, now_ms());
+            assert!(
+                !effects.is_empty(),
+                "setup sanity: the simulated poll disarm must actually find a live arm"
+            );
+            poll_revocation_pending.store(true, Ordering::Release);
+        });
+
+        run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
+
+        assert!(
+            ctx.peers.contains_key(CLIENT_KEY_ID),
+            "the peer must have established before the simulated poll disarm"
+        );
+        assert!(
+            !ctx.arm.lock().unwrap().is_armed(),
+            "setup sanity: the simulated poll disarm must have taken effect"
+        );
+
+        // Every env addressed to CLIENT_KEY_ID, in wire order: msg2, the
+        // establishment greeting (armed=true), then the poll-driven
+        // broadcast (armed=false).
+        let out = outbound.lock().unwrap().clone();
+        let envs: Vec<Vec<u8>> = out
+            .iter()
+            .filter_map(|s| match parse_frame(s).unwrap() {
+                RelayFrame::Env { dst, payload, .. } if dst == CLIENT_KEY_ID => Some(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(&payload)
+                        .unwrap(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            envs.len(),
+            3,
+            "msg2 + the establishment greeting + the poll-driven broadcast"
+        );
+
+        initiator.read_msg2(&envs[0]);
+        let mut transport = initiator.into_transport();
+        let mut decrypt = |ct: &[u8]| -> serde_json::Value {
+            let mut buf = vec![0u8; ct.len().max(1)];
+            let n = transport.read_message(ct, &mut buf).unwrap();
+            buf.truncate(n);
+            serde_json::from_slice(&buf).unwrap()
+        };
+
+        let greeting = decrypt(&envs[1]);
+        assert_eq!(greeting["event"]["event"], "controlState");
+        assert_eq!(
+            greeting["event"]["transmitArmed"], true,
+            "the establishment greeting must reflect the pre-armed state"
+        );
+
+        let broadcast = decrypt(&envs[2]);
+        assert_eq!(broadcast["event"]["event"], "controlState");
+        assert_eq!(
+            broadcast["event"]["transmitArmed"], false,
+            "the poll-driven disarm must broadcast an updated controlState with \
+             transmitArmed: false to the already-connected peer — not just mutate \
+             ArmState/the audit log"
         );
     }
 
@@ -4347,6 +4627,7 @@ mod tests {
         let poll_tx_allow_list = ctx.tx_allow_list.clone();
         let poll_client_keys = ctx.client_keys.clone();
         let poll_audit = ctx.audit.clone();
+        let poll_revocation_pending = ctx.revocation_pending.clone();
 
         let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cqdx_cfg = pancetta_config::network::CqdxConfig {
@@ -4371,6 +4652,7 @@ mod tests {
             poll_client_keys,
             poll_arm,
             poll_audit,
+            poll_revocation_pending,
             shutdown_clone,
             Duration::from_millis(5),
         ));
