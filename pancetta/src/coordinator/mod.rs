@@ -625,10 +625,23 @@ pub struct ApplicationCoordinator {
     /// desired state), and `SetPtt` never lands here -- it uses the
     /// direct-rig fallback in `replay_or_fallback` instead, since PTT-off
     /// must never wait for a future restart to complete.
+    ///
+    /// PAN-19 round-10 review (Codex P1): `Arc<Mutex<..>>`, not a plain
+    /// `Option`, because `deliver_pending_hamlib_state`'s ORIGINAL fix
+    /// (round-7) only ever ran once, synchronously within
+    /// `start_hamlib_component` -- if the brand-new channel happened to be
+    /// momentarily full at that exact instant, the pending command sat
+    /// stranded until the NEXT full Hamlib restart, even though the
+    /// channel likely had room again moments later. The Hamlib polling
+    /// task (a separately-spawned task with no `&mut self`) now ALSO
+    /// retries delivery every ~500ms tick, so this needs to be shared,
+    /// thread-safely-mutable state both that task and
+    /// `start_hamlib_component`/`replay_or_fallback` can reach without
+    /// `&mut self` -- same shape as `last_freq_command` below.
     #[cfg(feature = "pancetta-hamlib")]
-    pub(crate) hamlib_pending_frequency: Option<ComponentMessage>,
+    pub(crate) hamlib_pending_frequency: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     #[cfg(feature = "pancetta-hamlib")]
-    pub(crate) hamlib_pending_split: Option<ComponentMessage>,
+    pub(crate) hamlib_pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     /// Authorization refresh child owned by the current StationAgent generation.
     pub(crate) station_agent_poll: Option<tokio::task::AbortHandle>,
 
@@ -1625,9 +1638,9 @@ impl ApplicationCoordinator {
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_orphans: Vec::new(),
             #[cfg(feature = "pancetta-hamlib")]
-            hamlib_pending_frequency: None,
+            hamlib_pending_frequency: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(feature = "pancetta-hamlib")]
-            hamlib_pending_split: None,
+            hamlib_pending_split: Arc::new(std::sync::Mutex::new(None)),
             station_agent_poll: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),

@@ -472,7 +472,9 @@ impl super::ApplicationCoordinator {
                          command -- queuing it for the next Hamlib generation instead of \
                          dropping it"
                     );
-                    self.hamlib_pending_frequency = Some(pending);
+                    if let Ok(mut slot) = self.hamlib_pending_frequency.lock() {
+                        *slot = Some(pending);
+                    }
                 }
                 MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
                     ..
@@ -483,77 +485,15 @@ impl super::ApplicationCoordinator {
                          (a dropped SetSplit is not self-healing and could leave the rig \
                          holding stale split state)"
                     );
-                    self.hamlib_pending_split = Some(pending);
+                    if let Ok(mut slot) = self.hamlib_pending_split.lock() {
+                        *slot = Some(pending);
+                    }
                 }
                 _ => {
                     warn!(
                         "Hamlib teardown: dropping a replayed message, channel still full \
                          after {REPLAY_RETRY_ATTEMPTS} attempts"
                     );
-                }
-            }
-        }
-    }
-
-    /// Deliver any pending `SetFrequency`/`SetSplit` command left over from
-    /// a prior generation's failed teardown replay (see `replay_or_fallback`)
-    /// to THIS generation's now-confirmed-ready message loop, instead of
-    /// leaving it silently lost. Best-effort: a `try_send` failure here
-    /// just means the new channel is somehow already under pressure right
-    /// at startup -- log and move on rather than retrying indefinitely,
-    /// since these are best-effort freshness commands, not the PTT-off
-    /// safety path (which never goes through this queue at all).
-    fn deliver_pending_hamlib_state(
-        &mut self,
-        sender: &crossbeam_channel::Sender<ComponentMessage>,
-    ) {
-        // PAN-19 round-7 review (Codex P1): an earlier version of this
-        // function `take()`'d each pending slot, tried `try_send`, and on
-        // failure only logged the generic error -- discarding the
-        // `TrySendError`'s carried-back message entirely, so a command
-        // that arrived here right as another producer happened to fill
-        // the brand-new channel was lost for good on a single unlucky
-        // instant, defeating the whole point of queuing it in the first
-        // place. Both error variants (`Full` and `Disconnected`) carry the
-        // message back; put it back into its `Option` slot on failure so
-        // it survives to be retried on the NEXT delivery attempt (the
-        // next restart, or wherever else this gets called) instead of
-        // being silently gone.
-        if let Some(message) = self.hamlib_pending_frequency.take() {
-            match sender.try_send(message) {
-                Ok(()) => {
-                    info!(
-                        target: "rig",
-                        "Hamlib restart: delivered pending SetFrequency command carried over \
-                         from a prior failed teardown replay"
-                    );
-                }
-                Err(crossbeam_channel::TrySendError::Full(returned))
-                | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
-                    warn!(
-                        "Hamlib restart: failed to deliver pending SetFrequency command to the \
-                         new generation -- keeping it queued for the next attempt"
-                    );
-                    self.hamlib_pending_frequency = Some(returned);
-                }
-            }
-        }
-        if let Some(message) = self.hamlib_pending_split.take() {
-            match sender.try_send(message) {
-                Ok(()) => {
-                    info!(
-                        target: "rig",
-                        "Hamlib restart: delivered pending SetSplit command carried over from \
-                         a prior failed teardown replay"
-                    );
-                }
-                Err(crossbeam_channel::TrySendError::Full(returned))
-                | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
-                    warn!(
-                        "Hamlib restart: failed to deliver pending SetSplit command to the new \
-                         generation -- keeping it queued for the next attempt"
-                    );
-                    self.hamlib_pending_split = Some(returned);
                 }
             }
         }
@@ -839,6 +779,15 @@ impl super::ApplicationCoordinator {
         // pancetta-commanded change (already torn down by the TUI / autonomous
         // site; must NOT double-fire).
         let last_freq_command = self.last_freq_command.clone();
+        // PAN-19 round-10 review (Codex P1): the poll loop retries
+        // `deliver_pending_hamlib_state` every ~500ms tick for the rest of
+        // this generation's lifetime, so a command that finds the channel
+        // momentarily full on the FIRST attempt (in `start_hamlib_component`,
+        // after this task starts) isn't stranded until the next restart --
+        // see `deliver_pending_hamlib_state`'s doc comment.
+        let hamlib_pending_frequency_for_polling = self.hamlib_pending_frequency.clone();
+        let hamlib_pending_split_for_polling = self.hamlib_pending_split.clone();
+        let hamlib_tx_for_polling = hamlib_tx.clone();
 
         // Oneshot used to gate startup: the spawned task signals here once the
         // initial connect + get_frequency have completed (or failed).  We await
@@ -935,6 +884,19 @@ impl super::ApplicationCoordinator {
                     while !shutdown_for_polling.load(Ordering::Acquire) {
                         poll_interval.tick().await;
                         tick_count = tick_count.wrapping_add(1);
+
+                        // PAN-19 round-10 review (Codex P1): retry any
+                        // still-pending SetFrequency/SetSplit command every
+                        // tick for the rest of THIS generation's lifetime,
+                        // not just once at startup (see
+                        // `deliver_pending_hamlib_state`'s doc comment for
+                        // the full reasoning). Cheap no-op when both
+                        // pending slots are empty (the common case).
+                        deliver_pending_hamlib_state(
+                            &hamlib_pending_frequency_for_polling,
+                            &hamlib_pending_split_for_polling,
+                            &hamlib_tx_for_polling,
+                        );
 
                         let poll_ok = if let Ok(status) = rig_for_polling.get_status().await {
                             if status.connection_state
@@ -1579,8 +1541,17 @@ impl super::ApplicationCoordinator {
         // generation is dead; the pending item stays queued for the NEXT
         // restart attempt instead), nor on the mock/disabled-rig path's
         // own equally-fast startup -- called unconditionally here so
-        // both get it.
-        self.deliver_pending_hamlib_state(&hamlib_tx);
+        // both get it. PAN-19 round-10 review (Codex P1): this is only
+        // the FIRST attempt for this generation -- the Hamlib polling
+        // task's own tick loop (see its spawn above) retries this every
+        // ~500ms for the rest of the generation's lifetime, so a command
+        // that finds the brand-new channel momentarily full right here
+        // isn't stranded until the next restart.
+        deliver_pending_hamlib_state(
+            &self.hamlib_pending_frequency,
+            &self.hamlib_pending_split,
+            &hamlib_tx,
+        );
 
         // PAN-19 MEDIUM #2: `teardown_hamlib` only drains+aborts
         // `hamlib_orphans` at the START of the NEXT teardown call. A
@@ -1598,6 +1569,79 @@ impl super::ApplicationCoordinator {
 
         info!("Hamlib component started");
         Ok(())
+    }
+}
+
+/// Deliver any pending `SetFrequency`/`SetSplit` command left over from a
+/// prior failed teardown replay (see `replay_or_fallback`) onto `sender`,
+/// instead of leaving it silently lost.
+///
+/// A free function (not a `&mut self` method) because PAN-19 round-10
+/// review (Codex P1) needs this reachable from TWO independent call sites
+/// that don't share a `&mut self`:
+///   - `start_hamlib_component`, once at startup after the new
+///     generation's message loop confirms (or is en route to confirming)
+///     readiness.
+///   - The Hamlib polling task's own ~500ms tick loop, which retries this
+///     for the remainder of the CURRENT generation's lifetime -- the
+///     original round-7 fix only ever attempted delivery once, at
+///     startup; if the brand-new channel happened to be momentarily full
+///     at that exact instant, the pending command sat stranded until the
+///     NEXT full Hamlib restart even though the channel likely had room
+///     again moments later. `pending_frequency`/`pending_split` are
+///     `Arc<Mutex<..>>` specifically so both call sites can reach them
+///     without `&mut self`.
+///
+/// Best-effort: a `try_send` failure here just means the channel is
+/// somehow already under pressure right now -- log, put the message back
+/// in its slot (round-7's fix), and let it try again on the next call
+/// (round-10's fix) rather than retrying in a tight loop right here.
+fn deliver_pending_hamlib_state(
+    pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    sender: &crossbeam_channel::Sender<ComponentMessage>,
+) {
+    if let Ok(mut slot) = pending_frequency.lock() {
+        if let Some(message) = slot.take() {
+            match sender.try_send(message) {
+                Ok(()) => {
+                    info!(
+                        target: "rig",
+                        "Hamlib restart: delivered pending SetFrequency command carried over \
+                         from a prior failed teardown replay"
+                    );
+                }
+                Err(crossbeam_channel::TrySendError::Full(returned))
+                | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
+                    warn!(
+                        "Hamlib restart: failed to deliver pending SetFrequency command -- \
+                         keeping it queued for the next attempt"
+                    );
+                    *slot = Some(returned);
+                }
+            }
+        }
+    }
+    if let Ok(mut slot) = pending_split.lock() {
+        if let Some(message) = slot.take() {
+            match sender.try_send(message) {
+                Ok(()) => {
+                    info!(
+                        target: "rig",
+                        "Hamlib restart: delivered pending SetSplit command carried over from \
+                         a prior failed teardown replay"
+                    );
+                }
+                Err(crossbeam_channel::TrySendError::Full(returned))
+                | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
+                    warn!(
+                        "Hamlib restart: failed to deliver pending SetSplit command -- keeping \
+                         it queued for the next attempt"
+                    );
+                    *slot = Some(returned);
+                }
+            }
+        }
     }
 }
 
@@ -2498,7 +2542,11 @@ mod teardown_replay_tests {
     #[tokio::test]
     async fn replay_or_fallback_queues_a_stuck_set_frequency_instead_of_dropping_it() {
         let mut coordinator = test_coordinator().await;
-        assert!(coordinator.hamlib_pending_frequency.is_none());
+        assert!(coordinator
+            .hamlib_pending_frequency
+            .lock()
+            .unwrap()
+            .is_none());
 
         let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
         sender
@@ -2510,7 +2558,11 @@ mod teardown_replay_tests {
             .await;
 
         assert!(
-            coordinator.hamlib_pending_frequency.is_some(),
+            coordinator
+                .hamlib_pending_frequency
+                .lock()
+                .unwrap()
+                .is_some(),
             "a SetFrequency that couldn't be replayed must be queued, not dropped"
         );
     }
@@ -2523,7 +2575,7 @@ mod teardown_replay_tests {
     #[tokio::test]
     async fn replay_or_fallback_queues_a_stuck_set_split_instead_of_dropping_it() {
         let mut coordinator = test_coordinator().await;
-        assert!(coordinator.hamlib_pending_split.is_none());
+        assert!(coordinator.hamlib_pending_split.lock().unwrap().is_none());
 
         let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
         sender
@@ -2543,7 +2595,7 @@ mod teardown_replay_tests {
         coordinator.replay_or_fallback(&sender, split_msg).await;
 
         assert!(
-            coordinator.hamlib_pending_split.is_some(),
+            coordinator.hamlib_pending_split.lock().unwrap().is_some(),
             "a SetSplit that couldn't be replayed must be queued, not dropped -- it isn't \
              self-healing like SetFrequency"
         );
@@ -2557,9 +2609,9 @@ mod teardown_replay_tests {
     #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_sends_queued_commands_to_the_new_generation() {
-        let mut coordinator = test_coordinator().await;
+        let coordinator = test_coordinator().await;
 
-        coordinator.hamlib_pending_frequency = Some(set_freq_msg());
+        *coordinator.hamlib_pending_frequency.lock().unwrap() = Some(set_freq_msg());
         let split_msg = ComponentMessage::new(
             ComponentId::Hamlib,
             ComponentId::Hamlib,
@@ -2569,17 +2621,25 @@ mod teardown_replay_tests {
             }),
             Instant::now(),
         );
-        coordinator.hamlib_pending_split = Some(split_msg);
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(split_msg);
 
         let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
-        coordinator.deliver_pending_hamlib_state(&sender);
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &sender,
+        );
 
         assert!(
-            coordinator.hamlib_pending_frequency.is_none(),
+            coordinator
+                .hamlib_pending_frequency
+                .lock()
+                .unwrap()
+                .is_none(),
             "the pending frequency slot must be drained once delivered"
         );
         assert!(
-            coordinator.hamlib_pending_split.is_none(),
+            coordinator.hamlib_pending_split.lock().unwrap().is_none(),
             "the pending split slot must be drained once delivered"
         );
 
@@ -2623,7 +2683,7 @@ mod teardown_replay_tests {
     #[cfg(feature = "pancetta-hamlib")]
     #[tokio::test]
     async fn deliver_pending_hamlib_state_requeues_on_a_full_channel_and_delivers_later() {
-        let mut coordinator = test_coordinator().await;
+        let coordinator = test_coordinator().await;
         let split_msg = ComponentMessage::new(
             ComponentId::Hamlib,
             ComponentId::Hamlib,
@@ -2633,7 +2693,7 @@ mod teardown_replay_tests {
             }),
             Instant::now(),
         );
-        coordinator.hamlib_pending_split = Some(split_msg);
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(split_msg);
 
         // A full channel at delivery time.
         let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
@@ -2641,20 +2701,28 @@ mod teardown_replay_tests {
             .try_send(set_freq_msg())
             .expect("pre-fill the one slot");
 
-        coordinator.deliver_pending_hamlib_state(&sender);
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &sender,
+        );
 
         assert!(
-            coordinator.hamlib_pending_split.is_some(),
+            coordinator.hamlib_pending_split.lock().unwrap().is_some(),
             "a failed delivery (channel full) must leave the pending command still queued, \
              not silently dropped"
         );
 
         // Drain the blocker, then retry delivery with room -- must succeed.
         receiver.try_recv().expect("drain the blocker");
-        coordinator.deliver_pending_hamlib_state(&sender);
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &sender,
+        );
 
         assert!(
-            coordinator.hamlib_pending_split.is_none(),
+            coordinator.hamlib_pending_split.lock().unwrap().is_none(),
             "the pending slot must be cleared once delivery succeeds"
         );
         let delivered = receiver
@@ -2697,14 +2765,18 @@ mod teardown_replay_tests {
         );
         coordinator.replay_or_fallback(&old_sender, split_msg).await;
         assert!(
-            coordinator.hamlib_pending_split.is_some(),
+            coordinator.hamlib_pending_split.lock().unwrap().is_some(),
             "test setup: the SetSplit must have been queued, not delivered"
         );
 
         // The NEXT generation's (fresh, empty) channel -- delivery must
         // land here once it's confirmed ready.
         let (new_sender, new_receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
-        coordinator.deliver_pending_hamlib_state(&new_sender);
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &new_sender,
+        );
 
         let delivered = new_receiver
             .try_recv()
@@ -2720,9 +2792,175 @@ mod teardown_replay_tests {
             "the delivered message must be the SAME SetSplit that failed to replay earlier"
         );
         assert!(
-            coordinator.hamlib_pending_split.is_none(),
+            coordinator.hamlib_pending_split.lock().unwrap().is_none(),
             "the pending slot must be cleared once delivered"
         );
+    }
+
+    /// PAN-19 round-10 review (Codex P1) regression guard: a pending
+    /// command must get MORE THAN ONE delivery attempt per generation --
+    /// not be stranded until the next full Hamlib restart. `deliver_pending_hamlib_state`
+    /// itself already retries correctly when called again (proven above);
+    /// this specifically proves the retry is driven automatically WITHIN
+    /// the current generation (the polling task's ~500ms tick, mirrored
+    /// here) rather than requiring a brand new `start_hamlib_component`
+    /// call.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn a_pending_command_gets_more_than_one_delivery_attempt_within_one_generation() {
+        let coordinator = test_coordinator().await;
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(split_msg);
+
+        // The channel is full for the FIRST attempt (mirrors the exact
+        // scenario the finding describes: "a producer fills the bounded
+        // channel at this instant").
+        let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        let blocker = set_freq_msg();
+        sender.try_send(blocker).expect("pre-fill the one slot");
+
+        // Attempt #1 (mirrors the ORIGINAL call in start_hamlib_component):
+        // fails, channel still full.
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &sender,
+        );
+        assert!(
+            coordinator.hamlib_pending_split.lock().unwrap().is_some(),
+            "test setup: the first attempt must fail (channel full)"
+        );
+
+        // The channel drains on its own between attempts (the new
+        // generation's message loop consuming the blocker) -- NO new
+        // start_hamlib_component / restart call happens here.
+        receiver.try_recv().expect("drain the blocker");
+
+        // Attempt #2 (mirrors the polling task's next ~500ms tick, within
+        // the SAME generation): must now succeed.
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &sender,
+        );
+
+        assert!(
+            coordinator.hamlib_pending_split.lock().unwrap().is_none(),
+            "a pending command must not be stranded after only one failed attempt -- it must \
+             be retried and delivered within the SAME generation"
+        );
+        let delivered = receiver
+            .try_recv()
+            .expect("the SetSplit must have been delivered on the second, later attempt");
+        assert!(matches!(
+            delivered.message_type,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000
+            })
+        ));
+    }
+
+    /// PAN-19 round-10 review (Codex P1) regression guard, end to end: the
+    /// REAL Hamlib polling task (spawned by the REAL `start_hamlib_component`,
+    /// not a mirrored/manual double-call) must automatically retry and
+    /// eventually deliver a pending command that failed its FIRST attempt
+    /// -- without any second `start_hamlib_component`/restart call.
+    ///
+    /// Pre-fills the (small-capacity) Hamlib channel with a blocker BEFORE
+    /// calling `start_hamlib_component`, so its OWN internal
+    /// `deliver_pending_hamlib_state` call (the only attempt that existed
+    /// before this fix) finds the channel full and re-queues. Then drains
+    /// the blocker via a receiver held by the test -- simulating "the
+    /// channel likely has room again a moment later" from the finding --
+    /// and polls for the real polling task's own ~500ms tick to pick it up
+    /// on its own.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn poll_loop_automatically_retries_a_pending_command_within_the_same_generation() {
+        let mut coordinator = test_coordinator().await;
+        // Small capacity -- trivial to keep full for the first attempt.
+        coordinator.message_bus = crate::message_bus::MessageBus::new(1).unwrap();
+
+        let (sender, receiver) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Hamlib)
+            .await
+            .unwrap();
+        sender
+            .try_send(set_freq_msg())
+            .expect("pre-fill the one slot BEFORE start_hamlib_component runs");
+
+        // Simulate a prior generation's failed teardown replay: a SetSplit
+        // already queued before this (new) generation even starts.
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(split_msg);
+
+        coordinator
+            .start_hamlib_component()
+            .await
+            .expect("mock-rig hamlib start should succeed");
+
+        // The FIRST attempt (inside start_hamlib_component itself, before
+        // it even returned) must have found the channel full and left the
+        // command queued.
+        assert!(
+            coordinator.hamlib_pending_split.lock().unwrap().is_some(),
+            "test setup: the first delivery attempt (inside start_hamlib_component) must have \
+             failed -- channel full"
+        );
+
+        // Drain the blocker -- the channel has room again, exactly the
+        // scenario the finding describes. NO new start_hamlib_component /
+        // restart call happens from here on -- only the REAL, already
+        // -running polling task for this SAME generation.
+        receiver.try_recv().expect("drain the blocker");
+
+        let mut delivered = None;
+        for _ in 0..40 {
+            if let Ok(msg) = receiver.try_recv() {
+                delivered = Some(msg);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+
+        let delivered = delivered.expect(
+            "the REAL polling task must automatically retry and deliver the pending SetSplit \
+             within the current generation, without requiring another \
+             start_hamlib_component/restart call",
+        );
+        assert!(matches!(
+            delivered.message_type,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000
+            })
+        ));
+        assert!(
+            coordinator.hamlib_pending_split.lock().unwrap().is_none(),
+            "the pending slot must be cleared once the polling task delivers it"
+        );
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 }
 
