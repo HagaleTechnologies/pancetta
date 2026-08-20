@@ -825,6 +825,11 @@ impl super::ApplicationCoordinator {
         // could queue a key-up the loop consumed once it finally became
         // ready, well after the operator's actual keypress.
         let cmd_hamlib_command_loop_ready = self.hamlib_command_loop_ready.clone();
+        // PAN-19 round-14 review (Codex P1): "keep TX muted until pending
+        // rig state is delivered" -- see `tx_hard_mute_reason`'s doc
+        // comment in `coordinator/tx.rs`.
+        let cmd_hamlib_pending_frequency = self.hamlib_pending_frequency.clone();
+        let cmd_hamlib_pending_split = self.hamlib_pending_split.clone();
         // Operator Hold/Auto TX-frequency mode (`f`). The handler toggles this
         // atomic; the QSO engine and autonomous operator read it to gate
         // autonomous frequency moves.
@@ -1927,6 +1932,8 @@ impl super::ApplicationCoordinator {
                                     &cmd_tx_policy,
                                     &cmd_tx_restart_inhibit,
                                     &cmd_hamlib_command_loop_ready,
+                                    &cmd_hamlib_pending_frequency,
+                                    &cmd_hamlib_pending_split,
                                 ) {
                                     warn!(
                                         target: "tx.policy",
@@ -2382,19 +2389,41 @@ fn map_autonomous_status(
 /// (rather than duplicating its condition here) means a THIRD PTT-on call
 /// site added later gets this gate for free instead of needing its own
 /// copy that could omit a check again.
+///
+/// PAN-19 round-14 review (Codex P1): "keep TX muted until pending rig
+/// state is delivered". `tx_hard_mute_reason` now also checks
+/// `hamlib_pending_frequency`/`hamlib_pending_split` -- a manual PTT
+/// toggle must be refused just as much as an automated TX-worker key-up
+/// while a prior generation's SetFrequency/SetSplit is still waiting,
+/// undelivered, for the polling task's retry (see that function's doc
+/// comment).
 fn ptt_on_refusal(
     tx_policy: &Arc<std::sync::atomic::AtomicU8>,
     tx_restart_inhibit: &Arc<std::sync::atomic::AtomicU32>,
     hamlib_command_loop_ready: &Arc<std::sync::atomic::AtomicBool>,
+    hamlib_pending_frequency: &Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    hamlib_pending_split: &Arc<std::sync::Mutex<Option<ComponentMessage>>>,
 ) -> Option<String> {
-    super::tx::tx_hard_mute_reason(tx_policy, tx_restart_inhibit, hamlib_command_loop_ready)
-        .map(|reason| format!("Can't key PTT — {reason}"))
+    super::tx::tx_hard_mute_reason(
+        tx_policy,
+        tx_restart_inhibit,
+        hamlib_command_loop_ready,
+        hamlib_pending_frequency,
+        hamlib_pending_split,
+    )
+    .map(|reason| format!("Can't key PTT — {reason}"))
 }
 
 #[cfg(test)]
 mod tui_relay_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+
+    /// An empty pending slot -- the common case (nothing carried over from
+    /// a prior failed teardown replay).
+    fn no_pending() -> Arc<std::sync::Mutex<Option<ComponentMessage>>> {
+        Arc::new(std::sync::Mutex::new(None))
+    }
 
     /// PAN-19 round-12 review (Codex P1) regression guard: "apply loop
     /// readiness to direct PTT commands". The exact scenario the finding
@@ -2413,12 +2442,71 @@ mod tui_relay_tests {
         let tx_restart_inhibit = Arc::new(AtomicU32::new(0));
         let hamlib_command_loop_ready = Arc::new(AtomicBool::new(false));
 
-        let refusal = ptt_on_refusal(&tx_policy, &tx_restart_inhibit, &hamlib_command_loop_ready);
+        let refusal = ptt_on_refusal(
+            &tx_policy,
+            &tx_restart_inhibit,
+            &hamlib_command_loop_ready,
+            &no_pending(),
+            &no_pending(),
+        );
         assert!(
             refusal.is_some(),
             "a direct PTT-on toggle must be refused while the Hamlib command loop hasn't \
              confirmed readiness, even though the restart-supervision inhibit counter has \
              already released"
+        );
+    }
+
+    /// PAN-19 round-14 review (Codex P1) regression guard: "keep TX muted
+    /// until pending rig state is delivered". A pending `SetSplit` still
+    /// sitting undelivered (channel was momentarily full at startup, round
+    /// 10's requeue mechanism) with `hamlib_command_loop_ready == true` and
+    /// `tx_restart_inhibit == 0` -- the exact gap the finding describes,
+    /// where the loop is ready to consume commands but the rig's split
+    /// state is still stale. A direct PTT-on toggle must be refused until
+    /// the pending item clears, then permitted once it does.
+    #[test]
+    fn ptt_on_refusal_blocks_a_key_up_while_a_pending_split_is_undelivered() {
+        let tx_policy = Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8()));
+        let tx_restart_inhibit = Arc::new(AtomicU32::new(0));
+        let hamlib_command_loop_ready = Arc::new(AtomicBool::new(true));
+        let pending_split = Arc::new(std::sync::Mutex::new(Some(ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            std::time::Instant::now(),
+        ))));
+
+        assert!(
+            ptt_on_refusal(
+                &tx_policy,
+                &tx_restart_inhibit,
+                &hamlib_command_loop_ready,
+                &no_pending(),
+                &pending_split,
+            )
+            .is_some(),
+            "a direct PTT-on toggle must be refused while a pending SetSplit is still \
+             undelivered, even though the Hamlib command loop is ready and restart isn't \
+             inhibiting"
+        );
+
+        // Once delivered (or applied and the slot drained), PTT-on must be
+        // permitted again.
+        *pending_split.lock().unwrap() = None;
+        assert_eq!(
+            ptt_on_refusal(
+                &tx_policy,
+                &tx_restart_inhibit,
+                &hamlib_command_loop_ready,
+                &no_pending(),
+                &pending_split,
+            ),
+            None,
+            "PTT-on must be permitted again once the pending SetSplit has been delivered"
         );
     }
 
@@ -2431,7 +2519,13 @@ mod tui_relay_tests {
         let hamlib_command_loop_ready = Arc::new(AtomicBool::new(true));
 
         assert_eq!(
-            ptt_on_refusal(&tx_policy, &tx_restart_inhibit, &hamlib_command_loop_ready),
+            ptt_on_refusal(
+                &tx_policy,
+                &tx_restart_inhibit,
+                &hamlib_command_loop_ready,
+                &no_pending(),
+                &no_pending(),
+            ),
             None,
             "PTT-on must be permitted once TX policy allows it, restart isn't inhibiting, and \
              the Hamlib command loop has confirmed readiness"
