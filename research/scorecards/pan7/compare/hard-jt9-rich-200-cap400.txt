@@ -1,0 +1,12 @@
+A: research/scorecards/pan7/hard-jt9-rich-200-cap400-control.json (sha 0574f727, score 0.0000)
+B: research/scorecards/pan7/hard-jt9-rich-200-seeded-cap400.json (sha 0574f727, score 0.0000 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI (n_bootstrap=1000, seed=0xb007):
+  hard-jt9-rich-200         rec Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+  hard-jt9-rich-200         novel Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+
+CONFIG DIFF:
+  decoder.decoder.ft8lib_sync_seeds_enabled        false → true

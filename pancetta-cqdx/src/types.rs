@@ -146,6 +146,32 @@ pub struct AuthorizationEdge {
     pub scopes: Vec<String>,
     #[serde(rename = "createdAt")]
     pub created_at: String,
+    /// Whether the POLLING CALLER is this edge's grantor ("owner") or a
+    /// delegate guest ("delegate") — computed server-side as
+    /// `grantedByUserId == callerId`. **Not** usable to detect whether an
+    /// edge itself is delegated (dispensa Q-0052, cqdx's 2026-08-15
+    /// correction to its own earlier ask): a station agent's poll is always
+    /// filtered to its OWN `agentKeyId` first (see `poll_authorizations_loop`
+    /// in `pancetta`'s `station_agent` module), and the station owner is by
+    /// definition the grantor of every edge on their own agent — delegated or
+    /// not — so this field reads `"owner"` on every row that filter keeps.
+    /// `delegated_by` below is the field that actually distinguishes a
+    /// delegated edge. Kept here for completeness / other consumers (e.g. an
+    /// unfiltered agents-list view) — `#[serde(default)]` so a response that
+    /// omits it (older cqdx) still deserializes.
+    #[serde(default)]
+    pub role: Option<String>,
+    /// Present (non-null) iff this edge was granted to a DIFFERENT user's
+    /// device via cross-user rig delegation (CQD-4) rather than being the
+    /// station owner's own client edge. **This is the correct predicate for
+    /// "is this edge delegated"** (dispensa Q-0052) — `delegated_by.is_none()`
+    /// means "not delegated" (an owner edge). The wire field is Optional and
+    /// may be entirely ABSENT rather than explicit JSON `null`; `#[serde(default)]`
+    /// makes both cases deserialize to `None` here, matching the contract's
+    /// `delegatedBy == null` (loose-equality) semantics rather than a strict
+    /// `=== null` check that would only catch the explicit-null case.
+    #[serde(rename = "delegatedBy", default)]
+    pub delegated_by: Option<String>,
 }
 
 /// Envelope for `GET /api/v1/authorizations`. Envelope key is `authorizations`

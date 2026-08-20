@@ -54,6 +54,48 @@ pub struct ftx_candidate_t {
     pub freq_sub: u8,
 }
 
+/// One ft8_lib sync-search candidate, lifted out of FFI space as plain data.
+///
+/// PAN-7: [`ft8lib_find_candidate_seeds`] returns these so callers that never
+/// touch the C API can still reason about ft8_lib's candidate positions.
+///
+/// `score` is ft8_lib's own integer sync score in units of **0.5 dB**
+/// (`WF_ELEM_MAG_INT`, `vendor/ft8_lib/ft8/decode.h:26`, MIT). It orders seeds
+/// among themselves and is useful as a diagnostic, but it is **not** a pancetta
+/// `sync_score` and must never be used as one — the two kernels normalize
+/// differently. Callers re-score every seed on pancetta's own spectrogram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Ft8LibSeed {
+    pub score: i16,
+    pub time_offset: i16,
+    pub freq_offset: i16,
+    pub time_sub: u8,
+    pub freq_sub: u8,
+}
+
+/// A seed set plus the monitor scalars needed to interpret its coordinates.
+///
+/// `time_offset` / `freq_offset` are meaningless without the waterfall geometry
+/// they were computed against, so the scalars are copied out of `monitor_t`
+/// **before** `monitor_free` and travel with the seeds. Consumers must check
+/// `time_osr` / `freq_osr` / `block_size` against their own grid before
+/// translating: the two grids are set by independent constants that happen to
+/// agree today, and on mismatch the right move is to reject rather than emit
+/// silently-wrong positions.
+///
+/// Declared outside any `cfg` so the real and stub builds share one signature.
+#[derive(Debug, Clone, Default)]
+pub struct Ft8LibSeedSet {
+    pub seeds: Vec<Ft8LibSeed>,
+    pub min_bin: i32,
+    pub time_osr: i32,
+    pub freq_osr: i32,
+    pub num_bins: i32,
+    pub num_blocks: i32,
+    pub block_size: i32,
+    pub symbol_period: f32,
+}
+
 #[repr(C)]
 #[derive(Debug)]
 pub struct ftx_decode_status_t {
@@ -555,6 +597,108 @@ pub fn ft8lib_decode_audio_protocol(
     messages
 }
 
+/// Run ft8_lib's sync search over `samples` and return the raw candidate
+/// positions, without decoding any of them.
+///
+/// PAN-7: this is [`ft8lib_decode_audio_protocol`]'s
+/// `monitor_init → monitor_process → ftx_find_candidates` sequence
+/// (`vendor/ft8_lib/common/monitor.c`, `vendor/ft8_lib/ft8/decode.c`, MIT) with
+/// the LDPC decode loop removed. It exists so pancetta's own Costas sweep can
+/// union ft8_lib's candidate *locations* into its candidate list; every seed is
+/// re-scored on pancetta's spectrogram by the caller, so ft8_lib never
+/// contributes a score to a pancetta decode.
+///
+/// `num_candidates` is the heap budget handed to `ftx_find_candidates`. A
+/// budget of 0 short-circuits — never hand the C function a dangling heap
+/// pointer.
+///
+/// `min_score` is fixed at 0, making the returned set a strict superset of what
+/// ft8_lib's own demo would try (`vendor/ft8_lib/demo/decode_ft8.c:21` gates at
+/// `kMin_score = 10` ≡ 5.0 dB).
+///
+/// The `monitor_config_t` is byte-identical to
+/// [`ft8lib_decode_audio_protocol`]'s. Widening the band would change `min_bin`
+/// and `num_bins` and therefore every seed coordinate, and would depart from the
+/// already-measured ft8_lib configuration. Consequence worth knowing: ft8_lib
+/// covers bins 16–481 (100–3006 Hz), so seeds add no coverage outside that band.
+#[cfg(not(ft8lib_stub))]
+pub fn ft8lib_find_candidate_seeds(
+    samples: &[f32],
+    protocol: ftx_protocol_t,
+    num_candidates: usize,
+) -> Ft8LibSeedSet {
+    if num_candidates == 0 {
+        return Ft8LibSeedSet::default();
+    }
+
+    let cfg = monitor_config_t {
+        f_min: 100.0,
+        f_max: 3000.0,
+        sample_rate: 12000,
+        time_osr: 2,
+        freq_osr: 2,
+        protocol,
+    };
+
+    let mut mon: monitor_t = unsafe { std::mem::zeroed() };
+    unsafe { monitor_init(&mut mon, &cfg) };
+
+    // `monitor_init` mallocs `window`, `last_frame`, `wf.mag` and the kiss_fft
+    // config (monitor.c:37-45,66,75,83), and this runs once per decode window in
+    // a long-lived process. Everything between here and `monitor_free` below is
+    // deliberately panic-free and infallible — no `?`, no fallible call — so the
+    // single exit path is the only exit path.
+    let block_size = mon.block_size as usize;
+    let mut offset = 0;
+    while offset + block_size <= samples.len() {
+        unsafe { monitor_process(&mut mon, samples[offset..].as_ptr()) };
+        offset += block_size;
+    }
+
+    let mut heap = vec![
+        ftx_candidate_t {
+            score: 0,
+            time_offset: 0,
+            freq_offset: 0,
+            time_sub: 0,
+            freq_sub: 0,
+        };
+        num_candidates
+    ];
+
+    let n_found =
+        unsafe { ftx_find_candidates(&mon.wf, num_candidates as i32, heap.as_mut_ptr(), 0) };
+    let n_found = (n_found.max(0) as usize).min(num_candidates);
+
+    // Copy the monitor scalars out BEFORE the free — they are what makes the
+    // returned coordinates interpretable. `min_bin`, `block_size` and
+    // `symbol_period` live on `monitor_t`; the OSR/geometry fields live on its
+    // embedded waterfall.
+    let set = Ft8LibSeedSet {
+        seeds: heap[..n_found]
+            .iter()
+            .map(|c| Ft8LibSeed {
+                score: c.score,
+                time_offset: c.time_offset,
+                freq_offset: c.freq_offset,
+                time_sub: c.time_sub,
+                freq_sub: c.freq_sub,
+            })
+            .collect(),
+        min_bin: mon.min_bin,
+        time_osr: mon.wf.time_osr,
+        freq_osr: mon.wf.freq_osr,
+        num_bins: mon.wf.num_bins,
+        num_blocks: mon.wf.num_blocks,
+        block_size: mon.block_size,
+        symbol_period: mon.symbol_period,
+    };
+
+    unsafe { monitor_free(&mut mon) };
+
+    set
+}
+
 // ============================================================================
 // Stub implementations — used when ft8_lib C library is not compiled.
 // These return empty/None so code compiles and unit tests can run without
@@ -591,6 +735,20 @@ pub fn ft8lib_decode_audio_protocol(
     Vec::new()
 }
 
+/// Stub: returns an empty seed set when the ft8_lib C library is not available.
+///
+/// PAN-7: this is the runtime no-op that lets the `decoder.rs` call site stay
+/// **un-cfg-gated**, so `Ft8Config::ft8lib_sync_seeds_enabled` is the single
+/// gate and the flag-off path cannot diverge between real and stub builds.
+#[cfg(ft8lib_stub)]
+pub fn ft8lib_find_candidate_seeds(
+    _samples: &[f32],
+    _protocol: ftx_protocol_t,
+    _num_candidates: usize,
+) -> Ft8LibSeedSet {
+    Ft8LibSeedSet::default()
+}
+
 // ============================================================================
 // Availability detection
 // ============================================================================
@@ -624,5 +782,27 @@ mod tests {
     fn fixed_buf_leading_nul_returns_empty() {
         let buf = [0u8; 35];
         assert_eq!(cstr_from_fixed_buf(&buf), Some(""));
+    }
+}
+
+/// PAN-7: the real and stub `ft8lib_find_candidate_seeds` must keep identical
+/// signatures. No CI job ever type-checks the stub arm — all four compiling
+/// jobs use `submodules: recursive` — so this coercion into a typed fn pointer,
+/// which compiles under **both** cfgs, is the only mechanical guard against the
+/// stub rotting out of sync with the real one.
+#[cfg(test)]
+mod seed_signature_tests {
+    use super::*;
+
+    #[test]
+    fn seed_helper_signature_is_cfg_invariant() {
+        let f: fn(&[f32], ftx_protocol_t, usize) -> Ft8LibSeedSet = ft8lib_find_candidate_seeds;
+
+        // The zero-budget short-circuit is the one behavior that is identical
+        // under both cfgs: the real helper early-returns before touching C, the
+        // stub always returns empty.
+        let set = f(&[], ftx_protocol_t::FTX_PROTOCOL_FT8, 0);
+        assert!(set.seeds.is_empty());
+        assert_eq!(set.min_bin, 0);
     }
 }

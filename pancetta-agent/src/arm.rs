@@ -65,6 +65,12 @@ pub struct VerifiedArmGrant {
     /// arm via `armJti` (contract `$defs.txHeartbeat.armJti`); a heartbeat for a
     /// different `jti` is rejected without sliding the dead-man window.
     pub jti: String,
+    /// The client keyId this grant was verified for. Stored on the armed
+    /// session (see [`ArmState::armed_client_key_id`]) so a later live
+    /// authorization refresh (CQD-11 / dispensa Q-0052) can tell whether the
+    /// CURRENT arm's controller is still TX-arm-eligible, independent of the
+    /// ham-radio `operator_callsign` attribution above.
+    pub client_key_id: String,
 }
 
 /// Why TX is (not) permitted, for audit `detail` and diagnostics.
@@ -119,6 +125,14 @@ pub enum DisarmReason {
     HeartbeatLost,
     /// The station-agent component terminated unexpectedly.
     ComponentCrash,
+    /// A live cqdx authorization refresh (CQD-11 / dispensa Q-0052) removed
+    /// the current arm's controller from TX-arm eligibility — either the
+    /// edge was revoked entirely or it became delegated. The cloud may only
+    /// ever REDUCE station-local TX authority (frozen e2e-auth.v1
+    /// §6-revocation), so a poll that demotes an already-armed controller
+    /// must retroactively disarm rather than leave the live grant to run out
+    /// its TTL.
+    AuthorizationRevoked,
 }
 
 impl DisarmReason {
@@ -129,6 +143,7 @@ impl DisarmReason {
             DisarmReason::TtlExpired => "ttl-expired",
             DisarmReason::HeartbeatLost => "heartbeat-lost",
             DisarmReason::ComponentCrash => "component-crash",
+            DisarmReason::AuthorizationRevoked => "authorization-revoked",
         }
     }
 }
@@ -165,6 +180,9 @@ struct ArmedSession {
     /// The grant's `jti` — the arm this session represents. A heartbeat's
     /// `armJti` must equal this or it is rejected (contract `$defs.txHeartbeat`).
     current_jti: String,
+    /// The client keyId this arm was verified for (see
+    /// [`ArmState::armed_client_key_id`]).
+    client_key_id: String,
     /// The highest heartbeat `seq` accepted for this arm. A heartbeat with
     /// `seq <= last_heartbeat_seq` is a replay/non-monotonic frame and is
     /// rejected without sliding the window. `None` until the first heartbeat.
@@ -238,6 +256,18 @@ impl ArmState {
         self.session.as_ref().map(|s| s.current_jti.as_str())
     }
 
+    /// The client keyId of the currently-armed grant, if armed (CQD-11 /
+    /// dispensa Q-0052). This is the cryptographic client identity the grant
+    /// was verified for — distinct from [`Self::operator_callsign`], which
+    /// is the ham-radio callsign attribution. Used by the Q-0043
+    /// authorization-poll task to detect that a live cqdx refresh has
+    /// removed the current controller from TX-arm eligibility (revoked or
+    /// newly delegated), so the arm can be disarmed immediately rather than
+    /// left to run out its TTL.
+    pub fn armed_client_key_id(&self) -> Option<&str> {
+        self.session.as_ref().map(|s| s.client_key_id.as_str())
+    }
+
     // --- events ------------------------------------------------------------
 
     /// Arm from a verified grant. Records `armed_at = now`, the TTL, operator,
@@ -263,6 +293,7 @@ impl ArmState {
             last_heartbeat_ms: now_ms,
             scope_tx: true,
             current_jti: grant.jti.clone(),
+            client_key_id: grant.client_key_id.clone(),
             // A fresh arm resets the heartbeat sequence — a new arm's low seq is
             // accepted even if a prior arm had reached a high seq.
             last_heartbeat_seq: None,
@@ -485,6 +516,7 @@ mod tests {
     const TTL: i64 = 120_000; // 2 minutes
 
     const JTI: &str = "arm-jti-1";
+    const CLIENT_KEY_ID: &str = "clientKeyId000000";
 
     fn grant(scope_tx: bool) -> VerifiedArmGrant {
         VerifiedArmGrant {
@@ -492,6 +524,7 @@ mod tests {
             ttl_ms: TTL,
             scope_tx,
             jti: JTI.to_string(),
+            client_key_id: CLIENT_KEY_ID.to_string(),
         }
     }
 
@@ -531,6 +564,23 @@ mod tests {
         assert!(st.tx_permitted(T0));
         assert_eq!(st.tx_permit_reason(T0), TxPermit::Permitted);
         assert_eq!(st.operator_callsign(), Some("N0CALL"));
+    }
+
+    /// CQD-11 / dispensa Q-0052: `armed_client_key_id()` exposes the
+    /// CRYPTOGRAPHIC client identity the live arm was verified for (distinct
+    /// from `operator_callsign()`, the ham-radio attribution) — `None` when
+    /// not armed, `Some(client_key_id)` while armed, and back to `None` once
+    /// disarmed. This is what the Q-0043 authorization-poll task reads to
+    /// detect that a live cqdx refresh has revoked the current controller's
+    /// TX-arm eligibility.
+    #[test]
+    fn armed_client_key_id_tracks_the_live_arm() {
+        let mut st = ArmState::new();
+        assert_eq!(st.armed_client_key_id(), None, "not armed yet");
+        st.arm(grant(true), T0);
+        assert_eq!(st.armed_client_key_id(), Some(CLIENT_KEY_ID));
+        st.disarm(T0 + 1_000);
+        assert_eq!(st.armed_client_key_id(), None, "cleared after disarm");
     }
 
     #[test]
@@ -660,6 +710,7 @@ mod tests {
             ttl_ms: TTL,
             scope_tx: true,
             jti: "arm-jti-2".to_string(),
+            client_key_id: CLIENT_KEY_ID.to_string(),
         };
         st.arm(g2, T0 + 2_000);
         // A low seq (1) is accepted for the NEW arm despite the old arm's seq 9.
@@ -683,6 +734,7 @@ mod tests {
                 ttl_ms: short_ttl,
                 scope_tx: true,
                 jti: JTI.to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
             },
             T0,
         );
@@ -785,6 +837,7 @@ mod tests {
                 ttl_ms: short_ttl,
                 scope_tx: true,
                 jti: JTI.to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
             },
             T0,
         );
@@ -807,6 +860,7 @@ mod tests {
                 ttl_ms: short_ttl,
                 scope_tx: true,
                 jti: JTI.to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
             },
             after_expiry,
         );
@@ -850,6 +904,7 @@ mod tests {
                 ttl_ms: 10_000,
                 scope_tx: true,
                 jti: JTI.to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
             },
             T0,
         );
@@ -903,6 +958,7 @@ mod tests {
                 ttl_ms: 5_000,
                 scope_tx: true,
                 jti: JTI.to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
             },
             T0,
         );
@@ -1059,6 +1115,7 @@ mod tests {
                                 ttl_ms: ttl,
                                 scope_tx: scope,
                                 jti: jti.clone(),
+                                client_key_id: CLIENT_KEY_ID.to_string(),
                             },
                             now,
                         );

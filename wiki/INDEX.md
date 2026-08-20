@@ -12,4 +12,4 @@
 - [What will bite you about the additive-only remote gateway?](pages/additive-only-gateway.md) — The remote gateway is wired **additive-only**: every feed to it is a *new* bus
 - [What will bite you about the armed-TX gate?](pages/fail-closed-arm-gate.md) — The remote-TX arm gate **fails CLOSED**: on a poisoned lock (or any verify
 - [What will bite you about the half-duplex parity rule?](pages/parity-rule.md) — FT8 is deaf while transmitting, so **every concurrent active QSO must transmit
-- [What's the PR review convergence policy?](../docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md) — P1 findings get fixed every review round; P2-and-lower findings raised after round one are tracked in a follow-up ticket instead of chased inline, so PRs converge instead of oscillating.
+- [What's the PR review convergence policy?](../docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md) — Four-tier round schedule per reviewer: rounds 1-5 fix everything, 6-15 ticket new P2-or-lower, 16-25 ticket P1 too unless critical/blocking, round 25 is a hard stop — so PRs converge instead of oscillating.

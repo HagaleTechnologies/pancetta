@@ -1,0 +1,108 @@
+===== noise_1000 fixed =====
+A: research/scorecards/pan7/noise_1000-control.json (sha 0574f727, score 0.0000)
+B: research/scorecards/pan7/noise_1000-seeded.json (sha 0574f727, score 0.0000 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI:
+  (skipped: neither scorecard carries `per_wav_records`. Re-eval with the Phase-B build to enable.)
+
+CONFIG DIFF:
+  decoder.decoder.ft8lib_sync_seeds_enabled        false → true
+COMPARE_EXIT=0
+===== noise_1000 raised =====
+A: research/scorecards/pan7/noise_1000-cap400-control.json (sha 0574f727, score 0.0000)
+B: research/scorecards/pan7/noise_1000-seeded-cap400.json (sha 0574f727, score 0.0000 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI:
+  (skipped: neither scorecard carries `per_wav_records`. Re-eval with the Phase-B build to enable.)
+
+CONFIG DIFF:
+  decoder.decoder.ft8lib_sync_seeds_enabled        false → true
+COMPARE_EXIT=0
+===== hard-jt9-rich-200 fixed =====
+A: research/scorecards/pan7/hard-jt9-rich-200-control.json (sha 0574f727, score 0.0000)
+B: research/scorecards/pan7/hard-jt9-rich-200-seeded.json (sha 0574f727, score 0.0000 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI (n_bootstrap=1000, seed=0xb007):
+  hard-jt9-rich-200         rec Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+  hard-jt9-rich-200         novel Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+
+CONFIG DIFF:
+  decoder.decoder.ft8lib_sync_seeds_enabled        false → true
+COMPARE_EXIT=0
+===== hard-jt9-rich-200 raised =====
+A: research/scorecards/pan7/hard-jt9-rich-200-cap400-control.json (sha 0574f727, score 0.0000)
+B: research/scorecards/pan7/hard-jt9-rich-200-seeded-cap400.json (sha 0574f727, score 0.0000 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI (n_bootstrap=1000, seed=0xb007):
+  hard-jt9-rich-200         rec Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+  hard-jt9-rich-200         novel Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+
+CONFIG DIFF:
+  decoder.decoder.ft8lib_sync_seeds_enabled        false → true
+COMPARE_EXIT=0
+===== curated-hard-200 fixed =====
+A: research/scorecards/pan7/curated-hard-200-control.json (sha 0574f727, score 0.3126)
+B: research/scorecards/pan7/curated-hard-200-seeded.json (sha 0574f727, score 0.3126 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI (n_bootstrap=1000, seed=0xb007):
+  curated-hard-200          rec Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+  curated-hard-200          novel Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+
+CONFIG DIFF:
+  decoder.decoder.ft8lib_sync_seeds_enabled        false → true
+COMPARE_EXIT=0
+===== curated-hard-200 raised =====
+A: research/scorecards/pan7/curated-hard-200-cap400-control.json (sha 0574f727, score 0.3171)
+B: research/scorecards/pan7/curated-hard-200-seeded-cap400.json (sha 0574f727, score 0.3171 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI (n_bootstrap=1000, seed=0xb007):
+  curated-hard-200          rec Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+  curated-hard-200          novel Δ=+0  (95% CI [+0.0, +0.0], n_bootstrap=1000) — NOT significant
+
+CONFIG DIFF:
+  decoder.decoder.ft8lib_sync_seeds_enabled        false → true
+COMPARE_EXIT=0
+===== synth-pair-200 fixed =====
+A: research/scorecards/pan7/synth-pair-200-control.json (sha 0574f727, score 0.0000)
+B: research/scorecards/pan7/synth-pair-200-seeded.json (sha 0574f727, score 0.0000 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI:
+  (skipped: neither scorecard carries `per_wav_records`. Re-eval with the Phase-B build to enable.)
+
+CONFIG DIFF:
+  decoder.decoder.ft8lib_sync_seeds_enabled        false → true
+COMPARE_EXIT=0
+===== synth-pair-200 raised =====
+A: research/scorecards/pan7/synth-pair-200-cap400-control.json (sha 0574f727, score 0.0000)
+B: research/scorecards/pan7/synth-pair-200-seeded-cap400.json (sha 0574f727, score 0.0000 +0.0000)
+
+REGRESSIONS:
+  (none)
+
+BOOTSTRAP CI:
+  (skipped: neither scorecard carries `per_wav_records`. Re-eval with the Phase-B build to enable.)
+
+CONFIG DIFF:
+  decoder.decoder.ft8lib_sync_seeds_enabled        false → true
+COMPARE_EXIT=0

@@ -7726,6 +7726,7 @@ mod remote_arm_gate_tests {
             ttl_ms: 120_000,
             scope_tx: true,
             jti: "tx-test-arm-jti".to_string(),
+            client_key_id: "tx-test-client-key-id".to_string(),
         }
     }
 
