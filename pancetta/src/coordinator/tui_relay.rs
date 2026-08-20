@@ -815,6 +815,16 @@ impl super::ApplicationCoordinator {
         // resulting state back to the TUI banner.
         let cmd_tx_policy = self.tx_policy.clone();
         let cmd_tx_restart_inhibit = self.tx_restart_inhibit.clone();
+        // PAN-19 round-12 review (Codex P1): "apply loop readiness to
+        // direct PTT commands". `TogglePtt` below now routes its PTT-on
+        // gate through the SAME `tx::tx_hard_mute_reason` helper the TX
+        // worker uses (see that function's doc comment in
+        // `coordinator/tx.rs`), which additionally checks this flag --
+        // previously only `cmd_tx_restart_inhibit` was checked here, so a
+        // manual PTT toggle during a slow (but non-fatal) Hamlib startup
+        // could queue a key-up the loop consumed once it finally became
+        // ready, well after the operator's actual keypress.
+        let cmd_hamlib_command_loop_ready = self.hamlib_command_loop_ready.clone();
         // Operator Hold/Auto TX-frequency mode (`f`). The handler toggles this
         // atomic; the QSO engine and autonomous operator read it to gate
         // autonomous frequency moves.
@@ -1900,17 +1910,24 @@ impl super::ApplicationCoordinator {
                             // PTT-OFF (state=false) is ALWAYS allowed: it can
                             // only ever stop TX, never start it.
                             if new_state {
-                                let policy = pancetta_core::TxPolicy::from_u8(
-                                    cmd_tx_policy.load(Ordering::Acquire),
-                                );
-                                if !policy.allows_any_tx()
-                                    || cmd_tx_restart_inhibit.load(Ordering::Acquire) != 0
-                                {
-                                    let status = if !policy.allows_any_tx() {
-                                        "Can't key PTT — TX is DISABLED (press g to re-enable)"
-                                    } else {
-                                        "Can't key PTT — rig control is restarting"
-                                    };
+                                // PAN-19 round-12 review (Codex P1): route
+                                // through `ptt_on_refusal`, which itself
+                                // routes through the SAME shared gate the
+                                // TX worker uses (`tx::tx_hard_mute_reason`)
+                                // -- see both functions' doc comments for
+                                // why. This additionally checks
+                                // `hamlib_command_loop_ready`, closing the
+                                // coverage gap where a manual PTT toggle
+                                // during a slow-but-non-fatal Hamlib
+                                // startup could queue a key-up the loop
+                                // only consumed once it became ready,
+                                // unexpectedly keying the radio well after
+                                // the operator's actual keypress.
+                                if let Some(status) = ptt_on_refusal(
+                                    &cmd_tx_policy,
+                                    &cmd_tx_restart_inhibit,
+                                    &cmd_hamlib_command_loop_ready,
+                                ) {
                                     warn!(
                                         target: "tx.policy",
                                         "Refusing PTT key-up: {status}"
@@ -1918,7 +1935,7 @@ impl super::ApplicationCoordinator {
                                     let _ = cmd_tui_msg_tx.send(
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "TX".to_string(),
-                                            status: status.to_string(),
+                                            status,
                                         },
                                     );
                                     continue;
@@ -2347,9 +2364,79 @@ fn map_autonomous_status(
     }
 }
 
+/// PAN-19 round-12 review (Codex P1): "apply loop readiness to direct PTT
+/// commands". The `TogglePtt` handler's PTT-on gate, factored out into its
+/// own free function so it's directly unit-testable (the handler itself
+/// lives deep inside a giant `tokio::select!` command loop with no
+/// injectable seams). `None` means the key-up may proceed; `Some(status)`
+/// is the operator-facing status text explaining the refusal.
+///
+/// This is a thin wrapper over `tx::tx_hard_mute_reason` -- THE single
+/// shared gate every PTT-on call site in the coordinator must route
+/// through (see that function's doc comment). Before this fix, `TogglePtt`
+/// re-derived its own `tx_restart_inhibit`-only condition here instead of
+/// calling it, which silently omitted the `hamlib_command_loop_ready`
+/// check the TX worker had had since round 7 -- a manual PTT toggle during
+/// a slow-but-non-fatal Hamlib startup could queue a key-up the loop only
+/// consumed once it became ready. Routing through the shared function
+/// (rather than duplicating its condition here) means a THIRD PTT-on call
+/// site added later gets this gate for free instead of needing its own
+/// copy that could omit a check again.
+fn ptt_on_refusal(
+    tx_policy: &Arc<std::sync::atomic::AtomicU8>,
+    tx_restart_inhibit: &Arc<std::sync::atomic::AtomicU32>,
+    hamlib_command_loop_ready: &Arc<std::sync::atomic::AtomicBool>,
+) -> Option<String> {
+    super::tx::tx_hard_mute_reason(tx_policy, tx_restart_inhibit, hamlib_command_loop_ready)
+        .map(|reason| format!("Can't key PTT — {reason}"))
+}
+
 #[cfg(test)]
 mod tui_relay_tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+
+    /// PAN-19 round-12 review (Codex P1) regression guard: "apply loop
+    /// readiness to direct PTT commands". The exact scenario the finding
+    /// describes -- `start_hamlib_component` returned from a
+    /// `LoopReadyOutcome::TimedOut` (restart-supervision inhibit already
+    /// released back to 0) but `hamlib_command_loop_ready` never got set
+    /// true. Before this fix, `TogglePtt`'s own separate check only looked
+    /// at `tx_restart_inhibit` and TX policy, so this exact state (policy
+    /// Full, restart_inhibit 0, loop NOT ready) would have let a manual
+    /// PTT-on through -- queuing a key-up the slow loop could consume
+    /// later, unexpectedly keying the radio well after the operator's
+    /// keypress. `ptt_on_refusal` must refuse it.
+    #[test]
+    fn ptt_on_refusal_blocks_a_key_up_while_the_hamlib_loop_is_not_yet_ready() {
+        let tx_policy = Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8()));
+        let tx_restart_inhibit = Arc::new(AtomicU32::new(0));
+        let hamlib_command_loop_ready = Arc::new(AtomicBool::new(false));
+
+        let refusal = ptt_on_refusal(&tx_policy, &tx_restart_inhibit, &hamlib_command_loop_ready);
+        assert!(
+            refusal.is_some(),
+            "a direct PTT-on toggle must be refused while the Hamlib command loop hasn't \
+             confirmed readiness, even though the restart-supervision inhibit counter has \
+             already released"
+        );
+    }
+
+    /// The flip side: once everything is genuinely ready, PTT-on must be
+    /// allowed through -- the fix must not become overly conservative.
+    #[test]
+    fn ptt_on_refusal_permits_a_key_up_when_everything_is_ready() {
+        let tx_policy = Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8()));
+        let tx_restart_inhibit = Arc::new(AtomicU32::new(0));
+        let hamlib_command_loop_ready = Arc::new(AtomicBool::new(true));
+
+        assert_eq!(
+            ptt_on_refusal(&tx_policy, &tx_restart_inhibit, &hamlib_command_loop_ready),
+            None,
+            "PTT-on must be permitted once TX policy allows it, restart isn't inhibiting, and \
+             the Hamlib command loop has confirmed readiness"
+        );
+    }
 
     /// Batch 94: the relay's snapshot→banner mapping must carry every
     /// QSO-detail field through field-for-field — a dropped field here

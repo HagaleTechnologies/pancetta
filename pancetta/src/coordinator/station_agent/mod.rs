@@ -2039,6 +2039,7 @@ mod tests {
                 ttl_ms: 300_000,
                 scope_tx: true,
                 jti: "test-jti".to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
             },
             NOW,
         );

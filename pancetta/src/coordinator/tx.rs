@@ -1034,7 +1034,23 @@ fn current_tx_policy(
 /// (`coordinator/hamlib.rs`) and never touched by the restart-supervision
 /// counter machinery at all -- so a `TimedOut` startup still blocks PTT
 /// here even after `TxInhibitGuard` has already released.
-fn tx_hard_mute_reason(
+///
+/// PAN-19 round-12 review (Codex P1): "apply loop readiness to direct PTT
+/// commands". This is now `pub(crate)` and is THE single shared gate every
+/// PTT-on call site in the coordinator must route through -- not just the
+/// automated TX worker's own `schedule_tx`/multi-TX call sites below.
+/// Round 7 through 11 only ever wired this into the TX worker; the direct,
+/// operator-triggered `TogglePtt` path (`coordinator/tui_relay.rs`) had its
+/// own separate, duplicated `tx_restart_inhibit`-only check that never
+/// learned about `hamlib_command_loop_ready` at all, so a manual PTT toggle
+/// during a slow Hamlib startup (`LoopReadyOutcome::TimedOut`, restart
+/// counter already released) could still queue a key-up the loop consumes
+/// later -- unexpectedly keying the radio well after the operator's actual
+/// keypress. Routing `TogglePtt` through this SAME function (rather than
+/// re-deriving the same `restart_inhibit && hamlib_loop_ready` condition a
+/// second time) is deliberate: a third PTT-on call site added later gets
+/// this gate for free instead of silently omitting it again.
+pub(crate) fn tx_hard_mute_reason(
     tx_policy: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     restart_inhibit: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     hamlib_loop_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,

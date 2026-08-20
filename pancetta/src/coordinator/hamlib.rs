@@ -921,6 +921,19 @@ impl super::ApplicationCoordinator {
         // it directly isn't possible. See `HAMLIB_LOOP_READY_TIMEOUT` above
         // for why this wait exists at all.
         let (loop_ready_tx, loop_ready_rx) = tokio::sync::oneshot::channel::<()>();
+        // PAN-19 round-12 review (Codex P1): "retain the old watchdog until
+        // PTT-off is confirmed". A SEPARATE oneshot (not reusing
+        // `initial_read_tx`, which is `!rig_enabled`-gated and used for an
+        // unrelated purpose) that the spawned task fires right after its
+        // own startup connect+PTT-off attempt, carrying whether it's now
+        // safe to abort an orphaned watchdog retained from a prior failed
+        // teardown: `true` if THIS generation's own `set_ptt(Off)`
+        // succeeded, or if it started with an already-active PTT tracker
+        // (a real timer its own watchdog will act on) -- see the send
+        // site's comment below for the full reasoning. Only awaited when
+        // there's actually an orphan to protect (see the drain site) so
+        // ordinary startups (no prior failed teardown) never pay for it.
+        let (ptt_safe_tx, ptt_safe_rx) = tokio::sync::oneshot::channel::<bool>();
 
         let hamlib_handle = {
             let shutdown = self.shutdown_signal.clone();
@@ -1287,17 +1300,24 @@ impl super::ApplicationCoordinator {
                 // equivalent, but keeps the polling task's own capture
                 // (`rig_poll`/`rig_for_polling`) visibly separate from this
                 // one-shot startup sequence.
+                // PAN-19 round-12 review (Codex P1): tracks whether THIS
+                // generation's own startup `set_ptt(Off)` succeeded, so it
+                // can be combined with `initial_ptt_on` below into the
+                // `ptt_safe_tx` signal that gates aborting an orphaned
+                // watchdog retained from a prior failed teardown.
+                let mut startup_ptt_off_succeeded = false;
                 match rig.connect().await {
                     Ok(_) => {
                         info!("Rig connected successfully");
-                        if let Err(e) = rig
+                        match rig
                             .set_ptt(
                                 pancetta_hamlib::Vfo::Current,
                                 pancetta_hamlib::PttState::Off,
                             )
                             .await
                         {
-                            warn!("Startup PTT-off failed: {e}");
+                            Ok(()) => startup_ptt_off_succeeded = true,
+                            Err(e) => warn!("Startup PTT-off failed: {e}"),
                         }
                         // Only flag a *real* CAT link as Connected — a mock rig
                         // (rig control disabled) stays NotConnected so the TUI
@@ -1339,6 +1359,22 @@ impl super::ApplicationCoordinator {
                         }
                     }
                 }
+
+                // PAN-19 round-12 review (Codex P1): "retain the old
+                // watchdog until PTT-off is confirmed". Tell
+                // `start_hamlib_component` whether it's now safe to abort
+                // an orphaned watchdog retained from a prior failed
+                // teardown -- `true` if THIS generation's own startup
+                // PTT-off just succeeded above, OR if this generation
+                // started with `initial_ptt_on` already `Some` (an
+                // already-active PTT tracker with a real timer, so THIS
+                // generation's own watchdog -- spawned above -- is already
+                // capable of protecting against a stuck key on its own).
+                // Neither condition holding means nothing has yet
+                // established that PTT is safe for this new generation, so
+                // the retained orphan -- possibly the only thing still
+                // trying to unkey the radio -- must not be aborted yet.
+                let _ = ptt_safe_tx.send(startup_ptt_off_succeeded || initial_ptt_on.is_some());
 
                 // Signal that the initial connect + read sequence is done (or
                 // gave up).  The receiver in start_hamlib_component is waiting
@@ -1422,18 +1458,36 @@ impl super::ApplicationCoordinator {
                                         vfo,
                                         frequency,
                                     } => {
-                                        // PAN-19 round-11 review (Codex
-                                        // P1): record this message's
+                                        // PAN-19 round-11/12 review (Codex
+                                        // P1): `should_apply_and_record`
+                                        // both records this message's
                                         // globally-monotonic `id` as the
-                                        // latest SetFrequency this loop
-                                        // has seen, so the pending-queue
-                                        // retry (poll loop) can tell a
-                                        // stale redelivery apart from one
-                                        // that's still current -- see
+                                        // latest SetFrequency this loop has
+                                        // seen (so the pending-queue retry
+                                        // can tell a stale redelivery apart
+                                        // from a current one -- see
                                         // `last_applied_frequency_id`'s
-                                        // declaration above.
-                                        if let Ok(mut last) = last_applied_frequency_id.lock() {
-                                            *last = Some(message.id);
+                                        // declaration above) AND -- round
+                                        // 12 -- re-checks supersession right
+                                        // here, at the loop's single
+                                        // consumption point, so a stale
+                                        // pending command that slipped into
+                                        // the channel BEHIND a newer one
+                                        // already queued (a race the
+                                        // send-time check in
+                                        // `deliver_pending_hamlib_state`
+                                        // can't see) still gets dropped
+                                        // instead of applied.
+                                        if !should_apply_and_record(
+                                            &message,
+                                            &last_applied_frequency_id,
+                                        ) {
+                                            warn!(
+                                                target: "rig",
+                                                "Discarding a stale SetFrequency command \
+                                                 superseded by one already applied"
+                                            );
+                                            continue;
                                         }
                                         let vfo_enum = if *vfo == 0 {
                                             pancetta_hamlib::Vfo::A
@@ -1491,13 +1545,20 @@ impl super::ApplicationCoordinator {
                                         enabled,
                                         tx_frequency,
                                     } => {
-                                        // PAN-19 round-11 review (Codex
-                                        // P1): same tracking as
-                                        // SetFrequency above, for
-                                        // SetSplit's own pending-queue
-                                        // supersession check.
-                                        if let Ok(mut last) = last_applied_split_id.lock() {
-                                            *last = Some(message.id);
+                                        // PAN-19 round-11/12 review (Codex
+                                        // P1): same tracking + consumption-
+                                        // time supersession re-check as
+                                        // SetFrequency above.
+                                        if !should_apply_and_record(
+                                            &message,
+                                            &last_applied_split_id,
+                                        ) {
+                                            warn!(
+                                                target: "rig",
+                                                "Discarding a stale SetSplit command superseded \
+                                                 by one already applied"
+                                            );
+                                            continue;
                                         }
                                         if *enabled {
                                             if let Err(e) =
@@ -1703,18 +1764,45 @@ impl super::ApplicationCoordinator {
             &hamlib_tx,
         );
 
-        // PAN-19 MEDIUM #2: `teardown_hamlib` only drains+aborts
-        // `hamlib_orphans` at the START of the NEXT teardown call. A
-        // watchdog orphaned by a teardown whose 3 PTT-off attempts all
-        // failed (see `teardown_hamlib` below) would otherwise survive
-        // past THIS successful restart, holding a stale `ptt_on_since`
-        // from the OLD generation and capable of firing `set_ptt(Off)` on
-        // the NEW generation's rig client mid-transmission. Now that this
-        // new generation has successfully started (children handles
-        // published above), any such orphan is definitely stale -- abort
-        // it here too, rather than waiting for a subsequent teardown.
-        for orphan in self.hamlib_orphans.drain(..) {
-            orphan.abort();
+        // PAN-19 MEDIUM #2 (round 1) + round-12 review (Codex P1) "retain
+        // the old watchdog until PTT-off is confirmed": `teardown_hamlib`
+        // only drains+aborts `hamlib_orphans` at the START of the NEXT
+        // teardown call. A watchdog orphaned by a teardown whose 3 PTT-off
+        // attempts all failed (see `teardown_hamlib` below) would
+        // otherwise survive past THIS successful restart, holding a stale
+        // `ptt_on_since` from the OLD generation -- so it's tempting to
+        // abort it as soon as this new generation's children are
+        // published. But round-1's original fix did exactly that
+        // unconditionally, and round-12 found the real gap: publishing
+        // children only means the new poll/watchdog tasks exist, NOT that
+        // PTT is confirmed safe -- the new generation's own startup
+        // PTT-off (see `ptt_safe_tx.send` above) hasn't necessarily run or
+        // succeeded yet, and if the TX worker had already cleared
+        // `ptt_active` after queueing an unconsumed unkey, the new
+        // watchdog could start with no active timer either. Aborting the
+        // retained orphan in that scenario would remove the only task
+        // still trying to unkey a physically-keyed radio.
+        //
+        // Only pay for the wait when there's actually an orphan to
+        // protect -- ordinary startups (no prior failed teardown) skip it
+        // entirely, so this adds no latency to the common case.
+        if !self.hamlib_orphans.is_empty() {
+            let confirmed_safe = orphan_safe_to_abort(
+                tokio::time::timeout(RIG_INITIAL_READ_TIMEOUT, ptt_safe_rx).await,
+            );
+            if confirmed_safe {
+                for orphan in self.hamlib_orphans.drain(..) {
+                    orphan.abort();
+                }
+            } else {
+                warn!(
+                    target: "rig",
+                    "Hamlib restart: retaining {} orphaned PTT watchdog(s) from a prior \
+                     failed teardown -- the new generation hasn't confirmed PTT-off is safe \
+                     yet; will retry at the next teardown or restart",
+                    self.hamlib_orphans.len()
+                );
+            }
         }
 
         info!("Hamlib component started");
@@ -1759,6 +1847,82 @@ impl super::ApplicationCoordinator {
 /// already applied a SetFrequency/SetSplit with a NEWER id than the
 /// pending one, the pending item is provably stale -- drop it (don't put
 /// it back in its slot) instead of delivering it.
+/// `true` when the message loop has already applied a command of this kind
+/// newer than `message` -- i.e. `message` is stale and must not be
+/// (re)delivered or (re)applied. Fails safe toward delivering (returns
+/// `false`, i.e. "not known to be stale") on a poisoned tracker lock or if
+/// nothing has been applied yet.
+///
+/// PAN-19 round-12 review (Codex P1): hoisted out of
+/// `deliver_pending_hamlib_state` (was a nested fn there) so
+/// [`should_apply_and_record`] can share it -- see that function's doc
+/// comment for why a second call site was needed.
+fn is_superseded(
+    message: &ComponentMessage,
+    last_applied_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+) -> bool {
+    last_applied_id
+        .lock()
+        .ok()
+        .and_then(|last| *last)
+        .is_some_and(|last_id| last_id > message.id)
+}
+
+/// PAN-19 round-12 review (Codex P1): "discard pending state superseded by
+/// queued commands". Round-11's `is_superseded` check ran only inside
+/// `deliver_pending_hamlib_state`, at retry-SEND time -- but a newer
+/// SetFrequency/SetSplit that had already been sent (via the normal path,
+/// not a pending replay) and was sitting in `hamlib_rx` un-consumed at that
+/// moment wasn't reflected in `last_applied_*` yet. If the channel had one
+/// free slot, the stale pending message got appended BEHIND the newer one
+/// already queued; the message loop would then apply the newer command
+/// followed by the stale one, reverting good state.
+///
+/// The message loop's `while` loop is this generation's single
+/// serialization point: every SetFrequency/SetSplit, however and whenever
+/// it entered `hamlib_rx`, is consumed there one at a time, in true FIFO
+/// order. So the loop itself -- not the retry-send site -- is the only
+/// place that can see the FINAL order and give a correct, non-racy
+/// answer. This is the gate the message loop's SetFrequency/SetSplit arms
+/// call on every message (not just replayed ones) immediately before
+/// applying it: if a newer command of the same kind was already consumed
+/// (`is_superseded`), skip applying this one and leave the tracker alone;
+/// otherwise advance the tracker to this message's id and apply it. Because
+/// it runs at the loop's single consumption point, it is correct regardless
+/// of how a stale message ended up behind a fresher one in the channel.
+fn should_apply_and_record(
+    message: &ComponentMessage,
+    last_applied_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+) -> bool {
+    if is_superseded(message, last_applied_id) {
+        return false;
+    }
+    if let Ok(mut last) = last_applied_id.lock() {
+        *last = Some(message.id);
+    }
+    true
+}
+
+/// PAN-19 round-12 review (Codex P1): "retain the old watchdog until
+/// PTT-off is confirmed". `true` only when the new generation's spawned
+/// task explicitly confirmed `true` on `ptt_safe_tx` within the bound --
+/// i.e. its own startup PTT-off succeeded, or it started with an
+/// already-active PTT tracker. Fails SAFE (returns `false`, i.e. "do not
+/// abort the retained orphan") on every other outcome: an explicit
+/// `false` confirmation, the sender dropping without sending (the spawned
+/// task died before reaching that call site), or the bounded wait timing
+/// out entirely -- an orphan retained specifically because a prior
+/// teardown couldn't confirm PTT-off must never be aborted on anything
+/// less than a positive confirmation.
+fn orphan_safe_to_abort(
+    ptt_safe_outcome: Result<
+        Result<bool, tokio::sync::oneshot::error::RecvError>,
+        tokio::time::error::Elapsed,
+    >,
+) -> bool {
+    matches!(ptt_safe_outcome, Ok(Ok(true)))
+}
+
 fn deliver_pending_hamlib_state(
     pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
@@ -1766,22 +1930,6 @@ fn deliver_pending_hamlib_state(
     last_applied_split_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
     sender: &crossbeam_channel::Sender<ComponentMessage>,
 ) {
-    /// `true` when the message loop has already applied a command of this
-    /// kind newer than `message` -- i.e. `message` is stale and must not
-    /// be (re)delivered. Fails safe toward delivering (returns `false`,
-    /// i.e. "not known to be stale") on a poisoned tracker lock or if
-    /// nothing has been applied yet.
-    fn is_superseded(
-        message: &ComponentMessage,
-        last_applied_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
-    ) -> bool {
-        last_applied_id
-            .lock()
-            .ok()
-            .and_then(|last| *last)
-            .is_some_and(|last_id| last_id > message.id)
-    }
-
     if let Ok(mut slot) = pending_frequency.lock() {
         if let Some(message) = slot.take() {
             if is_superseded(&message, last_applied_frequency_id) {
@@ -2384,6 +2532,153 @@ mod restart_orphan_tests {
         coordinator
             .shutdown_signal
             .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(all(test, feature = "pancetta-hamlib"))]
+mod orphan_ptt_confirmation_tests {
+    //! PAN-19 round-12 review (Codex P1) regression guard: "retain the old
+    //! watchdog until PTT-off is confirmed". `restart_orphan_tests` above
+    //! (pre-existing, still green) already proves the POSITIVE case
+    //! end-to-end through the real `start_hamlib_component` -- a
+    //! successful mock-rig start (PTT-off succeeds by default) drains the
+    //! orphan. What round 1's original fix got wrong was aborting the
+    //! orphan on nothing stronger than "children published", BEFORE the
+    //! new generation's own PTT-off had even been attempted -- which
+    //! `start_hamlib_component`'s mock-rig path can't be made to
+    //! reproduce directly (it always constructs a default, non-failing
+    //! `MockRig`, with no injection point for a failing one -- see
+    //! `children_publish_race_tests`' doc comment for the same limitation
+    //! on a different mechanism).
+    //!
+    //! `orphan_safe_to_abort` is unit-tested directly below for the exact
+    //! branch logic (real oneshot/timeout primitives, all four outcomes).
+    //! The two integration-style tests after it mirror the orphan-drain
+    //! call site's exact concurrency SHAPE -- real `AbortHandle`s, a real
+    //! oneshot, a real bounded `timeout` -- to prove the retain/drain
+    //! wiring itself, not just the branch predicate in isolation.
+    use super::*;
+
+    #[tokio::test]
+    async fn orphan_safe_to_abort_is_true_only_for_an_explicit_positive_confirmation() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let _ = tx.send(true);
+        assert!(
+            orphan_safe_to_abort(tokio::time::timeout(Duration::from_millis(50), rx).await),
+            "an explicit `true` confirmation must be safe to abort on"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_safe_to_abort_is_false_for_an_explicit_negative_confirmation() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        let _ = tx.send(false);
+        assert!(
+            !orphan_safe_to_abort(tokio::time::timeout(Duration::from_millis(50), rx).await),
+            "an explicit `false` confirmation (PTT-off failed AND no active tracker) must \
+             never be treated as safe to abort"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_safe_to_abort_is_false_when_the_sender_drops_without_sending() {
+        let (tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        drop(tx); // the spawned task died before reaching `ptt_safe_tx.send`
+        assert!(
+            !orphan_safe_to_abort(tokio::time::timeout(Duration::from_millis(50), rx).await),
+            "a dropped confirmation sender must fail safe, not be treated as a green light"
+        );
+    }
+
+    #[tokio::test]
+    async fn orphan_safe_to_abort_is_false_when_the_wait_times_out() {
+        let (_tx, rx) = tokio::sync::oneshot::channel::<bool>();
+        // `_tx` is held (not sent, not dropped) so `rx` never resolves --
+        // the bounded wait itself must elapse.
+        assert!(
+            !orphan_safe_to_abort(tokio::time::timeout(Duration::from_millis(20), rx).await),
+            "a confirmation that never arrives in time must fail safe, not be treated as a \
+             green light"
+        );
+    }
+
+    /// Mirrors the real orphan-drain call site's exact shape: an orphan
+    /// `AbortHandle`, a `ptt_safe_tx`/`ptt_safe_rx` oneshot that resolves
+    /// to `false`, and the same bounded-`timeout` + `orphan_safe_to_abort`
+    /// + conditional-drain sequence `start_hamlib_component` runs. The
+    /// orphan must survive: it may be the only task still trying to unkey
+    /// a physically-keyed radio.
+    #[tokio::test]
+    async fn the_drain_call_site_retains_the_orphan_when_ptt_safety_is_not_confirmed() {
+        let orphan_task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let mut hamlib_orphans = vec![orphan_task.abort_handle()];
+
+        let (ptt_safe_tx, ptt_safe_rx) = tokio::sync::oneshot::channel::<bool>();
+        let _ = ptt_safe_tx.send(false);
+
+        if !hamlib_orphans.is_empty() {
+            let confirmed_safe = orphan_safe_to_abort(
+                tokio::time::timeout(Duration::from_millis(200), ptt_safe_rx).await,
+            );
+            if confirmed_safe {
+                for orphan in hamlib_orphans.drain(..) {
+                    orphan.abort();
+                }
+            }
+        }
+
+        assert!(
+            !hamlib_orphans.is_empty(),
+            "an orphan must be RETAINED (not drained) when the new generation hasn't \
+             confirmed PTT-off is safe"
+        );
+        assert!(
+            !orphan_task.is_finished(),
+            "the retained orphan watchdog must still be running, not aborted"
+        );
+
+        orphan_task.abort();
+    }
+
+    /// The flip side, same shape: a `true` confirmation drains (aborts)
+    /// the orphan.
+    #[tokio::test]
+    async fn the_drain_call_site_drains_the_orphan_once_ptt_safety_is_confirmed() {
+        let orphan_task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let mut hamlib_orphans = vec![orphan_task.abort_handle()];
+
+        let (ptt_safe_tx, ptt_safe_rx) = tokio::sync::oneshot::channel::<bool>();
+        let _ = ptt_safe_tx.send(true);
+
+        if !hamlib_orphans.is_empty() {
+            let confirmed_safe = orphan_safe_to_abort(
+                tokio::time::timeout(Duration::from_millis(200), ptt_safe_rx).await,
+            );
+            if confirmed_safe {
+                for orphan in hamlib_orphans.drain(..) {
+                    orphan.abort();
+                }
+            }
+        }
+
+        assert!(
+            hamlib_orphans.is_empty(),
+            "the orphan must be drained once the new generation confirms PTT-off is safe"
+        );
+        for _ in 0..1000 {
+            if orphan_task.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            orphan_task.is_finished(),
+            "the drained orphan must actually be aborted"
+        );
     }
 }
 
@@ -3060,6 +3355,83 @@ mod teardown_replay_tests {
         assert!(
             receiver.try_recv().is_ok(),
             "a non-superseded pending command must land on the channel"
+        );
+    }
+
+    /// PAN-19 round-12 review (Codex P1): "discard pending state superseded
+    /// by queued commands". Round-11's `is_superseded` check only ran at
+    /// `deliver_pending_hamlib_state`'s retry-SEND time -- it couldn't see a
+    /// newer command that had already been sent (normal path) but not yet
+    /// CONSUMED by the message loop, so a stale pending message that got
+    /// queued BEHIND an already-queued newer one would still be applied
+    /// after it once both reached the loop.
+    ///
+    /// This drives `should_apply_and_record` -- the consumption-time gate
+    /// the message loop's own SetFrequency/SetSplit arms now call on every
+    /// message -- through exactly that race, at the level the loop
+    /// actually sees it: two SetSplit messages consumed in FIFO order,
+    /// newer first (mirroring "already queued ahead of the stale replay"),
+    /// stale second. The newer one must apply and advance the tracker; the
+    /// stale one, consumed after, must be rejected regardless of whatever
+    /// the tracker looked like at the moment the stale one was ENQUEUED --
+    /// only the tracker's state at CONSUME time matters.
+    #[test]
+    fn should_apply_and_record_rejects_a_stale_message_consumed_after_a_newer_one() {
+        let stale_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000, // stale, wrong TX frequency
+            }),
+            Instant::now(),
+        );
+        // Constructed after `stale_split`, so its id is strictly greater
+        // (globally monotonic, see `generate_message_id`).
+        let newer_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_074_000, // the CORRECT, current TX frequency
+            }),
+            Instant::now(),
+        );
+        assert!(
+            newer_split.id > stale_split.id,
+            "test setup invariant: newer_split must have a strictly larger id"
+        );
+
+        let last_applied_split_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        // The loop consumes the ALREADY-QUEUED newer command first (the
+        // race in the finding: it was sent, and queued, before the stale
+        // pending retry ever ran) -- it applies and advances the tracker.
+        assert!(
+            should_apply_and_record(&newer_split, &last_applied_split_id),
+            "the newer command must apply"
+        );
+        assert_eq!(
+            *last_applied_split_id.lock().unwrap(),
+            Some(newer_split.id),
+            "the tracker must advance to the newer command's id"
+        );
+
+        // The loop then consumes the stale pending replay, which landed in
+        // the channel BEHIND the newer one. Even though the send-time
+        // `is_superseded` check in `deliver_pending_hamlib_state` may have
+        // seen a stale (or empty) tracker before the newer command was
+        // applied, the consumption-time gate must still reject it here,
+        // using the tracker's CURRENT state.
+        assert!(
+            !should_apply_and_record(&stale_split, &last_applied_split_id),
+            "a stale command consumed after a newer one must be rejected, not applied"
+        );
+        assert_eq!(
+            *last_applied_split_id.lock().unwrap(),
+            Some(newer_split.id),
+            "rejecting the stale command must not move the tracker backward"
         );
     }
 
