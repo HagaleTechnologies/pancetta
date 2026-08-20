@@ -860,6 +860,10 @@ impl super::ApplicationCoordinator {
 
         let hamlib_handle = {
             let shutdown = self.shutdown_signal.clone();
+            // PAN-19 round-8 review (Codex P1): the spawned task itself is
+            // the true source of truth for this flag -- see the comment at
+            // the readiness-reporting call site below for why.
+            let hamlib_command_loop_ready = self.hamlib_command_loop_ready.clone();
 
             tokio::spawn(async move {
                 // PAN-19 HIGH: the poll + PTT-watchdog child tasks are spawned
@@ -1262,15 +1266,59 @@ impl super::ApplicationCoordinator {
                 // with a bounded timeout; send errors are harmless (timeout
                 // already elapsed).
                 let _ = initial_read_tx.send(());
-                // PAN-19 HIGH follow-up (round 3, Codex P1): signal that the
-                // message loop is about to start consuming commands off the
-                // bus -- see `HAMLIB_LOOP_READY_TIMEOUT` for why a second,
-                // separate signal is needed here alongside `initial_read_tx`
-                // above (same moment, different consumer/purpose). Fired
-                // unconditionally (mock rig and disabled-rig paths reach
-                // here just as fast as the real-rig success path), right
-                // before the loop below that actually starts consuming.
-                let _ = loop_ready_tx.send(());
+
+                // PAN-19 round-8 review (Codex P1, two findings addressed
+                // together at this one call site so neither reintroduces an
+                // ordering issue against the other):
+                //
+                // 1) "Set readiness when the late Hamlib loop starts" -- an
+                //    earlier version only sent `loop_ready_tx` here and let
+                //    `start_hamlib_component`'s caller-side receive (within
+                //    its bounded `HAMLIB_LOOP_READY_TIMEOUT`) be the ONLY
+                //    place `hamlib_command_loop_ready` got set `true`. If
+                //    that bounded wait had already elapsed (dropping the
+                //    receiver) by the time we reach this point -- i.e. the
+                //    combined ~23s of waits upstream in
+                //    `start_hamlib_component` weren't enough -- this send
+                //    would have no receiver, and the atomic would NEVER
+                //    flip `true`, permanently muting TX (until the NEXT
+                //    restart) even once the rig genuinely recovers. Fix:
+                //    the atomic's true source of truth is THIS spawned task
+                //    setting it directly, right here, independent of
+                //    whether anyone is still listening on the oneshot.
+                //    `start_hamlib_component`'s own wait/timeout stays only
+                //    as a startup-latency signal for logging/classification
+                //    (`LoopReadyOutcome`), not as the sole trigger for the
+                //    atomic flag anymore.
+                //
+                // 2) "Verify child liveness before publishing loop
+                //    readiness" -- reporting readiness unconditionally here
+                //    ignored that the poll/watchdog children could have
+                //    ALREADY crashed during the connect/PTT-off/frequency
+                //    -read sequence above -- moments before the `while`
+                //    loop's own `child_task_crashed` check (its very first
+                //    line) would catch exactly that and bail the whole
+                //    generation. That left a brief window where TX was
+                //    reported ready/un-muted for a generation already about
+                //    to die with no command consumer. Fix: reuse the SAME
+                //    `child_task_crashed` check the loop uses on its first
+                //    iteration -- if a child is already dead, withhold
+                //    readiness entirely (neither the oneshot send nor the
+                //    atomic flag) and fall straight through to the loop's
+                //    own crash-handling bail below. The caller sees this as
+                //    `loop_ready_tx` being dropped without sending, i.e.
+                //    `LoopReadyOutcome::SenderDropped`, which already (round
+                //    -5) correctly bails and keeps TX inhibited.
+                if child_task_crashed(&shutdown, &spawned_handles) {
+                    // Already dead -- report nothing. `loop_ready_tx` drops
+                    // without sending when this task ends (via the bail
+                    // just below); `hamlib_command_loop_ready` stays at
+                    // whatever `start_hamlib_component` reset it to
+                    // (`false`) at the start of this call.
+                } else {
+                    hamlib_command_loop_ready.store(true, Ordering::Release);
+                    let _ = loop_ready_tx.send(());
+                }
 
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
@@ -1459,41 +1507,47 @@ impl super::ApplicationCoordinator {
         // here on timeout -- a slow rig must still start up successfully;
         // it just means TX stays inhibited a little longer than ideal,
         // which is the safe direction to be wrong in.
+        // PAN-19 round-8 review (Codex P1): `hamlib_command_loop_ready` is
+        // no longer set from here at all -- the spawned task itself is now
+        // the sole source of truth (it sets the atomic directly, right
+        // before sending `loop_ready_tx`, guarded by its own
+        // `child_task_crashed` check; see that call site above). Setting
+        // it AGAIN here on `Ready` would just be a redundant (harmless,
+        // but confusing) second writer of the same value; setting it
+        // unconditionally on the `!rig_enabled` path (an earlier version
+        // did both) could actually be WRONG -- it would report readiness
+        // before the spawned task's own liveness check has necessarily
+        // run. This wait now exists purely as a startup-latency signal for
+        // logging/classification, not as a trigger for the atomic flag.
         if rig_enabled {
             // PAN-19 round-5 review (Codex P1): see `classify_loop_ready`'s
             // doc comment for why the three outcomes are handled
             // differently. `SenderDropped` (the generation is provably
-            // dead) mirrors `children_rx`'s own `Ok(Err(_))` arm just
-            // above and bails the same way; that propagates through
-            // `restart_component`'s `Err(e)` branch in `health.rs`, where
-            // `TxInhibitGuard` is leaked (PAN-19 MEDIUM #3) rather than
-            // released for a generation that was never alive to consume
-            // anything. `self.hamlib_children`/`self.rig_handle` are left
-            // set to this (now-dead) generation's stale values on that
-            // path; that's fine -- `hamlib_handle` is already registered
-            // in `named_task_handles`, so the supervisor's own next
-            // `check_task_handles` tick will notice it finished, run
-            // `teardown_hamlib()` to clean up properly, and dispatch a
-            // fresh restart through the normal crash-recovery path.
-            // `TimedOut` stays the soft, non-bailing path -- a slow rig
-            // must never hard-fail startup (the regression the HIGH fix
-            // closed, which must stay closed).
+            // dead, OR the spawned task's own child-liveness check withheld
+            // readiness per round-8 above) mirrors `children_rx`'s own
+            // `Ok(Err(_))` arm just above and bails the same way; that
+            // propagates through `restart_component`'s `Err(e)` branch in
+            // `health.rs`, where `TxInhibitGuard` is leaked (PAN-19 MEDIUM
+            // #3) rather than released for a generation that was never
+            // alive to consume anything. `self.hamlib_children`/
+            // `self.rig_handle` are left set to this (now-dead)
+            // generation's stale values on that path; that's fine --
+            // `hamlib_handle` is already registered in `named_task_handles`,
+            // so the supervisor's own next `check_task_handles` tick will
+            // notice it finished, run `teardown_hamlib()` to clean up
+            // properly, and dispatch a fresh restart through the normal
+            // crash-recovery path. `TimedOut` stays the soft, non-bailing
+            // path -- a slow rig must never hard-fail startup (the
+            // regression the HIGH fix closed, which must stay closed) --
+            // and, per round-8, no longer needs to do anything to the
+            // atomic flag either: the spawned task will have already set
+            // it (or not) by the time it actually reaches its loop,
+            // independent of whether this wait is still listening.
             match classify_loop_ready(
                 tokio::time::timeout(HAMLIB_LOOP_READY_TIMEOUT, loop_ready_rx).await,
             ) {
                 LoopReadyOutcome::Ready => {
                     info!(target: "rig", "Hamlib message loop ready to consume commands");
-                    // PAN-19 round-7 review (Codex P1): the ONLY place this
-                    // flag is set true for the real-rig path -- see
-                    // `hamlib_command_loop_ready`'s doc comment. Deliberately
-                    // NOT set in the `TimedOut` arm below: `start_hamlib_component`
-                    // still returns `Ok(())` there (must not bail, or the
-                    // HIGH-fix regression comes back), but that must not be
-                    // conflated with "safe to un-inhibit TX" -- this flag is
-                    // what actually gates PTT at key-time, independent of
-                    // `start_hamlib_component`'s return value.
-                    self.hamlib_command_loop_ready
-                        .store(true, Ordering::Release);
                 }
                 LoopReadyOutcome::SenderDropped => {
                     hamlib_abort.abort();
@@ -1511,18 +1565,6 @@ impl super::ApplicationCoordinator {
                     );
                 }
             }
-        } else {
-            // Mock/disabled-rig path: `rig_enabled` is false, so the wait
-            // above never runs (`loop_ready_tx` still fires unconditionally
-            // from the spawned task, but nothing here awaits it) -- the
-            // connect/PTT/frequency-read sequence and message-loop start
-            // are both local and effectively instant (no real I/O), so
-            // there's no meaningful "is the loop actually ready" gap to
-            // guard against here. Mark ready immediately rather than
-            // leaving PTT permanently gated on a signal nothing will ever
-            // await.
-            self.hamlib_command_loop_ready
-                .store(true, Ordering::Release);
         }
 
         // PAN-19 round-5 review (Codex P1): deliver any `SetFrequency`/
@@ -1878,6 +1920,122 @@ mod children_publish_race_tests {
             .expect("loop_ready_rx must eventually fire once the slow connect finishes")
             .expect("loop_ready_tx sender must not have been dropped without sending");
     }
+
+    /// PAN-19 round-8 review (Codex P1), finding #1: "Set readiness when
+    /// the late Hamlib loop starts". An earlier version relied SOLELY on
+    /// `start_hamlib_component`'s bounded receive on `loop_ready_rx` to set
+    /// `hamlib_command_loop_ready`. If that wait had already elapsed
+    /// (dropping the receiver) by the time the spawned task reaches the
+    /// readiness point -- e.g. the combined ~23s of upstream waits weren't
+    /// enough -- the later `loop_ready_tx.send(())` would have no receiver,
+    /// and the atomic would NEVER flip `true`: TX stays muted forever
+    /// (until the next restart) even once the rig genuinely recovers, far
+    /// worse than the bounded over-caution window being fixed.
+    ///
+    /// Mirrors that exact scenario: drop `loop_ready_rx` FIRST (simulating
+    /// the caller's bounded wait already having timed out), THEN let a
+    /// slow-connecting task reach its own readiness point and set a real
+    /// `Arc<AtomicBool>` directly -- proving the flag still ends up `true`,
+    /// independent of whether anyone was still listening on the oneshot.
+    #[tokio::test]
+    async fn atomic_flag_is_set_by_the_spawned_task_even_after_the_caller_stopped_listening() {
+        let rig = Arc::new(MockRig::new(MockRigConfig {
+            connection_delay_ms: 200,
+            ..Default::default()
+        }));
+        let hamlib_command_loop_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (loop_ready_tx, loop_ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Simulate `start_hamlib_component`'s bounded wait having ALREADY
+        // timed out (and thus dropped its receiver) before the spawned
+        // task ever reaches the readiness point.
+        drop(loop_ready_rx);
+
+        let rig_for_task = rig.clone();
+        let flag_for_task = hamlib_command_loop_ready.clone();
+        let handle = tokio::spawn(async move {
+            let _ = rig_for_task.connect().await; // the slow part
+                                                  // Mirrors the real (fixed) spawned task: set the atomic
+                                                  // DIRECTLY, independent of whether `loop_ready_tx` still has a
+                                                  // receiver.
+            flag_for_task.store(true, Ordering::Release);
+            let _ = loop_ready_tx.send(()); // no receiver left -- harmless no-op
+        });
+        handle.await.expect("task should complete");
+
+        assert!(
+            hamlib_command_loop_ready.load(Ordering::Acquire),
+            "the atomic flag must be set by the spawned task directly, not stuck false just \
+             because the caller's receiver had already gone out of scope"
+        );
+    }
+
+    /// PAN-19 round-8 review (Codex P1), finding #2: "Verify child
+    /// liveness before publishing loop readiness". Reporting readiness
+    /// unconditionally ignored that the poll/watchdog children could
+    /// already be dead by the time the spawned task reaches the readiness
+    /// point (e.g. one panicked during the connect/PTT-off/frequency-read
+    /// sequence) -- moments before the message loop's own
+    /// `child_task_crashed` check (its very first line) would catch
+    /// exactly that and bail the whole generation. That left a window
+    /// where TX was reported ready for a generation already about to die
+    /// with no command consumer.
+    ///
+    /// Mirrors the fixed call site directly: a child handle that has
+    /// already finished, checked via the real `child_task_crashed` helper
+    /// BEFORE reporting readiness -- proving readiness (both the oneshot
+    /// send and the atomic flag) is withheld, matching the real
+    /// implementation's `if child_task_crashed(...) { /* withhold */ }
+    /// else { /* report */ }` shape.
+    #[tokio::test]
+    async fn readiness_is_withheld_when_a_child_has_already_terminated() {
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hamlib_command_loop_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let (loop_ready_tx, loop_ready_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // A poll/watchdog child that already terminated by the time the
+        // spawned task reaches the readiness-reporting point.
+        let already_dead: tokio::task::JoinHandle<()> = tokio::spawn(async {});
+        for _ in 0..1000 {
+            if already_dead.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            already_dead.is_finished(),
+            "test setup: the child should have finished"
+        );
+        let still_running = tokio::spawn(async { std::future::pending::<()>().await });
+        let spawned_handles = vec![already_dead, still_running];
+
+        // Mirrors the real (fixed) call site exactly: check liveness
+        // BEFORE reporting readiness.
+        if child_task_crashed(&shutdown, &spawned_handles) {
+            // Withhold: neither the atomic flag nor the oneshot send.
+            // Explicitly drop `loop_ready_tx` without sending, mirroring
+            // the real task going on to bail and end.
+            drop(loop_ready_tx);
+        } else {
+            hamlib_command_loop_ready.store(true, Ordering::Release);
+            let _ = loop_ready_tx.send(());
+        }
+
+        assert!(
+            !hamlib_command_loop_ready.load(Ordering::Acquire),
+            "the atomic flag must NOT be set when a child has already terminated -- readiness \
+             must be withheld, not reported for a generation about to die"
+        );
+        assert!(
+            loop_ready_rx.await.is_err(),
+            "loop_ready_rx must resolve as a dropped sender (no readiness reported), not a \
+             received value"
+        );
+
+        for handle in spawned_handles {
+            handle.abort();
+        }
+    }
 }
 
 #[cfg(all(test, feature = "pancetta-hamlib"))]
@@ -1950,6 +2108,36 @@ mod restart_orphan_tests {
             orphan_task.is_finished(),
             "the watchdog orphaned by a prior failed teardown must be aborted once the new \
              generation starts, not left running with a stale ptt_on_since from the old one"
+        );
+
+        // PAN-19 round-8 review: `hamlib_command_loop_ready` is now set by
+        // the SPAWNED task itself, asynchronously, rather than
+        // synchronously within `start_hamlib_component`'s own return path
+        // (which on the mock-rig path returns almost immediately). Poll
+        // for it briefly rather than asserting immediately -- proving the
+        // real, end-to-end integration point (not just the mirrored-shape
+        // tests in `children_publish_race_tests`) actually flips this flag
+        // true for a genuinely successful start.
+        // `yield_now()` alone doesn't reliably advance real time on a
+        // `current_thread` runtime while the spawned task is genuinely
+        // asleep inside `MockRig::connect()`'s ~100ms delay -- use a real
+        // (short) sleep between polls so this doesn't spuriously fail
+        // before the spawned task has had a real chance to run.
+        for _ in 0..50 {
+            if coordinator
+                .hamlib_command_loop_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            coordinator
+                .hamlib_command_loop_ready
+                .load(std::sync::atomic::Ordering::Acquire),
+            "hamlib_command_loop_ready must end up true once the real spawned task reaches \
+             its message loop on a genuinely successful start"
         );
 
         coordinator
