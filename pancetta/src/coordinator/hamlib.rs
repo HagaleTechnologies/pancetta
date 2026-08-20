@@ -132,6 +132,88 @@ mod classify_loop_ready_tests {
     }
 }
 
+/// PAN-19 round-11 review (Codex P1): clears `hamlib_command_loop_ready`
+/// back to `false` the instant the Hamlib message loop exits, for ANY
+/// reason -- normal shutdown, a child-crash bail, a disconnected command
+/// channel, or even an unexpected panic.
+///
+/// Rounds 8-9 correctly set the flag `true` when the loop starts, but
+/// there was no symmetric guarantee it went back to `false` when the loop
+/// died: `tx_restart_inhibit` isn't raised until the supervisor's own
+/// up-to-5s health-check tick notices the finished task, so without this
+/// a transmit could pass the TX key-time gate (`tx_hard_mute_reason` in
+/// `tx.rs`) during that window and play audio with no PTT command
+/// consumer left to key/unkey the rig.
+///
+/// Matches this codebase's existing RAII-cleanup-on-any-exit pattern --
+/// `RemoteTxDisarmGuard` in `station_agent/mod.rs` is the precedent, bound
+/// before a critical section starts and unconditionally cleaning up on
+/// `Drop` regardless of how the scope exits (including panic-unwind), so
+/// the exit path doesn't need to be enumerated one by one.
+struct HamlibLoopReadyGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl Drop for HamlibLoopReadyGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod hamlib_loop_ready_guard_tests {
+    use super::*;
+
+    /// PAN-19 round-11 review (Codex P1) regression guard: after the loop
+    /// has reported ready, forcing it to exit must clear
+    /// `hamlib_command_loop_ready` back to `false` IMMEDIATELY -- not
+    /// waiting for any external supervisor tick (the up-to-5s
+    /// `check_task_handles` health-check cycle).
+    #[test]
+    fn drop_clears_the_flag_immediately() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        flag.store(true, Ordering::Release);
+        {
+            let _guard = HamlibLoopReadyGuard(flag.clone());
+            assert!(
+                flag.load(Ordering::Acquire),
+                "test setup: flag should be true while guarded"
+            );
+        }
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "the guard's Drop must clear the readiness flag the instant its scope ends -- not \
+             waiting for any external supervisor tick"
+        );
+    }
+
+    /// The whole point of using an RAII guard here (matching
+    /// `RemoteTxDisarmGuard`'s precedent) rather than an explicit
+    /// end-of-function call: it must ALSO clear the flag when the scope
+    /// exits via an unexpected panic, not just a normal return/bail --
+    /// an explicit call at the "end" of the function would never run in
+    /// that case.
+    #[test]
+    fn drop_clears_the_flag_even_on_panic_unwind() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        flag.store(true, Ordering::Release);
+        let flag_for_panic = flag.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = HamlibLoopReadyGuard(flag_for_panic);
+            panic!("simulated unexpected panic inside the Hamlib message loop");
+        }));
+        assert!(
+            result.is_err(),
+            "test setup: the closure should have panicked"
+        );
+
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "the guard's Drop must clear the readiness flag even when the scope exits via a \
+             panic, not just a normal return"
+        );
+    }
+}
+
 /// Whether a spawned Hamlib child task (poll loop or PTT watchdog)
 /// terminated unexpectedly and the outer message-loop task should treat
 /// that as a crash.
@@ -788,6 +870,39 @@ impl super::ApplicationCoordinator {
         let hamlib_pending_frequency_for_polling = self.hamlib_pending_frequency.clone();
         let hamlib_pending_split_for_polling = self.hamlib_pending_split.clone();
         let hamlib_tx_for_polling = hamlib_tx.clone();
+        // PAN-19 round-11 review (Codex P1): "do not deliver stale split
+        // state after newer commands". The pending-queue retry above
+        // doesn't know whether a NEWER SetFrequency/SetSplit has already
+        // gone through the normal send path since the pending item was
+        // captured -- naively redelivering it could apply a stale value
+        // AFTER a correct, newer one, reverting good state (e.g. TX
+        // frequency via split) to bad. Track the message `id` (a global,
+        // strictly monotonic counter -- see `generate_message_id` in
+        // message_bus.rs, already on every `ComponentMessage`) of the most
+        // recent SetFrequency/SetSplit command THIS message loop has
+        // actually seen, whether it arrived via the normal send path or a
+        // pending-queue redelivery -- see the message loop's own
+        // SetFrequency/SetSplit arms below for where this gets written,
+        // and the poll loop's retry call for where it gets checked before
+        // ever re-injecting a stale pending command. Fresh (`None`) each
+        // generation -- a pending item surviving a restart is still
+        // correctly compared against whatever the NEW generation applies,
+        // since the compared `id`s are globally monotonic, not
+        // per-generation.
+        let last_applied_frequency_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let last_applied_split_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let last_applied_frequency_id_for_polling = last_applied_frequency_id.clone();
+        let last_applied_split_id_for_polling = last_applied_split_id.clone();
+        // A third clone for `start_hamlib_component`'s OWN (first,
+        // outside-the-spawned-task) `deliver_pending_hamlib_state` call
+        // below -- the other two are moved into the spawned task (one for
+        // the message loop's own writes, one further into the poll loop's
+        // nested spawn for reads), so this function's own later use needs
+        // its own handle taken before that move happens.
+        let last_applied_frequency_id_for_start = last_applied_frequency_id.clone();
+        let last_applied_split_id_for_start = last_applied_split_id.clone();
 
         // Oneshot used to gate startup: the spawned task signals here once the
         // initial connect + get_frequency have completed (or failed).  We await
@@ -895,6 +1010,8 @@ impl super::ApplicationCoordinator {
                         deliver_pending_hamlib_state(
                             &hamlib_pending_frequency_for_polling,
                             &hamlib_pending_split_for_polling,
+                            &last_applied_frequency_id_for_polling,
+                            &last_applied_split_id_for_polling,
                             &hamlib_tx_for_polling,
                         );
 
@@ -1271,16 +1388,26 @@ impl super::ApplicationCoordinator {
                 //    `loop_ready_tx` being dropped without sending, i.e.
                 //    `LoopReadyOutcome::SenderDropped`, which already (round
                 //    -5) correctly bails and keeps TX inhibited.
-                if child_task_crashed(&shutdown, &spawned_handles) {
+                // PAN-19 round-11 review (Codex P1): `_hamlib_loop_ready_guard`
+                // lives for the rest of this async block (through the
+                // `while` loop below, until the block returns/bails/panics)
+                // -- when readiness WAS reported, its `Drop` clears
+                // `hamlib_command_loop_ready` back to `false` the instant
+                // this task ends, for any reason. `None` when readiness was
+                // withheld (child already dead, per round-8): the flag was
+                // never set true, so there's nothing to clear.
+                let _hamlib_loop_ready_guard = if child_task_crashed(&shutdown, &spawned_handles) {
                     // Already dead -- report nothing. `loop_ready_tx` drops
                     // without sending when this task ends (via the bail
                     // just below); `hamlib_command_loop_ready` stays at
                     // whatever `start_hamlib_component` reset it to
                     // (`false`) at the start of this call.
+                    None
                 } else {
                     hamlib_command_loop_ready.store(true, Ordering::Release);
                     let _ = loop_ready_tx.send(());
-                }
+                    Some(HamlibLoopReadyGuard(hamlib_command_loop_ready.clone()))
+                };
 
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
@@ -1295,6 +1422,19 @@ impl super::ApplicationCoordinator {
                                         vfo,
                                         frequency,
                                     } => {
+                                        // PAN-19 round-11 review (Codex
+                                        // P1): record this message's
+                                        // globally-monotonic `id` as the
+                                        // latest SetFrequency this loop
+                                        // has seen, so the pending-queue
+                                        // retry (poll loop) can tell a
+                                        // stale redelivery apart from one
+                                        // that's still current -- see
+                                        // `last_applied_frequency_id`'s
+                                        // declaration above.
+                                        if let Ok(mut last) = last_applied_frequency_id.lock() {
+                                            *last = Some(message.id);
+                                        }
                                         let vfo_enum = if *vfo == 0 {
                                             pancetta_hamlib::Vfo::A
                                         } else {
@@ -1351,6 +1491,14 @@ impl super::ApplicationCoordinator {
                                         enabled,
                                         tx_frequency,
                                     } => {
+                                        // PAN-19 round-11 review (Codex
+                                        // P1): same tracking as
+                                        // SetFrequency above, for
+                                        // SetSplit's own pending-queue
+                                        // supersession check.
+                                        if let Ok(mut last) = last_applied_split_id.lock() {
+                                            *last = Some(message.id);
+                                        }
                                         if *enabled {
                                             if let Err(e) =
                                                 rig_poll.set_split_freq(*tx_frequency).await
@@ -1550,6 +1698,8 @@ impl super::ApplicationCoordinator {
         deliver_pending_hamlib_state(
             &self.hamlib_pending_frequency,
             &self.hamlib_pending_split,
+            &last_applied_frequency_id_for_start,
+            &last_applied_split_id_for_start,
             &hamlib_tx,
         );
 
@@ -1596,49 +1746,96 @@ impl super::ApplicationCoordinator {
 /// somehow already under pressure right now -- log, put the message back
 /// in its slot (round-7's fix), and let it try again on the next call
 /// (round-10's fix) rather than retrying in a tight loop right here.
+///
+/// `last_applied_frequency_id`/`last_applied_split_id` are PAN-19 round-11
+/// review (Codex P1): "do not deliver stale split state after newer
+/// commands". Round-10's periodic retry didn't know whether a NEWER
+/// SetFrequency/SetSplit had already gone through the normal send path
+/// (applied by the message loop) since the pending item was captured --
+/// blindly redelivering it could apply a stale value AFTER a correct,
+/// newer one, reverting good state (e.g. TX frequency via split) to bad.
+/// Each pending message carries its own globally-monotonic `id` (see
+/// `generate_message_id` in message_bus.rs); if the message loop has
+/// already applied a SetFrequency/SetSplit with a NEWER id than the
+/// pending one, the pending item is provably stale -- drop it (don't put
+/// it back in its slot) instead of delivering it.
 fn deliver_pending_hamlib_state(
     pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    last_applied_frequency_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+    last_applied_split_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
     sender: &crossbeam_channel::Sender<ComponentMessage>,
 ) {
+    /// `true` when the message loop has already applied a command of this
+    /// kind newer than `message` -- i.e. `message` is stale and must not
+    /// be (re)delivered. Fails safe toward delivering (returns `false`,
+    /// i.e. "not known to be stale") on a poisoned tracker lock or if
+    /// nothing has been applied yet.
+    fn is_superseded(
+        message: &ComponentMessage,
+        last_applied_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+    ) -> bool {
+        last_applied_id
+            .lock()
+            .ok()
+            .and_then(|last| *last)
+            .is_some_and(|last_id| last_id > message.id)
+    }
+
     if let Ok(mut slot) = pending_frequency.lock() {
         if let Some(message) = slot.take() {
-            match sender.try_send(message) {
-                Ok(()) => {
-                    info!(
-                        target: "rig",
-                        "Hamlib restart: delivered pending SetFrequency command carried over \
-                         from a prior failed teardown replay"
-                    );
-                }
-                Err(crossbeam_channel::TrySendError::Full(returned))
-                | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
-                    warn!(
-                        "Hamlib restart: failed to deliver pending SetFrequency command -- \
-                         keeping it queued for the next attempt"
-                    );
-                    *slot = Some(returned);
+            if is_superseded(&message, last_applied_frequency_id) {
+                info!(
+                    target: "rig",
+                    "Hamlib restart: dropping a pending SetFrequency command superseded by a \
+                     newer command that already went through -- not reverting good state"
+                );
+            } else {
+                match sender.try_send(message) {
+                    Ok(()) => {
+                        info!(
+                            target: "rig",
+                            "Hamlib restart: delivered pending SetFrequency command carried \
+                             over from a prior failed teardown replay"
+                        );
+                    }
+                    Err(crossbeam_channel::TrySendError::Full(returned))
+                    | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
+                        warn!(
+                            "Hamlib restart: failed to deliver pending SetFrequency command -- \
+                             keeping it queued for the next attempt"
+                        );
+                        *slot = Some(returned);
+                    }
                 }
             }
         }
     }
     if let Ok(mut slot) = pending_split.lock() {
         if let Some(message) = slot.take() {
-            match sender.try_send(message) {
-                Ok(()) => {
-                    info!(
-                        target: "rig",
-                        "Hamlib restart: delivered pending SetSplit command carried over from \
-                         a prior failed teardown replay"
-                    );
-                }
-                Err(crossbeam_channel::TrySendError::Full(returned))
-                | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
-                    warn!(
-                        "Hamlib restart: failed to deliver pending SetSplit command -- keeping \
-                         it queued for the next attempt"
-                    );
-                    *slot = Some(returned);
+            if is_superseded(&message, last_applied_split_id) {
+                info!(
+                    target: "rig",
+                    "Hamlib restart: dropping a pending SetSplit command superseded by a \
+                     newer command that already went through -- not reverting good state"
+                );
+            } else {
+                match sender.try_send(message) {
+                    Ok(()) => {
+                        info!(
+                            target: "rig",
+                            "Hamlib restart: delivered pending SetSplit command carried over \
+                             from a prior failed teardown replay"
+                        );
+                    }
+                    Err(crossbeam_channel::TrySendError::Full(returned))
+                    | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
+                        warn!(
+                            "Hamlib restart: failed to deliver pending SetSplit command -- \
+                             keeping it queued for the next attempt"
+                        );
+                        *slot = Some(returned);
+                    }
                 }
             }
         }
@@ -2362,6 +2559,15 @@ mod teardown_replay_tests {
         )
     }
 
+    /// PAN-19 round-11 review (Codex P1): a fresh "nothing applied yet"
+    /// supersession tracker for `deliver_pending_hamlib_state` -- tests
+    /// that aren't specifically exercising the supersession check use
+    /// this so delivery behaves exactly as it did before that check
+    /// existed (never treats anything as stale).
+    fn no_supersession() -> std::sync::Arc<std::sync::Mutex<Option<u64>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(None))
+    }
+
     /// The exact mechanism: `try_send` on a full bounded channel returns
     /// `Err(Full)` immediately rather than blocking the calling thread.
     #[test]
@@ -2627,6 +2833,8 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &no_supersession(),
             &sender,
         );
 
@@ -2704,6 +2912,8 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &no_supersession(),
             &sender,
         );
 
@@ -2718,6 +2928,8 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &no_supersession(),
             &sender,
         );
 
@@ -2737,6 +2949,117 @@ mod teardown_replay_tests {
                 })
             ),
             "the delivered message must be the SAME SetSplit that failed to deliver earlier"
+        );
+    }
+
+    /// PAN-19 round-11 review (Codex P1) regression guard: "do not deliver
+    /// stale split state after newer commands". A pending `SetSplit` is
+    /// queued (simulating a prior generation's failed teardown replay),
+    /// then a NEWER `SetSplit` is sent through the normal path BEFORE the
+    /// pending retry fires -- mirrored here by recording the newer
+    /// message's globally-monotonic `id` as "last applied", exactly what
+    /// the real message loop's own `SetSplit` arm does when it actually
+    /// processes a normal command. The stale pending command must NEVER
+    /// be delivered afterward: it must be dropped, so the rig ends up in
+    /// the newer, correct state (not reverted to a stale TX frequency).
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_drops_a_stale_split_superseded_by_a_newer_one() {
+        let coordinator = test_coordinator().await;
+
+        // The STALE pending command, captured from a prior failed replay.
+        let stale_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000, // stale, wrong TX frequency
+            }),
+            Instant::now(),
+        );
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(stale_split);
+
+        // A NEWER SetSplit "sent through the normal path" -- constructed
+        // AFTER the stale one above, so its globally-monotonic `id` is
+        // larger (see `generate_message_id` in message_bus.rs). Recording
+        // its id as "last applied" mirrors exactly what the real message
+        // loop's SetSplit arm does when it actually processes a normal
+        // command.
+        let newer_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_074_000, // the CORRECT, current TX frequency
+            }),
+            Instant::now(),
+        );
+        let last_applied_split_id = Arc::new(std::sync::Mutex::new(Some(newer_split.id)));
+
+        let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &last_applied_split_id,
+            &sender,
+        );
+
+        assert!(
+            coordinator.hamlib_pending_split.lock().unwrap().is_none(),
+            "the stale pending SetSplit must be dropped (cleared), not left queued to retry \
+             again"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "the stale pending SetSplit must never be delivered onto the channel once a newer \
+             command has already gone through -- delivering it would revert the rig's split \
+             state to the old, wrong TX frequency"
+        );
+    }
+
+    /// The flip side: a pending command that is NOT superseded (nothing
+    /// newer has been applied) must still deliver normally -- the
+    /// supersession check must not become overly conservative and start
+    /// dropping legitimate, still-current pending commands.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_still_delivers_when_not_superseded() {
+        let coordinator = test_coordinator().await;
+
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        let pending_id = split_msg.id;
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(split_msg);
+
+        // "Last applied" reflects an OLDER id than the pending command
+        // itself -- i.e. nothing newer has superseded it.
+        let last_applied_split_id =
+            Arc::new(std::sync::Mutex::new(Some(pending_id.saturating_sub(1))));
+
+        let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &last_applied_split_id,
+            &sender,
+        );
+
+        assert!(
+            coordinator.hamlib_pending_split.lock().unwrap().is_none(),
+            "a non-superseded pending command must still be delivered (slot drained)"
+        );
+        assert!(
+            receiver.try_recv().is_ok(),
+            "a non-superseded pending command must land on the channel"
         );
     }
 
@@ -2775,6 +3098,8 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &no_supersession(),
             &new_sender,
         );
 
@@ -2832,6 +3157,8 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &no_supersession(),
             &sender,
         );
         assert!(
@@ -2849,6 +3176,8 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &no_supersession(),
             &sender,
         );
 
