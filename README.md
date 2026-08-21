@@ -73,14 +73,16 @@ recorded on a development host with `pancetta --replay`, feeding archived
 off-air WAV captures through the real pipeline (see [`.tapes/`](.tapes/)).
 Real audio, real decodes, real panels — no mockups. The corpus is one short
 recording, so treat these as a tour of the interface, not a performance
-claim.
+claim: the QSO panel in particular is shown idle (`STANDBY`, "No QSOs yet"),
+because a completed QSO needs a multi-slot two-way handshake that a receive-
+only replay of someone else's traffic can't produce.
 
 | | |
 |---|---|
 | ![Operate overview](assets/screenshot-operate.png) | ![DX Hunter priority panel](assets/screenshot-priority.png) |
 | Operate overview: TX placement, band activity, QSO status, callers. | DX Hunter: the priority-scoring table (entity, grid, SNR, rarity, score). |
 | ![QSO status panel](assets/screenshot-qso.png) | ![Monitor / waterfall view](assets/screenshot-waterfall.png) |
-| QSO status: state machine, exchanges, TX/RX reports. | Monitor: the waterfall and the TX-frequency marker. |
+| QSO status (idle in this replay): state machine, exchanges, TX/RX reports. | Monitor: the waterfall and the TX-frequency marker. |
 
 Decode effort is a live control — press `e` to cycle presets and the status
 chip follows:

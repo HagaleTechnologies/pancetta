@@ -9,7 +9,7 @@ sources:
   - pancetta/src/coordinator/audio.rs
   - pancetta/src/coordinator/replay.rs
 verified:
-  commit: docs/readme-visual-identity
+  commit: ecf27f1
   date: 2026-08-21
 links:
   - modes

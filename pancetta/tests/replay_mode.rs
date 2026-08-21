@@ -48,8 +48,9 @@ fn replay_mode_runs_full_pipeline_and_exits_cleanly() {
 /// rejects the pair at parse time.
 #[test]
 fn replay_mode_conflicts_with_no_audio() {
+    // No WAV content needed: `conflicts_with` is enforced by clap at parse
+    // time, so the directory is never opened -- it only has to be a path.
     let dir = tempfile::tempdir().unwrap();
-    write_short_wav(&dir.path().join("a_first.wav"), 12000, 1.0);
 
     let mut cmd = Command::cargo_bin("pancetta").unwrap();
     cmd.args(["--headless", "--no-audio", "--replay"])
