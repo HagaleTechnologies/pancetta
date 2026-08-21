@@ -1,5 +1,9 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+use tokio::time::interval;
+use tracing::{info, warn};
 
 use super::util::resample_linear;
 use super::wav_playback::read_wav_mono;
@@ -51,6 +55,94 @@ pub(crate) fn load_replay_samples(dir: &Path, target_rate: u32) -> Result<Vec<f3
     }
 
     Ok(all_samples)
+}
+
+/// Grace period after the last replay chunk is fed before triggering
+/// shutdown -- long enough for in-flight FT8 decode windows to finish,
+/// short enough to keep `--replay` usable in CI and for VHS recordings.
+const REPLAY_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+impl super::ApplicationCoordinator {
+    /// Feed every `.wav` file in `replay_dir` (in filename order) into the
+    /// pipeline as if it were live audio: resampled to the configured audio
+    /// sample rate, chunked to the configured buffer size, and paced in
+    /// real time via the same `audio_to_dsp_tx` channel a real `cpal::Device`
+    /// or `PANCETTA_STUB_AUDIO` would use. Once the directory is exhausted,
+    /// waits [`REPLAY_GRACE_PERIOD`] then triggers the same graceful
+    /// shutdown Ctrl+C uses, so `--replay` is a finite, self-terminating
+    /// mode suitable for scripted demos and automated tests.
+    pub(crate) async fn start_replay_pipeline(
+        &mut self,
+        replay_dir: PathBuf,
+        audio_to_dsp_tx: crossbeam_channel::Sender<Vec<f32>>,
+    ) -> Result<()> {
+        self.audio_path_supervised = false;
+
+        let config = self.config.read().await;
+        let sample_rate = config.audio.sample_rate;
+        let buffer_size = config.audio.buffer_size as usize;
+        drop(config);
+
+        info!(
+            "Starting audio component in REPLAY mode: {}",
+            replay_dir.display()
+        );
+        let samples = load_replay_samples(&replay_dir, sample_rate)?;
+        info!(
+            "Replay: loaded {} samples ({:.1}s) at {} Hz",
+            samples.len(),
+            samples.len() as f64 / sample_rate as f64,
+            sample_rate
+        );
+
+        let shutdown = self.shutdown_signal.clone();
+        let last_timestamp = self.last_audio_timestamp.clone();
+
+        let handle = tokio::spawn(async move {
+            let buffer_duration_ms = (buffer_size as f64 * 1000.0 / sample_rate as f64) as u64;
+            let mut process_interval = interval(Duration::from_millis(buffer_duration_ms.max(5)));
+
+            let mut offset = 0usize;
+            while offset < samples.len() && !shutdown.load(Ordering::Acquire) {
+                process_interval.tick().await;
+
+                let end = (offset + buffer_size).min(samples.len());
+                let chunk = samples[offset..end].to_vec();
+                offset = end;
+
+                last_timestamp.store(super::now_epoch_ms(), Ordering::Relaxed);
+
+                match super::pipeline::forward_or_drop_async(
+                    &audio_to_dsp_tx,
+                    chunk,
+                    super::pipeline::DECODE_FORWARD_TIMEOUT,
+                )
+                .await
+                {
+                    super::pipeline::ForwardOutcome::Sent => {}
+                    super::pipeline::ForwardOutcome::Dropped => {
+                        warn!("Replay: DSP stage not draining -- dropped one batch");
+                    }
+                    super::pipeline::ForwardOutcome::Disconnected => break,
+                }
+            }
+
+            info!(
+                "Replay complete -- waiting {:?} before shutdown",
+                REPLAY_GRACE_PERIOD
+            );
+            tokio::time::sleep(REPLAY_GRACE_PERIOD).await;
+            shutdown.store(true, Ordering::Release);
+            info!("Replay: triggered shutdown");
+
+            Ok(())
+        });
+
+        self.named_task_handles
+            .push((crate::message_bus::ComponentId::Audio, handle));
+
+        Ok(())
+    }
 }
 
 #[cfg(test)]
