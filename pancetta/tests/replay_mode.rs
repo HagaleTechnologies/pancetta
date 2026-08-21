@@ -63,6 +63,29 @@ fn replay_mode_conflicts_with_no_audio() {
         .stderr(predicates::str::contains("--no-audio"));
 }
 
+/// `--test-tx` unconditionally sets the shutdown signal 35s after injecting
+/// its frame, truncating any replay corpus longer than that (including the
+/// bundled 75s demo corpus) before its final decodes -- and it can't
+/// validate real TX either, since `--replay` deliberately skips Hamlib
+/// startup. clap now rejects the pair at parse time.
+#[test]
+fn replay_mode_conflicts_with_test_tx() {
+    // No WAV content needed: `conflicts_with_all` is enforced by clap at
+    // parse time, so the directory is never opened -- it only has to be a
+    // path.
+    let dir = tempfile::tempdir().unwrap();
+
+    let mut cmd = Command::cargo_bin("pancetta").unwrap();
+    cmd.args(["--headless", "--test-tx", "N0CALL N0CALL 73", "--replay"])
+        .arg(dir.path())
+        .timeout(Duration::from_secs(15));
+
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"))
+        .stderr(predicates::str::contains("--test-tx"));
+}
+
 #[test]
 fn replay_mode_rejects_empty_directory() {
     let dir = tempfile::tempdir().unwrap();

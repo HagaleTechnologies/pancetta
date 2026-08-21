@@ -111,15 +111,27 @@ struct Cli {
     /// own a few seconds after the last file is exhausted. Unlike --wav,
     /// this runs the complete pipeline (TUI, QSO engine, priority scoring),
     /// not just the decoder -- intended for demos and scripted recordings.
-    /// Cannot be combined with --no-audio.
+    /// Cannot be combined with --no-audio or --test-tx.
     //
-    // The `conflicts_with` is load-bearing, not cosmetic: the `no_audio` early
-    // return in `coordinator::audio::start_audio_pipeline` precedes the replay
-    // branch, so the combination silently swallowed `--replay` -- no feeder was
-    // spawned, nothing ever set the shutdown signal, and the process hung
-    // forever instead of self-terminating as `--replay` promises. Rejecting the
-    // pair at parse time turns that hang into a clear error.
-    #[arg(long, global = true, conflicts_with = "no_audio")]
+    // The `conflicts_with_all` is load-bearing, not cosmetic:
+    //
+    // - `no_audio`: the early return in
+    //   `coordinator::audio::start_audio_pipeline` precedes the replay
+    //   branch, so the combination silently swallowed `--replay` -- no
+    //   feeder was spawned, nothing ever set the shutdown signal, and the
+    //   process hung forever instead of self-terminating as `--replay`
+    //   promises.
+    // - `test_tx`: the test-TX task unconditionally sets the shutdown signal
+    //   35s after injecting its frame, which truncates any replay corpus
+    //   longer than that (including the bundled 75s demo corpus) before its
+    //   final decodes, while the test itself can't validate real TX because
+    //   replay deliberately skips Hamlib startup (see
+    //   `ApplicationCoordinator::run`) -- so the combination is dead weight
+    //   at best and misleading at worst.
+    //
+    // Rejecting these pairs at parse time turns that hang / truncation into a
+    // clear error.
+    #[arg(long, global = true, conflicts_with_all = ["no_audio", "test_tx"])]
     replay: Option<PathBuf>,
 
     /// Enable metrics collection
