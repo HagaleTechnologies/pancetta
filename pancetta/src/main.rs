@@ -396,7 +396,7 @@ async fn run_application(cli: Cli) -> Result<()> {
     let result = coordinator.run().await;
 
     // Handle shutdown
-    match result {
+    match &result {
         Ok(_) => {
             info!("Application completed successfully");
         }
@@ -412,7 +412,10 @@ async fn run_application(cli: Cli) -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     info!("Pancetta shutdown complete");
 
-    Ok(())
+    // Propagate the coordinator's outcome so a genuine application error
+    // (e.g. `--replay` pointed at an empty/invalid directory) surfaces as a
+    // non-zero exit code instead of being logged and silently discarded.
+    result
 }
 
 async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
