@@ -1899,6 +1899,20 @@ impl AutonomousOperator {
                             self.state = OperatingState::CallingCq;
                             self.idle_cycles = 0;
 
+                            // Codex review (PR #276, round 5): invalidate a
+                            // stale Auto-mode sticky offset BEFORE snapshotting
+                            // — not only afterward, in the Hold-mode branch
+                            // below. Doing it only afterward meant a
+                            // suppressed Hold-mode CQ's restore would bring
+                            // back the pre-Hold value (same class of bug as
+                            // the round-4 band-hop fix, for this invalidation
+                            // instead of Step 0's). `should_switch` below
+                            // always implies Auto mode, so this covers every
+                            // path that can reach the Hold branch.
+                            if !self.tx_freq_auto() {
+                                self.current_cq_offset_hz = None;
+                            }
+
                             // Codex review (PR #276, round 4): captured HERE,
                             // not by the coordinator before calling decide()
                             // — this is after Step 0's band-hop/mode-driven
@@ -1973,14 +1987,12 @@ impl AutonomousOperator {
                                     None => self.allocate_smart_frequency(None, None, None),
                                 }
                             } else {
-                                // Codex review (PR #276, round 2): invalidate
-                                // any sticky Auto-mode offset while in Hold —
-                                // otherwise an Auto -> Hold -> Auto round trip
-                                // would resume on a potentially stale
-                                // pre-Hold value instead of re-ranking fresh
-                                // (band conditions, or the operator's own
-                                // manual retune, may have changed meanwhile).
-                                self.current_cq_offset_hz = None;
+                                // Codex review (PR #276, round 2): Hold mode
+                                // never uses a sticky offset — the invalidation
+                                // (so a later Auto -> Hold -> Auto round trip
+                                // re-ranks fresh instead of resuming a stale
+                                // pre-Hold value) now happens above, BEFORE
+                                // the snapshot is taken (round 5), not here.
                                 self.allocate_smart_frequency(None, None, None)
                             };
 
@@ -3026,6 +3038,50 @@ mod tests {
             Some(stale_pre_hop_offset),
             "restoring a suppressed same-cycle-band-hop CQ must NOT bring back \
              the stale pre-hop offset"
+        );
+    }
+
+    #[test]
+    fn restore_cq_state_does_not_undo_the_hold_mode_invalidation() {
+        // Codex review (PR #276, round 5): the same class of bug as the
+        // band-hop case above, but for the Hold-mode invalidation — that
+        // clear must ALSO happen before the snapshot is taken, or restoring
+        // a suppressed Hold-mode CQ brings back a stale pre-Hold Auto-mode
+        // offset.
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        ));
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 1;
+        config.listen_cycle.initial_interval = 1000;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(mode.clone());
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        let stale_auto_offset = 1500.0;
+        op.current_cq_offset_hz = Some(stale_auto_offset);
+
+        // Switch to Hold before this cycle's self-CQ.
+        mode.store(
+            pancetta_core::TxFreqMode::Hold.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // Hold-mode CQ: current_cq_offset_hz invalidated
+                               // (before the snapshot) and left at None.
+        op.restore_cq_state(); // simulate the coordinator finding it suppressed
+
+        assert_ne!(
+            op.current_cq_offset_hz,
+            Some(stale_auto_offset),
+            "restoring a suppressed Hold-mode CQ must NOT bring back the stale \
+             pre-Hold Auto-mode offset"
         );
     }
 
