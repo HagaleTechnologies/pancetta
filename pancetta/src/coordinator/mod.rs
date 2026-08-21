@@ -30,6 +30,7 @@ mod psk_reporter;
 mod qso;
 mod qso_filter;
 mod remote_gateway;
+mod replay;
 mod restart_budget;
 mod shutdown;
 pub mod station_agent;
@@ -808,6 +809,12 @@ pub struct ApplicationCoordinator {
     /// WAV file playback path (if set, runs in playback mode)
     wav_path: Option<PathBuf>,
 
+    /// Directory of sequential WAV captures to replay through the full
+    /// pipeline at real-time cadence (see `--replay` in `main.rs`). Checked
+    /// by `start_audio_pipeline` (`audio.rs`) ahead of the stub/real-device
+    /// branches.
+    pub(crate) replay_path: Option<PathBuf>,
+
     /// One-shot test transmission. If Some, after startup the coordinator
     /// injects a single TransmitRequest with this message text and shuts
     /// down on TransmitComplete. Used for hardware bench validation.
@@ -977,8 +984,11 @@ pub struct ApplicationCoordinator {
     /// `true` when the shared [`remote_gateway::DisplayFeed`] bus pump is
     /// wanted by SOMEONE — the read-only `remote_gateway` component
     /// (`[network.remote_gateway].enabled`) OR the station-agent read stream
-    /// (`station_agent::station_agent_active`). Cached from config at
-    /// construction and re-asserted by `start_display_feed` so the
+    /// (`station_agent::station_agent_active`) — and, under `--replay`
+    /// ([`ApplicationCoordinator::replay_mode`]), by NOBODY: the replay gate
+    /// ANDs over that whole disjunction, here and in `start_display_feed`.
+    /// Cached from config at construction and re-asserted by
+    /// `start_display_feed` so the
     /// display-event emit sites (decode fan-out, QSO snapshot, freq, s-meter,
     /// TX status, split) can cheaply gate their **additive** dual-destination
     /// send to `ComponentId::RemoteGateway` — when nobody needs the feed, the
@@ -1408,6 +1418,7 @@ impl ApplicationCoordinator {
         enable_metrics: bool,
         metrics_port: u16,
         wav_path: Option<PathBuf>,
+        replay_path: Option<PathBuf>,
         test_tx: Option<String>,
         test_tx_offset: f64,
         shutdown_signal: Arc<AtomicBool>,
@@ -1431,12 +1442,17 @@ impl ApplicationCoordinator {
         // feed. Computed with the SAME `station_agent::station_agent_active`
         // predicate `start_display_feed` uses, so this early snapshot (read by
         // components started before `start_display_feed` runs, e.g. hamlib/qso)
-        // already agrees with the value `start_display_feed` re-asserts later.
-        let display_feed_enabled_init = config.network.remote_gateway.enabled
-            || station_agent::station_agent_active(
-                &config.network.station_agent,
-                &config.network.cqdx,
-            );
+        // already agrees with the value `start_display_feed` re-asserts later —
+        // including the `--replay` gate, which `start_display_feed` ANDs over
+        // the WHOLE disjunction (no consumer may start the pump under replay),
+        // so this early snapshot never briefly claims a feed a replay run will
+        // never have.
+        let display_feed_enabled_init = replay_path.is_none()
+            && (config.network.remote_gateway.enabled
+                || station_agent::station_agent_active(
+                    &config.network.station_agent,
+                    &config.network.cqdx,
+                ));
         // Snapshot the wsjtx_udp enabled flag before `config` is moved into
         // the Arc<RwLock> — mirrors `display_feed_enabled_init` above.
         let wsjtx_enabled_init = config.network.wsjtx_udp.enabled;
@@ -1636,6 +1652,7 @@ impl ApplicationCoordinator {
             enable_metrics,
             metrics_port,
             wav_path,
+            replay_path,
             test_tx,
             test_tx_offset,
             cached_lookup: std::sync::Arc::new(
@@ -1760,9 +1777,47 @@ impl ApplicationCoordinator {
         // Start all components in dependency order using point-to-point channels
         self.start_pipeline().await?;
 
-        // Start auxiliary components
+        // Start auxiliary components.
+        //
+        // No rig means `operating_frequency_hz` never gets the rig-read that
+        // normally seeds it (hamlib.rs, get_frequency on connect). Left at 0 it
+        // corrupts every downstream consumer: remote snapshots would report
+        // BAND 0MHZ (remote_gateway/mod.rs), QSO metadata would stamp near-zero
+        // RF frequency (qso.rs set_dial_frequency_source), and the DB-seed band
+        // lookup would pass 0 Hz into `frequency_to_band` before falling back
+        // to the "20m" string literal (qso.rs, ~line 2124) — leaving the atomic
+        // and that string disagreeing. Seed it to the same 20 m default the TUI
+        // itself falls back to when hamlib hasn't reported yet (tui_relay.rs
+        // `operating_freq_mhz` fallback of 14.074 MHz), so every consumer of
+        // the shared atomic agrees on a real band from the first slot.
+        //
+        // Deliberately outside the `pancetta-hamlib` cfg below: this is a pure
+        // in-memory atomic store with nothing hamlib-specific about it, and a
+        // build with the feature compiled out starts no rig at all — exactly
+        // the case that needs the seed most. Gating it on the feature left
+        // `--replay` back at 0 Hz in those builds.
+        if self.replay_mode() {
+            const REPLAY_DEFAULT_DIAL_HZ: u64 = 14_074_000;
+            self.operating_frequency_hz
+                .store(REPLAY_DEFAULT_DIAL_HZ, Ordering::Relaxed);
+        }
+
+        // `--replay` deliberately does NOT start Hamlib. The audio the
+        // pipeline is decoding is a recording, not live off-air signal, but
+        // every stage downstream of the decoder (QSO engine, autonomous
+        // operator, TX worker) treats it as live: an operator who runs a demo
+        // against an already-configured rig (`[rig.interface] enabled = true`)
+        // would otherwise have the real transmitter keyed in response to
+        // historical traffic. Skipping Hamlib startup removes the PTT
+        // capability outright rather than relying on a downstream gate. This
+        // is the same shape as a build with the `pancetta-hamlib` feature
+        // compiled out (below), which the TX path already tolerates.
         #[cfg(feature = "pancetta-hamlib")]
-        self.start_hamlib_component().await?;
+        if self.replay_mode() {
+            info!("Replay mode: skipping Hamlib startup, no real transmitter control");
+        } else {
+            self.start_hamlib_component().await?;
+        }
         #[cfg(not(feature = "pancetta-hamlib"))]
         warn!("Hamlib feature is disabled -- PTT safety watchdog is not active. Transmit at your own risk.");
         self.start_qso_component().await?;
@@ -1963,6 +2018,8 @@ impl ApplicationCoordinator {
 
         self.start_autonomous_component().await?;
         self.start_dx_cluster_component().await?;
+        // Under `--replay` this starts the component in its uploads-disabled
+        // (noop drain) form -- see `start_pskreporter_component`.
         self.start_pskreporter_component().await?;
         self.start_display_feed().await?;
         self.start_remote_gateway_component().await?;
@@ -2010,6 +2067,62 @@ impl ApplicationCoordinator {
         }
 
         Ok(())
+    }
+
+    /// `true` when this process was started with `--replay` (see
+    /// `replay_path`): the audio being decoded is a historical off-air
+    /// recording, not live signal.
+    ///
+    /// **This is the single predicate every "does this run touch the outside
+    /// world — or the operator's real log?" gate must consult.** Everything
+    /// downstream of the decoder treats replayed decodes as live traffic and
+    /// re-stamps them with the current wall clock, so any component that keys
+    /// a transmitter, publishes reception data off-box, or persists a contact
+    /// has to short-circuit here or it will emit fabricated live data. Current
+    /// consumers:
+    ///
+    /// - Hamlib startup (`run`) — skipped outright, so no PTT capability.
+    /// - PSKReporter (`psk_reporter.rs`) — forced onto its uploads-disabled
+    ///   (noop-drain) path.
+    /// - cqdx.io spot reporting (`autonomous.rs`) — `report_spots` suppressed.
+    /// - WSJT-X UDP companion protocol (`wsjtx_udp/mod.rs`) — forced onto its
+    ///   drain-only path, so no Decode/Status datagrams reach GridTracker,
+    ///   JTAlert, or any other logging companion on the LAN.
+    /// - Per-QSO logbook uploads (`qso.rs`) — ClubLog/QRZ/LoTW/eQSL/cqdx.io
+    ///   subscriber never spawned, so a QSO "completed" off replayed traffic
+    ///   can't be filed as a real contact.
+    /// - Local ADIF source of truth (`qso.rs`, `start_local_qso_log_writers`)
+    ///   — the `~/.pancetta/qsos.adi` appender is not opened and its
+    ///   `QsoCompleted` subscriber is not spawned. This one is not an outbound
+    ///   integration, but the ADIF file is what every outbound integration is
+    ///   eventually fed from (manual upload, TQSL, another logger's import),
+    ///   and ADIF has no standard "not a real contact" field to tag a replayed
+    ///   record with — only `APP_<PROGRAMID>_*`, which no other tool honours.
+    ///   So it is dropped, not tagged.
+    /// - Local SQLite QSO index (`qso.rs`, `start_local_qso_log_writers`) —
+    ///   the `~/.pancetta/qso.db` logger is not constructed, so a replayed
+    ///   contact never lands in the index either (nor in the duplicate/worked
+    ///   history rebuilt from it on the next run). The startup
+    ///   duplicate-history seed further down still *reads* the ADIF/index (and
+    ///   rebuilds the index from the ADIF when it is stale) — that is a read
+    ///   of pre-existing contacts, and never a write of a replayed one.
+    /// - Remote-view gateway (`remote_gateway/mod.rs`) — `start_display_feed`
+    ///   ANDs this gate over its WHOLE `wants_feed` disjunction, so neither
+    ///   consumer (localhost gateway, station agent) can start the pump, and
+    ///   `start_remote_gateway_component` refuses to bind its WebSocket
+    ///   listener, so no connected client (loopback or otherwise) is ever
+    ///   streamed replayed decodes.
+    /// - Station agent (`station_agent/mod.rs`) — `start_station_agent_component`
+    ///   takes its disabled/unpaired drain-only path before loading keys or
+    ///   dialing the relay, so replayed decodes are never broadcast to relay
+    ///   peers AND no remote peer can send control frames (QSY/QSO actions)
+    ///   into a demo process.
+    ///
+    /// Add new outbound integrations — and any new persistence of a
+    /// "completed" contact — to that list rather than inventing a second
+    /// replay check.
+    pub(crate) fn replay_mode(&self) -> bool {
+        self.replay_path.is_some()
     }
 
     /// Shared split-TX dial atomic (0 = simplex). Written by the TUI SetSplit
@@ -2434,6 +2547,7 @@ mod tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,
@@ -2484,6 +2598,319 @@ mod tests {
         let a = coordinator.audit_log();
         let b = coordinator.audit_log();
         assert_eq!(a.path(), b.path());
+    }
+
+    // ------------------------------------------------------------------
+    // Replay predicate — the single gate every outbound integration
+    // (Hamlib/PTT, PSKReporter, cqdx.io spots, WSJT-X UDP, per-QSO
+    // logbook uploads) consults.
+    // ------------------------------------------------------------------
+
+    async fn build_coordinator_with_replay(replay: Option<PathBuf>) -> ApplicationCoordinator {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        ApplicationCoordinator::new(
+            Config::default(),
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            replay,
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// Same as [`build_coordinator_with_replay`] but with a caller-supplied
+    /// config, for the gates that only differ once a component is configured
+    /// ON (remote gateway / station agent).
+    async fn build_coordinator_with_config_and_replay(
+        config: Config,
+        replay: Option<PathBuf>,
+    ) -> ApplicationCoordinator {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            replay,
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// A station-agent config that `station_agent::station_agent_active`
+    /// reports as ACTIVE: enabled, both relay URLs present, and a non-empty
+    /// station-local TX allow-list. `station_agent_active` is deliberately
+    /// filesystem-free (see its doc), so this is the whole "would want the
+    /// display feed" precondition — no real pairing or network needed.
+    fn config_with_active_station_agent(key_dir: &std::path::Path) -> Config {
+        let mut config = Config::default();
+        {
+            let sa = &mut config.network.station_agent;
+            sa.enabled = true;
+            sa.relay_url = Some("wss://relay.invalid/agent".to_string());
+            sa.pairing_api_url = Some("https://relay.invalid/api/v1".to_string());
+            sa.key_dir = Some(key_dir.to_string_lossy().to_string());
+            sa.tx_allow_list = vec!["test-client-key-id".to_string()];
+        }
+        assert!(
+            station_agent::station_agent_active(
+                &config.network.station_agent,
+                &config.network.cqdx
+            ),
+            "precondition: this config must make the station agent ACTIVE, \
+             otherwise the replay assertions below prove nothing"
+        );
+        config
+    }
+
+    #[tokio::test]
+    async fn replay_mode_tracks_the_replay_path() {
+        let live = build_coordinator_with_replay(None).await;
+        assert!(
+            !live.replay_mode(),
+            "a normal run must not look like a replay to the outbound gates"
+        );
+        let replaying =
+            build_coordinator_with_replay(Some(PathBuf::from("/some/capture/dir"))).await;
+        assert!(
+            replaying.replay_mode(),
+            "--replay must be visible to every outbound gate"
+        );
+    }
+
+    /// Round-4 regression: `[network.remote_gateway].enabled = true` under
+    /// `--replay` must never bind a listener or feed one, even though
+    /// neither `start_display_feed` nor `start_remote_gateway_component`
+    /// consult `replay_mode` through the same `config.network.remote_gateway
+    /// .enabled` flag every other outbound integration in this list checks.
+    /// `bind_addr` is pinned to an ephemeral loopback port so a live run
+    /// would succeed here too — the assertion is entirely on replay-mode
+    /// behavior, not on some other reason the bind failed.
+    #[tokio::test]
+    async fn replay_mode_suppresses_remote_gateway_even_when_configured_enabled() {
+        let mut config = Config::default();
+        config.network.remote_gateway.enabled = true;
+        config.network.remote_gateway.bind_addr = "127.0.0.1:0".to_string();
+
+        let mut replaying = build_coordinator_with_config_and_replay(
+            config,
+            Some(PathBuf::from("/some/capture/dir")), // --replay
+        )
+        .await;
+        assert!(replaying.replay_mode());
+
+        replaying
+            .start_display_feed()
+            .await
+            .expect("start_display_feed should not error under replay");
+        assert!(
+            replaying.display_feed.is_none(),
+            "a configured-enabled localhost gateway must not get a display feed under \
+             --replay, even with an inert station agent"
+        );
+        // `start_display_feed`'s drain-path already registered one
+        // `RemoteGateway` task (the bus drain) -- capture that count before
+        // calling `start_remote_gateway_component` so the next assertion
+        // proves the axum server specifically was never spawned, rather
+        // than asserting zero tasks overall.
+        let remote_gateway_tasks_before = replaying
+            .named_task_handles
+            .iter()
+            .filter(|(id, _)| *id == ComponentId::RemoteGateway)
+            .count();
+
+        replaying
+            .start_remote_gateway_component()
+            .await
+            .expect("start_remote_gateway_component should not error under replay");
+        let remote_gateway_tasks_after = replaying
+            .named_task_handles
+            .iter()
+            .filter(|(id, _)| *id == ComponentId::RemoteGateway)
+            .count();
+        assert_eq!(
+            remote_gateway_tasks_before, remote_gateway_tasks_after,
+            "start_remote_gateway_component must not spawn a listener task under \
+             --replay, even with [network.remote_gateway].enabled = true"
+        );
+    }
+
+    /// Round-5 regression: the replay gate must AND over the WHOLE
+    /// `wants_feed` disjunction, not just the localhost-gateway operand.
+    ///
+    /// The previous shape (`(gateway_enabled && !replay) || station_agent_active`)
+    /// left the pump running whenever the station agent was active, and
+    /// `start_station_agent_component` then subscribed to it and broadcast
+    /// every replayed decode/spectrum/QSO event to its relay peers.
+    ///
+    /// The LIVE half of this test is what makes it non-vacuous: with the exact
+    /// same config and no `--replay`, the feed DOES start — so the replay half
+    /// is proving the gate, not proving the config was inert anyway (the flaw
+    /// in the round-4 test's station-agent assertion, which used
+    /// `Config::default()`).
+    #[tokio::test]
+    async fn replay_mode_suppresses_display_feed_when_station_agent_is_active() {
+        let key_dir = tempfile::tempdir().expect("tempdir");
+        let config = config_with_active_station_agent(key_dir.path());
+
+        // Control: no --replay, remote gateway DISABLED — the station agent is
+        // the only thing that could want the feed, and it does.
+        let mut live = build_coordinator_with_config_and_replay(config.clone(), None).await;
+        assert!(!live.config.read().await.network.remote_gateway.enabled);
+        live.start_display_feed()
+            .await
+            .expect("start_display_feed should not error");
+        assert!(
+            live.display_feed.is_some(),
+            "precondition: an active station agent must start the display feed \
+             on a live run — otherwise the replay assertion below is vacuous"
+        );
+        assert!(live.display_feed_enabled.load(Ordering::Relaxed));
+
+        // Under --replay the same config must take the drain path.
+        let mut replaying = build_coordinator_with_config_and_replay(
+            config,
+            Some(PathBuf::from("/some/capture/dir")),
+        )
+        .await;
+        assert!(replaying.replay_mode());
+        replaying
+            .start_display_feed()
+            .await
+            .expect("start_display_feed should not error under replay");
+        assert!(
+            replaying.display_feed.is_none(),
+            "an ACTIVE station agent must not start the display feed under \
+             --replay: the pump's events are broadcast off-box to relay peers"
+        );
+        assert!(
+            !replaying.display_feed_enabled.load(Ordering::Relaxed),
+            "display_feed_enabled must match the computed gate so the additive \
+             emit sites reflect reality"
+        );
+    }
+
+    /// Round-5 regression: `start_station_agent_component` must take its
+    /// inert drain-only path under `--replay`, closing the OUTBOUND relay
+    /// broadcast AND the INBOUND control-frame surface (`dispatch_action` →
+    /// rig/QSO messages) in one move.
+    ///
+    /// Observable proof, without any pairing or network: the live path reaches
+    /// `AgentIdentity::load_or_generate`, which PERSISTS freshly generated keys
+    /// into `key_dir` (it then goes inert at the unpaired check). The replay
+    /// path returns before that, so `key_dir` stays empty — i.e. the component
+    /// bailed out before touching key material, let alone dialing the relay.
+    #[tokio::test]
+    async fn replay_mode_forces_station_agent_onto_its_inert_path() {
+        fn key_files(dir: &std::path::Path) -> usize {
+            std::fs::read_dir(dir).map(|d| d.count()).unwrap_or(0)
+        }
+
+        // Control: live run with the same config gets as far as key material.
+        let live_keys = tempfile::tempdir().expect("tempdir");
+        let mut live = build_coordinator_with_config_and_replay(
+            config_with_active_station_agent(live_keys.path()),
+            None,
+        )
+        .await;
+        live.start_station_agent_component()
+            .await
+            .expect("start_station_agent_component should not error");
+        assert!(
+            key_files(live_keys.path()) > 0,
+            "precondition: a live run must reach identity load/generate (which \
+             persists keys) — otherwise the replay assertion below is vacuous"
+        );
+
+        // Replay: bail out before key material, before the relay connection.
+        let replay_keys = tempfile::tempdir().expect("tempdir");
+        let mut replaying = build_coordinator_with_config_and_replay(
+            config_with_active_station_agent(replay_keys.path()),
+            Some(PathBuf::from("/some/capture/dir")),
+        )
+        .await;
+        assert!(replaying.replay_mode());
+        replaying
+            .start_station_agent_component()
+            .await
+            .expect("start_station_agent_component should not error under replay");
+        assert_eq!(
+            key_files(replay_keys.path()),
+            0,
+            "under --replay the station agent must return before loading agent \
+             identity keys — no relay session, so no outbound broadcast of \
+             replayed decodes and no inbound control frames"
+        );
+        assert!(
+            replaying.station_agent_poll.is_none(),
+            "the cqdx authorizations poll task must not be spawned under --replay"
+        );
+        assert_eq!(
+            replaying
+                .named_task_handles
+                .iter()
+                .filter(|(id, _)| *id == ComponentId::StationAgent)
+                .count(),
+            1,
+            "exactly one StationAgent task (the no-op bus drain) must be \
+             registered — the same shape as the disabled path"
+        );
+    }
+
+    /// Round-8 regression: shutdown's DIRECT rigctld PTT-off (`shutdown.rs`)
+    /// opens its own TCP connection to the configured rigctld endpoint,
+    /// independent of this process's Hamlib component. Under `--replay`,
+    /// Hamlib is never started, so that write would land on whatever *else*
+    /// owns the endpoint (another app, or a real live pancetta) and unkey a
+    /// transmission this demo never started — an outbound write to real radio
+    /// hardware from a replay run.
+    ///
+    /// The LIVE half is what makes this non-vacuous: with the same
+    /// `[rig.interface].enabled = true` config and no `--replay`, the gate
+    /// still opens, so the safety net for normal operation is unchanged.
+    #[tokio::test]
+    async fn replay_mode_suppresses_shutdown_direct_rigctld_ptt_off() {
+        let mut config = Config::default();
+        config.rig.interface.enabled = true;
+
+        let live = build_coordinator_with_config_and_replay(config.clone(), None).await;
+        assert!(
+            live.wants_direct_rigctld_ptt_off().await,
+            "precondition: a live run with rig enabled must still send the direct \
+             shutdown PTT-off — otherwise the replay assertion below is vacuous"
+        );
+
+        let replaying = build_coordinator_with_config_and_replay(
+            config,
+            Some(PathBuf::from("/some/capture/dir")),
+        )
+        .await;
+        assert!(replaying.replay_mode());
+        assert!(
+            !replaying.wants_direct_rigctld_ptt_off().await,
+            "under --replay shutdown must not dial rigctld: this process never \
+             started rig control, so the PTT it would unkey belongs to someone else"
+        );
+
+        // And rig-disabled stays skipped on a live run, as before.
+        let rig_off = build_coordinator_with_config_and_replay(Config::default(), None).await;
+        assert!(!rig_off.config.read().await.rig.interface.enabled);
+        assert!(!rig_off.wants_direct_rigctld_ptt_off().await);
     }
 
     // ------------------------------------------------------------------
@@ -2715,6 +3142,7 @@ mod tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,
@@ -2751,6 +3179,7 @@ mod tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,
@@ -2794,6 +3223,7 @@ mod tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,
@@ -2879,6 +3309,7 @@ mod tests {
             false, // no metrics
             9090,
             Some(wav_path),
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,

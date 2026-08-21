@@ -144,8 +144,8 @@ Follow these guidelines:
   stay free of GPL/copyleft source. Do **not** copy, port, or paraphrase code
   from GPL projects (WSJT-X, JTDX, MSHV, JS8Call, ft8mon, …). Algorithm *ideas*
   from those projects may only enter via a prose-only spec in `research/specs/`
-  written by someone who does not then implement it — see the
-  "Provenance & clean-room methodology" section of the root README. MIT/BSD
+  written by someone who does not then implement it — see
+  [`docs/PROVENANCE.md`](docs/PROVENANCE.md). MIT/BSD
   sources (e.g. `ft8_lib`) may be used with attribution at the call site.
 
 ### 4. Test Your Changes

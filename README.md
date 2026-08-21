@@ -1,73 +1,158 @@
-# Pancetta
+<p align="center">
+  <img src="assets/logo.svg" alt="Pancetta logo" width="64">
+</p>
 
-A full-featured FT8 ham radio station, written in Rust — decode, log, and
-work QSOs, with optional hands-off operation.
+<h1 align="center">Pancetta</h1>
 
-Pancetta listens on the FT8 sub-band, decodes what it hears, and scores each
-station against a configurable priority model (needed DXCC entity, needed
-grid, POTA/SOTA, rarity, recent activity) so you can work the ones that matter
-— with a keystroke from the terminal UI, or hands-off when you choose to
-enable it. It can run a full CQ → grid → report → RR73 exchange, and transmit
-multiple simultaneous QSOs in a single 15-second slot when conditions allow.
+<p align="center">
+  A full FT8 station in one Rust binary — decode, score, work, log.<br>
+  Built and operated by <strong>Tony Hagale, K5ARH</strong>.
+</p>
 
-It runs on a normal desktop or a small headless host (e.g. a Windows MiniPC)
-attached to a transceiver via a USB CODEC, and is comfortable driven remotely
-over SSH.
+<p align="center">
+  <a href="https://github.com/HagaleTechnologies/pancetta/actions/workflows/ci.yml"><img src="https://github.com/HagaleTechnologies/pancetta/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="#license"><img src="https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg" alt="License: MIT OR Apache-2.0"></a>
+</p>
 
-> **Status: pre-1.0, on-air ready.** Pancetta's FT8 engine pairs the
-> MIT-licensed [`ft8_lib`](https://github.com/kgoba/ft8_lib) C decoder (via
-> FFI) with a native Rust decoder that adds parallel multi-candidate decoding
-> and a-priori-aided recovery. On a 1,201-file real off-air corpus the native
-> decoder produced **+11.6% more decodes than ft8_lib on the same audio**
-> (recovering 90.7% of ft8_lib's set, plus extras) — see
-> [`docs/decoder-comparison.md`](docs/decoder-comparison.md) for methodology,
-> the parallel-execution rationale, and honest caveats. Hardware TX has been
-> validated end-to-end on a Yaesu FTdx10 (clean ALC, PSKReporter spots across
-> NA + EU). ~295 FT8 tests cover encode / decode / LDPC / CRC / OSD. Hands-off
-> (automatic) operation respects FCC §97.221 — see
-> [`docs/fcc-part97-compliance.md`](docs/fcc-part97-compliance.md).
+Pancetta is an FT8 station that lives in your terminal.
 
----
+![Pancetta running a replayed band recording](assets/demo.gif)
 
-## Prerequisites
+*`pancetta --replay` feeding archived WAV captures through the real pipeline:
+startup, band monitoring, the TX-placement scorer ranking candidate offsets,
+a burst of real FT8 decodes filling Band Activity when the capture reaches
+its decodable slot, and a clean self-shutdown when the recording ends. One
+recording of one small corpus proves nothing about recall — for measured
+decode performance see
+[`docs/decoder-comparison.md`](docs/decoder-comparison.md).*
+
+## The pitch
+
+Operating FT8 seriously today means WSJT-X for the modem, a logger for the
+log, GridTracker for what's needed, and a cluster client for spots — four
+alt-tabbed windows, each with its own idea of what your station is doing.
+Pancetta is one binary and one terminal: decode, priority scoring, QSO state
+machine, DX cluster, PSKReporter, and logbook upload in a single process that
+runs as happily over SSH on a headless box behind the radio as on a desktop.
+
+## Why Pancetta
+
+- **A decoder measured against the real reference.** Against WSJT-X's `jt9` —
+  the decoder hams actually run — Pancetta needs **~2.1 dB more SNR** to
+  reach 50% recall on FT8, and **~3.95 dB more on FT4, where it caps at 78%
+  recall**, at a false-positive cost of 1 decode per 1,000 pure-noise
+  recordings (0.1%). In short: competitive, not yet class-leading. (An older
+  1,201-file comparison against `ft8_lib` showed +11.6% more decodes, but
+  `ft8_lib` is not the bar operators care about.) Full numbers and caveats:
+  [`docs/decoder-comparison.md`](docs/decoder-comparison.md).
+- **A priority engine, not a list.** Every decoded CQ is scored against
+  needed DXCC, needed grid, POTA/SOTA, rarity, signal, and recent activity —
+  so the station you should work is the one at the top.
+- **Multi-stream TX.** A smart frequency allocator places N simultaneous FT8
+  signals inside one 15-second slot, each on its own audio offset, all on the
+  same parity.
+- **Headless by design.** `--headless` logs instead of drawing; the decoder
+  is an *anytime* algorithm with a per-window budget that self-tunes to the
+  host, so slow hardware degrades recall instead of falling over.
+- **`pancetta doctor`.** One command checks config, clock vs. NTP, audio
+  device and level, decoder, and `rigctld` — and prints the fix for each
+  failure.
+
+On-air TX has been validated end-to-end against a Yaesu FTdx10 (clean ALC,
+PSKReporter spots across North America and Europe). ~295 FT8 tests cover
+encode, decode, LDPC, CRC, and OSD.
+
+<!-- TODO (maintainer): drop a PSKReporter map capture at assets/pskreporter.png
+     and reference it here as on-air proof. Requires a real pskreporter.info
+     session, so it could not be captured automatically. -->
+
+## What it looks like
+
+Every capture below — and the GIF further down, and the hero GIF above — was
+recorded on a development host with `pancetta --replay`, feeding archived
+off-air WAV captures through the real pipeline (see [`.tapes/`](.tapes/)).
+Real audio, real decodes, real panels — no mockups. The corpus is one short
+recording, so treat these as a tour of the interface, not a performance
+claim: the QSO panel in particular is shown idle (`STANDBY`, "No QSOs yet"),
+because a completed QSO needs a multi-slot two-way handshake that a receive-
+only replay of someone else's traffic can't produce.
+
+| | |
+|---|---|
+| ![Operate overview](assets/screenshot-operate.png) | ![DX Hunter priority panel](assets/screenshot-priority.png) |
+| Operate overview: TX placement, band activity, QSO status, callers. | DX Hunter: the priority-scoring table (entity, grid, SNR, rarity, score). |
+| ![QSO status panel](assets/screenshot-qso.png) | ![Monitor / waterfall view](assets/screenshot-waterfall.png) |
+| QSO status (idle in this replay): state machine, exchanges, TX/RX reports. | Monitor: the waterfall and the TX-frequency marker. |
+
+Decode effort is a live control — press `e` to cycle presets and the status
+chip follows:
+
+![Cycling decode-effort presets with the e key](assets/feature-decode-effort.gif)
+
+| Preset | Behavior |
+|---|---|
+| `Auto` (default) | Budget derived from the auto-probed hardware tier. |
+| `Eco` | Floor pass only — fastest, lowest recall. |
+| `Standard` | A moderate per-window budget. |
+| `Deep` | A generous budget — more passes/candidates, better recall. |
+| `Max` | Runs every decode stage, still bounded by the coordinator's per-slot ceiling (2 s on FT8). |
+
+Pin it at startup via `[decoder]` in `pancetta.toml`
+([`docs/CONFIG.md`](docs/CONFIG.md)); `e` is the only *live* control. Full
+keybinding reference: [`docs/KEYBINDINGS.md`](docs/KEYBINDINGS.md), or press
+`?` in the TUI.
+
+## Autonomy with a control operator present
+
+Hands-off operation is opt-in (`[autonomous] enabled = true`) and assumes a
+licensed control operator is at the keyboard and can stop it instantly:
+
+- **`Shift+Q` is an emergency stop** — halts TX and switches autonomous off.
+  It drops the runtime autonomy gate, and every TX item the engine produced
+  for that cycle is discarded before it can be keyed.
+- **Autonomous *initiation* requires a present operator.** Calling CQ or
+  pouncing needs a console keypress within the last two minutes (FCC §97.221:
+  a station with nobody at the control point may respond, not originate).
+  Headless or idle, Pancetta drops to respond-only; QSOs already in progress
+  still finish. Every autonomous TX item additionally has to clear the active
+  `TxPolicy` (e.g. dry-run/listen-only modes).
+- **The *remote*-TX arm gate fails closed.** Separate from the above, and
+  specific to transmissions originated over the remote-operation protocol:
+  a poisoned lock means no transmit, never a permissive fallback, and it ANDs
+  under the active TX policy. It governs `TxOrigin::Remote` only — local and
+  autonomous TX are gated by the mechanisms above.
+- **Drop-stale-TX.** The TX worker re-checks QSO liveness at the last instant
+  before PTT, so a frame for a QSO that just ended never goes out.
+- **One parity, always.** Concurrent QSOs share a slot parity; Pancetta never
+  transmits in sequential windows.
+
+Regulatory notes, including FCC §97.221 automatic-control considerations:
+[`docs/fcc-part97-compliance.md`](docs/fcc-part97-compliance.md).
+
+## Quick start
+
+**1. Dependencies.**
+
+```bash
+# Linux (Debian/Ubuntu):
+sudo apt update
+sudo apt install -y libasound2-dev libudev-dev libssl-dev pkg-config libhamlib-utils
+# macOS:
+brew install hamlib
+curl https://sh.rustup.rs -sSf | sh
+```
 
 | Requirement | Linux | macOS | Windows |
 |---|---|---|---|
 | Rust toolchain | rustup → stable | rustup → stable | rustup → stable |
 | Audio dev headers | `libasound2-dev`, `libudev-dev` | (built in) | (built in) |
 | TLS | `libssl-dev`, `pkg-config` | (built in) | (built in) |
-| Hamlib (CAT control — optional; runtime-only) | `apt install libhamlib-utils` | `brew install hamlib` | hamlib Windows build |
+| Hamlib (CAT — optional, runtime-only) | `apt install libhamlib-utils` | `brew install hamlib` | hamlib Windows build |
 
-Hamlib is **not** needed to build, or to run decode-only. Pancetta talks to
-`rigctld` over TCP at runtime, and only when `[rig.interface].enabled = true`.
-Install it when you're ready to key a radio.
+Hamlib is only needed to key a radio, not to build or to decode.
 
-Pancetta is developed and tested on:
-- **macOS** (development host, Apple Silicon)
-- **Linux** (CI lane and headless deployment)
-- **Windows 11 MiniPC** (production deployment behind the radio)
-
-The project is `MIT OR Apache-2.0` dual-licensed; pick whichever fits
-your use case.
-
----
-
-## Quick Start
-
-### 1. Install Rust and system dependencies
-
-```bash
-# Linux (Debian/Ubuntu):
-sudo apt update
-sudo apt install -y libasound2-dev libudev-dev libssl-dev pkg-config libhamlib-utils
-
-# macOS:
-brew install hamlib
-
-curl https://sh.rustup.rs -sSf | sh
-```
-
-### 2. Clone and build
+**2. Build.** `--recursive` matters: without the submodule the build warns and
+falls back to the Rust-only decode path. First build is 5–10 minutes.
 
 ```bash
 git clone --recursive https://github.com/HagaleTechnologies/pancetta.git
@@ -75,325 +160,114 @@ cd pancetta
 cargo build --release
 ```
 
-> Already cloned without `--recursive`? Run `git submodule update --init`
-> before building — otherwise the build silently falls back to the pure-Rust
-> decoder and you lose the C `ft8_lib` decode pass (the build will warn).
-
-The first build will take 5–10 minutes (workspace is 14 crates and
-compiles a vendored copy of `ft8_lib`, which Pancetta uses as a decoder
-via FFI alongside its own native Rust decoder — see
-[Acknowledgments](#acknowledgments)). After that, incremental builds are
-sub-30s.
-
-### 3. Bootstrap your config
-
-The first time you run `pancetta` it walks you through writing a
-`~/.pancetta/pancetta.toml` containing your callsign, grid square, audio
-device names, and rig model. You can also write the file by hand —
-see [`docs/CONFIG.md`](docs/CONFIG.md) for every supported key.
+**3. Configure.** The first run walks you through writing
+`~/.pancetta/pancetta.toml` — callsign, grid, audio devices, rig. Every key
+is documented in [`docs/CONFIG.md`](docs/CONFIG.md).
 
 ```bash
-# First-run wizard (runs automatically on first launch)
-./target/release/pancetta
-
-# Or, equivalently:
-cargo run --release -p pancetta
-
-# Optional: put `pancetta` on your PATH
-cargo install --path pancetta
+./target/release/pancetta        # first-run wizard
+cargo install --path pancetta    # optional: put `pancetta` on PATH
 ```
 
-The minimum viable config:
-
-```toml
-[station]
-callsign = "YOURCALL"
-grid_square = "FN42"   # 4-character Maidenhead grid
-
-[audio]
-input_device = "USB Audio CODEC"   # exact name from `pancetta test-audio --list`
-output_device = "USB Audio CODEC"
-
-[rig.interface]
-enabled = true
-port = "/dev/tty.usbserial-A1"     # or "COM3" on Windows
-baud_rate = 38400
-
-[rig]
-model = "FTdx10"
-```
-
-> **Replace `YOURCALL` with your actual callsign before transmitting.**
-> Pancetta refuses to call CQ as `NOCALL` / `N0CALL`, but it will
-> transmit whatever you put in `station.callsign` — and Part 97 is your
-> problem, not the software's.
-
-### 4. Run
+**4. Run.** With `[rig.interface]` disabled (the default) this is decode-only
+and cannot key the radio. Enable the rig interface for TX; see
+[`docs/RUNBOOK.md`](docs/RUNBOOK.md) for the autonomous-QSO procedure.
 
 ```bash
-# Decode-only mode (safe — no PTT). Achieved by leaving the rig
-# interface disabled in config (the default).
-cargo run --release -p pancetta
-
-# Full pipeline (decode + manual / autonomous TX). Requires:
-#   [rig.interface] enabled = true   in ~/.pancetta/pancetta.toml
-#   [autonomous]    enabled = true   for hands-off operation
-# and an actual antenna + license. See docs/RUNBOOK.md for the
-# Phase 5 (autonomous QSO loop) procedure.
 cargo run --release -p pancetta
 ```
 
----
-
-## How to drive the TUI
-
-The essentials (full reference: [`docs/KEYBINDINGS.md`](docs/KEYBINDINGS.md),
-or press `?` in the TUI):
-
-| Key | Action |
-|---|---|
-| `?` | Toggle help overlay (every binding, in-app) |
-| `Tab` / `Shift+Tab` | Switch panel |
-| `↑` / `↓` | Scroll / select within the active panel |
-| `Space` | Call selected station |
-| `c` / `s` | Start / stop repeating CQ |
-| `h` | Halt current TX |
-| `a` | Toggle autonomous mode |
-| `d` | Open audio device picker |
-| `q` | Quit (with confirm) |
-| `Shift+Q` | **EMERGENCY STOP** — halt TX, autonomous off |
-
-The status bar at the bottom shows live pipeline state, your TX queue,
-and any errors emitted by the audio / QSO components.
-
-### Decode-effort control
-
-Pancetta's decoder is an *anytime* algorithm: it always produces the
-same decodes if given enough time, but can be capped to a per-window
-wall-clock budget and still return everything found so far. Press `e`
-in the TUI to cycle presets (a status chip shows the active one):
-
-| Preset | Behavior |
-|---|---|
-| `Auto` (default) | Budget derived from the auto-probed hardware tier — full effort on fast hosts, a tighter cap on slower ones. |
-| `Eco` | Minimal effort (floor pass only) — fastest, lowest recall. Useful on very slow hardware or when CPU is needed elsewhere. |
-| `Standard` | A moderate per-window budget. |
-| `Deep` | A generous per-window budget — more decode passes/candidates for better recall. |
-| `Max` | Unlimited — always runs every decode stage to completion. |
-
-You can also pin this at startup via `[decoder]` in `pancetta.toml`
-(see [`docs/CONFIG.md`](docs/CONFIG.md)); an explicit `budget_ms`
-there overrides the preset. Editing the config file's `[decoder]`
-section while Pancetta is running has no live effect (restart
-required) — the `e` key is the only *live* control.
-
----
+> **Put your real callsign in `station.callsign` before transmitting.**
+> Pancetta refuses to call CQ as `NOCALL`/`N0CALL`, but it will transmit
+> whatever else you give it — Part 97 is your responsibility, not the
+> software's.
 
 ## Command-line tools
 
-Everything below ships in the one `pancetta` binary (`pancetta <cmd> --help`
-for details):
+One binary, several subcommands (`pancetta <cmd> --help` for details):
 
 | Command | What it does |
 |---|---|
 | `pancetta` | Run the station (TUI). First run launches the setup wizard. |
-| `pancetta doctor` | Check station health — config, clock vs NTP, audio device + level, decoder, rigctld — with a printed fix per failure. Run it whenever something "doesn't work". |
-| `pancetta setup` | Interactive wizard for station, audio, rig, PTT, and frequency control. Safe to re-run any time. |
-| `pancetta test-audio --list` | List audio input/output devices exactly as pancetta sees them (copy names into `[audio]`). |
-| `pancetta test-rig` | Test the rig link: serial port present, opens, data readable. Add `--ptt` to key TX for 1 s (careful!). |
-| `pancetta config --validate` | Validate the config file and exit non-zero on errors (also `--show`, `--generate <path>`). |
-| `pancetta export --output log.adi` | Export logged QSOs to ADIF (`--callsign` to filter). |
-| `pancetta info` | Version and host capabilities. |
-| `pancetta benchmark-decode <wav-or-dir>` | Compare the native decoder against ft8_lib on WAV captures. |
-| `pancetta --wav <file>` | Decode a 15-s WAV file and exit (no audio hardware needed). |
-| `pancetta --headless` | Run without the TUI (logs to `~/.pancetta/logs/`). |
+| `pancetta doctor` | Station health check with a printed fix per failure. |
+| `pancetta setup` | Interactive station/audio/rig/PTT wizard. Safe to re-run. |
+| `pancetta test-audio --list` | List audio devices exactly as pancetta sees them. |
+| `pancetta test-rig` | Test the rig link; `--ptt` keys TX for 1 s (careful!). |
+| `pancetta config --validate` | Validate config, non-zero on error (`--show`, `--generate`). |
+| `pancetta export --output log.adi` | Export logged QSOs to ADIF. |
+| `pancetta benchmark-decode <wav-or-dir>` | Native decoder vs. ft8_lib on WAV captures. |
+| `pancetta --wav <file>` | Decode one 15-s WAV and exit (no audio hardware). |
+| `pancetta --replay <wav-dir>` | Feed a directory of WAVs through the full TUI pipeline. |
+| `pancetta --headless` | No TUI; logs to `~/.pancetta/logs/`. |
 
----
+## Why not (yet)
 
-## Troubleshooting
+Honest gaps, so you can judge whether it fits your station:
 
-### "Audio init failed" appears in the TUI status
-
-Most often: cpal can't find the input device named in your config.
-Run `pancetta test-audio --list` to see the names cpal sees and copy one
-verbatim into `[audio].input_device`. Wireless USB CODECs sometimes
-present a transient name on first plug-in; unplug, replug, restart.
-
-### No decodes appear, even with strong signals
-
-1. Confirm audio is actually flowing: the audio-level meter on the
-   bottom-right of the TUI should bounce when stations are on. If it's
-   flat, your input device is wrong or muted at the OS level.
-2. Confirm slot timing: FT8 slots are aligned to UTC second `:00` and
-   `:15` etc. If the host clock is more than ~1 second off, decodes will
-   fail systematically. NTP fixes this; `chrony` is the recommended
-   daemon on Linux.
-3. Confirm the band — set the dial on your rig (CAT auto-syncs at
-   startup), or use the `=` / `-` band keys in the TUI. Listening on the
-   wrong band against a CW segment looks identical to "no signal" from
-   the decoder's point of view.
-
-### `Call X failed: duplicate QSO`
-
-Pancetta refuses to call the same station within the configured
-`duplicate_checking.time_window_hours` rolling window (by default, the
-in-memory check scopes this to within 50 Hz of the same frequency —
-see `[duplicate_checking]` in [`docs/CONFIG.md`](docs/CONFIG.md)).
-Adjust the window in config, or remove the prior QSO from
-`~/.pancetta/qso.db` if it was a test. The duplicate check is
-intentional — it prevents embarrassing repeat-calls during a contest
-or grid hunt.
-
-### `rigctld` won't connect
-
-Pancetta spawns `rigctld` automatically when `[rig.interface].enabled`
-is true. Check:
-
-- The serial device path in `[rig.interface].port` exists (`ls /dev/tty.*`
-  on macOS, `ls /dev/ttyUSB*` on Linux, Device Manager on Windows).
-- The hamlib model number matches your radio (`rigctl --list`).
-- The baud rate matches the radio's CAT port setting (38400 is correct
-  for the Yaesu FTdx10 default).
-- No other process holds the serial device (e.g. WSJT-X is not running).
-
-If `rigctld` itself works (`rigctld -m 1042 -r /dev/tty... -s 38400`)
-but Pancetta refuses to spawn it, check the log line that begins
-`Refusing to spawn rigctld with suspicious port path` — Pancetta now
-allow-lists `/dev/tty*`, `/dev/cu.*`, `COM<N>`, and `host:port` only.
-
----
-
-## Workspace layout
-
-14-crate Cargo workspace. Crates form a clean layering: a leaf crate
-never reaches up into an orchestrator.
-
-| Crate | Purpose |
-|---|---|
-| `pancetta-core` | Shared types, error handling |
-| `pancetta-audio` | Real-time audio I/O (cpal + ringbuf) |
-| `pancetta-dsp` | FFT, filtering, resampling |
-| `pancetta-ft8` | FT8 encoder, decoder, modulator, OSD, AP |
-| `pancetta-config` | Configuration loader + hot-reload |
-| `pancetta-qso` | QSO state machine, priority scoring, autonomous operator |
-| `pancetta-hamlib` | rigctld TCP client (CAT control) |
-| `pancetta-cqdx` | cqdx.io HTTP client and cache |
-| `pancetta-dx` | DX cluster + PSKReporter + scaffolded LoTW |
-| `pancetta-tui` | Terminal UI (ratatui + crossterm) |
-| `pancetta-agent` | Remote-TX security: ArmState, session gating |
-| `pancetta-protocol` | Remote-operation wire protocol (no bus internals) |
-| `pancetta-research` | Local-only decoder-iteration harness (excluded from CI) |
-| `pancetta` | Coordinator binary, message bus, runtime |
-
-Detailed component diagram and channel topology in
-[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
-
----
+- **Pre-1.0.** Config keys, CLI surface, and on-disk formats can still change
+  between releases.
+- **Some integrations are scaffolded, not live.** `pancetta-hamlib`'s FFI
+  bindings are done, but the project's own status table still calls the
+  crate an integration stub; `pancetta-cqdx` awaits live API validation;
+  LoTW/eQSL upload is scaffolded where ClubLog/QRZ/cqdx paths are live.
+- **Platform coverage is narrow.** Developed on macOS (Apple Silicon), CI on
+  Linux, deployed on a Windows 11 MiniPC. Pi-class ARM is a design target of
+  the effort-budget work but unvalidated on real hardware, and there are no
+  prebuilt binaries yet — you build from source.
+- **One radio, well tested.** CAT/PTT is exercised against a Yaesu FTdx10.
+  Other hamlib-supported rigs should work; nobody has proven it.
+- **`pancetta-research`** is a local-only decoder harness, excluded from CI
+  and unsupported.
 
 ## Building, testing, lint
 
 ```bash
-# Full workspace build
 cargo build --workspace
-
-# Run all tests
 cargo test --workspace --features transmit
-
-# pancetta-hamlib (single-threaded for deterministic mock-rig tests)
-cargo test -p pancetta-hamlib --lib -- --test-threads=1
-
-# Lint and format
+cargo test -p pancetta-hamlib --lib -- --test-threads=1   # deterministic mock rig
+cargo test -p pancetta --test loopback_qso                # end-to-end encode→decode
 cargo clippy --workspace --features transmit
 cargo fmt --all -- --check
-
-# Loopback integration: end-to-end QSO through encode → modulate → decode
-cargo test -p pancetta --test loopback_qso
 ```
 
-CI runs all of the above on every PR, plus a `cargo check` lane on macOS. `cargo deny check` runs on every push to catch security advisories and license drift.
-
----
+CI runs all of this per PR plus a macOS `cargo check` lane; `cargo deny check`
+guards advisories and license drift. The 14-crate strictly layered workspace
+is mapped in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Documentation
 
-- [`docs/GUIDE.md`](docs/GUIDE.md) — **start here**: your first 5 minutes, your first QSO, and how-do-I recipes.
+- [`docs/GUIDE.md`](docs/GUIDE.md) — **start here**: your first 5 minutes, your first QSO, how-do-I recipes.
 - [`docs/CONFIG.md`](docs/CONFIG.md) — every config key, with examples and defaults.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate dependency graph, data flow, key abstractions.
-- [`docs/decoder-comparison.md`](docs/decoder-comparison.md) — native decoder vs. ft8_lib: measured decode yield on a 1,201-file corpus + the parallel-execution approach.
+- [`docs/TROUBLESHOOTING.md`](docs/TROUBLESHOOTING.md) — audio init, missing decodes, duplicate QSOs, `rigctld`.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — crate graph, data flow, key abstractions.
+- [`docs/KEYBINDINGS.md`](docs/KEYBINDINGS.md) — every TUI binding.
+- [`docs/RUNBOOK.md`](docs/RUNBOOK.md) — operating procedures, including the autonomous QSO loop.
+- [`docs/decoder-comparison.md`](docs/decoder-comparison.md) — native decoder vs. ft8_lib, measured.
+- [`docs/PROVENANCE.md`](docs/PROVENANCE.md) — licensing provenance and the clean-room firewall.
 - [`FEATURES.md`](FEATURES.md) — capabilities and feature status.
 - [`SECURITY.md`](SECURITY.md) — vulnerability reporting and known trade-offs.
-- [`CONTRIBUTING.md`](CONTRIBUTING.md) — coding standards, contribution flow.
+- [`CONTRIBUTING.md`](CONTRIBUTING.md) — coding standards and contribution flow.
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes.
 
-API documentation: `cargo doc --workspace --no-deps --open`.
-
----
+API docs: `cargo doc --workspace --no-deps --open`.
 
 ## Acknowledgments
 
-Pancetta stands on the shoulders of the FT8 community. In particular:
+- **Joe Taylor (K1JT) and Steve Franke (K9AN)** designed FT8 — the LDPC code,
+  Costas sync arrays, modulation, and message schema this project implements,
+  documented in [*The FT4 and FT8 Communication Protocols*](https://wsjt.sourceforge.io/FT4_FT8_QEX.pdf).
+- **Kārlis Goba (YL3JG)** authored [`ft8_lib`](https://github.com/kgoba/ft8_lib),
+  the MIT-licensed C implementation Pancetta vendors at
+  `pancetta-ft8/vendor/ft8_lib/` and calls via FFI. Several algorithms in the
+  native Rust decoder are ported from it (CRC-14, LDPC tables, Gray code
+  mapping, sliding spectrogram, LLR normalization) and attributed in the
+  source where they appear.
+- **The WSJT-X project** (GPL) is the de-facto reference FT8 application.
+  Pancetta does **not** link or vendor any WSJT-X source; it interoperates
+  through the published protocol only.
 
-- **Joe Taylor (K1JT) and Steve Franke (K9AN)** designed the FT8
-  protocol — the LDPC code, Costas sync arrays, modulation, and message
-  schema that this project implements. The protocol is documented in
-  [*The FT4 and FT8 Communication Protocols*](https://wsjt.sourceforge.io/FT4_FT8_QEX.pdf).
-- **Kārlis Goba (YL3JG)** authored
-  [`ft8_lib`](https://github.com/kgoba/ft8_lib), the MIT-licensed C
-  reference implementation that Pancetta vendors at
-  `pancetta-ft8/vendor/ft8_lib/` and uses as its primary decoder via
-  FFI. Pancetta's native Rust decoder also ports several algorithms
-  from `ft8_lib` (CRC-14, LDPC tables, Gray code mapping, sliding
-  spectrogram, LLR normalization) — these are attributed in the source
-  comments where they appear.
-- **The WSJT-X project** (GPL) is the de-facto reference FT8
-  application. Pancetta does **not** link or vendor any WSJT-X source;
-  it interoperates with WSJT-X through the published protocol only.
-
-What's specifically novel in Pancetta: the neural-OSD bit-flip
-re-ordering CNN, active-QSO-aware AP decoding, multi-stream TX
-modulation, the autonomous-operator priority engine, and integration
-with the cqdx.io spotting/scoring service. See
-[`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md) for full third-party
-license text.
-
-## Provenance & clean-room methodology
-
-Pancetta is MIT/Apache-2.0. Its FT8 engine is built from three clearly
-separated sources, and we are careful about the boundary so the codebase
-stays free of copyleft contamination:
-
-1. **MIT code we use directly.** [`kgoba/ft8_lib`](https://github.com/kgoba/ft8_lib)
-   (MIT, © Kārlis Goba) is vendored and called via FFI, and re-implemented
-   in places in native Rust. ft8_lib's MIT license permits this; every
-   ft8_lib-derived algorithm or constant is attributed at its call site
-   (search `ft8_lib` in `pancetta-ft8/src/`).
-
-2. **The published FT8 protocol.** The Costas arrays, LDPC(174,91)
-   generator/parity matrices, CRC-14 polynomial, Gray code, and message
-   schema are defined by Joe Taylor (K1JT) and Steve Franke (K9AN) in the
-   [QEX paper](https://wsjt.sourceforge.io/FT4_FT8_QEX.pdf). These values are
-   **identical in every conformant decoder** (WSJT-X, ft8_lib, JTDX, MSHV, …)
-   because the protocol requires them — matching them is interoperability,
-   not derivation.
-
-3. **GPL peer decoders — algorithm *ideas* only, never code.** Where Pancetta
-   adopts a *technique* from a GPL-licensed project (WSJT-X, JTDX,
-   JS8Call-Improved, ft8mon, MSHV), it follows a strict **clean-room
-   firewall**: one contributor reads the peer and writes a *prose-only*
-   algorithm spec under `research/specs/` that explicitly does not quote
-   source; a separate implementer writes the Rust from that spec alone. No
-   GPL source is read, ported, copied, or paraphrased into Pancetta's code,
-   and the modules written this way carry a `clean-room` affirmation in their
-   header comments. Pancetta does **not** link, vendor, or copy any GPL
-   source, and does **not** shell out to any GPL binary at runtime.
-
-So: yes, the encoder/decoder *will* resemble the MIT `ft8_lib` (by design and
-by license), and the protocol constants *will* match every other FT8 decoder
-(by necessity) — but no GPL-licensed source has been incorporated. If you spot
-anything that looks like a copyleft-source copy, please open an issue; we treat
-that as a bug.
-
----
+Full third-party license text: [`THIRD-PARTY-NOTICES.md`](THIRD-PARTY-NOTICES.md).
+Licensing provenance and the clean-room process: [`docs/PROVENANCE.md`](docs/PROVENANCE.md).
 
 ## License
 

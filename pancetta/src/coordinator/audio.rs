@@ -66,6 +66,12 @@ impl super::ApplicationCoordinator {
 
         let use_stub = std::env::var("PANCETTA_STUB_AUDIO").is_ok();
 
+        if let Some(replay_dir) = self.replay_path.clone() {
+            return self
+                .start_replay_pipeline(replay_dir, audio_to_dsp_tx, health_audio_alive)
+                .await;
+        }
+
         if use_stub {
             self.audio_path_supervised = false;
             info!("Starting audio component in STUB mode");

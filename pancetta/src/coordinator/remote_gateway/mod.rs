@@ -266,17 +266,34 @@ impl super::ApplicationCoordinator {
     /// full" warnings — this mirrors today's disabled-gateway behavior
     /// exactly. `display_feed_enabled` is set to match the computed gate
     /// either way, so `relay_to_gateway`'s emit sites reflect reality.
+    ///
+    /// `--replay` ([`super::ApplicationCoordinator::replay_mode`]): the gate is
+    /// hoisted over the WHOLE disjunction — neither consumer may pull the pump
+    /// up under replay. A replay run with `[network.remote_gateway].enabled =
+    /// true` and/or an active (enabled + paired + allow-listed) station agent
+    /// takes the drain path exactly like a fully disabled config — no pump,
+    /// nothing for `start_remote_gateway_component` to serve and nothing for
+    /// the station agent's read stream to relay off-box. Gating only the
+    /// gateway half of the OR (the shape this had before) left the pump running
+    /// for an active station agent, which then broadcast replayed decodes to
+    /// every connected relay peer. Same class of gap as
+    /// PSKReporter/cqdx.io/WSJT-X UDP.
     pub(crate) async fn start_display_feed(&mut self) -> Result<()> {
         let config = self.config.read().await;
-        let gateway_wants_feed = config.network.remote_gateway.enabled;
-        let station_agent_wants_feed = super::station_agent::station_agent_active(
+        let replay_mode = self.replay_mode();
+        let gateway_configured_enabled = config.network.remote_gateway.enabled;
+        let station_agent_configured_active = super::station_agent::station_agent_active(
             &config.network.station_agent,
             &config.network.cqdx,
         );
         let our_callsign = config.station.callsign.clone();
         drop(config);
 
-        let wants_feed = gateway_wants_feed || station_agent_wants_feed;
+        // Replay gate ANDed over the whole disjunction, NOT over one operand:
+        // a consumer that would otherwise want the feed must not be able to
+        // start it under `--replay`.
+        let wants_feed =
+            (gateway_configured_enabled || station_agent_configured_active) && !replay_mode;
         self.display_feed_enabled
             .store(wants_feed, Ordering::Relaxed);
 
@@ -286,9 +303,17 @@ impl super::ApplicationCoordinator {
             .await?;
 
         if !wants_feed {
-            info!(
-                "display_feed: no consumer enabled (gateway off, station agent inert) — draining"
-            );
+            if replay_mode && (gateway_configured_enabled || station_agent_configured_active) {
+                info!(
+                    gateway = gateway_configured_enabled,
+                    station_agent = station_agent_configured_active,
+                    "Replay mode: display feed suppressed -- replayed decodes are not live traffic"
+                );
+            } else {
+                info!(
+                    "display_feed: no consumer enabled (gateway off, station agent inert) — draining"
+                );
+            }
             let shutdown = self.shutdown_signal.clone();
             let drain_handle = tokio::spawn(async move {
                 while !shutdown.load(Ordering::Acquire) {
@@ -375,9 +400,11 @@ impl super::ApplicationCoordinator {
         self.named_task_handles
             .push((ComponentId::RemoteGateway, pump));
         self.display_feed = Some(DisplayFeed { evt_tx, snapshot });
+        // Only reachable with `!replay_mode`, so the `configured` booleans are
+        // exactly the per-consumer "wants the feed" values here.
         info!(
-            gateway = gateway_wants_feed,
-            station_agent = station_agent_wants_feed,
+            gateway = gateway_configured_enabled,
+            station_agent = station_agent_configured_active,
             "display_feed started"
         );
         Ok(())
@@ -386,9 +413,18 @@ impl super::ApplicationCoordinator {
     /// Start the read-only remote-view gateway's localhost axum server
     /// (default-OFF, localhost-bound). Consumes the shared `DisplayFeed`
     /// started by [`Self::start_display_feed`] — this component itself only
-    /// ever gates on its OWN `[network.remote_gateway].enabled` flag, exactly
-    /// as before the pump was hoisted out: the localhost server never starts
-    /// just because the station agent wants a feed.
+    /// ever gates on its OWN `[network.remote_gateway].enabled` flag (and,
+    /// same as every other outbound integration, on
+    /// [`super::ApplicationCoordinator::replay_mode`]) exactly as before the
+    /// pump was hoisted out: the localhost server never starts just because
+    /// the station agent wants a feed.
+    ///
+    /// Under `--replay` this never binds the listener, regardless of config
+    /// — `start_display_feed` already withholds the feed from this consumer
+    /// in that case (`display_feed` is `None` unless the station agent
+    /// independently wants it), but the socket bind is also refused here
+    /// directly so a non-loopback `bind_addr` never has even a brief window
+    /// where replayed decodes could reach a connected client.
     pub(crate) async fn start_remote_gateway_component(&mut self) -> Result<()> {
         let config = self.config.read().await;
         let gw_cfg = config.network.remote_gateway.clone();
@@ -399,10 +435,17 @@ impl super::ApplicationCoordinator {
             return Ok(());
         }
 
+        if self.replay_mode() {
+            info!("Replay mode: remote_gateway localhost server not started -- replayed decodes are not live traffic");
+            return Ok(());
+        }
+
         let Some(feed) = self.display_feed.as_ref() else {
-            // Defensive only: `start_display_feed`'s gate ORs in this exact
-            // `enabled` flag, so this branch should be unreachable in
-            // practice. Fail soft (no localhost server) rather than panic.
+            // Defensive only: the `replay_mode()` early return above already
+            // covers replay, and outside replay `start_display_feed`'s gate
+            // ORs in this exact `enabled` flag, so this branch should be
+            // unreachable in practice either way. Fail soft (no localhost
+            // server) rather than panic.
             warn!("remote_gateway enabled but display_feed unavailable — localhost server not started");
             return Ok(());
         };

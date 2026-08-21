@@ -3628,6 +3628,7 @@ mod restart_orphan_tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,
@@ -4111,6 +4112,7 @@ mod teardown_stall_tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,
@@ -4226,6 +4228,7 @@ mod teardown_replay_tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,

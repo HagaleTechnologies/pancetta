@@ -105,6 +105,41 @@ struct Cli {
     #[arg(long, global = true)]
     wav: Option<PathBuf>,
 
+    /// Directory of sequential WAV captures to replay through the full
+    /// pipeline (audio → DSP → FT8 → QSO → TUI) at real-time cadence, as if
+    /// it were live audio. Files are read in filename order. Exits on its
+    /// own a few seconds after the last file is exhausted. Unlike --wav,
+    /// this runs the complete pipeline (TUI, QSO engine, priority scoring),
+    /// not just the decoder -- intended for demos and scripted recordings.
+    /// Cannot be combined with --wav, --no-audio, or --test-tx.
+    //
+    // The `conflicts_with_all` is load-bearing, not cosmetic:
+    //
+    // - `no_audio`: the early return in
+    //   `coordinator::audio::start_audio_pipeline` precedes the replay
+    //   branch, so the combination silently swallowed `--replay` -- no
+    //   feeder was spawned, nothing ever set the shutdown signal, and the
+    //   process hung forever instead of self-terminating as `--replay`
+    //   promises.
+    // - `wav`: `ApplicationCoordinator::run` checks `wav_path` first and
+    //   returns through `run_wav_playback` before the replay branch is ever
+    //   reached, so `--wav X --replay Y` silently ran single-file playback and
+    //   ignored the requested replay pipeline -- an undocumented precedence
+    //   between two modes that do genuinely different things (decode-and-exit
+    //   vs. full pipeline at real-time cadence).
+    // - `test_tx`: the test-TX task unconditionally sets the shutdown signal
+    //   35s after injecting its frame, which truncates any replay corpus
+    //   longer than that (including the bundled 75s demo corpus) before its
+    //   final decodes, while the test itself can't validate real TX because
+    //   replay deliberately skips Hamlib startup (see
+    //   `ApplicationCoordinator::run`) -- so the combination is dead weight
+    //   at best and misleading at worst.
+    //
+    // Rejecting these pairs at parse time turns that hang / truncation into a
+    // clear error.
+    #[arg(long, global = true, conflicts_with_all = ["wav", "no_audio", "test_tx"])]
+    replay: Option<PathBuf>,
+
     /// Enable metrics collection
     #[arg(long, global = true)]
     metrics: bool,
@@ -373,6 +408,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         cli.metrics,
         cli.metrics_port,
         cli.wav,
+        cli.replay,
         cli.test_tx,
         cli.test_tx_offset,
         shutdown.clone(),
@@ -386,7 +422,7 @@ async fn run_application(cli: Cli) -> Result<()> {
     let result = coordinator.run().await;
 
     // Handle shutdown
-    match result {
+    match &result {
         Ok(_) => {
             info!("Application completed successfully");
         }
@@ -402,7 +438,10 @@ async fn run_application(cli: Cli) -> Result<()> {
     tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
     info!("Pancetta shutdown complete");
 
-    Ok(())
+    // Propagate the coordinator's outcome so a genuine application error
+    // (e.g. `--replay` pointed at an empty/invalid directory) surfaces as a
+    // non-zero exit code instead of being logged and silently discarded.
+    result
 }
 
 async fn handle_command(command: Commands, cli: &Cli) -> Result<()> {
@@ -899,6 +938,7 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
                 if offer_wizard_on_load_failure(
                     cli.headless,
                     cli.wav.is_some(),
+                    cli.replay.is_some(),
                     std::io::stdin().is_terminal(),
                 ) =>
             {
@@ -941,8 +981,16 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
     // First-run setup: if callsign is still the default, prompt the user.
     // Only run when stdin is a TTY — non-interactive invocations (config --show,
     // piped input) must not trigger the wizard or overwrite the config.
+    // `--wav` and `--replay` are both file-fed, unattended runs (scripted demos,
+    // VHS recordings, integration tests): a modal wizard would hijack them even
+    // on a TTY, so both suppress it.
     let is_interactive = std::io::stdin().is_terminal();
-    if config.station.callsign == "N0CALL" && !cli.headless && cli.wav.is_none() && is_interactive {
+    if config.station.callsign == "N0CALL"
+        && !cli.headless
+        && cli.wav.is_none()
+        && cli.replay.is_none()
+        && is_interactive
+    {
         if let Some(updated) = run_first_time_setup(&config)? {
             config = updated;
         }
@@ -953,8 +1001,15 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
 
 /// The de-brick wizard offer fires only for interactive TUI launches —
 /// exactly the same gate as the first-run wizard's `is_interactive` check.
-fn offer_wizard_on_load_failure(headless: bool, wav: bool, interactive: bool) -> bool {
-    !headless && !wav && interactive
+/// `wav`/`replay` are file-fed unattended modes; neither may be interrupted
+/// by a prompt.
+fn offer_wizard_on_load_failure(
+    headless: bool,
+    wav: bool,
+    replay: bool,
+    interactive: bool,
+) -> bool {
+    !headless && !wav && !replay && interactive
 }
 
 /// Interactive first-run setup wizard.
@@ -1855,10 +1910,11 @@ mod wizard_validation_tests {
 
     #[test]
     fn debrick_gate_only_fires_interactive_tui_runs() {
-        assert!(offer_wizard_on_load_failure(false, false, true));
-        assert!(!offer_wizard_on_load_failure(true, false, true)); // headless
-        assert!(!offer_wizard_on_load_failure(false, true, true)); // --wav
-        assert!(!offer_wizard_on_load_failure(false, false, false)); // piped stdin
+        assert!(offer_wizard_on_load_failure(false, false, false, true));
+        assert!(!offer_wizard_on_load_failure(true, false, false, true)); // headless
+        assert!(!offer_wizard_on_load_failure(false, true, false, true)); // --wav
+        assert!(!offer_wizard_on_load_failure(false, false, true, true)); // --replay
+        assert!(!offer_wizard_on_load_failure(false, false, false, false)); // piped stdin
     }
 
     // Regression test for the run_first_time_setup validate-then-Ok(Some(..))

@@ -1896,12 +1896,19 @@ impl super::ApplicationCoordinator {
         let qrz_xml_enabled = qrz_xml_cfg.enabled
             && !qrz_xml_cfg.username.is_empty()
             && !qrz_xml_cfg.password.is_empty();
-        let upload_enabled = clublog_cfg.enabled
-            || qrz_cfg.enabled
-            || lotw_cfg.enabled
-            || eqsl_cfg.enabled
-            || cqdx_upload_enabled
-            || qrz_xml_enabled;
+        // The one predicate every "does this run touch the outside world — or
+        // the operator's real log?" gate consults. Read once here; both the
+        // upload subscriber and the LOCAL ADIF/DB writers below take it.
+        let replay_mode = self.replay_mode();
+        let upload_enabled = logbook_upload_enabled(
+            clublog_cfg.enabled,
+            qrz_cfg.enabled,
+            lotw_cfg.enabled,
+            eqsl_cfg.enabled,
+            cqdx_upload_enabled,
+            qrz_xml_enabled,
+            replay_mode,
+        );
 
         let qso_lookup = self.cached_lookup.clone();
         let upload_our_callsign = our_callsign.clone();
@@ -2003,87 +2010,42 @@ impl super::ApplicationCoordinator {
             let shutdown = self.shutdown_signal.clone();
 
             tokio::spawn(async move {
-                use pancetta_qso::LoggerConfig;
-
                 if let Err(e) = qso_manager.start().await {
                     error!("Failed to start QSO manager: {}", e);
                     return Err(anyhow::anyhow!("QSO manager startup failed"));
                 }
 
-                // Initialize QSO logger with SQLite database at ~/.pancetta/qso.db
+                // Rebuildable SQLite index at ~/.pancetta/qso.db.
                 let db_path = dirs::home_dir()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join(".pancetta")
                     .join("qso.db");
 
-                // ADIF source-of-truth writer. Subscribes to QsoEvent::QsoCompleted
-                // and appends one ADIF record per completed QSO. Fail-soft: if open
-                // fails, we log but proceed with DB-only — every operator should at
-                // least get duplicate detection from the DB.
+                // ADIF source of truth at ~/.pancetta/qsos.adi.
                 let adif_path = dirs::home_dir()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join(".pancetta")
                     .join("qsos.adi");
 
-                let _adif_writer = match pancetta_qso::AdifLogWriter::open(&adif_path).await {
-                    Ok(mut w) => {
-                        info!("ADIF log open at {}", adif_path.display());
-                        w.set_station_power_watts(station_power_watts);
-                        let w = std::sync::Arc::new(w);
-                        start_adif_subscriber(w.clone(), qso_manager.subscribe(), shutdown.clone());
-                        Some(w)
-                    }
-                    Err(e) => {
-                        warn!(
-                            "ADIF writer init failed at {}: {} — continuing; QSOs this \
-                             session will be DB-only",
-                            adif_path.display(),
-                            e,
-                        );
-                        None
-                    }
-                };
-
-                // Async QSO logger — subscribes independently to QsoEvent::QsoCompleted
-                // and inserts into the rebuildable SQLite index. Comes AFTER the ADIF
-                // writer so that a crash between the two is recoverable by Task 5's
-                // startup replay (ADIF is source of truth; DB is cache).
-                let logger_config = LoggerConfig {
-                    database_path: db_path.clone(),
+                // Both LOCAL source-of-truth writers (ADIF appender + SQLite
+                // index) live behind one helper so the `--replay` suppression
+                // is a single gate, testable without a whole coordinator.
+                let (_adif_writer, _async_logger) = start_local_qso_log_writers(
+                    replay_mode,
+                    &adif_path,
+                    &db_path,
+                    station_power_watts,
                     persist_qso_timeline,
-                    ..Default::default()
-                };
-
-                let _async_logger = match pancetta_qso::async_logger::QsoLogger::new(
-                    logger_config,
-                    qso_manager.clone(),
+                    &qso_manager,
+                    shutdown.clone(),
                 )
-                .await
-                {
-                    Ok(l) => {
-                        info!(
-                            "Async QSO logger initialized with database at {}",
-                            db_path.display()
-                        );
-                        let l = std::sync::Arc::new(l);
-                        if let Err(e) = l.start().await {
-                            warn!("Async QSO logger background tasks failed to start: {}", e);
-                        }
-                        Some(l)
-                    }
-                    Err(e) => {
-                        warn!(
-                            "Failed to initialize async QSO logger (continuing without): {}",
-                            e
-                        );
-                        None
-                    }
-                };
+                .await;
 
                 // Per-QSO log-upload subscriber (ClubLog + QRZ Logbook + cqdx.io
                 // + eQSL + LoTW), with optional QRZ-XML grid enrichment applied
                 // first. Opt-in: only spawned when at least one upload target OR
-                // QRZ XML enrichment is enabled. Best-effort and fully decoupled
+                // QRZ XML enrichment is enabled, and never under `--replay`
+                // (see `upload_enabled`). Best-effort and fully decoupled
                 // from the QSO pipeline — each upload runs in its own task so a
                 // slow/failing service never blocks logging.
                 if upload_enabled {
@@ -5804,6 +5766,32 @@ fn cqdx_logbook_upload_enabled(cfg: &pancetta_config::network::CqdxConfig) -> bo
     cfg.enabled && cfg.token.as_ref().is_some_and(|t| !t.is_empty())
 }
 
+/// Whether the per-QSO logbook upload subscriber should run at all: at least
+/// one target must be enabled, AND `--replay` must not be active.
+///
+/// `--replay` never uploads. A QSO the engine "completes" off replayed
+/// (historical) traffic would be POSTed to ClubLog/QRZ/LoTW/eQSL/cqdx.io as a
+/// brand-new contact stamped with today's date — permanent, externally-visible
+/// bad log data. Same gate as the reception/spot paths; see
+/// `ApplicationCoordinator::replay_mode`.
+fn logbook_upload_enabled(
+    clublog_enabled: bool,
+    qrz_enabled: bool,
+    lotw_enabled: bool,
+    eqsl_enabled: bool,
+    cqdx_upload_enabled: bool,
+    qrz_xml_enabled: bool,
+    replay: bool,
+) -> bool {
+    !replay
+        && (clublog_enabled
+            || qrz_enabled
+            || lotw_enabled
+            || eqsl_enabled
+            || cqdx_upload_enabled
+            || qrz_xml_enabled)
+}
+
 /// Build the structured cqdx.io `QsoRecord` for the `POST /api/v1/qsos`
 /// logbook endpoint from a completed `QsoMetadata`. Returns `None` when the
 /// contra-callsign is unknown (nothing to log). The frequency is the dial+offset
@@ -6282,6 +6270,119 @@ fn start_qso_upload_subscriber(
     });
 }
 
+/// Start the LOCAL source-of-truth QSO log writers and hand back the handles
+/// the QSO component keeps alive for the process lifetime: the ADIF appender
+/// (`~/.pancetta/qsos.adi`) and the rebuildable SQLite index
+/// (`~/.pancetta/qso.db`).
+///
+/// **Suppressed entirely under `--replay`** (see
+/// [`crate::coordinator::ApplicationCoordinator::replay_mode`]). A QSO the
+/// engine "completes" off replayed (historical) traffic is not a contact that
+/// ever happened, and it would be written to the operator's real log stamped
+/// with today's date — the same fabricated-live-data failure the outbound
+/// gates exist to stop, just aimed at the local logbook instead of the
+/// network. Tagging it instead of dropping it is not an option: ADIF has no
+/// standard field for "this is not a real contact". The only mechanism the
+/// specification offers is `APP_<PROGRAMID>_<FIELDNAME>`, which is
+/// private-by-convention to the originating program — no other logger, no
+/// TQSL, no upload tool would recognise or honour it, so a tagged record would
+/// still propagate as a genuine QSO the moment the file left this process.
+/// Writing nothing is the only portable answer, so replay returns
+/// `(None, None)` and the caller's keep-alive bindings stay the same shape
+/// either way.
+///
+/// No drain is needed for the suppressed path (unlike the bus-consumer
+/// components): each writer owns a `QsoManager::subscribe()` receiver that is
+/// simply never created, and a `broadcast` channel does not back up on
+/// account of a subscriber that does not exist.
+///
+/// On the live path the order matters and matches what it always was: ADIF
+/// first, SQLite second, so a crash between the two is recoverable by the
+/// startup ADIF→index replay (ADIF is the source of truth; the DB is a
+/// cache). Both are fail-soft — a failure to open either is logged and the
+/// other still runs.
+async fn start_local_qso_log_writers(
+    replay: bool,
+    adif_path: &std::path::Path,
+    db_path: &std::path::Path,
+    station_power_watts: u32,
+    persist_qso_timeline: bool,
+    qso_manager: &pancetta_qso::QsoManager,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> (
+    Option<std::sync::Arc<pancetta_qso::AdifLogWriter>>,
+    Option<std::sync::Arc<pancetta_qso::async_logger::QsoLogger>>,
+) {
+    if replay {
+        info!(
+            "--replay: local QSO log writes suppressed — neither {} nor {} is \
+             opened, so a QSO 'completed' off replayed traffic leaves no record",
+            adif_path.display(),
+            db_path.display(),
+        );
+        return (None, None);
+    }
+
+    // ADIF source-of-truth writer. Subscribes to QsoEvent::QsoCompleted and
+    // appends one ADIF record per completed QSO. Fail-soft: if open fails, we
+    // log but proceed with DB-only — every operator should at least get
+    // duplicate detection from the DB.
+    let adif_writer = match pancetta_qso::AdifLogWriter::open(adif_path).await {
+        Ok(mut w) => {
+            info!("ADIF log open at {}", adif_path.display());
+            w.set_station_power_watts(station_power_watts);
+            let w = std::sync::Arc::new(w);
+            start_adif_subscriber(w.clone(), qso_manager.subscribe(), shutdown);
+            Some(w)
+        }
+        Err(e) => {
+            warn!(
+                "ADIF writer init failed at {}: {} — continuing; QSOs this \
+                 session will be DB-only",
+                adif_path.display(),
+                e,
+            );
+            None
+        }
+    };
+
+    // Async QSO logger — subscribes independently to QsoEvent::QsoCompleted
+    // and inserts into the rebuildable SQLite index.
+    let logger_config = pancetta_qso::LoggerConfig {
+        database_path: db_path.to_path_buf(),
+        persist_qso_timeline,
+        ..Default::default()
+    };
+
+    let async_logger = match pancetta_qso::async_logger::QsoLogger::new(
+        logger_config,
+        qso_manager.clone(),
+    )
+    .await
+    {
+        Ok(l) => {
+            info!(
+                "Async QSO logger initialized with database at {}",
+                db_path.display()
+            );
+            let l = std::sync::Arc::new(l);
+            if let Err(e) = l.start().await {
+                warn!("Async QSO logger background tasks failed to start: {}", e);
+            }
+            Some(l)
+        }
+        Err(e) => {
+            warn!(
+                "Failed to initialize async QSO logger (continuing without): {}",
+                e
+            );
+            None
+        }
+    };
+
+    (adif_writer, async_logger)
+}
+
 fn start_adif_subscriber(
     writer: std::sync::Arc<pancetta_qso::AdifLogWriter>,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
@@ -6314,7 +6415,7 @@ fn start_adif_subscriber(
 
 #[cfg(test)]
 mod cqdx_upload_tests {
-    use super::{cqdx_logbook_upload_enabled, cqdx_record_from_metadata};
+    use super::{cqdx_logbook_upload_enabled, cqdx_record_from_metadata, logbook_upload_enabled};
     use chrono::Utc;
     use pancetta_config::network::CqdxConfig;
     use pancetta_qso::{GridSquares, QsoMetadata, SignalReports};
@@ -6426,6 +6527,50 @@ mod cqdx_upload_tests {
     fn record_none_without_callsign() {
         let md = metadata_with_call(None);
         assert!(cqdx_record_from_metadata(&md).is_none());
+    }
+
+    /// `--replay` forces the logbook-upload subscriber off even when every
+    /// target is enabled — a replayed "completed" QSO must never be filed as
+    /// a real contact.
+    #[test]
+    fn replay_disables_upload_even_with_every_target_enabled() {
+        assert!(!logbook_upload_enabled(
+            true, true, true, true, true, true, true
+        ));
+    }
+
+    /// With replay off, at least one enabled target is sufficient.
+    #[test]
+    fn any_single_target_enables_upload_when_not_replaying() {
+        assert!(logbook_upload_enabled(
+            true, false, false, false, false, false, false
+        ));
+        assert!(logbook_upload_enabled(
+            false, true, false, false, false, false, false
+        ));
+        assert!(logbook_upload_enabled(
+            false, false, true, false, false, false, false
+        ));
+        assert!(logbook_upload_enabled(
+            false, false, false, true, false, false, false
+        ));
+        assert!(logbook_upload_enabled(
+            false, false, false, false, true, false, false
+        ));
+        assert!(logbook_upload_enabled(
+            false, false, false, false, false, true, false
+        ));
+    }
+
+    /// No target enabled → no upload, replay or not.
+    #[test]
+    fn no_targets_enabled_means_no_upload() {
+        assert!(!logbook_upload_enabled(
+            false, false, false, false, false, false, false
+        ));
+        assert!(!logbook_upload_enabled(
+            false, false, false, false, false, false, true
+        ));
     }
 }
 
@@ -6642,5 +6787,200 @@ mod caller_dedup_tests {
             third_insert,
             "first decode in new slot must be admitted again"
         );
+    }
+}
+
+#[cfg(test)]
+mod replay_local_log_tests {
+    use super::start_local_qso_log_writers;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    /// Minimal manager config: a real callsign (the placeholder guard in
+    /// `start_cq` rejects NOCALL/N0CALL) and a grid, everything else default.
+    fn manager() -> pancetta_qso::QsoManager {
+        pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W1ABC".to_string(),
+            our_grid: Some("FN42".to_string()),
+            ..Default::default()
+        })
+    }
+
+    /// Drive one full CQ→grid→report→73 exchange, which is what makes the
+    /// manager emit `QsoEvent::QsoCompleted` — the single event both local
+    /// writers subscribe to.
+    async fn complete_one_qso(manager: &pancetta_qso::QsoManager) {
+        let freq = 14_074_000.0;
+        manager
+            .start_cq(freq, None, false)
+            .await
+            .expect("start_cq should succeed");
+
+        manager
+            .process_message(
+                pancetta_qso::MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                freq,
+                Some(-10.0),
+            )
+            .await
+            .expect("CqResponse should be accepted");
+        manager
+            .process_message(
+                pancetta_qso::MessageType::ReportAck {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -12,
+                },
+                "W1ABC K1DEF R-12".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .expect("ReportAck should be accepted");
+        manager
+            .process_message(
+                pancetta_qso::MessageType::SeventyThree {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                },
+                "W1ABC K1DEF 73".to_string(),
+                freq,
+                Some(-11.0),
+            )
+            .await
+            .expect("73 should be accepted");
+    }
+
+    /// Number of complete ADIF records in `path` (`<eor>` terminates one).
+    /// A missing file counts as zero — the file only exists once something
+    /// opened it for writing.
+    fn adif_record_count(path: &std::path::Path) -> usize {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .to_ascii_lowercase()
+            .matches("<eor>")
+            .count()
+    }
+
+    /// Poll for up to ~5s: the ADIF append happens in the subscriber task, so
+    /// the LIVE control has to wait for it rather than race it.
+    async fn wait_for_adif_record(path: &std::path::Path) -> usize {
+        for _ in 0..100 {
+            let n = adif_record_count(path);
+            if n > 0 {
+                return n;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        adif_record_count(path)
+    }
+
+    /// CONTROL (makes the replay assertion below non-vacuous): on a live run
+    /// the very same exchange DOES reach both local writers — the ADIF file
+    /// gains a record and the SQLite index is created.
+    #[tokio::test]
+    async fn live_run_writes_the_completed_qso_to_the_local_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (adif_writer, async_logger) = start_local_qso_log_writers(
+            false, // NOT replay
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+        assert!(
+            adif_writer.is_some(),
+            "precondition: a live run must open the ADIF source of truth"
+        );
+        assert!(
+            async_logger.is_some(),
+            "precondition: a live run must construct the SQLite QSO logger"
+        );
+
+        complete_one_qso(&manager).await;
+
+        assert_eq!(
+            wait_for_adif_record(&adif_path).await,
+            1,
+            "precondition: a completed QSO must be appended to the ADIF log on a \
+             live run — otherwise the --replay assertions prove nothing"
+        );
+        assert!(
+            db_path.exists(),
+            "precondition: a live run must create the SQLite index at {}",
+            db_path.display()
+        );
+
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// The gate itself: under `--replay` a QSO the engine "completes" off
+    /// replayed (historical) traffic must leave ZERO trace in the operator's
+    /// local log. Not a tagged record — no record, and no file at all, because
+    /// ADIF has no portable way to mark a record as synthetic.
+    #[tokio::test]
+    async fn replay_run_writes_nothing_to_the_local_log() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let adif_path = dir.path().join("qsos.adi");
+        let db_path = dir.path().join("qso.db");
+        let manager = manager();
+        let shutdown = Arc::new(AtomicBool::new(false));
+
+        let (adif_writer, async_logger) = start_local_qso_log_writers(
+            true, // --replay
+            &adif_path,
+            &db_path,
+            100,
+            false,
+            &manager,
+            shutdown.clone(),
+        )
+        .await;
+        assert!(
+            adif_writer.is_none(),
+            "the ADIF source of truth must not be opened under --replay"
+        );
+        assert!(
+            async_logger.is_none(),
+            "the SQLite QSO logger must not be constructed under --replay"
+        );
+
+        complete_one_qso(&manager).await;
+
+        // Give any (wrongly) spawned subscriber the same window the live
+        // control needed to land its record, so this is a real wait, not an
+        // instant pass on a race.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        assert_eq!(
+            adif_record_count(&adif_path),
+            0,
+            "a replayed QSO must not appear in the ADIF log"
+        );
+        assert!(
+            !adif_path.exists(),
+            "--replay must not even create {} — zero trace",
+            adif_path.display()
+        );
+        assert!(
+            !db_path.exists(),
+            "--replay must not even create the SQLite index at {} — zero trace",
+            db_path.display()
+        );
+
+        shutdown.store(true, std::sync::atomic::Ordering::Release);
     }
 }

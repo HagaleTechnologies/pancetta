@@ -62,6 +62,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--replay` now actually decodes. The replay feeder emitted bare mono samples
+  while the DSP stage de-interleaves every incoming buffer against `[audio]
+  input_channels` (default 2) — so it discarded every second real sample and
+  treated the survivors as covering the same wall-clock span, halving the
+  effective sample rate and making an FT8 decode impossible regardless of
+  timing, decode effort, or content. The feeder now interleaves each sample
+  across `input_channels`, mimicking a real capture stream. A `--replay` run
+  over `assets/demo-wav` goes from 0 decodes to 26, and the README demo GIF
+  and screenshots were re-rendered accordingly (the DX Hunter priority table
+  is populated for the first time).
+- `--replay` combined with `--no-audio`, `--test-tx`, or `--wav` is now
+  rejected at CLI parse time. `--no-audio` hung forever (the `no_audio`
+  short-circuit in `start_audio_pipeline` precedes the replay branch, so no
+  feeder was spawned and nothing ever triggered the shutdown signal);
+  `--test-tx` truncated any corpus longer than 35s before its final decodes;
+  and `--wav` silently won an undocumented precedence race in
+  `ApplicationCoordinator::run`, running single-file decode-and-exit playback
+  while ignoring the requested replay pipeline.
+- `--replay` fails fast instead of reporting a success that decoded nothing.
+  A configured `[audio] sample_rate` that the DSP stage cannot decimate to
+  12 kHz (44100 and 22050 are valid config values) made the DSP worker exit
+  on startup while the feeder paced the whole corpus into a dead channel and
+  exited 0; and a corpus of well-formed but zero-frame `.wav` files passed
+  the existing empty-directory check and fed nothing. Both now bail before
+  the feed loop starts, naming the cause.
+- A truncated or corrupt `.wav` is now a hard, path-naming error in both
+  `--wav` and `--replay` instead of a silently shortened success. WAV samples
+  that `hound` failed to read were filtered out and the read continued, so a
+  corrupt file decoded as if it were merely shorter — and under `--replay` the
+  next corpus file was concatenated straight onto the gap, collapsing archive
+  time and shifting the alignment of every FT8 frame after the corruption while
+  the run still exited 0.
+- `--replay` seeds its 14.074 MHz default dial frequency in builds without
+  the optional `pancetta-hamlib` feature too. The seed was inside the
+  feature's `cfg` block, so exactly the build that starts no rig at all was
+  the one left reporting 0 Hz (BAND 0MHZ in remote snapshots, near-zero RF
+  frequency in QSO metadata).
+- `--replay` no longer publishes to the outside world (read-only traffic —
+  cqdx.io's rarity/needed-entity lookups, DX cluster login — still happens,
+  so the demo keeps real scoring data). A demo run against an
+  already-configured station could otherwise key the real transmitter in
+  response to replayed (historical) traffic, and publish those replayed
+  decodes — re-stamped with the current clock — as if they were live. Every
+  outbound *write* now consults one shared predicate
+  (`ApplicationCoordinator::replay_mode`): Hamlib is not started at all (no
+  PTT capability); PSKReporter is forced onto its uploads-disabled (noop
+  drain) path; cqdx.io spot reporting is suppressed; the WSJT-X UDP companion
+  protocol takes its drain-only path, so GridTracker/JTAlert never see a
+  replayed decode as a live reception; and the per-QSO logbook upload
+  subscriber (ClubLog/QRZ/LoTW/eQSL/cqdx.io) is not spawned, so a QSO
+  "completed" off replayed traffic can't be automatically uploaded as a real
+  contact. The same predicate now also suppresses the **local** write: under
+  `--replay` neither the `~/.pancetta/qsos.adi` ADIF appender nor the
+  `~/.pancetta/qso.db` SQLite QSO logger is started at all, so a replayed
+  contact leaves no record in the operator's own log either (the startup
+  duplicate-history seed still *reads* those files, as it must to make the
+  demo behave like a real station). Tagging such a record instead of
+  dropping it isn't possible — ADIF has no standard "not a real contact"
+  field, only `APP_<PROGRAMID>_*` application-defined fields that are
+  private by convention to the originating program and that no other logger,
+  TQSL, or upload tool would recognise or honour. The two
+  remote-operation consumers of the shared display feed are gated at the same
+  predicate: the read-only remote-view gateway never gets a feed and never
+  binds its WebSocket listener, and the station agent takes its inert
+  drain-only path before loading keys or dialing the relay — so replayed
+  decodes/spectrum/QSO state are never broadcast to relay peers, and no remote
+  peer can send control frames (QSY/QSO actions) into a demo process. Shutdown
+  is covered too: its direct `rigctld` PTT-off — a deliberately independent TCP
+  connection that exists so a broken in-process rig state can't leave a real
+  transmitter keyed — is skipped under `--replay`, which never started rig
+  control, so it can no longer unkey a session belonging to some *other* owner
+  of that endpoint. Live behavior is unchanged.
 - Compound-callsign QSOs (e.g. `YS/WE9G`, `8G81PA`, `3E40CDW`) now actually
   complete instead of queuing and silently re-arming every slot for the full
   5-minute watchdog window (PAN-17). The FT8 encoder gained an i3=4

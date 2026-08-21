@@ -10,7 +10,9 @@
 //! emit Heartbeat every 15s and change-driven Status, fan in FT8 decodes
 //! (additive tap in `ft8.rs`) as Decode(2) into a 500-entry retention ring,
 //! emit Clear(3) on band change, answer Replay(7) by re-emitting the ring
-//! with `New=false`, and emit Close(6) on shutdown.
+//! with `New=false`, and emit Close(6) on shutdown. `--replay` forces the
+//! drain-only shape regardless of config (see
+//! [`super::ApplicationCoordinator::replay_mode`]).
 
 pub mod codec;
 
@@ -64,8 +66,9 @@ impl super::ApplicationCoordinator {
     /// Start the WSJT-X UDP companion-protocol component.
     ///
     /// Lifecycle mirrors `start_pskreporter_component` exactly:
-    /// `enabled = false` (default) ⇒ no socket is ever bound; a bus-drain
-    /// task keeps the `ComponentId::WsjtxUdp` channel open so the decoder
+    /// `enabled = false` (default) — or any `--replay` run ⇒ no socket is
+    /// ever bound; a bus-drain task keeps the `ComponentId::WsjtxUdp`
+    /// channel open so the decoder
     /// fan-out never backs up against a channel with no reader. `enabled =
     /// true` ⇒ snapshot config, open the socket, emit an immediate Status
     /// (GridTracker instance-validity rule — protocol notes §5: an instance
@@ -77,9 +80,23 @@ impl super::ApplicationCoordinator {
     /// datagrams (answering Replay(7) by re-emitting the ring with
     /// `New=false` then a Status). Emits Close(6) on loop exit.
     pub(crate) async fn start_wsjtx_udp_component(&mut self) -> Result<()> {
+        // `--replay` decodes are historical off-air captures, but every
+        // Decode(2) datagram built from them is stamped with the current
+        // slot's wall clock. Broadcasting those would feed replayed traffic
+        // to GridTracker/JTAlert (and anything else listening) as live
+        // reception, which those apps log and upload onward. Same class as
+        // the PSKReporter and cqdx.io gates -- see
+        // `ApplicationCoordinator::replay_mode`. Take the existing drain-only
+        // path so no socket is ever bound.
+        let replay_mode = self.replay_mode();
+
         let config = self.config.read().await;
-        if !config.network.wsjtx_udp.enabled {
-            info!("WSJT-X UDP companion protocol disabled in configuration");
+        if replay_mode || !config.network.wsjtx_udp.enabled {
+            if replay_mode {
+                info!("Replay mode: WSJT-X UDP companion protocol suppressed -- replayed decodes are not live spots");
+            } else {
+                info!("WSJT-X UDP companion protocol disabled in configuration");
+            }
             drop(config);
             self.spawn_wsjtx_drain_task().await?;
             return Ok(());
@@ -2215,5 +2232,78 @@ mod reply_tests {
         assert!(remote_tx_arm_consent(true, true));
         // Both off ⇒ not seeded (fail-closed default).
         assert!(!remote_tx_arm_consent(false, false));
+    }
+}
+
+#[cfg(test)]
+mod replay_gate_tests {
+    use super::*;
+    use crate::coordinator::ApplicationCoordinator;
+    use pancetta_config::Config;
+    use std::path::PathBuf;
+    use std::sync::atomic::AtomicBool;
+
+    /// A coordinator with the companion protocol *enabled* and pointed at a
+    /// caller-owned loopback port, optionally in `--replay` mode.
+    async fn coordinator_targeting(port: u16, replay: Option<PathBuf>) -> ApplicationCoordinator {
+        let mut config = Config::default();
+        config.network.wsjtx_udp.enabled = true;
+        config.network.wsjtx_udp.destination = format!("127.0.0.1:{port}");
+        ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            replay,
+            None, // no test-tx
+            1500.0,
+            Arc::new(AtomicBool::new(false)),
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// Waits for the startup Status datagram (protocol notes §5: the enabled
+    /// path sends one synchronously before its loop). `Ok` ⇒ a datagram
+    /// arrived, `Err` ⇒ nothing did within the window.
+    async fn wait_for_datagram(listener: &tokio::net::UdpSocket) -> bool {
+        let mut buf = [0u8; 2048];
+        tokio::time::timeout(Duration::from_millis(1500), listener.recv_from(&mut buf))
+            .await
+            .is_ok()
+    }
+
+    /// Control: proves the assertion below can actually fail — with the same
+    /// config and no `--replay`, the startup Status datagram does arrive.
+    #[tokio::test]
+    async fn enabled_component_emits_its_startup_status_when_not_replaying() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut coordinator = coordinator_targeting(port, None).await;
+        coordinator.start_wsjtx_udp_component().await.unwrap();
+        assert!(
+            wait_for_datagram(&listener).await,
+            "a live run with wsjtx_udp enabled must emit its startup Status"
+        );
+    }
+
+    /// `--replay` takes the drain-only path: no socket is bound, so nothing
+    /// on the LAN (GridTracker, JTAlert, ...) is ever told that replayed
+    /// historical traffic is a live reception.
+    #[tokio::test]
+    async fn replay_emits_no_datagram_even_with_the_component_enabled() {
+        let listener = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let mut coordinator =
+            coordinator_targeting(port, Some(PathBuf::from("/nonexistent/replay/dir"))).await;
+        coordinator.start_wsjtx_udp_component().await.unwrap();
+        assert!(
+            !wait_for_datagram(&listener).await,
+            "--replay must not broadcast replayed decodes to companion apps"
+        );
     }
 }

@@ -5,8 +5,11 @@
 //! and earning reciprocal visibility for spot lookups. Submits in
 //! batches; rate-limited to PSKReporter's policy.
 //!
-//! Always-on when `[network.psk_reporter].enabled = true` (the
-//! default — no credentials required, just an outbound HTTPS post).
+//! Opt-in: uploads run when `[network.psk_reporter].enabled = true`
+//! (`PskReporterConfig::default()` is `enabled: false`, so an operator
+//! has to turn this on deliberately — no credentials required once they
+//! do, just an outbound HTTPS post). Suppressed outright under
+//! `--replay`, because replayed decodes are not live receptions.
 
 use anyhow::Result;
 use std::sync::atomic::Ordering;
@@ -22,9 +25,24 @@ impl super::ApplicationCoordinator {
     /// Receives decoded FT8 messages, batches them, and uploads to PSKReporter
     /// at the configured interval (default: 5 minutes).
     pub(crate) async fn start_pskreporter_component(&mut self) -> Result<()> {
+        // `--replay` decodes are historical off-air captures, but every spot
+        // built from them is stamped `SystemTime::now()`. Uploading those
+        // would inject fabricated "live" reception reports into the public
+        // pskreporter.info propagation dataset other operators rely on, so a
+        // replay session takes the uploads-disabled path unconditionally --
+        // regardless of what the operator's config says.
+        // (`PskReporterConfig::default()` is `enabled: false`, so this only
+        // ever bites an operator who deliberately turned uploads on: exactly
+        // the station whose reports are trusted.)
+        let replay_mode = self.replay_mode();
+
         let config = self.config.read().await;
-        if !config.network.psk_reporter.enabled {
-            info!("PSKReporter upload disabled in configuration");
+        if replay_mode || !config.network.psk_reporter.enabled {
+            if replay_mode {
+                info!("Replay mode: PSKReporter uploads suppressed -- replayed decodes are not live spots");
+            } else {
+                info!("PSKReporter upload disabled in configuration");
+            }
             drop(config);
             // The decoder fans every decoded message out to PskReporter via the
             // message bus unconditionally. If we created the channel without a
