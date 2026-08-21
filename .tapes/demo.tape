@@ -41,14 +41,21 @@ Wait+Screen@15s /Band Activity/
 # audio feed -- up to 15s of pre-roll -- so the process no longer starts
 # feeding audio at an arbitrary phase relative to the decoder's UTC-keyed
 # windows. That phase-alignment is what makes a decode reliable, but it
-# also shifts the four 15s FT8 decode windows later by up to 15s in the
-# worst case (previously ~t=24s/37s/52s measured from process start).
-# Sleep through the full pre-roll + decode-window sequence regardless.
-Sleep 60s
+# also shifts the five 15s FT8 decode windows later by up to 15s in the
+# worst case. `assets/demo-wav` now holds 5 files (the original 4 numbered
+# captures plus `live_now.wav`, added because it's the one fixture in that
+# source directory documented to actually decode -- see
+# `assets/demo-wav/README.md`), so total audio is ~75s (5x15s) instead of
+# the previous ~60s. Sleep through the full pre-roll + decode-window
+# sequence regardless.
+Sleep 75s
 
 # `--replay` self-terminates ~5s after the input directory is exhausted
 # (REPLAY_GRACE_PERIOD in pancetta/src/coordinator/replay.rs). Worst-case
-# total process lifetime is now ~80s: up to 15s UTC-slot pre-roll + 60s of
-# audio + 5s grace period. Hold long enough to see the process exit back
-# to the shell prompt on its own; no manual Ctrl+C is needed or wanted.
-Sleep 35s
+# total process lifetime is now ~95s: up to 15s UTC-slot pre-roll + 75s of
+# audio + 5s grace period. Sleep well past that so the recording holds
+# long enough to see the process exit back to the shell prompt on its own
+# (no manual Ctrl+C); the extra margin also gives the 5th file's decode
+# window -- the one most likely to show a live decode -- room to render
+# and stay on screen before the process exits.
+Sleep 40s
