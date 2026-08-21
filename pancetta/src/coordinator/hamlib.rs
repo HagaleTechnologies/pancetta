@@ -422,33 +422,57 @@ mod hamlib_loop_ready_guard_tests {
 }
 
 /// PAN-19 round-16 review (Codex P1): "keep restored rig state pending
-/// through CAT application". Sets `hamlib_command_in_flight` `true` on
-/// construction and back to `false` on `Drop` -- unlike
-/// `HamlibLoopReadyGuard` above (which only ever clears, never sets), this
-/// one brackets a specific, short-lived critical section: the message
-/// loop's underlying `set_frequency`/`set_split_freq`/`set_split` CAT
-/// call. Constructed immediately before that call starts and dropped
-/// immediately after it resolves (success OR failure -- `Drop` doesn't
-/// care which), so `tx_hard_mute_reason`'s pending-state check sees
-/// "in flight" for the CAT call's entire duration, closing the window
-/// round 14's pending-slot check alone couldn't see: a pending command
-/// already handed off to the channel (slot cleared) but not yet applied.
-/// Same RAII-cleanup-on-any-exit precedent as `HamlibLoopReadyGuard`
-/// (`RemoteTxDisarmGuard` in `station_agent/mod.rs`) -- panic-unwind or
-/// task cancellation during the CAT call still clears it, so a crash
-/// mid-call can never leave PTT permanently muted.
-struct HamlibCommandInFlightGuard(Arc<std::sync::atomic::AtomicBool>);
+/// through CAT application". Bumps `hamlib_command_in_flight`'s count on
+/// construction and back down on `Drop` -- unlike `HamlibLoopReadyGuard`
+/// above (which only ever clears, never sets), this one brackets a
+/// specific, short-lived critical section: the message loop's underlying
+/// `set_frequency`/`set_split_freq`/`set_split` CAT call. Constructed
+/// immediately before that call starts and dropped immediately after it
+/// resolves (success OR failure -- `Drop` doesn't care which), so
+/// `tx_hard_mute_reason`'s pending-state check sees "in flight" for the
+/// CAT call's entire duration, closing the window round 14's pending-slot
+/// check alone couldn't see: a pending command already handed off to the
+/// channel (slot cleared) but not yet applied. Same RAII-cleanup-on-any-
+/// exit precedent as `HamlibLoopReadyGuard` (`RemoteTxDisarmGuard` in
+/// `station_agent/mod.rs`) -- panic-unwind or task cancellation during the
+/// CAT call still clears it, so a crash mid-call can never leave PTT
+/// permanently muted.
+///
+/// PAN-19 round-19 review (Codex P1): "count every pending command
+/// handoff". `hamlib_command_in_flight` is now a count (`AtomicU32`), not
+/// a boolean -- there can legitimately be TWO outstanding handoffs at
+/// once (a pending `SetFrequency` AND `SetSplit` delivered together).
+/// [`new`] increments on construction and decrements on drop, for a
+/// FRESH handoff this guard is entirely responsible for counting.
+/// [`adopt`] does NOT increment -- it takes over an EXISTING increment
+/// someone else already made (the producer side, `mark_in_flight_then_send`,
+/// for a message that turns out NOT to be superseded and is about to be
+/// applied) and decrements it on drop, so that increment is retired
+/// exactly once, not double-counted.
+struct HamlibCommandInFlightGuard(Arc<std::sync::atomic::AtomicU32>);
 
 impl HamlibCommandInFlightGuard {
-    fn new(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
-        flag.store(true, Ordering::Release);
-        Self(flag)
+    /// Increments on construction; use for a handoff this guard is
+    /// entirely responsible for counting (nothing else incremented for
+    /// it first).
+    fn new(count: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        count.fetch_add(1, Ordering::AcqRel);
+        Self(count)
+    }
+
+    /// Does NOT increment -- adopts (takes over responsibility for
+    /// decrementing) an increment someone else already made. Use when
+    /// this guard is retiring a handoff the producer side already
+    /// counted via `mark_in_flight_then_send`, so the SAME increment
+    /// isn't counted twice.
+    fn adopt(count: Arc<std::sync::atomic::AtomicU32>) -> Self {
+        Self(count)
     }
 }
 
 impl Drop for HamlibCommandInFlightGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        self.0.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -456,49 +480,52 @@ impl Drop for HamlibCommandInFlightGuard {
 mod hamlib_command_in_flight_guard_tests {
     use super::*;
 
-    /// The flag must be `true` for the guard's ENTIRE lifetime -- set the
-    /// instant it's constructed, not lazily.
+    /// The count must be bumped for the guard's ENTIRE lifetime -- `new`
+    /// increments immediately, not lazily.
     #[test]
-    fn new_sets_the_flag_immediately() {
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let _guard = HamlibCommandInFlightGuard::new(flag.clone());
-        assert!(
-            flag.load(Ordering::Acquire),
-            "constructing the guard must set the in-flight flag immediately"
+    fn new_increments_the_count_immediately() {
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let _guard = HamlibCommandInFlightGuard::new(count.clone());
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            1,
+            "constructing the guard must bump the in-flight count immediately"
         );
     }
 
-    /// Symmetric with `HamlibLoopReadyGuard`: `Drop` clears it, whether
-    /// the CAT call this guard brackets succeeded or failed -- the guard
-    /// itself is outcome-agnostic; `finish_rig_command` handles the
+    /// Symmetric with `HamlibLoopReadyGuard`: `Drop` decrements it,
+    /// whether the CAT call this guard brackets succeeded or failed -- the
+    /// guard itself is outcome-agnostic; `finish_rig_command` handles the
     /// outcome separately (pending slot / tracker), this guard only ever
-    /// tracks "is a call currently in flight".
+    /// tracks "how many calls are currently in flight".
     #[test]
-    fn drop_clears_the_flag_regardless_of_outcome() {
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    fn drop_decrements_the_count_regardless_of_outcome() {
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
         {
-            let _guard = HamlibCommandInFlightGuard::new(flag.clone());
-            assert!(
-                flag.load(Ordering::Acquire),
-                "test setup: flag should be true while guarded"
+            let _guard = HamlibCommandInFlightGuard::new(count.clone());
+            assert_eq!(
+                count.load(Ordering::Acquire),
+                1,
+                "test setup: count should be 1 while guarded"
             );
         }
-        assert!(
-            !flag.load(Ordering::Acquire),
-            "the guard's Drop must clear the in-flight flag the instant its scope ends"
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            0,
+            "the guard's Drop must decrement the in-flight count the instant its scope ends"
         );
     }
 
     /// Same panic-unwind safety net as `HamlibLoopReadyGuard` -- a panic
     /// mid-CAT-call must not leave PTT permanently muted by a stuck
-    /// in-flight flag.
+    /// in-flight count.
     #[test]
-    fn drop_clears_the_flag_even_on_panic_unwind() {
-        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag_for_panic = flag.clone();
+    fn drop_decrements_the_count_even_on_panic_unwind() {
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_for_panic = count.clone();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = HamlibCommandInFlightGuard::new(flag_for_panic);
+            let _guard = HamlibCommandInFlightGuard::new(count_for_panic);
             panic!("simulated unexpected panic mid-CAT-call");
         }));
         assert!(
@@ -506,10 +533,62 @@ mod hamlib_command_in_flight_guard_tests {
             "test setup: the closure should have panicked"
         );
 
-        assert!(
-            !flag.load(Ordering::Acquire),
-            "the guard's Drop must clear the in-flight flag even when the scope exits via a \
-             panic"
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            0,
+            "the guard's Drop must decrement the in-flight count even when the scope exits via \
+             a panic"
+        );
+    }
+
+    /// PAN-19 round-19 review (Codex P1): the actual bug finding #1
+    /// describes. TWO outstanding handoffs (frequency + split) at once --
+    /// the count must reach 2, and only drop to 0 once BOTH guards have
+    /// dropped, not after just the first.
+    #[test]
+    fn two_concurrent_guards_both_contribute_and_both_must_drop_to_reach_zero() {
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let frequency_guard = HamlibCommandInFlightGuard::new(count.clone());
+        let split_guard = HamlibCommandInFlightGuard::new(count.clone());
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            2,
+            "two independent handoffs must both contribute to the count"
+        );
+
+        drop(frequency_guard);
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            1,
+            "dropping only the FIRST of two guards must leave the count at 1, not 0 -- the \
+             second handoff is still outstanding"
+        );
+
+        drop(split_guard);
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            0,
+            "dropping the second guard must bring the count back to 0"
+        );
+    }
+
+    /// `adopt` must NOT increment -- it takes over an existing increment
+    /// (the producer's) rather than adding a new one.
+    #[test]
+    fn adopt_does_not_increment_but_still_decrements_on_drop() {
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(1)); // producer already incremented
+        {
+            let _guard = HamlibCommandInFlightGuard::adopt(count.clone());
+            assert_eq!(
+                count.load(Ordering::Acquire),
+                1,
+                "adopt must not add a SECOND increment on top of the producer's existing one"
+            );
+        }
+        assert_eq!(
+            count.load(Ordering::Acquire),
+            0,
+            "adopt's guard must still decrement (retire) the adopted increment on drop"
         );
     }
 }
@@ -854,8 +933,16 @@ impl super::ApplicationCoordinator {
                          command -- queuing it for the next Hamlib generation instead of \
                          dropping it"
                     );
+                    // PAN-19 round-19 review (Codex P1): "preserve the
+                    // newest split in teardown fallback" -- same
+                    // newest-wins comparison `finish_rig_command` already
+                    // uses, reused here (not reimplemented) so this
+                    // SEPARATE overwrite site can't revert an already-
+                    // retained NEWER pending command to a stale older one.
                     if let Ok(mut slot) = self.hamlib_pending_frequency.lock() {
-                        *slot = Some(pending);
+                        if should_replace_pending_slot(&pending, slot.as_ref()) {
+                            *slot = Some(pending);
+                        }
                     }
                 }
                 MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
@@ -867,8 +954,12 @@ impl super::ApplicationCoordinator {
                          (a dropped SetSplit is not self-healing and could leave the rig \
                          holding stale split state)"
                     );
+                    // PAN-19 round-19 review (Codex P1): same reasoning as
+                    // SetFrequency above.
                     if let Ok(mut slot) = self.hamlib_pending_split.lock() {
-                        *slot = Some(pending);
+                        if should_replace_pending_slot(&pending, slot.as_ref()) {
+                            *slot = Some(pending);
+                        }
                     }
                 }
                 _ => {
@@ -983,13 +1074,12 @@ impl super::ApplicationCoordinator {
 
         // PAN-19 round-17 review (Codex P1): "cover the pending-command
         // handoff before CAT starts". Reset alongside
-        // `hamlib_command_loop_ready` above -- a stuck-`true`
+        // `hamlib_command_loop_ready` above -- a stuck-nonzero
         // `hamlib_command_in_flight` (e.g. the producer-side handoff set
         // it, then the task that would have cleared it crashed before
         // ever reaching that point) must never survive past the NEXT
         // restart. See that field's doc comment in `coordinator/mod.rs`.
-        self.hamlib_command_in_flight
-            .store(false, Ordering::Release);
+        self.hamlib_command_in_flight.store(0, Ordering::Release);
 
         if self
             .rigctld_process
@@ -1242,6 +1332,27 @@ impl super::ApplicationCoordinator {
         // its own handle taken before that move happens.
         let last_applied_frequency_id_for_start = last_applied_frequency_id.clone();
         let last_applied_split_id_for_start = last_applied_split_id.clone();
+        // PAN-19 round-19 review (Codex P1): "retire the handoff marker
+        // when discarding stale state". Tracks the message `id` of
+        // whichever SetFrequency/SetSplit handoff `mark_in_flight_then_send`
+        // (producer side, in `deliver_pending_hamlib_state`) most recently
+        // incremented `hamlib_command_in_flight` for -- so that WHOEVER
+        // retires this specific message at the consumer side (whether it's
+        // actually applied via `HamlibCommandInFlightGuard::adopt`, or
+        // discarded as superseded by the message loop's own supersession
+        // check without ever reaching a guard) can find and clear the ONE
+        // matching increment, instead of leaving it stranded. See
+        // `take_producer_mark_if_matching`'s doc comment for the full
+        // reasoning. Same per-generation-fresh, per-kind-separate shape as
+        // `last_applied_frequency_id`/`last_applied_split_id` above.
+        let producer_marked_frequency_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let producer_marked_split_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let producer_marked_frequency_id_for_polling = producer_marked_frequency_id.clone();
+        let producer_marked_split_id_for_polling = producer_marked_split_id.clone();
+        let producer_marked_frequency_id_for_start = producer_marked_frequency_id.clone();
+        let producer_marked_split_id_for_start = producer_marked_split_id.clone();
 
         // Oneshot used to gate startup: the spawned task signals here once the
         // initial connect + get_frequency have completed (or failed).  We await
@@ -1408,6 +1519,8 @@ impl super::ApplicationCoordinator {
                             &last_applied_split_id_for_polling,
                             &hamlib_tx_for_polling,
                             &hamlib_command_in_flight_for_polling,
+                            &producer_marked_frequency_id_for_polling,
+                            &producer_marked_split_id_for_polling,
                         );
 
                         let poll_ok = if let Ok(status) = rig_for_polling.get_status().await {
@@ -1883,6 +1996,25 @@ impl super::ApplicationCoordinator {
                                         // can't see) still gets dropped
                                         // instead of applied.
                                         if is_superseded(&message, &last_applied_frequency_id) {
+                                            // PAN-19 round-19 review (Codex
+                                            // P1): "retire the handoff
+                                            // marker when discarding stale
+                                            // state" -- if this discarded
+                                            // message was the producer's
+                                            // own marked handoff, nothing
+                                            // else will ever retire its
+                                            // increment (the guard that
+                                            // normally does that is never
+                                            // constructed on this
+                                            // `continue` path), so retire
+                                            // it here directly.
+                                            if take_producer_mark_if_matching(
+                                                &message,
+                                                &producer_marked_frequency_id,
+                                            ) {
+                                                hamlib_command_in_flight
+                                                    .fetch_sub(1, Ordering::AcqRel);
+                                            }
                                             warn!(
                                                 target: "rig",
                                                 "Discarding a stale SetFrequency command \
@@ -1933,9 +2065,27 @@ impl super::ApplicationCoordinator {
                                         // time by `deliver_pending_hamlib_state`,
                                         // before this call even started).
                                         let io_ok = {
-                                            let _in_flight_guard = HamlibCommandInFlightGuard::new(
-                                                hamlib_command_in_flight.clone(),
-                                            );
+                                            // PAN-19 round-19 review (Codex
+                                            // P1): if this message was the
+                                            // producer's own marked
+                                            // handoff, ADOPT its existing
+                                            // increment (don't add a
+                                            // second one) -- otherwise this
+                                            // is a fresh send with nothing
+                                            // to adopt, so count it
+                                            // ourselves.
+                                            let _in_flight_guard = if take_producer_mark_if_matching(
+                                                &message,
+                                                &producer_marked_frequency_id,
+                                            ) {
+                                                HamlibCommandInFlightGuard::adopt(
+                                                    hamlib_command_in_flight.clone(),
+                                                )
+                                            } else {
+                                                HamlibCommandInFlightGuard::new(
+                                                    hamlib_command_in_flight.clone(),
+                                                )
+                                            };
                                             match rig_poll.set_frequency(vfo_enum, *frequency).await
                                             {
                                                 Ok(()) => true,
@@ -2002,6 +2152,18 @@ impl super::ApplicationCoordinator {
                                         // supersession re-check as
                                         // SetFrequency above.
                                         if is_superseded(&message, &last_applied_split_id) {
+                                            // PAN-19 round-19 review (Codex
+                                            // P1): same "retire the
+                                            // producer's mark on discard"
+                                            // reasoning as SetFrequency
+                                            // above.
+                                            if take_producer_mark_if_matching(
+                                                &message,
+                                                &producer_marked_split_id,
+                                            ) {
+                                                hamlib_command_in_flight
+                                                    .fetch_sub(1, Ordering::AcqRel);
+                                            }
                                             warn!(
                                                 target: "rig",
                                                 "Discarding a stale SetSplit command superseded \
@@ -2031,9 +2193,24 @@ impl super::ApplicationCoordinator {
                                         // calls (`set_split_freq` +
                                         // `set_split`) when enabling.
                                         let split_applied = {
-                                            let _in_flight_guard = HamlibCommandInFlightGuard::new(
-                                                hamlib_command_in_flight.clone(),
-                                            );
+                                            // PAN-19 round-19 review (Codex
+                                            // P1): adopt the producer's
+                                            // existing increment if this
+                                            // is its marked handoff, same
+                                            // reasoning as SetFrequency
+                                            // above.
+                                            let _in_flight_guard = if take_producer_mark_if_matching(
+                                                &message,
+                                                &producer_marked_split_id,
+                                            ) {
+                                                HamlibCommandInFlightGuard::adopt(
+                                                    hamlib_command_in_flight.clone(),
+                                                )
+                                            } else {
+                                                HamlibCommandInFlightGuard::new(
+                                                    hamlib_command_in_flight.clone(),
+                                                )
+                                            };
                                             if *enabled {
                                                 let freq_result =
                                                     rig_poll.set_split_freq(*tx_frequency).await;
@@ -2260,6 +2437,8 @@ impl super::ApplicationCoordinator {
             &last_applied_split_id_for_start,
             &hamlib_tx,
             &self.hamlib_command_in_flight,
+            &producer_marked_frequency_id_for_start,
+            &producer_marked_split_id_for_start,
         );
 
         // PAN-19 MEDIUM #2 (round 1) + round-12 review (Codex P1) "retain
@@ -2503,13 +2682,40 @@ fn finish_rig_command(
     if io_ok {
         record_applied(message, last_applied_id);
     } else if let Ok(mut slot) = pending_slot.lock() {
-        let should_replace = match slot.as_ref() {
-            Some(retained) => message.id > retained.id,
-            None => true,
-        };
-        if should_replace {
+        if should_replace_pending_slot(message, slot.as_ref()) {
             *slot = Some(message.clone());
         }
+    }
+}
+
+/// PAN-19 round-16 review (Codex P1) finding #2, extracted for round-19
+/// review (Codex P1) finding #3: "preserve the newest split in teardown
+/// fallback". The single, shared "is `candidate` newer than whatever's
+/// already retained" comparison every site that might overwrite a pending
+/// slot must use -- `finish_rig_command` (the message loop's own failure
+/// path) was the ORIGINAL fix, but `teardown_hamlib`'s SEPARATE replay-
+/// fallback path (draining a queued message during teardown, finding the
+/// pending slot already occupied) had its own independent, unconditional
+/// overwrite that never got the same fix: a newer split could already
+/// have failed CAT application and populated the slot, while an OLDER
+/// split remained queued behind it when the generation crashed; teardown
+/// draining that older message and finding delivery full/disconnected
+/// would silently replace the newer desired state with the stale one,
+/// and the next generation could then successfully apply the obsolete TX
+/// frequency and unmute PTT after the correct state was lost.
+///
+/// Reusing this ONE comparison everywhere (rather than a second inline
+/// copy of `message.id > retained.id`) means a THIRD site that might
+/// overwrite a pending slot in the future inherits the correct ordering
+/// for free instead of needing to remember to reimplement it.
+/// `retained: None` (nothing to preserve) always allows the replace.
+fn should_replace_pending_slot(
+    candidate: &ComponentMessage,
+    retained: Option<&ComponentMessage>,
+) -> bool {
+    match retained {
+        Some(retained) => candidate.id > retained.id,
+        None => true,
     }
 }
 
@@ -2558,14 +2764,25 @@ fn orphan_release_is_safe(confirmed_safe: bool, replacement_watchdog_alive: bool
 // the same way crossbeam's own `TrySendError<ComponentMessage>` already does
 // in the `try_send` calls below -- carrying the un-sent message back to the
 // caller so it can be requeued, not a new pattern this function introduces.
-#[allow(clippy::result_large_err)]
+//
+// PAN-19 round-19 review (Codex P1) added the two `producer_marked_*_id`
+// params (finding #2, "retire the handoff marker when discarding stale
+// state"), pushing this past clippy's default 7-argument threshold. Each
+// param plays a distinct, already-documented role (two pending slots, two
+// supersession trackers, the channel, the in-flight count, two producer-
+// mark trackers) and the two kinds (frequency/split) can't share a single
+// bundled struct without losing the "which kind is this" clarity at every
+// call site -- allowed rather than forcing an artificial grouping.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn deliver_pending_hamlib_state(
     pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     last_applied_frequency_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
     last_applied_split_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
     sender: &crossbeam_channel::Sender<ComponentMessage>,
-    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    producer_marked_frequency_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+    producer_marked_split_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
 ) {
     if let Ok(mut slot) = pending_frequency.lock() {
         if let Some(message) = slot.take() {
@@ -2575,11 +2792,12 @@ fn deliver_pending_hamlib_state(
                     "Hamlib restart: dropping a pending SetFrequency command superseded by a \
                      newer command that already went through -- not reverting good state"
                 );
-            } else if let Err(returned) =
-                mark_in_flight_then_send(message, hamlib_command_in_flight, |m| {
-                    sender.try_send(m).map_err(|e| e.into_inner())
-                })
-            {
+            } else if let Err(returned) = mark_in_flight_then_send(
+                message,
+                hamlib_command_in_flight,
+                producer_marked_frequency_id,
+                |m| sender.try_send(m).map_err(|e| e.into_inner()),
+            ) {
                 warn!(
                     "Hamlib restart: failed to deliver pending SetFrequency command -- \
                      keeping it queued for the next attempt"
@@ -2602,11 +2820,12 @@ fn deliver_pending_hamlib_state(
                     "Hamlib restart: dropping a pending SetSplit command superseded by a \
                      newer command that already went through -- not reverting good state"
                 );
-            } else if let Err(returned) =
-                mark_in_flight_then_send(message, hamlib_command_in_flight, |m| {
-                    sender.try_send(m).map_err(|e| e.into_inner())
-                })
-            {
+            } else if let Err(returned) = mark_in_flight_then_send(
+                message,
+                hamlib_command_in_flight,
+                producer_marked_split_id,
+                |m| sender.try_send(m).map_err(|e| e.into_inner()),
+            ) {
                 warn!(
                     "Hamlib restart: failed to deliver pending SetSplit command -- keeping it \
                      queued for the next attempt"
@@ -2652,19 +2871,216 @@ fn deliver_pending_hamlib_state(
 /// run arbitrary code (including a simulated consumer's full lifecycle)
 /// at the exact instant "the message left this function", which a real
 /// channel's internal timing can't be forced to reproduce reliably.
+///
+/// PAN-19 round-19 review (Codex P1): "count every pending command
+/// handoff" + "retire the handoff marker when discarding stale state".
+/// `hamlib_command_in_flight` is now a count, incremented here (not just
+/// set `true`) so two simultaneous handoffs (frequency + split) both
+/// register. `producer_marked_id` records THIS message's id as "who owns
+/// the increment this call just made" -- on send failure it's cleared
+/// here (the rollback also retires the mark, symmetric with the count
+/// rollback); on send SUCCESS it's left set so whichever consumer-side
+/// code path eventually handles this exact message (applies it via
+/// `HamlibCommandInFlightGuard::adopt`, or discards it as superseded
+/// without ever reaching a guard) can find and retire this SAME
+/// increment via `take_producer_mark_if_matching` -- see that function's
+/// doc comment.
 #[allow(clippy::result_large_err)] // ComponentMessage returned so it can be requeued; see deliver_pending_hamlib_state's own allow.
 fn mark_in_flight_then_send(
     message: ComponentMessage,
-    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    producer_marked_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
     mut send: impl FnMut(ComponentMessage) -> Result<(), ComponentMessage>,
 ) -> Result<(), ComponentMessage> {
-    hamlib_command_in_flight.store(true, Ordering::Release);
+    hamlib_command_in_flight.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut marked) = producer_marked_id.lock() {
+        *marked = Some(message.id);
+    }
     match send(message) {
         Ok(()) => Ok(()),
         Err(returned) => {
-            hamlib_command_in_flight.store(false, Ordering::Release);
+            hamlib_command_in_flight.fetch_sub(1, Ordering::AcqRel);
+            if let Ok(mut marked) = producer_marked_id.lock() {
+                *marked = None;
+            }
             Err(returned)
         }
+    }
+}
+
+/// PAN-19 round-19 review (Codex P1): "retire the handoff marker when
+/// discarding stale state". The message loop's own consumption-time
+/// `is_superseded` check (round 12) can decide to DISCARD a message
+/// (`continue`, without ever constructing a `HamlibCommandInFlightGuard`)
+/// -- but if that message was the one `mark_in_flight_then_send`
+/// (producer side) already incremented `hamlib_command_in_flight` for,
+/// nothing else will EVER decrement it: the guard that would normally
+/// retire it is never constructed on a discard path. That stranded
+/// increment permanently mutes an otherwise healthy generation, the same
+/// failure class as round 17/18's fixes, now specifically in the
+/// supersession-discard branch.
+///
+/// If `message`'s id matches the currently-tracked producer-marked
+/// handoff for this kind, clears the tracking and returns `true` -- the
+/// caller now OWNS retiring the one increment the producer made (either
+/// directly, on a discard path, or by adopting it into a
+/// `HamlibCommandInFlightGuard::adopt` on an apply path, so it isn't
+/// double-counted against a fresh `HamlibCommandInFlightGuard::new`).
+/// Returns `false` (tracker untouched) for a message that was never
+/// producer-marked (an ordinary fresh send, which the consumer's own
+/// guard must count independently) -- and, on a poisoned tracker lock,
+/// fails toward `false` (NOT retiring) rather than risk retiring a count
+/// contribution that isn't actually this message's to retire: an extra
+/// stranded `+1` (still-muted) is the safe-but-annoying failure, while a
+/// wrongly-claimed retirement could under-count a GENUINELY outstanding
+/// handoff and let PTT through too early.
+fn take_producer_mark_if_matching(
+    message: &ComponentMessage,
+    producer_marked_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+) -> bool {
+    let Ok(mut marked) = producer_marked_id.lock() else {
+        return false;
+    };
+    if *marked == Some(message.id) {
+        *marked = None;
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(test)]
+mod take_producer_mark_if_matching_tests {
+    use super::*;
+
+    fn msg(id_after: u64) -> ComponentMessage {
+        // Construct `id_after` throwaway messages first so this one's own
+        // globally-monotonic id is strictly greater than all of them --
+        // gives tests a cheap way to get two messages with a known
+        // relative ordering without depending on exact absolute ids.
+        for _ in 0..id_after {
+            let _ = ComponentMessage::new(
+                ComponentId::Hamlib,
+                ComponentId::Hamlib,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                    enabled: true,
+                    tx_frequency: 14_078_000,
+                }),
+                Instant::now(),
+            );
+        }
+        ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        )
+    }
+
+    #[test]
+    fn returns_true_and_clears_the_tracker_when_the_id_matches() {
+        let message = msg(0);
+        let producer_marked_id = Arc::new(std::sync::Mutex::new(Some(message.id)));
+
+        assert!(take_producer_mark_if_matching(
+            &message,
+            &producer_marked_id
+        ));
+        assert!(
+            producer_marked_id.lock().unwrap().is_none(),
+            "a matching take must clear the tracker so nobody else can also claim it"
+        );
+    }
+
+    #[test]
+    fn returns_false_and_leaves_the_tracker_untouched_when_the_id_does_not_match() {
+        let message = msg(0);
+        let other_id = msg(1).id;
+        let producer_marked_id = Arc::new(std::sync::Mutex::new(Some(other_id)));
+
+        assert!(!take_producer_mark_if_matching(
+            &message,
+            &producer_marked_id
+        ));
+        assert_eq!(
+            *producer_marked_id.lock().unwrap(),
+            Some(other_id),
+            "a non-matching message must not disturb whatever IS tracked -- it belongs to a \
+             different handoff"
+        );
+    }
+
+    #[test]
+    fn returns_false_when_nothing_is_tracked() {
+        let message = msg(0);
+        let producer_marked_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        assert!(!take_producer_mark_if_matching(
+            &message,
+            &producer_marked_id
+        ));
+    }
+
+    /// PAN-19 round-19 review (Codex P1) regression guard: "retire the
+    /// handoff marker when discarding stale state". The FULL scenario the
+    /// finding describes: the producer marks a handoff (increments the
+    /// count, records its id), but by the time the message loop actually
+    /// consumes it, a NEWER command has already been applied -- the
+    /// message loop's own `is_superseded` check discards it via
+    /// `continue`, WITHOUT ever constructing a `HamlibCommandInFlightGuard`.
+    /// Without retiring the producer's mark on that discard path, the
+    /// count would be stranded at 1 forever. This drives the exact
+    /// sequence `mark_in_flight_then_send` -> discard-as-superseded ->
+    /// retire, proving the count correctly returns to 0.
+    #[test]
+    fn a_discarded_producer_marked_message_retires_its_own_increment() {
+        let stale_split = msg(0);
+        let hamlib_command_in_flight = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let producer_marked_split_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        // Producer side: marks and "sends" successfully.
+        let send_result = mark_in_flight_then_send(
+            stale_split.clone(),
+            &hamlib_command_in_flight,
+            &producer_marked_split_id,
+            |m| {
+                drop(m);
+                Ok(())
+            },
+        );
+        assert!(
+            send_result.is_ok(),
+            "test setup: the simulated send must succeed"
+        );
+        assert_eq!(
+            hamlib_command_in_flight.load(Ordering::Acquire),
+            1,
+            "test setup: the producer's mark must have incremented the count"
+        );
+
+        // Consumer side: the message loop's own `is_superseded` check
+        // (simulated here as already true -- a newer command was applied
+        // in the meantime) discards it via the SAME retire-on-discard
+        // logic the real SetSplit arm now runs.
+        if take_producer_mark_if_matching(&stale_split, &producer_marked_split_id) {
+            hamlib_command_in_flight.fetch_sub(1, Ordering::AcqRel);
+        }
+
+        assert_eq!(
+            hamlib_command_in_flight.load(Ordering::Acquire),
+            0,
+            "discarding a producer-marked message as superseded must retire its own increment \
+             -- the count must return to 0, not strand permanently at 1"
+        );
+        assert!(
+            producer_marked_split_id.lock().unwrap().is_none(),
+            "the tracker itself must also be cleared once retired"
+        );
     }
 }
 
@@ -3840,11 +4256,21 @@ mod teardown_replay_tests {
         std::sync::Arc::new(std::sync::Mutex::new(None))
     }
 
-    /// PAN-19 round-17 review (Codex P1): a fresh, not-in-flight tracker
-    /// for `deliver_pending_hamlib_state`'s new `hamlib_command_in_flight`
-    /// param -- tests not specifically exercising that flag use this.
-    fn not_in_flight() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
-        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
+    /// PAN-19 round-17 review (Codex P1), updated round-19 (now a count,
+    /// not a boolean): a fresh, not-in-flight tracker for
+    /// `deliver_pending_hamlib_state`'s `hamlib_command_in_flight` param --
+    /// tests not specifically exercising that count use this.
+    fn not_in_flight() -> std::sync::Arc<std::sync::atomic::AtomicU32> {
+        std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0))
+    }
+
+    /// PAN-19 round-19 review (Codex P1): a fresh "nothing producer-marked"
+    /// tracker for `deliver_pending_hamlib_state`'s
+    /// `producer_marked_frequency_id`/`producer_marked_split_id` params --
+    /// tests not specifically exercising that retirement mechanism use
+    /// this.
+    fn no_producer_mark() -> std::sync::Arc<std::sync::Mutex<Option<u64>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(None))
     }
 
     /// The exact mechanism: `try_send` on a full bounded channel returns
@@ -4086,6 +4512,134 @@ mod teardown_replay_tests {
         );
     }
 
+    /// PAN-19 round-19 review (Codex P1) regression guard: "preserve the
+    /// newest split in teardown fallback". The exact scenario the finding
+    /// describes: a NEWER split has already failed CAT application and
+    /// populated `hamlib_pending_split` (e.g. via `finish_rig_command`),
+    /// while an OLDER split remains queued behind it when the generation
+    /// crashes; teardown drains that older message via `replay_or_fallback`,
+    /// replay is full/disconnected, and this fallback path used to
+    /// unconditionally overwrite the slot -- replacing the newer desired
+    /// state with the stale one. The next generation could then
+    /// successfully apply the obsolete TX frequency and unmute PTT after
+    /// the correct state was lost. This proves the fallback now reuses
+    /// the SAME newest-wins comparison `finish_rig_command` uses: the
+    /// pending slot must still hold the NEWER split afterward, untouched.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn replay_or_fallback_never_lets_an_older_split_clobber_a_newer_retained_one() {
+        let mut coordinator = test_coordinator().await;
+
+        // Constructed FIRST, so its globally-monotonic id is strictly
+        // smaller -- genuinely the older message.
+        let older_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000, // stale, wrong TX frequency
+            }),
+            Instant::now(),
+        );
+        // Constructed SECOND, so its id is strictly larger.
+        let newer_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_074_000, // the CORRECT, current TX frequency
+            }),
+            Instant::now(),
+        );
+        let newer_id = newer_split.id;
+        assert!(newer_id > older_split.id, "test setup invariant");
+
+        // Already retained -- simulates a newer split's CAT application
+        // having already failed and populated the slot (finish_rig_command),
+        // BEFORE the older message (queued behind it) drains through
+        // teardown.
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(newer_split);
+
+        // Force the fallback path (replay never succeeds).
+        let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        sender
+            .try_send(set_freq_msg())
+            .expect("pre-fill the one slot");
+
+        coordinator.replay_or_fallback(&sender, older_split).await;
+
+        let retained = coordinator.hamlib_pending_split.lock().unwrap();
+        assert_eq!(
+            retained.as_ref().map(|m| m.id),
+            Some(newer_id),
+            "an older split draining through teardown's fallback must never clobber an \
+             already-retained NEWER split -- doing so would lose the newer desired TX \
+             frequency and let a later retry re-apply the old, wrong one"
+        );
+        assert!(
+            matches!(
+                retained.as_ref().map(|m| &m.message_type),
+                Some(MessageType::RigControl(
+                    crate::message_bus::RigControlMessage::SetSplit {
+                        enabled: true,
+                        tx_frequency: 14_074_000,
+                    }
+                ))
+            ),
+            "the retained pending command must still carry the NEWER, correct TX frequency"
+        );
+    }
+
+    /// The flip side: when the fallback message genuinely IS newer than
+    /// whatever's retained (or nothing is retained), it must still
+    /// replace it -- the fix must not become a one-way ratchet that stops
+    /// updating the slot.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn replay_or_fallback_still_replaces_an_older_retained_split_with_a_newer_one() {
+        let mut coordinator = test_coordinator().await;
+
+        let older_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(older_split);
+
+        let newer_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_074_000,
+            }),
+            Instant::now(),
+        );
+        let newer_id = newer_split.id;
+
+        let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        sender
+            .try_send(set_freq_msg())
+            .expect("pre-fill the one slot");
+
+        coordinator.replay_or_fallback(&sender, newer_split).await;
+
+        assert_eq!(
+            coordinator
+                .hamlib_pending_split
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|m| m.id),
+            Some(newer_id),
+            "a newer fallback message must still replace an older retained one"
+        );
+    }
+
     /// PAN-19 round-5 review (Codex P1): a queued pending command must
     /// actually be DELIVERED once the next generation's message loop is
     /// ready -- not just held forever. Covers both `SetFrequency` and
@@ -4116,6 +4670,8 @@ mod teardown_replay_tests {
             &no_supersession(),
             &sender,
             &not_in_flight(),
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
 
         assert!(
@@ -4182,10 +4738,13 @@ mod teardown_replay_tests {
             &no_supersession(),
             &sender,
             &in_flight,
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
 
-        assert!(
+        assert_eq!(
             in_flight.load(Ordering::Acquire),
+            1,
             "a successful hand-off to the channel must mark hamlib_command_in_flight true \
              immediately, at producer time -- not wait for the message loop to pick the \
              message up and construct its own guard"
@@ -4216,14 +4775,17 @@ mod teardown_replay_tests {
             &no_supersession(),
             &sender,
             &in_flight,
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
 
         assert!(
             coordinator.hamlib_pending_split.lock().unwrap().is_some(),
             "test setup: the hand-off must have failed (channel full)"
         );
-        assert!(
-            !in_flight.load(Ordering::Acquire),
+        assert_eq!(
+            in_flight.load(Ordering::Acquire),
+            0,
             "a FAILED hand-off must not mark hamlib_command_in_flight -- nothing was actually \
              enqueued, so nothing is in flight"
         );
@@ -4250,15 +4812,26 @@ mod teardown_replay_tests {
 
         let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
         let in_flight = not_in_flight();
+        let producer_marked_split_id = no_producer_mark();
 
         // Spawn the "consumer" first so it's already blocked on `recv()`
         // -- ready to run its full lifecycle to completion the instant
         // the message arrives, maximizing the chance of the exact
-        // interleaving the finding describes.
+        // interleaving the finding describes. Mirrors the REAL consumer
+        // arm's round-19 logic exactly: adopt the producer's existing
+        // increment for a producer-marked message rather than adding a
+        // second one.
         let in_flight_for_consumer = in_flight.clone();
+        let producer_marked_split_id_for_consumer = producer_marked_split_id.clone();
         let consumer = tokio::task::spawn_blocking(move || {
-            let _message = receiver.recv().expect("the message must be delivered");
-            let guard = HamlibCommandInFlightGuard::new(in_flight_for_consumer);
+            let message = receiver.recv().expect("the message must be delivered");
+            let guard =
+                if take_producer_mark_if_matching(&message, &producer_marked_split_id_for_consumer)
+                {
+                    HamlibCommandInFlightGuard::adopt(in_flight_for_consumer)
+                } else {
+                    HamlibCommandInFlightGuard::new(in_flight_for_consumer)
+                };
             drop(guard);
         });
 
@@ -4269,12 +4842,15 @@ mod teardown_replay_tests {
             &no_supersession(),
             &sender,
             &in_flight,
+            &no_producer_mark(),
+            &producer_marked_split_id,
         );
 
         consumer.await.expect("consumer task must not panic");
 
-        assert!(
-            !in_flight.load(Ordering::Acquire),
+        assert_eq!(
+            in_flight.load(Ordering::Acquire),
+            0,
             "a fast consumer that completes its full lifecycle concurrently with the \
              producer's own call must not leave hamlib_command_in_flight stranded true -- it \
              must end up false, not permanently mute an otherwise healthy generation"
@@ -4315,13 +4891,15 @@ mod teardown_replay_tests {
             &no_supersession(),
             &sender,
             &in_flight,
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
 
         let observed_by_consumer = consumer.await.expect("consumer task must not panic");
         assert!(
-            observed_by_consumer,
+            observed_by_consumer > 0,
             "the in-flight marker must be set BEFORE the channel send is attempted -- any \
-             consumer that successfully receives the message must already observe it true, \
+             consumer that successfully receives the message must already observe it nonzero, \
              not race against a delayed post-send store"
         );
     }
@@ -4354,37 +4932,41 @@ mod teardown_replay_tests {
             }),
             Instant::now(),
         );
-        let in_flight: Arc<std::sync::atomic::AtomicBool> =
-            Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let in_flight: Arc<std::sync::atomic::AtomicU32> =
+            Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let producer_marked_id = no_producer_mark();
 
         let observed_during_send = std::cell::Cell::new(None);
-        let result = mark_in_flight_then_send(split_msg, &in_flight, |message| {
-            // Simulate the consumer's FULL lifecycle happening
-            // synchronously "during" the send -- the tightest possible
-            // interleaving, worse than any real scheduling could ever
-            // produce, so a fix that's only correct "most of the time"
-            // fails this every run.
-            observed_during_send.set(Some(in_flight.load(Ordering::Acquire)));
-            let guard = HamlibCommandInFlightGuard::new(in_flight.clone());
-            drop(guard);
-            // Standing in for successful delivery -- there's no real
-            // channel in this test.
-            drop(message);
-            Ok(())
-        });
+        let result =
+            mark_in_flight_then_send(split_msg, &in_flight, &producer_marked_id, |message| {
+                // Simulate the consumer's FULL lifecycle happening
+                // synchronously "during" the send -- the tightest possible
+                // interleaving, worse than any real scheduling could ever
+                // produce, so a fix that's only correct "most of the time"
+                // fails this every run. `adopt` (not `new`) mirrors the real
+                // consumer arm's behavior for a producer-marked message.
+                observed_during_send.set(Some(in_flight.load(Ordering::Acquire)));
+                let guard = HamlibCommandInFlightGuard::adopt(in_flight.clone());
+                drop(guard);
+                // Standing in for successful delivery -- there's no real
+                // channel in this test.
+                drop(message);
+                Ok(())
+            });
 
         assert!(result.is_ok(), "the simulated send must succeed");
         assert_eq!(
             observed_during_send.get(),
-            Some(true),
-            "the in-flight flag must already be true the instant the send is attempted -- a \
-             consumer running synchronously inside the send call must never observe false"
+            Some(1),
+            "the in-flight count must already be nonzero the instant the send is attempted -- a \
+             consumer running synchronously inside the send call must never observe zero"
         );
-        assert!(
-            !in_flight.load(Ordering::Acquire),
-            "after the consumer's full lifecycle (construct + drop) completes during the send, \
-             the flag must end up false, not resurrected true by a delayed producer-side write \
-             -- mark_in_flight_then_send must not write anything AFTER the send call on success"
+        assert_eq!(
+            in_flight.load(Ordering::Acquire),
+            0,
+            "after the consumer's full lifecycle (adopt + drop) completes during the send, the \
+             count must end up 0, not resurrected by a delayed producer-side write -- \
+             mark_in_flight_then_send must not write anything AFTER the send call on success"
         );
     }
 
@@ -4402,20 +4984,63 @@ mod teardown_replay_tests {
             Instant::now(),
         );
         let sent_id = split_msg.id;
-        let in_flight: Arc<std::sync::atomic::AtomicBool> =
-            Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let in_flight: Arc<std::sync::atomic::AtomicU32> =
+            Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let producer_marked_id = no_producer_mark();
 
-        let result = mark_in_flight_then_send(split_msg, &in_flight, Err);
+        let result = mark_in_flight_then_send(split_msg, &in_flight, &producer_marked_id, Err);
 
         let returned = result.expect_err("the simulated send must fail");
         assert_eq!(
             returned.id, sent_id,
             "the original message must be returned on failure so it can be re-queued"
         );
-        assert!(
-            !in_flight.load(Ordering::Acquire),
-            "a failed send must roll the in-flight marker back to false -- nothing was \
+        assert_eq!(
+            in_flight.load(Ordering::Acquire),
+            0,
+            "a failed send must roll the in-flight count back to 0 -- nothing was \
              actually handed off"
+        );
+        assert!(
+            producer_marked_id.lock().unwrap().is_none(),
+            "a failed send must also clear the producer-marked tracker -- nothing is \
+             outstanding to retire later"
+        );
+    }
+
+    /// PAN-19 round-19 review (Codex P1) regression guard: on a
+    /// SUCCESSFUL send, the producer-marked tracker must be left SET
+    /// (with this message's id) -- retiring it is the consumer's job
+    /// (`take_producer_mark_if_matching`), not this function's. Leaving
+    /// it set is what lets a later consumer-side discard (superseded) or
+    /// apply (adopt) find and retire the SAME increment this call made.
+    #[test]
+    fn mark_in_flight_then_send_leaves_the_producer_mark_set_on_success() {
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        let sent_id = split_msg.id;
+        let in_flight: Arc<std::sync::atomic::AtomicU32> =
+            Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let producer_marked_id = no_producer_mark();
+
+        let result = mark_in_flight_then_send(split_msg, &in_flight, &producer_marked_id, |m| {
+            drop(m);
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "the simulated send must succeed");
+        assert_eq!(
+            *producer_marked_id.lock().unwrap(),
+            Some(sent_id),
+            "a successful send must leave the producer-marked tracker set to THIS message's \
+             id -- it's the consumer's responsibility to retire it later, not this function's"
         );
     }
 
@@ -4456,6 +5081,8 @@ mod teardown_replay_tests {
             &no_supersession(),
             &sender,
             &not_in_flight(),
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
 
         assert!(
@@ -4473,6 +5100,8 @@ mod teardown_replay_tests {
             &no_supersession(),
             &sender,
             &not_in_flight(),
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
 
         assert!(
@@ -4546,6 +5175,8 @@ mod teardown_replay_tests {
             &last_applied_split_id,
             &sender,
             &not_in_flight(),
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
 
         assert!(
@@ -4595,6 +5226,8 @@ mod teardown_replay_tests {
             &last_applied_split_id,
             &sender,
             &not_in_flight(),
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
 
         assert!(
@@ -4747,7 +5380,7 @@ mod teardown_replay_tests {
         let hamlib_loop_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let no_pending_frequency: Arc<std::sync::Mutex<Option<ComponentMessage>>> =
             Arc::new(std::sync::Mutex::new(None));
-        let not_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let not_in_flight = Arc::new(std::sync::atomic::AtomicU32::new(0));
         assert!(
             super::super::tx::tx_hard_mute_reason(
                 &tx_policy,
@@ -4949,6 +5582,8 @@ mod teardown_replay_tests {
             &no_supersession(),
             &new_sender,
             &not_in_flight(),
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
 
         let delivered = new_receiver
@@ -5009,6 +5644,8 @@ mod teardown_replay_tests {
             &no_supersession(),
             &sender,
             &not_in_flight(),
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
         assert!(
             coordinator.hamlib_pending_split.lock().unwrap().is_some(),
@@ -5029,6 +5666,8 @@ mod teardown_replay_tests {
             &no_supersession(),
             &sender,
             &not_in_flight(),
+            &no_producer_mark(),
+            &no_producer_mark(),
         );
 
         assert!(

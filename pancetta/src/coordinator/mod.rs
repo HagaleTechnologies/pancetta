@@ -751,23 +751,34 @@ pub struct ApplicationCoordinator {
     /// of whether the CAT call that was in flight when it was gated
     /// through ultimately succeeds or fails.
     ///
-    /// The message loop's SetFrequency/SetSplit arms set this `true`
-    /// (via `HamlibLoopReadyGuard`-style RAII, see the CAT-call call sites
-    /// in `coordinator/hamlib.rs`) for the exact duration of the
-    /// underlying rig I/O call -- and only that duration, so ordinary
-    /// PTT-on requests pay nothing extra. `tx_hard_mute_reason` treats
-    /// `true` here the same as "pending state undelivered": refuse PTT.
-    /// Since the message loop processes messages strictly one at a time
-    /// (never concurrently), at most one CAT call is ever in flight at
-    /// once, so a single shared flag (not per-kind) is sufficient --
-    /// unlike the pending slots, which DO need per-kind separation because
-    /// they can each independently hold a value at rest.
+    /// The message loop's SetFrequency/SetSplit arms bracket this for the
+    /// exact duration of the underlying rig I/O call -- and only that
+    /// duration, so ordinary PTT-on requests pay nothing extra.
+    /// `tx_hard_mute_reason` treats a nonzero count the same as "pending
+    /// state undelivered": refuse PTT.
     ///
-    /// Defaults to `false` (nothing in flight) -- the correct "not gated"
+    /// PAN-19 round-19 review (Codex P1): "count every pending command
+    /// handoff". This used to be an `AtomicBool` -- but there can
+    /// legitimately be TWO outstanding handoffs at once (a pending
+    /// `SetFrequency` AND a pending `SetSplit` delivered together by the
+    /// same `deliver_pending_hamlib_state` call, round 17's fix #2). A
+    /// boolean can only represent "at least one outstanding"; clearing it
+    /// to `false` the instant the FIRST of two completes wrongly reported
+    /// "none outstanding" while the second was still live, letting a
+    /// concurrent PTT-on slip through and key the rig while a CAT
+    /// operation for the other pending kind was genuinely still applying
+    /// (or about to be rolled back on failure). Now a count: incremented
+    /// on each handoff (producer side, `mark_in_flight_then_send`) or CAT-
+    /// call start (consumer side, `HamlibCommandInFlightGuard`), and
+    /// decremented on each one's own retirement (success, rollback, OR
+    /// discard-as-superseded -- see round-19 finding #2). `tx_hard_
+    /// mute_reason` gates on "count > 0", not a boolean.
+    ///
+    /// Defaults to `0` (nothing in flight) -- the correct "not gated"
     /// state for a `pancetta-hamlib`-disabled build, matching
     /// `hamlib_command_loop_ready`'s own default-to-permissive convention
     /// above.
-    pub(crate) hamlib_command_in_flight: Arc<AtomicBool>,
+    pub(crate) hamlib_command_in_flight: Arc<std::sync::atomic::AtomicU32>,
 
     /// Operator TX-frequency mode (`pancetta_core::TxFreqMode` as `u8`),
     /// default `Hold`. Shared with the QSO engine (gates the stuck-DX TX-offset
@@ -1607,7 +1618,7 @@ impl ApplicationCoordinator {
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
             hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
             hamlib_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
-            hamlib_command_in_flight: Arc::new(AtomicBool::new(false)),
+            hamlib_command_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // Default TX-frequency mode = Hold (operator's picked offset is
             // sticky; pancetta never moves it autonomously). Operator switches
             // to Auto from the TUI (`f`).

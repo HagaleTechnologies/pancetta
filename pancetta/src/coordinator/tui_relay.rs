@@ -2415,7 +2415,7 @@ fn ptt_on_refusal(
     hamlib_command_loop_ready: &Arc<std::sync::atomic::AtomicBool>,
     hamlib_pending_frequency: &Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     hamlib_pending_split: &Arc<std::sync::Mutex<Option<ComponentMessage>>>,
-    hamlib_command_in_flight: &Arc<std::sync::atomic::AtomicBool>,
+    hamlib_command_in_flight: &Arc<std::sync::atomic::AtomicU32>,
 ) -> Option<String> {
     super::tx::tx_hard_mute_reason(
         tx_policy,
@@ -2440,8 +2440,8 @@ mod tui_relay_tests {
     }
 
     /// Not in flight -- the common case (no CAT call currently executing).
-    fn not_in_flight() -> Arc<AtomicBool> {
-        Arc::new(AtomicBool::new(false))
+    fn not_in_flight() -> Arc<std::sync::atomic::AtomicU32> {
+        Arc::new(std::sync::atomic::AtomicU32::new(0))
     }
 
     /// PAN-19 round-12 review (Codex P1) regression guard: "apply loop
@@ -2545,7 +2545,7 @@ mod tui_relay_tests {
         let tx_policy = Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8()));
         let tx_restart_inhibit = Arc::new(AtomicU32::new(0));
         let hamlib_command_loop_ready = Arc::new(AtomicBool::new(true));
-        let in_flight = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(std::sync::atomic::AtomicU32::new(1));
 
         assert!(
             ptt_on_refusal(
@@ -2561,7 +2561,7 @@ mod tui_relay_tests {
              flight, even though both pending slots are already empty"
         );
 
-        in_flight.store(false, Ordering::Release);
+        in_flight.store(0, Ordering::Release);
         assert_eq!(
             ptt_on_refusal(
                 &tx_policy,

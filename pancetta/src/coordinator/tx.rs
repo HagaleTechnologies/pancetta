@@ -1077,16 +1077,22 @@ fn current_tx_policy(
 /// pending slot and be permitted, then get queued behind that in-flight
 /// command and key the rig regardless of whether the CAT call succeeds or
 /// fails. `hamlib_command_in_flight` closes that window: the message
-/// loop's arms set it `true` for the CAT call's exact duration (see
-/// `HamlibCommandInFlightGuard` in `coordinator/hamlib.rs`), and it's
-/// treated the same as "pending state undelivered" here.
+/// loop's arms bump it for the CAT call's exact duration (see
+/// `HamlibCommandInFlightGuard` in `coordinator/hamlib.rs`), and any
+/// nonzero count is treated the same as "pending state undelivered" here.
+///
+/// PAN-19 round-19 review (Codex P1): "count every pending command
+/// handoff". `hamlib_command_in_flight` is now a count (`AtomicU32`), not
+/// a boolean -- see that field's doc comment in `coordinator/mod.rs` for
+/// why a boolean under-reported when two handoffs (frequency + split)
+/// were outstanding at once.
 pub(crate) fn tx_hard_mute_reason(
     tx_policy: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     restart_inhibit: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     hamlib_loop_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     hamlib_pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     hamlib_pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
-    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) -> Option<&'static str> {
     if restart_inhibit.load(Ordering::Acquire) != 0 {
         Some("rig control is restarting")
@@ -1094,7 +1100,7 @@ pub(crate) fn tx_hard_mute_reason(
         Some("Hamlib command loop is not yet ready")
     } else if has_undelivered_pending_hamlib_state(hamlib_pending_frequency, hamlib_pending_split) {
         Some("pending rig frequency/split state has not been delivered yet")
-    } else if hamlib_command_in_flight.load(Ordering::Acquire) {
+    } else if hamlib_command_in_flight.load(Ordering::Acquire) > 0 {
         Some("a rig frequency/split command is still being applied")
     } else if current_tx_policy(tx_policy) == pancetta_core::TxPolicy::Disabled {
         Some("TX policy is Disabled")
@@ -1154,8 +1160,8 @@ mod tx_hard_mute_reason_tests {
     }
 
     /// Not in flight -- the common case (no CAT call currently executing).
-    fn not_in_flight() -> Arc<AtomicBool> {
-        Arc::new(AtomicBool::new(false))
+    fn not_in_flight() -> Arc<AtomicU32> {
+        Arc::new(AtomicU32::new(0))
     }
 
     #[test]
@@ -1367,7 +1373,7 @@ mod tx_hard_mute_reason_tests {
         let policy = policy(pancetta_core::TxPolicy::Full);
         let restart_inhibit = Arc::new(AtomicU32::new(0));
         let hamlib_loop_ready = Arc::new(AtomicBool::new(true));
-        let in_flight = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicU32::new(1));
 
         let reason = tx_hard_mute_reason(
             &policy,
@@ -1386,7 +1392,7 @@ mod tx_hard_mute_reason_tests {
         // Once the CAT call resolves and the in-flight flag clears, PTT-on
         // must be permitted again -- the fix must not become overly
         // conservative.
-        in_flight.store(false, Ordering::Release);
+        in_flight.store(0, Ordering::Release);
         assert_eq!(
             tx_hard_mute_reason(
                 &policy,
