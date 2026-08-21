@@ -13,7 +13,7 @@ MIT/Apache-2.0 crate is fully permitted — the only obligation is to retain its
 copyright notice, which we do here and in `THIRD-PARTY-NOTICES.md`. No GPL
 source (WSJT-X, JTDX, MSHV, JS8Call) is read, ported, or copied anywhere in this
 crate; GPL-peer *techniques* are adopted only via the clean-room spec firewall
-described in the root README's "Provenance & clean-room" section. The split:
+described in [`docs/PROVENANCE.md`](../docs/PROVENANCE.md). The split:
 
 - **Vendored, used via FFI** — `vendor/ft8_lib/` is the unmodified
   C source of [kgoba/ft8_lib](https://github.com/kgoba/ft8_lib) (MIT,

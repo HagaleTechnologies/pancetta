@@ -302,7 +302,7 @@ not, restart.
 
 ## Troubleshooting (operational)
 
-For first-run / install issues, see [`README.md#troubleshooting`](../README.md#troubleshooting).
+For first-run / install issues, see [`TROUBLESHOOTING.md`](TROUBLESHOOTING.md).
 
 ### Autonomous mode runs but never transmits
 

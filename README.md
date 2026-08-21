@@ -19,7 +19,7 @@ Pancetta is an FT8 station that lives in your terminal.
 ![Pancetta running a replayed band recording](assets/demo.gif)
 
 *`pancetta --replay` feeding archived WAV captures through the real pipeline:
-startup, band monitoring, the TX-placement/priority-scoring engine running,
+startup, band monitoring, the TX-placement scorer ranking candidate offsets,
 and a clean self-shutdown when the recording ends. No decode lands in this
 particular capture — for measured decode performance see
 [`docs/decoder-comparison.md`](docs/decoder-comparison.md).*
@@ -35,10 +35,13 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
 
 ## Why Pancetta
 
-- **A decoder that finds more.** On a 1,201-file real off-air corpus the
-  native Rust decoder produced **+11.6% more decodes than `ft8_lib`** on the
-  same audio (recovering 90.7% of ft8_lib's set, plus extras). Methodology,
-  parallel-execution rationale, and honest caveats:
+- **A decoder measured against the real reference.** On a 1,201-file off-air
+  corpus the native Rust decoder produced **+11.6% more decodes than
+  `ft8_lib`** on the same audio — but that comparison is historical. Measured
+  against WSJT-X's `jt9`, the decoder hams actually run, Pancetta needs
+  **~2.1 dB more SNR** to reach 50% recall on FT8 (~3.95 dB on FT4, where it
+  caps at 78% recall), at a false-positive cost of 1 decode per 1,000
+  pure-noise recordings (0.1%). Full numbers and caveats:
   [`docs/decoder-comparison.md`](docs/decoder-comparison.md).
 - **A priority engine, not a list.** Every decoded CQ is scored against
   needed DXCC, needed grid, POTA/SOTA, rarity, signal, and recent activity —
@@ -63,16 +66,16 @@ encode, decode, LDPC, CRC, and OSD.
 
 ## What it looks like
 
-Four TUI views, captured on a development host with no radio or audio device
-attached — the panels are idle, so these show the layout and controls rather
-than a live band.
+Every capture below (and the GIF further down) comes from a development host
+with no radio or audio device attached — the panels are idle, so they show the
+layout and controls rather than a live band.
 
 | | |
 |---|---|
 | ![Operate overview](assets/screenshot-operate.png) | ![DX Hunter priority panel](assets/screenshot-priority.png) |
 | Operate overview: TX placement, band activity, QSO status, callers. | DX Hunter: the priority-scoring table (entity, grid, SNR, rarity, score). |
 | ![QSO status panel](assets/screenshot-qso.png) | ![Monitor / waterfall view](assets/screenshot-waterfall.png) |
-| QSO status: state machine, exchanges, TX/RX reports. | Monitor: waterfall with the TX marker over band activity. |
+| QSO status: state machine, exchanges, TX/RX reports. | Monitor: the waterfall and the TX-frequency marker. |
 
 Decode effort is a live control — press `e` to cycle presets and the status
 chip follows:
@@ -85,7 +88,7 @@ chip follows:
 | `Eco` | Floor pass only — fastest, lowest recall. |
 | `Standard` | A moderate per-window budget. |
 | `Deep` | A generous budget — more passes/candidates, better recall. |
-| `Max` | Always runs every decode stage to completion. |
+| `Max` | Runs every decode stage, still bounded by the coordinator's per-slot ceiling (2 s on FT8). |
 
 Pin it at startup via `[decoder]` in `pancetta.toml`
 ([`docs/CONFIG.md`](docs/CONFIG.md)); `e` is the only *live* control. Full
@@ -114,6 +117,7 @@ Regulatory notes, including FCC §97.221 automatic-control considerations:
 
 ```bash
 # Linux (Debian/Ubuntu):
+sudo apt update
 sudo apt install -y libasound2-dev libudev-dev libssl-dev pkg-config libhamlib-utils
 # macOS:
 brew install hamlib
@@ -184,10 +188,10 @@ Honest gaps, so you can judge whether it fits your station:
 
 - **Pre-1.0.** Config keys, CLI surface, and on-disk formats can still change
   between releases.
-- **Some integrations are scaffolded, not live.** `pancetta-hamlib`'s bindings
-  are complete but rig integration is still being hardened; `pancetta-cqdx`
-  awaits live API validation; LoTW/eQSL upload is scaffolded where
-  ClubLog/QRZ/cqdx paths are live.
+- **Some integrations are scaffolded, not live.** `pancetta-hamlib`'s FFI
+  bindings are done, but the project's own status table still calls the
+  crate an integration stub; `pancetta-cqdx` awaits live API validation;
+  LoTW/eQSL upload is scaffolded where ClubLog/QRZ/cqdx paths are live.
 - **Platform coverage is narrow.** Developed on macOS (Apple Silicon), CI on
   Linux, deployed on a Windows 11 MiniPC. Pi-class ARM is a design target of
   the effort-budget work but unvalidated on real hardware, and there are no
@@ -208,10 +212,9 @@ cargo clippy --workspace --features transmit
 cargo fmt --all -- --check
 ```
 
-CI runs all of the above on every PR plus a macOS `cargo check` lane;
-`cargo deny check` guards advisories and license drift. The workspace is 14
-strictly layered crates — see [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)
-for the component diagram and channel topology.
+CI runs all of this per PR plus a macOS `cargo check` lane; `cargo deny check`
+guards advisories and license drift. The 14-crate strictly layered workspace
+is mapped in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
 
 ## Documentation
 
