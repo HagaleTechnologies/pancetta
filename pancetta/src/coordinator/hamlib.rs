@@ -150,11 +150,162 @@ mod classify_loop_ready_tests {
 /// before a critical section starts and unconditionally cleaning up on
 /// `Drop` regardless of how the scope exits (including panic-unwind), so
 /// the exit path doesn't need to be enumerated one by one.
-struct HamlibLoopReadyGuard(Arc<std::sync::atomic::AtomicBool>);
+///
+/// PAN-19 round-17 review (Codex P1): "keep readiness cleanup scoped to
+/// its Hamlib generation". Round 16 gave the poll and watchdog child
+/// tasks their OWN copy of this guard (constructed fresh each generation),
+/// which is correct for the normal case -- but it missed `hamlib_orphans`:
+/// a watchdog retained across a restart specifically because teardown
+/// couldn't confirm PTT-off keeps running (and keeps holding ITS guard,
+/// from the OLD generation) until a LATER, successful generation proves
+/// itself PTT-safe and aborts it. When that abort finally lands, the OLD
+/// guard's `Drop` would otherwise unconditionally clear the SAME shared
+/// `hamlib_command_loop_ready` atomic the NEW generation already
+/// correctly set `true` -- permanently muting an otherwise healthy
+/// restart, since nothing else ever sets it back.
+///
+/// Fix: every guard now carries the generation it belongs to
+/// (`generation`) alongside a shared, live view of whichever generation
+/// is CURRENT (`current_generation`, `ApplicationCoordinator::
+/// hamlib_generation`, bumped once at the top of every
+/// `start_hamlib_component` call). `Drop` only clears the flag if those
+/// still match -- a guard from a generation that's since been superseded
+/// is a no-op, while a guard whose generation is STILL current (the
+/// overwhelmingly common case: normal shutdown, a genuine crash within
+/// the same generation) clears exactly as before.
+struct HamlibLoopReadyGuard {
+    flag: Arc<std::sync::atomic::AtomicBool>,
+    generation: u64,
+    current_generation: Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl HamlibLoopReadyGuard {
+    fn new(
+        flag: Arc<std::sync::atomic::AtomicBool>,
+        generation: u64,
+        current_generation: Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
+        Self {
+            flag,
+            generation,
+            current_generation,
+        }
+    }
+}
 
 impl Drop for HamlibLoopReadyGuard {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        if self.current_generation.load(Ordering::Acquire) == self.generation {
+            self.flag.store(false, Ordering::Release);
+        }
+        // else: a newer generation has since taken over -- this guard
+        // belongs to a superseded generation, so its clear is stale and
+        // must be a no-op (the flag now reflects the NEW generation's own
+        // state, which this guard has no authority over).
+    }
+}
+
+/// PAN-19 round-17 review (Codex P1): "prevent stale readiness after the
+/// liveness check". An ABA race in the message loop's own
+/// readiness-reporting call site: `child_crashed()` (which the real call
+/// site backs with `child_task_crashed`) could return `false` (all
+/// children alive at check time), but a child could then exit in the
+/// narrow window between THAT check and the `flag.store(true, ..)` write
+/// -- its own per-child guard (round 16) would clear this SAME flag to
+/// `false` in that instant, and the write here, already in flight, would
+/// then resurrect it back to `true` for a generation that has already
+/// lost a command consumer.
+///
+/// `JoinHandle::is_finished()` (what `child_task_crashed` ultimately
+/// reads) is monotonic -- a task that has finished never becomes
+/// unfinished again -- so re-running the SAME liveness check immediately
+/// AFTER the store closes that exact window: if a child died in the gap,
+/// this second check reliably catches it and corrects the flag back down
+/// rather than trusting the now-stale positive write. Returns `true` only
+/// when readiness was durably published (children were alive both before
+/// AND immediately after the store); `false` otherwise, with the flag
+/// left (or corrected) to `false`.
+///
+/// Takes the liveness check as an injectable closure (rather than calling
+/// `child_task_crashed` directly) so this exact race is directly,
+/// deterministically unit-testable -- a real concurrent child-exit-mid-
+/// write race can't be reproduced reliably by timing alone, but a stub
+/// closure that returns `false` then `true` reproduces the EXACT sequence
+/// of observations the real race produces.
+fn publish_loop_readiness_if_children_alive(
+    flag: &Arc<std::sync::atomic::AtomicBool>,
+    mut child_crashed: impl FnMut() -> bool,
+) -> bool {
+    if child_crashed() {
+        return false;
+    }
+    flag.store(true, Ordering::Release);
+    if child_crashed() {
+        // A child died in the check-to-store gap -- the store above just
+        // resurrected a stale `true`. Correct it back down.
+        flag.store(false, Ordering::Release);
+        return false;
+    }
+    true
+}
+
+#[cfg(test)]
+mod publish_loop_readiness_if_children_alive_tests {
+    use super::*;
+
+    #[test]
+    fn publishes_readiness_when_children_stay_alive_through_both_checks() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let published = publish_loop_readiness_if_children_alive(&flag, || false);
+        assert!(
+            published,
+            "readiness must publish when nothing ever crashed"
+        );
+        assert!(
+            flag.load(Ordering::Acquire),
+            "the flag must end up true when readiness was published"
+        );
+    }
+
+    #[test]
+    fn withholds_readiness_when_a_child_is_already_dead_before_the_first_check() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let published = publish_loop_readiness_if_children_alive(&flag, || true);
+        assert!(
+            !published,
+            "readiness must be withheld when a child is already dead"
+        );
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "the flag must never be set true when a child was already dead"
+        );
+    }
+
+    /// PAN-19 round-17 review (Codex P1) regression guard: the actual ABA
+    /// race this function closes. The first check sees "alive" (`false`);
+    /// by the time the second check runs (immediately after the store), a
+    /// child has died in that gap (`true`). The stale `true` write must be
+    /// corrected back down, not left resurrected.
+    #[test]
+    fn corrects_a_stale_resurrected_flag_when_a_child_dies_between_the_two_checks() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut call_count = 0;
+        let published = publish_loop_readiness_if_children_alive(&flag, || {
+            call_count += 1;
+            // First call (pre-store check): alive. Second call
+            // (post-store recheck): died in the gap.
+            call_count > 1
+        });
+        assert!(
+            !published,
+            "readiness must be withheld when a child died in the check-to-store gap"
+        );
+        assert_eq!(call_count, 2, "test setup: both checks must have run");
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "a child dying in the check-to-store gap must correct the flag back to false, not \
+             leave it resurrected to true by the in-flight store"
+        );
     }
 }
 
@@ -171,8 +322,9 @@ mod hamlib_loop_ready_guard_tests {
     fn drop_clears_the_flag_immediately() {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         flag.store(true, Ordering::Release);
+        let current_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
         {
-            let _guard = HamlibLoopReadyGuard(flag.clone());
+            let _guard = HamlibLoopReadyGuard::new(flag.clone(), 1, current_generation.clone());
             assert!(
                 flag.load(Ordering::Acquire),
                 "test setup: flag should be true while guarded"
@@ -196,9 +348,11 @@ mod hamlib_loop_ready_guard_tests {
         let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
         flag.store(true, Ordering::Release);
         let flag_for_panic = flag.clone();
+        let current_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+        let current_generation_for_panic = current_generation.clone();
 
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = HamlibLoopReadyGuard(flag_for_panic);
+            let _guard = HamlibLoopReadyGuard::new(flag_for_panic, 1, current_generation_for_panic);
             panic!("simulated unexpected panic inside the Hamlib message loop");
         }));
         assert!(
@@ -210,6 +364,59 @@ mod hamlib_loop_ready_guard_tests {
             !flag.load(Ordering::Acquire),
             "the guard's Drop must clear the readiness flag even when the scope exits via a \
              panic, not just a normal return"
+        );
+    }
+
+    /// PAN-19 round-17 review (Codex P1) regression guard: "keep readiness
+    /// cleanup scoped to its Hamlib generation". The exact scenario the
+    /// finding describes: an OLD generation's guard (e.g. an orphaned
+    /// watchdog's, retained across a restart because teardown couldn't
+    /// confirm PTT-off) is still alive when a NEW generation starts and
+    /// correctly sets readiness `true`. When the OLD guard finally drops
+    /// (the orphan gets aborted once the new generation proves itself
+    /// safe), it must NOT clobber the flag back to `false` -- the flag
+    /// belongs to the NEW generation now.
+    #[test]
+    fn a_stale_guard_from_a_superseded_generation_does_not_clobber_the_current_generations_flag() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let current_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+        // The OLD generation's guard, tagged generation 1 -- constructed
+        // while generation 1 was current, mirroring an orphaned
+        // watchdog's guard that outlives its own generation.
+        let old_guard = HamlibLoopReadyGuard::new(flag.clone(), 1, current_generation.clone());
+
+        // A NEW generation starts: bumps the shared counter and sets
+        // readiness true for itself.
+        current_generation.store(2, Ordering::Release);
+        flag.store(true, Ordering::Release);
+
+        // The OLD generation's guard is now dropped (its orphaned
+        // watchdog finally gets aborted). It must NOT clear the flag --
+        // it no longer belongs to the current generation.
+        drop(old_guard);
+
+        assert!(
+            flag.load(Ordering::Acquire),
+            "a stale guard from a superseded generation must not clobber the current \
+             generation's readiness flag back to false"
+        );
+    }
+
+    /// The flip side: a guard whose generation IS still current must keep
+    /// clearing the flag exactly as before -- the fix must not become so
+    /// conservative that it stops clearing altogether.
+    #[test]
+    fn a_guard_still_in_its_own_generation_still_clears_the_flag() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let current_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
+
+        let guard = HamlibLoopReadyGuard::new(flag.clone(), 1, current_generation.clone());
+        drop(guard);
+
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "a guard whose generation is still current must still clear the flag on drop"
         );
     }
 }
@@ -761,6 +968,29 @@ impl super::ApplicationCoordinator {
         self.hamlib_command_loop_ready
             .store(false, Ordering::Release);
 
+        // PAN-19 round-17 review (Codex P1): "keep readiness cleanup
+        // scoped to its Hamlib generation". Bump the generation epoch
+        // ONCE, right here, before anything else this call spawns can
+        // read it -- every `HamlibLoopReadyGuard` constructed during this
+        // generation (message loop, poll, watchdog) tags itself with
+        // `this_generation`, and its `Drop` becomes a no-op once a LATER
+        // call bumps this counter again (e.g. an orphaned watchdog
+        // retained from an OLD generation, per `hamlib_orphans`, whose
+        // guard would otherwise clobber the flag a NEW generation already
+        // correctly set). See `hamlib_generation`'s doc comment in
+        // `coordinator/mod.rs`.
+        let this_generation = self.hamlib_generation.fetch_add(1, Ordering::AcqRel) + 1;
+
+        // PAN-19 round-17 review (Codex P1): "cover the pending-command
+        // handoff before CAT starts". Reset alongside
+        // `hamlib_command_loop_ready` above -- a stuck-`true`
+        // `hamlib_command_in_flight` (e.g. the producer-side handoff set
+        // it, then the task that would have cleared it crashed before
+        // ever reaching that point) must never survive past the NEXT
+        // restart. See that field's doc comment in `coordinator/mod.rs`.
+        self.hamlib_command_in_flight
+            .store(false, Ordering::Release);
+
         if self
             .rigctld_process
             .as_mut()
@@ -963,6 +1193,10 @@ impl super::ApplicationCoordinator {
         let hamlib_pending_frequency_for_polling = self.hamlib_pending_frequency.clone();
         let hamlib_pending_split_for_polling = self.hamlib_pending_split.clone();
         let hamlib_tx_for_polling = hamlib_tx.clone();
+        // PAN-19 round-17 review (Codex P1): "cover the pending-command
+        // handoff before CAT starts" -- see `deliver_pending_hamlib_state`'s
+        // doc comment.
+        let hamlib_command_in_flight_for_polling = self.hamlib_command_in_flight.clone();
         // PAN-19 round-15 review (Codex P1): "keep TX muted until restored
         // rig state is applied". The message loop's own SetFrequency/
         // SetSplit arms need to reach the pending slots directly -- on a
@@ -1046,6 +1280,10 @@ impl super::ApplicationCoordinator {
             // the true source of truth for this flag -- see the comment at
             // the readiness-reporting call site below for why.
             let hamlib_command_loop_ready = self.hamlib_command_loop_ready.clone();
+            // PAN-19 round-17 review (Codex P1): "keep readiness cleanup
+            // scoped to its Hamlib generation" -- see `hamlib_generation`'s
+            // doc comment in `coordinator/mod.rs`.
+            let hamlib_generation = self.hamlib_generation.clone();
             // PAN-19 round-16 review (Codex P1): "keep restored rig state
             // pending through CAT application" -- see this field's doc
             // comment in `coordinator/mod.rs`.
@@ -1101,6 +1339,10 @@ impl super::ApplicationCoordinator {
                 // soon as either Hamlib child exits" -- see the guard
                 // construction at the top of this task's body below.
                 let hamlib_command_loop_ready_for_polling = hamlib_command_loop_ready.clone();
+                // PAN-19 round-17 review (Codex P1): "keep readiness
+                // cleanup scoped to its Hamlib generation" -- see
+                // `HamlibLoopReadyGuard`'s doc comment.
+                let hamlib_generation_for_polling = hamlib_generation.clone();
                 let mut spawned_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
                 spawned_handles.push(tokio::spawn(async move {
@@ -1125,8 +1367,11 @@ impl super::ApplicationCoordinator {
                     // instant it ends for any reason -- independent of
                     // whether the message loop has gotten back around to
                     // its own `child_task_crashed` check yet.
-                    let _poll_ready_guard =
-                        HamlibLoopReadyGuard(hamlib_command_loop_ready_for_polling);
+                    let _poll_ready_guard = HamlibLoopReadyGuard::new(
+                        hamlib_command_loop_ready_for_polling,
+                        this_generation,
+                        hamlib_generation_for_polling,
+                    );
                     let mut poll_interval = interval(Duration::from_millis(500));
                     let mut consecutive_failures: u32 = 0;
                     const CRASH_WARN_THRESHOLD: u32 = 10; // 5 seconds of failures
@@ -1162,6 +1407,7 @@ impl super::ApplicationCoordinator {
                             &last_applied_frequency_id_for_polling,
                             &last_applied_split_id_for_polling,
                             &hamlib_tx_for_polling,
+                            &hamlib_command_in_flight_for_polling,
                         );
 
                         let poll_ok = if let Ok(status) = rig_for_polling.get_status().await {
@@ -1383,9 +1629,23 @@ impl super::ApplicationCoordinator {
                 // PAN-19 round-16 review (Codex P1): same reasoning as the
                 // poll task's own guard above -- see that comment.
                 let hamlib_command_loop_ready_for_watchdog = hamlib_command_loop_ready.clone();
+                // PAN-19 round-17 review (Codex P1): "keep readiness
+                // cleanup scoped to its Hamlib generation" -- CRITICAL for
+                // this specific task: if `teardown_hamlib` can't confirm
+                // PTT-off, THIS watchdog is the one retained indefinitely
+                // in `hamlib_orphans`, still running (and still holding
+                // this guard) across however many FUTURE restarts happen
+                // before it's finally aborted. Without generation-tagging,
+                // its eventual drop would clobber whatever generation is
+                // current AT THAT FUTURE POINT -- see
+                // `HamlibLoopReadyGuard`'s doc comment.
+                let hamlib_generation_for_watchdog = hamlib_generation.clone();
                 spawned_handles.push(tokio::spawn(async move {
-                    let _watchdog_ready_guard =
-                        HamlibLoopReadyGuard(hamlib_command_loop_ready_for_watchdog);
+                    let _watchdog_ready_guard = HamlibLoopReadyGuard::new(
+                        hamlib_command_loop_ready_for_watchdog,
+                        this_generation,
+                        hamlib_generation_for_watchdog,
+                    );
                     let mut watchdog_interval = interval(Duration::from_secs(1));
                     loop {
                         watchdog_interval.tick().await;
@@ -1573,18 +1833,30 @@ impl super::ApplicationCoordinator {
                 // this task ends, for any reason. `None` when readiness was
                 // withheld (child already dead, per round-8): the flag was
                 // never set true, so there's nothing to clear.
-                let _hamlib_loop_ready_guard = if child_task_crashed(&shutdown, &spawned_handles) {
-                    // Already dead -- report nothing. `loop_ready_tx` drops
-                    // without sending when this task ends (via the bail
-                    // just below); `hamlib_command_loop_ready` stays at
-                    // whatever `start_hamlib_component` reset it to
-                    // (`false`) at the start of this call.
-                    None
-                } else {
-                    hamlib_command_loop_ready.store(true, Ordering::Release);
-                    let _ = loop_ready_tx.send(());
-                    Some(HamlibLoopReadyGuard(hamlib_command_loop_ready.clone()))
-                };
+                //
+                // PAN-19 round-17 review (Codex P1): "prevent stale
+                // readiness after the liveness check". See
+                // `publish_loop_readiness_if_children_alive`'s doc comment
+                // for the ABA race this closes.
+                let _hamlib_loop_ready_guard =
+                    if publish_loop_readiness_if_children_alive(&hamlib_command_loop_ready, || {
+                        child_task_crashed(&shutdown, &spawned_handles)
+                    }) {
+                        let _ = loop_ready_tx.send(());
+                        Some(HamlibLoopReadyGuard::new(
+                            hamlib_command_loop_ready.clone(),
+                            this_generation,
+                            hamlib_generation.clone(),
+                        ))
+                    } else {
+                        // Either already dead before the check, or died in
+                        // the check-to-store gap -- report nothing.
+                        // `loop_ready_tx` drops without sending when this
+                        // task ends (via the bail just below);
+                        // `hamlib_command_loop_ready` is left/corrected to
+                        // `false`.
+                        None
+                    };
 
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
@@ -1987,6 +2259,7 @@ impl super::ApplicationCoordinator {
             &last_applied_frequency_id_for_start,
             &last_applied_split_id_for_start,
             &hamlib_tx,
+            &self.hamlib_command_in_flight,
         );
 
         // PAN-19 MEDIUM #2 (round 1) + round-12 review (Codex P1) "retain
@@ -2015,7 +2288,17 @@ impl super::ApplicationCoordinator {
             let confirmed_safe = orphan_safe_to_abort(
                 tokio::time::timeout(RIG_INITIAL_READ_TIMEOUT, ptt_safe_rx).await,
             );
-            if confirmed_safe {
+            // PAN-19 round-17 review (Codex P1): "recheck watchdog
+            // liveness before releasing the orphan". `confirmed_safe`
+            // above is a BUFFERED signal that can go stale between when
+            // it was sent and now -- re-verify the replacement
+            // watchdog's liveness FRESH, immediately before acting on
+            // it, rather than trusting only the earlier confirmation.
+            let replacement_watchdog_alive = self
+                .hamlib_children
+                .as_ref()
+                .is_some_and(|children| !children.watchdog.is_finished());
+            if orphan_release_is_safe(confirmed_safe, replacement_watchdog_alive) {
                 for orphan in self.hamlib_orphans.drain(..) {
                     orphan.abort();
                 }
@@ -2024,7 +2307,8 @@ impl super::ApplicationCoordinator {
                     target: "rig",
                     "Hamlib restart: retaining {} orphaned PTT watchdog(s) from a prior \
                      failed teardown -- the new generation hasn't confirmed PTT-off is safe \
-                     yet; will retry at the next teardown or restart",
+                     yet (or its replacement watchdog is no longer alive to act on it); will \
+                     retry at the next teardown or restart",
                     self.hamlib_orphans.len()
                 );
             }
@@ -2072,6 +2356,25 @@ impl super::ApplicationCoordinator {
 /// already applied a SetFrequency/SetSplit with a NEWER id than the
 /// pending one, the pending item is provably stale -- drop it (don't put
 /// it back in its slot) instead of delivering it.
+///
+/// PAN-19 round-17 review (Codex P1): "cover the pending-command handoff
+/// before CAT starts". Round 16's `HamlibCommandInFlightGuard` only marks
+/// `hamlib_command_in_flight` from the CONSUMER side -- when the message
+/// loop actually starts the underlying CAT call. That still left a gap
+/// one layer earlier: between this function clearing the pending slot and
+/// successfully enqueuing the command (producer side, right here) and the
+/// message loop actually picking it up and constructing its own guard
+/// (consumer side), NEITHER the pending slot NOR the in-flight flag
+/// reflected "something is happening" -- a concurrent PTT-on could slip
+/// through `tx_hard_mute_reason` in exactly that handoff-to-consumption
+/// window. `hamlib_command_in_flight` is now set `true` HERE, at
+/// successful hand-off (`try_send` succeeding), not just at CAT-call
+/// start -- so there is no gap between "no longer pending" and "marked
+/// in-flight". The consumer's own guard (`HamlibCommandInFlightGuard`)
+/// still owns clearing it once the CAT call resolves (success or
+/// failure); setting it again there when the call actually starts is a
+/// harmless, redundant re-affirmation of the same `true` this function
+/// already set.
 /// `true` when the message loop has already applied a command of this kind
 /// newer than `message` -- i.e. `message` is stale and must not be
 /// (re)delivered or (re)applied. Fails safe toward delivering (returns
@@ -2213,12 +2516,34 @@ fn orphan_safe_to_abort(
     matches!(ptt_safe_outcome, Ok(Ok(true)))
 }
 
+/// PAN-19 round-17 review (Codex P1): "recheck watchdog liveness before
+/// releasing the orphan". `ptt_safe` (via [`orphan_safe_to_abort`]) can go
+/// stale between when it was SENT and when it's actually acted on here --
+/// if it vouched for safety only because the REPLACEMENT watchdog
+/// inherited an already-active PTT timer (not because startup PTT-off
+/// itself succeeded), that vouching is only meaningful while the
+/// replacement watchdog is actually still alive to act on it. If that
+/// watchdog has since died (e.g. it exited right after sending its
+/// confirmation but before this wait was processed), the old orphan is
+/// the only thing left that could ever retry the physical unkey -- so it
+/// must NOT be released.
+///
+/// `true` only when BOTH `confirmed_safe` (the buffered `ptt_safe` value)
+/// AND `replacement_watchdog_alive` (a FRESH liveness check, taken
+/// immediately before this decision is acted on, not the earlier
+/// buffered signal) hold. Fails safe (retains the orphan) the same as
+/// [`orphan_safe_to_abort`] does on every other uncertain outcome.
+fn orphan_release_is_safe(confirmed_safe: bool, replacement_watchdog_alive: bool) -> bool {
+    confirmed_safe && replacement_watchdog_alive
+}
+
 fn deliver_pending_hamlib_state(
     pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     last_applied_frequency_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
     last_applied_split_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
     sender: &crossbeam_channel::Sender<ComponentMessage>,
+    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) {
     if let Ok(mut slot) = pending_frequency.lock() {
         if let Some(message) = slot.take() {
@@ -2231,6 +2556,10 @@ fn deliver_pending_hamlib_state(
             } else {
                 match sender.try_send(message) {
                     Ok(()) => {
+                        // PAN-19 round-17 review (Codex P1): "cover the
+                        // pending-command handoff before CAT starts" --
+                        // see this function's doc comment.
+                        hamlib_command_in_flight.store(true, Ordering::Release);
                         info!(
                             target: "rig",
                             "Hamlib restart: delivered pending SetFrequency command carried \
@@ -2260,6 +2589,9 @@ fn deliver_pending_hamlib_state(
             } else {
                 match sender.try_send(message) {
                     Ok(()) => {
+                        // PAN-19 round-17 review (Codex P1): same as
+                        // SetFrequency above.
+                        hamlib_command_in_flight.store(true, Ordering::Release);
                         info!(
                             target: "rig",
                             "Hamlib restart: delivered pending SetSplit command carried over \
@@ -2748,6 +3080,7 @@ mod children_publish_race_tests {
     ) {
         let hamlib_command_loop_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
         hamlib_command_loop_ready.store(true, Ordering::Release);
+        let current_generation = Arc::new(std::sync::atomic::AtomicU64::new(1));
 
         // The "message loop": simulates being blocked inside a slow CAT
         // call for 300ms, never checking child liveness during that
@@ -2768,10 +3101,14 @@ mod children_publish_race_tests {
 
         // The "child" (poll or watchdog): holds the SAME real
         // `HamlibLoopReadyGuard` type wired into their spawned bodies,
+        // still in generation 1 (same as `current_generation`, so its
+        // drop must still clear -- this test isn't exercising round 17's
+        // cross-generation no-op, just the round-16 mechanism it wraps),
         // and ends immediately -- simulating a crash mid-CAT-await.
         let child_flag = hamlib_command_loop_ready.clone();
+        let child_generation = current_generation.clone();
         tokio::spawn(async move {
-            let _child_guard = HamlibLoopReadyGuard(child_flag);
+            let _child_guard = HamlibLoopReadyGuard::new(child_flag, 1, child_generation);
         })
         .await
         .expect("simulated child task must not panic");
@@ -3097,10 +3434,29 @@ mod orphan_ptt_confirmation_tests {
         );
     }
 
+    #[test]
+    fn orphan_release_is_safe_requires_both_conditions() {
+        assert!(
+            orphan_release_is_safe(true, true),
+            "release must be safe when both the confirmation and a fresh liveness check agree"
+        );
+        assert!(
+            !orphan_release_is_safe(false, true),
+            "a live replacement watchdog alone is not enough without a positive confirmation"
+        );
+        assert!(
+            !orphan_release_is_safe(true, false),
+            "a positive (possibly stale) confirmation alone is not enough without a FRESH \
+             liveness check confirming the replacement watchdog is still alive"
+        );
+        assert!(!orphan_release_is_safe(false, false));
+    }
+
     /// Mirrors the real orphan-drain call site's exact shape: an orphan
     /// `AbortHandle`, a `ptt_safe_tx`/`ptt_safe_rx` oneshot that resolves
-    /// to `false`, and the same bounded-`timeout` + `orphan_safe_to_abort`
-    /// + conditional-drain sequence `start_hamlib_component` runs. The
+    /// to `false`, a live replacement watchdog, and the same bounded-
+    /// `timeout` + `orphan_safe_to_abort` + `orphan_release_is_safe` +
+    /// conditional-drain sequence `start_hamlib_component` runs. The
     /// orphan must survive: it may be the only task still trying to unkey
     /// a physically-keyed radio.
     #[tokio::test]
@@ -3109,6 +3465,7 @@ mod orphan_ptt_confirmation_tests {
             tokio::time::sleep(Duration::from_secs(60)).await;
         });
         let mut hamlib_orphans = vec![orphan_task.abort_handle()];
+        let replacement_watchdog = tokio::spawn(async { std::future::pending::<()>().await });
 
         let (ptt_safe_tx, ptt_safe_rx) = tokio::sync::oneshot::channel::<bool>();
         let _ = ptt_safe_tx.send(false);
@@ -3117,7 +3474,8 @@ mod orphan_ptt_confirmation_tests {
             let confirmed_safe = orphan_safe_to_abort(
                 tokio::time::timeout(Duration::from_millis(200), ptt_safe_rx).await,
             );
-            if confirmed_safe {
+            let replacement_watchdog_alive = !replacement_watchdog.is_finished();
+            if orphan_release_is_safe(confirmed_safe, replacement_watchdog_alive) {
                 for orphan in hamlib_orphans.drain(..) {
                     orphan.abort();
                 }
@@ -3135,16 +3493,18 @@ mod orphan_ptt_confirmation_tests {
         );
 
         orphan_task.abort();
+        replacement_watchdog.abort();
     }
 
-    /// The flip side, same shape: a `true` confirmation drains (aborts)
-    /// the orphan.
+    /// The flip side, same shape: a `true` confirmation AND a live
+    /// replacement watchdog drains (aborts) the orphan.
     #[tokio::test]
     async fn the_drain_call_site_drains_the_orphan_once_ptt_safety_is_confirmed() {
         let orphan_task = tokio::spawn(async {
             tokio::time::sleep(Duration::from_secs(60)).await;
         });
         let mut hamlib_orphans = vec![orphan_task.abort_handle()];
+        let replacement_watchdog = tokio::spawn(async { std::future::pending::<()>().await });
 
         let (ptt_safe_tx, ptt_safe_rx) = tokio::sync::oneshot::channel::<bool>();
         let _ = ptt_safe_tx.send(true);
@@ -3153,7 +3513,8 @@ mod orphan_ptt_confirmation_tests {
             let confirmed_safe = orphan_safe_to_abort(
                 tokio::time::timeout(Duration::from_millis(200), ptt_safe_rx).await,
             );
-            if confirmed_safe {
+            let replacement_watchdog_alive = !replacement_watchdog.is_finished();
+            if orphan_release_is_safe(confirmed_safe, replacement_watchdog_alive) {
                 for orphan in hamlib_orphans.drain(..) {
                     orphan.abort();
                 }
@@ -3174,6 +3535,71 @@ mod orphan_ptt_confirmation_tests {
             orphan_task.is_finished(),
             "the drained orphan must actually be aborted"
         );
+
+        replacement_watchdog.abort();
+    }
+
+    /// PAN-19 round-17 review (Codex P1) regression guard: "recheck
+    /// watchdog liveness before releasing the orphan". The exact scenario
+    /// the finding describes: `ptt_safe` confirmed `true` (buffered,
+    /// e.g. because the replacement watchdog inherited an active PTT
+    /// timer), but the replacement watchdog has since DIED -- by the time
+    /// the drain site actually acts on that buffered confirmation, there
+    /// is no longer anything alive to vouch for. The orphan must be
+    /// RETAINED, not released: it may be the only thing left that could
+    /// ever retry the physical unkey.
+    #[tokio::test]
+    async fn the_drain_call_site_retains_the_orphan_when_the_replacement_watchdog_has_died() {
+        let orphan_task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        });
+        let mut hamlib_orphans = vec![orphan_task.abort_handle()];
+
+        // The replacement watchdog already dead by the time the drain
+        // site checks it -- simulates it having sent its `ptt_safe`
+        // confirmation and then crashed/exited before this ran.
+        let replacement_watchdog = tokio::spawn(async {});
+        for _ in 0..1000 {
+            if replacement_watchdog.is_finished() {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            replacement_watchdog.is_finished(),
+            "test setup: the replacement watchdog should have finished"
+        );
+
+        let (ptt_safe_tx, ptt_safe_rx) = tokio::sync::oneshot::channel::<bool>();
+        let _ = ptt_safe_tx.send(true);
+
+        if !hamlib_orphans.is_empty() {
+            let confirmed_safe = orphan_safe_to_abort(
+                tokio::time::timeout(Duration::from_millis(200), ptt_safe_rx).await,
+            );
+            assert!(
+                confirmed_safe,
+                "test setup: the buffered ptt_safe confirmation must be positive"
+            );
+            let replacement_watchdog_alive = !replacement_watchdog.is_finished();
+            if orphan_release_is_safe(confirmed_safe, replacement_watchdog_alive) {
+                for orphan in hamlib_orphans.drain(..) {
+                    orphan.abort();
+                }
+            }
+        }
+
+        assert!(
+            !hamlib_orphans.is_empty(),
+            "the orphan must be RETAINED when the replacement watchdog it was vouched by has \
+             since died, even though the buffered ptt_safe confirmation was positive"
+        );
+        assert!(
+            !orphan_task.is_finished(),
+            "the retained orphan watchdog must still be running, not aborted"
+        );
+
+        orphan_task.abort();
     }
 }
 
@@ -3356,6 +3782,13 @@ mod teardown_replay_tests {
     /// existed (never treats anything as stale).
     fn no_supersession() -> std::sync::Arc<std::sync::Mutex<Option<u64>>> {
         std::sync::Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// PAN-19 round-17 review (Codex P1): a fresh, not-in-flight tracker
+    /// for `deliver_pending_hamlib_state`'s new `hamlib_command_in_flight`
+    /// param -- tests not specifically exercising that flag use this.
+    fn not_in_flight() -> std::sync::Arc<std::sync::atomic::AtomicBool> {
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
     }
 
     /// The exact mechanism: `try_send` on a full bounded channel returns
@@ -3626,6 +4059,7 @@ mod teardown_replay_tests {
             &no_supersession(),
             &no_supersession(),
             &sender,
+            &not_in_flight(),
         );
 
         assert!(
@@ -3669,6 +4103,76 @@ mod teardown_replay_tests {
         );
     }
 
+    /// PAN-19 round-17 review (Codex P1) regression guard: "cover the
+    /// pending-command handoff before CAT starts". A successful hand-off
+    /// (the pending slot clears AND the message lands on the channel)
+    /// must mark `hamlib_command_in_flight` `true` immediately -- BEFORE
+    /// the message loop ever picks it up and constructs its own
+    /// `HamlibCommandInFlightGuard` -- so there is no gap between "no
+    /// longer pending" and "marked in-flight" for a concurrent PTT-on's
+    /// gate-check to slip through.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_marks_in_flight_on_successful_handoff() {
+        let coordinator = test_coordinator().await;
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(set_freq_msg());
+
+        let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
+        let in_flight = not_in_flight();
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &no_supersession(),
+            &sender,
+            &in_flight,
+        );
+
+        assert!(
+            in_flight.load(Ordering::Acquire),
+            "a successful hand-off to the channel must mark hamlib_command_in_flight true \
+             immediately, at producer time -- not wait for the message loop to pick the \
+             message up and construct its own guard"
+        );
+    }
+
+    /// The flip side: a FAILED hand-off (channel full) must NOT mark
+    /// in-flight -- nothing was actually enqueued, so there is nothing in
+    /// flight; the pending slot itself (already correctly repopulated)
+    /// remains the source of truth for "still needs delivery".
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_does_not_mark_in_flight_on_failed_handoff() {
+        let coordinator = test_coordinator().await;
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(set_freq_msg());
+
+        // A full channel at delivery time.
+        let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
+        sender
+            .try_send(set_freq_msg())
+            .expect("pre-fill the one slot");
+
+        let in_flight = not_in_flight();
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &no_supersession(),
+            &sender,
+            &in_flight,
+        );
+
+        assert!(
+            coordinator.hamlib_pending_split.lock().unwrap().is_some(),
+            "test setup: the hand-off must have failed (channel full)"
+        );
+        assert!(
+            !in_flight.load(Ordering::Acquire),
+            "a FAILED hand-off must not mark hamlib_command_in_flight -- nothing was actually \
+             enqueued, so nothing is in flight"
+        );
+    }
+
     /// PAN-19 round-7 review (Codex P1): an earlier version of
     /// `deliver_pending_hamlib_state` `take()`'d the pending slot, tried
     /// `try_send`, and on failure only logged -- discarding the
@@ -3705,6 +4209,7 @@ mod teardown_replay_tests {
             &no_supersession(),
             &no_supersession(),
             &sender,
+            &not_in_flight(),
         );
 
         assert!(
@@ -3721,6 +4226,7 @@ mod teardown_replay_tests {
             &no_supersession(),
             &no_supersession(),
             &sender,
+            &not_in_flight(),
         );
 
         assert!(
@@ -3793,6 +4299,7 @@ mod teardown_replay_tests {
             &no_supersession(),
             &last_applied_split_id,
             &sender,
+            &not_in_flight(),
         );
 
         assert!(
@@ -3841,6 +4348,7 @@ mod teardown_replay_tests {
             &no_supersession(),
             &last_applied_split_id,
             &sender,
+            &not_in_flight(),
         );
 
         assert!(
@@ -4194,6 +4702,7 @@ mod teardown_replay_tests {
             &no_supersession(),
             &no_supersession(),
             &new_sender,
+            &not_in_flight(),
         );
 
         let delivered = new_receiver
@@ -4253,6 +4762,7 @@ mod teardown_replay_tests {
             &no_supersession(),
             &no_supersession(),
             &sender,
+            &not_in_flight(),
         );
         assert!(
             coordinator.hamlib_pending_split.lock().unwrap().is_some(),
@@ -4272,6 +4782,7 @@ mod teardown_replay_tests {
             &no_supersession(),
             &no_supersession(),
             &sender,
+            &not_in_flight(),
         );
 
         assert!(

@@ -719,6 +719,24 @@ pub struct ApplicationCoordinator {
     /// to guard there).
     pub(crate) hamlib_command_loop_ready: Arc<AtomicBool>,
 
+    /// PAN-19 round-17 review (Codex P1): "keep readiness cleanup scoped to
+    /// its Hamlib generation". Monotonic epoch bumped once at the very top
+    /// of every `start_hamlib_component` call (first boot AND every
+    /// restart) -- `HamlibLoopReadyGuard` (round 11) tags itself with
+    /// whatever generation was current when it was constructed, and its
+    /// `Drop` only clears `hamlib_command_loop_ready` if THIS field still
+    /// matches that generation. Without this, an orphaned watchdog
+    /// retained across a restart specifically because teardown couldn't
+    /// confirm PTT-off (`hamlib_orphans`, MEDIUM #2) holds a guard from
+    /// the OLD generation; when it's finally aborted (once the NEW
+    /// generation proves it's PTT-safe, round 12), that stale guard's
+    /// `Drop` would otherwise unconditionally clobber the flag the NEW
+    /// generation just correctly set `true` back to `false` --
+    /// permanently muting an otherwise healthy restart, since nothing else
+    /// ever sets it back. Comparing against this generation counter at
+    /// drop time makes a stale prior-generation guard a no-op instead.
+    pub(crate) hamlib_generation: Arc<std::sync::atomic::AtomicU64>,
+
     /// PAN-19 round-16 review (Codex P1): "keep restored rig state pending
     /// through CAT application". `hamlib_command_loop_ready` above and the
     /// `hamlib_pending_frequency`/`hamlib_pending_split` slots (round 14)
@@ -1588,6 +1606,7 @@ impl ApplicationCoordinator {
             )),
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
             hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
+            hamlib_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hamlib_command_in_flight: Arc::new(AtomicBool::new(false)),
             // Default TX-frequency mode = Hold (operator's picked offset is
             // sticky; pancetta never moves it autonomously). Operator switches
