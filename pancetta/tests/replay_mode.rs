@@ -29,10 +29,15 @@ fn replay_mode_runs_full_pipeline_and_exits_cleanly() {
     write_short_wav(&dir.path().join("a_first.wav"), 12000, 1.0);
     write_short_wav(&dir.path().join("b_second.wav"), 12000, 1.0);
 
+    // Worst-case process lifetime: startup + up to 15s of UTC slot-boundary
+    // pre-roll (`replay_preroll_wait`) + 2s of audio + REPLAY_GRACE_PERIOD
+    // (20s, sized to cover the final slot's boundary+13s decode window plus
+    // the 2000ms decode ceiling) ≈ 39s. 60s leaves headroom for a loaded CI
+    // runner without letting a genuine hang run forever.
     let mut cmd = Command::cargo_bin("pancetta").unwrap();
     cmd.args(["--headless", "--replay"])
         .arg(dir.path())
-        .timeout(Duration::from_secs(30));
+        .timeout(Duration::from_secs(60));
 
     cmd.assert().success();
 }

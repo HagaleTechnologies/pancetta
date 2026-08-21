@@ -1,8 +1,8 @@
 use anyhow::Result;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::interval;
 use tracing::{info, warn};
 
 use super::util::resample_linear;
@@ -58,9 +58,42 @@ pub(crate) fn load_replay_samples(dir: &Path, target_rate: u32) -> Result<Vec<f3
 }
 
 /// Grace period after the last replay chunk is fed before triggering
-/// shutdown -- long enough for in-flight FT8 decode windows to finish,
-/// short enough to keep `--replay` usable in CI and for VHS recordings.
-const REPLAY_GRACE_PERIOD: Duration = Duration::from_secs(5);
+/// shutdown -- long enough for the *final* slot's decode window to fire and
+/// be decoded, short enough to keep `--replay` usable in CI and for VHS
+/// recordings.
+///
+/// Derivation (FT8; see `coordinator/dsp.rs`): the DSP stage emits one decode
+/// window per 15s slot at `slot_boundary + 13s` (`dsp_decode_phase`). Audio
+/// fed after a slot's :13 emit point is only covered by the *next* slot's
+/// window, so the worst-case wait from "last sample handed to DSP" to "the
+/// window covering it fires" is one full slot period minus epsilon -- ~15s
+/// (last sample landing at :13+e waits until the next :28). On top of that
+/// the FT8 stage clamps each window to a hard 2000ms decode ceiling
+/// (`decode_budget_ceiling_ms` in `coordinator/ft8.rs`), plus a little slack
+/// for channel hand-off and the TUI's next render. 15 + 2 + margin => 20s.
+///
+/// This was 5s, which was shorter than the 13s decode phase alone: the last
+/// slot of a replay could never reach the decoder before shutdown.
+const REPLAY_GRACE_PERIOD: Duration = Duration::from_secs(20);
+
+/// Wall-clock offset, measured from the instant the feed loop started, at
+/// which the chunk *beginning* at sample index `samples_sent` is due.
+///
+/// Real-time pacing is expressed as an absolute deadline per chunk rather
+/// than as a fixed-period timer so per-chunk rounding error can never
+/// accumulate. The previous implementation computed a single millisecond
+/// period -- `(buffer_size * 1000 / sample_rate) as u64` -- which *truncates*:
+/// at the default 48000 Hz / 512-sample buffer the true period is 10.667ms
+/// but the timer fired every 10ms, delivering audio 6.67% faster than real
+/// time (~1s of drift per 15s FT8 slot). Because `coordinator/dsp.rs`
+/// positions every decode window against the real wall clock
+/// (`boundary_anchored_slice` keys off `now`), that drift walks the replayed
+/// audio out from under the window the decoder extracts.
+pub(crate) fn replay_chunk_deadline(samples_sent: u64, sample_rate: u32) -> Duration {
+    debug_assert!(sample_rate > 0, "sample_rate must be non-zero");
+    let nanos = samples_sent as u128 * 1_000_000_000u128 / sample_rate.max(1) as u128;
+    Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
+}
 
 /// How long to wait, from `now`, until the next true UTC FT8 slot boundary
 /// (:00/:15/:30/:45). Replayed audio is a real off-air capture naturally
@@ -85,10 +118,15 @@ impl super::ApplicationCoordinator {
     /// waits [`REPLAY_GRACE_PERIOD`] then triggers the same graceful
     /// shutdown Ctrl+C uses, so `--replay` is a finite, self-terminating
     /// mode suitable for scripted demos and automated tests.
+    ///
+    /// `health_audio_alive` is the same flag the real-device relay sets (see
+    /// `audio.rs`); the replay feeder sets it too, so a `--replay` session
+    /// does not render a false "AUDIO DEAD" alarm in the TUI health badge.
     pub(crate) async fn start_replay_pipeline(
         &mut self,
         replay_dir: PathBuf,
         audio_to_dsp_tx: crossbeam_channel::Sender<Vec<f32>>,
+        health_audio_alive: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<()> {
         self.audio_path_supervised = false;
 
@@ -122,12 +160,18 @@ impl super::ApplicationCoordinator {
             }
             tokio::time::sleep(preroll_wait).await;
 
-            let buffer_duration_ms = (buffer_size as f64 * 1000.0 / sample_rate as f64) as u64;
-            let mut process_interval = interval(Duration::from_millis(buffer_duration_ms.max(5)));
+            // Absolute-deadline pacing: every chunk's due time is recomputed
+            // from `feed_start` plus the exact duration of all audio already
+            // sent, so rounding is bounded at one nanosecond per chunk instead
+            // of compounding. See [`replay_chunk_deadline`].
+            let feed_start = tokio::time::Instant::now();
 
             let mut offset = 0usize;
             while offset < samples.len() && !shutdown.load(Ordering::Acquire) {
-                process_interval.tick().await;
+                tokio::time::sleep_until(
+                    feed_start + replay_chunk_deadline(offset as u64, sample_rate),
+                )
+                .await;
 
                 let end = (offset + buffer_size).min(samples.len());
                 let chunk = samples[offset..end].to_vec();
@@ -142,7 +186,16 @@ impl super::ApplicationCoordinator {
                 )
                 .await
                 {
-                    super::pipeline::ForwardOutcome::Sent => {}
+                    super::pipeline::ForwardOutcome::Sent => {
+                        // Mirror the real-device relay (`audio.rs`): audio is
+                        // genuinely flowing into the DSP stage, so the health
+                        // badge must not read "AUDIO DEAD". Deliberately never
+                        // reset to false when the feed ends -- unlike a wedged
+                        // capture device, an exhausted replay directory is the
+                        // expected terminal state and shutdown follows within
+                        // REPLAY_GRACE_PERIOD.
+                        health_audio_alive.store(true, Ordering::Relaxed);
+                    }
                     super::pipeline::ForwardOutcome::Dropped => {
                         warn!("Replay: DSP stage not draining -- dropped one batch");
                     }
@@ -150,6 +203,12 @@ impl super::ApplicationCoordinator {
                 }
             }
 
+            info!(
+                "Replay: fed {} samples ({:.2}s of audio) in {:.2}s wall-clock",
+                offset,
+                offset as f64 / sample_rate as f64,
+                feed_start.elapsed().as_secs_f64(),
+            );
             info!(
                 "Replay complete -- waiting {:?} before shutdown",
                 REPLAY_GRACE_PERIOD
@@ -237,6 +296,65 @@ mod tests {
         // 80 samples @ 8000 Hz resampled to 12000 Hz -> 120 samples each (linear
         // resampler truncates via integer division: 80 * 12000 / 8000 = 120).
         assert_eq!(samples.len(), 240);
+    }
+
+    /// The regression this function exists for: the old
+    /// `(buffer_size * 1000 / sample_rate) as u64` millisecond period
+    /// truncated 10.667ms to 10ms at the project-default 48000 Hz / 512
+    /// buffer, running replayed audio 6.67% fast. The absolute deadline for
+    /// the Nth chunk must track true audio time, not a truncated period.
+    #[test]
+    fn replay_chunk_deadline_does_not_truncate_default_config_period() {
+        const RATE: u32 = 48_000;
+        const BUF: u64 = 512;
+
+        // One buffer of audio at 48kHz is 10.6666...ms, not 10ms.
+        let one_chunk = replay_chunk_deadline(BUF, RATE);
+        assert_eq!(one_chunk, Duration::from_nanos(10_666_666));
+
+        // The old truncating math would have put chunk 1407 (the last chunk of
+        // a 15s slot) at 14.07s instead of 15.0s -- ~930ms of drift inside a
+        // single FT8 slot. The deadline form must land on true audio time.
+        let slot_chunks = 15 * RATE as u64 / BUF; // 1406.25 -> 1406 whole chunks
+        let deadline = replay_chunk_deadline(slot_chunks * BUF, RATE);
+        let drift = 15.0 - deadline.as_secs_f64();
+        assert!(
+            drift < 0.011,
+            "one slot of chunks should be within one chunk of 15s, got {deadline:?}"
+        );
+    }
+
+    #[test]
+    fn replay_chunk_deadline_is_cumulative_and_starts_at_zero() {
+        const RATE: u32 = 12_000;
+        // First chunk is due immediately (matches the old `interval`, whose
+        // first tick completed without delay).
+        assert_eq!(replay_chunk_deadline(0, RATE), Duration::ZERO);
+        // Deadlines are absolute offsets from feed start, so they scale
+        // linearly in the number of samples already sent -- there is no
+        // per-chunk residual to accumulate.
+        assert_eq!(replay_chunk_deadline(12_000, RATE), Duration::from_secs(1));
+        assert_eq!(
+            replay_chunk_deadline(120_000, RATE),
+            Duration::from_secs(10)
+        );
+        assert_eq!(
+            replay_chunk_deadline(6_000, RATE),
+            Duration::from_millis(500)
+        );
+    }
+
+    #[test]
+    fn replay_grace_period_covers_final_slot_decode() {
+        // The DSP stage emits a slot's decode window at boundary+13s and the
+        // FT8 stage clamps each window to a 2000ms ceiling; the worst-case
+        // wait from last-sample-fed to window-fired is one full 15s slot.
+        // The grace period must exceed 15s + 2s or the last slot of a replay
+        // can never reach the decoder before shutdown.
+        assert!(
+            REPLAY_GRACE_PERIOD >= Duration::from_secs(17),
+            "grace period {REPLAY_GRACE_PERIOD:?} is shorter than one slot plus the decode ceiling"
+        );
     }
 
     #[test]
