@@ -11,11 +11,10 @@ name: Regenerate demo assets
 # to link cpal/audio + reqwest/TLS deps, or `cargo build -p pancetta` fails
 # outright on ubuntu-latest.
 #
-# Note: `.tapes/demo.tape` itself documents that the current demo corpus
-# does not reliably show a live FT8 decode even under --replay (see its
-# "HONEST DISCLOSURE" comment). This workflow's job is only to re-render
-# whatever the tape currently produces and commit it if the bytes changed
-# -- it makes no claim about decode content.
+# Note: this workflow's job is only to re-render whatever the tape currently
+# produces and commit it if the bytes changed -- it makes no claim about
+# decode content. `.tapes/demo.tape` documents the corpus's decode profile
+# (only the last file decodes, ~26 messages) in its trailing comment block.
 
 on:
   pull_request:
@@ -103,6 +102,21 @@ jobs:
           # with no CI runs at all -- required checks stay pending forever, or
           # the PR merges against a head that was never actually checked. One
           # extra CI run per regeneration is the correct price for that.
+          #
+          # KNOWN LIMITATION (not fixable in this workflow file, tracked here
+          # so it is not silently forgotten): dropping `[skip ci]` is
+          # necessary but NOT sufficient. GitHub deliberately does not trigger
+          # any workflow run for a commit pushed with the default
+          # `GITHUB_TOKEN`, precisely to prevent recursive workflow loops --
+          # so the auto-commit above still lands a head commit with no CI
+          # attached regardless of the commit message. Actually closing the
+          # gap needs one of:
+          #   1. push with a PAT or GitHub App installation token instead of
+          #      GITHUB_TOKEN (a repo-secrets/infrastructure change), or
+          #   2. redesign this lane as verify-only -- render, `git diff
+          #      --exit-code assets/demo.gif`, and FAIL the check telling the
+          #      author to re-render locally, committing nothing.
+          # Both are out of scope for a code-only change.
           commit_message: "chore: regenerate demo.gif"
           file_pattern: assets/demo.gif
           # Belt-and-suspenders alongside the checkout `ref:` above: pins
