@@ -17,8 +17,19 @@ Set Theme "Dracula"
 # fires when station.callsign is still the "N0CALL" default. This writes a
 # throwaway file under the OS temp dir; it never touches the operator's
 # real ~/.pancetta/pancetta.toml.
+#
+# Also sets [decoder] effort = "max" (pancetta-config/src/decoder.rs,
+# DecodeEffort::Max -- "maximum effort, slowest decode, highest recall").
+# The live coordinator's default DecodeEffort::Auto maps to a time-boxed
+# per-window budget (~1000ms on typical hardware, see
+# pancetta/src/coordinator/effort.rs) that is too tight for the FT8
+# decoder's S4 cross-cycle-averaging recovery stage -- the stage that
+# pancetta-ft8/tests/wav_decode_tests.rs (~lines 784, 802-812) documents as
+# needed to decode assets/demo-wav/live_now.wav. `effort = "max"` removes
+# the time box so every recovery stage runs to completion, same as the
+# unit test's DecodeBudget::unlimited().
 Hide
-Type `DEMO_CFG=$(mktemp -t pancetta-demo-config).toml; printf '[station]\ncallsign = \"K5ARH\"\n' > $DEMO_CFG`
+Type `DEMO_CFG=$(mktemp -t pancetta-demo-config).toml; printf '[station]\ncallsign = \"K5ARH\"\n\n[decoder]\neffort = \"max\"\n' > $DEMO_CFG`
 Enter
 Sleep 500ms
 Type "clear"
