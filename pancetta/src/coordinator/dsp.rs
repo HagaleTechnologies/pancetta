@@ -53,10 +53,16 @@ pub(crate) fn dsp_supports_input_rate(rate: u32) -> bool {
 /// The operator-facing explanation for a rate [`dsp_supports_input_rate`]
 /// rejects. Shared so the DSP worker's error and `--replay`'s fail-fast bail
 /// name the same constraint and the same supported rates.
+///
+/// The rate list here is the intersection of what `AudioConfig::validate_section`
+/// accepts for `[audio] sample_rate` and what's a whole multiple of
+/// `DSP_TARGET_SAMPLE_RATE_HZ` -- naming a rate here that config validation
+/// would itself reject (e.g. 12000, 24000) would just trade one error for
+/// another.
 pub(crate) fn unsupported_input_rate_message(rate: u32) -> String {
     format!(
         "Audio sample rate {rate} Hz is not evenly divisible by {DSP_TARGET_SAMPLE_RATE_HZ} Hz. \
-         Supported rates: 12000, 24000, 48000, 96000."
+         Of the [audio] sample_rate values pancetta accepts, use 48000 (the default), 96000, or 192000."
     )
 }
 
