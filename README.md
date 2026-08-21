@@ -35,13 +35,13 @@ runs as happily over SSH on a headless box behind the radio as on a desktop.
 
 ## Why Pancetta
 
-- **A decoder measured against the real reference.** On a 1,201-file off-air
-  corpus the native Rust decoder produced **+11.6% more decodes than
-  `ft8_lib`** on the same audio — but that comparison is historical. Measured
-  against WSJT-X's `jt9`, the decoder hams actually run, Pancetta needs
-  **~2.1 dB more SNR** to reach 50% recall on FT8 (~3.95 dB on FT4, where it
-  caps at 78% recall), at a false-positive cost of 1 decode per 1,000
-  pure-noise recordings (0.1%). Full numbers and caveats:
+- **A decoder measured against the real reference.** Against WSJT-X's `jt9` —
+  the decoder hams actually run — Pancetta needs **~2.1 dB more SNR** to
+  reach 50% recall on FT8, and **~3.95 dB more on FT4, where it caps at 78%
+  recall**, at a false-positive cost of 1 decode per 1,000 pure-noise
+  recordings (0.1%). In short: competitive, not yet class-leading. (An older
+  1,201-file comparison against `ft8_lib` showed +11.6% more decodes, but
+  `ft8_lib` is not the bar operators care about.) Full numbers and caveats:
   [`docs/decoder-comparison.md`](docs/decoder-comparison.md).
 - **A priority engine, not a list.** Every decoded CQ is scored against
   needed DXCC, needed grid, POTA/SOTA, rarity, signal, and recent activity —
@@ -66,9 +66,12 @@ encode, decode, LDPC, CRC, and OSD.
 
 ## What it looks like
 
-Every capture below (and the GIF further down) comes from a development host
-with no radio or audio device attached — the panels are idle, so they show the
-layout and controls rather than a live band.
+Every capture below — and the GIF further down, and the hero GIF above — was
+recorded on a development host with `pancetta --replay`, feeding archived
+off-air WAV captures through the real pipeline (see [`.tapes/`](.tapes/)).
+Real audio, real panels; no decode lands in this particular corpus, so the
+decode-driven tables read empty and these show layout, chrome and controls
+rather than a worked band.
 
 | | |
 |---|---|
