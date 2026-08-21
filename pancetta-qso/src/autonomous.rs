@@ -853,6 +853,12 @@ pub struct AutonomousOperator {
     /// Cleared on a band hop, since it's scoped to the old band's audio
     /// offset space.
     current_cq_offset_hz: Option<f64>,
+    /// Snapshot of state taken immediately before the current cycle's
+    /// speculative self-CQ mutations, if `decide_at` reached that point this
+    /// cycle. The coordinator calls [`Self::restore_cq_state`] to pop and
+    /// apply it when a downstream gate suppressed the self-CQ before it
+    /// reached the radio. `None` on any cycle that didn't attempt a self-CQ.
+    last_cq_snapshot: Option<CqStateSnapshot>,
     /// Real FT8 message parser, used by [`Self::is_directed_response`] to
     /// recognize a genuine reply (handles compound/hash-rendered callsigns
     /// and every valid rung shape correctly, instead of a hand-rolled text
@@ -949,6 +955,7 @@ impl AutonomousOperator {
             idle_cycles: 0,
             cq_no_response_streak: 0,
             current_cq_offset_hz: None,
+            last_cq_snapshot: None,
             exchange,
             our_callsign,
             our_grid,
@@ -977,32 +984,30 @@ impl AutonomousOperator {
         std::mem::take(&mut self.skip_log)
     }
 
-    /// Capture the self-CQ-relevant state before calling `decide()`/`decide_at`.
+    /// Undo this cycle's speculative self-CQ mutations — call when the
+    /// coordinator determines the self-CQ `decide_at` emitted was suppressed
+    /// by a downstream gate (Shift+Q runtime gate, TX policy, operator-
+    /// presence/FCC §97.221 gate, dry_run) before reaching the radio.
     ///
-    /// Codex review (PR #276, rounds 2-3): `decide_at` mutates
+    /// No-op if this cycle didn't reach the self-CQ branch (`decide_at`
+    /// clears `last_cq_snapshot` back to `None` after consuming it here, so
+    /// calling this twice, or on a cycle with no self-CQ, is always safe).
+    ///
+    /// Codex review (PR #276, rounds 2-4): `decide_at` mutates
     /// `cq_no_response_streak`, `current_cq_offset_hz`, and (on a
-    /// threshold-driven switch) `config.tx_offset_hz` speculatively — before
-    /// the coordinator's downstream gates (Shift+Q runtime gate, TX policy,
-    /// operator-presence/FCC §97.221 gate, dry_run) decide whether the self-CQ
-    /// actually reaches the radio. A simple "subtract one from the streak" undo
-    /// is correct for a routine CQ but WRONG for a suppressed switch: a switch
-    /// resets the streak, installs a new sticky offset, and updates
-    /// `config.tx_offset_hz`, none of which a bare decrement restores — the
-    /// station would end up "switched" to a frequency it never actually
-    /// transmitted on, with the real pre-switch streak lost. Snapshot/restore
-    /// undoes all three fields atomically regardless of which case occurred.
-    pub fn snapshot_cq_state(&self) -> CqStateSnapshot {
-        CqStateSnapshot {
-            streak: self.cq_no_response_streak,
-            current_cq_offset_hz: self.current_cq_offset_hz,
-            tx_offset_hz: self.config.tx_offset_hz,
-        }
-    }
-
-    /// Restore state captured by [`Self::snapshot_cq_state`] — call when the
-    /// coordinator determines this cycle's self-CQ was suppressed by a
-    /// downstream gate before reaching the radio.
-    pub fn restore_cq_state(&mut self, snapshot: CqStateSnapshot) {
+    /// threshold-driven switch) `config.tx_offset_hz` speculatively. A
+    /// simple "subtract one from the streak" undo is wrong for a suppressed
+    /// switch (round 3 — misses the offset/config changes a switch also
+    /// makes). The snapshot itself must also be taken from INSIDE
+    /// `decide_at`, immediately before those mutations, not by the
+    /// coordinator before calling `decide()` (round 4 — a pre-`decide()`
+    /// snapshot would "restore" a value Step 0's band-hop/Hold-mode
+    /// handling had *just correctly invalidated* earlier in the very same
+    /// cycle, e.g. `current_cq_offset_hz` cleared on a same-cycle band hop).
+    pub fn restore_cq_state(&mut self) {
+        let Some(snapshot) = self.last_cq_snapshot.take() else {
+            return;
+        };
         self.cq_no_response_streak = snapshot.streak;
         self.current_cq_offset_hz = snapshot.current_cq_offset_hz;
         self.config.tx_offset_hz = snapshot.tx_offset_hz;
@@ -1894,6 +1899,22 @@ impl AutonomousOperator {
                             self.state = OperatingState::CallingCq;
                             self.idle_cycles = 0;
 
+                            // Codex review (PR #276, round 4): captured HERE,
+                            // not by the coordinator before calling decide()
+                            // — this is after Step 0's band-hop/mode-driven
+                            // invalidations already ran this cycle, but
+                            // before this block's own speculative self-CQ
+                            // mutations. A pre-decide() snapshot would
+                            // "restore" a value Step 0 had just correctly
+                            // invalidated (e.g. `current_cq_offset_hz`
+                            // cleared on a same-cycle band hop) if this
+                            // cycle's CQ then got suppressed downstream.
+                            self.last_cq_snapshot = Some(CqStateSnapshot {
+                                streak: self.cq_no_response_streak,
+                                current_cq_offset_hz: self.current_cq_offset_hz,
+                                tx_offset_hz: self.config.tx_offset_hz,
+                            });
+
                             let should_switch = self.tx_freq_auto()
                                 && self.cq_no_response_streak
                                     >= self.config.cq_no_response_switch_after;
@@ -2770,17 +2791,17 @@ mod tests {
     #[test]
     fn restore_cq_state_undoes_a_suppressed_routine_cq() {
         // decide_at counts a self-CQ optimistically, before the
-        // coordinator's TX gates run. snapshot_cq_state/restore_cq_state is
-        // what the coordinator uses when a gate suppressed it.
+        // coordinator's TX gates run, snapshotting internally right before
+        // that mutation. restore_cq_state() is what the coordinator calls
+        // when a gate suppressed it.
         let mut op = primed_operator(2, 5, true);
         for _ in 0..8 {
             op.feed_decoded_messages(&[], &NullDxEvaluator);
         }
         let even_ts: i64 = 0;
         op.decide_at(even_ts); // idle
-        let snapshot = op.snapshot_cq_state();
-        op.decide_at(even_ts); // CQ #1, streak -> 1 (speculative)
-        op.restore_cq_state(snapshot); // gate suppressed it: streak -> back to 0
+        op.decide_at(even_ts); // CQ #1, streak -> 1 (speculative, self-snapshotted)
+        op.restore_cq_state(); // gate suppressed it: streak -> back to 0
 
         op.decide_at(even_ts); // idle
         let round = op.decide_at(even_ts); // CQ #2 (post-restore): entering streak 0, not 1
@@ -2811,20 +2832,24 @@ mod tests {
         op.decide_at(even_ts); // idle
         op.decide_at(even_ts); // CQ #2, streak -> 2
 
-        let snapshot = op.snapshot_cq_state();
-        assert_eq!(snapshot.streak, 2);
-        let pre_switch_offset = op.current_cq_offset_hz;
-
         // switch_after=3: entering streak is 2 at CQ #3, still below
         // threshold — confirms it's routine before CQ #4 below switches.
         op.decide_at(even_ts); // idle
-        let switch_round = op.decide_at(even_ts); // CQ #3, routine
+        let round3 = op.decide_at(even_ts); // CQ #3, routine
         assert!(
-            !switch_round
+            !round3
                 .iter()
                 .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
             "sanity: CQ #3 must be routine, not yet a switch (test setup check)"
         );
+
+        let pre_switch_streak = op.cq_no_response_streak;
+        let pre_switch_offset = op.current_cq_offset_hz;
+        assert_eq!(
+            pre_switch_streak, 3,
+            "sanity: streak should be 3 entering CQ #4"
+        );
+
         op.decide_at(even_ts); // idle
         let switch_round = op.decide_at(even_ts); // CQ #4: entering streak 3 >= 3 -> switches
         assert!(
@@ -2836,10 +2861,10 @@ mod tests {
 
         // The switch already ran (streak reset+incremented, offset changed).
         // Now simulate the coordinator discovering it was suppressed.
-        op.restore_cq_state(snapshot);
+        op.restore_cq_state();
 
         assert_eq!(
-            op.cq_no_response_streak, 2,
+            op.cq_no_response_streak, pre_switch_streak,
             "streak must be restored to its real pre-switch value, not left at \
              whatever the switch's reset+increment produced"
         );
@@ -2937,6 +2962,70 @@ mod tests {
             op.current_cq_offset_hz.is_none(),
             "current CQ offset must be cleared on band hop and not repopulated \
              by a same-cycle switch that correctly declined to use stale data"
+        );
+    }
+
+    #[test]
+    fn restore_cq_state_does_not_undo_a_same_cycle_band_hop() {
+        // Codex review (PR #276, round 4): the snapshot restore_cq_state()
+        // applies must be taken AFTER Step 0's band-hop clearing, not from
+        // before decide_at ran at all — otherwise "restoring" a suppressed
+        // self-CQ on a band-hop cycle would bring back the stale PRE-hop
+        // current_cq_offset_hz, undoing what the hop correctly invalidated.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 1;
+        config.cq_no_response_switch_after = 100; // stay routine, not a switch
+        config.listen_cycle.initial_interval = 1000;
+        config.band_hopping = BandHoppingConfig {
+            enabled: true,
+            hop_threshold: 1,
+            bands: vec![
+                BandEntry {
+                    dial_frequency: 14_074_000,
+                    band_name: "20m".into(),
+                    priority: 1,
+                },
+                BandEntry {
+                    dial_frequency: 7_074_000,
+                    band_name: "40m".into(),
+                    priority: 2,
+                },
+            ],
+        };
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        op.feed_decoded_messages(&[], &NullDxEvaluator); // meets hop_threshold=1
+        let stale_pre_hop_offset = 1500.0;
+        op.current_cq_offset_hz = Some(stale_pre_hop_offset);
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::ChangeBand { .. })),
+            "expected a band hop with hop_threshold=1"
+        );
+        // Not a switch (switch_after=100) — a routine CQ ran this cycle,
+        // re-ranking fresh (current_cq_offset_hz was cleared by the hop)
+        // and setting a NEW value. Simulate the coordinator finding it
+        // suppressed by a downstream gate.
+        op.restore_cq_state();
+
+        assert_ne!(
+            op.current_cq_offset_hz,
+            Some(stale_pre_hop_offset),
+            "restoring a suppressed same-cycle-band-hop CQ must NOT bring back \
+             the stale pre-hop offset"
         );
     }
 

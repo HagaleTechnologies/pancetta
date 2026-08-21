@@ -1337,13 +1337,6 @@ impl super::ApplicationCoordinator {
                                 // than holding it through `decide()`/dispatch.
                                 drop(op);
                             } else {
-                            // Codex review (PR #276, round 3): captured
-                            // BEFORE decide() so a suppressed self-CQ this
-                            // cycle can be fully rolled back (streak, sticky
-                            // offset, config.tx_offset_hz) — not just
-                            // decremented, which doesn't undo a suppressed
-                            // switch's offset change.
-                            let cq_state_snapshot = op.snapshot_cq_state();
                             let actions = op.decide();
                             let skip_records = op.take_skip_log();
                             drop(op);
@@ -1643,7 +1636,7 @@ impl super::ApplicationCoordinator {
                                 dry_run,
                             ) {
                                 let mut op = operator.lock().await;
-                                op.restore_cq_state(cq_state_snapshot);
+                                op.restore_cq_state();
                                 drop(op);
                             }
                             for diagnostic in
