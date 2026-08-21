@@ -1,0 +1,71 @@
+name: Regenerate demo assets
+
+# Re-renders .tapes/demo.tape whenever a PR touches the TUI, the tape
+# sources, or the replay WAV fixtures it feeds, and auto-commits the
+# resulting assets/demo.gif if the render changed. Keeps the README hero
+# GIF from silently going stale.
+#
+# Mirrors this repo's other CI lanes (see ci.yml/docs.yml/release.yml):
+# checkout MUST be `submodules: recursive` and the Linux runner needs the
+# same system packages (libasound2-dev/libudev-dev/libssl-dev/pkg-config)
+# to link cpal/audio + reqwest/TLS deps, or `cargo build -p pancetta` fails
+# outright on ubuntu-latest.
+#
+# Note: `.tapes/demo.tape` itself documents that the current demo corpus
+# does not reliably show a live FT8 decode even under --replay (see its
+# "HONEST DISCLOSURE" comment). This workflow's job is only to re-render
+# whatever the tape currently produces and commit it if the bytes changed
+# -- it makes no claim about decode content.
+
+on:
+  pull_request:
+    paths:
+      - "pancetta-tui/**"
+      - ".tapes/**"
+      - "assets/demo-wav/**"
+
+jobs:
+  vhs:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Without the ft8_lib submodule, pancetta-ft8/build.rs silently
+          # falls back to the stub decoder (see release.yml's guard). That
+          # wouldn't break this workflow, but a demo build should still
+          # match how the binary is actually built everywhere else in CI.
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: demo-assets
+
+      - name: Build pancetta
+        # Pre-build so the tape's `cargo run --release -p pancetta` starts
+        # the TUI almost immediately -- the tape's Wait+Screen@15s anchor
+        # assumes a warm binary, not a fresh compile.
+        run: cargo build --release -p pancetta
+
+      - name: Render demo tape
+        uses: charmbracelet/vhs-action@v2
+        with:
+          path: ".tapes/demo.tape"
+
+      - name: Check for changed assets
+        id: diff
+        run: |
+          if ! git diff --quiet -- assets/demo.gif; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Commit updated GIF
+        if: steps.diff.outputs.changed == 'true'
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "chore: regenerate demo.gif [skip ci]"
+          file_pattern: assets/demo.gif
