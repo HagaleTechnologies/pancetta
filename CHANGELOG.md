@@ -76,11 +76,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of hanging forever (the `no_audio` short-circuit in
   `start_audio_pipeline` precedes the replay branch, so no feeder was spawned
   and nothing ever triggered the shutdown signal).
-- `--replay` no longer touches the outside world. A demo run against an
+- `--replay` no longer publishes to the outside world (read-only traffic —
+  cqdx.io's rarity/needed-entity lookups, DX cluster login — still happens,
+  so the demo keeps real scoring data). A demo run against an
   already-configured station could otherwise key the real transmitter in
   response to replayed (historical) traffic, and publish those replayed
   decodes — re-stamped with the current clock — as if they were live. Every
-  outbound integration now consults one shared predicate
+  outbound *write* now consults one shared predicate
   (`ApplicationCoordinator::replay_mode`): Hamlib is not started at all (no
   PTT capability); PSKReporter is forced onto its uploads-disabled (noop
   drain) path; cqdx.io spot reporting is suppressed; the WSJT-X UDP companion

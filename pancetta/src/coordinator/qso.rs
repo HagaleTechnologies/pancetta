@@ -1896,18 +1896,15 @@ impl super::ApplicationCoordinator {
         let qrz_xml_enabled = qrz_xml_cfg.enabled
             && !qrz_xml_cfg.username.is_empty()
             && !qrz_xml_cfg.password.is_empty();
-        // `--replay` never uploads. A QSO the engine "completes" off replayed
-        // (historical) traffic would be POSTed to ClubLog/QRZ/LoTW/eQSL/
-        // cqdx.io as a brand-new contact stamped with today's date —
-        // permanent, externally-visible bad log data. Same gate as the
-        // reception/spot paths; see `ApplicationCoordinator::replay_mode`.
-        let upload_enabled = !self.replay_mode()
-            && (clublog_cfg.enabled
-                || qrz_cfg.enabled
-                || lotw_cfg.enabled
-                || eqsl_cfg.enabled
-                || cqdx_upload_enabled
-                || qrz_xml_enabled);
+        let upload_enabled = logbook_upload_enabled(
+            clublog_cfg.enabled,
+            qrz_cfg.enabled,
+            lotw_cfg.enabled,
+            eqsl_cfg.enabled,
+            cqdx_upload_enabled,
+            qrz_xml_enabled,
+            self.replay_mode(),
+        );
 
         let qso_lookup = self.cached_lookup.clone();
         let upload_our_callsign = our_callsign.clone();
@@ -5811,6 +5808,32 @@ fn cqdx_logbook_upload_enabled(cfg: &pancetta_config::network::CqdxConfig) -> bo
     cfg.enabled && cfg.token.as_ref().is_some_and(|t| !t.is_empty())
 }
 
+/// Whether the per-QSO logbook upload subscriber should run at all: at least
+/// one target must be enabled, AND `--replay` must not be active.
+///
+/// `--replay` never uploads. A QSO the engine "completes" off replayed
+/// (historical) traffic would be POSTed to ClubLog/QRZ/LoTW/eQSL/cqdx.io as a
+/// brand-new contact stamped with today's date — permanent, externally-visible
+/// bad log data. Same gate as the reception/spot paths; see
+/// `ApplicationCoordinator::replay_mode`.
+fn logbook_upload_enabled(
+    clublog_enabled: bool,
+    qrz_enabled: bool,
+    lotw_enabled: bool,
+    eqsl_enabled: bool,
+    cqdx_upload_enabled: bool,
+    qrz_xml_enabled: bool,
+    replay: bool,
+) -> bool {
+    !replay
+        && (clublog_enabled
+            || qrz_enabled
+            || lotw_enabled
+            || eqsl_enabled
+            || cqdx_upload_enabled
+            || qrz_xml_enabled)
+}
+
 /// Build the structured cqdx.io `QsoRecord` for the `POST /api/v1/qsos`
 /// logbook endpoint from a completed `QsoMetadata`. Returns `None` when the
 /// contra-callsign is unknown (nothing to log). The frequency is the dial+offset
@@ -6321,7 +6344,7 @@ fn start_adif_subscriber(
 
 #[cfg(test)]
 mod cqdx_upload_tests {
-    use super::{cqdx_logbook_upload_enabled, cqdx_record_from_metadata};
+    use super::{cqdx_logbook_upload_enabled, cqdx_record_from_metadata, logbook_upload_enabled};
     use chrono::Utc;
     use pancetta_config::network::CqdxConfig;
     use pancetta_qso::{GridSquares, QsoMetadata, SignalReports};
@@ -6433,6 +6456,50 @@ mod cqdx_upload_tests {
     fn record_none_without_callsign() {
         let md = metadata_with_call(None);
         assert!(cqdx_record_from_metadata(&md).is_none());
+    }
+
+    /// `--replay` forces the logbook-upload subscriber off even when every
+    /// target is enabled — a replayed "completed" QSO must never be filed as
+    /// a real contact.
+    #[test]
+    fn replay_disables_upload_even_with_every_target_enabled() {
+        assert!(!logbook_upload_enabled(
+            true, true, true, true, true, true, true
+        ));
+    }
+
+    /// With replay off, at least one enabled target is sufficient.
+    #[test]
+    fn any_single_target_enables_upload_when_not_replaying() {
+        assert!(logbook_upload_enabled(
+            true, false, false, false, false, false, false
+        ));
+        assert!(logbook_upload_enabled(
+            false, true, false, false, false, false, false
+        ));
+        assert!(logbook_upload_enabled(
+            false, false, true, false, false, false, false
+        ));
+        assert!(logbook_upload_enabled(
+            false, false, false, true, false, false, false
+        ));
+        assert!(logbook_upload_enabled(
+            false, false, false, false, true, false, false
+        ));
+        assert!(logbook_upload_enabled(
+            false, false, false, false, false, true, false
+        ));
+    }
+
+    /// No target enabled → no upload, replay or not.
+    #[test]
+    fn no_targets_enabled_means_no_upload() {
+        assert!(!logbook_upload_enabled(
+            false, false, false, false, false, false, false
+        ));
+        assert!(!logbook_upload_enabled(
+            false, false, false, false, false, false, true
+        ));
     }
 }
 
