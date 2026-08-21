@@ -106,8 +106,19 @@ Hands-off operation is opt-in (`[autonomous] enabled = true`) and assumes a
 licensed control operator is at the keyboard and can stop it instantly:
 
 - **`Shift+Q` is an emergency stop** — halts TX and switches autonomous off.
-- **The TX-arm gate fails closed.** A poisoned lock means no transmit, never
-  a permissive fallback, and it ANDs under the active TX policy.
+  It drops the runtime autonomy gate, and every TX item the engine produced
+  for that cycle is discarded before it can be keyed.
+- **Autonomous *initiation* requires a present operator.** Calling CQ or
+  pouncing needs a console keypress within the last two minutes (FCC §97.221:
+  a station with nobody at the control point may respond, not originate).
+  Headless or idle, Pancetta drops to respond-only; QSOs already in progress
+  still finish. Every autonomous TX item additionally has to clear the active
+  `TxPolicy` (e.g. dry-run/listen-only modes).
+- **The *remote*-TX arm gate fails closed.** Separate from the above, and
+  specific to transmissions originated over the remote-operation protocol:
+  a poisoned lock means no transmit, never a permissive fallback, and it ANDs
+  under the active TX policy. It governs `TxOrigin::Remote` only — local and
+  autonomous TX are gated by the mechanisms above.
 - **Drop-stale-TX.** The TX worker re-checks QSO liveness at the last instant
   before PTT, so a frame for a QSO that just ended never goes out.
 - **One parity, always.** Concurrent QSOs share a slot parity; Pancetta never
