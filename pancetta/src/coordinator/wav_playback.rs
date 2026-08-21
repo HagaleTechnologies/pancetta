@@ -27,6 +27,16 @@ fn int_sample_max_val(bits_per_sample: u16) -> Result<f32> {
 /// Read a WAV file, mixing to mono if it's multi-channel. Returns the mono
 /// samples at the file's own native sample rate (no resampling here) plus
 /// that rate, so callers can resample to whatever target they need.
+///
+/// A failed sample read (truncated file, malformed data chunk) is a hard
+/// error naming the offending path, NOT a silently dropped sample. Silently
+/// skipping bad samples shortens the decoded audio without telling anyone:
+/// under `--replay` (`replay.rs`, `load_replay_samples`) every subsequent
+/// corpus file is concatenated straight onto the shortened stream, collapsing
+/// archive time and shifting the alignment of every FT8 frame after the
+/// corruption while the run still exits 0. `--wav` single-file mode has the
+/// milder version of the same bug — a quietly truncated decode reported as a
+/// successful one — so both callers want the error.
 pub(crate) fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32)> {
     let reader = hound::WavReader::open(path)
         .map_err(|e| anyhow::anyhow!("Failed to open WAV file {}: {}", path.display(), e))?;
@@ -37,19 +47,29 @@ pub(crate) fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32)> {
         spec.channels, spec.sample_rate, spec.sample_format, spec.bits_per_sample
     );
 
+    let sample_err = |index: usize, e: hound::Error| {
+        anyhow::anyhow!(
+            "Failed to read sample {} of WAV file {}: {} (file is truncated or corrupt)",
+            index,
+            path.display(),
+            e
+        )
+    };
+
     let raw_samples: Vec<f32> = match spec.sample_format {
         hound::SampleFormat::Int => {
             let max_val = int_sample_max_val(spec.bits_per_sample)?;
             reader
                 .into_samples::<i32>()
-                .filter_map(|s| s.ok())
-                .map(|s| s as f32 / max_val)
-                .collect()
+                .enumerate()
+                .map(|(i, s)| s.map(|s| s as f32 / max_val).map_err(|e| sample_err(i, e)))
+                .collect::<Result<Vec<f32>>>()?
         }
         hound::SampleFormat::Float => reader
             .into_samples::<f32>()
-            .filter_map(|s| s.ok())
-            .collect(),
+            .enumerate()
+            .map(|(i, s)| s.map_err(|e| sample_err(i, e)))
+            .collect::<Result<Vec<f32>>>()?,
     };
 
     let mono_samples: Vec<f32> = if spec.channels > 1 {
@@ -195,5 +215,55 @@ mod tests {
             assert!(s.abs() < 0.001, "expected near-zero mix-down, got {s}");
         }
         let _ = Cursor::new(Vec::<u8>::new()); // silence unused-import if hound changes later
+    }
+
+    /// Round-8 regression: a truncated WAV must be a hard, path-naming error,
+    /// not a silently shortened success.
+    ///
+    /// The old `filter_map(|s| s.ok())` dropped every failed sample and read
+    /// on. Under `--replay` that shortens one corpus file in place and
+    /// concatenates the next one straight onto the gap, collapsing archive
+    /// time and shifting the alignment of every later FT8 frame -- while the
+    /// run still exits 0.
+    #[test]
+    fn truncated_wav_errors_instead_of_silently_shortening() {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate: 12000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("truncated.wav");
+        {
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            for i in 0..500i16 {
+                writer.write_sample(i).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        // Control: intact, the file reads back in full.
+        let (intact, rate) = read_wav_mono(&path).unwrap();
+        assert_eq!(rate, 12000);
+        assert_eq!(intact.len(), 500);
+
+        // Chop the tail off the data chunk. The header still declares 500
+        // samples, so `hound` reports an error partway through the iterator.
+        let full_len = std::fs::metadata(&path).unwrap().len();
+        let file = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(full_len - 200).unwrap();
+        drop(file);
+
+        let err = read_wav_mono(&path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("truncated.wav"),
+            "error must name the offending file so an operator can find it, got: {msg}"
+        );
+        assert!(
+            msg.contains("Failed to read sample"),
+            "error must name the cause, got: {msg}"
+        );
     }
 }

@@ -415,6 +415,34 @@ mod tests {
         }
     }
 
+    /// Round-8 regression: a corrupt file anywhere in the corpus must abort
+    /// the load, not be silently shortened and then have the NEXT file
+    /// concatenated onto the gap -- which collapses archive time and shifts
+    /// every subsequent FT8 frame's alignment while the run still exits 0.
+    #[test]
+    fn load_replay_samples_rejects_a_truncated_corpus_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("a_truncated.wav");
+        write_test_wav(&bad, 12000, 500);
+        write_test_wav(&dir.path().join("b_intact.wav"), 12000, 500);
+
+        // Control: intact, the corpus loads and concatenates.
+        assert_eq!(load_replay_samples(dir.path(), 12000).unwrap().len(), 1000);
+
+        // Chop the tail off the first file's data chunk.
+        let full_len = std::fs::metadata(&bad).unwrap().len();
+        let file = std::fs::OpenOptions::new().write(true).open(&bad).unwrap();
+        file.set_len(full_len - 200).unwrap();
+        drop(file);
+
+        let err = load_replay_samples(dir.path(), 12000).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("a_truncated.wav"),
+            "error must name the corrupt corpus file, got: {msg}"
+        );
+    }
+
     #[test]
     fn load_replay_samples_concatenates_files_in_order_and_resamples() {
         let dir = tempfile::tempdir().unwrap();

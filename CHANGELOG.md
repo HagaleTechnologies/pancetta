@@ -87,6 +87,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   exited 0; and a corpus of well-formed but zero-frame `.wav` files passed
   the existing empty-directory check and fed nothing. Both now bail before
   the feed loop starts, naming the cause.
+- A truncated or corrupt `.wav` is now a hard, path-naming error in both
+  `--wav` and `--replay` instead of a silently shortened success. WAV samples
+  that `hound` failed to read were filtered out and the read continued, so a
+  corrupt file decoded as if it were merely shorter — and under `--replay` the
+  next corpus file was concatenated straight onto the gap, collapsing archive
+  time and shifting the alignment of every FT8 frame after the corruption while
+  the run still exited 0.
 - `--replay` seeds its 14.074 MHz default dial frequency in builds without
   the optional `pancetta-hamlib` feature too. The seed was inside the
   feature's `cfg` block, so exactly the build that starts no rig at all was
