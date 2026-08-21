@@ -609,6 +609,40 @@ pub struct ApplicationCoordinator {
     pub(crate) hamlib_children: Option<hamlib::HamlibChildren>,
     #[cfg(feature = "pancetta-hamlib")]
     pub(crate) hamlib_orphans: Vec<tokio::task::AbortHandle>,
+    /// PAN-19 round-5 (Codex P1): the LATEST `SetFrequency`/`SetSplit`
+    /// command that failed to replay during a Hamlib teardown (the replay
+    /// channel stayed full through `replay_or_fallback`'s bounded retry).
+    /// Delivered to the NEXT Hamlib generation once its message loop
+    /// confirms readiness (`LoopReadyOutcome::Ready`), instead of being
+    /// silently dropped. `SetFrequency` is largely self-healing (the poll
+    /// loop re-reads and re-publishes the rig's actual frequency every
+    /// 500ms regardless), but `SetSplit` is NOT -- nothing else in this
+    /// codebase re-asserts or re-polls split state, so a dropped
+    /// `SetSplit` could leave the rig silently holding stale split config
+    /// (e.g. still split-on with an old TX frequency) with nothing to
+    /// notice or correct it -- a real off-frequency-TX risk, not just
+    /// cosmetic staleness. Only the latest of each type is kept (no need
+    /// to replay a stale sequence of intermediate changes, just the final
+    /// desired state), and `SetPtt` never lands here -- it uses the
+    /// direct-rig fallback in `replay_or_fallback` instead, since PTT-off
+    /// must never wait for a future restart to complete.
+    ///
+    /// PAN-19 round-10 review (Codex P1): `Arc<Mutex<..>>`, not a plain
+    /// `Option`, because `deliver_pending_hamlib_state`'s ORIGINAL fix
+    /// (round-7) only ever ran once, synchronously within
+    /// `start_hamlib_component` -- if the brand-new channel happened to be
+    /// momentarily full at that exact instant, the pending command sat
+    /// stranded until the NEXT full Hamlib restart, even though the
+    /// channel likely had room again moments later. The Hamlib polling
+    /// task (a separately-spawned task with no `&mut self`) now ALSO
+    /// retries delivery every ~500ms tick, so this needs to be shared,
+    /// thread-safely-mutable state both that task and
+    /// `start_hamlib_component`/`replay_or_fallback` can reach without
+    /// `&mut self` -- same shape as `last_freq_command` below.
+    #[cfg(feature = "pancetta-hamlib")]
+    pub(crate) hamlib_pending_frequency: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    #[cfg(feature = "pancetta-hamlib")]
+    pub(crate) hamlib_pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     /// Authorization refresh child owned by the current StationAgent generation.
     pub(crate) station_agent_poll: Option<tokio::task::AbortHandle>,
 
@@ -656,6 +690,96 @@ pub struct ApplicationCoordinator {
     /// Number of active supervisor-owned hard mutes. Non-zero while Hamlib is
     /// being torn down and reacquired; separate from operator TX policy.
     pub(crate) tx_restart_inhibit: Arc<AtomicU32>,
+    /// PAN-19 round-7 review (Codex P1): whether the CURRENT Hamlib
+    /// generation's message loop has confirmed it's actually consuming
+    /// commands. Independent of, and orthogonal to, `tx_restart_inhibit`
+    /// above: `TxInhibitGuard` (health.rs) releases the moment
+    /// `start_hamlib_component` RETURNS -- which happens even on a
+    /// `LoopReadyOutcome::TimedOut` (round-5's `classify_loop_ready` in
+    /// hamlib.rs), because that path must stay non-bailing to preserve the
+    /// HIGH fix (a slow rig must never hard-fail startup). But "startup
+    /// didn't hard-fail" and "TX may now be un-inhibited" are NOT the same
+    /// property -- conflating them was the round-7 bug. This flag gates
+    /// PTT directly at TX key-time (`tx_hard_mute_reason` in `tx.rs`),
+    /// independent of the restart-supervision counter, so a `TimedOut`
+    /// startup still keeps PTT blocked until the loop genuinely confirms
+    /// readiness, without ever making a slow rig fail startup.
+    ///
+    /// Defaults to `true` (i.e. un-gated by this mechanism) so a build
+    /// with the `pancetta-hamlib` feature disabled -- where
+    /// `start_hamlib_component` never runs at all and Hamlib provides no
+    /// PTT safety watchdog by design (see the `warn!` in `start_pipeline`:
+    /// "Transmit at your own risk") -- behaves exactly as before, never
+    /// gated by a flag nothing would ever set. `start_hamlib_component`
+    /// resets this to `false` at the very start of every call (first boot
+    /// AND every restart) and only sets it back to `true` once the
+    /// message loop genuinely confirms readiness (or, on the mock/
+    /// disabled-rig path, immediately -- that path's connect/PTT/
+    /// frequency-read sequence and message-loop start are local and fast
+    /// enough that there's no meaningful "is the loop actually ready" gap
+    /// to guard there).
+    pub(crate) hamlib_command_loop_ready: Arc<AtomicBool>,
+
+    /// PAN-19 round-17 review (Codex P1): "keep readiness cleanup scoped to
+    /// its Hamlib generation". Monotonic epoch bumped once at the very top
+    /// of every `start_hamlib_component` call (first boot AND every
+    /// restart) -- `HamlibLoopReadyGuard` (round 11) tags itself with
+    /// whatever generation was current when it was constructed, and its
+    /// `Drop` only clears `hamlib_command_loop_ready` if THIS field still
+    /// matches that generation. Without this, an orphaned watchdog
+    /// retained across a restart specifically because teardown couldn't
+    /// confirm PTT-off (`hamlib_orphans`, MEDIUM #2) holds a guard from
+    /// the OLD generation; when it's finally aborted (once the NEW
+    /// generation proves it's PTT-safe, round 12), that stale guard's
+    /// `Drop` would otherwise unconditionally clobber the flag the NEW
+    /// generation just correctly set `true` back to `false` --
+    /// permanently muting an otherwise healthy restart, since nothing else
+    /// ever sets it back. Comparing against this generation counter at
+    /// drop time makes a stale prior-generation guard a no-op instead.
+    pub(crate) hamlib_generation: Arc<std::sync::atomic::AtomicU64>,
+
+    /// PAN-19 round-16 review (Codex P1): "keep restored rig state pending
+    /// through CAT application". `hamlib_command_loop_ready` above and the
+    /// `hamlib_pending_frequency`/`hamlib_pending_split` slots (round 14)
+    /// together still leave a gap: `deliver_pending_hamlib_state` clears a
+    /// pending slot as soon as the command is successfully HANDED OFF onto
+    /// the channel -- but the message loop hasn't actually attempted the
+    /// underlying `set_frequency`/`set_split_freq`/`set_split` CAT call
+    /// yet, let alone learned its result. A PTT-on whose gate-check lands
+    /// in that window (the pending slot already looks empty; the message
+    /// loop is now awaiting the CAT call) gets queued BEHIND the state
+    /// command and will proceed to key the rig once consumed, regardless
+    /// of whether the CAT call that was in flight when it was gated
+    /// through ultimately succeeds or fails.
+    ///
+    /// The message loop's SetFrequency/SetSplit arms bracket this for the
+    /// exact duration of the underlying rig I/O call -- and only that
+    /// duration, so ordinary PTT-on requests pay nothing extra.
+    /// `tx_hard_mute_reason` treats a nonzero count the same as "pending
+    /// state undelivered": refuse PTT.
+    ///
+    /// PAN-19 round-19 review (Codex P1): "count every pending command
+    /// handoff". This used to be an `AtomicBool` -- but there can
+    /// legitimately be TWO outstanding handoffs at once (a pending
+    /// `SetFrequency` AND a pending `SetSplit` delivered together by the
+    /// same `deliver_pending_hamlib_state` call, round 17's fix #2). A
+    /// boolean can only represent "at least one outstanding"; clearing it
+    /// to `false` the instant the FIRST of two completes wrongly reported
+    /// "none outstanding" while the second was still live, letting a
+    /// concurrent PTT-on slip through and key the rig while a CAT
+    /// operation for the other pending kind was genuinely still applying
+    /// (or about to be rolled back on failure). Now a count: incremented
+    /// on each handoff (producer side, `mark_in_flight_then_send`) or CAT-
+    /// call start (consumer side, `HamlibCommandInFlightGuard`), and
+    /// decremented on each one's own retirement (success, rollback, OR
+    /// discard-as-superseded -- see round-19 finding #2). `tx_hard_
+    /// mute_reason` gates on "count > 0", not a boolean.
+    ///
+    /// Defaults to `0` (nothing in flight) -- the correct "not gated"
+    /// state for a `pancetta-hamlib`-disabled build, matching
+    /// `hamlib_command_loop_ready`'s own default-to-permissive convention
+    /// above.
+    pub(crate) hamlib_command_in_flight: Arc<std::sync::atomic::AtomicU32>,
 
     /// Operator TX-frequency mode (`pancetta_core::TxFreqMode` as `u8`),
     /// default `Hold`. Shared with the QSO engine (gates the stuck-DX TX-offset
@@ -1508,6 +1632,9 @@ impl ApplicationCoordinator {
                 pancetta_core::TxPolicy::default().as_u8(),
             )),
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
+            hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
+            hamlib_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            hamlib_command_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // Default TX-frequency mode = Hold (operator's picked offset is
             // sticky; pancetta never moves it autonomously). Operator switches
             // to Auto from the TUI (`f`).
@@ -1590,6 +1717,10 @@ impl ApplicationCoordinator {
             hamlib_children: None,
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_orphans: Vec::new(),
+            #[cfg(feature = "pancetta-hamlib")]
+            hamlib_pending_frequency: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(feature = "pancetta-hamlib")]
+            hamlib_pending_split: Arc::new(std::sync::Mutex::new(None)),
             station_agent_poll: None,
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
