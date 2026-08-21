@@ -121,7 +121,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binds its WebSocket listener, and the station agent takes its inert
   drain-only path before loading keys or dialing the relay — so replayed
   decodes/spectrum/QSO state are never broadcast to relay peers, and no remote
-  peer can send control frames (QSY/QSO actions) into a demo process.
+  peer can send control frames (QSY/QSO actions) into a demo process. Shutdown
+  is covered too: its direct `rigctld` PTT-off — a deliberately independent TCP
+  connection that exists so a broken in-process rig state can't leave a real
+  transmitter keyed — is skipped under `--replay`, which never started rig
+  control, so it can no longer unkey a session belonging to some *other* owner
+  of that endpoint. Live behavior is unchanged.
 - Compound-callsign QSOs (e.g. `YS/WE9G`, `8G81PA`, `3E40CDW`) now actually
   complete instead of queuing and silently re-arming every slot for the full
   5-minute watchdog window (PAN-17). The FT8 encoder gained an i3=4

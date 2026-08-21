@@ -2741,6 +2741,47 @@ mod tests {
         );
     }
 
+    /// Round-8 regression: shutdown's DIRECT rigctld PTT-off (`shutdown.rs`)
+    /// opens its own TCP connection to the configured rigctld endpoint,
+    /// independent of this process's Hamlib component. Under `--replay`,
+    /// Hamlib is never started, so that write would land on whatever *else*
+    /// owns the endpoint (another app, or a real live pancetta) and unkey a
+    /// transmission this demo never started — an outbound write to real radio
+    /// hardware from a replay run.
+    ///
+    /// The LIVE half is what makes this non-vacuous: with the same
+    /// `[rig.interface].enabled = true` config and no `--replay`, the gate
+    /// still opens, so the safety net for normal operation is unchanged.
+    #[tokio::test]
+    async fn replay_mode_suppresses_shutdown_direct_rigctld_ptt_off() {
+        let mut config = Config::default();
+        config.rig.interface.enabled = true;
+
+        let live = build_coordinator_with_config_and_replay(config.clone(), None).await;
+        assert!(
+            live.wants_direct_rigctld_ptt_off().await,
+            "precondition: a live run with rig enabled must still send the direct \
+             shutdown PTT-off — otherwise the replay assertion below is vacuous"
+        );
+
+        let replaying = build_coordinator_with_config_and_replay(
+            config,
+            Some(PathBuf::from("/some/capture/dir")),
+        )
+        .await;
+        assert!(replaying.replay_mode());
+        assert!(
+            !replaying.wants_direct_rigctld_ptt_off().await,
+            "under --replay shutdown must not dial rigctld: this process never \
+             started rig control, so the PTT it would unkey belongs to someone else"
+        );
+
+        // And rig-disabled stays skipped on a live run, as before.
+        let rig_off = build_coordinator_with_config_and_replay(Config::default(), None).await;
+        assert!(!rig_off.config.read().await.rig.interface.enabled);
+        assert!(!rig_off.wants_direct_rigctld_ptt_off().await);
+    }
+
     // ------------------------------------------------------------------
     // DspTiming derivation — FT8 byte-identical regression guard + FT4.
     // ------------------------------------------------------------------
