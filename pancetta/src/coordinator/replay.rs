@@ -1,0 +1,125 @@
+use anyhow::Result;
+use std::path::{Path, PathBuf};
+
+use super::util::resample_linear;
+use super::wav_playback::read_wav_mono;
+
+/// List `.wav` files in `dir`, sorted by filename. Sequential-capture
+/// filenames (`170923_082000.wav`, `170923_082015.wav`, ...) sort
+/// chronologically this way; callers rely on that order to replay a
+/// directory as a continuous recording.
+pub(crate) fn list_wav_files_sorted(dir: &Path) -> Result<Vec<PathBuf>> {
+    if !dir.is_dir() {
+        anyhow::bail!("--replay path is not a directory: {}", dir.display());
+    }
+
+    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map_err(|e| anyhow::anyhow!("Failed to read replay directory {}: {}", dir.display(), e))?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext.eq_ignore_ascii_case("wav"))
+                .unwrap_or(false)
+        })
+        .collect();
+
+    if files.is_empty() {
+        anyhow::bail!("No .wav files found in replay directory: {}", dir.display());
+    }
+
+    files.sort();
+    Ok(files)
+}
+
+/// Read every `.wav` file in `dir` (in filename order), mix each to mono,
+/// resample each to `target_rate`, and concatenate into one continuous
+/// sample stream -- as if the directory were one long recording.
+pub(crate) fn load_replay_samples(dir: &Path, target_rate: u32) -> Result<Vec<f32>> {
+    let files = list_wav_files_sorted(dir)?;
+
+    let mut all_samples = Vec::new();
+    for path in &files {
+        let (mono, native_rate) = read_wav_mono(path)?;
+        let resampled = if native_rate != target_rate {
+            resample_linear(&mono, native_rate, target_rate)
+        } else {
+            mono
+        };
+        all_samples.extend(resampled);
+    }
+
+    Ok(all_samples)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_test_wav(path: &Path, sample_rate: u32, n_samples: usize) {
+        let spec = hound::WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let mut writer = hound::WavWriter::create(path, spec).unwrap();
+        for i in 0..n_samples {
+            let v = ((i % 100) as i16) - 50;
+            writer.write_sample(v).unwrap();
+        }
+        writer.finalize().unwrap();
+    }
+
+    #[test]
+    fn list_wav_files_sorted_orders_by_filename_and_ignores_non_wav() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_wav(&dir.path().join("170923_082030.wav"), 12000, 10);
+        write_test_wav(&dir.path().join("170923_082000.wav"), 12000, 10);
+        write_test_wav(&dir.path().join("170923_082015.wav"), 12000, 10);
+        std::fs::write(dir.path().join("notes.txt"), b"ignore me").unwrap();
+
+        let files = list_wav_files_sorted(dir.path()).unwrap();
+        let names: Vec<&str> = files
+            .iter()
+            .map(|p| p.file_name().unwrap().to_str().unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "170923_082000.wav",
+                "170923_082015.wav",
+                "170923_082030.wav",
+            ]
+        );
+    }
+
+    #[test]
+    fn list_wav_files_sorted_rejects_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(list_wav_files_sorted(dir.path()).is_err());
+    }
+
+    #[test]
+    fn list_wav_files_sorted_rejects_non_directory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file_path = dir.path().join("not_a_dir.wav");
+        write_test_wav(&file_path, 12000, 10);
+        assert!(list_wav_files_sorted(&file_path).is_err());
+    }
+
+    #[test]
+    fn load_replay_samples_concatenates_files_in_order_and_resamples() {
+        let dir = tempfile::tempdir().unwrap();
+        // Native rate 8000 Hz; request 12000 Hz target so resampling is exercised.
+        write_test_wav(&dir.path().join("a_first.wav"), 8000, 80);
+        write_test_wav(&dir.path().join("b_second.wav"), 8000, 80);
+
+        let samples = load_replay_samples(dir.path(), 12000).unwrap();
+
+        // 80 samples @ 8000 Hz resampled to 12000 Hz -> 120 samples each (linear
+        // resampler truncates via integer division: 80 * 12000 / 8000 = 120).
+        assert_eq!(samples.len(), 240);
+    }
+}
