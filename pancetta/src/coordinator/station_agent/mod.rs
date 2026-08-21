@@ -1126,6 +1126,28 @@ impl super::ApplicationCoordinator {
     /// Start the station-agent component (default-OFF, inert unless enabled +
     /// paired). Mirrors [`start_remote_gateway_component`](super::ApplicationCoordinator::start_remote_gateway_component):
     /// disabled/unpaired → drain-only; enabled + paired → connect + serve.
+    ///
+    /// `--replay` ([`super::ApplicationCoordinator::replay_mode`]) forces the
+    /// same drain-only path a disabled component takes, before any key
+    /// material is loaded and before the relay connection is ever attempted.
+    /// This closes BOTH directions at once, which is why it is an early return
+    /// rather than merely passing `events: None` into `run_session_loop`:
+    ///
+    /// - OUTBOUND: `drain_read_stream` serializes every display-feed
+    ///   `ServerEvent` and `MultiPeerSession::broadcast`s it to every
+    ///   established peer over the relay socket — real off-box network traffic
+    ///   carrying replayed decodes, spectrum, QSO state and dial frequency
+    ///   fabricated as live.
+    /// - INBOUND: an established peer's control frames (`dispatch_action` →
+    ///   `send_rig`/`send_qso`) would otherwise drive QSY/QSO actions against a
+    ///   demo process. Replay already skips Hamlib, so there is no PTT
+    ///   capability, but a remote control surface has no business existing
+    ///   during a demo at all.
+    ///
+    /// Local consent seeding (above) still runs: it only mirrors config into
+    /// the in-process arm, touches nothing off-box, and keeps the arm's value
+    /// identical to a live run's — with no session to admit a controller, it
+    /// can never lead to TX.
     pub(crate) async fn start_station_agent_component(&mut self) -> Result<()> {
         let config = self.config.read().await;
         let cfg = config.network.station_agent.clone();
@@ -1156,6 +1178,17 @@ impl super::ApplicationCoordinator {
             if let Ok(mut st) = self.remote_tx_arm.lock() {
                 let _ = st.set_local_consent(consent, now);
             }
+        }
+
+        // --- Inert path: --replay (see this function's doc) -------------------
+        // Checked before key loading / pairing state so a demo run never even
+        // touches the agent key dir, let alone opens the relay socket.
+        if self.replay_mode() {
+            info!(
+                "Replay mode: station_agent not started -- replayed decodes are not live traffic, \
+                 and no remote peer may drive a demo process"
+            );
+            return self.spawn_station_agent_drain().await;
         }
 
         // --- Inert paths: disabled or missing required config ---------------

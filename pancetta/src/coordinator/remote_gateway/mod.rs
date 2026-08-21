@@ -267,25 +267,33 @@ impl super::ApplicationCoordinator {
     /// exactly. `display_feed_enabled` is set to match the computed gate
     /// either way, so `relay_to_gateway`'s emit sites reflect reality.
     ///
-    /// `--replay` ([`super::ApplicationCoordinator::replay_mode`]): the
-    /// localhost gateway never counts toward `wants_feed` regardless of its
-    /// config, so a replay-only run with `[network.remote_gateway].enabled =
-    /// true` and an inert station agent takes the drain path exactly like a
-    /// disabled gateway — no pump, nothing for `start_remote_gateway_component`
-    /// to serve. Same class of gap as PSKReporter/cqdx.io/WSJT-X UDP.
+    /// `--replay` ([`super::ApplicationCoordinator::replay_mode`]): the gate is
+    /// hoisted over the WHOLE disjunction — neither consumer may pull the pump
+    /// up under replay. A replay run with `[network.remote_gateway].enabled =
+    /// true` and/or an active (enabled + paired + allow-listed) station agent
+    /// takes the drain path exactly like a fully disabled config — no pump,
+    /// nothing for `start_remote_gateway_component` to serve and nothing for
+    /// the station agent's read stream to relay off-box. Gating only the
+    /// gateway half of the OR (the shape this had before) left the pump running
+    /// for an active station agent, which then broadcast replayed decodes to
+    /// every connected relay peer. Same class of gap as
+    /// PSKReporter/cqdx.io/WSJT-X UDP.
     pub(crate) async fn start_display_feed(&mut self) -> Result<()> {
         let config = self.config.read().await;
         let replay_mode = self.replay_mode();
         let gateway_configured_enabled = config.network.remote_gateway.enabled;
-        let gateway_wants_feed = gateway_configured_enabled && !replay_mode;
-        let station_agent_wants_feed = super::station_agent::station_agent_active(
+        let station_agent_configured_active = super::station_agent::station_agent_active(
             &config.network.station_agent,
             &config.network.cqdx,
         );
         let our_callsign = config.station.callsign.clone();
         drop(config);
 
-        let wants_feed = gateway_wants_feed || station_agent_wants_feed;
+        // Replay gate ANDed over the whole disjunction, NOT over one operand:
+        // a consumer that would otherwise want the feed must not be able to
+        // start it under `--replay`.
+        let wants_feed =
+            (gateway_configured_enabled || station_agent_configured_active) && !replay_mode;
         self.display_feed_enabled
             .store(wants_feed, Ordering::Relaxed);
 
@@ -295,8 +303,12 @@ impl super::ApplicationCoordinator {
             .await?;
 
         if !wants_feed {
-            if replay_mode && gateway_configured_enabled {
-                info!("Replay mode: remote_gateway display feed suppressed -- replayed decodes are not live traffic");
+            if replay_mode && (gateway_configured_enabled || station_agent_configured_active) {
+                info!(
+                    gateway = gateway_configured_enabled,
+                    station_agent = station_agent_configured_active,
+                    "Replay mode: display feed suppressed -- replayed decodes are not live traffic"
+                );
             } else {
                 info!(
                     "display_feed: no consumer enabled (gateway off, station agent inert) — draining"
@@ -388,9 +400,11 @@ impl super::ApplicationCoordinator {
         self.named_task_handles
             .push((ComponentId::RemoteGateway, pump));
         self.display_feed = Some(DisplayFeed { evt_tx, snapshot });
+        // Only reachable with `!replay_mode`, so the `configured` booleans are
+        // exactly the per-consumer "wants the feed" values here.
         info!(
-            gateway = gateway_wants_feed,
-            station_agent = station_agent_wants_feed,
+            gateway = gateway_configured_enabled,
+            station_agent = station_agent_configured_active,
             "display_feed started"
         );
         Ok(())
