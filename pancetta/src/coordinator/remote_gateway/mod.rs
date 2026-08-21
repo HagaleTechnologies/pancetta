@@ -266,9 +266,18 @@ impl super::ApplicationCoordinator {
     /// full" warnings — this mirrors today's disabled-gateway behavior
     /// exactly. `display_feed_enabled` is set to match the computed gate
     /// either way, so `relay_to_gateway`'s emit sites reflect reality.
+    ///
+    /// `--replay` ([`super::ApplicationCoordinator::replay_mode`]): the
+    /// localhost gateway never counts toward `wants_feed` regardless of its
+    /// config, so a replay-only run with `[network.remote_gateway].enabled =
+    /// true` and an inert station agent takes the drain path exactly like a
+    /// disabled gateway — no pump, nothing for `start_remote_gateway_component`
+    /// to serve. Same class of gap as PSKReporter/cqdx.io/WSJT-X UDP.
     pub(crate) async fn start_display_feed(&mut self) -> Result<()> {
         let config = self.config.read().await;
-        let gateway_wants_feed = config.network.remote_gateway.enabled;
+        let replay_mode = self.replay_mode();
+        let gateway_configured_enabled = config.network.remote_gateway.enabled;
+        let gateway_wants_feed = gateway_configured_enabled && !replay_mode;
         let station_agent_wants_feed = super::station_agent::station_agent_active(
             &config.network.station_agent,
             &config.network.cqdx,
@@ -286,9 +295,13 @@ impl super::ApplicationCoordinator {
             .await?;
 
         if !wants_feed {
-            info!(
-                "display_feed: no consumer enabled (gateway off, station agent inert) — draining"
-            );
+            if replay_mode && gateway_configured_enabled {
+                info!("Replay mode: remote_gateway display feed suppressed -- replayed decodes are not live traffic");
+            } else {
+                info!(
+                    "display_feed: no consumer enabled (gateway off, station agent inert) — draining"
+                );
+            }
             let shutdown = self.shutdown_signal.clone();
             let drain_handle = tokio::spawn(async move {
                 while !shutdown.load(Ordering::Acquire) {
@@ -386,9 +399,18 @@ impl super::ApplicationCoordinator {
     /// Start the read-only remote-view gateway's localhost axum server
     /// (default-OFF, localhost-bound). Consumes the shared `DisplayFeed`
     /// started by [`Self::start_display_feed`] — this component itself only
-    /// ever gates on its OWN `[network.remote_gateway].enabled` flag, exactly
-    /// as before the pump was hoisted out: the localhost server never starts
-    /// just because the station agent wants a feed.
+    /// ever gates on its OWN `[network.remote_gateway].enabled` flag (and,
+    /// same as every other outbound integration, on
+    /// [`super::ApplicationCoordinator::replay_mode`]) exactly as before the
+    /// pump was hoisted out: the localhost server never starts just because
+    /// the station agent wants a feed.
+    ///
+    /// Under `--replay` this never binds the listener, regardless of config
+    /// — `start_display_feed` already withholds the feed from this consumer
+    /// in that case (`display_feed` is `None` unless the station agent
+    /// independently wants it), but the socket bind is also refused here
+    /// directly so a non-loopback `bind_addr` never has even a brief window
+    /// where replayed decodes could reach a connected client.
     pub(crate) async fn start_remote_gateway_component(&mut self) -> Result<()> {
         let config = self.config.read().await;
         let gw_cfg = config.network.remote_gateway.clone();
@@ -396,6 +418,11 @@ impl super::ApplicationCoordinator {
 
         if !gw_cfg.enabled {
             info!("remote_gateway disabled in configuration");
+            return Ok(());
+        }
+
+        if self.replay_mode() {
+            info!("Replay mode: remote_gateway localhost server not started -- replayed decodes are not live traffic");
             return Ok(());
         }
 

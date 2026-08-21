@@ -1944,6 +1944,11 @@ impl ApplicationCoordinator {
     /// - Per-QSO logbook uploads (`qso.rs`) — ClubLog/QRZ/LoTW/eQSL/cqdx.io
     ///   subscriber never spawned, so a QSO "completed" off replayed traffic
     ///   can't be filed as a real contact.
+    /// - Remote-view gateway (`remote_gateway/mod.rs`) — `start_display_feed`
+    ///   never counts the localhost gateway as wanting the feed, and
+    ///   `start_remote_gateway_component` refuses to bind its WebSocket
+    ///   listener, so no connected client (loopback or otherwise) is ever
+    ///   streamed replayed decodes.
     ///
     /// Add new outbound integrations to that list rather than inventing a
     /// second replay check.
@@ -2464,6 +2469,75 @@ mod tests {
         assert!(
             replaying.replay_mode(),
             "--replay must be visible to every outbound gate"
+        );
+    }
+
+    /// Round-4 regression: `[network.remote_gateway].enabled = true` under
+    /// `--replay` must never bind a listener or feed one, even though
+    /// neither `start_display_feed` nor `start_remote_gateway_component`
+    /// consult `replay_mode` through the same `config.network.remote_gateway
+    /// .enabled` flag every other outbound integration in this list checks.
+    /// `bind_addr` is pinned to an ephemeral loopback port so a live run
+    /// would succeed here too — the assertion is entirely on replay-mode
+    /// behavior, not on some other reason the bind failed.
+    #[tokio::test]
+    async fn replay_mode_suppresses_remote_gateway_even_when_configured_enabled() {
+        let mut config = Config::default();
+        config.network.remote_gateway.enabled = true;
+        config.network.remote_gateway.bind_addr = "127.0.0.1:0".to_string();
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut replaying = ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None,                                     // no WAV
+            Some(PathBuf::from("/some/capture/dir")), // --replay
+            None,                                     // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed");
+        assert!(replaying.replay_mode());
+
+        replaying
+            .start_display_feed()
+            .await
+            .expect("start_display_feed should not error under replay");
+        assert!(
+            replaying.display_feed.is_none(),
+            "a configured-enabled localhost gateway must not get a display feed under \
+             --replay, even with an inert station agent"
+        );
+        // `start_display_feed`'s drain-path already registered one
+        // `RemoteGateway` task (the bus drain) -- capture that count before
+        // calling `start_remote_gateway_component` so the next assertion
+        // proves the axum server specifically was never spawned, rather
+        // than asserting zero tasks overall.
+        let remote_gateway_tasks_before = replaying
+            .named_task_handles
+            .iter()
+            .filter(|(id, _)| *id == ComponentId::RemoteGateway)
+            .count();
+
+        replaying
+            .start_remote_gateway_component()
+            .await
+            .expect("start_remote_gateway_component should not error under replay");
+        let remote_gateway_tasks_after = replaying
+            .named_task_handles
+            .iter()
+            .filter(|(id, _)| *id == ComponentId::RemoteGateway)
+            .count();
+        assert_eq!(
+            remote_gateway_tasks_before, remote_gateway_tasks_after,
+            "start_remote_gateway_component must not spawn a listener task under \
+             --replay, even with [network.remote_gateway].enabled = true"
         );
     }
 
