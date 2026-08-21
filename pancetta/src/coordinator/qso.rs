@@ -1896,12 +1896,18 @@ impl super::ApplicationCoordinator {
         let qrz_xml_enabled = qrz_xml_cfg.enabled
             && !qrz_xml_cfg.username.is_empty()
             && !qrz_xml_cfg.password.is_empty();
-        let upload_enabled = clublog_cfg.enabled
-            || qrz_cfg.enabled
-            || lotw_cfg.enabled
-            || eqsl_cfg.enabled
-            || cqdx_upload_enabled
-            || qrz_xml_enabled;
+        // `--replay` never uploads. A QSO the engine "completes" off replayed
+        // (historical) traffic would be POSTed to ClubLog/QRZ/LoTW/eQSL/
+        // cqdx.io as a brand-new contact stamped with today's date —
+        // permanent, externally-visible bad log data. Same gate as the
+        // reception/spot paths; see `ApplicationCoordinator::replay_mode`.
+        let upload_enabled = !self.replay_mode()
+            && (clublog_cfg.enabled
+                || qrz_cfg.enabled
+                || lotw_cfg.enabled
+                || eqsl_cfg.enabled
+                || cqdx_upload_enabled
+                || qrz_xml_enabled);
 
         let qso_lookup = self.cached_lookup.clone();
         let upload_our_callsign = our_callsign.clone();
@@ -2083,7 +2089,8 @@ impl super::ApplicationCoordinator {
                 // Per-QSO log-upload subscriber (ClubLog + QRZ Logbook + cqdx.io
                 // + eQSL + LoTW), with optional QRZ-XML grid enrichment applied
                 // first. Opt-in: only spawned when at least one upload target OR
-                // QRZ XML enrichment is enabled. Best-effort and fully decoupled
+                // QRZ XML enrichment is enabled, and never under `--replay`
+                // (see `upload_enabled`). Best-effort and fully decoupled
                 // from the QSO pipeline — each upload runs in its own task so a
                 // slow/failing service never blocks logging.
                 if upload_enabled {

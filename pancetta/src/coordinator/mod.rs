@@ -1651,7 +1651,7 @@ impl ApplicationCoordinator {
         // is the same shape as a build with the `pancetta-hamlib` feature
         // compiled out (below), which the TX path already tolerates.
         #[cfg(feature = "pancetta-hamlib")]
-        if self.replay_path.is_some() {
+        if self.replay_mode() {
             info!("Replay mode: skipping Hamlib startup, no real transmitter control");
         } else {
             self.start_hamlib_component().await?;
@@ -1905,6 +1905,34 @@ impl ApplicationCoordinator {
         }
 
         Ok(())
+    }
+
+    /// `true` when this process was started with `--replay` (see
+    /// `replay_path`): the audio being decoded is a historical off-air
+    /// recording, not live signal.
+    ///
+    /// **This is the single predicate every "does this run touch the outside
+    /// world?" gate must consult.** Everything downstream of the decoder
+    /// treats replayed decodes as live traffic and re-stamps them with the
+    /// current wall clock, so any component that keys a transmitter or
+    /// publishes reception data off-box has to short-circuit here or it will
+    /// emit fabricated live data. Current consumers:
+    ///
+    /// - Hamlib startup (`run`) — skipped outright, so no PTT capability.
+    /// - PSKReporter (`psk_reporter.rs`) — forced onto its uploads-disabled
+    ///   (noop-drain) path.
+    /// - cqdx.io spot reporting (`autonomous.rs`) — `report_spots` suppressed.
+    /// - WSJT-X UDP companion protocol (`wsjtx_udp/mod.rs`) — forced onto its
+    ///   drain-only path, so no Decode/Status datagrams reach GridTracker,
+    ///   JTAlert, or any other logging companion on the LAN.
+    /// - Per-QSO logbook uploads (`qso.rs`) — ClubLog/QRZ/LoTW/eQSL/cqdx.io
+    ///   subscriber never spawned, so a QSO "completed" off replayed traffic
+    ///   can't be filed as a real contact.
+    ///
+    /// Add new outbound integrations to that list rather than inventing a
+    /// second replay check.
+    pub(crate) fn replay_mode(&self) -> bool {
+        self.replay_path.is_some()
     }
 
     /// Shared split-TX dial atomic (0 = simplex). Written by the TUI SetSplit
@@ -2380,6 +2408,47 @@ mod tests {
         let a = coordinator.audit_log();
         let b = coordinator.audit_log();
         assert_eq!(a.path(), b.path());
+    }
+
+    // ------------------------------------------------------------------
+    // Replay predicate — the single gate every outbound integration
+    // (Hamlib/PTT, PSKReporter, cqdx.io spots, WSJT-X UDP, per-QSO
+    // logbook uploads) consults.
+    // ------------------------------------------------------------------
+
+    async fn build_coordinator_with_replay(replay: Option<PathBuf>) -> ApplicationCoordinator {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        ApplicationCoordinator::new(
+            Config::default(),
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            replay,
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    #[tokio::test]
+    async fn replay_mode_tracks_the_replay_path() {
+        let live = build_coordinator_with_replay(None).await;
+        assert!(
+            !live.replay_mode(),
+            "a normal run must not look like a replay to the outbound gates"
+        );
+        let replaying =
+            build_coordinator_with_replay(Some(PathBuf::from("/some/capture/dir"))).await;
+        assert!(
+            replaying.replay_mode(),
+            "--replay must be visible to every outbound gate"
+        );
     }
 
     // ------------------------------------------------------------------

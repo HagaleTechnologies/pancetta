@@ -76,11 +76,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instead of hanging forever (the `no_audio` short-circuit in
   `start_audio_pipeline` precedes the replay branch, so no feeder was spawned
   and nothing ever triggered the shutdown signal).
-- `--replay` no longer starts Hamlib or PSKReporter. A demo run against an
+- `--replay` no longer touches the outside world. A demo run against an
   already-configured station could otherwise key the real transmitter in
-  response to replayed (historical) traffic, and upload replayed decodes to
-  the public pskreporter.info service stamped `SystemTime::now()` as if they
-  were live spots.
+  response to replayed (historical) traffic, and publish those replayed
+  decodes — re-stamped with the current clock — as if they were live. Every
+  outbound integration now consults one shared predicate
+  (`ApplicationCoordinator::replay_mode`): Hamlib is not started at all (no
+  PTT capability); PSKReporter is forced onto its uploads-disabled (noop
+  drain) path; cqdx.io spot reporting is suppressed; the WSJT-X UDP companion
+  protocol takes its drain-only path, so GridTracker/JTAlert never see a
+  replayed decode as a live reception; and the per-QSO logbook upload
+  subscriber (ClubLog/QRZ/LoTW/eQSL/cqdx.io) is not spawned, so a QSO
+  "completed" off replayed traffic can't be filed as a real contact.
 - Compound-callsign QSOs (e.g. `YS/WE9G`, `8G81PA`, `3E40CDW`) now actually
   complete instead of queuing and silently re-arming every slot for the full
   5-minute watchdog window (PAN-17). The FT8 encoder gained an i3=4

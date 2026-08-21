@@ -59,6 +59,72 @@ pub(crate) fn classify_autonomous_opening(
     (dx, frequency, parity)
 }
 
+/// Resolve the cqdx.io bridge a slot tick may *publish* spots through.
+///
+/// `Some` only when a bridge is configured AND this process is not a
+/// `--replay` demo. Replayed decodes are historical off-air captures, but
+/// every `SpotReport` built from them is stamped `chrono::Utc::now()`, so
+/// posting them would inject fabricated "live" spots into cqdx.io's real
+/// dataset — the same failure mode the PSKReporter gate exists for (see
+/// [`crate::coordinator::ApplicationCoordinator::replay_mode`]).
+///
+/// Read-only bridge uses (`spot_frequencies`, which feeds the frequency
+/// allocator from the local cache) deliberately do NOT go through this: they
+/// publish nothing, so a demo keeps showing real placement behavior.
+pub(crate) fn spot_publish_target(
+    bridge: Option<&std::sync::Arc<crate::cqdx_bridge::CqdxBridge>>,
+    replay_mode: bool,
+) -> Option<&std::sync::Arc<crate::cqdx_bridge::CqdxBridge>> {
+    bridge.filter(|_| !replay_mode)
+}
+
+#[cfg(test)]
+mod replay_gate_tests {
+    use super::*;
+    use crate::cqdx_bridge::CqdxBridge;
+    use crate::priority_evaluator::CachedStationLookup;
+    use std::sync::Arc;
+
+    /// A real (never-used) bridge: `from_config` only builds a reqwest
+    /// client, so this touches no network. The token has to satisfy
+    /// `CqdxClient::new`'s PAT format check (`pat_` prefix, >= 16 chars).
+    fn bridge() -> Arc<CqdxBridge> {
+        let cfg = pancetta_config::network::CqdxConfig {
+            enabled: true,
+            token: Some("pat_0123456789abcdef".to_string()),
+            ..Default::default()
+        };
+        Arc::new(
+            CqdxBridge::from_config(&cfg, Arc::new(CachedStationLookup::new()))
+                .expect("enabled + non-empty token yields a bridge"),
+        )
+    }
+
+    #[tokio::test]
+    async fn configured_bridge_publishes_spots_when_not_replaying() {
+        let b = bridge();
+        assert!(
+            spot_publish_target(Some(&b), false).is_some(),
+            "a live run with cqdx.io configured must still report spots"
+        );
+    }
+
+    #[tokio::test]
+    async fn replay_suppresses_spot_publishing_even_with_a_configured_bridge() {
+        let b = bridge();
+        assert!(
+            spot_publish_target(Some(&b), true).is_none(),
+            "--replay must never POST replayed decodes to cqdx.io as live spots"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_bridge_is_none_either_way() {
+        assert!(spot_publish_target(None, false).is_none());
+        assert!(spot_publish_target(None, true).is_none());
+    }
+}
+
 #[cfg(test)]
 mod pan6_diagnostic_tests {
     use super::*;
@@ -860,6 +926,10 @@ impl super::ApplicationCoordinator {
         let display_feed_enabled = self.display_feed_enabled.clone();
 
         let cqdx_bridge_for_auto = self.cqdx_bridge.clone();
+        // Under `--replay` the cqdx.io *write* path is suppressed (the read
+        // path is not) — see `spot_publish_target`, which this is fed into
+        // at the one publishing site below.
+        let suppress_spot_reports = self.replay_mode();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         // Split TX dial atomic (0 = simplex). Cleared on autonomous band-hop
         // (same as the manual TUI SetFrequency path).
@@ -909,6 +979,9 @@ impl super::ApplicationCoordinator {
 
             tokio::spawn(async move {
                 info!("Autonomous operator started");
+                if suppress_spot_reports && cqdx_bridge_for_auto.is_some() {
+                    info!("Replay mode: cqdx.io spot reporting suppressed -- replayed decodes are not live spots");
+                }
 
                 let mut slot_messages: Vec<pancetta_qso::DecodedMessageInfo> = Vec::new();
                 // Task 15: coordinator-local edge-trigger baseline for the
@@ -937,8 +1010,11 @@ impl super::ApplicationCoordinator {
                 loop {
                     tokio::select! {
                         _ = slot_interval.tick() => {
-                            // Report decoded spots to cqdx.io
-                            if let Some(ref bridge) = cqdx_bridge_for_auto {
+                            // Report decoded spots to cqdx.io (never under
+                            // `--replay` -- see `suppress_spot_reports`).
+                            if let Some(bridge) =
+                                spot_publish_target(cqdx_bridge_for_auto.as_ref(), suppress_spot_reports)
+                            {
                                 let dial_freq = operating_frequency_hz.load(Ordering::Relaxed);
                                 let spot_reports: Vec<pancetta_cqdx::SpotReport> = slot_messages
                                     .iter()
