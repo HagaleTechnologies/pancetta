@@ -26,9 +26,12 @@ Set Theme "Dracula"
 
 # Scratch config pinning [decoder] effort = "max". Identical bootstrap to
 # `.tapes/demo.tape` -- see there for why the callsign is no longer
-# load-bearing (`--replay` suppresses the first-run wizard on its own now).
+# load-bearing (`--replay` suppresses the first-run wizard on its own now), and
+# for why the `mktemp` invocation uses an explicit `XXXXXX` template instead of
+# `-t <prefix>` (GNU mktemp rejects the latter, and the old form wrote the
+# config to a file named `.toml` in the repo root on Linux).
 Hide
-Type `DEMO_CFG=$(mktemp -t pancetta-screenshot-config).toml; printf '[station]\ncallsign = \"K5ARH\"\n\n[decoder]\neffort = \"max\"\n' > $DEMO_CFG`
+Type `DEMO_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pancetta-screenshot-config.XXXXXX"); DEMO_CFG="$DEMO_DIR/pancetta.toml"; printf '[station]\ncallsign = \"K5ARH\"\n\n[decoder]\neffort = \"max\"\n' > $DEMO_CFG`
 Enter
 Sleep 500ms
 # Reset the persisted active view to Operate -- see `.tapes/demo.tape` for the
@@ -116,3 +119,13 @@ Type "q"
 Sleep 300ms
 Type "y"
 Sleep 1s
+
+# Remove the scratch config directory (off-camera; screenshots are already
+# captured) so a local run leaves nothing behind in TMPDIR. The extra sleep
+# lets the TUI finish tearing down and hand the terminal back to the shell --
+# typed too early, `rm` would land in the TUI instead of at the prompt.
+Hide
+Sleep 3s
+Type `rm -rf "$DEMO_DIR"`
+Enter
+Sleep 500ms

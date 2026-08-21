@@ -24,8 +24,21 @@ Set Theme "Dracula"
 # wizard even with a default N0CALL config. The scratch config is kept only to
 # pin `effort = "max"` and to keep the recording independent of whatever the
 # operator has in their real config.
+#
+# PORTABILITY: this used to be `DEMO_CFG=$(mktemp -t pancetta-demo-config).toml`.
+# GNU mktemp (every Linux runner, including the `ubuntu-latest` box
+# `.github/workflows/demo-assets.yml` uses) rejects a `-t` template with no
+# `XXXXXX` placeholder -- "too few X's in template" -- so the command
+# substitution yielded the empty string, `DEMO_CFG` became the literal
+# `.toml`, and the redirect below wrote/clobbered a file named `.toml` in the
+# REPO ROOT. BSD/macOS mktemp accepts the bare prefix, which is why it only
+# ever broke on Linux. The template form below (explicit directory + trailing
+# X's, no `-t`) is accepted identically by GNU and BSD mktemp; `mktemp -d`
+# also gets the `.toml` extension the config loader dispatches on without
+# leaking the separate scratch file the old `$(mktemp ...).toml` form created
+# and never used.
 Hide
-Type `DEMO_CFG=$(mktemp -t pancetta-demo-config).toml; printf '[station]\ncallsign = \"K5ARH\"\n\n[decoder]\neffort = \"max\"\n' > $DEMO_CFG`
+Type `DEMO_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pancetta-demo-config.XXXXXX"); DEMO_CFG="$DEMO_DIR/pancetta.toml"; printf '[station]\ncallsign = \"K5ARH\"\n\n[decoder]\neffort = \"max\"\n' > $DEMO_CFG`
 Enter
 Sleep 500ms
 # Force the TUI's persisted active view back to Operate. `active_view` lives in
@@ -68,6 +81,13 @@ Sleep 75s
 # the recording holds long enough to see the process exit back to the shell
 # prompt on its own (no manual Ctrl+C).
 Sleep 45s
+
+# Remove the scratch config directory. Off-camera (`Hide`), after the recorded
+# portion, so a local run leaves nothing behind in TMPDIR.
+Hide
+Type `rm -rf "$DEMO_DIR"`
+Enter
+Sleep 500ms
 
 # WHAT assets/demo.gif (as committed) SHOWS. Keep this accurate; do not
 # overclaim beyond it.

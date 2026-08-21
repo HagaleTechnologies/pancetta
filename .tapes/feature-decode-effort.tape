@@ -31,9 +31,12 @@ Set Padding 20
 Set Theme "Dracula"
 
 # Same config-bootstrap pattern as `.tapes/demo.tape` / `.tapes/screenshots.tape`:
-# a scratch config pinning effort = "max" as the ring's starting preset.
+# a scratch config pinning effort = "max" as the ring's starting preset. See
+# `.tapes/demo.tape` for why the `mktemp` invocation uses an explicit `XXXXXX`
+# template instead of `-t <prefix>` (GNU mktemp rejects the latter, and the old
+# form wrote the config to a file named `.toml` in the repo root on Linux).
 Hide
-Type `DEMO_CFG=$(mktemp -t pancetta-feature-config).toml; printf '[station]\ncallsign = \"K5ARH\"\n\n[decoder]\neffort = \"max\"\n' > $DEMO_CFG`
+Type `DEMO_DIR=$(mktemp -d "${TMPDIR:-/tmp}/pancetta-feature-config.XXXXXX"); DEMO_CFG="$DEMO_DIR/pancetta.toml"; printf '[station]\ncallsign = \"K5ARH\"\n\n[decoder]\neffort = \"max\"\n' > $DEMO_CFG`
 Enter
 Sleep 500ms
 # Reset the persisted active view AND decode-effort preset -- see
@@ -89,4 +92,13 @@ Hide
 Type "q"
 Sleep 300ms
 Type "y"
+Sleep 500ms
+
+# Remove the scratch config directory so a local run leaves nothing behind in
+# TMPDIR. Already off-camera (`Hide` above). The extra sleep lets the TUI
+# finish tearing down and hand the terminal back to the shell -- typed too
+# early, `rm` would land in the TUI instead of at the prompt.
+Sleep 3s
+Type `rm -rf "$DEMO_DIR"`
+Enter
 Sleep 500ms
