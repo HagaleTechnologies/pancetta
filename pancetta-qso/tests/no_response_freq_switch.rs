@@ -105,3 +105,54 @@ async fn s2_hold_mode_never_switches_despite_silent_cq_streak() {
         "Hold mode must transmit every CQ on the same frequency\n{tl}"
     );
 }
+
+// S3 — a genuine decoded reply to our CQ, arriving before the no-response
+// threshold trips, must reset the streak (not just the higher, easier-to-
+// fake `active_qso_count` signal our own pending self-CQ can also set).
+// switch_after is deliberately high relative to the 20-tick budget so that
+// ANY switch observed can only be explained by the reset failing to hold.
+#[tokio::test]
+async fn s3_directed_reply_resets_streak_and_prevents_switch() {
+    let op = auto_operator(2, 10);
+    let mut sim = Sim::new(US, Some(GRID)).await.with_autonomous(op);
+
+    // Let one no-response self-CQ round happen first.
+    sim.tick_n(4).await;
+    let after_first_cq = sim
+        .timeline()
+        .transmissions
+        .iter()
+        .filter(|t| t.text.starts_with("CQ"))
+        .count();
+    assert!(after_first_cq >= 1, "expected at least one self-CQ by tick 4");
+
+    // A station answers our CQ: standard "<us> <them> <report>" reply.
+    // Injected far from our CQ frequency (1500 Hz) so it doesn't itself
+    // pollute DecodeHistory's occupancy scoring near our TX offset — this
+    // test is about the streak reset, not the allocator's independent
+    // (and entirely legitimate) tendency to avoid recently-active spots.
+    sim.inject_decode("K5ARH K9ZZ -05", 2200.0, -8.0, 0.1);
+    sim.tick().await; // deliver the injected decode
+
+    // Continue in silence for the rest of the budget. Bounded so that even
+    // a freshly-reset streak (starting from 0) cannot reach switch_after=10
+    // again within the remaining ticks.
+    sim.tick_n(15).await;
+
+    let tl = sim.into_timeline();
+    let cq_freqs: Vec<f64> = tl
+        .transmissions
+        .iter()
+        .filter(|t| t.text.starts_with("CQ"))
+        .map(|t| t.freq_hz)
+        .collect();
+    assert!(
+        cq_freqs.len() >= 2,
+        "expected further self-CQs after the reply\n{tl}"
+    );
+    let first = cq_freqs[0];
+    assert!(
+        cq_freqs.iter().all(|&f| (f - first).abs() < 1.0),
+        "the directed reply must have reset the streak — no frequency switch expected\n{tl}"
+    );
+}

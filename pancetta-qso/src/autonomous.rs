@@ -820,11 +820,14 @@ pub struct AutonomousOperator {
     state: OperatingState,
     idle_cycles: u32,
     /// Consecutive self-CQ transmissions with zero decoded responses. Reset
-    /// whenever a QSO becomes active (`active_qso_count > 0` — a response
-    /// arrived, from this CQ or otherwise). Tracked regardless of
-    /// `TxFreqMode` (cheap, and ready if the operator switches to Auto —
-    /// same precedent as `QsoMetadata.dx_repeat_count`); only acted on in
-    /// Auto mode.
+    /// by `feed_decoded_messages_at` whenever a decoded message directs a
+    /// reply at our callsign (see [`is_directed_response`]) — deliberately
+    /// NOT keyed off `active_qso_count`, since our own self-CQ opens a
+    /// `CallingCq` QSO that is itself "active" until it times out, which
+    /// would otherwise reset the streak against our own unanswered call.
+    /// Tracked regardless of `TxFreqMode` (cheap, and ready if the operator
+    /// switches to Auto — same precedent as `QsoMetadata.dx_repeat_count`);
+    /// only acted on in Auto mode.
     cq_no_response_streak: u32,
     our_callsign: String,
     our_grid: Option<String>,
@@ -1091,6 +1094,20 @@ impl AutonomousOperator {
             for call in third_party_exchange_callsigns(&msg.message_text, &self.our_callsign) {
                 self.recently_in_qso.insert(call, busy_now);
             }
+        }
+
+        // No-response CQ-streak reset: a genuine reply directed at us (the
+        // standard "<us> <them> <payload>" exchange format, not a CQ) means
+        // someone answered — reset the streak regardless of whether that
+        // reply goes on to become a tracked QSO. Deliberately NOT keyed off
+        // `active_qso_count`: our own self-CQ opens a `CallingCq` QSO that is
+        // itself "active" until it times out, so that signal would reset the
+        // streak against our own unanswered call, not a real response.
+        if messages
+            .iter()
+            .any(|m| is_directed_response(&m.message_text, &self.our_callsign))
+        {
+            self.cq_no_response_streak = 0;
         }
 
         // Extract CQ candidates.
@@ -1467,10 +1484,6 @@ impl AutonomousOperator {
     pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
         self.skip_log.clear();
         let mut actions = Vec::new();
-
-        if self.active_qso_count > 0 {
-            self.cq_no_response_streak = 0;
-        }
 
         if self.paused {
             actions.push(self.status_action());
@@ -1968,6 +1981,20 @@ pub fn is_exchange_payload(tok: &str) -> bool {
 /// definition (it re-implements an equivalent locally because `pancetta-tui`
 /// does not depend on `pancetta-qso`; keeping this canonical and tested
 /// guards both copies against drift).
+/// `true` if `text` is a non-CQ message whose first token addresses
+/// `our_callsign` directly — the standard FT8 "<to> <from> <payload>" reply
+/// format someone uses to answer our CQ. Used to detect a genuine response,
+/// as distinct from `active_qso_count` (which our own not-yet-timed-out
+/// self-CQ can also make nonzero).
+fn is_directed_response(text: &str, our_callsign: &str) -> bool {
+    if is_cq_message(text) {
+        return false;
+    }
+    text.split_whitespace()
+        .next()
+        .is_some_and(|to| to.eq_ignore_ascii_case(our_callsign))
+}
+
 pub fn third_party_exchange_callsigns(text: &str, our_callsign: &str) -> Vec<String> {
     if is_cq_message(text) {
         return Vec::new();
@@ -2298,15 +2325,18 @@ mod tests {
 
     #[test]
     fn auto_mode_listens_instead_of_switching_when_history_is_thin() {
-        // switch_after = 0: the streak (starting at 0) already meets the
-        // threshold on the very first CQ-eligible call, so a single call
-        // is enough to exercise the freshness-gated skip.
-        let mut op = primed_operator(1, 0, true);
+        // switch_after = 1 (a reachable, config-valid threshold — 0 is
+        // rejected by AutonomousConfig::validate_section): the first
+        // CQ-eligible call sends a real no-response CQ (streak -> 1); the
+        // second is where the streak first meets the threshold, and is the
+        // one that must be gated on thin history.
+        let mut op = primed_operator(1, 1, true);
         // Deliberately do NOT prime decode history — cycles_recorded() stays
         // below FrequencyAllocatorConfig::default().decode_history_cycles (4).
 
         let even_ts: i64 = 0;
-        let actions = op.decide_at(even_ts); // idle_cycles 0->1 >= cq_after_idle_cycles(1): CQ-eligible
+        op.decide_at(even_ts); // idle_cycles 0->1 >= cq_after_idle_cycles(1): first CQ, streak -> 1
+        let actions = op.decide_at(even_ts); // streak(1) >= switch_after(1): would-be switch, history thin
 
         assert!(
             !actions
@@ -2324,7 +2354,12 @@ mod tests {
     }
 
     #[test]
-    fn streak_resets_when_a_qso_becomes_active() {
+    fn streak_resets_on_directed_reply_not_on_active_qso_count() {
+        // Regression: our own self-CQ opens a CallingCq QSO, which is itself
+        // "active" until it times out — active_qso_count is NOT a safe reset
+        // signal (it would zero the streak against our own unanswered CQ,
+        // not a real response). Only a decoded reply directed at us must
+        // reset it.
         let mut op = primed_operator(2, 2, true);
         for _ in 0..8 {
             op.feed_decoded_messages(&[], &NullDxEvaluator);
@@ -2333,9 +2368,26 @@ mod tests {
         op.decide_at(even_ts); // idle
         op.decide_at(even_ts); // CQ #1, streak -> 1
 
-        op.set_active_qso_count(1); // a response arrived
-        op.decide_at(even_ts); // self-CQ branch doesn't even run (active_qso_count > 0)
+        // active_qso_count alone must NOT reset the streak (this is exactly
+        // what our own not-yet-timed-out self-CQ looks like from outside).
+        op.set_active_qso_count(1);
+        op.decide_at(even_ts); // self-CQ branch doesn't run (active_qso_count > 0), no reset either
         op.set_active_qso_count(0);
+
+        // A genuine directed reply ("<us> <them> <payload>") DOES reset it.
+        op.feed_decoded_messages(
+            &[DecodedMessageInfo {
+                callsign: Some("K9ZZ".into()),
+                frequency_hz: 1500.0,
+                snr: -5,
+                message_text: "W1ABC K9ZZ -05".into(),
+                slot_parity: None,
+                confidence: None,
+                time_offset_s: None,
+                decode_origin: None,
+            }],
+            &NullDxEvaluator,
+        );
 
         op.decide_at(even_ts); // idle
         let round = op.decide_at(even_ts); // CQ #2 post-reset, streak -> 1 again, not 3
@@ -2343,7 +2395,36 @@ mod tests {
             !round
                 .iter()
                 .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
-            "streak must have reset when the QSO went active, not kept accumulating"
+            "streak must have reset on the directed reply, not kept accumulating"
+        );
+    }
+
+    #[test]
+    fn streak_is_not_reset_by_active_qso_count_alone() {
+        // The precise regression Codex flagged: active_qso_count > 0 with NO
+        // directed reply decoded must leave the streak untouched.
+        let mut op = primed_operator(2, 2, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #1, streak -> 1
+
+        op.set_active_qso_count(1); // e.g. our own pending self-CQ's CallingCq QSO
+        op.decide_at(even_ts); // must NOT reset the streak
+        op.set_active_qso_count(0);
+
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #2: streak entering=1 (NOT reset to 0), 1 < 2, -> becomes 2
+        op.decide_at(even_ts); // idle
+        let round = op.decide_at(even_ts); // CQ #3: streak entering=2 >= threshold(2) -> switches
+        assert!(
+            round
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "streak must have kept accumulating across the active_qso_count blip, reaching \
+             the threshold on the 3rd CQ"
         );
     }
 
