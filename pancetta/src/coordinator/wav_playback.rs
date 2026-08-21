@@ -1,6 +1,6 @@
 use anyhow::Result;
 use pancetta_ft8::{Ft8Config, Ft8Decoder};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use tracing::{debug, info};
 
 use super::util::resample_linear;
@@ -24,59 +24,60 @@ fn int_sample_max_val(bits_per_sample: u16) -> Result<f32> {
     Ok((1i64 << (bits_per_sample - 1)) as f32)
 }
 
+/// Read a WAV file, mixing to mono if it's multi-channel. Returns the mono
+/// samples at the file's own native sample rate (no resampling here) plus
+/// that rate, so callers can resample to whatever target they need.
+pub(crate) fn read_wav_mono(path: &Path) -> Result<(Vec<f32>, u32)> {
+    let reader = hound::WavReader::open(path)
+        .map_err(|e| anyhow::anyhow!("Failed to open WAV file {}: {}", path.display(), e))?;
+
+    let spec = reader.spec();
+    info!(
+        "WAV: {} channels, {} Hz, {:?}, {} bits",
+        spec.channels, spec.sample_rate, spec.sample_format, spec.bits_per_sample
+    );
+
+    let raw_samples: Vec<f32> = match spec.sample_format {
+        hound::SampleFormat::Int => {
+            let max_val = int_sample_max_val(spec.bits_per_sample)?;
+            reader
+                .into_samples::<i32>()
+                .filter_map(|s| s.ok())
+                .map(|s| s as f32 / max_val)
+                .collect()
+        }
+        hound::SampleFormat::Float => reader
+            .into_samples::<f32>()
+            .filter_map(|s| s.ok())
+            .collect(),
+    };
+
+    let mono_samples: Vec<f32> = if spec.channels > 1 {
+        let ch = spec.channels as usize;
+        raw_samples
+            .chunks(ch)
+            .map(|frame| frame.iter().sum::<f32>() / ch as f32)
+            .collect()
+    } else {
+        raw_samples
+    };
+
+    Ok((mono_samples, spec.sample_rate))
+}
+
 impl super::ApplicationCoordinator {
     /// Run WAV playback mode: read file, decode, print results, exit.
     pub(crate) async fn run_wav_playback(&self, wav_path: PathBuf) -> Result<()> {
         info!("WAV playback mode: {}", wav_path.display());
 
-        // Read WAV file
-        let reader = hound::WavReader::open(&wav_path).map_err(|e| {
-            anyhow::anyhow!("Failed to open WAV file {}: {}", wav_path.display(), e)
-        })?;
-
-        let spec = reader.spec();
-        info!(
-            "WAV: {} channels, {} Hz, {:?}, {} bits",
-            spec.channels, spec.sample_rate, spec.sample_format, spec.bits_per_sample
-        );
-
-        // Read all samples as f32
-        let raw_samples: Vec<f32> = match spec.sample_format {
-            hound::SampleFormat::Int => {
-                let max_val = int_sample_max_val(spec.bits_per_sample)?;
-                reader
-                    .into_samples::<i32>()
-                    .filter_map(|s| s.ok())
-                    .map(|s| s as f32 / max_val)
-                    .collect()
-            }
-            hound::SampleFormat::Float => reader
-                .into_samples::<f32>()
-                .filter_map(|s| s.ok())
-                .collect(),
-        };
-
-        info!("Read {} raw samples", raw_samples.len());
-
-        // Mix down to mono if stereo
-        let mono_samples: Vec<f32> = if spec.channels > 1 {
-            let ch = spec.channels as usize;
-            raw_samples
-                .chunks(ch)
-                .map(|frame| frame.iter().sum::<f32>() / ch as f32)
-                .collect()
-        } else {
-            raw_samples
-        };
+        let (mono_samples, native_rate) = read_wav_mono(&wav_path)?;
+        info!("Read {} mono samples", mono_samples.len());
 
         // Resample to 12 kHz if needed
         let target_rate = pancetta_ft8::SAMPLE_RATE;
-        let samples_12k: Vec<f32> = if spec.sample_rate != target_rate {
-            info!(
-                "Resampling from {} Hz to {} Hz",
-                spec.sample_rate, target_rate
-            );
-            resample_linear(&mono_samples, spec.sample_rate, target_rate)
+        let samples_12k: Vec<f32> = if native_rate != target_rate {
+            info!("Resampling from {} Hz to {} Hz", native_rate, target_rate);
+            resample_linear(&mono_samples, native_rate, target_rate)
         } else {
             mono_samples
         };
@@ -94,12 +95,8 @@ impl super::ApplicationCoordinator {
 
         let window_size = pancetta_ft8::WINDOW_SAMPLES; // 151680 (12.64s @ 12 kHz)
 
-        // Decode each 15-second slot worth of samples
-        // FT8 windows overlap -- try decoding from multiple offsets
         let mut all_decoded = Vec::new();
         let mut offset = 0usize;
-
-        // Step by half a window (6.32s) to catch messages at slot boundaries
         let step = window_size / 2;
 
         while offset + window_size <= total_samples {
@@ -112,7 +109,6 @@ impl super::ApplicationCoordinator {
                         let dt = msg.time_offset;
                         let text = &msg.text;
 
-                        // Print in WSJT-X style format with confidence and AP level
                         let slot_time = offset as f64 / target_rate as f64;
                         let mins = (slot_time / 60.0) as u32;
                         let secs = (slot_time % 60.0) as u32;
@@ -132,11 +128,6 @@ impl super::ApplicationCoordinator {
             offset += step;
         }
 
-        // Also try from offset 0 if we haven't covered it
-        if total_samples >= window_size && step > 0 {
-            // Already covered above
-        }
-
         println!(
             "\n--- Decoded {} messages from {} ---",
             all_decoded.len(),
@@ -149,7 +140,7 @@ impl super::ApplicationCoordinator {
 
 #[cfg(test)]
 mod tests {
-    use super::int_sample_max_val;
+    use super::{int_sample_max_val, read_wav_mono};
 
     #[test]
     fn valid_pcm_widths_match_naive_scale() {
@@ -172,5 +163,37 @@ mod tests {
         // Naive `1i64 << (65535 - 1)` would be an oversized shift.
         assert!(int_sample_max_val(33).is_err());
         assert!(int_sample_max_val(u16::MAX).is_err());
+    }
+
+    #[test]
+    fn read_wav_mono_mixes_stereo_and_reports_native_rate() {
+        use std::io::Cursor;
+
+        // Build a tiny 2-channel, 16-bit, 8000 Hz WAV in memory: left=1.0, right=-1.0
+        // for every sample, so mono mix-down must produce 0.0 at every sample.
+        let spec = hound::WavSpec {
+            channels: 2,
+            sample_rate: 8000,
+            bits_per_sample: 16,
+            sample_format: hound::SampleFormat::Int,
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("stereo.wav");
+        {
+            let mut writer = hound::WavWriter::create(&path, spec).unwrap();
+            for _ in 0..100 {
+                writer.write_sample(i16::MAX).unwrap();
+                writer.write_sample(i16::MIN + 1).unwrap();
+            }
+            writer.finalize().unwrap();
+        }
+
+        let (mono, rate) = read_wav_mono(&path).unwrap();
+        assert_eq!(rate, 8000);
+        assert_eq!(mono.len(), 100);
+        for s in mono {
+            assert!(s.abs() < 0.001, "expected near-zero mix-down, got {s}");
+        }
+        let _ = Cursor::new(Vec::<u8>::new()); // silence unused-import if hound changes later
     }
 }
