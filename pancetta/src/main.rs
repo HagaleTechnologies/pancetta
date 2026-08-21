@@ -912,6 +912,7 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
                 if offer_wizard_on_load_failure(
                     cli.headless,
                     cli.wav.is_some(),
+                    cli.replay.is_some(),
                     std::io::stdin().is_terminal(),
                 ) =>
             {
@@ -954,8 +955,16 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
     // First-run setup: if callsign is still the default, prompt the user.
     // Only run when stdin is a TTY — non-interactive invocations (config --show,
     // piped input) must not trigger the wizard or overwrite the config.
+    // `--wav` and `--replay` are both file-fed, unattended runs (scripted demos,
+    // VHS recordings, integration tests): a modal wizard would hijack them even
+    // on a TTY, so both suppress it.
     let is_interactive = std::io::stdin().is_terminal();
-    if config.station.callsign == "N0CALL" && !cli.headless && cli.wav.is_none() && is_interactive {
+    if config.station.callsign == "N0CALL"
+        && !cli.headless
+        && cli.wav.is_none()
+        && cli.replay.is_none()
+        && is_interactive
+    {
         if let Some(updated) = run_first_time_setup(&config)? {
             config = updated;
         }
@@ -966,8 +975,15 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
 
 /// The de-brick wizard offer fires only for interactive TUI launches —
 /// exactly the same gate as the first-run wizard's `is_interactive` check.
-fn offer_wizard_on_load_failure(headless: bool, wav: bool, interactive: bool) -> bool {
-    !headless && !wav && interactive
+/// `wav`/`replay` are file-fed unattended modes; neither may be interrupted
+/// by a prompt.
+fn offer_wizard_on_load_failure(
+    headless: bool,
+    wav: bool,
+    replay: bool,
+    interactive: bool,
+) -> bool {
+    !headless && !wav && !replay && interactive
 }
 
 /// Interactive first-run setup wizard.
@@ -1868,10 +1884,11 @@ mod wizard_validation_tests {
 
     #[test]
     fn debrick_gate_only_fires_interactive_tui_runs() {
-        assert!(offer_wizard_on_load_failure(false, false, true));
-        assert!(!offer_wizard_on_load_failure(true, false, true)); // headless
-        assert!(!offer_wizard_on_load_failure(false, true, true)); // --wav
-        assert!(!offer_wizard_on_load_failure(false, false, false)); // piped stdin
+        assert!(offer_wizard_on_load_failure(false, false, false, true));
+        assert!(!offer_wizard_on_load_failure(true, false, false, true)); // headless
+        assert!(!offer_wizard_on_load_failure(false, true, false, true)); // --wav
+        assert!(!offer_wizard_on_load_failure(false, false, true, true)); // --replay
+        assert!(!offer_wizard_on_load_failure(false, false, false, false)); // piped stdin
     }
 
     // Regression test for the run_first_time_setup validate-then-Ok(Some(..))
