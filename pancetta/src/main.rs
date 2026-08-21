@@ -111,7 +111,7 @@ struct Cli {
     /// own a few seconds after the last file is exhausted. Unlike --wav,
     /// this runs the complete pipeline (TUI, QSO engine, priority scoring),
     /// not just the decoder -- intended for demos and scripted recordings.
-    /// Cannot be combined with --no-audio or --test-tx.
+    /// Cannot be combined with --wav, --no-audio, or --test-tx.
     //
     // The `conflicts_with_all` is load-bearing, not cosmetic:
     //
@@ -121,6 +121,12 @@ struct Cli {
     //   feeder was spawned, nothing ever set the shutdown signal, and the
     //   process hung forever instead of self-terminating as `--replay`
     //   promises.
+    // - `wav`: `ApplicationCoordinator::run` checks `wav_path` first and
+    //   returns through `run_wav_playback` before the replay branch is ever
+    //   reached, so `--wav X --replay Y` silently ran single-file playback and
+    //   ignored the requested replay pipeline -- an undocumented precedence
+    //   between two modes that do genuinely different things (decode-and-exit
+    //   vs. full pipeline at real-time cadence).
     // - `test_tx`: the test-TX task unconditionally sets the shutdown signal
     //   35s after injecting its frame, which truncates any replay corpus
     //   longer than that (including the bundled 75s demo corpus) before its
@@ -131,7 +137,7 @@ struct Cli {
     //
     // Rejecting these pairs at parse time turns that hang / truncation into a
     // clear error.
-    #[arg(long, global = true, conflicts_with_all = ["no_audio", "test_tx"])]
+    #[arg(long, global = true, conflicts_with_all = ["wav", "no_audio", "test_tx"])]
     replay: Option<PathBuf>,
 
     /// Enable metrics collection
