@@ -527,6 +527,9 @@ pub struct AutonomousConfig {
     pub slot_parity: SlotParityConfig,
     /// Idle TX cycles before we start calling CQ ourselves.
     pub cq_after_idle_cycles: u32,
+    /// Consecutive self-CQ transmissions with zero decoded responses before
+    /// switching to a different TX frequency (Auto mode only).
+    pub cq_no_response_switch_after: u32,
     pub max_concurrent_qsos: u32,
     pub tx_offset_hz: f64,
     /// 0.0–1.0 threshold for DX score when deciding whether to answer a CQ.
@@ -558,6 +561,7 @@ impl Default for AutonomousConfig {
             enabled: false,
             slot_parity: SlotParityConfig::Auto,
             cq_after_idle_cycles: 10,
+            cq_no_response_switch_after: 5,
             max_concurrent_qsos: 1,
             tx_offset_hz: 1500.0,
             min_dx_score: 0.3,
@@ -815,6 +819,13 @@ pub struct AutonomousOperator {
     frequency_allocator: FrequencyAllocator,
     state: OperatingState,
     idle_cycles: u32,
+    /// Consecutive self-CQ transmissions with zero decoded responses. Reset
+    /// whenever a QSO becomes active (`active_qso_count > 0` — a response
+    /// arrived, from this CQ or otherwise). Tracked regardless of
+    /// `TxFreqMode` (cheap, and ready if the operator switches to Auto —
+    /// same precedent as `QsoMetadata.dx_repeat_count`); only acted on in
+    /// Auto mode.
+    cq_no_response_streak: u32,
     our_callsign: String,
     our_grid: Option<String>,
     /// CQs decoded in the most recent RX slot.
@@ -903,6 +914,7 @@ impl AutonomousOperator {
             frequency_allocator,
             state: OperatingState::Hunting,
             idle_cycles: 0,
+            cq_no_response_streak: 0,
             our_callsign,
             our_grid,
             pending_cqs: Vec::new(),
@@ -1221,6 +1233,7 @@ impl AutonomousOperator {
         &self,
         dx_target_hz: Option<f64>,
         target_parity: Option<pancetta_core::slot::SlotParity>,
+        avoid_hz: Option<f64>,
     ) -> f64 {
         // Hold mode (default): pancetta does not choose the offset — every
         // autonomous transmission goes out on the operator's pinned offset.
@@ -1239,12 +1252,15 @@ impl AutonomousOperator {
             return self.config.tx_offset_hz;
         }
 
-        let own_freqs: Vec<f64> = self
+        let mut own_freqs: Vec<f64> = self
             .frequency_allocator
             .own_frequencies()
             .values()
             .copied()
             .collect();
+        if let Some(avoid) = avoid_hz {
+            own_freqs.push(avoid);
+        }
 
         // FQ-F8: map the caller's known TX slot parity (for a pounce, the
         // opposite of the DX's own observed slot — same convention as the
@@ -1451,6 +1467,10 @@ impl AutonomousOperator {
     pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
         self.skip_log.clear();
         let mut actions = Vec::new();
+
+        if self.active_qso_count > 0 {
+            self.cq_no_response_streak = 0;
+        }
 
         if self.paused {
             actions.push(self.status_action());
@@ -1711,6 +1731,7 @@ impl AutonomousOperator {
                         let tx_freq = self.allocate_smart_frequency(
                             Some(cq.frequency_hz),
                             cq.slot_parity.map(|p| p.opposite()),
+                            None,
                         );
 
                         let grid_part = self
@@ -1745,10 +1766,53 @@ impl AutonomousOperator {
                             self.state = OperatingState::CallingCq;
                             self.idle_cycles = 0;
 
+                            let should_switch = self.tx_freq_auto()
+                                && self.cq_no_response_streak
+                                    >= self.config.cq_no_response_switch_after;
+
+                            let switched_freq = if should_switch {
+                                let history_fresh = self.spectral_snapshot.is_some()
+                                    && self.decode_history.cycles_recorded()
+                                        >= self.config.frequency.decode_history_cycles;
+
+                                if !history_fresh {
+                                    // Not enough fresh occupancy data to pick a good
+                                    // alternative — skip this window and listen instead
+                                    // of guessing blind. Streak stays put; retried next
+                                    // window once history fills in from ordinary RX.
+                                    self.state = OperatingState::Hunting;
+                                    actions.push(OperatorAction::Listen);
+                                    actions.push(self.status_action());
+                                    return actions;
+                                }
+
+                                let old_offset = self.config.tx_offset_hz;
+                                // FQ-F8: a self-CQ can land on either slot parity —
+                                // degrades to the slot-blind scoring path, same as below.
+                                let new_offset =
+                                    self.allocate_smart_frequency(None, None, Some(old_offset));
+                                self.set_tx_offset(new_offset);
+                                self.cq_no_response_streak = 0;
+                                actions.push(OperatorAction::FrequencyShift {
+                                    new_offset_hz: new_offset,
+                                });
+                                Some(new_offset)
+                            } else {
+                                None
+                            };
+
                             // FQ-F8: a self-CQ can land on either slot parity, so
                             // there's no single known target at scoring time —
-                            // degrades to the slot-blind scoring path.
-                            let cq_freq = self.allocate_smart_frequency(None, None);
+                            // degrades to the slot-blind scoring path. If we just
+                            // switched, use that offset directly rather than
+                            // re-ranking — a second unavoided call could simply
+                            // re-pick the frequency we just switched away from.
+                            let cq_freq = match switched_freq {
+                                Some(freq) => freq,
+                                None => self.allocate_smart_frequency(None, None, None),
+                            };
+                            self.cq_no_response_streak =
+                                self.cq_no_response_streak.saturating_add(1);
 
                             let cq_text = if self.config.cq_direction.is_empty() {
                                 format!(
@@ -2084,6 +2148,203 @@ mod tests {
 
         // After 4 slots, should pick Even (quieter).
         assert_eq!(sm.our_slot, Some(SlotParity::Even));
+    }
+
+    #[test]
+    fn autonomous_config_default_cq_no_response_switch_after_is_5() {
+        let config = AutonomousConfig::default();
+        assert_eq!(config.cq_no_response_switch_after, 5);
+    }
+
+    #[test]
+    fn allocate_smart_frequency_avoids_the_given_offset() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+
+        let chosen = op.allocate_smart_frequency(None, None, Some(1500.0));
+
+        assert!(
+            (chosen - 1500.0).abs() >= 75.0,
+            "expected a frequency at least 75 Hz from the avoided 1500 Hz, got {chosen}"
+        );
+    }
+
+    #[test]
+    fn allocate_smart_frequency_ignores_avoid_hz_in_hold_mode() {
+        // Hold mode returns the pinned/parked offset regardless of avoid_hz —
+        // avoid_hz only matters on the Auto ranking path.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.tx_offset_hz = 1500.0;
+        let op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        // Default mode is Hold (no set_tx_freq_mode_source call).
+        let chosen = op.allocate_smart_frequency(None, None, Some(1500.0));
+        assert_eq!(chosen, 1500.0);
+    }
+
+    fn primed_operator(
+        cq_after_idle_cycles: u32,
+        switch_after: u32,
+        auto: bool,
+    ) -> AutonomousOperator {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = cq_after_idle_cycles;
+        config.cq_no_response_switch_after = switch_after;
+        config.listen_cycle.initial_interval = 100; // never listen-jitter mid-test
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        if auto {
+            op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                pancetta_core::TxFreqMode::Auto.as_u8(),
+            )));
+        }
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        op
+    }
+
+    fn run_cq_rounds(op: &mut AutonomousOperator, rounds: u32) -> Vec<Vec<OperatorAction>> {
+        let even_ts: i64 = 0;
+        let mut all = Vec::new();
+        for _ in 0..rounds {
+            // cq_after_idle_cycles = 2: one "idle" tick, then one "CQ" tick.
+            op.decide_at(even_ts);
+            all.push(op.decide_at(even_ts));
+        }
+        all
+    }
+
+    #[test]
+    fn auto_mode_switches_frequency_after_streak_threshold() {
+        let mut op = primed_operator(2, 3, true);
+        // Pre-fill decode history so freshness never blocks this test.
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let rounds = run_cq_rounds(&mut op, 4);
+
+        // First 3 CQ rounds: no FrequencyShift.
+        for round in &rounds[..3] {
+            assert!(
+                !round
+                    .iter()
+                    .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+                "must not switch before the threshold"
+            );
+        }
+        // 4th round: FrequencyShift AND a CQ transmit on the new offset.
+        let shift_offset = rounds[3].iter().find_map(|a| {
+            if let OperatorAction::FrequencyShift { new_offset_hz } = a {
+                Some(*new_offset_hz)
+            } else {
+                None
+            }
+        });
+        assert!(
+            shift_offset.is_some(),
+            "expected a FrequencyShift at the threshold round"
+        );
+        let tx_offset = rounds[3].iter().find_map(|a| {
+            if let OperatorAction::Transmit {
+                frequency_offset,
+                message_text,
+                ..
+            } = a
+            {
+                message_text.starts_with("CQ").then_some(*frequency_offset)
+            } else {
+                None
+            }
+        });
+        assert_eq!(
+            tx_offset, shift_offset,
+            "the CQ must go out on the newly-switched frequency"
+        );
+    }
+
+    #[test]
+    fn hold_mode_never_switches_even_past_the_streak_threshold() {
+        let mut op = primed_operator(2, 2, false); // Hold mode: no set_tx_freq_mode_source call
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let rounds = run_cq_rounds(&mut op, 6); // well past the threshold of 2
+
+        for round in &rounds {
+            assert!(
+                !round
+                    .iter()
+                    .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+                "Hold mode must never emit a FrequencyShift"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_mode_listens_instead_of_switching_when_history_is_thin() {
+        // switch_after = 0: the streak (starting at 0) already meets the
+        // threshold on the very first CQ-eligible call, so a single call
+        // is enough to exercise the freshness-gated skip.
+        let mut op = primed_operator(1, 0, true);
+        // Deliberately do NOT prime decode history — cycles_recorded() stays
+        // below FrequencyAllocatorConfig::default().decode_history_cycles (4).
+
+        let even_ts: i64 = 0;
+        let actions = op.decide_at(even_ts); // idle_cycles 0->1 >= cq_after_idle_cycles(1): CQ-eligible
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::Transmit { .. })),
+            "must not transmit a blind CQ/switch while history is thin"
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "must not switch while history is thin"
+        );
+        assert!(actions.iter().any(|a| matches!(a, OperatorAction::Listen)));
+    }
+
+    #[test]
+    fn streak_resets_when_a_qso_becomes_active() {
+        let mut op = primed_operator(2, 2, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #1, streak -> 1
+
+        op.set_active_qso_count(1); // a response arrived
+        op.decide_at(even_ts); // self-CQ branch doesn't even run (active_qso_count > 0)
+        op.set_active_qso_count(0);
+
+        op.decide_at(even_ts); // idle
+        let round = op.decide_at(even_ts); // CQ #2 post-reset, streak -> 1 again, not 3
+        assert!(
+            !round
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "streak must have reset when the QSO went active, not kept accumulating"
+        );
     }
 
     #[test]
@@ -2532,7 +2793,7 @@ mod tests {
             freq_max_hz: 3000.0,
         });
 
-        let baseline = op.allocate_smart_frequency(None, None);
+        let baseline = op.allocate_smart_frequency(None, None, None);
 
         // Register (via bulk replace) an own-frequency exactly at the
         // baseline pick — criterion #7's -50 penalty should knock it out
@@ -2542,7 +2803,7 @@ mod tests {
         op.frequency_allocator_mut()
             .set_own_frequencies(frequencies);
 
-        let after = op.allocate_smart_frequency(None, None);
+        let after = op.allocate_smart_frequency(None, None, None);
         assert_ne!(
             after, baseline,
             "an own-frequency collision at the baseline pick must move the \
@@ -2571,7 +2832,7 @@ mod tests {
         // Nothing parked yet (atomic == 0): must fall back to the static
         // config value, byte-identical to pre-fix behavior.
         assert_eq!(
-            op.allocate_smart_frequency(None, None),
+            op.allocate_smart_frequency(None, None, None),
             1500.0,
             "unset parked-offset atomic must fall back to config.tx_offset_hz"
         );
@@ -2579,7 +2840,7 @@ mod tests {
         // Operator parks a live offset via the `o` modal (simulated store).
         hold_hz.store(2137, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            op.allocate_smart_frequency(None, None),
+            op.allocate_smart_frequency(None, None, None),
             2137.0,
             "a non-zero parked offset must win over the static config value"
         );
@@ -2587,7 +2848,7 @@ mod tests {
         // Operator clears the park (0 = unset again): must revert to config.
         hold_hz.store(0, std::sync::atomic::Ordering::Relaxed);
         assert_eq!(
-            op.allocate_smart_frequency(None, None),
+            op.allocate_smart_frequency(None, None, None),
             1500.0,
             "clearing the park (0) must revert to config.tx_offset_hz"
         );
@@ -2605,7 +2866,7 @@ mod tests {
         };
         let op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
         // Default mode is Hold; no `set_tx_offset_hold_source` call at all.
-        assert_eq!(op.allocate_smart_frequency(None, None), 1234.0);
+        assert_eq!(op.allocate_smart_frequency(None, None, None), 1234.0);
     }
 
     /// FQ-F8: `allocate_smart_frequency`'s `target_parity` parameter must
@@ -2662,7 +2923,7 @@ mod tests {
             (SlotParity::Even, TimeSlot::First),
             (SlotParity::Odd, TimeSlot::Second),
         ] {
-            let via_operator = op.allocate_smart_frequency(Some(1500.0), Some(slot_parity));
+            let via_operator = op.allocate_smart_frequency(Some(1500.0), Some(slot_parity), None);
             let via_direct_ranking = op
                 .smart_allocator
                 .rank_candidates_with_parity(
@@ -3233,7 +3494,7 @@ mod tests {
         assert_eq!(unboosted, 1500.0, "sanity: unboosted winner is band center");
 
         // Real CQ-frequency decision path.
-        let real_freq = op.allocate_smart_frequency(None, None);
+        let real_freq = op.allocate_smart_frequency(None, None, None);
 
         // TX-placement instrument.
         let snap = op.placement_snapshot(usize::MAX).unwrap();

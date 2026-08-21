@@ -769,6 +769,7 @@ impl super::ApplicationCoordinator {
                 }
             },
             cq_after_idle_cycles: config.autonomous.cq_after_idle_cycles,
+            cq_no_response_switch_after: config.autonomous.cq_no_response_switch_after,
             max_concurrent_qsos: config.autonomous.max_concurrent_qsos,
             tx_offset_hz: config.autonomous.tx_offset_hz,
             min_dx_score: config.autonomous.min_dx_score,

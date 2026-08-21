@@ -126,6 +126,7 @@ shape = "sine"
 [autonomous]
 cq_after_idle_cycles = 10
 cq_direction = ""
+cq_no_response_switch_after = 5
 dry_run = false
 enabled = false
 max_concurrent_qsos = 1

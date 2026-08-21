@@ -175,6 +175,13 @@ impl DecodeHistory {
     pub fn is_clear_both_slots(&self, offset_hz: f64, radius_hz: f64) -> bool {
         self.activity_near(offset_hz, radius_hz) == 0
     }
+
+    /// How many decode cycles are currently retained (0..=`max_cycles`).
+    /// Used to distinguish a freshly-started/just-hopped history (thin data,
+    /// don't trust rankings yet) from a full rolling window.
+    pub fn cycles_recorded(&self) -> usize {
+        self.cycles.len()
+    }
 }
 
 /// A scored frequency candidate.
@@ -427,6 +434,21 @@ mod tests {
             freq_min_hz: 200.0,
             freq_max_hz: 2800.0,
         }
+    }
+
+    #[test]
+    fn cycles_recorded_tracks_pushes_up_to_capacity() {
+        let mut history = DecodeHistory::new(4);
+        assert_eq!(history.cycles_recorded(), 0);
+
+        history.push_cycle(vec![]);
+        assert_eq!(history.cycles_recorded(), 1);
+
+        for _ in 0..5 {
+            history.push_cycle(vec![]);
+        }
+        // Capped at max_cycles even after more pushes than capacity.
+        assert_eq!(history.cycles_recorded(), 4);
     }
 
     #[test]

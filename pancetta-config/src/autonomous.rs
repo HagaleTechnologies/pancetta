@@ -189,6 +189,10 @@ impl Default for FrequencyAllocatorConfig {
     }
 }
 
+fn default_cq_no_response_switch_after() -> u32 {
+    5
+}
+
 /// Top-level autonomous operator configuration.
 ///
 /// Corresponds to the `[autonomous]` section in the TOML config file.
@@ -200,6 +204,11 @@ pub struct AutonomousConfig {
     pub slot_parity: SlotParitySetting,
     /// Number of idle TX cycles before calling CQ (~150 s at default 10).
     pub cq_after_idle_cycles: u32,
+    /// Consecutive self-CQ transmissions with zero decoded responses before
+    /// switching to a different TX frequency (Auto mode only; Hold mode
+    /// tracks but never acts on this). Default 5.
+    #[serde(default = "default_cq_no_response_switch_after")]
+    pub cq_no_response_switch_after: u32,
     /// Maximum concurrent QSOs (default 1, capability for 2).
     pub max_concurrent_qsos: u32,
     /// Our TX audio offset in Hz within the FT8 sub-band.
@@ -235,6 +244,7 @@ impl Default for AutonomousConfig {
             enabled: false,
             slot_parity: SlotParitySetting::Auto,
             cq_after_idle_cycles: 10,
+            cq_no_response_switch_after: default_cq_no_response_switch_after(),
             max_concurrent_qsos: 1,
             tx_offset_hz: 1500.0,
             min_dx_score: 0.3,
@@ -254,6 +264,12 @@ impl ConfigSection for AutonomousConfig {
         if self.cq_after_idle_cycles == 0 {
             return Err(ConfigError::InvalidValue {
                 field: "autonomous.cq_after_idle_cycles".into(),
+                value: "0".into(),
+            });
+        }
+        if self.cq_no_response_switch_after == 0 {
+            return Err(ConfigError::InvalidValue {
+                field: "autonomous.cq_no_response_switch_after".into(),
                 value: "0".into(),
             });
         }
@@ -289,6 +305,7 @@ impl ConfigSection for AutonomousConfig {
         self.enabled = other.enabled;
         self.slot_parity = other.slot_parity;
         self.cq_after_idle_cycles = other.cq_after_idle_cycles;
+        self.cq_no_response_switch_after = other.cq_no_response_switch_after;
         self.max_concurrent_qsos = other.max_concurrent_qsos;
         self.tx_offset_hz = other.tx_offset_hz;
         self.min_dx_score = other.min_dx_score;
@@ -365,6 +382,72 @@ mod tests {
 
         config.min_multi_slot_score = 1.5;
         assert!(config.validate_section().is_err());
+    }
+
+    #[test]
+    fn cq_no_response_switch_after_defaults_to_5() {
+        let config = AutonomousConfig::default();
+        assert_eq!(config.cq_no_response_switch_after, 5);
+    }
+
+    #[test]
+    fn validate_rejects_zero_cq_no_response_switch_after() {
+        let mut config = AutonomousConfig::default();
+        config.cq_no_response_switch_after = 0;
+        assert!(config.validate_section().is_err());
+    }
+
+    #[test]
+    fn config_missing_cq_no_response_switch_after_field_uses_default() {
+        // An [autonomous] section from before this field existed must still parse.
+        let toml_input = r#"
+enabled = true
+slot_parity = "auto"
+cq_after_idle_cycles = 10
+max_concurrent_qsos = 1
+tx_offset_hz = 1500.0
+min_dx_score = 0.3
+min_multi_slot_score = 0.7
+cq_direction = ""
+
+[frequency]
+decode_history_cycles = 4
+center_bias_hz = 1500.0
+dx_proximity_min_hz = 50.0
+dx_proximity_max_hz = 200.0
+min_separation_hz = 75.0
+neighbor_guard_hz = 100.0
+
+[listen_cycle]
+initial_interval = 3
+backoff_interval = 5
+collision_interval = 2
+backoff_threshold = 5
+
+[band_hopping]
+enabled = false
+hop_threshold = 20
+bands = []
+
+[priorities]
+needed_dxcc = 0.35
+needed_grid = 0.20
+pota_sota = 0.15
+rarity = 0.10
+signal_strength = 0.05
+duplicate_penalty = -0.40
+recent_failure_penalty = -0.15
+"#;
+        let parsed: AutonomousConfig =
+            toml::from_str(toml_input).expect("must deserialize without the new field");
+        assert_eq!(parsed.cq_no_response_switch_after, 5);
+    }
+
+    #[test]
+    fn custom_cq_no_response_switch_after_parses() {
+        let mut config = AutonomousConfig::default();
+        config.cq_no_response_switch_after = 8;
+        assert!(config.validate_section().is_ok());
     }
 
     #[test]
