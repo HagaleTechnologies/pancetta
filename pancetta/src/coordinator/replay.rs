@@ -62,12 +62,26 @@ pub(crate) fn load_replay_samples(dir: &Path, target_rate: u32) -> Result<Vec<f3
 /// short enough to keep `--replay` usable in CI and for VHS recordings.
 const REPLAY_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
+/// How long to wait, from `now`, until the next true UTC FT8 slot boundary
+/// (:00/:15/:30/:45). Replayed audio is a real off-air capture naturally
+/// aligned to slot boundaries when it was recorded; the live pipeline's
+/// decoder buffers incoming audio into windows keyed to the real wall clock,
+/// so starting the feed loop mid-slot would misalign every subsequent
+/// window. Waiting for the next boundary re-establishes that alignment.
+pub(crate) fn replay_preroll_wait(now: chrono::DateTime<chrono::Utc>) -> Duration {
+    let next_boundary = pancetta_core::slot::next_slot_start(now, chrono::Duration::zero());
+    pancetta_core::slot::duration_until(next_boundary, now)
+}
+
 impl super::ApplicationCoordinator {
     /// Feed every `.wav` file in `replay_dir` (in filename order) into the
     /// pipeline as if it were live audio: resampled to the configured audio
     /// sample rate, chunked to the configured buffer size, and paced in
     /// real time via the same `audio_to_dsp_tx` channel a real `cpal::Device`
-    /// or `PANCETTA_STUB_AUDIO` would use. Once the directory is exhausted,
+    /// or `PANCETTA_STUB_AUDIO` would use. Before the feed loop starts, waits
+    /// for the next true UTC slot boundary (see [`replay_preroll_wait`]) so
+    /// the replayed audio's phase lines up with the live decoder's
+    /// wall-clock-keyed 15s windows. Once the directory is exhausted,
     /// waits [`REPLAY_GRACE_PERIOD`] then triggers the same graceful
     /// shutdown Ctrl+C uses, so `--replay` is a finite, self-terminating
     /// mode suitable for scripted demos and automated tests.
@@ -99,6 +113,15 @@ impl super::ApplicationCoordinator {
         let last_timestamp = self.last_audio_timestamp.clone();
 
         let handle = tokio::spawn(async move {
+            let preroll_wait = replay_preroll_wait(chrono::Utc::now());
+            if preroll_wait > Duration::ZERO {
+                info!(
+                    "Replay: waiting {:?} for next UTC slot boundary before starting feed",
+                    preroll_wait
+                );
+            }
+            tokio::time::sleep(preroll_wait).await;
+
             let buffer_duration_ms = (buffer_size as f64 * 1000.0 / sample_rate as f64) as u64;
             let mut process_interval = interval(Duration::from_millis(buffer_duration_ms.max(5)));
 
@@ -148,6 +171,7 @@ impl super::ApplicationCoordinator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::TimeZone;
 
     fn write_test_wav(path: &Path, sample_rate: u32, n_samples: usize) {
         let spec = hound::WavSpec {
@@ -213,5 +237,25 @@ mod tests {
         // 80 samples @ 8000 Hz resampled to 12000 Hz -> 120 samples each (linear
         // resampler truncates via integer division: 80 * 12000 / 8000 = 120).
         assert_eq!(samples.len(), 240);
+    }
+
+    #[test]
+    fn replay_preroll_wait_lands_on_next_boundary_mid_slot() {
+        // 7s into a slot that started at :00:00 -> next boundary is :00:15,
+        // so the wait should be exactly 8s.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 7).unwrap();
+        let wait = replay_preroll_wait(now);
+        assert_eq!(wait, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn replay_preroll_wait_on_exact_boundary_waits_a_full_slot() {
+        // next_slot_start with a zero min_lead always advances to the *next*
+        // boundary even when `now` is exactly on one (see
+        // pancetta-core/src/slot.rs `slot_boundary_aligned_picks_next`), so
+        // starting replay exactly at :00:00 should wait the full 15s.
+        let now = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 0).unwrap();
+        let wait = replay_preroll_wait(now);
+        assert_eq!(wait, Duration::from_secs(15));
     }
 }
