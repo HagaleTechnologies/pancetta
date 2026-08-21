@@ -1998,7 +1998,20 @@ fn is_directed_response(text: &str, our_callsign: &str) -> bool {
         && base.chars().all(|c| c.is_ascii_alphanumeric())
         && base.chars().any(|c| c.is_ascii_alphabetic())
         && base.chars().any(|c| c.is_ascii_digit());
-    looks_like_call && (is_exchange_payload(payload) || looks_like_grid(payload))
+    if !looks_like_call {
+        return false;
+    }
+    // Every OTHER `/`-separated component (prefix/suffix modifiers like
+    // "VP2", "R", "MM") must be a short (<=4 char) alphanumeric affix, not
+    // garbage — rejects e.g. "W1XYZ/TOOLONG" or "BOGUS/W1XYZ/INVALID",
+    // where base_callsign would otherwise still extract a valid-looking
+    // base out of an overall malformed compound token.
+    let modifiers_ok = from
+        .to_uppercase()
+        .split('/')
+        .filter(|c| !c.is_empty())
+        .all(|c| c == base || (c.len() <= 4 && c.chars().all(|ch| ch.is_ascii_alphanumeric())));
+    modifiers_ok && (is_exchange_payload(payload) || looks_like_grid(payload))
 }
 
 /// `true` if `tok` has exact Maidenhead locator shape: 2 letters + 2 digits
@@ -2254,6 +2267,15 @@ mod tests {
         assert!(is_directed_response("W1ABC VP2/W1XYZ FK87", "W1ABC"));
         assert!(is_directed_response("W1ABC K1ABC/R -05", "W1ABC"));
         assert!(is_directed_response("W1ABC EA8/G8BCG RR73", "W1ABC"));
+    }
+
+    #[test]
+    fn is_directed_response_rejects_malformed_compound_modifiers() {
+        // base_callsign() alone would extract a valid-looking "W1XYZ" out
+        // of these, but the OTHER slash-separated component is garbage, not
+        // a real (<=4 char) prefix/suffix modifier.
+        assert!(!is_directed_response("W1ABC W1XYZ/TOOLONG -05", "W1ABC"));
+        assert!(!is_directed_response("W1ABC BOGUS/W1XYZ/INVALID -05", "W1ABC"));
     }
 
     #[test]
