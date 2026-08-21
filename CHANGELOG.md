@@ -89,7 +89,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protocol takes its drain-only path, so GridTracker/JTAlert never see a
   replayed decode as a live reception; and the per-QSO logbook upload
   subscriber (ClubLog/QRZ/LoTW/eQSL/cqdx.io) is not spawned, so a QSO
-  "completed" off replayed traffic can't be filed as a real contact. The two
+  "completed" off replayed traffic can't be automatically uploaded as a real
+  contact (it is still appended to the local ADIF source of truth like any
+  other completed QSO — see the open question in PR #263 about whether
+  that's the right call). The two
   remote-operation consumers of the shared display feed are gated at the same
   predicate: the read-only remote-view gateway never gets a feed and never
   binds its WebSocket listener, and the station agent takes its inert

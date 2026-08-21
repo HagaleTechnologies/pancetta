@@ -441,9 +441,11 @@ impl super::ApplicationCoordinator {
         }
 
         let Some(feed) = self.display_feed.as_ref() else {
-            // Defensive only: `start_display_feed`'s gate ORs in this exact
-            // `enabled` flag, so this branch should be unreachable in
-            // practice. Fail soft (no localhost server) rather than panic.
+            // Defensive only: the `replay_mode()` early return above already
+            // covers replay, and outside replay `start_display_feed`'s gate
+            // ORs in this exact `enabled` flag, so this branch should be
+            // unreachable in practice either way. Fail soft (no localhost
+            // server) rather than panic.
             warn!("remote_gateway enabled but display_feed unavailable — localhost server not started");
             return Ok(());
         };
