@@ -20,14 +20,19 @@ Set Theme "Dracula"
 #
 # Also sets [decoder] effort = "max" (pancetta-config/src/decoder.rs,
 # DecodeEffort::Max -- "maximum effort, slowest decode, highest recall").
-# The live coordinator's default DecodeEffort::Auto maps to a time-boxed
-# per-window budget (~1000ms on typical hardware, see
-# pancetta/src/coordinator/effort.rs) that is too tight for the FT8
-# decoder's S4 cross-cycle-averaging recovery stage -- the stage that
-# pancetta-ft8/tests/wav_decode_tests.rs (~lines 784, 802-812) documents as
-# needed to decode assets/demo-wav/live_now.wav. `effort = "max"` removes
-# the time box so every recovery stage runs to completion, same as the
-# unit test's DecodeBudget::unlimited().
+#
+# CAUTION -- this does NOT mean unbounded decode time in the live runtime.
+# `DecodeEffort::Max` resolves to a `decode_effort_budget_ms == 0` ("unlimited")
+# sentinel, but `pancetta/src/coordinator/ft8.rs` (see `decode_budget_ceiling_ms`,
+# ~lines 57-63, and its use at ~lines 667-686) still clamps every decode window
+# to a hard per-slot ceiling regardless of effort preset -- 2000ms for FT8's
+# 15s slot. That ceiling is NOT the same guarantee as
+# pancetta-ft8/tests/wav_decode_tests.rs's `DecodeBudget::unlimited()`, which
+# truly never times out. In other words: `effort = "max"` sets the preset, but
+# the coordinator's live decode loop still enforces a fixed wall-clock cutoff
+# every window, preset notwithstanding. (Investigated 2026-08-20 while chasing
+# why this demo doesn't show a decode -- see the final comment block below and
+# the task report for full detail.)
 Hide
 Type `DEMO_CFG=$(mktemp -t pancetta-demo-config).toml; printf '[station]\ncallsign = \"K5ARH\"\n\n[decoder]\neffort = \"max\"\n' > $DEMO_CFG`
 Enter
@@ -70,3 +75,35 @@ Sleep 75s
 # window -- the one most likely to show a live decode -- room to render
 # and stay on screen before the process exits.
 Sleep 40s
+
+# HONEST DISCLOSURE about what assets/demo.gif (as committed) actually shows,
+# for whoever writes the README next (do not overclaim beyond this):
+#
+# The committed GIF shows real pipeline operation -- startup, TX-placement /
+# priority-scoring, band monitoring, and a clean self-terminating exit -- but
+# it does NOT show an actual FT8 decode. `Msgs: 0` / "No message
+# Monitoring..." holds for the entire recording despite `RF present` and the
+# `DECODE: MAX <n>ms` badge confirming effort=max is active end-to-end.
+#
+# Two known, un-fixed reasons, tracked as follow-up investigation and
+# explicitly NOT part of this plan:
+#   1. The effort=max ceiling gap documented in the comment above this tape's
+#      bootstrap block: "max" still enforces a hard 2000ms/slot ceiling in
+#      pancetta/src/coordinator/ft8.rs, not a true unbounded decode.
+#   2. Even accounting for (1), timing the exact fixture
+#      (basicft8/live_now.wav) through the unit test's genuinely unbounded
+#      DecodeBudget::unlimited() (wav_decode_tests.rs) shows it decodes in
+#      ~1s -- comfortably under the 2000ms ceiling on time alone. So there is
+#      a likely separate discrepancy between the live streaming --replay
+#      decode path (cross-cycle decoder state accumulated across consecutive
+#      real-time windows) and the offline batch-test harness (which hands the
+#      decoder one fixture window directly) -- not yet root-caused.
+#
+# Three attempts across this branch (slot-alignment fix, adding the
+# documented-decodable live_now.wav fixture, effort=max) each landed a real,
+# correct fix but none produced a visible decode. This is accepted as final
+# for this plan -- README copy should describe the GIF as showing live
+# pipeline startup / TX-scoring / clean shutdown, and must NOT claim or imply
+# it shows a captured FT8 decode. See
+# .superpowers/sdd/2026-08-20-readme-visual-identity-plan/replay-demo-max-effort-report.md
+# for the full investigation.
