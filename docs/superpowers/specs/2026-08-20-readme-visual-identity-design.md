@@ -100,11 +100,12 @@ Content displaced from the README gets real homes:
 - Full workspace crate table → pointer to `docs/ARCHITECTURE.md` (already
   has the detailed version)
 
-Logo: a mark selected from the exploration canvas
-(https://claude.ai/code/artifact/d6fc7587-70b7-4d25-a734-7fc79cdc4f70) —
-12 concepts across 4 directions (monogram/waterfall, pancetta-pun icon,
-pure ham-radio iconography, terminal-native marks). Selection and any
-refinement pass happens before Phase 2 is implemented.
+Logo: **decided.** Direction 4, mark A2 ("gradient fade" — the ASCII
+full-block P with a top-to-bottom opacity ramp), from the exploration canvas
+(https://claude.ai/code/artifact/d6fc7587-70b7-4d25-a734-7fc79cdc4f70).
+Several refinement passes on the loop's right edge (flush-fill, paired-column
+rebuild, solid-fill, vector-shape punched void) were tried and rejected —
+locked in as-is for now; revisit polish later rather than keep iterating.
 
 ### Phase 3 — Distribution (decide item by item)
 
@@ -129,6 +130,5 @@ Candidates, not commitments:
 
 ## Open decisions carried into implementation
 
-- Final logo pick (and whether it needs a professional polish pass after
-  the exploration canvas)
+- Logo: resolved — Direction 4 / mark A2, locked in as-is (see Phase 2).
 - Exact Phase 3 items to execute now vs. defer
