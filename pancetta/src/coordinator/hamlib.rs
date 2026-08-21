@@ -2367,14 +2367,31 @@ impl super::ApplicationCoordinator {
 /// (consumer side), NEITHER the pending slot NOR the in-flight flag
 /// reflected "something is happening" -- a concurrent PTT-on could slip
 /// through `tx_hard_mute_reason` in exactly that handoff-to-consumption
-/// window. `hamlib_command_in_flight` is now set `true` HERE, at
-/// successful hand-off (`try_send` succeeding), not just at CAT-call
-/// start -- so there is no gap between "no longer pending" and "marked
-/// in-flight". The consumer's own guard (`HamlibCommandInFlightGuard`)
-/// still owns clearing it once the CAT call resolves (success or
-/// failure); setting it again there when the call actually starts is a
-/// harmless, redundant re-affirmation of the same `true` this function
-/// already set.
+/// window. `hamlib_command_in_flight` is set `true` HERE, at hand-off, not
+/// just at CAT-call start -- so there is no gap between "no longer
+/// pending" and "marked in-flight". The consumer's own guard
+/// (`HamlibCommandInFlightGuard`) still owns clearing it once the CAT call
+/// resolves (success or failure); setting it again there when the call
+/// actually starts is a harmless, redundant re-affirmation of the same
+/// `true` this function already set.
+///
+/// PAN-19 round-18 review (Codex P1): "establish the handoff marker
+/// before publishing the command". Round 17's fix marked in-flight AFTER
+/// `try_send` succeeded, not before -- on a fast consumer, the full cycle
+/// (dequeue -> CAT call completes -> `HamlibCommandInFlightGuard::drop`
+/// clears the flag) could finish BEFORE this producer's own delayed
+/// `store(true, ..)` executed, letting that stale write resurrect the
+/// flag to `true` with nothing left in the pending slot and no guard left
+/// to ever clear it -- permanently muting an otherwise healthy
+/// generation. Fix: the store now happens BEFORE `try_send`, not after --
+/// by the time the consumer could possibly see the message (which can
+/// only happen once `try_send` has actually run), the flag is already
+/// `true`, so there is no window where the consumer's clear could ever
+/// land before this producer's own set. Rolled back (cleared) ONLY on
+/// `try_send` failure, when nothing was actually handed off to a
+/// consumer -- symmetric with how `HamlibCommandInFlightGuard` clears on
+/// the consumption side, so exactly one write establishes `true` for this
+/// message's handoff, never two independent writers racing to do it.
 /// `true` when the message loop has already applied a command of this kind
 /// newer than `message` -- i.e. `message` is stale and must not be
 /// (re)delivered or (re)applied. Fails safe toward delivering (returns
@@ -2537,6 +2554,11 @@ fn orphan_release_is_safe(confirmed_safe: bool, replacement_watchdog_alive: bool
     confirmed_safe && replacement_watchdog_alive
 }
 
+// `ComponentMessage` (432 bytes) travels by value through `Result::Err` here
+// the same way crossbeam's own `TrySendError<ComponentMessage>` already does
+// in the `try_send` calls below -- carrying the un-sent message back to the
+// caller so it can be requeued, not a new pattern this function introduces.
+#[allow(clippy::result_large_err)]
 fn deliver_pending_hamlib_state(
     pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
@@ -2553,28 +2575,22 @@ fn deliver_pending_hamlib_state(
                     "Hamlib restart: dropping a pending SetFrequency command superseded by a \
                      newer command that already went through -- not reverting good state"
                 );
+            } else if let Err(returned) =
+                mark_in_flight_then_send(message, hamlib_command_in_flight, |m| {
+                    sender.try_send(m).map_err(|e| e.into_inner())
+                })
+            {
+                warn!(
+                    "Hamlib restart: failed to deliver pending SetFrequency command -- \
+                     keeping it queued for the next attempt"
+                );
+                *slot = Some(returned);
             } else {
-                match sender.try_send(message) {
-                    Ok(()) => {
-                        // PAN-19 round-17 review (Codex P1): "cover the
-                        // pending-command handoff before CAT starts" --
-                        // see this function's doc comment.
-                        hamlib_command_in_flight.store(true, Ordering::Release);
-                        info!(
-                            target: "rig",
-                            "Hamlib restart: delivered pending SetFrequency command carried \
-                             over from a prior failed teardown replay"
-                        );
-                    }
-                    Err(crossbeam_channel::TrySendError::Full(returned))
-                    | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
-                        warn!(
-                            "Hamlib restart: failed to deliver pending SetFrequency command -- \
-                             keeping it queued for the next attempt"
-                        );
-                        *slot = Some(returned);
-                    }
-                }
+                info!(
+                    target: "rig",
+                    "Hamlib restart: delivered pending SetFrequency command carried over from \
+                     a prior failed teardown replay"
+                );
             }
         }
     }
@@ -2586,28 +2602,68 @@ fn deliver_pending_hamlib_state(
                     "Hamlib restart: dropping a pending SetSplit command superseded by a \
                      newer command that already went through -- not reverting good state"
                 );
+            } else if let Err(returned) =
+                mark_in_flight_then_send(message, hamlib_command_in_flight, |m| {
+                    sender.try_send(m).map_err(|e| e.into_inner())
+                })
+            {
+                warn!(
+                    "Hamlib restart: failed to deliver pending SetSplit command -- keeping it \
+                     queued for the next attempt"
+                );
+                *slot = Some(returned);
             } else {
-                match sender.try_send(message) {
-                    Ok(()) => {
-                        // PAN-19 round-17 review (Codex P1): same as
-                        // SetFrequency above.
-                        hamlib_command_in_flight.store(true, Ordering::Release);
-                        info!(
-                            target: "rig",
-                            "Hamlib restart: delivered pending SetSplit command carried over \
-                             from a prior failed teardown replay"
-                        );
-                    }
-                    Err(crossbeam_channel::TrySendError::Full(returned))
-                    | Err(crossbeam_channel::TrySendError::Disconnected(returned)) => {
-                        warn!(
-                            "Hamlib restart: failed to deliver pending SetSplit command -- \
-                             keeping it queued for the next attempt"
-                        );
-                        *slot = Some(returned);
-                    }
-                }
+                info!(
+                    target: "rig",
+                    "Hamlib restart: delivered pending SetSplit command carried over from a \
+                     prior failed teardown replay"
+                );
             }
+        }
+    }
+}
+
+/// PAN-19 round-18 review (Codex P1): "establish the handoff marker
+/// before publishing the command". Round 17's fix marked
+/// `hamlib_command_in_flight` AFTER `try_send` succeeded, not before --
+/// on a fast consumer, the full cycle (dequeue -> CAT call completes ->
+/// `HamlibCommandInFlightGuard::drop` clears the flag) could finish
+/// BEFORE this producer's own delayed `store(true, ..)` executed,
+/// letting that stale write resurrect the flag to `true` with nothing
+/// left in the pending slot and no guard left to ever clear it --
+/// permanently muting an otherwise healthy generation.
+///
+/// Fix: mark in-flight BEFORE attempting the send, not after. By the
+/// time a consumer could possibly see the message (which can only happen
+/// once `send` has actually run), the flag is already `true` -- there is
+/// no window where the consumer's clear could ever land before this
+/// producer's own set. Rolled back (cleared) ONLY when `send` itself
+/// fails, returning the message back to the caller (as `Err`) so it can
+/// be put back in its pending slot -- nothing was actually handed off,
+/// so no consumer could ever be racing against this specific rollback.
+/// This is symmetric with how `HamlibCommandInFlightGuard` clears on the
+/// consumption side: exactly one write establishes `true` for this
+/// message's handoff, never two independent writers racing to do it.
+///
+/// Takes the channel send as an injectable closure (rather than a
+/// concrete `crossbeam_channel::Sender`) so the exact ordering claim --
+/// "the flag is true BEFORE send is attempted, not just eventually
+/// true" -- is directly, deterministically testable: a test closure can
+/// run arbitrary code (including a simulated consumer's full lifecycle)
+/// at the exact instant "the message left this function", which a real
+/// channel's internal timing can't be forced to reproduce reliably.
+#[allow(clippy::result_large_err)] // ComponentMessage returned so it can be requeued; see deliver_pending_hamlib_state's own allow.
+fn mark_in_flight_then_send(
+    message: ComponentMessage,
+    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+    mut send: impl FnMut(ComponentMessage) -> Result<(), ComponentMessage>,
+) -> Result<(), ComponentMessage> {
+    hamlib_command_in_flight.store(true, Ordering::Release);
+    match send(message) {
+        Ok(()) => Ok(()),
+        Err(returned) => {
+            hamlib_command_in_flight.store(false, Ordering::Release);
+            Err(returned)
         }
     }
 }
@@ -4170,6 +4226,196 @@ mod teardown_replay_tests {
             !in_flight.load(Ordering::Acquire),
             "a FAILED hand-off must not mark hamlib_command_in_flight -- nothing was actually \
              enqueued, so nothing is in flight"
+        );
+    }
+
+    /// PAN-19 round-18 review (Codex P1) regression guard: "establish the
+    /// handoff marker before publishing the command". A fast consumer --
+    /// receives the message and runs its own full lifecycle (constructs
+    /// `HamlibCommandInFlightGuard`, mirroring the message loop's own
+    /// wrapping of the CAT call, then drops it immediately, mirroring an
+    /// instant CAT call) concurrently with the producer's own call to
+    /// `deliver_pending_hamlib_state`. With the pre-round-18 ordering
+    /// (mark the flag AFTER `try_send` succeeds), a fast-enough consumer's
+    /// clear could land BEFORE the producer's own delayed store, letting
+    /// that stale write resurrect the flag to `true` with nothing left to
+    /// ever clear it -- permanently muting an otherwise healthy
+    /// generation. With the fix (mark BEFORE `try_send`), the flag must
+    /// reliably end up `false` regardless of how fast the consumer is.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_does_not_strand_in_flight_true_for_a_fast_consumer() {
+        let coordinator = test_coordinator().await;
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(set_freq_msg());
+
+        let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
+        let in_flight = not_in_flight();
+
+        // Spawn the "consumer" first so it's already blocked on `recv()`
+        // -- ready to run its full lifecycle to completion the instant
+        // the message arrives, maximizing the chance of the exact
+        // interleaving the finding describes.
+        let in_flight_for_consumer = in_flight.clone();
+        let consumer = tokio::task::spawn_blocking(move || {
+            let _message = receiver.recv().expect("the message must be delivered");
+            let guard = HamlibCommandInFlightGuard::new(in_flight_for_consumer);
+            drop(guard);
+        });
+
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &no_supersession(),
+            &sender,
+            &in_flight,
+        );
+
+        consumer.await.expect("consumer task must not panic");
+
+        assert!(
+            !in_flight.load(Ordering::Acquire),
+            "a fast consumer that completes its full lifecycle concurrently with the \
+             producer's own call must not leave hamlib_command_in_flight stranded true -- it \
+             must end up false, not permanently mute an otherwise healthy generation"
+        );
+    }
+
+    /// PAN-19 round-18 review (Codex P1) regression guard: proves the
+    /// ORDER directly, not just the eventual value -- the marker must be
+    /// set BEFORE the channel send is attempted. This is deterministic
+    /// (not a timing-luck race): crossbeam channels establish a
+    /// happens-before relationship between what the sender did before
+    /// `try_send` and what the receiver observes once `recv()` returns,
+    /// so with the fix, ANY receiver that successfully receives the
+    /// message is GUARANTEED to see `hamlib_command_in_flight == true`
+    /// the instant it checks -- regardless of real-time scheduling.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_marks_in_flight_before_the_channel_send_not_after() {
+        let coordinator = test_coordinator().await;
+        *coordinator.hamlib_pending_split.lock().unwrap() = Some(set_freq_msg());
+
+        let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
+        let in_flight = not_in_flight();
+
+        let in_flight_for_consumer = in_flight.clone();
+        let consumer = tokio::task::spawn_blocking(move || {
+            let _message = receiver.recv().expect("the message must be delivered");
+            // Checked THE INSTANT the message is received -- proves the
+            // producer's store happened BEFORE the send, not just
+            // eventually before this check.
+            in_flight_for_consumer.load(Ordering::Acquire)
+        });
+
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &no_supersession(),
+            &no_supersession(),
+            &sender,
+            &in_flight,
+        );
+
+        let observed_by_consumer = consumer.await.expect("consumer task must not panic");
+        assert!(
+            observed_by_consumer,
+            "the in-flight marker must be set BEFORE the channel send is attempted -- any \
+             consumer that successfully receives the message must already observe it true, \
+             not race against a delayed post-send store"
+        );
+    }
+
+    /// PAN-19 round-18 review (Codex P1) regression guard: a fully
+    /// DETERMINISTIC version of the ordering claim above, exercising
+    /// `mark_in_flight_then_send` directly. The two tests above rely on
+    /// real thread scheduling to (maybe) reproduce the exact race -- a
+    /// real crossbeam channel's send-to-receive latency turns out fast
+    /// enough in practice that even the PRE-fix (mark-after-send)
+    /// ordering usually "wins" the race by luck, so those tests can't be
+    /// trusted to fail reliably against a regression (confirmed by
+    /// hand: reverting the fix and running them repeatedly still mostly
+    /// passes). This test instead injects a `send` closure that runs a
+    /// simulated consumer's FULL lifecycle -- checking the flag, then
+    /// running `HamlibCommandInFlightGuard`'s construct+drop -- synchronously,
+    /// INSIDE the closure, at the exact instant the real function would
+    /// call `sender.try_send`. This deterministically reproduces "the
+    /// consumer runs to completion during the send call" on every single
+    /// run, no scheduling luck required, and is what actually caught the
+    /// round-17 -> round-18 regression class this finding describes.
+    #[test]
+    fn mark_in_flight_then_send_observes_true_synchronously_during_the_send_call() {
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        let in_flight: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let observed_during_send = std::cell::Cell::new(None);
+        let result = mark_in_flight_then_send(split_msg, &in_flight, |message| {
+            // Simulate the consumer's FULL lifecycle happening
+            // synchronously "during" the send -- the tightest possible
+            // interleaving, worse than any real scheduling could ever
+            // produce, so a fix that's only correct "most of the time"
+            // fails this every run.
+            observed_during_send.set(Some(in_flight.load(Ordering::Acquire)));
+            let guard = HamlibCommandInFlightGuard::new(in_flight.clone());
+            drop(guard);
+            // Standing in for successful delivery -- there's no real
+            // channel in this test.
+            drop(message);
+            Ok(())
+        });
+
+        assert!(result.is_ok(), "the simulated send must succeed");
+        assert_eq!(
+            observed_during_send.get(),
+            Some(true),
+            "the in-flight flag must already be true the instant the send is attempted -- a \
+             consumer running synchronously inside the send call must never observe false"
+        );
+        assert!(
+            !in_flight.load(Ordering::Acquire),
+            "after the consumer's full lifecycle (construct + drop) completes during the send, \
+             the flag must end up false, not resurrected true by a delayed producer-side write \
+             -- mark_in_flight_then_send must not write anything AFTER the send call on success"
+        );
+    }
+
+    /// The failure path: `send` returning `Err` must roll the marker
+    /// back, and the message must come back out so it can be re-queued.
+    #[test]
+    fn mark_in_flight_then_send_rolls_back_on_failure() {
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        let sent_id = split_msg.id;
+        let in_flight: Arc<std::sync::atomic::AtomicBool> =
+            Arc::new(std::sync::atomic::AtomicBool::new(false));
+
+        let result = mark_in_flight_then_send(split_msg, &in_flight, Err);
+
+        let returned = result.expect_err("the simulated send must fail");
+        assert_eq!(
+            returned.id, sent_id,
+            "the original message must be returned on failure so it can be re-queued"
+        );
+        assert!(
+            !in_flight.load(Ordering::Acquire),
+            "a failed send must roll the in-flight marker back to false -- nothing was \
+             actually handed off"
         );
     }
 
