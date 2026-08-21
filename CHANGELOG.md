@@ -62,6 +62,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--replay` now actually decodes. The replay feeder emitted bare mono samples
+  while the DSP stage de-interleaves every incoming buffer against `[audio]
+  input_channels` (default 2) — so it discarded every second real sample and
+  treated the survivors as covering the same wall-clock span, halving the
+  effective sample rate and making an FT8 decode impossible regardless of
+  timing, decode effort, or content. The feeder now interleaves each sample
+  across `input_channels`, mimicking a real capture stream. A `--replay` run
+  over `assets/demo-wav` goes from 0 decodes to 26, and the README demo GIF
+  and screenshots were re-rendered accordingly (the DX Hunter priority table
+  is populated for the first time).
 - `--replay` combined with `--no-audio` is now rejected at CLI parse time
   instead of hanging forever (the `no_audio` short-circuit in
   `start_audio_pipeline` precedes the replay branch, so no feeder was spawned

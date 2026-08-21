@@ -2,21 +2,24 @@
 #   vhs .tapes/feature-decode-effort.tape
 # Produces assets/feature-decode-effort.gif.
 #
-# Why this feature and not "a CQ getting scored then worked": the
-# `assets/demo-wav` corpus does not produce an FT8 decode under --replay's
-# live streaming pipeline. See `.tapes/demo.tape`'s trailing "HONEST
-# DISCLOSURE" comment for what has been measured and ruled out. A GIF of
-# "priority-based station selection" would require a real decoded CQ to
-# score and work, which this fixture can't deliver on demand -- faking that
-# would misrepresent the pipeline. Decode-effort cycling (`e` key,
-# pancetta-config/src/decoder.rs DecodeEffort::cycle, wired in
-# pancetta-tui/src/tui_runner.rs) is a genuinely decode-independent feature:
-# it's a live operator control that updates the title-bar "DECODE: <PRESET>
-# <n>ms" chip (pancetta-tui/src/ui/mod.rs:712) immediately on keypress, no
-# decode required. Same reasoning applies to the multi-stream-TX GIF the
-# brief also floats -- two simultaneous TX streams requires two active QSOs,
-# which requires decodes, so it's skipped for the same reason (see the task
-# report).
+# Why this feature and not "a CQ getting scored then worked": timing, not
+# capability. `--replay` DOES decode now -- the channel-framing bug that
+# suppressed every decode is fixed (see `.tapes/demo.tape`'s trailing notes)
+# -- but the `assets/demo-wav` corpus only decodes on its LAST slot
+# (`live_now.wav`); the four numbered captures ahead of it are documented
+# non-decoding content (assets/demo-wav/README.md). So a decode-driven clip
+# would have to sit through ~75s of empty panels before anything happened,
+# and a full "scored, then worked" QSO progression needs a responding station
+# that a fixed recording cannot provide at all.
+#
+# Decode-effort cycling (`e` key, pancetta-config/src/decoder.rs
+# DecodeEffort::cycle, wired in pancetta-tui/src/tui_runner.rs) is instead
+# decode-INDEPENDENT: a live operator control that updates the title-bar
+# "DECODE: <PRESET> <n>ms" chip (pancetta-tui/src/ui/mod.rs:712) immediately
+# on keypress, so it makes a tight clip with no waiting. The same reasoning
+# applies to the multi-stream-TX GIF the brief also floats -- two
+# simultaneous TX streams needs two live QSO partners, which no recording
+# can supply.
 
 Output assets/feature-decode-effort.gif
 
@@ -52,12 +55,19 @@ Enter
 # the same reliable startup anchor `.tapes/demo.tape` uses. Stay Hidden through
 # startup so the GIF opens directly on the feature, not on boilerplate.
 #
-# The extra hidden sleep clears the replay feeder's worst-case 15s UTC
-# slot-boundary pre-roll (`replay_preroll_wait`) so the clip opens on a live
-# waterfall rather than a blank one. It costs nothing in GIF length -- these
+# The extra hidden wait clears the replay feeder's UTC slot-boundary pre-roll
+# (`replay_preroll_wait`) AND runs on to the corpus's decode burst, so the clip
+# opens on a populated station -- live waterfall, filled Band Activity and DX
+# Hunter -- rather than a blank one. It costs nothing in GIF length: these
 # frames are Hidden.
+#
+# `Msgs: <n>` is the status bar's decoded-message counter; the two-digit
+# requirement skips a possible single spurious pre-roll decode. See
+# `.tapes/screenshots.tape` for the full derivation of this anchor. The burst
+# lands ~73-88s in, leaving the ~20s REPLAY_GRACE_PERIOD window -- ample for
+# the ~6s of key presses below.
 Wait+Screen@15s /Band Activity/
-Sleep 20s
+Wait+Screen@120s /Msgs: [1-9][0-9]/
 Show
 
 # Cycle the full decode-effort ring: Max -> Auto -> Eco -> Standard -> Deep

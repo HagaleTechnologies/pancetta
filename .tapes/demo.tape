@@ -69,48 +69,51 @@ Sleep 75s
 # prompt on its own (no manual Ctrl+C).
 Sleep 45s
 
-# HONEST DISCLOSURE about what assets/demo.gif (as committed) actually shows.
-# Do not overclaim beyond this.
+# WHAT assets/demo.gif (as committed) SHOWS. Keep this accurate; do not
+# overclaim beyond it.
 #
-# WHAT IT SHOWS: real pipeline operation against real off-air audio -- startup,
-# a live waterfall fed by the replayed capture, the TX-placement /
-# priority-scoring instrument, a healthy audio path, and a clean
-# self-terminating exit.
+# Real pipeline operation against real off-air audio: startup, a live
+# waterfall fed by the replayed capture, the TX-placement / priority-scoring
+# instrument, a healthy audio path, a real FT8 decode burst late in the run,
+# and a clean self-terminating exit.
 #
-# WHAT IT DOES NOT SHOW: an actual FT8 decode. `Msgs: 0` / "No message
-# Monitoring..." holds for the whole recording.
+# The decode burst comes from `live_now.wav`, the last file in the corpus.
+# Measured 2026-08-21 with `--headless --replay assets/demo-wav` at
+# effort=max: window #6 (the window covering that file) reports
+# "26 messages decoded (25 ft8lib + 1 native + 0 cross-seq)" -- CQ WA3YUV
+# FM18, CQ AG6X DM12, CQ AD9DU EN52 and ~23 more. The four numbered captures
+# ahead of it are separately documented as non-decoding content (see
+# assets/demo-wav/README.md), so the first several slots correctly show an
+# empty Band Activity panel; that is the fixture, not a fault.
 #
-# Ruled out as the cause (measured on 2026-08-21 against this exact fixture
-# set, `--headless --replay assets/demo-wav` with effort=max):
+# ROOT CAUSE OF THE OLD "--replay NEVER DECODES" BUG (fixed, PR #263):
+# channel framing. `coordinator/dsp.rs` unconditionally de-interleaves every
+# buffer it receives against `[audio] input_channels` (default 2) --
+# `samples.chunks(input_channels).map(|ch| ch[0])` -- which is exactly right
+# for a real cpal capture stream. The replay feeder was handing it bare mono
+# samples, so DSP threw away every second REAL sample while still treating
+# the survivors as covering the same wall-clock span: the decoder saw the
+# audio at half its true sample rate (every tone an octave up, every symbol
+# half length). No FT8 decode was possible through that, which is why no
+# amount of timing, effort, or content work ever helped. The feeder now
+# interleaves each mono sample across `input_channels`
+# (`interleave_mono`, pancetta/src/coordinator/replay.rs), so DSP's existing
+# extraction recovers the original stream byte-for-byte.
+#
+# Two earlier fixes were necessary but not sufficient, and remain load-bearing:
 #
 #   * Feed pacing / slot phase alignment. The feeder used to derive a single
 #     truncated millisecond timer period, running audio 6.67% fast at the
 #     default 48000Hz/512 config and walking the replayed audio out from under
 #     the decoder's wall-clock-keyed windows. Fixed (absolute-deadline pacing);
-#     the run now logs "fed 3600000 samples (75.00s of audio) in 75.00s
-#     wall-clock", and windows #2-#5 fire at exactly slot_boundary+13s.
+#     the run logs "fed 3600000 samples (75.00s of audio) in 75.00s
+#     wall-clock", and every window fires at exactly slot_boundary+13s.
 #   * The grace period truncating the tail. It was 5s -- shorter than the
-#     13s decode phase alone -- so the final slot never reached the decoder
-#     (3 of 4 windows on the old 60s corpus). Now 20s; all 5 windows reach
-#     the FT8 stage.
-#   * The per-slot decode-time ceiling. `decode_budget_ceiling_ms`
-#     (pancetta/src/coordinator/ft8.rs) clamps each window to 2000ms for FT8
-#     regardless of effort preset, but the windows here complete in
-#     ~100-480ms and report 0 messages -- they are not budget-limited, so the
-#     ceiling is not what's suppressing the decode.
+#     13s decode phase alone -- so the final slot never reached the decoder.
+#     Now 20s. This one matters more than ever: the decode burst is in the
+#     LAST slot, so a short grace period would cut off the only decode.
 #
-# What remains unexplained: the window covering `live_now.wav` (window #5,
-# the highest-RMS window, correctly phase-aligned) reports
-# "0 messages decoded (0 ft8lib + 0 native + 0 cross-seq)" with
-# best_score=4.3 over 200 sync candidates, even though
-# pancetta-ft8/tests/wav_decode_tests.rs decodes that same file offline as a
-# single window. The four numbered captures are separately documented as
-# non-decoding content (see assets/demo-wav/README.md). Why the live
-# streaming path and the offline harness disagree on `live_now.wav` is NOT
-# root-caused -- treat it as an open question, not a known mechanism.
-#
-# Note also that FT8 decoding is inherently probabilistic: even a corpus that
-# decodes reliably would not guarantee a decode in every recording. README
-# copy should describe this GIF as showing live pipeline startup, waterfall,
-# TX-scoring and clean shutdown, and must NOT claim or imply it shows a
-# captured FT8 decode.
+# Note that FT8 decoding is inherently probabilistic. The corpus is fixed and
+# this decode reproduces run to run, but README copy should describe the GIF
+# as showing the live pipeline decoding a replayed off-air capture -- not as
+# a guarantee about on-air performance.

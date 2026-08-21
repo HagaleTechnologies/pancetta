@@ -20,8 +20,10 @@ Pancetta is an FT8 station that lives in your terminal.
 
 *`pancetta --replay` feeding archived WAV captures through the real pipeline:
 startup, band monitoring, the TX-placement scorer ranking candidate offsets,
-and a clean self-shutdown when the recording ends. No decode lands in this
-particular capture — for measured decode performance see
+a burst of real FT8 decodes filling Band Activity when the capture reaches
+its decodable slot, and a clean self-shutdown when the recording ends. One
+recording of one small corpus proves nothing about recall — for measured
+decode performance see
 [`docs/decoder-comparison.md`](docs/decoder-comparison.md).*
 
 ## The pitch
@@ -69,9 +71,9 @@ encode, decode, LDPC, CRC, and OSD.
 Every capture below — and the GIF further down, and the hero GIF above — was
 recorded on a development host with `pancetta --replay`, feeding archived
 off-air WAV captures through the real pipeline (see [`.tapes/`](.tapes/)).
-Real audio, real panels; no decode lands in this particular corpus, so the
-decode-driven tables read empty and these show layout, chrome and controls
-rather than a worked band.
+Real audio, real decodes, real panels — no mockups. The corpus is one short
+recording, so treat these as a tour of the interface, not a performance
+claim.
 
 | | |
 |---|---|

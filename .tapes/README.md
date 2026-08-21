@@ -20,11 +20,20 @@ Output lands in `assets/`.
 | `feature-decode-effort.tape` | `assets/feature-decode-effort.gif` | A short, decode-independent feature clip: cycling the decode-effort preset ring with `e` and the title-bar `DECODE: <PRESET> <n>ms` chip updating live. |
 
 All three drive `pancetta --replay assets/demo-wav`, so every asset comes
-from a real run with real off-air audio flowing through the pipeline. That
-corpus does **not** produce an FT8 decode under `--replay`; see the trailing
-"HONEST DISCLOSURE" comment block in `demo.tape` for what has been measured
-and ruled out. Don't write README copy that implies these assets show a
-captured decode.
+from a real run with real off-air audio flowing through the pipeline.
+
+The corpus decodes only on its **last** slot: `live_now.wav` yields ~26
+messages in one window, while the four numbered captures ahead of it are
+documented non-decoding content (`assets/demo-wav/README.md`). So the first
+~60s of any replay run correctly shows empty decode panels and the payoff
+lands at the end — `demo.gif` captures that arrival, and `screenshots.tape`
+waits for it (`Wait+Screen /Msgs: [1-9][0-9]/`) before capturing. Sizing any
+new tape's timing off a fixed sleep instead will capture empty panels.
+
+(Until PR #263 the corpus decoded *nothing* under `--replay`. Root cause: the
+replay feeder emitted bare mono while the DSP stage de-interleaved against
+`[audio] input_channels`, silently halving the effective sample rate. See
+`demo.tape`'s trailing comment block.)
 
 ## CI
 

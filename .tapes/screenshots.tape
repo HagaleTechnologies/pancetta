@@ -7,14 +7,15 @@
 # a real run with real off-air audio flowing through the pipeline -- NOT from
 # an idle process with no audio device.
 #
-# The `assets/demo-wav` corpus does not, however, produce an FT8 decode under
-# `--replay`. See `.tapes/demo.tape`'s trailing "HONEST DISCLOSURE" block for
-# what has been measured and ruled out (feed pacing, grace period, and the
-# per-slot decode-time ceiling are all ruled out; the remaining cause is not
-# root-caused). These screenshots therefore show real panel chrome and layout
-# -- including the DX Hunter panel's "Pri" (priority score) column and the
-# TX-placement instrument -- with unpopulated decode rows. That is the honest
-# current state of this fixture, not a bug in this tape.
+# The captures are timed to land AFTER the corpus's decode burst, so the
+# decode-driven panels (Band Activity, DX Hunter with its "Pri" priority-score
+# column) show real rows, not empty chrome. See `.tapes/demo.tape`'s trailing
+# notes for the corpus's decode profile: only the last file (`live_now.wav`)
+# decodes -- ~26 messages in one window -- because the four numbered captures
+# ahead of it are documented non-decoding content
+# (assets/demo-wav/README.md). Everything below therefore waits for the
+# status bar's message counter to go double-digit rather than sleeping a
+# fixed interval.
 
 Set Shell "bash"
 Set FontSize 16
@@ -54,24 +55,33 @@ Enter
 # and the AUD badge is dim. Screenshotting there captures an idle process, not
 # the station running.
 #
-# Sleep past the worst-case pre-roll (15s) PLUS the 13s the DSP stage takes to
-# emit its first decode window (slot_boundary + dsp_decode_phase, see
-# pancetta/src/coordinator/dsp.rs), so the status bar's "DSP:<n>" counter has
-# incremented at least once and every capture shows real audio flowing through
-# a working pipeline rather than a blank waterfall and a red zero. 15 + 13 +
-# margin => 32s. Total audio is 75s and the panel navigation that follows
-# takes ~5s, so all four captures land comfortably inside the feed.
+# Then wait for the decode burst itself rather than sleeping a fixed
+# interval. The burst comes from `live_now.wav`, the LAST 15s of the 75s
+# corpus, so its decode window fires at feed_start + 73s (slot_boundary +
+# dsp_decode_phase, pancetta/src/coordinator/dsp.rs) -- i.e. anywhere from
+# t+73s to t+88s after this anchor depending on how much UTC-slot pre-roll
+# the feeder had to absorb. A fixed sleep sized for the worst case would
+# waste up to 15s of the ~20s REPLAY_GRACE_PERIOD window the captures have
+# to complete in; waiting on the counter instead starts the captures the
+# moment the decodes land, leaving the same ~20s no matter the pre-roll.
+#
+# `Msgs: <n>` is the status bar's decoded-message counter
+# (pancetta-tui/src/ui/mod.rs, app.decoded_messages.len()). The regex
+# requires TWO digits deliberately: an early window over the pre-roll's
+# near-silence can produce a single spurious low-SNR decode, and matching
+# `Msgs: 1` would fire the captures ~60s too early on an empty panel. The
+# real burst is ~26-28 messages.
 Wait+Screen@15s /Band Activity/
-Sleep 32s
+Wait+Screen@120s /Msgs: [1-9][0-9]/
 
 # 1. Default Operate view: Band Activity + TX-placement instrument + station
 #    card + title-bar DECODE-effort chip, all real chrome from a live run.
 Screenshot "assets/screenshot-operate.png"
 
-# 2. DX Hunter panel, zoomed. Shows the real "Src/Call/Entity/Grid/SNR/
-#    Rarity/Rpt/Last/Pri" column layout (Pri = the per-station priority
-#    score column; pancetta-tui/src/ui/dx_hunter.rs) -- with empty rows,
-#    since this replay run produces no decode, per the disclosure above.
+# 2. DX Hunter panel, zoomed -- the flagship priority-engine capture. Shows
+#    the real "Src/Call/Entity/Grid/SNR/Rarity/Rpt/Last/Pri" column layout
+#    (Pri = the per-station priority score; pancetta-tui/src/ui/dx_hunter.rs)
+#    populated from the decode burst this tape waits for above.
 #    Panel 4 = DX Hunter (see pancetta-tui/src/keymap.rs).
 Type "4"
 Sleep 300ms

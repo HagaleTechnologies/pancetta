@@ -95,6 +95,42 @@ pub(crate) fn replay_chunk_deadline(samples_sent: u64, sample_rate: u32) -> Dura
     Duration::from_nanos(nanos.min(u64::MAX as u128) as u64)
 }
 
+/// Expand a mono chunk into the interleaved multi-channel framing the DSP
+/// stage expects, by duplicating each sample across all `channels` channels.
+///
+/// The DSP stage (`coordinator/dsp.rs`) unconditionally treats every buffer
+/// arriving on `audio_to_dsp_tx` as interleaved `[c0, c1, c0, c1, ...]` frames
+/// and extracts channel 0 with
+/// `samples.chunks(input_channels).map(|ch| ch[0])` -- that is what a real
+/// `cpal` capture stream delivers when `[audio] input_channels = 2` (the
+/// project default; most rig CODECs are 2-channel).
+///
+/// The replay feeder produces genuinely mono audio. Handing that stream to the
+/// DSP stage raw made it discard every second *real* sample while still
+/// treating the survivors as spanning the same wall-clock interval: the
+/// decoder saw audio at half the true sample rate, i.e. every tone shifted an
+/// octave up and every symbol half as long. No FT8 decode is possible through
+/// that corruption regardless of timing, decode effort, or signal quality --
+/// which is exactly what `--replay` exhibited (`Msgs: 0`, forever).
+///
+/// Mimicking the hardware framing here, rather than special-casing replay
+/// inside `dsp.rs`, keeps the DSP stage's live-audio contract untouched and
+/// makes replay's output byte-for-byte what a real 2-channel capture of the
+/// same mono content would look like.
+pub(crate) fn interleave_mono(mono: &[f32], channels: u16) -> Vec<f32> {
+    let channels = channels.max(1) as usize;
+    if channels == 1 {
+        return mono.to_vec();
+    }
+    let mut out = Vec::with_capacity(mono.len() * channels);
+    for &sample in mono {
+        for _ in 0..channels {
+            out.push(sample);
+        }
+    }
+    out
+}
+
 /// How long to wait, from `now`, until the next true UTC FT8 slot boundary
 /// (:00/:15/:30/:45). Replayed audio is a real off-air capture naturally
 /// aligned to slot boundaries when it was recorded; the live pipeline's
@@ -109,7 +145,8 @@ pub(crate) fn replay_preroll_wait(now: chrono::DateTime<chrono::Utc>) -> Duratio
 impl super::ApplicationCoordinator {
     /// Feed every `.wav` file in `replay_dir` (in filename order) into the
     /// pipeline as if it were live audio: resampled to the configured audio
-    /// sample rate, chunked to the configured buffer size, and paced in
+    /// sample rate, chunked to the configured buffer size, interleaved to
+    /// `[audio] input_channels` (see [`interleave_mono`]), and paced in
     /// real time via the same `audio_to_dsp_tx` channel a real `cpal::Device`
     /// or `PANCETTA_STUB_AUDIO` would use. Before the feed loop starts, waits
     /// for the next true UTC slot boundary (see [`replay_preroll_wait`]) so
@@ -133,6 +170,10 @@ impl super::ApplicationCoordinator {
         let config = self.config.read().await;
         let sample_rate = config.audio.sample_rate;
         let buffer_size = config.audio.buffer_size as usize;
+        // The DSP stage de-interleaves against this same setting; the feeder
+        // must therefore emit frames, not bare mono samples. See
+        // [`interleave_mono`].
+        let input_channels = config.audio.input_channels as u16;
         drop(config);
 
         info!(
@@ -174,7 +215,11 @@ impl super::ApplicationCoordinator {
                 .await;
 
                 let end = (offset + buffer_size).min(samples.len());
-                let chunk = samples[offset..end].to_vec();
+                // Pacing (`offset`, `replay_chunk_deadline`) stays in mono
+                // frames -- one frame is one instant of audio regardless of
+                // how many channels carry it -- while the buffer handed to the
+                // DSP stage is the interleaved expansion of those frames.
+                let chunk = interleave_mono(&samples[offset..end], input_channels);
                 offset = end;
 
                 last_timestamp.store(super::now_epoch_ms(), Ordering::Relaxed);
@@ -355,6 +400,62 @@ mod tests {
             REPLAY_GRACE_PERIOD >= Duration::from_secs(17),
             "grace period {REPLAY_GRACE_PERIOD:?} is shorter than one slot plus the decode ceiling"
         );
+    }
+
+    /// The exact de-interleave `coordinator/dsp.rs` performs on every buffer
+    /// it receives. Duplicated here (rather than imported) so this test pins
+    /// the *contract* between the two stages: whatever the feeder emits, this
+    /// operation must recover the original mono stream unchanged.
+    fn dsp_extract_channel_zero(buffer: &[f32], input_channels: u16) -> Vec<f32> {
+        if input_channels > 1 {
+            buffer
+                .chunks(input_channels as usize)
+                .map(|ch| ch[0])
+                .collect()
+        } else {
+            buffer.to_vec()
+        }
+    }
+
+    #[test]
+    fn interleave_mono_round_trips_through_dsp_channel_extraction() {
+        let mono: Vec<f32> = (0..64).map(|i| i as f32 * 0.01).collect();
+
+        // The regression: feeding raw mono while the DSP stage de-interleaves
+        // against input_channels=2 silently drops every second real sample.
+        let raw_mono_through_dsp = dsp_extract_channel_zero(&mono, 2);
+        assert_eq!(
+            raw_mono_through_dsp.len(),
+            mono.len() / 2,
+            "raw mono handed to a 2-channel DSP stage must lose half its samples \
+             -- this is the bug the interleaving fix exists to prevent"
+        );
+
+        // With interleaving, every channel count round-trips exactly.
+        for channels in [1u16, 2, 4, 8] {
+            let framed = interleave_mono(&mono, channels);
+            assert_eq!(framed.len(), mono.len() * channels as usize);
+            assert_eq!(
+                dsp_extract_channel_zero(&framed, channels),
+                mono,
+                "input_channels={channels} must round-trip the mono stream unchanged"
+            );
+        }
+    }
+
+    #[test]
+    fn interleave_mono_duplicates_each_sample_across_every_channel() {
+        assert_eq!(
+            interleave_mono(&[1.0, 2.0, 3.0], 2),
+            vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0]
+        );
+        // Mono config is a pass-through, not a copy of a copy.
+        assert_eq!(interleave_mono(&[1.0, 2.0], 1), vec![1.0, 2.0]);
+        // A zero channel count is rejected by config validation
+        // (pancetta-config/src/audio.rs), but must not panic or produce an
+        // empty buffer if it ever reaches here.
+        assert_eq!(interleave_mono(&[1.0, 2.0], 0), vec![1.0, 2.0]);
+        assert!(interleave_mono(&[], 2).is_empty());
     }
 
     #[test]
