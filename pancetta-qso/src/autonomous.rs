@@ -1967,6 +1967,43 @@ pub fn is_exchange_payload(tok: &str) -> bool {
     false
 }
 
+/// `true` if `text` is a genuine directed reply to us: a well-formed
+/// 3-token FT8 "<to> <from> <payload>" exchange where `to` is our callsign,
+/// `from` looks like a real callsign, and `payload` is either a Maidenhead
+/// grid (the standard *first* reply to a CQ) or a recognized report/RR73/
+/// RRR/73 (a later rung). Deliberately strict — a bare "K5ARH" or free-text
+/// merely starting with our callsign must NOT count as a response.
+///
+/// Used to reset the no-response CQ streak on a genuine reply, as distinct
+/// from `active_qso_count` (which our own not-yet-timed-out self-CQ can
+/// also make nonzero — see `AutonomousOperator::cq_no_response_streak`).
+fn is_directed_response(text: &str, our_callsign: &str) -> bool {
+    if is_cq_message(text) {
+        return false;
+    }
+    let parts: Vec<&str> = text.split_whitespace().collect();
+    if parts.len() != 3 {
+        return false;
+    }
+    let (to, from, payload) = (parts[0], parts[1], parts[2]);
+    if !to.eq_ignore_ascii_case(our_callsign) {
+        return false;
+    }
+    let looks_like_call = from.len() >= 3 && from.chars().any(|c| c.is_ascii_digit());
+    looks_like_call && (is_exchange_payload(payload) || looks_like_grid(payload))
+}
+
+/// `true` if `tok` has Maidenhead locator shape: 2 letters followed by 2
+/// digits (optionally with a finer-grained 2-letter subsquare suffix).
+fn looks_like_grid(tok: &str) -> bool {
+    tok.len() >= 4
+        && tok.len() <= 6
+        && tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
+        && tok.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic())
+        && tok.chars().nth(2).is_some_and(|c| c.is_ascii_digit())
+        && tok.chars().nth(3).is_some_and(|c| c.is_ascii_digit())
+}
+
 /// Inspect a decoded message and, if it is a **third-party exchange** —
 /// two callsign tokens followed by a report/RR73/RRR/73 payload, where it
 /// is neither a CQ nor directed at/from us — return the participant
@@ -1981,20 +2018,6 @@ pub fn is_exchange_payload(tok: &str) -> bool {
 /// definition (it re-implements an equivalent locally because `pancetta-tui`
 /// does not depend on `pancetta-qso`; keeping this canonical and tested
 /// guards both copies against drift).
-/// `true` if `text` is a non-CQ message whose first token addresses
-/// `our_callsign` directly — the standard FT8 "<to> <from> <payload>" reply
-/// format someone uses to answer our CQ. Used to detect a genuine response,
-/// as distinct from `active_qso_count` (which our own not-yet-timed-out
-/// self-CQ can also make nonzero).
-fn is_directed_response(text: &str, our_callsign: &str) -> bool {
-    if is_cq_message(text) {
-        return false;
-    }
-    text.split_whitespace()
-        .next()
-        .is_some_and(|to| to.eq_ignore_ascii_case(our_callsign))
-}
-
 pub fn third_party_exchange_callsigns(text: &str, our_callsign: &str) -> Vec<String> {
     if is_cq_message(text) {
         return Vec::new();
@@ -2031,19 +2054,9 @@ pub fn third_party_exchange_callsigns(text: &str, our_callsign: &str) -> Vec<Str
 fn extract_grid_from_cq(text: &str) -> Option<String> {
     // CQ messages: "CQ W1ABC FN42" or "CQ DX W1ABC FN42"
     let parts: Vec<&str> = text.split_whitespace().collect();
-    // The grid is the last token if it looks like a Maidenhead locator (2 letters + 2 digits).
-    if let Some(last) = parts.last() {
-        if last.len() >= 4
-            && last.len() <= 6
-            && last.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-            && last.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic())
-            && last.chars().nth(2).is_some_and(|c| c.is_ascii_digit())
-            && last.chars().nth(3).is_some_and(|c| c.is_ascii_digit())
-        {
-            return Some(last.to_uppercase());
-        }
-    }
-    None
+    // The grid is the last token if it looks like a Maidenhead locator.
+    let last = parts.last()?;
+    looks_like_grid(last).then(|| last.to_uppercase())
 }
 
 /// Simple deterministic jitter in ±200 Hz range using system time low bits.
@@ -2159,6 +2172,47 @@ mod tests {
             Some("FN42AB".into())
         );
         assert_eq!(extract_grid_from_cq("CQ W1ABC"), None);
+    }
+
+    #[test]
+    fn is_directed_response_accepts_grid_reply() {
+        // The standard FIRST reply to a CQ: a grid, not a report yet.
+        assert!(is_directed_response("W1ABC K9ZZ EM48", "W1ABC"));
+    }
+
+    #[test]
+    fn is_directed_response_accepts_report_and_rr73() {
+        assert!(is_directed_response("W1ABC K9ZZ -05", "W1ABC"));
+        assert!(is_directed_response("W1ABC K9ZZ R-05", "W1ABC"));
+        assert!(is_directed_response("W1ABC K9ZZ RR73", "W1ABC"));
+        assert!(is_directed_response("W1ABC K9ZZ 73", "W1ABC"));
+    }
+
+    #[test]
+    fn is_directed_response_rejects_not_directed_at_us() {
+        assert!(!is_directed_response("K1DEF K9ZZ -05", "W1ABC"));
+    }
+
+    #[test]
+    fn is_directed_response_rejects_our_own_cq() {
+        assert!(!is_directed_response("CQ W1ABC FN42", "W1ABC"));
+    }
+
+    #[test]
+    fn is_directed_response_rejects_bare_callsign() {
+        assert!(!is_directed_response("W1ABC", "W1ABC"));
+    }
+
+    #[test]
+    fn is_directed_response_rejects_free_text_starting_with_our_callsign() {
+        assert!(!is_directed_response("W1ABC TEST MESSAGE", "W1ABC"));
+        assert!(!is_directed_response("W1ABC HELLO THERE", "W1ABC"));
+    }
+
+    #[test]
+    fn is_directed_response_rejects_malformed_sender_token() {
+        // "from" token doesn't look like a callsign (no digit).
+        assert!(!is_directed_response("W1ABC HELLO -05", "W1ABC"));
     }
 
     #[test]
