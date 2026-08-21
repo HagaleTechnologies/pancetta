@@ -42,6 +42,26 @@ fn replay_mode_runs_full_pipeline_and_exits_cleanly() {
     cmd.assert().success();
 }
 
+/// `--no-audio` short-circuits `start_audio_pipeline` before the replay
+/// branch, so the combination used to spawn no feeder at all -- nothing ever
+/// set the shutdown signal and the process hung indefinitely. clap now
+/// rejects the pair at parse time.
+#[test]
+fn replay_mode_conflicts_with_no_audio() {
+    let dir = tempfile::tempdir().unwrap();
+    write_short_wav(&dir.path().join("a_first.wav"), 12000, 1.0);
+
+    let mut cmd = Command::cargo_bin("pancetta").unwrap();
+    cmd.args(["--headless", "--no-audio", "--replay"])
+        .arg(dir.path())
+        .timeout(Duration::from_secs(15));
+
+    cmd.assert()
+        .failure()
+        .stderr(predicates::str::contains("cannot be used with"))
+        .stderr(predicates::str::contains("--no-audio"));
+}
+
 #[test]
 fn replay_mode_rejects_empty_directory() {
     let dir = tempfile::tempdir().unwrap();

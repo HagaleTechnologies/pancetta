@@ -62,6 +62,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--replay` combined with `--no-audio` is now rejected at CLI parse time
+  instead of hanging forever (the `no_audio` short-circuit in
+  `start_audio_pipeline` precedes the replay branch, so no feeder was spawned
+  and nothing ever triggered the shutdown signal).
 - `--replay` no longer starts Hamlib or PSKReporter. A demo run against an
   already-configured station could otherwise key the real transmitter in
   response to replayed (historical) traffic, and upload replayed decodes to
