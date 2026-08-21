@@ -23,6 +23,17 @@ on:
       - "pancetta-tui/**"
       - ".tapes/**"
       - "assets/demo-wav/**"
+      # The GIF's content depends on far more than the TUI crate: the binary
+      # crate owns the replay feeder and its pacing/grace-period timing
+      # (pancetta/src/coordinator/replay.rs), the audio and DSP stages, and
+      # the CLI gates the tape drives. pancetta-config and pancetta-ft8 own
+      # the decode-effort presets and the decoder itself, both of which the
+      # tape renders on screen. Without these paths a change to the replay
+      # feeder would never retrigger regeneration and the GIF would go stale
+      # silently -- which is the exact failure this workflow exists to stop.
+      - "pancetta/src/**"
+      - "pancetta-config/src/**"
+      - "pancetta-ft8/src/**"
 
 permissions:
   contents: write
@@ -30,6 +41,14 @@ permissions:
 jobs:
   vhs:
     runs-on: ubuntu-latest
+    # Fork PRs cannot run this job: the `ref: ${{ github.head_ref }}` checkout
+    # below names a branch that does not exist in the base repo, so checkout
+    # hard-fails (not skips) on every external contribution. The auto-commit
+    # push would fail anyway -- a `pull_request` event from a fork gets a
+    # read-only token regardless of the `contents: write` permission above.
+    # Skipping cleanly beats failing loudly on someone else's PR; a maintainer
+    # can re-render by hand per .tapes/README.md.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     steps:
       - uses: actions/checkout@v7
         with:
@@ -77,7 +96,14 @@ jobs:
         if: steps.diff.outputs.changed == 'true'
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "chore: regenerate demo.gif [skip ci]"
+          # Deliberately NO `[skip ci]` here. The GIF is not byte-reproducible
+          # (embedded timestamps, live waterfall), so this step fires on
+          # nearly every qualifying PR. With `[skip ci]` GitHub skips ALL
+          # workflows for the pushed commit, leaving the PR's newest commit
+          # with no CI runs at all -- required checks stay pending forever, or
+          # the PR merges against a head that was never actually checked. One
+          # extra CI run per regeneration is the correct price for that.
+          commit_message: "chore: regenerate demo.gif"
           file_pattern: assets/demo.gif
           # Belt-and-suspenders alongside the checkout `ref:` above: pins
           # the push target explicitly to the PR's head branch.
