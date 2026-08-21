@@ -90,9 +90,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   replayed decode as a live reception; and the per-QSO logbook upload
   subscriber (ClubLog/QRZ/LoTW/eQSL/cqdx.io) is not spawned, so a QSO
   "completed" off replayed traffic can't be automatically uploaded as a real
-  contact (it is still appended to the local ADIF source of truth like any
-  other completed QSO — see the open question in PR #263 about whether
-  that's the right call). The two
+  contact. The same predicate now also suppresses the **local** write: under
+  `--replay` neither the `~/.pancetta/qsos.adi` ADIF appender nor the
+  `~/.pancetta/qso.db` SQLite QSO logger is started at all, so a replayed
+  contact leaves no record in the operator's own log either (the startup
+  duplicate-history seed still *reads* those files, as it must to make the
+  demo behave like a real station). Tagging such a record instead of
+  dropping it isn't possible — ADIF has no standard "not a real contact"
+  field, only `APP_<PROGRAMID>_*` application-defined fields that are
+  private by convention to the originating program and that no other logger,
+  TQSL, or upload tool would recognise or honour. The two
   remote-operation consumers of the shared display feed are gated at the same
   predicate: the read-only remote-view gateway never gets a feed and never
   binds its WebSocket listener, and the station agent takes its inert

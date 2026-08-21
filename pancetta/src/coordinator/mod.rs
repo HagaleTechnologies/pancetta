@@ -1936,11 +1936,12 @@ impl ApplicationCoordinator {
     /// recording, not live signal.
     ///
     /// **This is the single predicate every "does this run touch the outside
-    /// world?" gate must consult.** Everything downstream of the decoder
-    /// treats replayed decodes as live traffic and re-stamps them with the
-    /// current wall clock, so any component that keys a transmitter or
-    /// publishes reception data off-box has to short-circuit here or it will
-    /// emit fabricated live data. Current consumers:
+    /// world — or the operator's real log?" gate must consult.** Everything
+    /// downstream of the decoder treats replayed decodes as live traffic and
+    /// re-stamps them with the current wall clock, so any component that keys
+    /// a transmitter, publishes reception data off-box, or persists a contact
+    /// has to short-circuit here or it will emit fabricated live data. Current
+    /// consumers:
     ///
     /// - Hamlib startup (`run`) — skipped outright, so no PTT capability.
     /// - PSKReporter (`psk_reporter.rs`) — forced onto its uploads-disabled
@@ -1952,6 +1953,21 @@ impl ApplicationCoordinator {
     /// - Per-QSO logbook uploads (`qso.rs`) — ClubLog/QRZ/LoTW/eQSL/cqdx.io
     ///   subscriber never spawned, so a QSO "completed" off replayed traffic
     ///   can't be filed as a real contact.
+    /// - Local ADIF source of truth (`qso.rs`, `start_local_qso_log_writers`)
+    ///   — the `~/.pancetta/qsos.adi` appender is not opened and its
+    ///   `QsoCompleted` subscriber is not spawned. This one is not an outbound
+    ///   integration, but the ADIF file is what every outbound integration is
+    ///   eventually fed from (manual upload, TQSL, another logger's import),
+    ///   and ADIF has no standard "not a real contact" field to tag a replayed
+    ///   record with — only `APP_<PROGRAMID>_*`, which no other tool honours.
+    ///   So it is dropped, not tagged.
+    /// - Local SQLite QSO index (`qso.rs`, `start_local_qso_log_writers`) —
+    ///   the `~/.pancetta/qso.db` logger is not constructed, so a replayed
+    ///   contact never lands in the index either (nor in the duplicate/worked
+    ///   history rebuilt from it on the next run). The startup
+    ///   duplicate-history seed further down still *reads* the ADIF/index (and
+    ///   rebuilds the index from the ADIF when it is stale) — that is a read
+    ///   of pre-existing contacts, and never a write of a replayed one.
     /// - Remote-view gateway (`remote_gateway/mod.rs`) — `start_display_feed`
     ///   ANDs this gate over its WHOLE `wants_feed` disjunction, so neither
     ///   consumer (localhost gateway, station agent) can start the pump, and
@@ -1964,8 +1980,9 @@ impl ApplicationCoordinator {
     ///   peers AND no remote peer can send control frames (QSY/QSO actions)
     ///   into a demo process.
     ///
-    /// Add new outbound integrations to that list rather than inventing a
-    /// second replay check.
+    /// Add new outbound integrations — and any new persistence of a
+    /// "completed" contact — to that list rather than inventing a second
+    /// replay check.
     pub(crate) fn replay_mode(&self) -> bool {
         self.replay_path.is_some()
     }
