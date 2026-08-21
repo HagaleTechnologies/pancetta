@@ -1989,19 +1989,31 @@ fn is_directed_response(text: &str, our_callsign: &str) -> bool {
     if !to.eq_ignore_ascii_case(our_callsign) {
         return false;
     }
-    let looks_like_call = from.len() >= 3 && from.chars().any(|c| c.is_ascii_digit());
+    let looks_like_call = from.len() >= 3
+        && from.chars().all(|c| c.is_ascii_alphanumeric())
+        && from.chars().any(|c| c.is_ascii_alphabetic())
+        && from.chars().any(|c| c.is_ascii_digit());
     looks_like_call && (is_exchange_payload(payload) || looks_like_grid(payload))
 }
 
-/// `true` if `tok` has Maidenhead locator shape: 2 letters followed by 2
-/// digits (optionally with a finer-grained 2-letter subsquare suffix).
+/// `true` if `tok` has exact Maidenhead locator shape: 2 letters + 2 digits
+/// (a 4-character field+square), optionally followed by a 2-letter
+/// subsquare suffix (6 characters total). Any other length, or wrong
+/// character class in any position, is rejected — a 5-character or
+/// wrong-shaped 6-character token (e.g. "FN42X", "FN4212") is not a grid.
 fn looks_like_grid(tok: &str) -> bool {
-    tok.len() >= 4
-        && tok.len() <= 6
-        && tok.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-        && tok.chars().nth(1).is_some_and(|c| c.is_ascii_alphabetic())
-        && tok.chars().nth(2).is_some_and(|c| c.is_ascii_digit())
-        && tok.chars().nth(3).is_some_and(|c| c.is_ascii_digit())
+    let chars: Vec<char> = tok.chars().collect();
+    let field_square_ok = |c: &[char]| {
+        c[0].is_ascii_alphabetic()
+            && c[1].is_ascii_alphabetic()
+            && c[2].is_ascii_digit()
+            && c[3].is_ascii_digit()
+    };
+    match chars.len() {
+        4 => field_square_ok(&chars),
+        6 => field_square_ok(&chars) && chars[4].is_ascii_alphabetic() && chars[5].is_ascii_alphabetic(),
+        _ => false,
+    }
 }
 
 /// Inspect a decoded message and, if it is a **third-party exchange** —
@@ -2213,6 +2225,20 @@ mod tests {
     fn is_directed_response_rejects_malformed_sender_token() {
         // "from" token doesn't look like a callsign (no digit).
         assert!(!is_directed_response("W1ABC HELLO -05", "W1ABC"));
+        // No letter at all.
+        assert!(!is_directed_response("W1ABC 123 -05", "W1ABC"));
+        // Contains a non-alphanumeric character.
+        assert!(!is_directed_response("W1ABC XX1! -05", "W1ABC"));
+    }
+
+    #[test]
+    fn is_directed_response_rejects_malformed_grid_payload() {
+        // 5 characters: not a valid 4- or 6-char Maidenhead locator.
+        assert!(!is_directed_response("W1ABC K9ZZ FN42X", "W1ABC"));
+        // 6 characters but wrong shape (digits, not letters, in positions 5-6).
+        assert!(!is_directed_response("W1ABC K9ZZ FN4212", "W1ABC"));
+        // Valid 6-char subsquare grid IS accepted.
+        assert!(is_directed_response("W1ABC K9ZZ FN42ab", "W1ABC"));
     }
 
     #[test]
