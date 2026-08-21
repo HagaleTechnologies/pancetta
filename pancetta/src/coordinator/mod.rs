@@ -1648,6 +1648,29 @@ impl ApplicationCoordinator {
 
         // Start auxiliary components.
         //
+        // No rig means `operating_frequency_hz` never gets the rig-read that
+        // normally seeds it (hamlib.rs, get_frequency on connect). Left at 0 it
+        // corrupts every downstream consumer: remote snapshots would report
+        // BAND 0MHZ (remote_gateway/mod.rs), QSO metadata would stamp near-zero
+        // RF frequency (qso.rs set_dial_frequency_source), and the DB-seed band
+        // lookup would pass 0 Hz into `frequency_to_band` before falling back
+        // to the "20m" string literal (qso.rs, ~line 2124) — leaving the atomic
+        // and that string disagreeing. Seed it to the same 20 m default the TUI
+        // itself falls back to when hamlib hasn't reported yet (tui_relay.rs
+        // `operating_freq_mhz` fallback of 14.074 MHz), so every consumer of
+        // the shared atomic agrees on a real band from the first slot.
+        //
+        // Deliberately outside the `pancetta-hamlib` cfg below: this is a pure
+        // in-memory atomic store with nothing hamlib-specific about it, and a
+        // build with the feature compiled out starts no rig at all — exactly
+        // the case that needs the seed most. Gating it on the feature left
+        // `--replay` back at 0 Hz in those builds.
+        if self.replay_mode() {
+            const REPLAY_DEFAULT_DIAL_HZ: u64 = 14_074_000;
+            self.operating_frequency_hz
+                .store(REPLAY_DEFAULT_DIAL_HZ, Ordering::Relaxed);
+        }
+
         // `--replay` deliberately does NOT start Hamlib. The audio the
         // pipeline is decoding is a recording, not live off-air signal, but
         // every stage downstream of the decoder (QSO engine, autonomous
@@ -1661,22 +1684,6 @@ impl ApplicationCoordinator {
         #[cfg(feature = "pancetta-hamlib")]
         if self.replay_mode() {
             info!("Replay mode: skipping Hamlib startup, no real transmitter control");
-            // Skipping Hamlib means `operating_frequency_hz` never gets the
-            // rig-read that normally seeds it (hamlib.rs, get_frequency on
-            // connect). Left at 0 it corrupts every downstream consumer:
-            // remote snapshots would report BAND 0MHZ (remote_gateway/mod.rs),
-            // QSO metadata would stamp near-zero RF frequency (qso.rs
-            // set_dial_frequency_source), and the DB-seed band lookup would
-            // pass 0 Hz into `frequency_to_band` before falling back to the
-            // "20m" string literal (qso.rs, ~line 2124) — leaving the atomic
-            // and that string disagreeing. Seed it to the same 20 m default
-            // the TUI itself falls back to when hamlib hasn't reported yet
-            // (tui_relay.rs `operating_freq_mhz` fallback of 14.074 MHz), so
-            // every consumer of the shared atomic agrees on a real band from
-            // the first slot.
-            const REPLAY_DEFAULT_DIAL_HZ: u64 = 14_074_000;
-            self.operating_frequency_hz
-                .store(REPLAY_DEFAULT_DIAL_HZ, Ordering::Relaxed);
         } else {
             self.start_hamlib_component().await?;
         }
