@@ -62,6 +62,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- `--replay` no longer starts Hamlib or PSKReporter. A demo run against an
+  already-configured station could otherwise key the real transmitter in
+  response to replayed (historical) traffic, and upload replayed decodes to
+  the public pskreporter.info service stamped `SystemTime::now()` as if they
+  were live spots.
 - Compound-callsign QSOs (e.g. `YS/WE9G`, `8G81PA`, `3E40CDW`) now actually
   complete instead of queuing and silently re-arming every slot for the full
   5-minute watchdog window (PAN-17). The FT8 encoder gained an i3=4

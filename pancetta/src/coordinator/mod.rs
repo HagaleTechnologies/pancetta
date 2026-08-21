@@ -1638,9 +1638,24 @@ impl ApplicationCoordinator {
         // Start all components in dependency order using point-to-point channels
         self.start_pipeline().await?;
 
-        // Start auxiliary components
+        // Start auxiliary components.
+        //
+        // `--replay` deliberately does NOT start Hamlib. The audio the
+        // pipeline is decoding is a recording, not live off-air signal, but
+        // every stage downstream of the decoder (QSO engine, autonomous
+        // operator, TX worker) treats it as live: an operator who runs a demo
+        // against an already-configured rig (`[rig.interface] enabled = true`)
+        // would otherwise have the real transmitter keyed in response to
+        // historical traffic. Skipping Hamlib startup removes the PTT
+        // capability outright rather than relying on a downstream gate. This
+        // is the same shape as a build with the `pancetta-hamlib` feature
+        // compiled out (below), which the TX path already tolerates.
         #[cfg(feature = "pancetta-hamlib")]
-        self.start_hamlib_component().await?;
+        if self.replay_path.is_some() {
+            info!("Replay mode: skipping Hamlib startup, no real transmitter control");
+        } else {
+            self.start_hamlib_component().await?;
+        }
         #[cfg(not(feature = "pancetta-hamlib"))]
         warn!("Hamlib feature is disabled -- PTT safety watchdog is not active. Transmit at your own risk.");
         self.start_qso_component().await?;
@@ -1841,6 +1856,8 @@ impl ApplicationCoordinator {
 
         self.start_autonomous_component().await?;
         self.start_dx_cluster_component().await?;
+        // Under `--replay` this starts the component in its uploads-disabled
+        // (noop drain) form -- see `start_pskreporter_component`.
         self.start_pskreporter_component().await?;
         self.start_display_feed().await?;
         self.start_remote_gateway_component().await?;
