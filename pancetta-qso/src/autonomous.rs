@@ -806,6 +806,16 @@ impl FrequencyAllocator {
 // time-dependent maps below key on `DateTime<Utc>` for the same reason.
 const RECENT_RESPONSE_WINDOW_SECS: i64 = 60;
 
+/// Snapshot of the fields a `decide_at` self-CQ cycle may mutate
+/// speculatively (streak, sticky offset, config offset). See
+/// [`AutonomousOperator::snapshot_cq_state`]/[`AutonomousOperator::restore_cq_state`].
+#[derive(Debug, Clone, Copy)]
+pub struct CqStateSnapshot {
+    streak: u32,
+    current_cq_offset_hz: Option<f64>,
+    tx_offset_hz: f64,
+}
+
 /// The per-cycle decision-making brain.
 ///
 /// Each TX slot it runs a decision tree:
@@ -967,19 +977,36 @@ impl AutonomousOperator {
         std::mem::take(&mut self.skip_log)
     }
 
-    /// Codex review (PR #276): `decide_at` counts a self-CQ toward
-    /// `cq_no_response_streak` as soon as it emits the `Transmit` action —
-    /// before the coordinator's downstream gates (Shift+Q runtime gate, TX
-    /// policy, operator-presence/FCC §97.221 gate) decide whether it
-    /// actually reaches the radio. If any of those gates suppressed this
-    /// cycle's self-CQ, the coordinator calls this to undo the optimistic
-    /// increment — otherwise a station with initiation disabled (or simply
-    /// out of presence) would silently accumulate/switch on CQs that were
-    /// never transmitted. Call at most once per `decide_at` cycle whose
-    /// actions included a suppressed self-CQ; safe (saturating) if called
-    /// when the streak is already 0.
-    pub fn discount_suppressed_cq(&mut self) {
-        self.cq_no_response_streak = self.cq_no_response_streak.saturating_sub(1);
+    /// Capture the self-CQ-relevant state before calling `decide()`/`decide_at`.
+    ///
+    /// Codex review (PR #276, rounds 2-3): `decide_at` mutates
+    /// `cq_no_response_streak`, `current_cq_offset_hz`, and (on a
+    /// threshold-driven switch) `config.tx_offset_hz` speculatively — before
+    /// the coordinator's downstream gates (Shift+Q runtime gate, TX policy,
+    /// operator-presence/FCC §97.221 gate, dry_run) decide whether the self-CQ
+    /// actually reaches the radio. A simple "subtract one from the streak" undo
+    /// is correct for a routine CQ but WRONG for a suppressed switch: a switch
+    /// resets the streak, installs a new sticky offset, and updates
+    /// `config.tx_offset_hz`, none of which a bare decrement restores — the
+    /// station would end up "switched" to a frequency it never actually
+    /// transmitted on, with the real pre-switch streak lost. Snapshot/restore
+    /// undoes all three fields atomically regardless of which case occurred.
+    pub fn snapshot_cq_state(&self) -> CqStateSnapshot {
+        CqStateSnapshot {
+            streak: self.cq_no_response_streak,
+            current_cq_offset_hz: self.current_cq_offset_hz,
+            tx_offset_hz: self.config.tx_offset_hz,
+        }
+    }
+
+    /// Restore state captured by [`Self::snapshot_cq_state`] — call when the
+    /// coordinator determines this cycle's self-CQ was suppressed by a
+    /// downstream gate before reaching the radio.
+    pub fn restore_cq_state(&mut self, snapshot: CqStateSnapshot) {
+        self.cq_no_response_streak = snapshot.streak;
+        self.current_cq_offset_hz = snapshot.current_cq_offset_hz;
+        self.config.tx_offset_hz = snapshot.tx_offset_hz;
+        self.collision_detector.our_tx_offset_hz = snapshot.tx_offset_hz;
     }
 
     fn push_skip(&mut self, record: CqSkipRecord) {
@@ -1035,19 +1062,18 @@ impl AutonomousOperator {
     /// self-CQ can also make nonzero — see `Self::cq_no_response_streak`).
     fn is_directed_response(&self, text: &str) -> bool {
         match self.exchange.parse_message(text) {
-            // The first reply to a CQ: field order is "<addressee> <replier>
-            // [grid]". Check both sides — a hash-rendered form can land in
-            // either position (Codex review, PR #276) — so this doesn't
-            // depend on getting the exact field-order convention right for
-            // every hash-rendering case.
+            // The first reply to a CQ: field order is "<addressee>
+            // <replier> [grid]" — `calling_station` (the addressee, per
+            // states.rs's own doc and exchange.rs's parser) is US when
+            // someone is replying to our CQ. Checking `responding_station`
+            // too would be checking "did WE reply to someone else's CQ,"
+            // which a genuine RX decode should never show (Codex review,
+            // PR #276 round 2 — an earlier version of this checked both
+            // sides on a mistaken belief that hash-rendering could land in
+            // either position).
             Ok(MessageType::CqResponse {
-                calling_station,
-                responding_station,
-                ..
-            }) => {
-                callsigns_match(&calling_station, &self.our_callsign)
-                    || callsigns_match(&responding_station, &self.our_callsign)
-            }
+                calling_station, ..
+            }) => callsigns_match(&calling_station, &self.our_callsign),
             Ok(MessageType::SignalReport { to_station, .. })
             | Ok(MessageType::ReportAck { to_station, .. })
             | Ok(MessageType::FinalConfirmation { to_station, .. })
@@ -1926,6 +1952,14 @@ impl AutonomousOperator {
                                     None => self.allocate_smart_frequency(None, None, None),
                                 }
                             } else {
+                                // Codex review (PR #276, round 2): invalidate
+                                // any sticky Auto-mode offset while in Hold —
+                                // otherwise an Auto -> Hold -> Auto round trip
+                                // would resume on a potentially stale
+                                // pre-Hold value instead of re-ranking fresh
+                                // (band conditions, or the operator's own
+                                // manual retune, may have changed meanwhile).
+                                self.current_cq_offset_hz = None;
                                 self.allocate_smart_frequency(None, None, None)
                             };
 
@@ -2015,6 +2049,13 @@ impl AutonomousOperator {
                 let jitter = simple_jitter();
                 let new_offset = (self.config.tx_offset_hz + jitter).clamp(200.0, 2800.0);
                 self.set_tx_offset(new_offset);
+                // Codex review (PR #276, round 2): this comment block already
+                // documents the jitter as seeding the *next* CQ's offset —
+                // without also updating the no-response-streak's sticky
+                // baseline, the next self-CQ would read the stale
+                // pre-jitter `current_cq_offset_hz` instead and silently
+                // undo this jitter.
+                self.current_cq_offset_hz = Some(new_offset);
 
                 actions.push(OperatorAction::FrequencyShift {
                     new_offset_hz: new_offset,
@@ -2309,14 +2350,25 @@ mod tests {
     }
 
     #[test]
-    fn is_directed_response_accepts_hash_rendered_cq_response() {
-        // Codex review (PR #276), the exact example given: a compound-call
-        // CqResponse with our callsign hash-rendered in the SECOND
-        // (responding_station) position — checked on both sides precisely
-        // because CqResponse field-order isn't reliable once hashing is
-        // involved.
+    fn is_directed_response_accepts_hash_rendered_addressee_with_compound_replier() {
+        // Hash-rendered addressee (us) combined with a compound-call
+        // replier — both edge cases in one message.
         let op = op_for_directed_response_tests();
-        assert!(op.is_directed_response("YS/WE9G <W1ABC>"));
+        assert!(op.is_directed_response("<W1ABC> YS/WE9G"));
+    }
+
+    #[test]
+    fn is_directed_response_rejects_our_callsign_in_replier_position() {
+        // Codex review (PR #276, round 2): `calling_station` (first token)
+        // is the addressee; `responding_station` (second token) is the
+        // replier. A message where OUR callsign is the replier and someone
+        // else is the addressee is a message where WE supposedly answered
+        // a DIFFERENT station's CQ — not something a genuine RX decode of
+        // a reply TO us should ever produce. An earlier version of this
+        // classifier incorrectly accepted this by checking both fields.
+        let op = op_for_directed_response_tests();
+        assert!(!op.is_directed_response("YS/WE9G <W1ABC>"));
+        assert!(!op.is_directed_response("YS/WE9G W1ABC"));
     }
 
     #[test]
@@ -2716,47 +2768,84 @@ mod tests {
     }
 
     #[test]
-    fn discount_suppressed_cq_undoes_one_increment() {
-        // Codex review (PR #276): decide_at counts a self-CQ optimistically,
-        // before the coordinator's TX gates run. discount_suppressed_cq is
-        // what the coordinator calls when a gate suppressed it.
+    fn restore_cq_state_undoes_a_suppressed_routine_cq() {
+        // decide_at counts a self-CQ optimistically, before the
+        // coordinator's TX gates run. snapshot_cq_state/restore_cq_state is
+        // what the coordinator uses when a gate suppressed it.
         let mut op = primed_operator(2, 5, true);
         for _ in 0..8 {
             op.feed_decoded_messages(&[], &NullDxEvaluator);
         }
         let even_ts: i64 = 0;
         op.decide_at(even_ts); // idle
-        op.decide_at(even_ts); // CQ #1, streak -> 1
-        op.discount_suppressed_cq(); // gate suppressed it: streak -> 0
+        let snapshot = op.snapshot_cq_state();
+        op.decide_at(even_ts); // CQ #1, streak -> 1 (speculative)
+        op.restore_cq_state(snapshot); // gate suppressed it: streak -> back to 0
 
         op.decide_at(even_ts); // idle
-        let round = op.decide_at(even_ts); // CQ #2 (post-discount): entering streak 0, not 1
+        let round = op.decide_at(even_ts); // CQ #2 (post-restore): entering streak 0, not 1
         assert!(
             !round
                 .iter()
                 .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
-            "discounting a suppressed CQ must roll the streak back, not just pause it"
+            "restoring a suppressed CQ must roll the streak back, not just pause it"
         );
     }
 
     #[test]
-    fn discount_suppressed_cq_saturates_at_zero() {
-        let mut op = primed_operator(2, 5, true);
-        op.discount_suppressed_cq();
-        op.discount_suppressed_cq();
-        // No panic on underflow; streak clamped at 0. Confirmed indirectly:
-        // a subsequent real CQ still starts counting from a sane baseline.
+    fn restore_cq_state_fully_undoes_a_suppressed_switch() {
+        // Codex review (PR #276, round 3): a suppressed SWITCH mutates more
+        // than the counter — it resets the streak, installs a new sticky
+        // offset, and updates config.tx_offset_hz. A bare "subtract one"
+        // would leave the station "switched" to a frequency it never
+        // actually transmitted on, with the real pre-switch streak lost.
+        // snapshot/restore must undo all of it.
+        let mut op = primed_operator(2, 3, true);
         for _ in 0..8 {
             op.feed_decoded_messages(&[], &NullDxEvaluator);
         }
         let even_ts: i64 = 0;
-        op.decide_at(even_ts);
-        let round = op.decide_at(even_ts);
+        // Build up a real streak just below the switch threshold.
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #1, streak -> 1
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #2, streak -> 2
+
+        let snapshot = op.snapshot_cq_state();
+        assert_eq!(snapshot.streak, 2);
+        let pre_switch_offset = op.current_cq_offset_hz;
+
+        // switch_after=3: entering streak is 2 at CQ #3, still below
+        // threshold — confirms it's routine before CQ #4 below switches.
+        op.decide_at(even_ts); // idle
+        let switch_round = op.decide_at(even_ts); // CQ #3, routine
         assert!(
-            !round
+            !switch_round
                 .iter()
                 .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
-            "streak must not have underflowed into a huge value that trips an early switch"
+            "sanity: CQ #3 must be routine, not yet a switch (test setup check)"
+        );
+        op.decide_at(even_ts); // idle
+        let switch_round = op.decide_at(even_ts); // CQ #4: entering streak 3 >= 3 -> switches
+        assert!(
+            switch_round
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "sanity: CQ #4 must be the switch (test setup check)"
+        );
+
+        // The switch already ran (streak reset+incremented, offset changed).
+        // Now simulate the coordinator discovering it was suppressed.
+        op.restore_cq_state(snapshot);
+
+        assert_eq!(
+            op.cq_no_response_streak, 2,
+            "streak must be restored to its real pre-switch value, not left at \
+             whatever the switch's reset+increment produced"
+        );
+        assert_eq!(
+            op.current_cq_offset_hz, pre_switch_offset,
+            "sticky offset must be restored — the switch never actually transmitted"
         );
     }
 
