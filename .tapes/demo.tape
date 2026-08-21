@@ -36,23 +36,19 @@ Enter
 # which reaches steady state within ~1s).
 Wait+Screen@15s /Band Activity/
 
-# Let the replay run. The four 15s FT8 decode windows land at
-# approximately t=24s/37s/52s (measured from process start). NOTE: across
-# repeated live runs of this exact demo-wav set, whether any of those
-# windows actually decodes a message is inconsistent (observed both 0 and
-# 1 decoded messages across otherwise-identical runs) -- --replay streams
-# audio at real-time cadence from process start, which is NOT aligned to
-# true UTC FT8 slot boundaries, so the decoder's sync search sometimes
-# catches this corpus's one marginal signal (SNR -14) and sometimes
-# doesn't, independent of anything this tape controls. This is a
-# real characteristic of the current demo-wav + --replay pairing, not a
-# tape-timing bug -- see assets/demo-wav/README.md and the Task 6 report
-# for detail. Sleep through the full decode-window sequence regardless.
-Sleep 45s
+# Let the replay run. `start_replay_pipeline` (pancetta/src/coordinator/replay.rs)
+# now waits for the next true UTC 15s slot boundary before starting the
+# audio feed -- up to 15s of pre-roll -- so the process no longer starts
+# feeding audio at an arbitrary phase relative to the decoder's UTC-keyed
+# windows. That phase-alignment is what makes a decode reliable, but it
+# also shifts the four 15s FT8 decode windows later by up to 15s in the
+# worst case (previously ~t=24s/37s/52s measured from process start).
+# Sleep through the full pre-roll + decode-window sequence regardless.
+Sleep 60s
 
 # `--replay` self-terminates ~5s after the input directory is exhausted
-# (REPLAY_GRACE_PERIOD in pancetta/src/coordinator/replay.rs) -- total
-# process lifetime for this WAV set is ~62s. Hold long enough to see the
-# process exit back to the shell prompt on its own; no manual Ctrl+C is
-# needed or wanted.
-Sleep 20s
+# (REPLAY_GRACE_PERIOD in pancetta/src/coordinator/replay.rs). Worst-case
+# total process lifetime is now ~80s: up to 15s UTC-slot pre-roll + 60s of
+# audio + 5s grace period. Hold long enough to see the process exit back
+# to the shell prompt on its own; no manual Ctrl+C is needed or wanted.
+Sleep 35s
