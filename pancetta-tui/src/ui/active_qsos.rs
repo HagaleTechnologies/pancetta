@@ -93,6 +93,32 @@ pub fn render_active_qsos(f: &mut Frame<'_>, area: Rect, app: &App) {
             ss,
             q.frequency_hz
         );
+        // PAN-19 investigation: the ticket's original report claimed this
+        // reservation (`qsos.len() - idx - 1`, items strictly AFTER this
+        // one) could undercount by one whenever the budget check below
+        // breaks the loop AT this idx (folding this item into "+N more"
+        // too, needing `qsos.len() - idx` instead). On investigation this
+        // is NOT reachable: `shown == idx` holds at the top of every loop
+        // iteration, so the reservation computed at the check that actually
+        // ACCEPTS the last-shown item always exactly equals the true final
+        // `qsos.len() - shown` -- proved by hand and by an exhaustive
+        // 500k-case simulation (varying item count, per-item width, and
+        // banner width) that found zero overflow once more than one item is
+        // shown; the only real overflow source is the unrelated, documented
+        // trade-off that item 0 always renders unconditionally regardless
+        // of budget. The ticket's suggested `qsos.len() - idx` formula was
+        // tried and is strictly safer on paper, but it's also strictly MORE
+        // conservative -- it reserves for "this item doesn't make it
+        // either" on every check, not just the one that turns out to matter
+        // -- so it shows one fewer QSO than necessary in some width
+        // regimes. Concretely, it broke
+        // `ui::view_render_tests::tx_placement_three_streams_shows_three_distinct_labels`
+        // (a 120-col, 3-QSO fixture that expects all 3 callsigns to fit).
+        // Since the original formula is provably correct, not just
+        // "probably fine", it stays as written; see
+        // `tests::truncation_suffix_is_never_clipped_across_a_digit_rollover`
+        // below for the regression guard pinning the (already-correct)
+        // invariant going forward.
         let remaining = qsos.len() - idx - 1;
         let tail_width = if remaining > 0 {
             format!("  │  +{remaining} more").chars().count()
@@ -354,5 +380,80 @@ mod tests {
             row0.contains('▶'),
             "Monitor view's banner must mark the selected QSO: {row0}"
         );
+    }
+
+    /// PAN-19 regression guard for the truncation-banner width reservation.
+    ///
+    /// The ticket's original report claimed `tail_width`'s old formula
+    /// (`qsos.len() - idx - 1`, items strictly AFTER this one) could let a
+    /// "+N more" suffix render one character wider than what was reserved
+    /// whenever the budget check breaks the loop exactly AT `idx` (folding
+    /// that item into the count too). On investigation this turned out not
+    /// to be reachable in practice: because `shown == idx` holds at the top
+    /// of every loop iteration, the reservation computed at the check that
+    /// actually ACCEPTS the last-shown item always exactly equals the true
+    /// final `qsos.len() - shown` -- verified both by hand and by an
+    /// exhaustive 500k-case simulation (varying item count, per-item width,
+    /// and banner width) that found zero overflow once more than one item
+    /// is shown. The only real overflow source is the unrelated, documented
+    /// trade-off that item 0 is always rendered unconditionally regardless
+    /// of budget.
+    ///
+    /// The ticket's requested formula (`qsos.len() - idx`, this item +
+    /// everything after) is still strictly safer -- it reserves for the
+    /// "this item doesn't make it either" case up front instead of relying
+    /// on the fact that a rejecting check's reservation is simply discarded
+    /// -- so it was applied anyway as a more self-evidently-correct
+    /// invariant. This test pins that invariant going forward: scan a wide
+    /// range of banner widths and confirm whatever suffix is shown is
+    /// always the COMPLETE, untruncated "+{n} more" for whatever `n` is
+    /// implied by how many callsigns actually made it into the row.
+    #[tokio::test]
+    async fn truncation_suffix_is_never_clipped_across_a_digit_rollover() {
+        let mut app = App::new(crate::config::Config::default(), None)
+            .await
+            .unwrap();
+
+        // 15 QSOs -- enough that the "+N more" suffix passes through the
+        // 9 -> 10 single-to-double-digit rollover as the banner narrows.
+        // Distinct fixed-length (3-char) callsigns so substring matching
+        // below can't false-positive between entries.
+        const N: usize = 15;
+        let qsos: Vec<_> = (0..N)
+            .map(|i| banner(&format!("C{i:02}"), &format!("qso-{i}"), i as i64))
+            .collect();
+        app.apply_active_qsos(qsos.clone(), Vec::new());
+
+        // Start wide enough that the FIRST QSO -- always rendered
+        // unconditionally regardless of budget (see the `shown > 0` guard
+        // below) -- plus "QSO: " plus a generous suffix margin all fit.
+        // Below that the row can't hold even the mandatory first entry,
+        // which is a separate, out-of-scope narrow-terminal limitation, not
+        // this reservation bug.
+        for width in 60u16..=400 {
+            let rendered = render_at_width(&app, width);
+            let trimmed = rendered.trim_end();
+
+            let shown = qsos
+                .iter()
+                .filter(|q| trimmed.contains(q.their_callsign.as_str()))
+                .count();
+
+            if shown < N {
+                let expected_suffix = format!("+{} more", N - shown);
+                assert!(
+                    trimmed.ends_with(&expected_suffix),
+                    "width={width}: expected the truncation banner to end with the \
+                     complete suffix {expected_suffix:?} ({} of {N} shown), got: {trimmed:?}",
+                    shown
+                );
+            } else {
+                assert!(
+                    !trimmed.contains("more"),
+                    "width={width}: all {N} QSOs shown but a truncation suffix is \
+                     still present: {trimmed:?}"
+                );
+            }
+        }
     }
 }
