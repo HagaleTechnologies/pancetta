@@ -24,6 +24,9 @@ on:
       - ".tapes/**"
       - "assets/demo-wav/**"
 
+permissions:
+  contents: write
+
 jobs:
   vhs:
     runs-on: ubuntu-latest
@@ -35,6 +38,13 @@ jobs:
           # wouldn't break this workflow, but a demo build should still
           # match how the binary is actually built everywhere else in CI.
           submodules: recursive
+          # REQUIRED for pull_request events: without this, checkout leaves
+          # a detached HEAD at the merge ref, and
+          # stefanzweifel/git-auto-commit-action's push falls through to a
+          # bare `git push origin` with no refspec, which fails outright
+          # ("not currently on a branch"). Checking out the PR's actual
+          # head branch is what its own docs prescribe for this trigger.
+          ref: ${{ github.head_ref }}
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
@@ -69,3 +79,6 @@ jobs:
         with:
           commit_message: "chore: regenerate demo.gif [skip ci]"
           file_pattern: assets/demo.gif
+          # Belt-and-suspenders alongside the checkout `ref:` above: pins
+          # the push target explicitly to the PR's head branch.
+          branch: ${{ github.head_ref }}
