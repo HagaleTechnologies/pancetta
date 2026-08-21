@@ -1989,10 +1989,15 @@ fn is_directed_response(text: &str, our_callsign: &str) -> bool {
     if !to.eq_ignore_ascii_case(our_callsign) {
         return false;
     }
-    let looks_like_call = from.len() >= 3
-        && from.chars().all(|c| c.is_ascii_alphanumeric())
-        && from.chars().any(|c| c.is_ascii_alphabetic())
-        && from.chars().any(|c| c.is_ascii_digit());
+    // Compound/portable senders ("VP2/W1XYZ", "K1ABC/R") are a real, tested
+    // reply form (see adversarial_compound_calls.rs) — validate the
+    // extracted base callsign's shape, not the raw token, so the `/` doesn't
+    // trip the alphanumeric check.
+    let base = crate::exchange::base_callsign(from);
+    let looks_like_call = base.len() >= 3
+        && base.chars().all(|c| c.is_ascii_alphanumeric())
+        && base.chars().any(|c| c.is_ascii_alphabetic())
+        && base.chars().any(|c| c.is_ascii_digit());
     looks_like_call && (is_exchange_payload(payload) || looks_like_grid(payload))
 }
 
@@ -2239,6 +2244,16 @@ mod tests {
         assert!(!is_directed_response("W1ABC K9ZZ FN4212", "W1ABC"));
         // Valid 6-char subsquare grid IS accepted.
         assert!(is_directed_response("W1ABC K9ZZ FN42ab", "W1ABC"));
+    }
+
+    #[test]
+    fn is_directed_response_accepts_compound_and_portable_senders() {
+        // Prefix-portable and suffix-portable are real, tested reply forms
+        // (adversarial_compound_calls.rs) — must not be rejected as
+        // malformed just because they contain '/'.
+        assert!(is_directed_response("W1ABC VP2/W1XYZ FK87", "W1ABC"));
+        assert!(is_directed_response("W1ABC K1ABC/R -05", "W1ABC"));
+        assert!(is_directed_response("W1ABC EA8/G8BCG RR73", "W1ABC"));
     }
 
     #[test]
