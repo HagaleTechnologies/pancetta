@@ -870,6 +870,18 @@ impl super::ApplicationCoordinator {
         let hamlib_pending_frequency_for_polling = self.hamlib_pending_frequency.clone();
         let hamlib_pending_split_for_polling = self.hamlib_pending_split.clone();
         let hamlib_tx_for_polling = hamlib_tx.clone();
+        // PAN-19 round-15 review (Codex P1): "keep TX muted until restored
+        // rig state is applied". The message loop's own SetFrequency/
+        // SetSplit arms need to reach the pending slots directly -- on a
+        // `rig_poll.set_frequency`/`set_split_freq`/`set_split` FAILURE,
+        // the loop re-populates the corresponding slot (see those arms
+        // below) so the PTT gate (`tx_hard_mute_reason`'s round-14 check)
+        // stays closed and the polling task's round-10 retry gets another
+        // real attempt at the CAT command -- not just a resend of a
+        // message that was already "consumed" off the channel but never
+        // actually accepted by the rig.
+        let hamlib_pending_frequency_for_loop = self.hamlib_pending_frequency.clone();
+        let hamlib_pending_split_for_loop = self.hamlib_pending_split.clone();
         // PAN-19 round-11 review (Codex P1): "do not deliver stale split
         // state after newer commands". The pending-queue retry above
         // doesn't know whether a NEWER SetFrequency/SetSplit has already
@@ -1459,16 +1471,7 @@ impl super::ApplicationCoordinator {
                                         frequency,
                                     } => {
                                         // PAN-19 round-11/12 review (Codex
-                                        // P1): `should_apply_and_record`
-                                        // both records this message's
-                                        // globally-monotonic `id` as the
-                                        // latest SetFrequency this loop has
-                                        // seen (so the pending-queue retry
-                                        // can tell a stale redelivery apart
-                                        // from a current one -- see
-                                        // `last_applied_frequency_id`'s
-                                        // declaration above) AND -- round
-                                        // 12 -- re-checks supersession right
+                                        // P1): re-check supersession right
                                         // here, at the loop's single
                                         // consumption point, so a stale
                                         // pending command that slipped into
@@ -1478,10 +1481,7 @@ impl super::ApplicationCoordinator {
                                         // `deliver_pending_hamlib_state`
                                         // can't see) still gets dropped
                                         // instead of applied.
-                                        if !should_apply_and_record(
-                                            &message,
-                                            &last_applied_frequency_id,
-                                        ) {
+                                        if is_superseded(&message, &last_applied_frequency_id) {
                                             warn!(
                                                 target: "rig",
                                                 "Discarding a stale SetFrequency command \
@@ -1494,11 +1494,43 @@ impl super::ApplicationCoordinator {
                                         } else {
                                             pancetta_hamlib::Vfo::B
                                         };
-                                        if let Err(e) =
-                                            rig_poll.set_frequency(vfo_enum, *frequency).await
+                                        // PAN-19 round-15 review (Codex P1):
+                                        // "keep TX muted until restored rig
+                                        // state is applied". Only record
+                                        // this message's id as applied
+                                        // (`record_applied`) once
+                                        // `set_frequency` has actually
+                                        // SUCCEEDED -- recording it
+                                        // unconditionally beforehand (the
+                                        // pre-round-15 behavior) could mark
+                                        // a still-wrong rig state as
+                                        // "applied", wrongly superseding a
+                                        // still-correct pending item. On
+                                        // failure, (re)populate the pending
+                                        // slot so the PTT gate stays closed
+                                        // and the round-10 polling retry
+                                        // gets another real attempt at the
+                                        // CAT command -- not just a resend
+                                        // of a message already consumed off
+                                        // the channel. `finish_rig_command`
+                                        // is the shared post-I/O step both
+                                        // arms use.
+                                        let io_ok = match rig_poll
+                                            .set_frequency(vfo_enum, *frequency)
+                                            .await
                                         {
-                                            error!("Failed to set frequency: {}", e);
-                                        }
+                                            Ok(()) => true,
+                                            Err(e) => {
+                                                error!("Failed to set frequency: {}", e);
+                                                false
+                                            }
+                                        };
+                                        finish_rig_command(
+                                            io_ok,
+                                            &message,
+                                            &last_applied_frequency_id,
+                                            &hamlib_pending_frequency_for_loop,
+                                        );
                                     }
                                     crate::message_bus::RigControlMessage::SetPtt { state } => {
                                         if *state && tx_restart_inhibit.load(Ordering::Acquire) != 0
@@ -1546,13 +1578,10 @@ impl super::ApplicationCoordinator {
                                         tx_frequency,
                                     } => {
                                         // PAN-19 round-11/12 review (Codex
-                                        // P1): same tracking + consumption-
-                                        // time supersession re-check as
+                                        // P1): same consumption-time
+                                        // supersession re-check as
                                         // SetFrequency above.
-                                        if !should_apply_and_record(
-                                            &message,
-                                            &last_applied_split_id,
-                                        ) {
+                                        if is_superseded(&message, &last_applied_split_id) {
                                             warn!(
                                                 target: "rig",
                                                 "Discarding a stale SetSplit command superseded \
@@ -1560,27 +1589,62 @@ impl super::ApplicationCoordinator {
                                             );
                                             continue;
                                         }
-                                        if *enabled {
-                                            if let Err(e) =
-                                                rig_poll.set_split_freq(*tx_frequency).await
-                                            {
+                                        // PAN-19 round-15 review (Codex P1):
+                                        // "keep TX muted until restored rig
+                                        // state is applied". `split_applied`
+                                        // aggregates BOTH underlying CAT
+                                        // calls when enabling split
+                                        // (`set_split_freq` + `set_split`)
+                                        // -- either failing means the rig's
+                                        // split state is NOT what this
+                                        // message intended, so the message
+                                        // is not recorded as applied and
+                                        // gets (re)queued for the round-10
+                                        // retry instead, exactly like
+                                        // SetFrequency above.
+                                        let split_applied = if *enabled {
+                                            let freq_result =
+                                                rig_poll.set_split_freq(*tx_frequency).await;
+                                            if let Err(e) = &freq_result {
                                                 warn!(target: "rig.split", "set_split_freq failed: {}", e);
                                             }
-                                            if let Err(e) = rig_poll
+                                            let on_result = rig_poll
                                                 .set_split(true, pancetta_hamlib::Vfo::B)
+                                                .await;
+                                            match &on_result {
+                                                Ok(()) => info!(
+                                                    target: "rig.split",
+                                                    "split ON, TX {} Hz",
+                                                    tx_frequency
+                                                ),
+                                                Err(e) => warn!(
+                                                    target: "rig.split",
+                                                    "set_split(on) failed: {}",
+                                                    e
+                                                ),
+                                            }
+                                            freq_result.is_ok() && on_result.is_ok()
+                                        } else {
+                                            match rig_poll
+                                                .set_split(false, pancetta_hamlib::Vfo::A)
                                                 .await
                                             {
-                                                warn!(target: "rig.split", "set_split(on) failed: {}", e);
-                                            } else {
-                                                info!(target: "rig.split", "split ON, TX {} Hz", tx_frequency);
+                                                Ok(()) => {
+                                                    info!(target: "rig.split", "split OFF");
+                                                    true
+                                                }
+                                                Err(e) => {
+                                                    warn!(target: "rig.split", "set_split(off) failed: {}", e);
+                                                    false
+                                                }
                                             }
-                                        } else if let Err(e) =
-                                            rig_poll.set_split(false, pancetta_hamlib::Vfo::A).await
-                                        {
-                                            warn!(target: "rig.split", "set_split(off) failed: {}", e);
-                                        } else {
-                                            info!(target: "rig.split", "split OFF");
-                                        }
+                                        };
+                                        finish_rig_command(
+                                            split_applied,
+                                            &message,
+                                            &last_applied_split_id,
+                                            &hamlib_pending_split_for_loop,
+                                        );
                                     }
                                     _ => {}
                                 }
@@ -1854,9 +1918,10 @@ impl super::ApplicationCoordinator {
 /// nothing has been applied yet.
 ///
 /// PAN-19 round-12 review (Codex P1): hoisted out of
-/// `deliver_pending_hamlib_state` (was a nested fn there) so
-/// [`should_apply_and_record`] can share it -- see that function's doc
-/// comment for why a second call site was needed.
+/// `deliver_pending_hamlib_state` (was a nested fn there) so the message
+/// loop's own SetFrequency/SetSplit arms can share it as their pre-I/O
+/// supersession gate -- see those arms' comments, and [`record_applied`],
+/// for the post-I/O half of the mechanism (round 15).
 fn is_superseded(
     message: &ComponentMessage,
     last_applied_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
@@ -1883,24 +1948,65 @@ fn is_superseded(
 /// it entered `hamlib_rx`, is consumed there one at a time, in true FIFO
 /// order. So the loop itself -- not the retry-send site -- is the only
 /// place that can see the FINAL order and give a correct, non-racy
-/// answer. This is the gate the message loop's SetFrequency/SetSplit arms
-/// call on every message (not just replayed ones) immediately before
-/// applying it: if a newer command of the same kind was already consumed
-/// (`is_superseded`), skip applying this one and leave the tracker alone;
-/// otherwise advance the tracker to this message's id and apply it. Because
-/// it runs at the loop's single consumption point, it is correct regardless
-/// of how a stale message ended up behind a fresher one in the channel.
-fn should_apply_and_record(
+/// answer. This is why the message loop's SetFrequency/SetSplit arms call
+/// [`is_superseded`] on every message (not just replayed ones) immediately
+/// BEFORE attempting to apply it -- skip a superseded one and leave the
+/// tracker alone; otherwise attempt the underlying rig I/O.
+///
+/// PAN-19 round-15 review (Codex P1): "keep TX muted until restored rig
+/// state is applied". This function used to ALSO advance the tracker
+/// itself, unconditionally, right after the supersession check -- i.e.
+/// BEFORE the caller's rig I/O call even ran. That was wrong: if the
+/// underlying `set_frequency`/`set_split_freq`/`set_split` call then
+/// FAILED (e.g. CAT still recovering mid-restart), the tracker had already
+/// advanced past a still-pending, still-correct SetSplit/SetFrequency
+/// waiting in the pending slot -- `deliver_pending_hamlib_state`'s own
+/// `is_superseded` check would then wrongly judge that pending item stale
+/// and drop it, and the PTT gate (`tx_hard_mute_reason`) would see a
+/// cleared pending slot and permit TX with the rig still holding its
+/// stale, pre-crash state. `record_applied` is now called by the message
+/// loop's arms ONLY after the rig I/O has actually succeeded -- never
+/// before, and never merely because the message was successfully consumed
+/// off the channel.
+fn record_applied(
     message: &ComponentMessage,
     last_applied_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
-) -> bool {
-    if is_superseded(message, last_applied_id) {
-        return false;
-    }
+) {
     if let Ok(mut last) = last_applied_id.lock() {
         *last = Some(message.id);
     }
-    true
+}
+
+/// PAN-19 round-15 review (Codex P1): the shared post-I/O step both the
+/// message loop's SetFrequency and SetSplit arms call once they know
+/// whether the underlying rig I/O (`set_frequency`/`set_split_freq`/
+/// `set_split`) succeeded (`io_ok`). On success, records the message as
+/// applied ([`record_applied`]). On failure, (re)populates `pending_slot`
+/// with this message so the PTT gate (`tx_hard_mute_reason`'s
+/// `has_undelivered_pending_hamlib_state` check, round 14) stays closed
+/// and the polling task's round-10 retry gets another real attempt at the
+/// actual CAT command -- not just a resend of a message that was already
+/// consumed off the channel but never actually accepted by the rig.
+///
+/// Extracted as its own function (rather than left inline in each arm) so
+/// it's directly unit-testable: the message loop's arms live deep inside a
+/// giant spawned task with no injectable rig, and `MockRig::set_split`/
+/// `set_split_freq` never fail regardless of `failure_rate` (they don't
+/// call `simulate_failure` at all), so a genuine CAT-level split failure
+/// can't be driven through `start_hamlib_component` end to end -- see
+/// `children_publish_race_tests`' doc comment for the same kind of
+/// limitation on a different mechanism.
+fn finish_rig_command(
+    io_ok: bool,
+    message: &ComponentMessage,
+    last_applied_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+    pending_slot: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+) {
+    if io_ok {
+        record_applied(message, last_applied_id);
+    } else if let Ok(mut slot) = pending_slot.lock() {
+        *slot = Some(message.clone());
+    }
 }
 
 /// PAN-19 round-12 review (Codex P1): "retain the old watchdog until
@@ -3366,17 +3472,21 @@ mod teardown_replay_tests {
     /// queued BEHIND an already-queued newer one would still be applied
     /// after it once both reached the loop.
     ///
-    /// This drives `should_apply_and_record` -- the consumption-time gate
-    /// the message loop's own SetFrequency/SetSplit arms now call on every
-    /// message -- through exactly that race, at the level the loop
-    /// actually sees it: two SetSplit messages consumed in FIFO order,
-    /// newer first (mirroring "already queued ahead of the stale replay"),
-    /// stale second. The newer one must apply and advance the tracker; the
-    /// stale one, consumed after, must be rejected regardless of whatever
-    /// the tracker looked like at the moment the stale one was ENQUEUED --
-    /// only the tracker's state at CONSUME time matters.
+    /// This drives `is_superseded` + `record_applied` -- the pre-I/O gate
+    /// and post-I/O-success recorder the message loop's own SetFrequency/
+    /// SetSplit arms now call around every rig I/O attempt (round 15 split
+    /// what used to be a single `should_apply_and_record` call into these
+    /// two steps, straddling the I/O call itself) -- through exactly that
+    /// race, at the level the loop actually sees it: two SetSplit messages
+    /// consumed in FIFO order, newer first (mirroring "already queued
+    /// ahead of the stale replay"), stale second. The newer one must pass
+    /// the gate and (once its simulated I/O succeeds) advance the tracker;
+    /// the stale one, consumed after, must be rejected by the gate
+    /// regardless of whatever the tracker looked like at the moment the
+    /// stale one was ENQUEUED -- only the tracker's state at CONSUME time
+    /// matters.
     #[test]
-    fn should_apply_and_record_rejects_a_stale_message_consumed_after_a_newer_one() {
+    fn stale_message_consumed_after_a_newer_one_is_rejected_by_the_gate() {
         let stale_split = ComponentMessage::new(
             ComponentId::Hamlib,
             ComponentId::Hamlib,
@@ -3407,11 +3517,13 @@ mod teardown_replay_tests {
 
         // The loop consumes the ALREADY-QUEUED newer command first (the
         // race in the finding: it was sent, and queued, before the stale
-        // pending retry ever ran) -- it applies and advances the tracker.
+        // pending retry ever ran) -- passes the pre-I/O gate, its
+        // (simulated, successful) I/O completes, so it's recorded applied.
         assert!(
-            should_apply_and_record(&newer_split, &last_applied_split_id),
-            "the newer command must apply"
+            !is_superseded(&newer_split, &last_applied_split_id),
+            "the newer command must pass the gate"
         );
+        record_applied(&newer_split, &last_applied_split_id);
         assert_eq!(
             *last_applied_split_id.lock().unwrap(),
             Some(newer_split.id),
@@ -3423,15 +3535,119 @@ mod teardown_replay_tests {
         // `is_superseded` check in `deliver_pending_hamlib_state` may have
         // seen a stale (or empty) tracker before the newer command was
         // applied, the consumption-time gate must still reject it here,
-        // using the tracker's CURRENT state.
+        // using the tracker's CURRENT state -- so its I/O is never even
+        // attempted, and the tracker is never touched for it.
         assert!(
-            !should_apply_and_record(&stale_split, &last_applied_split_id),
+            is_superseded(&stale_split, &last_applied_split_id),
             "a stale command consumed after a newer one must be rejected, not applied"
         );
         assert_eq!(
             *last_applied_split_id.lock().unwrap(),
             Some(newer_split.id),
             "rejecting the stale command must not move the tracker backward"
+        );
+    }
+
+    /// PAN-19 round-15 review (Codex P1) regression guard: "keep TX muted
+    /// until restored rig state is applied". The exact scenario the
+    /// finding describes -- a `SetSplit` is consumed by the message loop
+    /// (passes the pre-I/O `is_superseded` gate), but the underlying
+    /// `set_split`/`set_split_freq` CAT call FAILS (e.g. CAT still
+    /// recovering mid-restart). `finish_rig_command` must NOT record the
+    /// message as applied, and must (re)populate the pending slot -- not
+    /// silently swallow the failure with the tracker advanced and the slot
+    /// left clear, which would let `tx_hard_mute_reason`'s pending-state
+    /// check (round 14) wrongly report "clear, PTT is safe".
+    #[test]
+    fn finish_rig_command_repopulates_the_pending_slot_on_io_failure() {
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_074_000,
+            }),
+            Instant::now(),
+        );
+        let last_applied_split_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        // Simulate the CAT command FAILING (`io_ok = false`) -- e.g.
+        // `set_split_freq`/`set_split` returned `Err` while the rig is
+        // still recovering.
+        finish_rig_command(false, &split_msg, &last_applied_split_id, &pending_split);
+
+        assert_eq!(
+            *last_applied_split_id.lock().unwrap(),
+            None,
+            "a failed CAT command must NOT be recorded as applied"
+        );
+        assert_eq!(
+            pending_split.lock().unwrap().as_ref().map(|m| m.id),
+            Some(split_msg.id),
+            "a failed CAT command must (re)populate the pending slot so the round-10 retry \
+             gets another real attempt, and so tx_hard_mute_reason's pending-state check keeps \
+             PTT refused"
+        );
+
+        // Directly exercise the same PTT gate `tx_hard_mute_reason` (and
+        // `tui_relay`'s `ptt_on_refusal`) route through, proving the
+        // consequence the finding cares about: PTT actually stays refused
+        // as a result of this pending slot being populated, not just that
+        // the slot happens to be non-empty in isolation.
+        let tx_policy = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxPolicy::Full.as_u8(),
+        ));
+        let tx_restart_inhibit = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let hamlib_loop_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let no_pending_frequency: Arc<std::sync::Mutex<Option<ComponentMessage>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        assert!(
+            super::super::tx::tx_hard_mute_reason(
+                &tx_policy,
+                &tx_restart_inhibit,
+                &hamlib_loop_ready,
+                &no_pending_frequency,
+                &pending_split,
+            )
+            .is_some(),
+            "PTT must stay refused while the pending slot a failed CAT command repopulated is \
+             still unresolved"
+        );
+    }
+
+    /// The flip side: a successful CAT command records the message as
+    /// applied and does NOT touch the pending slot (it was already cleared
+    /// by `deliver_pending_hamlib_state` at delivery time, if this was a
+    /// redelivery, or never populated at all for a fresh send).
+    #[test]
+    fn finish_rig_command_records_applied_on_io_success() {
+        let split_msg = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_074_000,
+            }),
+            Instant::now(),
+        );
+        let last_applied_split_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        finish_rig_command(true, &split_msg, &last_applied_split_id, &pending_split);
+
+        assert_eq!(
+            *last_applied_split_id.lock().unwrap(),
+            Some(split_msg.id),
+            "a successful CAT command must be recorded as applied"
+        );
+        assert!(
+            pending_split.lock().unwrap().is_none(),
+            "a successful CAT command must not populate the pending slot"
         );
     }
 
