@@ -17,9 +17,21 @@ pub(crate) fn list_wav_files_sorted(dir: &Path) -> Result<Vec<PathBuf>> {
         anyhow::bail!("--replay path is not a directory: {}", dir.display());
     }
 
-    let mut files: Vec<PathBuf> = std::fs::read_dir(dir)
+    let entries: Vec<std::fs::DirEntry> = std::fs::read_dir(dir)
         .map_err(|e| anyhow::anyhow!("Failed to read replay directory {}: {}", dir.display(), e))?
-        .filter_map(|entry| entry.ok())
+        .collect::<std::io::Result<Vec<_>>>()
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to read an entry in replay directory {}: {} \
+                 (a transient or failing mount can surface here -- a silently \
+                 incomplete corpus would shift every later FT8 slot)",
+                dir.display(),
+                e
+            )
+        })?;
+
+    let mut files: Vec<PathBuf> = entries
+        .into_iter()
         .map(|entry| entry.path())
         .filter(|path| {
             path.extension()
