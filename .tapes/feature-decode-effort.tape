@@ -2,11 +2,10 @@
 #   vhs .tapes/feature-decode-effort.tape
 # Produces assets/feature-decode-effort.gif.
 #
-# Why this feature and not "a CQ getting scored then worked": Task 6 and this
-# task's own screenshot pass (`.tapes/screenshots.tape`) both confirmed the
-# `assets/demo-wav` corpus does not reliably produce an actual FT8 decode
-# under --replay's live streaming pipeline (see `.tapes/demo.tape`'s trailing
-# "HONEST DISCLOSURE" comment for the full investigation). A GIF of
+# Why this feature and not "a CQ getting scored then worked": the
+# `assets/demo-wav` corpus does not produce an FT8 decode under --replay's
+# live streaming pipeline. See `.tapes/demo.tape`'s trailing "HONEST
+# DISCLOSURE" comment for what has been measured and ruled out. A GIF of
 # "priority-based station selection" would require a real decoded CQ to
 # score and work, which this fixture can't deliver on demand -- faking that
 # would misrepresent the pipeline. Decode-effort cycling (`e` key,
@@ -29,10 +28,17 @@ Set Padding 20
 Set Theme "Dracula"
 
 # Same config-bootstrap pattern as `.tapes/demo.tape` / `.tapes/screenshots.tape`:
-# a scratch config with a real callsign so the first-run setup wizard doesn't
-# hijack the recording.
+# a scratch config pinning effort = "max" as the ring's starting preset.
 Hide
 Type `DEMO_CFG=$(mktemp -t pancetta-feature-config).toml; printf '[station]\ncallsign = \"K5ARH\"\n\n[decoder]\neffort = \"max\"\n' > $DEMO_CFG`
+Enter
+Sleep 500ms
+# Reset the persisted active view AND decode-effort preset -- see
+# `.tapes/demo.tape` for the full rationale. Both live in
+# ~/.pancetta/tui_state.json rather than the scratch --config, so the `e`-ring
+# below only starts at Max (as its comment claims) if the persisted preset is
+# reset too.
+Type `mkdir -p ~/.pancetta && printf '{"active_view":"Operate","decode_effort":"MAX"}' > ~/.pancetta/tui_state.json`
 Enter
 Sleep 500ms
 Type "clear"
@@ -45,8 +51,13 @@ Enter
 # "Band Activity" renders on the first TUI frame regardless of decode state --
 # the same reliable startup anchor `.tapes/demo.tape` uses. Stay Hidden through
 # startup so the GIF opens directly on the feature, not on boilerplate.
+#
+# The extra hidden sleep clears the replay feeder's worst-case 15s UTC
+# slot-boundary pre-roll (`replay_preroll_wait`) so the clip opens on a live
+# waterfall rather than a blank one. It costs nothing in GIF length -- these
+# frames are Hidden.
 Wait+Screen@15s /Band Activity/
-Sleep 1s
+Sleep 20s
 Show
 
 # Cycle the full decode-effort ring: Max -> Auto -> Eco -> Standard -> Deep
