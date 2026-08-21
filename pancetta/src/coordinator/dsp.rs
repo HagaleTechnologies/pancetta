@@ -31,6 +31,35 @@ use crate::message_bus::ComponentId;
 /// Maximum total disk space for WAV recordings (bytes).
 const WAV_RECORDING_MAX_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GB
 
+/// Sample rate the FT8 stages consume. The DSP worker reaches it by *integer*
+/// subsampling of the capture stream (`decimation_factor = input_rate / 12000`),
+/// so the configured input rate must be a whole multiple of this.
+pub(crate) const DSP_TARGET_SAMPLE_RATE_HZ: u32 = 12_000;
+
+/// Whether `rate` can drive the DSP decimation path in
+/// [`start_dsp_pipeline`].
+///
+/// `pancetta-config` accepts a wider set of rates than the DSP stage can
+/// decimate (44100/22050/... are all valid `[audio] sample_rate` values), so
+/// this predicate is the narrower, DSP-specific constraint. It is shared with
+/// the `--replay` feeder (`coordinator/replay.rs`), which resamples its corpus
+/// to `[audio] sample_rate` and would otherwise hand the DSP worker an input it
+/// rejects — the worker would exit and the run would "succeed" with zero
+/// decodes.
+pub(crate) fn dsp_supports_input_rate(rate: u32) -> bool {
+    rate >= DSP_TARGET_SAMPLE_RATE_HZ && rate.is_multiple_of(DSP_TARGET_SAMPLE_RATE_HZ)
+}
+
+/// The operator-facing explanation for a rate [`dsp_supports_input_rate`]
+/// rejects. Shared so the DSP worker's error and `--replay`'s fail-fast bail
+/// name the same constraint and the same supported rates.
+pub(crate) fn unsupported_input_rate_message(rate: u32) -> String {
+    format!(
+        "Audio sample rate {rate} Hz is not evenly divisible by {DSP_TARGET_SAMPLE_RATE_HZ} Hz. \
+         Supported rates: 12000, 24000, 48000, 96000."
+    )
+}
+
 /// Peak absolute amplitude of an f32 audio window (0.0 if empty).
 fn window_peak(samples: &[f32]) -> f32 {
     samples.iter().fold(0.0f32, |m, &s| m.max(s.abs()))
@@ -313,14 +342,10 @@ impl super::ApplicationCoordinator {
             // FT8 timing: transmissions start at 0/15/30/45 second marks.
             // We need 12.64 seconds of audio at 12kHz = 151,680 samples per window.
             // We align window capture to UTC 15-second boundaries for best decode.
-            let decimation_factor = (input_rate / 12000) as usize;
-            if input_rate as usize != decimation_factor * 12000 {
-                return Err(anyhow::anyhow!(
-                    "Audio sample rate {} Hz is not evenly divisible by 12000 Hz. \
-                     Supported rates: 12000, 24000, 48000, 96000.",
-                    input_rate
-                ));
+            if !dsp_supports_input_rate(input_rate) {
+                return Err(anyhow::anyhow!(unsupported_input_rate_message(input_rate)));
             }
+            let decimation_factor = (input_rate / DSP_TARGET_SAMPLE_RATE_HZ) as usize;
             const FT8_SAMPLE_RATE: usize = 12000;
             // Protocol-derived timing, captured from `DspTiming` above.
             // Mutable so a live mode switch (Shift+M) can resize the decode

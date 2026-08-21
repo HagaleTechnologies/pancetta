@@ -40,6 +40,14 @@ pub(crate) fn list_wav_files_sorted(dir: &Path) -> Result<Vec<PathBuf>> {
 /// Read every `.wav` file in `dir` (in filename order), mix each to mono,
 /// resample each to `target_rate`, and concatenate into one continuous
 /// sample stream -- as if the directory were one long recording.
+///
+/// Rejects a corpus that yields no samples at all. `list_wav_files_sorted`
+/// only proves the directory holds *files* with a `.wav` extension; a
+/// directory of valid-but-zero-frame WAVs (or files so short that resampling
+/// truncates them away) passes that check and then feeds nothing. The feeder
+/// would sit through `REPLAY_GRACE_PERIOD` and exit 0, reporting a
+/// "successful" replay that decoded nothing -- the same false success the
+/// empty-directory check exists to prevent.
 pub(crate) fn load_replay_samples(dir: &Path, target_rate: u32) -> Result<Vec<f32>> {
     let files = list_wav_files_sorted(dir)?;
 
@@ -52,6 +60,14 @@ pub(crate) fn load_replay_samples(dir: &Path, target_rate: u32) -> Result<Vec<f3
             mono
         };
         all_samples.extend(resampled);
+    }
+
+    if all_samples.is_empty() {
+        anyhow::bail!(
+            "Replay directory contains {} .wav file(s) but no audio samples: {}",
+            files.len(),
+            dir.display()
+        );
     }
 
     Ok(all_samples)
@@ -180,6 +196,32 @@ impl super::ApplicationCoordinator {
             "Starting audio component in REPLAY mode: {}",
             replay_dir.display()
         );
+
+        // Fail fast on a rate the DSP stage cannot decimate.
+        //
+        // `pancetta-config` accepts rates the DSP worker rejects (44100 and
+        // 22050 are both valid `[audio] sample_rate` values; see
+        // `AudioConfig::validate_section`). The feeder resamples its corpus to
+        // `[audio] sample_rate` so the DSP stage's channel-extraction and
+        // decimation see exactly what a real capture device would deliver --
+        // which means an incompatible rate is fed faithfully into a worker
+        // that returns `unsupported_input_rate_message` and exits immediately.
+        // The feeder then paces the whole corpus into a dead channel, waits
+        // out REPLAY_GRACE_PERIOD and exits 0, while the supervisor restarts
+        // the same doomed worker in the background: a "successful" replay with
+        // zero decodes and no clear reason why. Bail here, before the feed
+        // loop is spawned, so the operator gets the real cause.
+        if !super::dsp::dsp_supports_input_rate(sample_rate) {
+            anyhow::bail!(
+                "--replay cannot run at the configured [audio] sample_rate. {} \
+                 Replay resamples its corpus to the configured rate, so the DSP \
+                 stage would reject it and decode nothing. Of the rates \
+                 [audio] sample_rate itself accepts, use 48000 (the default), \
+                 96000, or 192000.",
+                super::dsp::unsupported_input_rate_message(sample_rate),
+            );
+        }
+
         let samples = load_replay_samples(&replay_dir, sample_rate)?;
         info!(
             "Replay: loaded {} samples ({:.1}s) at {} Hz",
@@ -327,6 +369,50 @@ mod tests {
         let file_path = dir.path().join("not_a_dir.wav");
         write_test_wav(&file_path, 12000, 10);
         assert!(list_wav_files_sorted(&file_path).is_err());
+    }
+
+    /// A directory of valid-but-empty WAVs passes `list_wav_files_sorted`
+    /// (the files exist and end in `.wav`) but yields nothing to feed. Left
+    /// unchecked the feeder waits out the grace period and exits 0 --
+    /// a "successful" replay that processed no audio at all.
+    #[test]
+    fn load_replay_samples_rejects_corpus_with_no_audio_samples() {
+        let dir = tempfile::tempdir().unwrap();
+        write_test_wav(&dir.path().join("a_empty.wav"), 12000, 0);
+        write_test_wav(&dir.path().join("b_empty.wav"), 12000, 0);
+
+        // The files themselves are well-formed and discoverable...
+        assert_eq!(list_wav_files_sorted(dir.path()).unwrap().len(), 2);
+
+        // ...but a corpus with zero samples is not a replayable corpus.
+        let err = load_replay_samples(dir.path(), 12000).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("no audio samples"),
+            "error should name the empty-corpus cause, got: {msg}"
+        );
+    }
+
+    /// `--replay` resamples its corpus to `[audio] sample_rate`; a rate the
+    /// DSP stage cannot decimate must be rejected before the feed loop starts
+    /// (see `start_replay_pipeline`), not fed into a worker that exits.
+    #[test]
+    fn replay_rejects_sample_rates_the_dsp_stage_cannot_decimate() {
+        use super::super::dsp::dsp_supports_input_rate;
+
+        // Valid `[audio] sample_rate` values (per
+        // `AudioConfig::validate_section`) that the DSP decimation path cannot
+        // use -- these are the rates `--replay` must reject up front.
+        for rate in [8000u32, 11025, 16000, 22050, 44100, 88200, 176400] {
+            assert!(
+                !dsp_supports_input_rate(rate),
+                "{rate} Hz is not a whole multiple of 12000 Hz"
+            );
+        }
+        // ...and the config-accepted rates that do decimate cleanly.
+        for rate in [48000u32, 96000, 192000] {
+            assert!(dsp_supports_input_rate(rate), "{rate} Hz must be accepted");
+        }
     }
 
     #[test]
