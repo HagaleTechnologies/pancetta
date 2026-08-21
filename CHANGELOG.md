@@ -72,10 +72,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over `assets/demo-wav` goes from 0 decodes to 26, and the README demo GIF
   and screenshots were re-rendered accordingly (the DX Hunter priority table
   is populated for the first time).
-- `--replay` combined with `--no-audio` is now rejected at CLI parse time
-  instead of hanging forever (the `no_audio` short-circuit in
-  `start_audio_pipeline` precedes the replay branch, so no feeder was spawned
-  and nothing ever triggered the shutdown signal).
+- `--replay` combined with `--no-audio`, `--test-tx`, or `--wav` is now
+  rejected at CLI parse time. `--no-audio` hung forever (the `no_audio`
+  short-circuit in `start_audio_pipeline` precedes the replay branch, so no
+  feeder was spawned and nothing ever triggered the shutdown signal);
+  `--test-tx` truncated any corpus longer than 35s before its final decodes;
+  and `--wav` silently won an undocumented precedence race in
+  `ApplicationCoordinator::run`, running single-file decode-and-exit playback
+  while ignoring the requested replay pipeline.
+- `--replay` fails fast instead of reporting a success that decoded nothing.
+  A configured `[audio] sample_rate` that the DSP stage cannot decimate to
+  12 kHz (44100 and 22050 are valid config values) made the DSP worker exit
+  on startup while the feeder paced the whole corpus into a dead channel and
+  exited 0; and a corpus of well-formed but zero-frame `.wav` files passed
+  the existing empty-directory check and fed nothing. Both now bail before
+  the feed loop starts, naming the cause.
+- `--replay` seeds its 14.074 MHz default dial frequency in builds without
+  the optional `pancetta-hamlib` feature too. The seed was inside the
+  feature's `cfg` block, so exactly the build that starts no rig at all was
+  the one left reporting 0 Hz (BAND 0MHZ in remote snapshots, near-zero RF
+  frequency in QSO metadata).
 - `--replay` no longer publishes to the outside world (read-only traffic —
   cqdx.io's rarity/needed-entity lookups, DX cluster login — still happens,
   so the demo keeps real scoring data). A demo run against an
