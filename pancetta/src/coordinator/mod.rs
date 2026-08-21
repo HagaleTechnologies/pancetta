@@ -685,6 +685,12 @@ pub struct ApplicationCoordinator {
     /// WAV file playback path (if set, runs in playback mode)
     wav_path: Option<PathBuf>,
 
+    /// Directory of sequential WAV captures to replay through the full
+    /// pipeline at real-time cadence (see `--replay` in `main.rs`). Checked
+    /// by `start_audio_pipeline` (`audio.rs`) ahead of the stub/real-device
+    /// branches.
+    pub(crate) replay_path: Option<PathBuf>,
+
     /// One-shot test transmission. If Some, after startup the coordinator
     /// injects a single TransmitRequest with this message text and shuts
     /// down on TransmitComplete. Used for hardware bench validation.
@@ -1285,6 +1291,7 @@ impl ApplicationCoordinator {
         enable_metrics: bool,
         metrics_port: u16,
         wav_path: Option<PathBuf>,
+        replay_path: Option<PathBuf>,
         test_tx: Option<String>,
         test_tx_offset: f64,
         shutdown_signal: Arc<AtomicBool>,
@@ -1510,6 +1517,7 @@ impl ApplicationCoordinator {
             enable_metrics,
             metrics_port,
             wav_path,
+            replay_path,
             test_tx,
             test_tx_offset,
             cached_lookup: std::sync::Arc::new(
@@ -2304,6 +2312,7 @@ mod tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,
@@ -2585,6 +2594,7 @@ mod tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,
@@ -2621,6 +2631,7 @@ mod tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,
@@ -2664,6 +2675,7 @@ mod tests {
             false, // metrics
             9090,
             None, // no WAV
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,
@@ -2749,6 +2761,7 @@ mod tests {
             false, // no metrics
             9090,
             Some(wav_path),
+            None, // no replay
             None, // no test-tx
             1500.0,
             shutdown,

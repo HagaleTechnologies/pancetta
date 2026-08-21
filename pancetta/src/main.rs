@@ -105,6 +105,15 @@ struct Cli {
     #[arg(long, global = true)]
     wav: Option<PathBuf>,
 
+    /// Directory of sequential WAV captures to replay through the full
+    /// pipeline (audio → DSP → FT8 → QSO → TUI) at real-time cadence, as if
+    /// it were live audio. Files are read in filename order. Exits on its
+    /// own a few seconds after the last file is exhausted. Unlike --wav,
+    /// this runs the complete pipeline (TUI, QSO engine, priority scoring),
+    /// not just the decoder -- intended for demos and scripted recordings.
+    #[arg(long, global = true)]
+    replay: Option<PathBuf>,
+
     /// Enable metrics collection
     #[arg(long, global = true)]
     metrics: bool,
@@ -373,6 +382,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         cli.metrics,
         cli.metrics_port,
         cli.wav,
+        cli.replay,
         cli.test_tx,
         cli.test_tx_offset,
         shutdown.clone(),
