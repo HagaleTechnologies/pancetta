@@ -38,12 +38,22 @@ replay feeder emitted bare mono while the DSP stage de-interleaved against
 ## CI
 
 `.github/workflows/demo-assets.yml` re-renders **`demo.tape` only** and
-auto-commits `assets/demo.gif` when the render changes. It triggers on PRs
-touching `.tapes/**`, `assets/demo-wav/**`, `pancetta-tui/**`,
-`pancetta/src/**`, `pancetta-config/src/**`, or `pancetta-ft8/src/**`, and is
-skipped on fork PRs (the auto-commit push can't work there). `demo.gif`
-therefore doesn't need re-rendering by hand for every PR.
+auto-commits `assets/demo.gif` when the render changes. It is **manual-only**
+(`workflow_dispatch`) — nothing regenerates the GIF automatically:
 
-`screenshots.tape` and `feature-decode-effort.tape` are **not** automated —
-re-render those by hand with the commands above after any TUI change that
-alters what they show.
+```bash
+gh workflow run demo-assets.yml --ref <branch>   # or the Actions tab
+```
+
+Dispatch it after a change under `.tapes/**`, `assets/demo-wav/**`,
+`pancetta-tui/**`, `pancetta/src/**`, `pancetta-config/src/**`, or
+`pancetta-ft8/src/**` — the paths that actually change what the GIF shows.
+That list lives in the workflow's header comment as the filter to restore if
+this ever goes automatic again. It used to be a `pull_request` trigger with
+exactly that filter, but the render is never byte-reproducible (embedded
+timestamps, live waterfall), so it auto-committed on nearly every push and
+regenerated the GIF 8 times in ~3 hours on one PR.
+
+`screenshots.tape` and `feature-decode-effort.tape` are **not** automated at
+all — re-render those by hand with the commands above after any TUI change
+that alters what they show.

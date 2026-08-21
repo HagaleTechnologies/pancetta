@@ -1,9 +1,40 @@
 name: Regenerate demo assets
 
-# Re-renders .tapes/demo.tape whenever a PR touches the TUI, the tape
-# sources, or the replay WAV fixtures it feeds, and auto-commits the
-# resulting assets/demo.gif if the render changed. Keeps the README hero
-# GIF from silently going stale.
+# Re-renders `.tapes/demo.tape` **on request** and auto-commits the resulting
+# assets/demo.gif if the render changed. Keeps the README hero GIF from
+# silently going stale without regenerating it on every push.
+#
+# Manual trigger only -- from the Actions tab ("Run workflow", picking the
+# branch in the ref dropdown) or from the CLI:
+#
+#   gh workflow run demo-assets.yml --ref <branch>
+#
+# This lane used to run automatically on `pull_request` with the path filter
+# preserved below. That fired far more often than anyone wanted: the render is
+# never byte-reproducible (embedded timestamps, live waterfall), so it
+# auto-committed on nearly every run -- 8 regenerations in ~3 hours during one
+# PR's review-fix cycle, each one a new head commit. Automating this again is
+# still worth doing (a schedule, or the verify-only shape sketched in the
+# auto-commit step below), but not per-push.
+#
+# WHEN TO DISPATCH IT: after a change under any of these paths, which is the
+# exact `paths:` filter the `pull_request` trigger carried and the one to
+# restore under whatever automatic trigger eventually replaces this:
+#
+#   - "pancetta-tui/**"
+#   - ".tapes/**"
+#   - "assets/demo-wav/**"
+#   # The GIF's content depends on far more than the TUI crate: the binary
+#   # crate owns the replay feeder and its pacing/grace-period timing
+#   # (pancetta/src/coordinator/replay.rs), the audio and DSP stages, and the
+#   # CLI gates the tape drives. pancetta-config and pancetta-ft8 own the
+#   # decode-effort presets and the decoder itself, both of which the tape
+#   # renders on screen. Without these paths a change to the replay feeder
+#   # would never call for regeneration and the GIF would go stale silently --
+#   # which is the exact failure this workflow exists to stop.
+#   - "pancetta/src/**"
+#   - "pancetta-config/src/**"
+#   - "pancetta-ft8/src/**"
 #
 # Mirrors this repo's other CI lanes (see ci.yml/docs.yml/release.yml):
 # checkout MUST be `submodules: recursive` and the Linux runner needs the
@@ -17,22 +48,7 @@ name: Regenerate demo assets
 # (only the last file decodes, ~26 messages) in its trailing comment block.
 
 on:
-  pull_request:
-    paths:
-      - "pancetta-tui/**"
-      - ".tapes/**"
-      - "assets/demo-wav/**"
-      # The GIF's content depends on far more than the TUI crate: the binary
-      # crate owns the replay feeder and its pacing/grace-period timing
-      # (pancetta/src/coordinator/replay.rs), the audio and DSP stages, and
-      # the CLI gates the tape drives. pancetta-config and pancetta-ft8 own
-      # the decode-effort presets and the decoder itself, both of which the
-      # tape renders on screen. Without these paths a change to the replay
-      # feeder would never retrigger regeneration and the GIF would go stale
-      # silently -- which is the exact failure this workflow exists to stop.
-      - "pancetta/src/**"
-      - "pancetta-config/src/**"
-      - "pancetta-ft8/src/**"
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -40,14 +56,12 @@ permissions:
 jobs:
   vhs:
     runs-on: ubuntu-latest
-    # Fork PRs cannot run this job: the `ref: ${{ github.head_ref }}` checkout
-    # below names a branch that does not exist in the base repo, so checkout
-    # hard-fails (not skips) on every external contribution. The auto-commit
-    # push would fail anyway -- a `pull_request` event from a fork gets a
-    # read-only token regardless of the `contents: write` permission above.
-    # Skipping cleanly beats failing loudly on someone else's PR; a maintainer
-    # can re-render by hand per .tapes/README.md.
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # No fork guard needed under `workflow_dispatch`: dispatching a workflow
+    # requires write access to THIS repository, and the run always operates on
+    # a ref of this repository -- there is no fork head to check. (The previous
+    # `github.event.pull_request.head.repo.full_name == github.repository`
+    # guard would in fact skip every run now, since a dispatch carries no
+    # pull_request event payload at all.)
     steps:
       - uses: actions/checkout@v7
         with:
@@ -56,13 +70,12 @@ jobs:
           # wouldn't break this workflow, but a demo build should still
           # match how the binary is actually built everywhere else in CI.
           submodules: recursive
-          # REQUIRED for pull_request events: without this, checkout leaves
-          # a detached HEAD at the merge ref, and
-          # stefanzweifel/git-auto-commit-action's push falls through to a
-          # bare `git push origin` with no refspec, which fails outright
-          # ("not currently on a branch"). Checking out the PR's actual
-          # head branch is what its own docs prescribe for this trigger.
-          ref: ${{ github.head_ref }}
+          # No explicit `ref:` -- a `workflow_dispatch` run already resolves
+          # `github.ref` to the branch chosen at dispatch time, and checkout
+          # leaves that branch checked out (not a detached merge ref, which is
+          # what `pull_request` gave us and what forced an explicit `ref:`
+          # here before). The auto-commit push below therefore has a branch to
+          # push to. Dispatch against a BRANCH, not a tag.
 
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
@@ -97,10 +110,10 @@ jobs:
         with:
           # Deliberately NO `[skip ci]` here. The GIF is not byte-reproducible
           # (embedded timestamps, live waterfall), so this step fires on
-          # nearly every qualifying PR. With `[skip ci]` GitHub skips ALL
-          # workflows for the pushed commit, leaving the PR's newest commit
+          # essentially every dispatch. With `[skip ci]` GitHub skips ALL
+          # workflows for the pushed commit, leaving the branch's newest commit
           # with no CI runs at all -- required checks stay pending forever, or
-          # the PR merges against a head that was never actually checked. One
+          # a PR merges against a head that was never actually checked. One
           # extra CI run per regeneration is the correct price for that.
           #
           # KNOWN LIMITATION (not fixable in this workflow file, tracked here
@@ -119,6 +132,8 @@ jobs:
           # Both are out of scope for a code-only change.
           commit_message: "chore: regenerate demo.gif"
           file_pattern: assets/demo.gif
-          # Belt-and-suspenders alongside the checkout `ref:` above: pins
-          # the push target explicitly to the PR's head branch.
-          branch: ${{ github.head_ref }}
+          # Belt-and-suspenders alongside the checkout above: pins the push
+          # target explicitly to the dispatched branch. (`github.ref_name` is
+          # the dispatch ref's short name -- `head_ref` is empty outside a
+          # `pull_request` event and would push nowhere.)
+          branch: ${{ github.ref_name }}
