@@ -719,6 +719,38 @@ pub struct ApplicationCoordinator {
     /// to guard there).
     pub(crate) hamlib_command_loop_ready: Arc<AtomicBool>,
 
+    /// PAN-19 round-16 review (Codex P1): "keep restored rig state pending
+    /// through CAT application". `hamlib_command_loop_ready` above and the
+    /// `hamlib_pending_frequency`/`hamlib_pending_split` slots (round 14)
+    /// together still leave a gap: `deliver_pending_hamlib_state` clears a
+    /// pending slot as soon as the command is successfully HANDED OFF onto
+    /// the channel -- but the message loop hasn't actually attempted the
+    /// underlying `set_frequency`/`set_split_freq`/`set_split` CAT call
+    /// yet, let alone learned its result. A PTT-on whose gate-check lands
+    /// in that window (the pending slot already looks empty; the message
+    /// loop is now awaiting the CAT call) gets queued BEHIND the state
+    /// command and will proceed to key the rig once consumed, regardless
+    /// of whether the CAT call that was in flight when it was gated
+    /// through ultimately succeeds or fails.
+    ///
+    /// The message loop's SetFrequency/SetSplit arms set this `true`
+    /// (via `HamlibLoopReadyGuard`-style RAII, see the CAT-call call sites
+    /// in `coordinator/hamlib.rs`) for the exact duration of the
+    /// underlying rig I/O call -- and only that duration, so ordinary
+    /// PTT-on requests pay nothing extra. `tx_hard_mute_reason` treats
+    /// `true` here the same as "pending state undelivered": refuse PTT.
+    /// Since the message loop processes messages strictly one at a time
+    /// (never concurrently), at most one CAT call is ever in flight at
+    /// once, so a single shared flag (not per-kind) is sufficient --
+    /// unlike the pending slots, which DO need per-kind separation because
+    /// they can each independently hold a value at rest.
+    ///
+    /// Defaults to `false` (nothing in flight) -- the correct "not gated"
+    /// state for a `pancetta-hamlib`-disabled build, matching
+    /// `hamlib_command_loop_ready`'s own default-to-permissive convention
+    /// above.
+    pub(crate) hamlib_command_in_flight: Arc<AtomicBool>,
+
     /// Operator TX-frequency mode (`pancetta_core::TxFreqMode` as `u8`),
     /// default `Hold`. Shared with the QSO engine (gates the stuck-DX TX-offset
     /// hop) and the autonomous operator (gates the smart-frequency allocator and
@@ -1556,6 +1588,7 @@ impl ApplicationCoordinator {
             )),
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
             hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
+            hamlib_command_in_flight: Arc::new(AtomicBool::new(false)),
             // Default TX-frequency mode = Hold (operator's picked offset is
             // sticky; pancetta never moves it autonomously). Operator switches
             // to Auto from the TUI (`f`).

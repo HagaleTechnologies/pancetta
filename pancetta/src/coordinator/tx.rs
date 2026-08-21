@@ -1066,12 +1066,27 @@ fn current_tx_policy(
 /// elsewhere) and, like `restart_inhibit`/`hamlib_loop_ready` above, fail
 /// CLOSED (treated as still-pending, i.e. still muted) on a poisoned
 /// lock -- see [`has_undelivered_pending_hamlib_state`].
+///
+/// PAN-19 round-16 review (Codex P1): "keep restored rig state pending
+/// through CAT application". Round 14's pending-slot check alone still had
+/// a gap: `deliver_pending_hamlib_state` clears a pending slot as soon as
+/// the command is successfully handed off onto the channel -- NOT once the
+/// rig has actually accepted it. A PTT-on gated through here while the
+/// message loop is still awaiting the underlying `set_frequency`/
+/// `set_split_freq`/`set_split` CAT call would see an already-empty
+/// pending slot and be permitted, then get queued behind that in-flight
+/// command and key the rig regardless of whether the CAT call succeeds or
+/// fails. `hamlib_command_in_flight` closes that window: the message
+/// loop's arms set it `true` for the CAT call's exact duration (see
+/// `HamlibCommandInFlightGuard` in `coordinator/hamlib.rs`), and it's
+/// treated the same as "pending state undelivered" here.
 pub(crate) fn tx_hard_mute_reason(
     tx_policy: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     restart_inhibit: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     hamlib_loop_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     hamlib_pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     hamlib_pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<&'static str> {
     if restart_inhibit.load(Ordering::Acquire) != 0 {
         Some("rig control is restarting")
@@ -1079,6 +1094,8 @@ pub(crate) fn tx_hard_mute_reason(
         Some("Hamlib command loop is not yet ready")
     } else if has_undelivered_pending_hamlib_state(hamlib_pending_frequency, hamlib_pending_split) {
         Some("pending rig frequency/split state has not been delivered yet")
+    } else if hamlib_command_in_flight.load(Ordering::Acquire) {
+        Some("a rig frequency/split command is still being applied")
     } else if current_tx_policy(tx_policy) == pancetta_core::TxPolicy::Disabled {
         Some("TX policy is Disabled")
     } else {
@@ -1136,6 +1153,11 @@ mod tx_hard_mute_reason_tests {
         )
     }
 
+    /// Not in flight -- the common case (no CAT call currently executing).
+    fn not_in_flight() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
     #[test]
     fn permits_tx_when_everything_is_ready() {
         let policy = policy(pancetta_core::TxPolicy::Full);
@@ -1147,7 +1169,8 @@ mod tx_hard_mute_reason_tests {
                 &restart_inhibit,
                 &hamlib_loop_ready,
                 &no_pending(),
-                &no_pending()
+                &no_pending(),
+                &not_in_flight(),
             ),
             None
         );
@@ -1163,7 +1186,8 @@ mod tx_hard_mute_reason_tests {
             &restart_inhibit,
             &hamlib_loop_ready,
             &no_pending(),
-            &no_pending()
+            &no_pending(),
+            &not_in_flight(),
         )
         .is_some());
     }
@@ -1194,6 +1218,7 @@ mod tx_hard_mute_reason_tests {
             &hamlib_loop_ready,
             &no_pending(),
             &no_pending(),
+            &not_in_flight(),
         );
         assert!(
             reason.is_some(),
@@ -1225,6 +1250,7 @@ mod tx_hard_mute_reason_tests {
             &hamlib_loop_ready,
             &no_pending(),
             &pending_split,
+            &not_in_flight(),
         );
         assert!(
             reason.is_some(),
@@ -1242,7 +1268,8 @@ mod tx_hard_mute_reason_tests {
                 &restart_inhibit,
                 &hamlib_loop_ready,
                 &no_pending(),
-                &pending_split
+                &pending_split,
+                &not_in_flight(),
             ),
             None,
             "PTT-on must be permitted again once the pending SetSplit has been delivered"
@@ -1271,7 +1298,8 @@ mod tx_hard_mute_reason_tests {
             &restart_inhibit,
             &hamlib_loop_ready,
             &pending_frequency,
-            &no_pending()
+            &no_pending(),
+            &not_in_flight(),
         )
         .is_some());
     }
@@ -1287,7 +1315,8 @@ mod tx_hard_mute_reason_tests {
                 &restart_inhibit,
                 &hamlib_loop_ready,
                 &no_pending(),
-                &no_pending()
+                &no_pending(),
+                &not_in_flight(),
             ),
             Some("TX policy is Disabled")
         );
@@ -1315,11 +1344,60 @@ mod tx_hard_mute_reason_tests {
                 &restart_inhibit,
                 &hamlib_loop_ready,
                 &no_pending(),
-                &pending_split
+                &pending_split,
+                &not_in_flight(),
             )
             .is_some(),
             "a poisoned pending-slot lock must fail closed (still muted), not be treated as \
              'nothing pending'"
+        );
+    }
+
+    /// PAN-19 round-16 review (Codex P1) regression guard: "keep restored
+    /// rig state pending through CAT application". The exact scenario the
+    /// finding describes: the pending slot is ALREADY empty (cleared at
+    /// hand-off time by `deliver_pending_hamlib_state`, before the message
+    /// loop even started the underlying CAT call), the loop is ready, and
+    /// restart isn't inhibiting -- yet a `set_frequency`/`set_split_freq`/
+    /// `set_split` call is genuinely in flight right now. PTT must still
+    /// be refused: the empty pending slot alone (round 14) doesn't mean
+    /// the rig's state is confirmed correct.
+    #[test]
+    fn in_flight_command_mutes_tx_even_when_the_pending_slot_is_already_empty() {
+        let policy = policy(pancetta_core::TxPolicy::Full);
+        let restart_inhibit = Arc::new(AtomicU32::new(0));
+        let hamlib_loop_ready = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicBool::new(true));
+
+        let reason = tx_hard_mute_reason(
+            &policy,
+            &restart_inhibit,
+            &hamlib_loop_ready,
+            &no_pending(),
+            &no_pending(),
+            &in_flight,
+        );
+        assert!(
+            reason.is_some(),
+            "TX must stay muted while a rig frequency/split command is in flight, even though \
+             both pending slots are already empty"
+        );
+
+        // Once the CAT call resolves and the in-flight flag clears, PTT-on
+        // must be permitted again -- the fix must not become overly
+        // conservative.
+        in_flight.store(false, Ordering::Release);
+        assert_eq!(
+            tx_hard_mute_reason(
+                &policy,
+                &restart_inhibit,
+                &hamlib_loop_ready,
+                &no_pending(),
+                &no_pending(),
+                &in_flight,
+            ),
+            None,
+            "PTT-on must be permitted again once the in-flight CAT call has resolved"
         );
     }
 }
@@ -2557,6 +2635,10 @@ impl super::ApplicationCoordinator {
             // doc comment.
             let hamlib_pending_frequency = self.hamlib_pending_frequency.clone();
             let hamlib_pending_split = self.hamlib_pending_split.clone();
+            // PAN-19 round-16 review (Codex P1): "keep restored rig state
+            // pending through CAT application" -- see `tx_hard_mute_reason`'s
+            // doc comment.
+            let hamlib_command_in_flight = self.hamlib_command_in_flight.clone();
             // Drop-stale-TX gate: the QSO component keeps this set in sync;
             // the worker refuses to key PTT for a request whose `qso_id` is no
             // longer present (superseded / cancelled / completed-past-grace).
@@ -2957,6 +3039,7 @@ impl super::ApplicationCoordinator {
                                         &hamlib_command_loop_ready,
                                         &hamlib_pending_frequency,
                                         &hamlib_pending_split,
+                                        &hamlib_command_in_flight,
                                     ) {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -3411,6 +3494,7 @@ impl super::ApplicationCoordinator {
                                             &hamlib_command_loop_ready,
                                             &hamlib_pending_frequency,
                                             &hamlib_pending_split,
+                                            &hamlib_command_in_flight,
                                         ) {
                                             emit_diagnostic(
                                                 &message_bus,
@@ -4125,6 +4209,7 @@ impl super::ApplicationCoordinator {
                                         &hamlib_command_loop_ready,
                                         &hamlib_pending_frequency,
                                         &hamlib_pending_split,
+                                        &hamlib_command_in_flight,
                                     ) {
                                         info!(
                                             target: "pancetta::tx.policy",
@@ -5018,6 +5103,7 @@ impl super::ApplicationCoordinator {
                                         &hamlib_command_loop_ready,
                                         &hamlib_pending_frequency,
                                         &hamlib_pending_split,
+                                        &hamlib_command_in_flight,
                                     ) {
                                         emit_diagnostic(
                                             &message_bus,
@@ -5382,6 +5468,7 @@ impl super::ApplicationCoordinator {
                                         &hamlib_command_loop_ready,
                                         &hamlib_pending_frequency,
                                         &hamlib_pending_split,
+                                        &hamlib_command_in_flight,
                                     ) {
                                         info!(
                                             target: "pancetta::tx.policy",

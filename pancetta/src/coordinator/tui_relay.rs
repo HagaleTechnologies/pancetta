@@ -830,6 +830,10 @@ impl super::ApplicationCoordinator {
         // comment in `coordinator/tx.rs`.
         let cmd_hamlib_pending_frequency = self.hamlib_pending_frequency.clone();
         let cmd_hamlib_pending_split = self.hamlib_pending_split.clone();
+        // PAN-19 round-16 review (Codex P1): "keep restored rig state
+        // pending through CAT application" -- see `tx_hard_mute_reason`'s
+        // doc comment in `coordinator/tx.rs`.
+        let cmd_hamlib_command_in_flight = self.hamlib_command_in_flight.clone();
         // Operator Hold/Auto TX-frequency mode (`f`). The handler toggles this
         // atomic; the QSO engine and autonomous operator read it to gate
         // autonomous frequency moves.
@@ -1934,6 +1938,7 @@ impl super::ApplicationCoordinator {
                                     &cmd_hamlib_command_loop_ready,
                                     &cmd_hamlib_pending_frequency,
                                     &cmd_hamlib_pending_split,
+                                    &cmd_hamlib_command_in_flight,
                                 ) {
                                     warn!(
                                         target: "tx.policy",
@@ -2397,12 +2402,20 @@ fn map_autonomous_status(
 /// while a prior generation's SetFrequency/SetSplit is still waiting,
 /// undelivered, for the polling task's retry (see that function's doc
 /// comment).
+///
+/// PAN-19 round-16 review (Codex P1): "keep restored rig state pending
+/// through CAT application". `tx_hard_mute_reason` now ALSO checks
+/// `hamlib_command_in_flight` -- a manual PTT toggle must be refused while
+/// the message loop is actively awaiting a `set_frequency`/
+/// `set_split_freq`/`set_split` CAT call, not just while a pending slot is
+/// populated (see that function's doc comment).
 fn ptt_on_refusal(
     tx_policy: &Arc<std::sync::atomic::AtomicU8>,
     tx_restart_inhibit: &Arc<std::sync::atomic::AtomicU32>,
     hamlib_command_loop_ready: &Arc<std::sync::atomic::AtomicBool>,
     hamlib_pending_frequency: &Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     hamlib_pending_split: &Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    hamlib_command_in_flight: &Arc<std::sync::atomic::AtomicBool>,
 ) -> Option<String> {
     super::tx::tx_hard_mute_reason(
         tx_policy,
@@ -2410,6 +2423,7 @@ fn ptt_on_refusal(
         hamlib_command_loop_ready,
         hamlib_pending_frequency,
         hamlib_pending_split,
+        hamlib_command_in_flight,
     )
     .map(|reason| format!("Can't key PTT — {reason}"))
 }
@@ -2423,6 +2437,11 @@ mod tui_relay_tests {
     /// a prior failed teardown replay).
     fn no_pending() -> Arc<std::sync::Mutex<Option<ComponentMessage>>> {
         Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// Not in flight -- the common case (no CAT call currently executing).
+    fn not_in_flight() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
     }
 
     /// PAN-19 round-12 review (Codex P1) regression guard: "apply loop
@@ -2448,6 +2467,7 @@ mod tui_relay_tests {
             &hamlib_command_loop_ready,
             &no_pending(),
             &no_pending(),
+            &not_in_flight(),
         );
         assert!(
             refusal.is_some(),
@@ -2487,6 +2507,7 @@ mod tui_relay_tests {
                 &hamlib_command_loop_ready,
                 &no_pending(),
                 &pending_split,
+                &not_in_flight(),
             )
             .is_some(),
             "a direct PTT-on toggle must be refused while a pending SetSplit is still \
@@ -2504,9 +2525,54 @@ mod tui_relay_tests {
                 &hamlib_command_loop_ready,
                 &no_pending(),
                 &pending_split,
+                &not_in_flight(),
             ),
             None,
             "PTT-on must be permitted again once the pending SetSplit has been delivered"
+        );
+    }
+
+    /// PAN-19 round-16 review (Codex P1) regression guard: "keep restored
+    /// rig state pending through CAT application". Both pending slots are
+    /// ALREADY empty (mirrors the exact race: `deliver_pending_hamlib_state`
+    /// cleared the slot at hand-off, before the message loop's CAT call
+    /// even started), the loop is ready, and restart isn't inhibiting --
+    /// yet a CAT call is genuinely in flight right now. A direct PTT-on
+    /// toggle must still be refused, then permitted again once the
+    /// in-flight flag clears.
+    #[test]
+    fn ptt_on_refusal_blocks_a_key_up_while_a_rig_command_is_in_flight() {
+        let tx_policy = Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8()));
+        let tx_restart_inhibit = Arc::new(AtomicU32::new(0));
+        let hamlib_command_loop_ready = Arc::new(AtomicBool::new(true));
+        let in_flight = Arc::new(AtomicBool::new(true));
+
+        assert!(
+            ptt_on_refusal(
+                &tx_policy,
+                &tx_restart_inhibit,
+                &hamlib_command_loop_ready,
+                &no_pending(),
+                &no_pending(),
+                &in_flight,
+            )
+            .is_some(),
+            "a direct PTT-on toggle must be refused while a rig frequency/split command is in \
+             flight, even though both pending slots are already empty"
+        );
+
+        in_flight.store(false, Ordering::Release);
+        assert_eq!(
+            ptt_on_refusal(
+                &tx_policy,
+                &tx_restart_inhibit,
+                &hamlib_command_loop_ready,
+                &no_pending(),
+                &no_pending(),
+                &in_flight,
+            ),
+            None,
+            "PTT-on must be permitted again once the in-flight CAT call has resolved"
         );
     }
 
@@ -2525,6 +2591,7 @@ mod tui_relay_tests {
                 &hamlib_command_loop_ready,
                 &no_pending(),
                 &no_pending(),
+                &not_in_flight(),
             ),
             None,
             "PTT-on must be permitted once TX policy allows it, restart isn't inhibiting, and \

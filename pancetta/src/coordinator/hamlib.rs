@@ -214,6 +214,99 @@ mod hamlib_loop_ready_guard_tests {
     }
 }
 
+/// PAN-19 round-16 review (Codex P1): "keep restored rig state pending
+/// through CAT application". Sets `hamlib_command_in_flight` `true` on
+/// construction and back to `false` on `Drop` -- unlike
+/// `HamlibLoopReadyGuard` above (which only ever clears, never sets), this
+/// one brackets a specific, short-lived critical section: the message
+/// loop's underlying `set_frequency`/`set_split_freq`/`set_split` CAT
+/// call. Constructed immediately before that call starts and dropped
+/// immediately after it resolves (success OR failure -- `Drop` doesn't
+/// care which), so `tx_hard_mute_reason`'s pending-state check sees
+/// "in flight" for the CAT call's entire duration, closing the window
+/// round 14's pending-slot check alone couldn't see: a pending command
+/// already handed off to the channel (slot cleared) but not yet applied.
+/// Same RAII-cleanup-on-any-exit precedent as `HamlibLoopReadyGuard`
+/// (`RemoteTxDisarmGuard` in `station_agent/mod.rs`) -- panic-unwind or
+/// task cancellation during the CAT call still clears it, so a crash
+/// mid-call can never leave PTT permanently muted.
+struct HamlibCommandInFlightGuard(Arc<std::sync::atomic::AtomicBool>);
+
+impl HamlibCommandInFlightGuard {
+    fn new(flag: Arc<std::sync::atomic::AtomicBool>) -> Self {
+        flag.store(true, Ordering::Release);
+        Self(flag)
+    }
+}
+
+impl Drop for HamlibCommandInFlightGuard {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod hamlib_command_in_flight_guard_tests {
+    use super::*;
+
+    /// The flag must be `true` for the guard's ENTIRE lifetime -- set the
+    /// instant it's constructed, not lazily.
+    #[test]
+    fn new_sets_the_flag_immediately() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let _guard = HamlibCommandInFlightGuard::new(flag.clone());
+        assert!(
+            flag.load(Ordering::Acquire),
+            "constructing the guard must set the in-flight flag immediately"
+        );
+    }
+
+    /// Symmetric with `HamlibLoopReadyGuard`: `Drop` clears it, whether
+    /// the CAT call this guard brackets succeeded or failed -- the guard
+    /// itself is outcome-agnostic; `finish_rig_command` handles the
+    /// outcome separately (pending slot / tracker), this guard only ever
+    /// tracks "is a call currently in flight".
+    #[test]
+    fn drop_clears_the_flag_regardless_of_outcome() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let _guard = HamlibCommandInFlightGuard::new(flag.clone());
+            assert!(
+                flag.load(Ordering::Acquire),
+                "test setup: flag should be true while guarded"
+            );
+        }
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "the guard's Drop must clear the in-flight flag the instant its scope ends"
+        );
+    }
+
+    /// Same panic-unwind safety net as `HamlibLoopReadyGuard` -- a panic
+    /// mid-CAT-call must not leave PTT permanently muted by a stuck
+    /// in-flight flag.
+    #[test]
+    fn drop_clears_the_flag_even_on_panic_unwind() {
+        let flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag_for_panic = flag.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = HamlibCommandInFlightGuard::new(flag_for_panic);
+            panic!("simulated unexpected panic mid-CAT-call");
+        }));
+        assert!(
+            result.is_err(),
+            "test setup: the closure should have panicked"
+        );
+
+        assert!(
+            !flag.load(Ordering::Acquire),
+            "the guard's Drop must clear the in-flight flag even when the scope exits via a \
+             panic"
+        );
+    }
+}
+
 /// Whether a spawned Hamlib child task (poll loop or PTT watchdog)
 /// terminated unexpectedly and the outer message-loop task should treat
 /// that as a crash.
@@ -953,6 +1046,10 @@ impl super::ApplicationCoordinator {
             // the true source of truth for this flag -- see the comment at
             // the readiness-reporting call site below for why.
             let hamlib_command_loop_ready = self.hamlib_command_loop_ready.clone();
+            // PAN-19 round-16 review (Codex P1): "keep restored rig state
+            // pending through CAT application" -- see this field's doc
+            // comment in `coordinator/mod.rs`.
+            let hamlib_command_in_flight = self.hamlib_command_in_flight.clone();
 
             tokio::spawn(async move {
                 // PAN-19 HIGH: the poll + PTT-watchdog child tasks are spawned
@@ -1000,9 +1097,36 @@ impl super::ApplicationCoordinator {
                 let last_freq_command_poll = last_freq_command.clone();
                 let bus_for_polling = message_bus.clone();
                 let display_feed_enabled_poll = display_feed_enabled.clone();
+                // PAN-19 round-16 review (Codex P1): "clear readiness as
+                // soon as either Hamlib child exits" -- see the guard
+                // construction at the top of this task's body below.
+                let hamlib_command_loop_ready_for_polling = hamlib_command_loop_ready.clone();
                 let mut spawned_handles: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
                 spawned_handles.push(tokio::spawn(async move {
+                    // PAN-19 round-16 review (Codex P1): "clear readiness
+                    // as soon as either Hamlib child exits". Round 11's
+                    // `HamlibLoopReadyGuard` only lives on the message
+                    // loop itself, so it only clears readiness when THAT
+                    // loop notices (between messages) that a child died --
+                    // if this poll task dies (panic, or falls out of its
+                    // `while` loop) while the message loop is separately
+                    // blocked awaiting a slow multi-second CAT call
+                    // (`set_frequency`/`set_split`), readiness stays
+                    // `true` for that whole window: a PTT-on could pass
+                    // the gate and queue during it, then get consumed and
+                    // key the rig once the CAT call finally returns and
+                    // the message loop bails, having never actually
+                    // checked this child's death before that PTT-on was
+                    // already on its way to audio playback. Reusing
+                    // `HamlibLoopReadyGuard` here (same guard type as the
+                    // message loop's own, same underlying flag) means
+                    // THIS child clears readiness itself, directly, the
+                    // instant it ends for any reason -- independent of
+                    // whether the message loop has gotten back around to
+                    // its own `child_task_crashed` check yet.
+                    let _poll_ready_guard =
+                        HamlibLoopReadyGuard(hamlib_command_loop_ready_for_polling);
                     let mut poll_interval = interval(Duration::from_millis(500));
                     let mut consecutive_failures: u32 = 0;
                     const CRASH_WARN_THRESHOLD: u32 = 10; // 5 seconds of failures
@@ -1256,7 +1380,12 @@ impl super::ApplicationCoordinator {
                 let ptt_watchdog_tracker = ptt_on_since.clone();
                 let shutdown_for_watchdog = shutdown.clone();
                 let ptt_active_watchdog = ptt_active.clone();
+                // PAN-19 round-16 review (Codex P1): same reasoning as the
+                // poll task's own guard above -- see that comment.
+                let hamlib_command_loop_ready_for_watchdog = hamlib_command_loop_ready.clone();
                 spawned_handles.push(tokio::spawn(async move {
+                    let _watchdog_ready_guard =
+                        HamlibLoopReadyGuard(hamlib_command_loop_ready_for_watchdog);
                     let mut watchdog_interval = interval(Duration::from_secs(1));
                     loop {
                         watchdog_interval.tick().await;
@@ -1515,14 +1644,33 @@ impl super::ApplicationCoordinator {
                                         // the channel. `finish_rig_command`
                                         // is the shared post-I/O step both
                                         // arms use.
-                                        let io_ok = match rig_poll
-                                            .set_frequency(vfo_enum, *frequency)
-                                            .await
-                                        {
-                                            Ok(()) => true,
-                                            Err(e) => {
-                                                error!("Failed to set frequency: {}", e);
-                                                false
+                                        //
+                                        // PAN-19 round-16 review (Codex
+                                        // P1): "keep restored rig state
+                                        // pending through CAT application".
+                                        // `_in_flight_guard` marks
+                                        // `hamlib_command_in_flight` true
+                                        // for exactly the duration of the
+                                        // I/O call below -- a PTT-on gated
+                                        // through `tx_hard_mute_reason`
+                                        // WHILE this await is in flight
+                                        // must see the rig's state as not
+                                        // yet confirmed, even though the
+                                        // pending slot itself may already
+                                        // be empty (cleared at hand-off
+                                        // time by `deliver_pending_hamlib_state`,
+                                        // before this call even started).
+                                        let io_ok = {
+                                            let _in_flight_guard = HamlibCommandInFlightGuard::new(
+                                                hamlib_command_in_flight.clone(),
+                                            );
+                                            match rig_poll.set_frequency(vfo_enum, *frequency).await
+                                            {
+                                                Ok(()) => true,
+                                                Err(e) => {
+                                                    error!("Failed to set frequency: {}", e);
+                                                    false
+                                                }
                                             }
                                         };
                                         finish_rig_command(
@@ -1602,40 +1750,53 @@ impl super::ApplicationCoordinator {
                                         // gets (re)queued for the round-10
                                         // retry instead, exactly like
                                         // SetFrequency above.
-                                        let split_applied = if *enabled {
-                                            let freq_result =
-                                                rig_poll.set_split_freq(*tx_frequency).await;
-                                            if let Err(e) = &freq_result {
-                                                warn!(target: "rig.split", "set_split_freq failed: {}", e);
-                                            }
-                                            let on_result = rig_poll
-                                                .set_split(true, pancetta_hamlib::Vfo::B)
-                                                .await;
-                                            match &on_result {
-                                                Ok(()) => info!(
-                                                    target: "rig.split",
-                                                    "split ON, TX {} Hz",
-                                                    tx_frequency
-                                                ),
-                                                Err(e) => warn!(
-                                                    target: "rig.split",
-                                                    "set_split(on) failed: {}",
-                                                    e
-                                                ),
-                                            }
-                                            freq_result.is_ok() && on_result.is_ok()
-                                        } else {
-                                            match rig_poll
-                                                .set_split(false, pancetta_hamlib::Vfo::A)
-                                                .await
-                                            {
-                                                Ok(()) => {
-                                                    info!(target: "rig.split", "split OFF");
-                                                    true
+                                        // PAN-19 round-16 review (Codex
+                                        // P1): "keep restored rig state
+                                        // pending through CAT application"
+                                        // -- same `_in_flight_guard`
+                                        // reasoning as SetFrequency above,
+                                        // bracketing BOTH underlying CAT
+                                        // calls (`set_split_freq` +
+                                        // `set_split`) when enabling.
+                                        let split_applied = {
+                                            let _in_flight_guard = HamlibCommandInFlightGuard::new(
+                                                hamlib_command_in_flight.clone(),
+                                            );
+                                            if *enabled {
+                                                let freq_result =
+                                                    rig_poll.set_split_freq(*tx_frequency).await;
+                                                if let Err(e) = &freq_result {
+                                                    warn!(target: "rig.split", "set_split_freq failed: {}", e);
                                                 }
-                                                Err(e) => {
-                                                    warn!(target: "rig.split", "set_split(off) failed: {}", e);
-                                                    false
+                                                let on_result = rig_poll
+                                                    .set_split(true, pancetta_hamlib::Vfo::B)
+                                                    .await;
+                                                match &on_result {
+                                                    Ok(()) => info!(
+                                                        target: "rig.split",
+                                                        "split ON, TX {} Hz",
+                                                        tx_frequency
+                                                    ),
+                                                    Err(e) => warn!(
+                                                        target: "rig.split",
+                                                        "set_split(on) failed: {}",
+                                                        e
+                                                    ),
+                                                }
+                                                freq_result.is_ok() && on_result.is_ok()
+                                            } else {
+                                                match rig_poll
+                                                    .set_split(false, pancetta_hamlib::Vfo::A)
+                                                    .await
+                                                {
+                                                    Ok(()) => {
+                                                        info!(target: "rig.split", "split OFF");
+                                                        true
+                                                    }
+                                                    Err(e) => {
+                                                        warn!(target: "rig.split", "set_split(off) failed: {}", e);
+                                                        false
+                                                    }
                                                 }
                                             }
                                         };
@@ -1996,6 +2157,23 @@ fn record_applied(
 /// can't be driven through `start_hamlib_component` end to end -- see
 /// `children_publish_race_tests`' doc comment for the same kind of
 /// limitation on a different mechanism.
+///
+/// PAN-19 round-16 review (Codex P1): "preserve the newest failed rig
+/// command". On failure, this used to overwrite `pending_slot`
+/// unconditionally -- but if a stale (older) message's CAT call fails
+/// AFTER a newer message's CAT call already failed and restored ITS OWN
+/// (correct, current) state into the slot, the stale failure would
+/// clobber it: a later retry would then re-apply the OLD frequency/split
+/// instead of the newer desired one, and once THAT retry (wrongly)
+/// succeeds, the pending slot clears and PTT is permitted with the wrong
+/// state applied. Now only replaces the slot when the failing message's
+/// id is NEWER than whatever failed message is already retained there --
+/// reusing the same globally-monotonic id ordering [`is_superseded`] and
+/// [`record_applied`] already rely on. A failure can still be recorded
+/// over an EMPTY slot regardless of id (nothing to preserve), and a
+/// failure with an OLDER id than what's retained is simply dropped (not
+/// written back) -- the newer failure already correctly represents "what
+/// still needs to be corrected".
 fn finish_rig_command(
     io_ok: bool,
     message: &ComponentMessage,
@@ -2005,7 +2183,13 @@ fn finish_rig_command(
     if io_ok {
         record_applied(message, last_applied_id);
     } else if let Ok(mut slot) = pending_slot.lock() {
-        *slot = Some(message.clone());
+        let should_replace = match slot.as_ref() {
+            Some(retained) => message.id > retained.id,
+            None => true,
+        };
+        if should_replace {
+            *slot = Some(message.clone());
+        }
     }
 }
 
@@ -2531,6 +2715,83 @@ mod children_publish_race_tests {
             handle.abort();
         }
     }
+
+    /// PAN-19 round-16 review (Codex P1): "clear readiness as soon as
+    /// either Hamlib child exits". `restart_orphan_tests` (below) proves
+    /// the real wiring end to end -- aborting a published child's
+    /// `AbortHandle` does clear `hamlib_command_loop_ready`. But in that
+    /// test the message loop is otherwise idle (its own `while` loop is
+    /// cycling a ~10ms `try_recv`-empty sleep), so round 11's PRE-EXISTING
+    /// `HamlibLoopReadyGuard` on the message loop itself also notices the
+    /// dead child within that same window -- the two mechanisms can't be
+    /// timing-distinguished there, and `start_hamlib_component` has no
+    /// injection point for a genuinely slow rig I/O call to hold the
+    /// message loop busy for a controlled window (same limitation this
+    /// module's own doc comment describes for a different mechanism).
+    ///
+    /// This test instead isolates the SPECIFIC property the finding
+    /// describes -- a child's own guard fires independent of whatever the
+    /// "message loop" is doing -- using genuine async concurrency: a
+    /// simulated "message loop" spawned task sleeps for a controlled
+    /// window (standing in for a slow `set_frequency`/`set_split` CAT
+    /// await) and does NOT check anything during that window (mirroring
+    /// that the real loop's `child_task_crashed` check ONLY runs between
+    /// iterations, never during an in-flight I/O await); a separate
+    /// simulated "child" task holds the exact real `HamlibLoopReadyGuard`
+    /// type this round wires into the poll/watchdog tasks' spawned bodies,
+    /// and ends immediately (simulating a crash). Readiness must already
+    /// be false well before the simulated slow await completes -- proving
+    /// the mechanism does not depend on the busy loop ever getting a
+    /// chance to check.
+    #[tokio::test]
+    async fn a_childs_own_guard_clears_readiness_while_a_simulated_slow_cat_call_is_still_in_flight(
+    ) {
+        let hamlib_command_loop_ready = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        hamlib_command_loop_ready.store(true, Ordering::Release);
+
+        // The "message loop": simulates being blocked inside a slow CAT
+        // call for 300ms, never checking child liveness during that
+        // window (mirrors the real loop, which only calls
+        // `child_task_crashed` between `while` iterations -- never while
+        // an `.await` on `rig_poll.set_frequency`/`set_split_freq`/
+        // `set_split` is in flight). Reports what it observes the instant
+        // its simulated I/O "returns".
+        let message_loop_flag = hamlib_command_loop_ready.clone();
+        let message_loop_task = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            message_loop_flag.load(Ordering::Acquire)
+        });
+
+        // Give the "message loop" task a moment to actually start its
+        // sleep before the "child" ends, so this isn't a same-tick race.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+
+        // The "child" (poll or watchdog): holds the SAME real
+        // `HamlibLoopReadyGuard` type wired into their spawned bodies,
+        // and ends immediately -- simulating a crash mid-CAT-await.
+        let child_flag = hamlib_command_loop_ready.clone();
+        tokio::spawn(async move {
+            let _child_guard = HamlibLoopReadyGuard(child_flag);
+        })
+        .await
+        .expect("simulated child task must not panic");
+
+        // Readiness must ALREADY be false now -- ~280ms before the
+        // simulated slow CAT call even returns, let alone before any
+        // "message loop" code could have checked anything.
+        assert!(
+            !hamlib_command_loop_ready.load(Ordering::Acquire),
+            "the child's own guard must clear readiness immediately on its own exit, without \
+             waiting for the busy message loop to get back around to a liveness check"
+        );
+
+        let seen_once_the_slow_call_finally_returns = message_loop_task.await.unwrap();
+        assert!(
+            !seen_once_the_slow_call_finally_returns,
+            "readiness must still read false once the simulated slow CAT call finishes -- it \
+             was never the message loop's own check that cleared it"
+        );
+    }
 }
 
 #[cfg(all(test, feature = "pancetta-hamlib"))]
@@ -2633,6 +2894,134 @@ mod restart_orphan_tests {
                 .load(std::sync::atomic::Ordering::Acquire),
             "hamlib_command_loop_ready must end up true once the real spawned task reaches \
              its message loop on a genuinely successful start"
+        );
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// PAN-19 round-16 review (Codex P1) regression guard: "clear
+    /// readiness as soon as either Hamlib child exits". Drives the REAL
+    /// `start_hamlib_component` end to end (mock-rig path, same as the
+    /// test above) to a genuinely-ready generation, then aborts the
+    /// PUBLISHED poll child's `AbortHandle` directly -- exactly what a
+    /// crash of that task looks like from the outside (tokio cancels it
+    /// at its next await point, dropping its locals, including the
+    /// `_poll_ready_guard` this round wired into its spawned body). Before
+    /// this fix, only the message loop's OWN `HamlibLoopReadyGuard`
+    /// existed, so nothing would clear readiness until the message loop's
+    /// own between-message `child_task_crashed` check happened to run --
+    /// this test proves the poll child clears it ITSELF, without the
+    /// message loop doing anything (it's never even ticked here).
+    #[tokio::test]
+    async fn aborting_the_poll_child_clears_readiness_without_the_message_loop_doing_anything() {
+        let mut coordinator = test_coordinator().await;
+        coordinator
+            .start_hamlib_component()
+            .await
+            .expect("mock-rig hamlib start should succeed");
+
+        for _ in 0..50 {
+            if coordinator
+                .hamlib_command_loop_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            coordinator
+                .hamlib_command_loop_ready
+                .load(std::sync::atomic::Ordering::Acquire),
+            "test setup invariant: readiness must be true before simulating the child crash"
+        );
+
+        // Simulate the poll child crashing/exiting -- abort it directly,
+        // exactly as tokio would cancel it on a real panic or task end.
+        coordinator
+            .hamlib_children
+            .as_ref()
+            .expect("children must be published by a successful start")
+            .poll
+            .abort();
+
+        // Readiness must clear promptly -- well within a couple of ticks,
+        // NOT waiting for anything resembling the message loop's own
+        // ~10ms `try_recv`-empty sleep interval to accumulate over many
+        // iterations of an unrelated check.
+        let mut cleared = false;
+        for _ in 0..50 {
+            if !coordinator
+                .hamlib_command_loop_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            cleared,
+            "aborting the poll child must clear hamlib_command_loop_ready itself, directly -- \
+             not depend on the message loop's own crash check ever running"
+        );
+
+        coordinator
+            .shutdown_signal
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Same as above, for the watchdog child -- both children must clear
+    /// readiness on their own exit, not just the poll task.
+    #[tokio::test]
+    async fn aborting_the_watchdog_child_clears_readiness_without_the_message_loop_doing_anything()
+    {
+        let mut coordinator = test_coordinator().await;
+        coordinator
+            .start_hamlib_component()
+            .await
+            .expect("mock-rig hamlib start should succeed");
+
+        for _ in 0..50 {
+            if coordinator
+                .hamlib_command_loop_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            coordinator
+                .hamlib_command_loop_ready
+                .load(std::sync::atomic::Ordering::Acquire),
+            "test setup invariant: readiness must be true before simulating the child crash"
+        );
+
+        coordinator
+            .hamlib_children
+            .as_ref()
+            .expect("children must be published by a successful start")
+            .watchdog
+            .abort();
+
+        let mut cleared = false;
+        for _ in 0..50 {
+            if !coordinator
+                .hamlib_command_loop_ready
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                cleared = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(
+            cleared,
+            "aborting the watchdog child must clear hamlib_command_loop_ready itself, directly \
+             -- not depend on the message loop's own crash check ever running"
         );
 
         coordinator
@@ -3604,6 +3993,7 @@ mod teardown_replay_tests {
         let hamlib_loop_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
         let no_pending_frequency: Arc<std::sync::Mutex<Option<ComponentMessage>>> =
             Arc::new(std::sync::Mutex::new(None));
+        let not_in_flight = Arc::new(std::sync::atomic::AtomicBool::new(false));
         assert!(
             super::super::tx::tx_hard_mute_reason(
                 &tx_policy,
@@ -3611,6 +4001,7 @@ mod teardown_replay_tests {
                 &hamlib_loop_ready,
                 &no_pending_frequency,
                 &pending_split,
+                &not_in_flight,
             )
             .is_some(),
             "PTT must stay refused while the pending slot a failed CAT command repopulated is \
@@ -3648,6 +4039,120 @@ mod teardown_replay_tests {
         assert!(
             pending_split.lock().unwrap().is_none(),
             "a successful CAT command must not populate the pending slot"
+        );
+    }
+
+    /// PAN-19 round-16 review (Codex P1) regression guard: "preserve the
+    /// newest failed rig command". The exact scenario the finding
+    /// describes: a stale command has been appended behind a newer normal
+    /// command (the round-12 race), and BOTH of their CAT calls fail. The
+    /// newer command's failure is processed FIRST (occupies the slot);
+    /// the stale command's failure is processed SECOND. Before this fix,
+    /// the stale (older) failure would unconditionally overwrite the slot,
+    /// losing the newer command's restored state -- a later retry would
+    /// then re-apply the OLD frequency/split, clear the slot, and permit
+    /// TX while the newer desired state was never actually restored.
+    #[test]
+    fn finish_rig_command_never_lets_an_older_failure_clobber_a_newer_ones_restored_state() {
+        let stale_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000, // stale, wrong TX frequency
+            }),
+            Instant::now(),
+        );
+        // Constructed after `stale_split`, so its id is strictly greater.
+        let newer_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_074_000, // the CORRECT, current desired TX frequency
+            }),
+            Instant::now(),
+        );
+        assert!(newer_split.id > stale_split.id);
+
+        let last_applied_split_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        // The newer command's CAT call fails FIRST -- restores it into
+        // the (currently empty) slot.
+        finish_rig_command(false, &newer_split, &last_applied_split_id, &pending_split);
+        assert_eq!(
+            pending_split.lock().unwrap().as_ref().map(|m| m.id),
+            Some(newer_split.id),
+            "test setup: the newer command's failure must occupy the empty slot"
+        );
+
+        // The stale command's CAT call ALSO fails, processed SECOND --
+        // must NOT clobber the newer command's already-restored state.
+        finish_rig_command(false, &stale_split, &last_applied_split_id, &pending_split);
+
+        assert_eq!(
+            pending_split.lock().unwrap().as_ref().map(|m| m.id),
+            Some(newer_split.id),
+            "a stale (older) command's failure must never overwrite a newer command's already-\
+             restored pending state -- doing so would lose the newer desired frequency/split \
+             and let a later retry re-apply the old one instead"
+        );
+        let retained = pending_split.lock().unwrap();
+        assert!(
+            matches!(
+                retained.as_ref().map(|m| &m.message_type),
+                Some(MessageType::RigControl(
+                    crate::message_bus::RigControlMessage::SetSplit {
+                        enabled: true,
+                        tx_frequency: 14_074_000,
+                    }
+                ))
+            ),
+            "the retained pending command must still carry the NEWER, correct TX frequency"
+        );
+    }
+
+    /// The flip side: a failure with a NEWER id than what's already
+    /// retained must still replace it -- the fix must not become so
+    /// conservative that it stops ever updating the slot.
+    #[test]
+    fn finish_rig_command_still_replaces_an_older_retained_failure_with_a_newer_one() {
+        let older_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_078_000,
+            }),
+            Instant::now(),
+        );
+        let newer_split = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetSplit {
+                enabled: true,
+                tx_frequency: 14_074_000,
+            }),
+            Instant::now(),
+        );
+        assert!(newer_split.id > older_split.id);
+
+        let last_applied_split_id: Arc<std::sync::Mutex<Option<u64>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        finish_rig_command(false, &older_split, &last_applied_split_id, &pending_split);
+        finish_rig_command(false, &newer_split, &last_applied_split_id, &pending_split);
+
+        assert_eq!(
+            pending_split.lock().unwrap().as_ref().map(|m| m.id),
+            Some(newer_split.id),
+            "a newer failure must still replace an older retained one -- ordering must not \
+             become a one-way ratchet that stops updating the slot"
         );
     }
 
