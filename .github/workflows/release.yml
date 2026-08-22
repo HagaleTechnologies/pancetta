@@ -102,7 +102,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          NAME="pancetta-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # Sanitize: GITHUB_REF_NAME is a bare tag ("v0.9.5") on a real
+          # release, but on a workflow_dispatch dry run it's the branch name,
+          # which contains "/" per this repo's feat/fix/docs/... convention
+          # and would otherwise break `mkdir` by being read as a path.
+          REF_SLUG="${GITHUB_REF_NAME//\//-}"
+          NAME="pancetta-${REF_SLUG}-${{ matrix.target }}"
           mkdir "$NAME"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/pancetta.exe" "$NAME/"
