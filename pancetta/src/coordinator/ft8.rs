@@ -231,6 +231,312 @@ mod ap_eval_mode_tests {
     }
 }
 
+/// PAN-40: half-width (Hz) tolerance used to decide whether two decodes
+/// from the two different decoder backends (`ft8lib`, native) plausibly
+/// came from the same physical signal, for hash-placeholder twin
+/// detection ([`drop_unresolved_hash_twins`]). Reuses the precedent set
+/// by `a7_freq_window_hz` in `pancetta-ft8/src/decoder.rs`: the
+/// spectrogram bin step is 3.125 Hz, so a handful of bins comfortably
+/// absorbs independent frequency-estimate quantization between the two
+/// backends while staying far tighter than typical FT8 station spacing
+/// on a busy band.
+const HASH_TWIN_FREQ_TOLERANCE_HZ: f64 = 10.0;
+
+/// PAN-40: is `word` the literal unresolved i3=4 hash-miss placeholder
+/// token? Mirrors the `None`-branch semantics of
+/// `pancetta_core::callsign::resolve_hash_render` (private to that
+/// crate) applied to a single whitespace-split token rather than a full
+/// callsign string.
+fn is_unresolved_hash_token(word: &str) -> bool {
+    word == "<...>"
+}
+
+/// PAN-40: normalize a single decode-text token for hash-twin
+/// comparison. A resolved i3=4 hash render (`"<K5ARH>"`) unwraps to its
+/// plain callsign (`"K5ARH"`); every other token (including the
+/// unresolved placeholder, handled separately by
+/// [`is_unresolved_hash_token`]) passes through unchanged.
+fn normalize_hash_bracket_word(word: &str) -> &str {
+    if word.len() >= 2
+        && word.starts_with('<')
+        && word.ends_with('>')
+        && !is_unresolved_hash_token(word)
+    {
+        &word[1..word.len() - 1]
+    } else {
+        word
+    }
+}
+
+/// PAN-40 — root cause: `callsigns_match` (pancetta-core) correctly
+/// refuses, by design, to ever match the unresolved i3=4 hash-miss
+/// placeholder `"<...>"` against a QSO's known partner — it carries no
+/// identity information at all. But the ft8lib+native decoder merge
+/// (the loop just above this function's call site) deduped only by
+/// *exact* decode text: when the two backends decode the same physical
+/// signal differently — one resolving the hash render, one leaving it
+/// `"<...>"` — the texts differ, so both survive the merge and both get
+/// forwarded to the QSO engine. The unresolved twin is then correctly
+/// (but uselessly) rejected by `callsigns_match` every single cycle,
+/// which can burn an entire watchdog window on a QSO whose partner was
+/// actually replying the whole time (see PR body for the live-log
+/// evidence: QSO `d8bc41ca-0da8-4e6b-bef9-23ae05ccbeb2` vs 3B9/SQ9UM).
+///
+/// Declares two decodes twins of the same signal only when BOTH hold:
+///   - their `frequency_offset`s agree within
+///     [`HASH_TWIN_FREQ_TOLERANCE_HZ`], AND
+///   - after normalizing away hash-resolution differences (unwrapping
+///     resolved `"<CALL>"` renders to plain `"CALL"`, and treating the
+///     literal unresolved placeholder `"<...>"` as a wildcard that
+///     matches any single token at that position), the texts are
+///     token-for-token identical.
+///
+/// When a pair is declared twins, only the more-resolved side (the one
+/// without the placeholder) is kept. Deliberately conservative: any
+/// non-wildcard token mismatch aborts twin detection for that pair, and
+/// two decodes where NEITHER side has the placeholder are never twins
+/// here (if two backends fully and identically resolved the same
+/// signal, their texts are literally equal and were already deduped
+/// before this pass ever sees them). Per PAN-40's stated bias, an
+/// ambiguous pair keeps BOTH rather than risk dropping a genuine decode:
+/// a spurious extra decode reaching the QSO engine is harmless (it's
+/// just correctly rejected if irrelevant), while dropping a real decode
+/// can silently kill a live QSO.
+///
+/// Returns `Some(true)` if `a` is the side to keep, `Some(false)` if `b`
+/// is, `None` if the pair are not (confidently) twins.
+fn hash_twin_keep_first(a: &str, b: &str) -> Option<bool> {
+    let ta: Vec<&str> = a.split_whitespace().collect();
+    let tb: Vec<&str> = b.split_whitespace().collect();
+    if ta.is_empty() || ta.len() != tb.len() {
+        return None;
+    }
+
+    let mut a_has_placeholder = false;
+    let mut b_has_placeholder = false;
+    let mut saw_wildcard_position = false;
+
+    for (wa, wb) in ta.iter().zip(tb.iter()) {
+        let a_unresolved = is_unresolved_hash_token(wa);
+        let b_unresolved = is_unresolved_hash_token(wb);
+        a_has_placeholder |= a_unresolved;
+        b_has_placeholder |= b_unresolved;
+
+        if a_unresolved || b_unresolved {
+            // A placeholder position matches anything on the other side
+            // (it carries no identity information to contradict). If
+            // BOTH sides are the placeholder at this position that's
+            // also a compatible (equal) position.
+            if !(a_unresolved && b_unresolved) {
+                saw_wildcard_position = true;
+            }
+            continue;
+        }
+
+        if normalize_hash_bracket_word(wa) != normalize_hash_bracket_word(wb) {
+            // Genuine content mismatch at a non-placeholder position —
+            // these are two different real decodes, not a hash twin.
+            return None;
+        }
+    }
+
+    if !saw_wildcard_position {
+        // The texts differ (callers only consider non-identical pairs)
+        // but not because of a placeholder difference — not our case.
+        return None;
+    }
+
+    match (a_has_placeholder, b_has_placeholder) {
+        (true, false) => Some(false), // b is the resolved side
+        (false, true) => Some(true),  // a is the resolved side
+        // Both sides carry the placeholder somewhere, or neither does —
+        // genuinely ambiguous which (if either) is "more resolved".
+        // Keep both per the conservative bias above.
+        _ => None,
+    }
+}
+
+/// PAN-40 — drop the unresolved-hash-placeholder half of any decode pair
+/// in `messages` that [`hash_twin_keep_first`] confidently identifies as
+/// the same physical signal decoded twice (once resolved, once not) by
+/// the two decoder backends. See that function's doc comment for the
+/// full rationale and the conservative-by-default policy.
+///
+/// Returns `(kept_messages, dropped_count)`. Order of the surviving
+/// messages is preserved.
+fn drop_unresolved_hash_twins(
+    messages: Vec<pancetta_ft8::DecodedMessage>,
+) -> (Vec<pancetta_ft8::DecodedMessage>, usize) {
+    let n = messages.len();
+    let mut drop = vec![false; n];
+
+    for i in 0..n {
+        if drop[i] {
+            continue;
+        }
+        for j in (i + 1)..n {
+            if drop[j] || messages[i].text == messages[j].text {
+                continue;
+            }
+            if (messages[i].frequency_offset - messages[j].frequency_offset).abs()
+                > HASH_TWIN_FREQ_TOLERANCE_HZ
+            {
+                continue;
+            }
+            match hash_twin_keep_first(&messages[i].text, &messages[j].text) {
+                Some(true) => drop[j] = true,
+                Some(false) => {
+                    drop[i] = true;
+                    break; // i is gone; no point comparing it further
+                }
+                None => {}
+            }
+        }
+    }
+
+    let mut dropped_count = 0usize;
+    let kept = messages
+        .into_iter()
+        .zip(drop)
+        .filter_map(|(m, d)| {
+            if d {
+                dropped_count += 1;
+                None
+            } else {
+                Some(m)
+            }
+        })
+        .collect();
+    (kept, dropped_count)
+}
+
+#[cfg(test)]
+mod hash_twin_dedup_tests {
+    use super::{drop_unresolved_hash_twins, hash_twin_keep_first};
+    use pancetta_ft8::{DecodedMessage, Ft8Message};
+
+    fn decoded_at(freq_hz: f64, text: &str) -> DecodedMessage {
+        let mut d = DecodedMessage::new(Ft8Message::default(), -10.0, 0.5, freq_hz, 0.1);
+        d.text = text.to_string();
+        d
+    }
+
+    // --- hash_twin_keep_first (pure token-comparison unit) --------------
+
+    #[test]
+    fn keeps_resolved_side_over_unresolved_placeholder() {
+        assert_eq!(
+            hash_twin_keep_first("3B9/SQ9UM <...>", "3B9/SQ9UM <K5ARH>"),
+            Some(false),
+            "b (resolved) should be preferred"
+        );
+        assert_eq!(
+            hash_twin_keep_first("3B9/SQ9UM <K5ARH>", "3B9/SQ9UM <...>"),
+            Some(true),
+            "a (resolved) should be preferred"
+        );
+    }
+
+    #[test]
+    fn genuinely_different_content_is_not_a_twin() {
+        // Same shape (placeholder in the same slot) but a DIFFERENT
+        // leading callsign entirely -- must not be treated as a twin.
+        assert_eq!(
+            hash_twin_keep_first("W2XYZ <...>", "3B9/SQ9UM <K5ARH>"),
+            None
+        );
+    }
+
+    #[test]
+    fn different_token_counts_are_not_a_twin() {
+        assert_eq!(
+            hash_twin_keep_first("3B9/SQ9UM <...>", "3B9/SQ9UM <K5ARH> R-15"),
+            None
+        );
+    }
+
+    #[test]
+    fn both_placeholders_is_ambiguous_keeps_both() {
+        // Each side carries the unresolved placeholder at a DIFFERENT
+        // position -- neither side is "more resolved" than the other,
+        // so this must not pick a winner.
+        assert_eq!(hash_twin_keep_first("<...> K1ABC", "K1ABC <...>"), None);
+    }
+
+    #[test]
+    fn both_resolved_and_textually_different_is_not_a_twin() {
+        assert_eq!(
+            hash_twin_keep_first("3B9/SQ9UM <K5ARH>", "3B9/SQ9UM <W1AW>"),
+            None
+        );
+    }
+
+    // --- drop_unresolved_hash_twins (merge-list pass) --------------------
+
+    #[test]
+    fn drops_unresolved_twin_matching_freq_and_normalized_text() {
+        let messages = vec![
+            decoded_at(2700.0, "3B9/SQ9UM <...>"),
+            decoded_at(2700.0, "3B9/SQ9UM <K5ARH>"),
+        ];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        assert_eq!(dropped, 1);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "3B9/SQ9UM <K5ARH>");
+    }
+
+    #[test]
+    fn keeps_both_when_frequency_differs_beyond_tolerance() {
+        let messages = vec![
+            decoded_at(1200.0, "3B9/SQ9UM <...>"),
+            decoded_at(2700.0, "3B9/SQ9UM <K5ARH>"),
+        ];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn keeps_both_for_genuinely_different_signals_sharing_a_freq_bin() {
+        let messages = vec![
+            decoded_at(2700.0, "CQ K1ABC FN42"),
+            decoded_at(2700.0, "W2XYZ K3DEF -05"),
+        ];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.len(), 2);
+    }
+
+    #[test]
+    fn no_placeholder_involved_and_identical_text_is_unaffected() {
+        // The normal case today: both backends fully and identically
+        // resolved the frame. This is the exact-text-dedup case (would
+        // never reach this pass with two entries in practice, but the
+        // pass itself must be a no-op on an already-single-copy list).
+        let messages = vec![decoded_at(2700.0, "CQ K1ABC FN42")];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        assert_eq!(dropped, 0);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "CQ K1ABC FN42");
+    }
+
+    #[test]
+    fn three_way_merge_keeps_only_the_resolved_copy() {
+        // ft8lib emits the unresolved placeholder, native emits the
+        // resolved twin, AND an unrelated third decode on a different
+        // frequency in the same window must survive untouched.
+        let messages = vec![
+            decoded_at(2700.0, "3B9/SQ9UM <...>"),
+            decoded_at(1500.0, "CQ K1ABC FN42"),
+            decoded_at(2700.0, "3B9/SQ9UM <K5ARH>"),
+        ];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        assert_eq!(dropped, 1);
+        let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
+        assert_eq!(texts, vec!["CQ K1ABC FN42", "3B9/SQ9UM <K5ARH>"]);
+    }
+}
+
 /// How many recent TX-clear ("quiet") windows feed the rolling decode-count
 /// baseline for [`maybe_flag_tx_desense`].
 const DESENSE_BASELINE_WINDOWS: usize = 20;
@@ -1128,6 +1434,32 @@ impl super::ApplicationCoordinator {
                                 decoded_messages.push(msg);
                                 native_added_count += 1;
                             }
+                        }
+
+                        // PAN-40: exact-text dedup above does NOT catch the
+                        // case where the two backends decode the SAME
+                        // physical signal differently — one resolving an
+                        // i3=4 hash-callsign render, one leaving it the
+                        // unresolved "<...>" placeholder. Those survive as
+                        // two distinct texts and both get forwarded
+                        // downstream, where `callsigns_match` correctly (but
+                        // uselessly) rejects the unresolved twin every
+                        // cycle — silently starving an active QSO of every
+                        // reply from its partner until the watchdog times
+                        // it out. See `drop_unresolved_hash_twins` for the
+                        // full rationale; this can only ever *remove* a
+                        // decode that's a confident duplicate of one we're
+                        // keeping, never drop a decode with no surviving
+                        // twin.
+                        let (deduped_messages, hash_twins_dropped) =
+                            drop_unresolved_hash_twins(decoded_messages);
+                        decoded_messages = deduped_messages;
+                        if hash_twins_dropped > 0 {
+                            debug!(
+                                target: "ft8.decode",
+                                "PAN-40: dropped {} unresolved-hash-placeholder twin(s) at decoder merge",
+                                hash_twins_dropped,
+                            );
                         }
 
                         // hb-237 cross-sequence A7 — consumer invocation
