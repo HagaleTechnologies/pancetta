@@ -1387,7 +1387,19 @@ impl super::ApplicationCoordinator {
                                                 "Autonomous: opening slot at {:.0} Hz: {}",
                                                 frequency_offset, message_text
                                             );
-                                            if message_text.starts_with("CQ") {
+                                            // Codex review (PR #276, round 6):
+                                            // match the CQ token exactly, not
+                                            // just a byte prefix — a pounce
+                                            // reply to a valid callsign like
+                                            // "CQ7ABC" ("CQ7ABC <us> <grid>")
+                                            // would otherwise satisfy
+                                            // starts_with("CQ") and be
+                                            // misidentified as a self-CQ,
+                                            // corrupting a later
+                                            // restore_cq_state() call with
+                                            // the wrong action's snapshot.
+                                            if message_text.split_whitespace().next() == Some("CQ")
+                                            {
                                                 self_cq_emitted = true;
                                             }
                                         }
