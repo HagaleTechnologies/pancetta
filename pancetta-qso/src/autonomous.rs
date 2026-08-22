@@ -2098,6 +2098,9 @@ impl AutonomousOperator {
             // entirely (only Auto mode lets it shift off the interferer).
             if self.tx_freq_auto() && self.active_qso_count == 0 {
                 // Pick a new offset with random jitter.
+                let prev_offset = self
+                    .current_cq_offset_hz
+                    .unwrap_or(self.config.tx_offset_hz);
                 let jitter = simple_jitter();
                 let new_offset = (self.config.tx_offset_hz + jitter).clamp(200.0, 2800.0);
                 self.set_tx_offset(new_offset);
@@ -2108,19 +2111,28 @@ impl AutonomousOperator {
                 // pre-jitter `current_cq_offset_hz` instead and silently
                 // undo this jitter.
                 self.current_cq_offset_hz = Some(new_offset);
-                // Codex review (PR #276, round 6): also reset the
-                // no-response streak. Without this, an idle Auto operator
-                // that already reached the switch threshold — collision
-                // jitter fires first and moves the offset — would still
-                // have a streak sitting at/above the threshold, so the very
-                // next self-CQ immediately re-enters the switch branch and
-                // moves away again without ever trying the frequency
-                // collision avoidance just picked.
-                self.cq_no_response_streak = 0;
+                // Codex review (PR #277, round 1): `simple_jitter()` can
+                // return 0, or a boundary clamp can snap `new_offset` back
+                // to `prev_offset` — in either case no real frequency change
+                // happened, so resetting the streak or reporting a
+                // FrequencyShift here would be a no-op disguised as
+                // collision avoidance, silently postponing the real
+                // no-response-driven switch indefinitely.
+                if (new_offset - prev_offset).abs() > f64::EPSILON {
+                    // Codex review (PR #276, round 6): also reset the
+                    // no-response streak. Without this, an idle Auto operator
+                    // that already reached the switch threshold — collision
+                    // jitter fires first and moves the offset — would still
+                    // have a streak sitting at/above the threshold, so the very
+                    // next self-CQ immediately re-enters the switch branch and
+                    // moves away again without ever trying the frequency
+                    // collision avoidance just picked.
+                    self.cq_no_response_streak = 0;
 
-                actions.push(OperatorAction::FrequencyShift {
-                    new_offset_hz: new_offset,
-                });
+                    actions.push(OperatorAction::FrequencyShift {
+                        new_offset_hz: new_offset,
+                    });
+                }
             }
         } else {
             self.slot_manager
@@ -2391,6 +2403,51 @@ mod tests {
         assert_eq!(
             op.cq_no_response_streak, 0,
             "the streak must reset when collision avoidance moves the frequency"
+        );
+    }
+
+    #[test]
+    fn collision_jitter_preserves_streak_when_the_offset_does_not_actually_change() {
+        // Codex review (PR #277, round 1): `simple_jitter()` can return 0,
+        // and at the 200/2800 Hz boundaries an outward jitter clamps back to
+        // the current offset — in either case no real collision avoidance
+        // happened, so the streak must survive and no FrequencyShift should
+        // be reported. Force a deterministic no-op regardless of the actual
+        // jitter value by seeding `tx_offset_hz` at 3000 Hz: any jitter in
+        // simple_jitter()'s -200..+200 range pushes the raw value to
+        // 2800..3200, which always clamps to exactly 2800 Hz — matching the
+        // sticky offset already recorded below.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.tx_offset_hz = 3000.0;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.cq_no_response_streak = 10;
+        op.current_cq_offset_hz = Some(2800.0);
+
+        let messages = vec![DecodedMessageInfo {
+            callsign: Some("K1DEF".into()),
+            frequency_hz: 3020.0,
+            snr: -10,
+            message_text: "CQ K1DEF FN31".into(),
+            slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
+            decode_origin: None,
+        }];
+        let actions = op.process_collision_listen(&messages);
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "no FrequencyShift should be reported when the clamped offset didn't change"
+        );
+        assert_eq!(
+            op.cq_no_response_streak, 10,
+            "a no-op jitter must not reset the no-response streak"
         );
     }
 
