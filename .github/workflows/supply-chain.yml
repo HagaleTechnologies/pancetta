@@ -250,7 +250,8 @@ jobs:
           # reusable-workflow `uses`, job `container`/`services.*.image`, composite/docker
           # action `runs.image` (a Dockerfile-backed action's FROM images; any changed
           # Dockerfile, or any file an action manifest names as its runs.image, whatever its
-          # filename), with local `./path` actions expanded recursively -- are
+          # filename; COPY/ADD/RUN --from images too), with local `./path` actions expanded
+          # recursively -- are
           # counted PER FILE, and only occurrences new in that file are judged: floating
           # branch ref or no version -> fail; docker:// or container image without an
           # immutable @sha256 digest -> fail; tag pin -> warning; SHA -> ok. Local
@@ -281,15 +282,30 @@ jobs:
                   logical.append(buf + raw); buf = ""
               if buf: logical.append(buf)
               args, stages, out, index = {}, set(), [], 0
+              def expand(v):
+                  v = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
+                             lambda m: (args.get(m.group(1)) or (m.group(2) if m.group(2) is not None else args.get(m.group(1), m.group(0)))) if m.group(2) is not None or m.group(1) in args else m.group(0), v)
+                  return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda m: args.get(m.group(1), m.group(0)), v)
               for line in logical:
                   m = re.match(r"\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?\s*$", line, re.I)
                   if m: args[m.group(1)] = (m.group(2) or "").strip().strip("\"'"); continue
+                  # COPY/ADD --from=X (instruction FLAGS only) and RUN --mount=...,from=X
+                  # (inside the --mount option value only) pull X when it is not a stage;
+                  # ordinary command text such as `RUN echo from=x` is never an image.
+                  srcs = []
+                  fm = re.match(r"\s*(COPY|ADD)\s+((?:--\S+\s+)*)", line, re.I)
+                  if fm: srcs += re.findall(r"--from=(\S+)", fm.group(2))
+                  rm = re.match(r"\s*RUN\s+((?:--\S+\s+)*)", line, re.I)
+                  if rm:
+                      for mnt in re.findall(r"--mount=(\S+)", rm.group(1)):
+                          srcs += re.findall(r"(?:^|,)from=([^,]+)", mnt)
+                  for src in srcs:
+                      src = expand(src)
+                      if src.lower() not in stages and not (src.isdigit() and int(src) < index):
+                          out.append("container:" + src)
                   m = re.match(r"\s*FROM\s+((?:--\S+\s+)*)(\S+)(?:\s+AS\s+(\S+))?", line, re.I)
                   if not m: continue
-                  img, alias = m.group(2), m.group(3)
-                  img = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
-                               lambda v: (args.get(v.group(1)) or (v.group(2) if v.group(2) is not None else args.get(v.group(1), v.group(0)))) if v.group(2) is not None or v.group(1) in args else v.group(0), img)
-                  img = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda v: args.get(v.group(1), v.group(0)), img)
+                  img, alias = expand(m.group(2)), m.group(3)
                   is_stage_index = img.isdigit() and int(img) < index
                   if img.lower() != "scratch" and img.lower() not in stages and not is_stage_index:
                       out.append("container:" + img)
@@ -342,8 +358,18 @@ jobs:
                   if b is not None and not is_target(b): b = None
                   out.append((b, h))
               return out
+          def is_symlink(rev, path):
+              _, out = sh("git", "ls-tree", rev, "--", path)
+              return out.startswith("120000 ")
           def show(rev, path):
+              if is_symlink(rev, path):
+                  # the runner follows the link to some other checked-in file; refuse to
+                  # judge a manifest/Dockerfile we cannot attribute (fail closed)
+                  if rev == head and path not in SYMLINKED:          # a base-only symlink is just "unavailable" for subtraction
+                      print(f"::error::{path} is a symlink -- executable manifests must be real files"); SYMLINKED.add(path)
+                  return None
               rc, out = sh("git", "show", f"{rev}:{path}"); return out if rc == 0 else None
+          SYMLINKED = set()
           def load(rev, path):
               txt = show(rev, path)
               if txt is None: return None
@@ -422,6 +448,7 @@ jobs:
           for b, h in changed_pairs():
               if h is None: continue                               # deleted file: nothing new runs
               new += refs_at(head, h) - (refs_at(base, b) if b else Counter())   # per file, per occurrence
+          if SYMLINKED: fail = 1
           for ref in sorted(new):            # one verdict per distinct ref (a ref reached via a local action AND its own changed manifest is reported once)
               if ref.startswith("MISSING:"): fail = 1; continue
               if ref.startswith("HagaleTechnologies/"): continue
