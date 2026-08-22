@@ -1379,15 +1379,12 @@ impl AutonomousOperator {
             return self.config.tx_offset_hz;
         }
 
-        let mut own_freqs: Vec<f64> = self
+        let own_freqs: Vec<f64> = self
             .frequency_allocator
             .own_frequencies()
             .values()
             .copied()
             .collect();
-        if let Some(avoid) = avoid_hz {
-            own_freqs.push(avoid);
-        }
 
         // FQ-F8: map the caller's known TX slot parity (for a pounce, the
         // opposite of the DX's own observed slot — same convention as the
@@ -1416,8 +1413,46 @@ impl AutonomousOperator {
                 Self::apply_live_spot_rarity_boost(&mut candidates, &self.live_spot_frequencies);
             }
 
-            if let Some(best) = candidates.first() {
+            // Codex review (PR #276, round 6): `avoid_hz` needs a HARD
+            // exclusion, not the soft -50 penalty `own_frequencies` scoring
+            // applies (score_candidate's comment "effectively eliminates
+            // this candidate" is aspirational, not guaranteed — on a
+            // crowded/noisy band the penalized offset can still outrank
+            // every alternative). Filtering the ranked list directly, only
+            // for this specific avoid_hz, keeps the shared own_frequencies
+            // soft-penalty semantics unchanged for its original callers
+            // (own-QSO separation).
+            let min_separation_hz = self.smart_allocator.config().min_separation_hz;
+            let excluded: Vec<_> = match avoid_hz {
+                Some(avoid) => candidates
+                    .iter()
+                    .filter(|c| (c.offset_hz - avoid).abs() >= min_separation_hz)
+                    .cloned()
+                    .collect(),
+                None => candidates.clone(),
+            };
+
+            if let Some(best) = excluded.first() {
                 return best.offset_hz;
+            }
+
+            // Codex review (PR #277, round 3): if the hard exclusion above
+            // filters out every ranked candidate (e.g. min_separation_hz
+            // configured larger than the available spectral spread), there
+            // is genuinely no frequency that honors the exclusion. Don't
+            // fall through to the legacy `allocate_cq_frequency()` below
+            // (avoid_hz-blind, could reselect exactly the abandoned
+            // frequency) — and don't pick a "farthest available"
+            // compromise either (round 2's fix), since that still openly
+            // violates the configured separation the caller asked for.
+            // Return `avoid` itself unchanged: the caller (the
+            // no-response-streak switch path in `decide_at`) treats a
+            // no-op result as "no valid relocation" and skips the switch
+            // entirely, matching the existing "stale occupancy data" skip
+            // path rather than committing to a frequency that isn't
+            // actually excluded.
+            if let Some(avoid) = avoid_hz {
+                return avoid;
             }
         }
 
@@ -1594,6 +1629,17 @@ impl AutonomousOperator {
     pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
         self.skip_log.clear();
         let mut actions = Vec::new();
+
+        // Codex review (PR #276, round 6): invalidate any stale Auto-mode
+        // sticky offset as soon as Hold mode is observed, every cycle — not
+        // only when a Hold-mode self-CQ happens to run. Waiting for a
+        // Hold-mode CQ meant an operator who toggled Auto -> Hold -> Auto
+        // between CQ opportunities (or simply never got idle enough to CQ
+        // while in Hold) would resume Auto on a stale pre-Hold value instead
+        // of re-ranking fresh.
+        if !self.tx_freq_auto() {
+            self.current_cq_offset_hz = None;
+        }
 
         if self.paused {
             actions.push(self.status_action());
@@ -1899,20 +1945,13 @@ impl AutonomousOperator {
                             self.state = OperatingState::CallingCq;
                             self.idle_cycles = 0;
 
-                            // Codex review (PR #276, round 5): invalidate a
-                            // stale Auto-mode sticky offset BEFORE snapshotting
-                            // — not only afterward, in the Hold-mode branch
-                            // below. Doing it only afterward meant a
-                            // suppressed Hold-mode CQ's restore would bring
-                            // back the pre-Hold value (same class of bug as
-                            // the round-4 band-hop fix, for this invalidation
-                            // instead of Step 0's). `should_switch` below
-                            // always implies Auto mode, so this covers every
-                            // path that can reach the Hold branch.
-                            if !self.tx_freq_auto() {
-                                self.current_cq_offset_hz = None;
-                            }
-
+                            // (Codex review round 5's Hold-mode invalidation
+                            // used to live here; round 6 moved it to the top
+                            // of `decide_at` so it runs every cycle, not only
+                            // when a Hold-mode CQ happens to fire — so by
+                            // this point `current_cq_offset_hz` is already
+                            // correctly `None` whenever we're in Hold mode.)
+                            //
                             // Codex review (PR #276, round 4): captured HERE,
                             // not by the coordinator before calling decide()
                             // — this is after Step 0's band-hop/mode-driven
@@ -1976,6 +2015,26 @@ impl AutonomousOperator {
                                     .unwrap_or(self.config.tx_offset_hz);
                                 let new_offset =
                                     self.allocate_smart_frequency(None, None, Some(avoid));
+
+                                // Codex review (PR #277, round 3): a no-op
+                                // result (new_offset == avoid) means
+                                // allocate_smart_frequency found no
+                                // candidate honoring the hard exclusion —
+                                // committing to it anyway would transmit
+                                // right back on the abandoned frequency
+                                // while claiming a successful switch. Treat
+                                // this exactly like the "stale occupancy
+                                // data" case above: skip the window and
+                                // listen instead, preserving the streak so
+                                // the switch is retried once conditions
+                                // improve.
+                                if (new_offset - avoid).abs() < f64::EPSILON {
+                                    self.state = OperatingState::Hunting;
+                                    actions.push(OperatorAction::Listen);
+                                    actions.push(self.status_action());
+                                    return actions;
+                                }
+
                                 self.cq_no_response_streak = 0;
                                 actions.push(OperatorAction::FrequencyShift {
                                     new_offset_hz: new_offset,
@@ -2079,6 +2138,9 @@ impl AutonomousOperator {
             // entirely (only Auto mode lets it shift off the interferer).
             if self.tx_freq_auto() && self.active_qso_count == 0 {
                 // Pick a new offset with random jitter.
+                let prev_offset = self
+                    .current_cq_offset_hz
+                    .unwrap_or(self.config.tx_offset_hz);
                 let jitter = simple_jitter();
                 let new_offset = (self.config.tx_offset_hz + jitter).clamp(200.0, 2800.0);
                 self.set_tx_offset(new_offset);
@@ -2089,10 +2151,45 @@ impl AutonomousOperator {
                 // pre-jitter `current_cq_offset_hz` instead and silently
                 // undo this jitter.
                 self.current_cq_offset_hz = Some(new_offset);
+                // Codex review (PR #277, round 1): `simple_jitter()` can
+                // return 0, or a boundary clamp can snap `new_offset` back
+                // to `prev_offset` — in either case no real frequency change
+                // happened, so resetting the streak or reporting a
+                // FrequencyShift here would be a no-op disguised as
+                // collision avoidance, silently postponing the real
+                // no-response-driven switch indefinitely.
+                if (new_offset - prev_offset).abs() > f64::EPSILON {
+                    // Codex review (PR #277, round 3): a nonzero jitter
+                    // isn't necessarily a nonzero jitter AWAY from the
+                    // interferer — a small draw (e.g. ±1 Hz) can leave
+                    // `new_offset` still within the collision detector's
+                    // tolerance of the same decoded station. Only reset the
+                    // no-response streak once we've actually escaped every
+                    // interferer that triggered this collision check;
+                    // otherwise the next CQ would still be colliding while
+                    // the threshold-driven smart switch has been postponed
+                    // for another full streak.
+                    let still_colliding = decoded.iter().any(|msg| {
+                        (msg.frequency_hz - new_offset).abs()
+                            <= self.collision_detector.tolerance_hz
+                    });
 
-                actions.push(OperatorAction::FrequencyShift {
-                    new_offset_hz: new_offset,
-                });
+                    if !still_colliding {
+                        // Codex review (PR #276, round 6): also reset the
+                        // no-response streak. Without this, an idle Auto operator
+                        // that already reached the switch threshold — collision
+                        // jitter fires first and moves the offset — would still
+                        // have a streak sitting at/above the threshold, so the very
+                        // next self-CQ immediately re-enters the switch branch and
+                        // moves away again without ever trying the frequency
+                        // collision avoidance just picked.
+                        self.cq_no_response_streak = 0;
+                    }
+
+                    actions.push(OperatorAction::FrequencyShift {
+                        new_offset_hz: new_offset,
+                    });
+                }
             }
         } else {
             self.slot_manager
@@ -2326,6 +2423,166 @@ mod tests {
     }
 
     #[test]
+    fn collision_jitter_resets_the_no_response_streak() {
+        // Codex review (PR #276, round 6): without this, an idle Auto
+        // operator that already reached the switch threshold — collision
+        // jitter fires first and moves the offset — would still have a
+        // streak sitting at/above the threshold, so the very next self-CQ
+        // immediately re-enters the switch branch and moves away again
+        // without ever trying the frequency collision avoidance just picked.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.tx_offset_hz = 1500.0;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.cq_no_response_streak = 10; // already past any reasonable threshold
+                                       // Codex review (PR #277, round 2): `simple_jitter()` draws from real
+                                       // system time (-200..=200 around tx_offset_hz=1500, i.e. always in
+                                       // [1300, 1700]), and can occasionally return exactly 0 — which,
+                                       // combined with the round-2 no-op guard, would leave `new_offset`
+                                       // equal to the default `prev_offset` (also 1500, since
+                                       // `current_cq_offset_hz` starts unset) about 1-in-401 runs, making
+                                       // this assertion flaky. Seed `current_cq_offset_hz` to a value
+                                       // jitter can never reach so `new_offset != prev_offset` holds no
+                                       // matter what the real jitter draws, without weakening the test to
+                                       // a synthetic clamp scenario.
+        op.current_cq_offset_hz = Some(1000.0);
+        // Codex review (PR #277, round 3): the streak reset is now also
+        // gated on having escaped the interferer's collision tolerance
+        // (not just "the offset moved at all"). With the interferer placed
+        // near tx_offset_hz=1500 (required to trigger detection at all,
+        // since the detector checks against tx_offset_hz) and jitter always
+        // landing new_offset in [1300, 1700], a real jitter draw could
+        // coincidentally still land within 50 Hz of the interferer,
+        // flaking this assertion. Decouple detection from the jitter base
+        // by pointing the detector's own tracked offset at a frequency far
+        // from tx_offset_hz's jitter range, so every possible new_offset
+        // guarantees escape regardless of the real jitter draw.
+        op.collision_detector.our_tx_offset_hz = 700.0;
+
+        let messages = vec![DecodedMessageInfo {
+            callsign: Some("K1DEF".into()),
+            frequency_hz: 710.0, // within the 50 Hz collision tolerance of 700 (detector's offset)
+            snr: -10,
+            message_text: "CQ K1DEF FN31".into(),
+            slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
+            decode_origin: None,
+        }];
+        let actions = op.process_collision_listen(&messages);
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "sanity: collision jitter must have fired"
+        );
+        assert_eq!(
+            op.cq_no_response_streak, 0,
+            "the streak must reset when collision avoidance moves the frequency"
+        );
+    }
+
+    #[test]
+    fn collision_jitter_preserves_streak_when_the_new_offset_is_still_within_collision_range() {
+        // Codex review (PR #277, round 3): a nonzero jitter can still land
+        // within the collision detector's tolerance of the same interferer
+        // (e.g. a small draw). `simple_jitter()` has no test injection
+        // point, so this asserts the actual gating INVARIANT — whichever
+        // way any given real jitter draw falls — across many trials rather
+        // than depending on one draw landing in either bucket, giving
+        // deterministic coverage of both branches of the new
+        // `still_colliding` check.
+        for _ in 0..100 {
+            let mut config = AutonomousConfig::default();
+            config.enabled = true;
+            config.tx_offset_hz = 1500.0;
+            let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+            op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                pancetta_core::TxFreqMode::Auto.as_u8(),
+            )));
+            op.cq_no_response_streak = 10;
+            op.current_cq_offset_hz = Some(1000.0); // outside jitter's [1300,1700] range
+
+            let messages = vec![DecodedMessageInfo {
+                callsign: Some("K1DEF".into()),
+                frequency_hz: 1520.0, // within the 50 Hz collision tolerance of 1500
+                snr: -10,
+                message_text: "CQ K1DEF FN31".into(),
+                slot_parity: None,
+                confidence: None,
+                time_offset_s: None,
+                decode_origin: None,
+            }];
+            op.process_collision_listen(&messages);
+
+            let new_offset = op.current_cq_offset_hz.expect("jitter always sets this");
+            let still_colliding = (1520.0_f64 - new_offset).abs() <= 50.0;
+            if still_colliding {
+                assert_eq!(
+                    op.cq_no_response_streak, 10,
+                    "new_offset {new_offset} is still within 50 Hz of the 1520 Hz \
+                     interferer — the streak must NOT reset"
+                );
+            } else {
+                assert_eq!(
+                    op.cq_no_response_streak, 0,
+                    "new_offset {new_offset} escaped the 1520 Hz interferer's \
+                     collision range — the streak must reset"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn collision_jitter_preserves_streak_when_the_offset_does_not_actually_change() {
+        // Codex review (PR #277, round 1): `simple_jitter()` can return 0,
+        // and at the 200/2800 Hz boundaries an outward jitter clamps back to
+        // the current offset — in either case no real collision avoidance
+        // happened, so the streak must survive and no FrequencyShift should
+        // be reported. Force a deterministic no-op regardless of the actual
+        // jitter value by seeding `tx_offset_hz` at 3000 Hz: any jitter in
+        // simple_jitter()'s -200..+200 range pushes the raw value to
+        // 2800..3200, which always clamps to exactly 2800 Hz — matching the
+        // sticky offset already recorded below.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.tx_offset_hz = 3000.0;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.cq_no_response_streak = 10;
+        op.current_cq_offset_hz = Some(2800.0);
+
+        let messages = vec![DecodedMessageInfo {
+            callsign: Some("K1DEF".into()),
+            frequency_hz: 3020.0,
+            snr: -10,
+            message_text: "CQ K1DEF FN31".into(),
+            slot_parity: None,
+            confidence: None,
+            time_offset_s: None,
+            decode_origin: None,
+        }];
+        let actions = op.process_collision_listen(&messages);
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "no FrequencyShift should be reported when the clamped offset didn't change"
+        );
+        assert_eq!(
+            op.cq_no_response_streak, 10,
+            "a no-op jitter must not reset the no-response streak"
+        );
+    }
+
+    #[test]
     fn test_is_cq_message() {
         assert!(is_cq_message("CQ W1ABC FN42"));
         assert!(is_cq_message("CQ DX W1ABC FN42"));
@@ -2517,6 +2774,121 @@ mod tests {
     }
 
     #[test]
+    fn allocate_smart_frequency_hard_excludes_even_when_avoid_hz_scores_best() {
+        // Codex review (PR #276, round 6): `own_frequencies`' -50 soft
+        // penalty isn't guaranteed to displace avoid_hz from first place on
+        // a sufficiently crowded band ("effectively eliminates" per its own
+        // comment is aspirational, not guaranteed). Occupy densely
+        // everywhere except a narrow window around 1500 Hz, so 1500 Hz is
+        // the ONLY genuinely clear spot on the whole band (would win even
+        // after -50) — confirm it's still hard-excluded.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+
+        // Codex review (PR #277, round 2): the original `> 100.0` threshold
+        // left a 200 Hz-wide clear window (1400-1600) around 1500 — wider
+        // than the 75 Hz exclusion radius under test — so genuinely clear,
+        // non-excluded candidates already existed at the 75/100 Hz boundary
+        // (e.g. 1425/1575) and could win on score alone, without the hard
+        // filter doing any work. Narrow the clear window to entirely inside
+        // the exclusion radius (`> 50.0`, i.e. only [1450, 1550] stays
+        // clear) so nothing outside the excluded band is naturally clear.
+        let mut records = Vec::new();
+        let mut freq = 200.0f64;
+        while freq <= 2800.0 {
+            if (freq - 1500.0).abs() > 50.0 {
+                records.push(DecodeRecord {
+                    frequency_hz: freq,
+                    time_slot: TimeSlot::First,
+                });
+                records.push(DecodeRecord {
+                    frequency_hz: freq,
+                    time_slot: TimeSlot::Second,
+                });
+            }
+            freq += 50.0;
+        }
+        op.decode_history.push_cycle(records);
+
+        // Confirm the premise directly against the unfiltered ranker: with
+        // this occupancy, the top-ranked candidate (no avoid_hz filtering
+        // applied at all) really does fall inside the 75 Hz exclusion
+        // radius around 1500 — proving the fix's hard filter is doing real
+        // work below, not just re-confirming what the ranker would have
+        // picked anyway.
+        let unfiltered_top = op
+            .smart_allocator
+            .rank_candidates_with_parity(
+                op.spectral_snapshot.as_ref().unwrap(),
+                &op.decode_history,
+                &[],
+                None,
+                None,
+            )
+            .into_iter()
+            .next()
+            .expect("ranker must return at least one candidate");
+        assert!(
+            (unfiltered_top.offset_hz - 1500.0).abs() < 75.0,
+            "test premise broken: the unfiltered ranker's top pick ({}) must fall \
+             inside the exclusion radius for this to be a meaningful regression test",
+            unfiltered_top.offset_hz
+        );
+
+        let chosen = op.allocate_smart_frequency(None, None, Some(1500.0));
+
+        assert!(
+            (chosen - 1500.0).abs() >= 75.0,
+            "avoid_hz must be hard-excluded even when it's the only clear spot \
+             on an otherwise crowded band, got {chosen}"
+        );
+    }
+
+    #[test]
+    fn allocate_smart_frequency_returns_avoid_hz_unchanged_when_the_hard_filter_empties_out() {
+        // Codex review (PR #277, round 3): if `min_separation_hz` is
+        // configured large enough that every ranked candidate falls inside
+        // the exclusion radius, the hard filter empties the candidate list.
+        // Round 2's "farthest candidate" fallback still openly violated the
+        // configured separation; the caller (`decide_at`'s switch path)
+        // must instead be able to tell "no valid relocation exists" apart
+        // from a real pick. Signal that by returning `avoid_hz` itself
+        // unchanged, distinct from both the farthest-candidate compromise
+        // and the avoid_hz-blind legacy allocator's fallback (which, with
+        // no own/observed frequencies recorded, always returns the
+        // allocation range's minimum — 200 Hz here, not 1000 Hz).
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.frequency.min_separation_hz = 10_000.0;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+
+        let chosen = op.allocate_smart_frequency(None, None, Some(1000.0));
+
+        assert_eq!(
+            chosen, 1000.0,
+            "must return avoid_hz unchanged (a detectable no-op) rather than the \
+             avoid_hz-blind legacy allocator's 200.0 or a farther-but-still-excluded compromise"
+        );
+    }
+
+    #[test]
     fn allocate_smart_frequency_ignores_avoid_hz_in_hold_mode() {
         // Hold mode returns the pinned/parked offset regardless of avoid_hz —
         // avoid_hz only matters on the Auto ranking path.
@@ -2564,6 +2936,72 @@ mod tests {
             all.push(op.decide_at(even_ts));
         }
         all
+    }
+
+    #[test]
+    fn switch_skips_and_listens_when_no_frequency_honors_the_exclusion() {
+        // Codex review (PR #277, round 3): when min_separation_hz is
+        // configured too large for any candidate to honor the exclusion,
+        // allocate_smart_frequency returns avoid_hz unchanged. Committing to
+        // that as if it were a real switch would reset the streak and
+        // transmit right back on the abandoned frequency. This must instead
+        // fall back to the same "skip the window and listen" path as the
+        // stale-occupancy-data case, preserving the streak.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 2;
+        config.cq_no_response_switch_after = 3;
+        config.listen_cycle.initial_interval = 100;
+        config.frequency.min_separation_hz = 10_000.0; // impossible to honor
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let rounds = run_cq_rounds(&mut op, 4);
+
+        for (i, round) in rounds.iter().enumerate() {
+            assert!(
+                !round
+                    .iter()
+                    .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+                "round {i}: must never report a FrequencyShift when no candidate honors \
+                 the exclusion, got {round:?}"
+            );
+        }
+        // The threshold round (index 3, 0-based — matching
+        // auto_mode_switches_frequency_after_streak_threshold's established
+        // "4th round" cadence for switch_after=3) must listen instead of
+        // transmitting.
+        assert!(
+            rounds[3]
+                .iter()
+                .any(|a| matches!(a, OperatorAction::Listen)),
+            "expected the threshold round to skip and listen, got {:?}",
+            rounds[3]
+        );
+        assert!(
+            !rounds[3]
+                .iter()
+                .any(|a| matches!(a, OperatorAction::Transmit { .. })),
+            "must not transmit on the round where the switch is skipped, got {:?}",
+            rounds[3]
+        );
+        assert_eq!(
+            op.cq_no_response_streak, 3,
+            "the streak must be preserved (not reset, not incremented further) while \
+             the switch keeps being skipped"
+        );
     }
 
     #[test]
@@ -3082,6 +3520,42 @@ mod tests {
             Some(stale_auto_offset),
             "restoring a suppressed Hold-mode CQ must NOT bring back the stale \
              pre-Hold Auto-mode offset"
+        );
+    }
+
+    #[test]
+    fn hold_mode_invalidates_sticky_offset_even_without_a_cq_firing() {
+        // Codex review (PR #276, round 6): the round-5 fix only invalidated
+        // current_cq_offset_hz when a Hold-mode self-CQ actually ran. If the
+        // operator toggles Auto -> Hold -> Auto between CQ opportunities (or
+        // simply never goes idle enough to CQ while in Hold), no CQ ever
+        // fires — the invalidation must still happen every cycle, not only
+        // as a side effect of the self-CQ branch.
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        ));
+        // High idle threshold: no self-CQ will ever fire during this test.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 1000;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(mode.clone());
+        let stale_auto_offset = 1500.0;
+        op.current_cq_offset_hz = Some(stale_auto_offset);
+
+        mode.store(
+            pancetta_core::TxFreqMode::Hold.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // no CQ fires (idle threshold is 1000)
+
+        assert!(
+            op.current_cq_offset_hz.is_none(),
+            "current_cq_offset_hz must be invalidated on observing Hold mode, \
+             even when no self-CQ ran this cycle"
         );
     }
 
