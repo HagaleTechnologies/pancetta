@@ -131,6 +131,16 @@ Regulatory notes, including FCC §97.221 automatic-control considerations:
 
 ## Quick start
 
+**Prebuilt binaries.** No Rust toolchain needed. Every
+[release](https://github.com/HagaleTechnologies/pancetta/releases/latest)
+ships CI-verified binaries for macOS (Apple Silicon), Linux x86_64, Linux
+aarch64 (Raspberry Pi 4/5 and other 64-bit ARM boards), and Windows x86_64.
+Download the archive for your platform, extract it, and run `./pancetta`
+(`pancetta.exe` on Windows) — skip straight to step 3 below. Hamlib is still
+needed at runtime if you want to key a radio (see the table below).
+
+To build from source instead:
+
 **1. Dependencies.**
 
 ```bash

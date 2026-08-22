@@ -43,6 +43,8 @@ jobs:
             os: macos-latest
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
           - target: x86_64-pc-windows-gnu
             os: windows-latest
     runs-on: ${{ matrix.os }}
@@ -156,8 +158,9 @@ jobs:
             echo ""
             echo "---"
             echo "Tagged at \`${GITHUB_SHA}\`. Prebuilt binaries: macOS (Apple Silicon),"
-            echo "Linux x86_64 (gnu), Windows x86_64 (MinGW). Every binary is CI-verified"
-            echo "to embed the real \`ft8_lib\` C decoder (\`pancetta info\`)."
+            echo "Linux x86_64 (gnu), Linux aarch64/Raspberry Pi (gnu), Windows x86_64"
+            echo "(MinGW). Every binary is CI-verified to embed the real \`ft8_lib\` C"
+            echo "decoder (\`pancetta info\`)."
           } >> notes.md
 
       - name: Create draft release (operator publishes)
