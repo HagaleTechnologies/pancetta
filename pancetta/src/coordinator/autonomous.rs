@@ -477,6 +477,38 @@ pub(crate) struct SlotPlan {
 /// so no double-send — while `qso_id == Some` items stay on the raw TX path).
 /// `dry_run` records openings without opening them.
 ///
+/// Codex review (PR #276): `AutonomousOperator::decide_at` counts a self-CQ
+/// toward its no-response streak as soon as it emits the `Transmit` action —
+/// before any of the gates `plan_slot_transmissions` applies have run. This
+/// mirrors those same gating conditions (extracted as its own pure function,
+/// same rationale as `plan_slot_transmissions`, so it can never drift out of
+/// sync with what actually got suppressed) to tell the caller whether THIS
+/// cycle's self-CQ needs its optimistic increment undone via
+/// `AutonomousOperator::discount_suppressed_cq`.
+///
+/// `self_cq_emitted` is `true` iff `decide_at`'s actions this cycle included
+/// a self-CQ (`Transmit` with `qso_id: None` and CQ-shaped text — distinct
+/// from a pounce opening, which doesn't affect the no-response streak).
+pub(crate) fn self_cq_suppressed(
+    self_cq_emitted: bool,
+    runtime_gate_open: bool,
+    policy: pancetta_core::TxPolicy,
+    operator_present: bool,
+    dry_run: bool,
+) -> bool {
+    if !self_cq_emitted {
+        return false;
+    }
+    // (1) Shift+Q runtime gate closed: drops everything, including the CQ.
+    // (2) Policy+presence: suppress `qso_id: None` initiations specifically
+    //     — a self-CQ always has `qso_id: None`, so this always applies to
+    //     it when initiation isn't allowed.
+    // (3) dry_run: opening items are diverted to `dry_run_openings` instead
+    //     of `qso_starts` — never forwarded to the transmitter either.
+    let initiation_allowed = policy.allows_initiation() && operator_present;
+    !runtime_gate_open || !initiation_allowed || dry_run
+}
+
 /// Extracted as a pure function so the full gating/routing matrix is unit
 /// testable without the wall-clock slot loop. The spawned task only does I/O
 /// (logging + `send_message`) around this.
@@ -769,6 +801,7 @@ impl super::ApplicationCoordinator {
                 }
             },
             cq_after_idle_cycles: config.autonomous.cq_after_idle_cycles,
+            cq_no_response_switch_after: config.autonomous.cq_no_response_switch_after,
             max_concurrent_qsos: config.autonomous.max_concurrent_qsos,
             tx_offset_hz: config.autonomous.tx_offset_hz,
             min_dx_score: config.autonomous.min_dx_score,
@@ -1333,6 +1366,13 @@ impl super::ApplicationCoordinator {
                             // Collect Transmit actions, then bundle into a
                             // single MultiTransmitRequest (or single TransmitRequest).
                             let mut tx_items: Vec<(crate::message_bus::TransmitRequestItem, Option<pancetta_core::slot::SlotParity>)> = Vec::new();
+                            // Codex review (PR #276): captured while actions are
+                            // still available (tx_items is moved into
+                            // plan_slot_transmissions below) so we can tell,
+                            // after gating, whether THIS cycle's self-CQ
+                            // (qso_id: None, CQ-shaped text — distinct from a
+                            // pounce opening) actually reached the radio.
+                            let mut self_cq_emitted = false;
 
                             for action in actions {
                                 match action {
@@ -1347,6 +1387,9 @@ impl super::ApplicationCoordinator {
                                                 "Autonomous: opening slot at {:.0} Hz: {}",
                                                 frequency_offset, message_text
                                             );
+                                            if message_text.starts_with("CQ") {
+                                                self_cq_emitted = true;
+                                            }
                                         }
                                         tx_items.push((
                                             crate::message_bus::TransmitRequestItem {
@@ -1572,6 +1615,29 @@ impl super::ApplicationCoordinator {
                                     super::OPERATOR_PRESENCE_WINDOW.as_secs(),
                                     plan.presence_dropped
                                 );
+                            }
+
+                            // Codex review (PR #276): `decide_at` counted this
+                            // cycle's self-CQ toward the no-response streak
+                            // optimistically, before any of these gates ran.
+                            // Mirrors `plan_slot_transmissions`'s own suppression
+                            // conditions exactly (runtime gate drops everything;
+                            // policy+presence drop qso_id:None items; dry_run
+                            // diverts openings to `dry_run_openings` instead of
+                            // `qso_starts`) rather than re-deriving from `plan`,
+                            // so it can never disagree with what actually got
+                            // gated. If none of those apply, the CQ genuinely
+                            // reached the radio and the streak stands.
+                            if self_cq_suppressed(
+                                self_cq_emitted,
+                                runtime_gate_open,
+                                policy,
+                                operator_present,
+                                dry_run,
+                            ) {
+                                let mut op = operator.lock().await;
+                                op.restore_cq_state();
+                                drop(op);
                             }
                             for diagnostic in
                                 gate_diagnostics_for_slot(
@@ -2393,6 +2459,54 @@ mod plan_slot_transmissions_tests {
             plan.policy_dropped, 0,
             "runtime gate already cleared the list"
         );
+    }
+}
+
+#[cfg(test)]
+mod self_cq_suppressed_tests {
+    use super::*;
+    use pancetta_core::TxPolicy;
+
+    #[test]
+    fn no_self_cq_this_cycle_never_suppressed() {
+        assert!(!self_cq_suppressed(
+            false,
+            true,
+            TxPolicy::Full,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn self_cq_with_all_gates_open_is_not_suppressed() {
+        assert!(!self_cq_suppressed(true, true, TxPolicy::Full, true, false));
+    }
+
+    #[test]
+    fn runtime_gate_closed_suppresses_self_cq() {
+        assert!(self_cq_suppressed(true, false, TxPolicy::Full, true, false));
+    }
+
+    #[test]
+    fn policy_disallowing_initiation_suppresses_self_cq() {
+        assert!(self_cq_suppressed(
+            true,
+            true,
+            TxPolicy::RespondOnly,
+            true,
+            false
+        ));
+    }
+
+    #[test]
+    fn operator_absent_suppresses_self_cq() {
+        assert!(self_cq_suppressed(true, true, TxPolicy::Full, false, false));
+    }
+
+    #[test]
+    fn dry_run_suppresses_self_cq() {
+        assert!(self_cq_suppressed(true, true, TxPolicy::Full, true, true));
     }
 }
 
