@@ -3187,6 +3187,46 @@ impl super::ApplicationCoordinator {
                                             dx_parity,
                                             remote_origin,
                                         } => {
+                                            // PAN-23 round-2 (Codex review of #283): reject the
+                                            // unresolved-hash placeholder "<...>" at ADMISSION
+                                            // time, before it can ever be queued. Same bug class
+                                            // as the RespondToCaller fix just above (and the
+                                            // same fix shape): a cross-parity StartQso — e.g. a
+                                            // remote `callStation` request, whose callsign and
+                                            // parity are accepted without validation upstream —
+                                            // queues into `pending_manual_calls` FIRST (below)
+                                            // and only reaches the `qso_manager` guard later, at
+                                            // promotion time via `promote_pending_manual_calls`.
+                                            // Since the InvalidCallsign rejection is
+                                            // deterministic, letting it reach that generic
+                                            // queue-on-failure path would re-queue it at the
+                                            // front on every promotion attempt, repeatedly
+                                            // holding the parity slot against legitimate
+                                            // opposite-parity calls for up to the full
+                                            // 10-minute queue TTL. Reject it here instead,
+                                            // before it ever occupies a slot.
+                                            if callsign == "<...>" {
+                                                warn!(
+                                                    target: "qso.security",
+                                                    "Refusing StartQso for the unresolved hash \
+                                                     placeholder \"<...>\"",
+                                                );
+                                                crate::coordinator::tx::emit_diagnostic_full(
+                                                    &message_bus,
+                                                    ComponentId::Qso,
+                                                    "qso.security",
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                    "Refusing StartQso for the unresolved hash \
+                                                     placeholder \"<...>\" — it carries no \
+                                                     identity information and can never be \
+                                                     transmitted"
+                                                        .to_string(),
+                                                    None,
+                                                    Some(&callsign),
+                                                )
+                                                .await;
+                                                continue;
+                                            }
                                             // Belt-and-suspenders: refuse to call our own
                                             // station regardless of how the command arrived.
                                             // The relay already blocks this via CallStation,
@@ -7147,6 +7187,100 @@ mod respond_to_caller_admission_tests {
                 dx_parity: Some(SlotParity::Odd),
                 step: ResponseStep::ReportAck,
                 snr: Some(-8.0),
+                remote_origin: false,
+            }),
+            Instant::now(),
+        );
+        coordinator.message_bus.send_message(msg).await.unwrap();
+
+        // The admission-time rejection diagnostic must land on the Tui
+        // channel — proves the guard fired before any queueing decision.
+        let rejection = poll_until(&tui_rx, 200, |m| {
+            matches!(
+                &m.message_type,
+                MessageType::DiagnosticEvent { target, callsign, .. }
+                    if *target == "qso.security" && callsign.as_deref() == Some("<...>")
+            )
+        })
+        .await;
+        assert!(
+            rejection.is_some(),
+            "expected a qso.security DiagnosticEvent refusing the unresolved \
+             hash placeholder at admission time"
+        );
+
+        // And it must never have been queued: no "Queued <callsign> ..."
+        // status update naming the placeholder may have been emitted.
+        let mut saw_queued = false;
+        while let Ok(m) = tui_rx.try_recv() {
+            if let MessageType::StatusUpdate(text) = &m.message_type {
+                if text.contains("Queued") && text.contains("<...>") {
+                    saw_queued = true;
+                }
+            }
+        }
+        assert!(
+            !saw_queued,
+            "the unresolved hash placeholder must never be queued — even \
+             when the opposite-parity gate would otherwise defer the call — \
+             or it would repeatedly hold the parity slot against legitimate \
+             opposite-parity calls for up to the full queue TTL"
+        );
+
+        // Cleanup (best-effort, not asserted): retire the priming QSO.
+        let _ = manager
+            .fail_qso(priming_id, pancetta_qso::QsoFailureReason::UserCancelled)
+            .await;
+    }
+
+    /// PAN-23 round-2 (Codex review of #283, second finding): the SAME bug
+    /// class as the `RespondToCaller` test above, via the OTHER admission
+    /// path — `StartQso`, reachable via a remote `callStation` request whose
+    /// callsign/parity are accepted without validation upstream. A
+    /// cross-parity `StartQso` targeting the placeholder would (pre-fix)
+    /// queue into `pending_manual_calls` first and only hit the
+    /// deterministic `InvalidCallsign` rejection later at promotion, where
+    /// the generic failure path re-queues it at the front — repeatedly
+    /// holding the parity slot for up to the full queue TTL. Identical
+    /// assertions to the sibling test: the admission-time guard must fire
+    /// (a `qso.security` diagnostic lands) and the placeholder must never be
+    /// queued.
+    #[tokio::test]
+    async fn start_qso_placeholder_rejected_at_admission_not_queued() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+
+        let (_tui_tx, tui_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+
+        // Pin current_tx_side to Odd, same as the RespondToCaller test.
+        let priming_id = manager
+            .respond_to_cq("K9RDY".to_string(), 1500.0, Some(SlotParity::Even))
+            .await
+            .expect("seeding the parity-pinning QSO");
+        assert_eq!(
+            manager.current_tx_side().await,
+            Some(SlotParity::Odd),
+            "priming QSO must pin current_tx_side to Odd"
+        );
+
+        // A StartQso whose DX transmits on Odd wants us to reply on the
+        // OPPOSITE side (Even) — conflicting with the pinned Odd side.
+        // Pre-fix, this exact shape is what got queued into
+        // `pending_manual_calls` instead of rejected.
+        let msg = ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Qso,
+            MessageType::QsoMessage(QsoMessage::StartQso {
+                callsign: "<...>".to_string(),
+                frequency: 2000,
+                dx_parity: Some(SlotParity::Odd),
                 remote_origin: false,
             }),
             Instant::now(),
