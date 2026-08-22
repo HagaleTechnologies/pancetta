@@ -329,6 +329,74 @@ fn normalized_time_offset(msg: &pancetta_ft8::DecodedMessage, symbol_period_s: f
     }
 }
 
+/// PAN-40 round-4 review — general provenance check: does `msg` carry a
+/// genuine bit-level LDPC/CRC-verified codeword, as opposed to being
+/// built purely from a template/hypothesis's TEXT?
+///
+/// The native pipeline's real per-candidate decode path always
+/// round-trips the actual demodulated codeword through
+/// `MessageParser::parse_payload` (13 call sites across
+/// `pancetta-ft8/src/decoder.rs`, covering every real decode pass:
+/// standard passes 0/1, cross-cycle averaging, coherent multipass,
+/// joint-pair retry, sync-relaxation, BICM-ID rescue, and the standard
+/// fourth-pass-after-a7 iteration) — `parse_payload` always sets
+/// `Ft8Message::payload_bits` to the real 77-bit codeword bits.
+///
+/// Every currently-known speculative/template-derived construction path
+/// — the within-window a7 cross-correlation pass
+/// (`a7_cross_correlation_pass`) AND the cross-sequence a7 consumer
+/// (`try_cross_sequence_decodes`) — instead builds its `Ft8Message` via
+/// `Ft8Message::from_text(template_text)`: parsing the WINNING
+/// TEMPLATE's text, not a real decode. `from_text` never touches
+/// `payload_bits`, leaving it at `Ft8Message::default()`'s empty
+/// `BitVec`. (Confirmed exhaustively: `Ft8Message::from_text` has
+/// exactly two call sites in `decoder.rs`, and both are these two a7
+/// paths.)
+///
+/// This makes "does this message carry a non-empty `payload_bits`" a
+/// single, forward-compatible provenance signal — round-2 excluded
+/// cross-sequence a7 by name (`via_cross_sequence_a7`), round-3 then had
+/// to add a second special case for within-window a7
+/// (`decode_origin == 5`, ALSO used by the unrelated, genuinely-real
+/// fourth-pass-after-a7). Both of those are one-mechanism-at-a-time
+/// patches; this check instead asks "was a real decode ever performed",
+/// so a THIRD speculative mechanism (now or added later) that similarly
+/// builds from template text rather than decoded bits is excluded
+/// automatically, without this function or its caller needing to know
+/// it by name.
+///
+/// Must only be applied to native-pipeline messages — see
+/// [`is_ineligible_for_hash_twin_removal`], which combines this with
+/// [`is_ft8lib_origin_decode`] correctly. (ft8lib-FFI-origin decodes
+/// ALSO have empty `payload_bits` — `from_ft8lib` re-parses the C
+/// library's already-CRC-verified rendered TEXT via the same
+/// `Ft8Message::from_text`, for the same reason a7's template text is
+/// re-parsed — despite being genuine decodes: ft8_lib only ever returns
+/// text for candidates that passed its own C-side CRC check. Applying
+/// this check to an ft8lib-origin message would wrongly exclude it.)
+fn native_decode_lacks_verified_payload(msg: &pancetta_ft8::DecodedMessage) -> bool {
+    msg.message.payload_bits.is_empty()
+}
+
+/// PAN-40 round-4 review — the single, unified "is `msg` ineligible to
+/// participate in hash-twin removal, on either side of the pair" check.
+/// A message is ineligible iff it is a template/hypothesis-derived
+/// candidate rather than a genuine decode of received audio: either the
+/// legacy explicit cross-sequence-a7 marker is set, or (for a
+/// native-pipeline message specifically — never an ft8lib-origin one,
+/// see [`native_decode_lacks_verified_payload`]'s doc comment)
+/// `payload_bits` shows no real LDPC/CRC decode ever happened.
+///
+/// `via_cross_sequence_a7` is redundant with the payload check today
+/// (cross-sequence a7 also builds via `Ft8Message::from_text`, so it
+/// also always has empty `payload_bits`) — kept anyway as a cheap,
+/// intent-revealing, belt-and-suspenders check that stays correct even
+/// if the cross-sequence path's construction ever changes.
+fn is_ineligible_for_hash_twin_removal(msg: &pancetta_ft8::DecodedMessage) -> bool {
+    msg.via_cross_sequence_a7
+        || (!is_ft8lib_origin_decode(msg) && native_decode_lacks_verified_payload(msg))
+}
+
 /// PAN-40: is `word` the literal unresolved i3=4 hash-miss placeholder
 /// token? Mirrors the `None`-branch semantics of
 /// `pancetta_core::callsign::resolve_hash_render` (private to that
@@ -377,9 +445,10 @@ fn normalize_hash_bracket_word(word: &str) -> &str {
 ///   - their [`normalized_time_offset`] (DT, put on a common convention
 ///     across backends) agree within [`hash_twin_time_tolerance_s`] for
 ///     the active protocol (also checked by the caller), AND
-///   - neither side is a cross-sequence-A7 speculative candidate
-///     (`via_cross_sequence_a7 == true`; also checked by the caller —
-///     see its doc comment, PAN-40 round-3 review finding 2), AND
+///   - neither side is a speculative, template/hypothesis-derived
+///     candidate (checked by the caller via
+///     [`is_ineligible_for_hash_twin_removal`] — see its doc comment,
+///     PAN-40 round-4 review), AND
 ///   - after normalizing away hash-resolution differences (unwrapping
 ///     resolved `"<CALL>"` renders to plain `"CALL"`, and treating the
 ///     literal unresolved placeholder `"<...>"` as a wildcard that
@@ -460,11 +529,13 @@ fn hash_twin_keep_first(a: &str, b: &str) -> Option<bool> {
 /// twice (once resolved, once not) by the two decoder backends: their
 /// `frequency_offset`s agree within [`hash_twin_freq_tolerance_hz`],
 /// their [`normalized_time_offset`]s agree within
-/// [`hash_twin_time_tolerance_s`], neither side is a cross-sequence-A7
-/// speculative candidate, and [`hash_twin_keep_first`] confirms the texts
-/// are twins modulo hash resolution. See those functions' doc comments
-/// for the full rationale and the conservative-by-default policy — a
-/// pair that fails ANY check keeps both messages.
+/// [`hash_twin_time_tolerance_s`], neither side is a speculative
+/// template/hypothesis-derived candidate (per
+/// [`is_ineligible_for_hash_twin_removal`]), and
+/// [`hash_twin_keep_first`] confirms the texts are twins modulo hash
+/// resolution. See those functions' doc comments for the full rationale
+/// and the conservative-by-default policy — a pair that fails ANY check
+/// keeps both messages.
 ///
 /// `protocol` is the coordinator's currently-active decode protocol
 /// (`last_protocol` at the call site) — PAN-40 round-3 review finding 3:
@@ -488,18 +559,24 @@ fn hash_twin_keep_first(a: &str, b: &str) -> Option<bool> {
 /// it never sees (and so can never be tricked by) a decode AP-eval-mode
 /// has already decided to suppress.
 ///
-/// PAN-40 round-3 review (Codex finding 2): a pair is never eligible for
-/// twin-removal if EITHER side is a cross-sequence-A7 candidate
-/// (`via_cross_sequence_a7 == true`, appended to `decoded_messages`
-/// before this pass runs — see `invoke_cross_sequence_consumer`). A7
-/// candidates are speculative template hypotheses, not confirmed
-/// CRC-valid decodes from either normal backend; if one were allowed to
-/// "win" a twin comparison it could cause a real, CRC-valid decode
-/// (e.g. the genuine unresolved-hash frame this whole pass exists to
-/// rescue) to be discarded in favor of a guess. Excluding A7 candidates
-/// entirely (rather than merely never letting one survive) is the
-/// simplest option that fully closes this — it also means an A7
-/// candidate can never cause the REAL decode to be dropped either.
+/// PAN-40 round-3 review (Codex finding 2) then round-4 review
+/// (generalized): a pair is never eligible for twin-removal if EITHER
+/// side is a speculative, template/hypothesis-derived candidate rather
+/// than a genuine decode of received audio — see
+/// [`is_ineligible_for_hash_twin_removal`]'s doc comment for the general
+/// mechanism. If a speculative candidate were allowed to "win" a twin
+/// comparison it could cause a real, CRC-valid decode (e.g. the genuine
+/// unresolved-hash frame this whole pass exists to rescue) to be
+/// discarded in favor of a guess.
+///
+/// Round 3 excluded only the cross-sequence-A7 path by its explicit
+/// `via_cross_sequence_a7` marker; round 4 found a SECOND, separately-
+/// marked speculative-decode mechanism (the within-window a7
+/// cross-correlation pass) that path-specific check didn't cover, and
+/// generalized to a payload-provenance check instead of adding a second
+/// special case — see [`is_ineligible_for_hash_twin_removal`] for why
+/// this is expected to also catch a not-yet-invented third mechanism
+/// without needing its own follow-up.
 ///
 /// Returns `(kept_messages, dropped_count)`. Order of the surviving
 /// messages is preserved.
@@ -522,7 +599,9 @@ fn drop_unresolved_hash_twins(
             if drop[j] || messages[i].text == messages[j].text {
                 continue;
             }
-            if messages[i].via_cross_sequence_a7 || messages[j].via_cross_sequence_a7 {
+            if is_ineligible_for_hash_twin_removal(&messages[i])
+                || is_ineligible_for_hash_twin_removal(&messages[j])
+            {
                 continue;
             }
             if (messages[i].frequency_offset - messages[j].frequency_offset).abs()
@@ -577,24 +656,53 @@ mod hash_twin_dedup_tests {
         d
     }
 
-    /// Marks a test-constructed message as native-pipeline-origin (as
-    /// opposed to the default ft8lib-FFI-origin every `decoded_at*`
-    /// message starts as) by giving it a `confidence_features` stamp,
-    /// exactly like the native decoder's `stamp_decode_origin` does.
-    /// Needed to test [`super::normalized_time_offset`]'s asymmetric
-    /// per-backend DT correction (PAN-40 round-3 review finding 1).
+    /// Marks a test-constructed message as a GENUINE native-pipeline
+    /// decode (as opposed to the default ft8lib-FFI-origin every
+    /// `decoded_at*` message starts as): gives it a `confidence_features`
+    /// stamp exactly like the native decoder's `stamp_decode_origin`
+    /// does, AND a non-empty `payload_bits` exactly like a real
+    /// `MessageParser::parse_payload` round-trip does (PAN-40 round-4
+    /// review's `native_decode_lacks_verified_payload` reads this field
+    /// to tell a genuine decode apart from a template-derived one — a
+    /// real native decode always has non-empty `payload_bits`, so this
+    /// double must too or it would be wrongly classified as
+    /// speculative). Needed to test
+    /// [`super::normalized_time_offset`]'s asymmetric per-backend DT
+    /// correction (PAN-40 round-3 review finding 1).
     fn native_origin(mut d: DecodedMessage) -> DecodedMessage {
         d.confidence_features = Some(ConfidenceFeatures {
             decode_origin: Some(0),
             ..Default::default()
         });
+        d.message.payload_bits.resize(77, false);
         d
     }
 
     /// Marks a test-constructed message as a cross-sequence-A7
-    /// speculative candidate (PAN-40 round-3 review finding 2).
+    /// speculative candidate (PAN-40 round-3 review finding 2) — the
+    /// explicit `via_cross_sequence_a7` marker. `payload_bits` is left
+    /// empty (the default), matching `try_cross_sequence_decodes`'s real
+    /// construction via `Ft8Message::from_text`.
     fn a7_origin(mut d: DecodedMessage) -> DecodedMessage {
         d.via_cross_sequence_a7 = true;
+        d
+    }
+
+    /// Marks a test-constructed message as a within-window a7
+    /// cross-correlation candidate (`a7_cross_correlation_pass`,
+    /// `decode_origin == 5`) — PAN-40 round-4 review's actual counter-
+    /// example: native-origin, `decode_origin` stamped, but
+    /// (deliberately, matching production) `payload_bits` left empty
+    /// since it was built from the winning template's TEXT via
+    /// `Ft8Message::from_text`, never a real LDPC/CRC decode. Crucially
+    /// does NOT set `via_cross_sequence_a7` — that flag belongs to the
+    /// DIFFERENT cross-sequence path; this is the separately-marked
+    /// mechanism the round-3 fix didn't cover.
+    fn within_window_a7_origin(mut d: DecodedMessage) -> DecodedMessage {
+        d.confidence_features = Some(ConfidenceFeatures {
+            decode_origin: Some(5),
+            ..Default::default()
+        });
         d
     }
 
@@ -916,6 +1024,79 @@ mod hash_twin_dedup_tests {
             "the same 10 Hz gap must NOT merge under FT8's tighter (3.125 Hz) tolerance"
         );
         assert_eq!(kept_ft8.len(), 2);
+    }
+
+    /// PAN-40 round-4 review, the specific counter-example given: a
+    /// within-window a7 hypothesis competing against a real, CRC-valid,
+    /// still-unresolved decode of the same underlying signal. Without
+    /// the generalized fix this pair looks exactly like an ordinary hash
+    /// twin (same freq/DT, texts differ only by the placeholder), so the
+    /// a7 guess would wrongly displace the real decode -- the round-3
+    /// fix's `via_cross_sequence_a7`-only check didn't catch this
+    /// SEPARATELY-marked mechanism (`decode_origin == 5`, no
+    /// `via_cross_sequence_a7`).
+    #[test]
+    fn within_window_a7_candidate_never_displaces_a_real_decode() {
+        let messages = vec![
+            // Real, CRC-valid decode from the standard pipeline -- still
+            // carries the unresolved hash placeholder.
+            decoded_at(2700.0, "<...> YS/WE9G RR73"),
+            // Speculative within-window a7 template hypothesis at the
+            // same freq/DT, "resolving" the hash to a guessed callsign.
+            within_window_a7_origin(decoded_at(2700.0, "<K1ABC> YS/WE9G RR73")),
+        ];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
+        assert_eq!(
+            dropped, 0,
+            "a within-window a7 candidate must never participate in hash-twin removal, \
+             even though it doesn't set via_cross_sequence_a7"
+        );
+        assert_eq!(kept.len(), 2);
+        assert!(
+            kept.iter().any(|m| m.text == "<...> YS/WE9G RR73"),
+            "the real CRC-valid decode must survive regardless of the a7 guess; kept={:?}",
+            kept.iter().map(|m| m.text.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PAN-40 round-4 review: proves the exclusion is truly UNIFIED, not
+    /// one check per known `decode_origin` value. Every currently-
+    /// assigned `decode_origin` ordinal (see
+    /// `ConfidenceFeatures::decode_origin`'s doc comment in
+    /// `pancetta-ft8/src/message.rs` -- ordinals 0-7 are documented
+    /// there as "fully assigned") is exercised here with deliberately
+    /// EMPTY `payload_bits` ("what if a future speculative mechanism
+    /// stamped this ordinal"), and every single one must be excluded --
+    /// because the check keys off `payload_bits`, never the ordinal
+    /// value. If a NEW ordinal is ever added for a future decode pass,
+    /// extending the range below is the obvious place to confirm it
+    /// stays covered, instead of silently falling through like the
+    /// round-3-to-round-4 regression did.
+    #[test]
+    fn every_known_decode_origin_ordinal_is_excluded_when_payload_is_unverified() {
+        for origin in 0u8..=7 {
+            let mut speculative = decoded_at(2700.0, "<K1ABC> YS/WE9G RR73");
+            speculative.confidence_features = Some(ConfidenceFeatures {
+                decode_origin: Some(origin),
+                ..Default::default()
+            });
+            // payload_bits deliberately left empty -- this is the
+            // property under test, independent of which ordinal is
+            // stamped.
+            assert!(
+                speculative.message.payload_bits.is_empty(),
+                "test setup sanity check for origin {origin}"
+            );
+
+            let messages = vec![decoded_at(2700.0, "<...> YS/WE9G RR73"), speculative];
+            let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
+            assert_eq!(
+                dropped, 0,
+                "decode_origin={origin} with unverified payload_bits must be excluded from \
+                 hash-twin removal regardless of which ordinal it carries"
+            );
+            assert_eq!(kept.len(), 2, "origin={origin}");
+        }
     }
 }
 
