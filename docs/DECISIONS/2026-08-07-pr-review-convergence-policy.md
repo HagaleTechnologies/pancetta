@@ -131,57 +131,59 @@ accurate for whichever caller does invoke it after `land-pr` has acted in
 the same session.
 
 ```bash
-BRANCH="$(git symbolic-ref --short -q HEAD || true)"
-if [ -z "$BRANCH" ]; then
-  echo "HEAD is detached — this check assumes a checked-out branch matching the PR's remote head." >&2
-  echo "Check out that branch explicitly before running it, rather than guessing at a ref." >&2
-  exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
-fi
 if [ -z "${PR_NUMBER:-}" ]; then
   echo "PR_NUMBER is not set — this check requires it (both resolve-review-feedback and land-pr establish it in their own Step 1)." >&2
   echo "Cannot verify remote state without it. Pausing rather than guessing." >&2
-  exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
+  exit 0  # deliberate: inconclusive pause, not a detected collision — see the exit-code contract below
 fi
+COLLISION_REF="refs/hag-collision-check/pr-${PR_NUMBER}-$$"
 FETCH_ERR="$(mktemp)"
-trap 'rm -f "$FETCH_ERR"' EXIT
-if ! git fetch origin "refs/pull/${PR_NUMBER}/head" --quiet 2>"$FETCH_ERR"; then
+trap 'rm -f "$FETCH_ERR"; git update-ref -d "$COLLISION_REF" >/dev/null 2>&1 || true' EXIT
+if ! git fetch origin "refs/pull/${PR_NUMBER}/head:${COLLISION_REF}" --quiet --force 2>"$FETCH_ERR"; then
   echo "Could not fetch the PR's head ref (refs/pull/${PR_NUMBER}/head) — remote state is unverifiable: $(cat "$FETCH_ERR")" >&2
   echo "Pausing rather than treating an unreachable remote as collision-free." >&2
-  exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
+  exit 0  # deliberate: inconclusive pause, not a detected collision — see the exit-code contract below
 fi
-REMOTE_SHA="$(git rev-parse FETCH_HEAD 2>/dev/null || echo "")"
+REMOTE_SHA="$(git rev-parse --verify -q "$COLLISION_REF" 2>/dev/null || echo "")"
 if [ -z "$REMOTE_SHA" ]; then
-  echo "Could not resolve FETCH_HEAD after a successful fetch — remote state is unverifiable." >&2
+  echo "Could not resolve the fetched PR head — remote state is unverifiable." >&2
   echo "Pausing rather than treating an unreachable remote as collision-free." >&2
-  exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
+  exit 0  # deliberate: inconclusive pause, not a detected collision — see the exit-code contract below
 fi
 LOCAL_SHA="$(git rev-parse HEAD)"
 if [ "$REMOTE_SHA" != "$LOCAL_SHA" ] && ! git merge-base --is-ancestor "$REMOTE_SHA" HEAD 2>/dev/null; then
-  CHERRY_OUT="$(git cherry HEAD "$REMOTE_SHA" 2>/dev/null)" || CHERRY_OUT="+ unverifiable"
-  if ! echo "$CHERRY_OUT" | grep -q '^+'; then
-    : # every commit unique to $REMOTE_SHA is patch-equivalent to something already in our
-      # history (git cherry reports no '+' lines) — this is our own rebase/amend of content
-      # we already have, not new content from someone else
-  else
+  if ! CHERRY_OUT="$(git cherry HEAD "$REMOTE_SHA" 2>/dev/null)"; then
+    echo "Could not compare local and remote history (git cherry failed — shallow checkout without a shared merge base?) — remote state is unverifiable." >&2
+    echo "Pausing rather than treating an unreachable comparison as collision-free." >&2
+    exit 0  # deliberate: inconclusive pause, not a detected collision — see the exit-code contract below
+  fi
+  if grep -q '^+' <<<"$CHERRY_OUT"; then
     RECENT_AUTHOR="$(git log -1 --format='%an <%ae> at %ad' "$REMOTE_SHA" 2>/dev/null || echo "unknown")"
     echo "The PR's remote head (${REMOTE_SHA}) is not reachable from our local history and we didn't produce it (${RECENT_AUTHOR})." >&2
     echo "Possible concurrent session on this PR. Pausing — do not race it." >&2
-    exit 2  # see the exit-code contract below — distinct from 0 (clean, or couldn't verify) so an automated caller can tell them apart
+    exit 2  # confirmed collision — see the exit-code contract below
   fi
 fi
 ```
 
-This fetches `refs/pull/${PR_NUMBER}/head` directly into `FETCH_HEAD` — no
-local branch or `origin/$BRANCH` ref needed, so it works identically for
-same-repo and fork PRs (a fork PR's head branch doesn't exist as
-`origin/$BRANCH` at all — it lives in the contributor's fork), and is
-immune to `--single-branch` clone limitations (a `--single-branch`
-clone's `remote.origin.fetch` refspec may not map the current branch
-name, so fetching `origin "$BRANCH"` can succeed without actually
-updating the `origin/$BRANCH` ref; `git fetch origin <explicit-ref>`
-bypasses the configured refspec entirely). `FETCH_HEAD` is also always
-exactly the commit this fetch just retrieved, so there's no separate
-"which ref did we actually just fetch" ambiguity to track.
+This fetches `refs/pull/${PR_NUMBER}/head` directly into a unique
+per-invocation ref (`refs/hag-collision-check/pr-${PR_NUMBER}-$$`, `$$`
+being this process's PID) — no local branch or `origin/$BRANCH` ref
+needed, so it works identically for same-repo and fork PRs (a fork PR's
+head branch doesn't exist as `origin/$BRANCH` at all — it lives in the
+contributor's fork), and is immune to `--single-branch` clone limitations
+(a `--single-branch` clone's `remote.origin.fetch` refspec may not map the
+current branch name, so fetching `origin "$BRANCH"` can succeed without
+actually updating the `origin/$BRANCH` ref; `git fetch origin
+<explicit-ref>` bypasses the configured refspec entirely). Fetching into
+`$COLLISION_REF` instead of `FETCH_HEAD` closes a real race HAG-6 found:
+`FETCH_HEAD` is a single shared mutable file, so a later fetch — this same
+session's own subsequent steps, or a second session sharing the same
+checkout (not a worktree) — landing between this fetch and the read of it
+could silently overwrite `FETCH_HEAD` and make the check compare against
+the wrong commit. A PID-suffixed ref name is unique to this invocation, so
+nothing else can touch it before it's read; the `trap` deletes it on exit
+either way, so it never lingers as fleet-wide ref clutter.
 
 Deliberately stateless — no baseline file. A persisted "last known remote
 SHA" sounds stronger, but it has to be scoped correctly (per-branch,
@@ -228,7 +230,15 @@ of scope for this fix. (4) `git cherry` does not evaluate merge commits
 at all — a foreign session's merge commit (e.g. merging base into the PR
 branch and resolving real conflicts) that carries content beyond its
 parents is invisible to this check if all of that merge's non-merge
-parent commits are otherwise already known to us.
+parent commits are otherwise already known to us. (5) more fundamentally,
+patch-equivalence proves content-equivalence, not provenance — a
+legitimate `--amend`, a whitespace-only remote change, a remote force-push
+that only removes commits, or two workers independently converging on
+identical content can all fool this heuristic in one direction or the
+other. HAG-7 tracks whether this needs a real redesign (e.g. a
+session-scoped provenance baseline) rather than another point-patch —
+this file's own `## Two check-in triggers` section named the exact
+condition for that kind of check-in.
 
 **Exit-code contract.** Exit 2 means a real collision was detected and the
 worker paused — an automated caller can distinguish this from exit 0
@@ -236,11 +246,11 @@ worker paused — an automated caller can distinguish this from exit 0
 parsing stderr. Both still count as "don't proceed" for a human/agent
 caller; the distinction is only for a scripted wrapper that wants to log
 or alert differently on an actual collision versus an inconclusive check.
-Every pause-without-a-detected-collision case above — detached HEAD,
-unset `PR_NUMBER`, a failed fetch, and an unresolvable `FETCH_HEAD` after
-an ostensibly successful fetch — stays `exit 0`: they're "couldn't
-verify, pausing defensively," not "detected a real collision." Only the
-actual-collision-detected branch uses `exit 2`.
+Every pause-without-a-detected-collision case above — unset `PR_NUMBER`, a
+failed fetch, an unresolvable fetched ref after an ostensibly successful
+fetch, and a `git cherry` comparison failure — stays `exit 0`: they're
+"couldn't verify, pausing defensively," not "detected a real collision."
+Only the actual-collision-detected branch uses `exit 2`.
 
 If detected, do not race it — pause and surface it (hand off, split scope
 explicitly, or stand down) rather than pushing a competing fix round.
@@ -290,6 +300,13 @@ no longer fails open — its exit status is captured explicitly rather than inhe
 downstream `grep`; added the `git cherry`-skips-merge-commits gap to the known-gaps list;
 exit-code-contract prose and inline comments now cover all four `exit 0` pause sites, not just
 the original two; `land-pr`'s `diagnose_behind` sync no longer silently no-ops when the
-`refs/pull/${PR_NUMBER}/head` fetch itself fails). Edit
+`refs/pull/${PR_NUMBER}/head` fetch itself fails); corrected a fourth time 2026-08-22 (HAG-6: closed a
+shared-`FETCH_HEAD` race condition — the fetch now targets a unique per-invocation ref instead
+of the single shared mutable `FETCH_HEAD` file; fixed a `git cherry` failure being
+miscategorized as a confirmed collision instead of an inconclusive pause; fixed a pipefail
+SIGPIPE bug in the collision scan (`grep -q` piped from `echo` could SIGPIPE-kill the upstream
+`echo` and silently flip a real collision into "no collision"; replaced with a herestring);
+removed the now-dead detached-HEAD guard, which no longer served any function after HAG-5's
+fetch-mechanism rewrite). Edit
 `credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`,
 not a per-repo copy.
