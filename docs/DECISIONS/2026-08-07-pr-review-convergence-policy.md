@@ -47,9 +47,10 @@ Classify by substance, not by the reviewer's own label — many bots use
 against: **P1** = correctness bugs, security vulnerabilities, data
 loss/corruption, broken build/tests, spec/contract violations. **P2** =
 style, naming, structure preferences, unverified micro-optimizations, doc
-nits, subjective suggestions. Only defer to an explicit tag when its
-vocabulary maps cleanly onto blocking-vs-not (e.g. `critical`/`blocking` →
-P1, `minor`/`nit`/`suggestion` → P2). When genuinely unsure, treat it as
+nits, subjective suggestions. A finding's own substance always wins over
+its label — use an explicit tag (e.g. `critical`/`blocking` → P1,
+`minor`/`nit`/`suggestion` → P2) only as a shortcut when nothing about the
+finding itself contradicts that tag. When genuinely unsure, treat it as
 P1 — the failure mode to avoid is silently deferring a real bug.
 
 ## Ticketing mechanics
@@ -94,7 +95,10 @@ Treat local findings with the same severity/round mechanics as remote ones. This
 replace the remote check — it's still required and still the authoritative round counter —
 it just means the remote round should usually come back clean, so a round that does find
 something is genuinely new signal, not something a first local look would have caught for
-free.
+free. A local finding has no PR review thread, so the ticketing mechanics above adapt: paste
+the local reviewer's finding verbatim same as any other, write `(found by local review gate,
+no PR thread)` in place of the thread URL, and skip the reply-and-resolve-thread step (there
+is no thread to resolve) — filing to the single follow-up ticket is what clears it.
 
 ## Collision awareness
 
@@ -185,4 +189,6 @@ schedule (rounds 6-15/16-25, local-review gate, collision-awareness); canonicali
 credenza 2026-08-21 (this file becomes the single source, synced into each repo's
 `docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md`); corrected 2026-08-22 (restored
 several clauses a rewrite had silently dropped, fixed a false-positive bug in the
-collision-awareness check). Edit this file, not a per-repo copy.
+collision-awareness check). Edit
+`credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`,
+not a per-repo copy.
