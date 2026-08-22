@@ -1,0 +1,474 @@
+name: Supply Chain
+
+# (CAT-299) Supply-chain gate for dependency changes. Governance: dispensa ADR-0014.
+#
+# WHY THIS RUNS ON EVERY PR: the job named "Supply Chain" below is a
+# ruleset-required status check on main. A required check that only ran on
+# some PRs would leave every other PR stuck at "Expected -- waiting for
+# status" forever, so this workflow runs on every PR and passes trivially
+# when no dependency manifest, lockfile, or workflow changed. When one DID
+# change, the scanners run and GitHub's native auto-merge (armed by
+# auto-merge.yml / dependabot-auto-merge.yml via `gh pr merge --auto`)
+# cannot fire until they pass -- that is the "dependency bumps are excluded
+# from blanket standing auto-merge until a scan passes" carve-out, enforced
+# by the ruleset rather than by convention.
+#
+# What runs when dependencies changed:
+#   * osv            -- google/osv-scanner PR diff against OSV.dev. Fails only
+#                       on advisories NEW in this PR (pre-existing ones don't
+#                       block the fix). OSV.dev carries the OpenSSF
+#                       malicious-packages feed (MAL-* ids), e.g. the Aug 2026
+#                       keyv@6.0.0 compromise is MAL-2026-11524 -- so this is a
+#                       malware gate, not just a CVE gate.
+#   * install-policy -- `cargo fetch --locked` (every crate must still resolve to exactly the
+#                       pinned checksum; no build.rs runs) and no git/path crate sources.
+#   * actions-pins   -- on EVERY PR: every NEWLY
+#                       ADDED executable reference (parsed from the YAML at the
+#                       merge-base and head, per file and per occurrence: step
+#                       and reusable-workflow `uses:`, job container / service
+#                       images, local ./actions expanded, docker-action images)
+#                       must be pinned: a floating branch ref, no version, or an
+#                       image without an @sha256 digest fails; a tag pin warns --
+#                       SHA pinning of the whole fleet's workflows is a separate
+#                       decision, ADR-0014 open questions.
+#
+# THREAT MODEL / KNOWN LIMIT: this gate defends against malicious DEPENDENCY
+# CONTENT. It does not defend against a PR author who rewrites this file --
+# on a same-repo PR a `pull_request` workflow runs the PR's own definition.
+# The fleet's PR authors are a single trusted identity that can already edit
+# any workflow (CI included); a compromised author identity is the
+# credential-rotation runbook's domain (dispensa docs/runbooks). GitHub's
+# "require workflows to pass" ruleset rule (base-controlled definition) is
+# Enterprise-only; `pull_request_target` would run untrusted PR content under
+# the base definition AND break the OSV base/head diff (GITHUB_SHA is the base
+# there). Every action below is pinned to a full commit SHA so the verifier
+# itself cannot change underneath the check.
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect dependency changes
+    runs-on: ubuntu-latest
+    # paths-filter lists the PR's files through the API on pull_request events;
+    # without pull-requests:read it fails "Resource not accessible by
+    # integration" (seen live on the first run of this workflow).
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          filters: |
+            deps:
+              - '**/package.json'
+              - '**/package-lock.json'
+              - '**/npm-shrinkwrap.json'
+              - '**/pnpm-lock.yaml'
+              - '**/pnpm-workspace.yaml'
+              - '**/.npmrc'
+              - '**/yarn.lock'
+              - '**/bun.lock'
+              - '**/bun.lockb'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '.github/workflows/**'
+              - '**/action.yml'
+              - '**/action.yaml'
+              - '**/Dockerfile*'
+              - '**/dockerfile*'
+              - '**/*.Dockerfile'
+              - '**/*.dockerfile'
+  osv:
+    name: OSV advisories (incl. malicious-package MAL-*)
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@8deb546fdb875b9996d27d4950be7312dac076a1 # v2.5.0
+    with:
+      # The job conclusion is the gate; code-scanning upload needs GitHub
+      # Advanced Security on private repos and is not what we're relying on.
+      upload-sarif: false
+      fail-on-vuln: true
+
+  install-policy:
+    name: Lockfile integrity (cargo fetch --locked) + source policy
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # 0. Every manifest must be covered by a lockfile this gate validates
+      #    (pnpm importer / sibling package-lock.json / a package of the Cargo
+      #    workspace its Cargo.lock actually locks); yarn/bun/shrinkwrap are
+      #    refused rather than silently passed. Every manifest and lockfile
+      #    kind named here is also in the detector above, so a PR that adds
+      #    only a refused kind still reaches this step.
+      - name: Every manifest is covered by a validated lockfile
+        run: |
+          python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
+          python3 - cargo <<'PY'
+          import os, sys, yaml
+          # Every npm/pnpm manifest must be covered by a lockfile this gate validates
+          # (CAT-299 / ADR-0014, local review gate round 5): a package.json is covered if
+          # it is an importer of a pnpm-lock.yaml (workspace member) or has a sibling
+          # package-lock.json / pnpm-lock.yaml. yarn.lock / bun.lock are NOT validated by
+          # this gate and are refused outright rather than silently passed.
+          # argv[1]: comma-separated lockfile kinds this repo's gate actually validates
+          # (pnpm,npm[,cargo] for pnpm workspaces; npm only for an npm repo; cargo for Rust). A lockfile of any
+          # other kind is refused, never counted as coverage (local gate round 6).
+          ACCEPT = set((sys.argv[1] if len(sys.argv) > 1 else "pnpm,npm").split(","))
+          PRUNE = {"node_modules", "target", ".git", ".worktrees"}
+          manifests, covered, refused = [], set(), []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in PRUNE]
+              rel = os.path.normpath(root)
+              if "package.json" in files:
+                  manifests.append(rel)
+              if "package-lock.json" in files:
+                  (covered.add(rel) if "npm" in ACCEPT else refused.append(os.path.join(rel, "package-lock.json")))
+              if "pnpm-lock.yaml" in files:
+                  if "pnpm" in ACCEPT:
+                      covered.add(rel)
+                      lock = yaml.safe_load(open(os.path.join(root, "pnpm-lock.yaml"))) or {}
+                      for imp in (lock.get("importers") or {}):
+                          covered.add(os.path.normpath(os.path.join(rel, imp)))
+                  else:
+                      refused.append(os.path.join(rel, "pnpm-lock.yaml"))
+              for f in ("yarn.lock", "bun.lock", "bun.lockb"):
+                  if f in files:
+                      refused.append(os.path.join(rel, f))
+          # Cargo manifests: a Cargo.toml is covered only if it is a package of the
+          # workspace that some Cargo.lock actually locks (cargo metadata --locked from
+          # that lock's directory; an ancestor lock does NOT cover a nested standalone
+          # project -- Codex round 2). Refused outright if this gate does not validate Cargo.
+          import json, subprocess
+          cargo_manifests, cargo_locks = [], []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in PRUNE]
+              rel = os.path.normpath(root)
+              if "Cargo.toml" in files: cargo_manifests.append(os.path.normpath(os.path.join(rel, "Cargo.toml")))
+              if "Cargo.lock" in files: cargo_locks.append(rel)
+          cargo_covered = set()
+          if "cargo" in ACCEPT:
+              for d in cargo_locks:
+                  r = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"], cwd=d, capture_output=True, text=True)
+                  if r.returncode != 0:
+                      print(f"::error::{d}/Cargo.lock: cargo metadata --locked failed (manifest/lockfile drift?)\n{r.stderr.strip()[:400]}"); sys.exit(1)
+                  cargo_covered.add(os.path.normpath(os.path.join(d, "Cargo.toml")))   # the workspace root manifest itself
+                  for pkg in json.loads(r.stdout)["packages"]:
+                      cargo_covered.add(os.path.normpath(os.path.relpath(pkg["manifest_path"], ".")))
+          if cargo_manifests and "cargo" not in ACCEPT:
+              refused += cargo_manifests
+          bad = [m for m in manifests if m not in covered]
+          bad += [m for m in cargo_manifests if "cargo" in ACCEPT and m not in cargo_covered]
+          manifests = manifests + (cargo_manifests if "cargo" in ACCEPT else [])
+          if refused:
+              print("::error::lockfile format(s) this gate does not validate -- add validation or remove them:")
+              print("\n".join("  " + r for r in refused))
+          if bad:
+              print("::error::manifest(s) with no covering validated lockfile (not installed, not signature-audited, not source-checked):")
+              print("\n".join("  " + b for b in bad))
+          if refused or bad:
+              sys.exit(1)
+          print(f"all {len(manifests)} manifest(s) are covered by a validated lockfile")
+          PY
+      # Per Cargo project: the parsed source policy (registry crates or
+      # (name, version) workspace members only; cargo metadata --no-deps --locked,
+      # no download) runs BEFORE cargo fetch --locked resolves and
+      # checksum-verifies the crates of THAT project.
+      - name: Crate source policy + cargo fetch --locked (every Cargo.lock)
+        run: |
+          cat > /tmp/cargo-sources.py <<'PY'
+          import json, subprocess, sys, tomllib
+          # Registry-only source policy for Cargo.lock (CAT-299 / ADR-0014). A path
+          # dependency has NO `source` field in Cargo.lock, so "no git source" is not
+          # enough: every package must either be a workspace member or come from a
+          # registry.
+          # --locked: a manifest that drifted from Cargo.lock must FAIL here instead of
+          # cargo silently regenerating the lockfile we are about to judge (local gate
+          # round 10).
+          meta = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"]))
+          # workspace_members are package IDs; identify members by (name, version) so a
+          # path crate that merely reuses a member's NAME cannot pass as that member.
+          ids = set(meta["workspace_members"])
+          members = {(p["name"], p["version"]) for p in meta["packages"] if p["id"] in ids}
+          lock = tomllib.load(open("Cargo.lock", "rb"))
+          bad = []
+          for p in lock.get("package", []):
+              src = p.get("source")
+              if src is None:
+                  if (p["name"], p["version"]) not in members:
+                      bad.append(f"{p['name']} {p['version']}: path dependency (not a workspace member)")
+              elif not src.startswith("registry+"):
+                  bad.append(f"{p['name']} {p['version']}: source={src}")
+          if bad:
+              print("::error::non-registry crate sources in Cargo.lock:"); print("\n".join("  " + b for b in bad)); sys.exit(1)
+          print(f"all {len(lock.get('package', []))} locked crates are registry crates or workspace members ({len(members)} members)")
+          PY
+          n=0
+          while IFS= read -r lock; do
+            n=$((n+1)); echo "== $lock"; ( cd "$(dirname "$lock")" && python3 /tmp/cargo-sources.py && cargo fetch --locked )
+          done < <(find . \( -name node_modules -o -name target -o -name .git \) -prune -o -name 'Cargo.lock' -print | sort)
+          echo "checked $n Cargo lockfile(s)"
+
+  # Runs on EVERY PR (~10s): no path filter can know the custom filenames a
+  # Docker action's runs.image may point at, so the script classifies every
+  # changed file itself (local review gate, round 3).
+  actions-pins:
+    name: Newly added actions are pinned
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Newly added actions must be pinned (structural YAML check)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
+          cat > /tmp/action-pins.py <<'PY'
+          import os, re, subprocess, sys, yaml
+          from collections import Counter
+          # Newly-added-action pin policy (CAT-299 / ADR-0014). Structural, not textual:
+          # every workflow (.github/workflows/*.yml) and every action manifest
+          # (**/action.yml|yaml) changed in the PR is parsed at the PR's MERGE-BASE and at
+          # HEAD; the executable references of each file -- step `uses`, job-level
+          # reusable-workflow `uses`, job `container`/`services.*.image`, composite/docker
+          # action `runs.image` (a Dockerfile-backed action's FROM images; any changed
+          # Dockerfile, or any file an action manifest names as its runs.image, whatever its
+          # filename), with local `./path` actions expanded recursively -- are
+          # counted PER FILE, and only occurrences new in that file are judged: floating
+          # branch ref or no version -> fail; docker:// or container image without an
+          # immutable @sha256 digest -> fail; tag pin -> warning; SHA -> ok. Local
+          # references are expanded per invocation (cycle-safe, fail-closed on depth) and
+          # a file renamed INTO an executable location is judged as new.
+          # HagaleTechnologies/ refs are the fleet's own code.
+          base_arg, head = sys.argv[1], sys.argv[2]
+          def sh(*a):
+              r = subprocess.run(a, capture_output=True, text=True); return r.returncode, r.stdout
+          rc, mb = sh("git", "merge-base", base_arg, head)
+          base = mb.strip() if rc == 0 and mb.strip() else base_arg   # judge only the PR's own additions
+          def dockerfile_images(text):
+              """container:<image> for every FROM that is not `scratch`, an earlier build
+              stage (alias OR numeric index), honouring a leading `# escape=` directive for
+              line continuations; `ARG NAME=default` declared before a FROM is substituted
+              ($NAME / ${NAME} / ${NAME:-fallback}); an unresolved variable stays in the
+              ref and fails the digest check (fail closed)."""
+              esc = "\\"
+              for raw in text.splitlines():
+                  m = re.match(r"\s*#\s*escape\s*=\s*(\S)", raw, re.I)
+                  if m: esc = m.group(1); continue
+                  if raw.strip() and not raw.lstrip().startswith("#"): break           # directives only precede instructions
+              logical, buf = [], ""
+              for raw in text.splitlines():
+                  if raw.lstrip().startswith("#"): continue
+                  if raw.rstrip().endswith(esc):
+                      buf += raw.rstrip()[:-1] + " "; continue
+                  logical.append(buf + raw); buf = ""
+              if buf: logical.append(buf)
+              args, stages, out, index = {}, set(), [], 0
+              for line in logical:
+                  m = re.match(r"\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?\s*$", line, re.I)
+                  if m: args[m.group(1)] = (m.group(2) or "").strip().strip("\"'"); continue
+                  m = re.match(r"\s*FROM\s+((?:--\S+\s+)*)(\S+)(?:\s+AS\s+(\S+))?", line, re.I)
+                  if not m: continue
+                  img, alias = m.group(2), m.group(3)
+                  img = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
+                               lambda v: (args.get(v.group(1)) or (v.group(2) if v.group(2) is not None else args.get(v.group(1), v.group(0)))) if v.group(2) is not None or v.group(1) in args else v.group(0), img)
+                  img = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda v: args.get(v.group(1), v.group(0)), img)
+                  is_stage_index = img.isdigit() and int(img) < index
+                  if img.lower() != "scratch" and img.lower() not in stages and not is_stage_index:
+                      out.append("container:" + img)
+                  if alias: stages.add(alias.lower())
+                  index += 1
+              return out
+          def manifests_at(rev):
+              _, out = sh("git", "ls-tree", "-r", "--name-only", "-z", rev)
+              return [p for p in out.split("\0") if os.path.basename(p) in ("action.yml", "action.yaml")]
+          def image_files_at(rev):
+              """Every file an action manifest at `rev` builds from (runs.image as a relative
+              path, any filename) -- a change to such a file changes what executes."""
+              refs = set()
+              for m in manifests_at(rev):
+                  doc = load(rev, m)
+                  runs = doc.get("runs") if isinstance(doc, dict) else None
+                  img = runs.get("image") if isinstance(runs, dict) else None
+                  if isinstance(img, str) and img.strip() and not img.startswith("docker://"):
+                      refs.add(os.path.normpath(os.path.join(os.path.dirname(m), img.strip())))
+              return refs
+          REF_CACHE = {}
+          def referenced_at(rev):
+              if rev not in REF_CACHE: REF_CACHE[rev] = image_files_at(rev)
+              return REF_CACHE[rev]
+          REFERENCED = None
+          def is_target(p):
+              global REFERENCED
+              if REFERENCED is None: REFERENCED = referenced_at(head) | referenced_at(base)   # union: classify the CHANGE
+              b = os.path.basename(p); bl = b.lower()
+              return ((p.startswith(".github/workflows/") and p.endswith((".yml", ".yaml"))) or b in ("action.yml", "action.yaml")
+                      or bl.startswith("dockerfile") or bl.endswith(".dockerfile") or p in REFERENCED)
+          def changed_pairs():
+              """[(base_path|None, head_path|None)] rename-aware, NUL-safe."""
+              _, raw = sh("git", "diff", "-z", "--name-status", "-M", base, head, "--", ".")
+              raw = raw.split("\0"); pairs, i = [], 0
+              while i < len(raw) and raw[i]:
+                  st = raw[i]; i += 1
+                  if st[0] in "RC":
+                      old, new = raw[i], raw[i + 1]; i += 2
+                      pairs.append((old if st[0] == "R" else None, new))
+                  else:
+                      p = raw[i]; i += 1
+                      pairs.append((None if st[0] == "A" else p, None if st[0] == "D" else p))
+              out = []
+              for b, h in pairs:
+                  if h is not None and not is_target(h): continue
+                  if h is None and not is_target(b): continue
+                  # a file renamed INTO an executable location was not executable before:
+                  # judge it as new rather than subtracting its old, inert contents
+                  if b is not None and not is_target(b): b = None
+                  out.append((b, h))
+              return out
+          def show(rev, path):
+              rc, out = sh("git", "show", f"{rev}:{path}"); return out if rc == 0 else None
+          def load(rev, path):
+              txt = show(rev, path)
+              if txt is None: return None
+              try: return yaml.safe_load(txt)
+              except yaml.YAMLError as e:
+                  print(f"::error::{path}@{rev[:8]}: unparseable YAML ({e}) -- refusing to judge it"); sys.exit(1)
+          def image_ref(v):
+              if isinstance(v, dict): v = v.get("image")
+              return f"container:{v.strip()}" if isinstance(v, str) and v.strip() else None
+          MAX_DEPTH = 12
+          def refs_of(rev, doc, acc, stack, depth=0, manifest_path=""):
+              if not isinstance(doc, dict): return
+              def expand(path, label):
+                  # every invocation is expanded (per-occurrence policy); `stack` is the
+                  # current recursion path only, so a cycle is cut but a repeated
+                  # invocation is still counted; too-deep chains FAIL rather than vanish.
+                  if path in stack:
+                      return
+                  if depth >= MAX_DEPTH:
+                      print(f"::error::local reference chain deeper than {MAX_DEPTH} at {label} -- refusing to skip it"); acc["MISSING:" + label] += 1; return
+                  sub = load(rev, path)
+                  if sub is None:
+                      print(f"::error::local reference {label} has no {path} at {rev[:8]}"); acc["MISSING:" + label] += 1; return
+                  refs_of(rev, sub, acc, stack | {path}, depth + 1, path)
+              def add(ref, job_level=False):
+                  ref = ref.strip()
+                  if ref.startswith("./"):
+                      local = ref[2:].rstrip("/")
+                      if job_level and local.endswith((".yml", ".yaml")):      # local reusable workflow
+                          expand(local, ref)
+                      else:                                                    # local action directory
+                          cand = [f"{local}/action.yml", f"{local}/action.yaml"]
+                          hit = next((c for c in cand if show(rev, c) is not None), None)
+                          expand(hit if hit else cand[0], ref)
+                  else: acc[ref] += 1
+              def steps(lst):
+                  for st in lst or []:
+                      if isinstance(st, dict) and isinstance(st.get("uses"), str): add(st["uses"])
+              jobs = doc.get("jobs")
+              if isinstance(jobs, dict):
+                  for job in jobs.values():
+                      if not isinstance(job, dict): continue
+                      if isinstance(job.get("uses"), str): add(job["uses"], job_level=True)
+                      if isinstance(job.get("steps"), list): steps(job["steps"])
+                      c = image_ref(job.get("container"))
+                      if c: acc[c] += 1
+                      svcs = job.get("services")
+                      if isinstance(svcs, dict):
+                          for sv in svcs.values():
+                              c = image_ref(sv)
+                              if c: acc[c] += 1
+              runs = doc.get("runs")
+              if isinstance(runs, dict):
+                  if isinstance(runs.get("steps"), list): steps(runs["steps"])
+                  img = runs.get("image")
+                  if isinstance(img, str) and img.startswith("docker://"): acc[img.strip()] += 1
+                  elif isinstance(img, str) and img.strip():
+                      # Dockerfile-backed action: GitHub builds it, so its FROM images run (round 3)
+                      df = os.path.normpath(os.path.join(os.path.dirname(manifest_path), img.strip()))
+                      txt = show(rev, df)
+                      if txt is None: print(f"::error::action {manifest_path} references missing {df}"); acc["MISSING:" + df] += 1
+                      else:
+                          for c in dockerfile_images(txt): acc[c] += 1
+          def refs_at(rev, path):
+              acc = Counter()
+              b = os.path.basename(path).lower()
+              if b.startswith("dockerfile") or b.endswith(".dockerfile") or path in referenced_at(rev):   # per revision: what EXECUTES there
+                  txt = show(rev, path)
+                  if txt is not None:
+                      for c in dockerfile_images(txt): acc[c] += 1
+                  return acc
+              doc = load(rev, path)
+              if doc is not None: refs_of(rev, doc, acc, frozenset({path}), 0, path)
+              return acc
+          fail = 0; new = Counter()
+          for b, h in changed_pairs():
+              if h is None: continue                               # deleted file: nothing new runs
+              new += refs_at(head, h) - (refs_at(base, b) if b else Counter())   # per file, per occurrence
+          for ref in sorted(new):            # one verdict per distinct ref (a ref reached via a local action AND its own changed manifest is reported once)
+              if ref.startswith("MISSING:"): fail = 1; continue
+              if ref.startswith("HagaleTechnologies/"): continue
+              if ref.startswith(("docker://", "container:")):
+                  if re.search(r"@sha256:[0-9a-f]{64}$", ref): print(f"pinned by digest: {ref}")
+                  else: print(f"::error::image without an immutable @sha256 digest: {ref}"); fail = 1
+                  continue
+              if "@" not in ref: print(f"::error::unpinned action (no @version): {ref}"); fail = 1; continue
+              ver = ref.rsplit("@", 1)[1]
+              if re.fullmatch(r"[0-9a-f]{40}", ver): print(f"pinned by SHA: {ref}")
+              elif re.fullmatch(r"v?[0-9]+(\.[0-9]+)*", ver): print(f"::warning::tag-pinned (mutable) action added: {ref} -- prefer a full commit SHA")
+              else: print(f"::error::floating ref (branch) action added: {ref}"); fail = 1
+          print("added-action pin check " + ("FAILED" if fail else "passed")); sys.exit(fail)
+          PY
+          python3 /tmp/action-pins.py "$BASE" "$HEAD"
+
+  # Fan-in gate. Its check context is "Supply Chain" -- the branch ruleset's
+  # required status check. NEVER rename this job. Runs with if: always() so a
+  # failed/cancelled upstream job FAILS this check instead of skipping it (a
+  # skipped required check does NOT block merge).
+  supply-chain:
+    name: Supply Chain
+    if: always()
+    needs: [changes, osv, install-policy, actions-pins]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          DEPS: ${{ needs.changes.outputs.deps }}
+          OSV: ${{ needs.osv.result }}
+          POLICY: ${{ needs.install-policy.result }}
+          PINS: ${{ needs.actions-pins.result }}
+        run: |
+          echo "changes=$CHANGES deps=$DEPS osv=$OSV install-policy=$POLICY actions-pins=$PINS"
+          if [ "$CHANGES" != success ]; then
+            echo "::error::dependency change detection did not succeed ($CHANGES)"; exit 1
+          fi
+          if [ "$PINS" != success ]; then
+            echo "::error::newly added actions/images are not acceptably pinned ($PINS)"; exit 1
+          fi
+          if [ "$DEPS" != true ]; then
+            echo "No dependency manifest, lockfile, or workflow changed -- nothing more to scan."; exit 0
+          fi
+          for r in "$OSV" "$POLICY"; do
+            if [ "$r" != success ]; then
+              echo "::error::a supply-chain scan did not succeed -- this PR must not merge until it does"; exit 1
+            fi
+          done
+          echo "All supply-chain scans passed."

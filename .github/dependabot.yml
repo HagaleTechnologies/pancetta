@@ -1,6 +1,12 @@
 version: 2
 updates:
   - package-ecosystem: "cargo"
+    # (CAT-299) Let a fresh release age past the window in which most
+    # compromised versions are caught and yanked before it is even proposed
+    # here -- same 4-day brake widdershins already uses. The Supply Chain
+    # required check is the scan gate; this just shrinks what reaches it.
+    cooldown:
+      default-days: 4
     directory: "/"
     schedule:
       interval: "weekly"
