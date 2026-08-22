@@ -1423,16 +1423,37 @@ impl AutonomousOperator {
             // soft-penalty semantics unchanged for its original callers
             // (own-QSO separation).
             let min_separation_hz = self.smart_allocator.config().min_separation_hz;
-            let candidates: Vec<_> = match avoid_hz {
+            let excluded: Vec<_> = match avoid_hz {
                 Some(avoid) => candidates
-                    .into_iter()
+                    .iter()
                     .filter(|c| (c.offset_hz - avoid).abs() >= min_separation_hz)
+                    .cloned()
                     .collect(),
-                None => candidates,
+                None => candidates.clone(),
             };
 
-            if let Some(best) = candidates.first() {
+            if let Some(best) = excluded.first() {
                 return best.offset_hz;
+            }
+
+            // Codex review (PR #277, round 2): if the hard exclusion above
+            // filters out every ranked candidate (e.g. min_separation_hz
+            // configured larger than the available spectral spread), don't
+            // fall through to the legacy `allocate_cq_frequency()` below —
+            // it has no notion of `avoid_hz` and could reselect exactly the
+            // abandoned frequency. Fall back to the best-ranked candidate
+            // farthest from `avoid_hz` instead, so occupancy-aware ranking
+            // still applies even when nothing clears the full exclusion
+            // radius.
+            if let Some(avoid) = avoid_hz {
+                if let Some(farthest) = candidates.iter().max_by(|a, b| {
+                    (a.offset_hz - avoid)
+                        .abs()
+                        .partial_cmp(&(b.offset_hz - avoid).abs())
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                }) {
+                    return farthest.offset_hz;
+                }
             }
         }
 
@@ -2381,6 +2402,17 @@ mod tests {
             pancetta_core::TxFreqMode::Auto.as_u8(),
         )));
         op.cq_no_response_streak = 10; // already past any reasonable threshold
+                                       // Codex review (PR #277, round 2): `simple_jitter()` draws from real
+                                       // system time (-200..=200 around tx_offset_hz=1500, i.e. always in
+                                       // [1300, 1700]), and can occasionally return exactly 0 — which,
+                                       // combined with the round-2 no-op guard, would leave `new_offset`
+                                       // equal to the default `prev_offset` (also 1500, since
+                                       // `current_cq_offset_hz` starts unset) about 1-in-401 runs, making
+                                       // this assertion flaky. Seed `current_cq_offset_hz` to a value
+                                       // jitter can never reach so `new_offset != prev_offset` holds no
+                                       // matter what the real jitter draws, without weakening the test to
+                                       // a synthetic clamp scenario.
+        op.current_cq_offset_hz = Some(1000.0);
 
         let messages = vec![DecodedMessageInfo {
             callsign: Some("K1DEF".into()),
@@ -2663,10 +2695,18 @@ mod tests {
             freq_max_hz: 2800.0,
         });
 
+        // Codex review (PR #277, round 2): the original `> 100.0` threshold
+        // left a 200 Hz-wide clear window (1400-1600) around 1500 — wider
+        // than the 75 Hz exclusion radius under test — so genuinely clear,
+        // non-excluded candidates already existed at the 75/100 Hz boundary
+        // (e.g. 1425/1575) and could win on score alone, without the hard
+        // filter doing any work. Narrow the clear window to entirely inside
+        // the exclusion radius (`> 50.0`, i.e. only [1450, 1550] stays
+        // clear) so nothing outside the excluded band is naturally clear.
         let mut records = Vec::new();
         let mut freq = 200.0f64;
         while freq <= 2800.0 {
-            if (freq - 1500.0).abs() > 100.0 {
+            if (freq - 1500.0).abs() > 50.0 {
                 records.push(DecodeRecord {
                     frequency_hz: freq,
                     time_slot: TimeSlot::First,
@@ -2680,12 +2720,73 @@ mod tests {
         }
         op.decode_history.push_cycle(records);
 
+        // Confirm the premise directly against the unfiltered ranker: with
+        // this occupancy, the top-ranked candidate (no avoid_hz filtering
+        // applied at all) really does fall inside the 75 Hz exclusion
+        // radius around 1500 — proving the fix's hard filter is doing real
+        // work below, not just re-confirming what the ranker would have
+        // picked anyway.
+        let unfiltered_top = op
+            .smart_allocator
+            .rank_candidates_with_parity(
+                op.spectral_snapshot.as_ref().unwrap(),
+                &op.decode_history,
+                &[],
+                None,
+                None,
+            )
+            .into_iter()
+            .next()
+            .expect("ranker must return at least one candidate");
+        assert!(
+            (unfiltered_top.offset_hz - 1500.0).abs() < 75.0,
+            "test premise broken: the unfiltered ranker's top pick ({}) must fall \
+             inside the exclusion radius for this to be a meaningful regression test",
+            unfiltered_top.offset_hz
+        );
+
         let chosen = op.allocate_smart_frequency(None, None, Some(1500.0));
 
         assert!(
             (chosen - 1500.0).abs() >= 75.0,
             "avoid_hz must be hard-excluded even when it's the only clear spot \
              on an otherwise crowded band, got {chosen}"
+        );
+    }
+
+    #[test]
+    fn allocate_smart_frequency_never_returns_inside_the_exclusion_when_the_hard_filter_empties_out(
+    ) {
+        // Codex review (PR #277, round 2): if `min_separation_hz` is
+        // configured large enough that every ranked candidate falls inside
+        // the exclusion radius, the hard filter empties the candidate list.
+        // The pre-fix fallthrough to `allocate_cq_frequency()` (avoid_hz-
+        // blind, and with no own/observed frequencies recorded, always
+        // returns the allocation range's minimum — 200 Hz here) ignores
+        // avoid_hz entirely. Set min_separation_hz far larger than the
+        // whole allocation range so NOTHING can pass the hard filter, and
+        // confirm the farthest-candidate fallback picks 2800 Hz (the far
+        // edge from avoid_hz=1000, unambiguously farther than 200 Hz)
+        // instead of falling through to the legacy allocator's 200 Hz.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.frequency.min_separation_hz = 10_000.0;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+
+        let chosen = op.allocate_smart_frequency(None, None, Some(1000.0));
+
+        assert_eq!(
+            chosen, 2800.0,
+            "must fall back to the farthest ranked candidate from avoid_hz, not the \
+             avoid_hz-blind legacy allocator (which would return 200.0 here)"
         );
     }
 
