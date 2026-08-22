@@ -3187,6 +3187,46 @@ impl super::ApplicationCoordinator {
                                             dx_parity,
                                             remote_origin,
                                         } => {
+                                            // PAN-23 round-2 (Codex review of #283): reject the
+                                            // unresolved-hash placeholder "<...>" at ADMISSION
+                                            // time, before it can ever be queued. Same bug class
+                                            // as the RespondToCaller fix just above (and the
+                                            // same fix shape): a cross-parity StartQso — e.g. a
+                                            // remote `callStation` request, whose callsign and
+                                            // parity are accepted without validation upstream —
+                                            // queues into `pending_manual_calls` FIRST (below)
+                                            // and only reaches the `qso_manager` guard later, at
+                                            // promotion time via `promote_pending_manual_calls`.
+                                            // Since the InvalidCallsign rejection is
+                                            // deterministic, letting it reach that generic
+                                            // queue-on-failure path would re-queue it at the
+                                            // front on every promotion attempt, repeatedly
+                                            // holding the parity slot against legitimate
+                                            // opposite-parity calls for up to the full
+                                            // 10-minute queue TTL. Reject it here instead,
+                                            // before it ever occupies a slot.
+                                            if callsign == "<...>" {
+                                                warn!(
+                                                    target: "qso.security",
+                                                    "Refusing StartQso for the unresolved hash \
+                                                     placeholder \"<...>\"",
+                                                );
+                                                crate::coordinator::tx::emit_diagnostic_full(
+                                                    &message_bus,
+                                                    ComponentId::Qso,
+                                                    "qso.security",
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                    "Refusing StartQso for the unresolved hash \
+                                                     placeholder \"<...>\" — it carries no \
+                                                     identity information and can never be \
+                                                     transmitted"
+                                                        .to_string(),
+                                                    None,
+                                                    Some(&callsign),
+                                                )
+                                                .await;
+                                                continue;
+                                            }
                                             // Belt-and-suspenders: refuse to call our own
                                             // station regardless of how the command arrived.
                                             // The relay already blocks this via CallStation,
@@ -3651,6 +3691,46 @@ impl super::ApplicationCoordinator {
                                             snr,
                                             remote_origin,
                                         } => {
+                                            // PAN-23 round-2 (Codex review of #283): reject the
+                                            // unresolved-hash placeholder "<...>" at ADMISSION
+                                            // time, before it can ever be queued. The guard in
+                                            // `qso_manager::respond_to_caller`/
+                                            // `respond_to_cq_with` only fires when a call is
+                                            // actually PROCESSED — but when both TX parities are
+                                            // occupied by active QSOs this arm queues the request
+                                            // first (below) and defers processing to
+                                            // `promote_pending_manual_calls`. Since the
+                                            // InvalidCallsign rejection is deterministic (it can
+                                            // never succeed, no matter how many times it's
+                                            // retried), letting it reach that generic
+                                            // queue-on-failure path would re-queue it at the
+                                            // front on every promotion attempt, repeatedly
+                                            // holding the parity slot against legitimate
+                                            // opposite-parity calls for up to the full 10-minute
+                                            // queue TTL. Reject it here instead, before it ever
+                                            // occupies a slot.
+                                            if callsign == "<...>" {
+                                                warn!(
+                                                    target: "qso.security",
+                                                    "Refusing RespondToCaller for the unresolved \
+                                                     hash placeholder \"<...>\"",
+                                                );
+                                                crate::coordinator::tx::emit_diagnostic_full(
+                                                    &message_bus,
+                                                    ComponentId::Qso,
+                                                    "qso.security",
+                                                    pancetta_core::DiagnosticLevel::Warn,
+                                                    "Refusing RespondToCaller for the unresolved \
+                                                     hash placeholder \"<...>\" — it carries no \
+                                                     identity information and can never be \
+                                                     transmitted"
+                                                        .to_string(),
+                                                    None,
+                                                    Some(&callsign),
+                                                )
+                                                .await;
+                                                continue;
+                                            }
                                             info!(
                                                 "Responding to caller {} on {} Hz at step {:?} \
                                                  (manual)",
@@ -6982,5 +7062,305 @@ mod replay_local_log_tests {
         );
 
         shutdown.store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
+#[cfg(test)]
+mod respond_to_caller_admission_tests {
+    //! PAN-23 round-2 (Codex review of PR #283): the backend guards added to
+    //! `qso_manager::respond_to_caller`/`respond_to_cq_with` only fire when
+    //! a call is actually PROCESSED. But `RespondToCaller`'s (and
+    //! `StartQso`'s — round-3 finding) admission path (the
+    //! `if matches!(admit_new_qso(...), TxAdmission::Queue)` block above,
+    //! guarding `pending_manual_calls`) can queue a request FIRST —
+    //! whenever both TX parities are contested (an active QSO occupies the
+    //! side opposite the one this caller wants) — and only run the
+    //! `qso_manager` guard later, at promotion time
+    //! (`promote_pending_manual_calls`). Since the unresolved-hash
+    //! placeholder `"<...>"` is deterministically un-transmittable no
+    //! matter how many times it's retried, letting it reach that point
+    //! would re-queue it at the front of `pending_manual_calls` on every
+    //! failed promotion attempt — repeatedly holding the parity slot
+    //! against legitimate opposite-parity calls for up to the full
+    //! `QUEUED_CALL_TTL` (10 minutes).
+    //!
+    //! The fix (this module proves it): reject the placeholder at
+    //! ADMISSION time, in both match arms, BEFORE the opposite-parity
+    //! queueing check ever runs — so it can never occupy a slot in the
+    //! first place. This exercises the REAL `start_qso_component` message
+    //! loop end to end (real coordinator, real message bus, real admission
+    //! logic), not a synthetic reproduction — a lower-level unit test of
+    //! `qso_manager`'s guards alone (see `pancetta-qso/src/qso_manager.rs`)
+    //! cannot see this gap, since it never goes through the queueing path
+    //! at all.
+    //!
+    //! PAN-23 round-3 (Codex review, two more findings):
+    //!
+    //! 1. **Never touch the operator's real logbook.** `start_qso_component`
+    //!    in its normal (non-`--replay`) mode opens/creates
+    //!    `~/.pancetta/qsos.adi` and `~/.pancetta/qso.db` unconditionally
+    //!    (see `start_local_qso_log_writers`'s `replay` gate above). Running
+    //!    these tests on an operator's real workstation must never touch
+    //!    that file, and two tests racing `AdifLogWriter::open`'s
+    //!    existence check could even corrupt it. `test_coordinator` below
+    //!    passes `replay_path: Some(..)` (mirroring
+    //!    `coordinator::mod`'s own `build_coordinator_with_replay` /
+    //!    `replay_mode_tracks_the_replay_path` pattern — the SAME dummy,
+    //!    never-read path value) so `self.replay_mode()` is `true` and
+    //!    `start_local_qso_log_writers` returns `(None, None)` without ever
+    //!    opening `adif_path`/`db_path`. Confirmed this doesn't interfere
+    //!    with anything these tests exercise: `replay_mode` only gates the
+    //!    local ADIF/DB writers and the (here, unconfigured) upload
+    //!    subscriber — never the `RespondToCaller`/`StartQso` admission
+    //!    logic, the Tui message-bus channel, or diagnostic emission.
+    //! 2. **Don't discard messages while polling.** The original
+    //!    `poll_until` consumed messages from the channel while searching
+    //!    for the wanted diagnostic and discarded every non-matching one —
+    //!    so a regression that emitted the forbidden `"Queued <...>"`
+    //!    status BEFORE the diagnostic would have that status silently
+    //!    thrown away by the search itself, and the later separate
+    //!    "must never have seen Queued" check would find nothing (already
+    //!    consumed), giving a false pass. `drain_all` below instead
+    //!    collects EVERY message observed into one `Vec` regardless of
+    //!    order, and both assertions inspect that same complete buffer.
+    use super::super::ApplicationCoordinator;
+    use crate::message_bus::{ComponentId, ComponentMessage, MessageType, QsoMessage};
+    use pancetta_config::Config;
+    use pancetta_core::slot::SlotParity;
+    use pancetta_core::ResponseStep;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    /// Local copy of the `test_coordinator` pattern used elsewhere in this
+    /// crate (`coordinator::health`, `coordinator::hamlib`) — no shared
+    /// helper exists yet — EXCEPT for `replay_path`, which (unlike those
+    /// other copies) is deliberately `Some(..)`: see this module's
+    /// doc-comment, finding 1. The path itself is never read (only
+    /// `.is_some()` matters to `replay_mode()`); the value mirrors
+    /// `coordinator::mod`'s own replay-mode tests
+    /// (`build_coordinator_with_replay`).
+    async fn test_coordinator() -> ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None,                                                // no WAV
+            Some(std::path::PathBuf::from("/some/capture/dir")), // --replay: never touch the real logbook
+            None,                                                // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    /// Drain the Tui channel (bounded crossbeam queue, not broadcast — a
+    /// message sent before the consuming loop starts polling simply waits
+    /// in the queue, so no readiness handshake is needed here), collecting
+    /// EVERY message observed — not just ones matching some predicate — so
+    /// callers can run multiple independent assertions against the same
+    /// complete stream afterward (see this module's doc-comment, finding
+    /// 2). Polls every 10ms up to `max_tries`, but exits early once the
+    /// channel has gone quiet for `idle_stop` consecutive empty polls after
+    /// at least one message has been seen — keeps the common case fast
+    /// without truncating a slow-arriving message burst.
+    async fn drain_all(
+        rx: &crossbeam_channel::Receiver<ComponentMessage>,
+        max_tries: u32,
+        idle_stop: u32,
+    ) -> Vec<ComponentMessage> {
+        let mut out = Vec::new();
+        let mut idle = 0u32;
+        for _ in 0..max_tries {
+            match rx.try_recv() {
+                Ok(msg) => {
+                    out.push(msg);
+                    idle = 0;
+                }
+                Err(_) => {
+                    idle += 1;
+                    if !out.is_empty() && idle >= idle_stop {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            }
+        }
+        out
+    }
+
+    fn rejects_placeholder_at_admission(messages: &[ComponentMessage]) -> bool {
+        messages.iter().any(|m| {
+            matches!(
+                &m.message_type,
+                MessageType::DiagnosticEvent { target, callsign, .. }
+                    if *target == "qso.security" && callsign.as_deref() == Some("<...>")
+            )
+        })
+    }
+
+    fn ever_queued_placeholder(messages: &[ComponentMessage]) -> bool {
+        messages.iter().any(|m| {
+            matches!(
+                &m.message_type,
+                MessageType::StatusUpdate(text)
+                    if text.contains("Queued") && text.contains("<...>")
+            )
+        })
+    }
+
+    #[tokio::test]
+    async fn respond_to_caller_placeholder_rejected_at_admission_not_queued() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+
+        let (_tui_tx, tui_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+
+        // Pin current_tx_side to Odd: DX CQs on Even, so we answer on the
+        // opposite side (Odd) — mirrors
+        // `current_tx_side_none_when_idle_then_pins_after_admit`
+        // (pancetta-qso/src/qso_manager.rs).
+        let priming_id = manager
+            .respond_to_cq("K9RDY".to_string(), 1500.0, Some(SlotParity::Even))
+            .await
+            .expect("seeding the parity-pinning QSO");
+        assert_eq!(
+            manager.current_tx_side().await,
+            Some(SlotParity::Odd),
+            "priming QSO must pin current_tx_side to Odd"
+        );
+
+        // A RespondToCaller whose caller transmits on Odd wants us to reply
+        // on the OPPOSITE side (Even) — conflicting with the pinned Odd
+        // side. Pre-fix, this exact shape is what got queued into
+        // `pending_manual_calls` instead of rejected.
+        let msg = ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Qso,
+            MessageType::QsoMessage(QsoMessage::RespondToCaller {
+                callsign: "<...>".to_string(),
+                frequency: 2000,
+                dx_parity: Some(SlotParity::Odd),
+                step: ResponseStep::ReportAck,
+                snr: Some(-8.0),
+                remote_origin: false,
+            }),
+            Instant::now(),
+        );
+        coordinator.message_bus.send_message(msg).await.unwrap();
+
+        // Capture the WHOLE Tui-bound stream this command produced, then
+        // check both properties against that one complete buffer — neither
+        // assertion can miss a message the other one consumed.
+        let messages = drain_all(&tui_rx, 200, 5).await;
+        assert!(
+            rejects_placeholder_at_admission(&messages),
+            "expected a qso.security DiagnosticEvent refusing the unresolved \
+             hash placeholder at admission time; observed: {messages:?}"
+        );
+        assert!(
+            !ever_queued_placeholder(&messages),
+            "the unresolved hash placeholder must never be queued — even \
+             when the opposite-parity gate would otherwise defer the call — \
+             or it would repeatedly hold the parity slot against legitimate \
+             opposite-parity calls for up to the full queue TTL; observed: \
+             {messages:?}"
+        );
+
+        // Cleanup (best-effort, not asserted): retire the priming QSO.
+        let _ = manager
+            .fail_qso(priming_id, pancetta_qso::QsoFailureReason::UserCancelled)
+            .await;
+    }
+
+    /// PAN-23 round-2 (Codex review of #283, second finding): the SAME bug
+    /// class as the `RespondToCaller` test above, via the OTHER admission
+    /// path — `StartQso`, reachable via a remote `callStation` request whose
+    /// callsign/parity are accepted without validation upstream. A
+    /// cross-parity `StartQso` targeting the placeholder would (pre-fix)
+    /// queue into `pending_manual_calls` first and only hit the
+    /// deterministic `InvalidCallsign` rejection later at promotion, where
+    /// the generic failure path re-queues it at the front — repeatedly
+    /// holding the parity slot for up to the full queue TTL. Identical
+    /// assertions to the sibling test: the admission-time guard must fire
+    /// (a `qso.security` diagnostic lands) and the placeholder must never be
+    /// queued.
+    #[tokio::test]
+    async fn start_qso_placeholder_rejected_at_admission_not_queued() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+
+        let (_tui_tx, tui_rx) = coordinator
+            .message_bus
+            .create_channel(ComponentId::Tui)
+            .await
+            .unwrap();
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+
+        // Pin current_tx_side to Odd, same as the RespondToCaller test.
+        let priming_id = manager
+            .respond_to_cq("K9RDY".to_string(), 1500.0, Some(SlotParity::Even))
+            .await
+            .expect("seeding the parity-pinning QSO");
+        assert_eq!(
+            manager.current_tx_side().await,
+            Some(SlotParity::Odd),
+            "priming QSO must pin current_tx_side to Odd"
+        );
+
+        // A StartQso whose DX transmits on Odd wants us to reply on the
+        // OPPOSITE side (Even) — conflicting with the pinned Odd side.
+        // Pre-fix, this exact shape is what got queued into
+        // `pending_manual_calls` instead of rejected.
+        let msg = ComponentMessage::new(
+            ComponentId::Tui,
+            ComponentId::Qso,
+            MessageType::QsoMessage(QsoMessage::StartQso {
+                callsign: "<...>".to_string(),
+                frequency: 2000,
+                dx_parity: Some(SlotParity::Odd),
+                remote_origin: false,
+            }),
+            Instant::now(),
+        );
+        coordinator.message_bus.send_message(msg).await.unwrap();
+
+        // Capture the WHOLE Tui-bound stream this command produced, then
+        // check both properties against that one complete buffer.
+        let messages = drain_all(&tui_rx, 200, 5).await;
+        assert!(
+            rejects_placeholder_at_admission(&messages),
+            "expected a qso.security DiagnosticEvent refusing the unresolved \
+             hash placeholder at admission time; observed: {messages:?}"
+        );
+        assert!(
+            !ever_queued_placeholder(&messages),
+            "the unresolved hash placeholder must never be queued — even \
+             when the opposite-parity gate would otherwise defer the call — \
+             or it would repeatedly hold the parity slot against legitimate \
+             opposite-parity calls for up to the full queue TTL; observed: \
+             {messages:?}"
+        );
+
+        // Cleanup (best-effort, not asserted): retire the priming QSO.
+        let _ = manager
+            .fail_qso(priming_id, pancetta_qso::QsoFailureReason::UserCancelled)
+            .await;
     }
 }
