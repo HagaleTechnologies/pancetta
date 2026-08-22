@@ -1,17 +1,17 @@
 name: Supply Chain
 
-# (CAT-299) Supply-chain gate for dependency changes.
+# (CAT-299) Supply-chain gate for dependency changes. Governance: dispensa ADR-0014.
 #
 # WHY THIS RUNS ON EVERY PR: the job named "Supply Chain" below is a
 # ruleset-required status check on main. A required check that only ran on
 # some PRs would leave every other PR stuck at "Expected -- waiting for
 # status" forever, so this workflow runs on every PR and passes trivially
-# when no dependency manifest or lockfile changed. When one DID change, the
-# scanners run and GitHub's native auto-merge (armed by auto-merge.yml /
-# dependabot-auto-merge.yml via `gh pr merge --auto`) cannot fire until they
-# pass -- that is the "dependency bumps are excluded from blanket standing
-# auto-merge until a scan passes" carve-out, enforced by the ruleset rather
-# than by convention. See dispensa ADR-0014.
+# when no dependency manifest, lockfile, or workflow changed. When one DID
+# change, the scanners run and GitHub's native auto-merge (armed by
+# auto-merge.yml / dependabot-auto-merge.yml via `gh pr merge --auto`)
+# cannot fire until they pass -- that is the "dependency bumps are excluded
+# from blanket standing auto-merge until a scan passes" carve-out, enforced
+# by the ruleset rather than by convention.
 #
 # What runs when dependencies changed:
 #   * osv            -- google/osv-scanner PR diff against OSV.dev. Fails only
@@ -20,9 +20,27 @@ name: Supply Chain
 #                       malicious-packages feed (MAL-* ids), e.g. the Aug 2026
 #                       keyv@6.0.0 compromise is MAL-2026-11524 -- so this is a
 #                       malware gate, not just a CVE gate.
-#   * install-policy -- `cargo fetch --locked`: every crate in Cargo.lock must
-#                       still resolve to exactly the pinned checksum (crates.io
-#                       has no per-package signature step to verify yet).
+#   * install-policy -- `cargo fetch --locked` (every crate must still resolve to exactly the
+#                       pinned checksum; no build.rs runs) and no git/path crate sources.
+#   * actions-pins   -- when a workflow/action file changed: every NEWLY ADDED
+#                       third-party `uses:` (parsed from the YAML at base and head,
+#                       so flow-style/quoted keys are seen too) must be version-
+#                       pinned: a floating branch ref or a docker:// image without
+#                       an @sha256 digest fails; a tag pin warns -- SHA pinning of
+#                       the whole fleet's workflows is a separate decision,
+#                       ADR-0014 open questions.
+#
+# THREAT MODEL / KNOWN LIMIT: this gate defends against malicious DEPENDENCY
+# CONTENT. It does not defend against a PR author who rewrites this file --
+# on a same-repo PR a `pull_request` workflow runs the PR's own definition.
+# The fleet's PR authors are a single trusted identity that can already edit
+# any workflow (CI included); a compromised author identity is the
+# credential-rotation runbook's domain (dispensa docs/runbooks). GitHub's
+# "require workflows to pass" ruleset rule (base-controlled definition) is
+# Enterprise-only; `pull_request_target` would run untrusted PR content under
+# the base definition AND break the OSV base/head diff (GITHUB_SHA is the base
+# there). Every action below is pinned to a full commit SHA so the verifier
+# itself cannot change underneath the check.
 on:
   pull_request:
     branches: [main]
@@ -42,16 +60,22 @@ jobs:
       pull-requests: read
     outputs:
       deps: ${{ steps.filter.outputs.deps }}
+      actions: ${{ steps.filter.outputs.actions }}
     steps:
-      - uses: actions/checkout@v7
-      - uses: dorny/paths-filter@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
           filters: |
             deps:
               - '**/Cargo.toml'
               - '**/Cargo.lock'
-              - '.github/workflows/supply-chain.yml'
+              - '**/npm-shrinkwrap.json'
+              - '.github/workflows/**'
+              - '.github/actions/**'
+            actions:
+              - '.github/workflows/**'
+              - '.github/actions/**'
 
   osv:
     name: OSV advisories (incl. malicious-package MAL-*)
@@ -61,7 +85,7 @@ jobs:
       actions: read
       contents: read
       security-events: write
-    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@v2.5.0
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@8deb546fdb875b9996d27d4950be7312dac076a1 # v2.5.0
     with:
       # The job conclusion is the gate; code-scanning upload needs GitHub
       # Advanced Security on private repos and is not what we're relying on.
@@ -69,17 +93,232 @@ jobs:
       fail-on-vuln: true
 
   install-policy:
-    name: Lockfile integrity (cargo fetch --locked)
+    name: Lockfile integrity (cargo fetch --locked) + source policy
     needs: changes
     if: needs.changes.outputs.deps == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@stable
-      # Resolves every crate in Cargo.lock against the registry index without
-      # building (no build.rs runs). Fails if the lockfile is out of date or a
-      # pinned crate/checksum no longer matches what the registry serves.
-      - run: cargo fetch --locked
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      # 0. Every Cargo.toml must sit under a validated Cargo.lock; JS lockfiles
+      #    would be refused here because this gate does not validate them
+      #    (local review gate, round 10).
+      - name: Every manifest is covered by a validated lockfile
+        run: |
+          python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
+          python3 - cargo <<'PY'
+          import os, sys, yaml
+          # Every npm/pnpm manifest must be covered by a lockfile this gate validates
+          # (CAT-299 / ADR-0014, local review gate round 5): a package.json is covered if
+          # it is an importer of a pnpm-lock.yaml (workspace member) or has a sibling
+          # package-lock.json / pnpm-lock.yaml. yarn.lock / bun.lock are NOT validated by
+          # this gate and are refused outright rather than silently passed.
+          # argv[1]: comma-separated lockfile kinds this repo's gate actually validates
+          # (pnpm,npm[,cargo] for pnpm workspaces; npm only for an npm repo; cargo for Rust). A lockfile of any
+          # other kind is refused, never counted as coverage (local gate round 6).
+          ACCEPT = set((sys.argv[1] if len(sys.argv) > 1 else "pnpm,npm").split(","))
+          PRUNE = {"node_modules", "target", ".git", ".worktrees"}
+          manifests, covered, refused = [], set(), []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in PRUNE]
+              rel = os.path.normpath(root)
+              if "package.json" in files:
+                  manifests.append(rel)
+              if "package-lock.json" in files:
+                  (covered.add(rel) if "npm" in ACCEPT else refused.append(os.path.join(rel, "package-lock.json")))
+              if "pnpm-lock.yaml" in files:
+                  if "pnpm" in ACCEPT:
+                      covered.add(rel)
+                      lock = yaml.safe_load(open(os.path.join(root, "pnpm-lock.yaml"))) or {}
+                      for imp in (lock.get("importers") or {}):
+                          covered.add(os.path.normpath(os.path.join(rel, imp)))
+                  else:
+                      refused.append(os.path.join(rel, "pnpm-lock.yaml"))
+              for f in ("yarn.lock", "bun.lock", "bun.lockb"):
+                  if f in files:
+                      refused.append(os.path.join(rel, f))
+          # Cargo manifests (local gate round 10): every Cargo.toml must sit at or below a
+          # directory holding a Cargo.lock (workspace members live under the workspace
+          # root's lockfile). Refused outright if this gate does not validate Cargo.
+          cargo_manifests, cargo_locks = [], set()
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in PRUNE]
+              rel = os.path.normpath(root)
+              if "Cargo.toml" in files:
+                  cargo_manifests.append(rel)
+              if "Cargo.lock" in files:
+                  cargo_locks.add(rel)
+          def cargo_covered(m):
+              cur = m
+              while True:
+                  if cur in cargo_locks:
+                      return True
+                  if cur in (".", ""):
+                      return False
+                  cur = os.path.normpath(os.path.dirname(cur)) or "."
+          if cargo_manifests and "cargo" not in ACCEPT:
+              refused += [os.path.join(m, "Cargo.toml") for m in cargo_manifests]
+          bad = [m for m in manifests if m not in covered]
+          bad += [os.path.join(m, "Cargo.toml") for m in cargo_manifests if "cargo" in ACCEPT and not cargo_covered(m)]
+          manifests = manifests + (cargo_manifests if "cargo" in ACCEPT else [])
+          if refused:
+              print("::error::lockfile format(s) this gate does not validate -- add validation or remove them:")
+              print("\n".join("  " + r for r in refused))
+          if bad:
+              print("::error::package.json manifest(s) with no covering lockfile (not installed, not signature-audited, not source-checked):")
+              print("\n".join("  " + b for b in bad))
+          if refused or bad:
+              sys.exit(1)
+          print(f"all {len(manifests)} manifest(s) are covered by a validated lockfile")
+          PY
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # Nothing may come from outside a registry: a path crate has NO `source`
+      # field in Cargo.lock, so "no git source" is not enough -- every locked
+      # package must be a workspace member (by name AND version) or a registry
+      # crate (tomllib + `cargo metadata`; local review gate rounds 1-2).
+      # EVERY Cargo.lock in the repo is checked (round 3).
+      - name: Crate source policy + cargo fetch --locked (every Cargo.lock)
+        run: |
+          cat > /tmp/cargo-sources.py <<'PY'
+          import json, subprocess, sys, tomllib
+          # Registry-only source policy for Cargo.lock (CAT-299 / ADR-0014). A path
+          # dependency has NO `source` field in Cargo.lock, so "no git source" is not
+          # enough: every package must either be a workspace member or come from a
+          # registry.
+          # --locked: a manifest that drifted from Cargo.lock must FAIL here instead of
+          # cargo silently regenerating the lockfile we are about to judge (local gate
+          # round 10).
+          meta = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"]))
+          # workspace_members are package IDs; identify members by (name, version) so a
+          # path crate that merely reuses a member's NAME cannot pass as that member.
+          ids = set(meta["workspace_members"])
+          members = {(p["name"], p["version"]) for p in meta["packages"] if p["id"] in ids}
+          lock = tomllib.load(open("Cargo.lock", "rb"))
+          bad = []
+          for p in lock.get("package", []):
+              src = p.get("source")
+              if src is None:
+                  if (p["name"], p["version"]) not in members:
+                      bad.append(f"{p['name']} {p['version']}: path dependency (not a workspace member)")
+              elif not src.startswith("registry+"):
+                  bad.append(f"{p['name']} {p['version']}: source={src}")
+          if bad:
+              print("::error::non-registry crate sources in Cargo.lock:"); print("\n".join("  " + b for b in bad)); sys.exit(1)
+          print(f"all {len(lock.get('package', []))} locked crates are registry crates or workspace members ({len(members)} members)")
+          PY
+          n=0
+          while IFS= read -r lock; do
+            # source policy first (no download: cargo metadata --no-deps --locked), THEN
+            # cargo fetch --locked resolves + checksum-verifies every crate of THIS
+            # project (a nested Cargo project gets its own fetch -- local gate round 11).
+            n=$((n+1)); echo "== $lock"; ( cd "$(dirname "$lock")" && python3 /tmp/cargo-sources.py && cargo fetch --locked )
+          done < <(find . \( -name node_modules -o -name target -o -name .git \) -prune -o -name 'Cargo.lock' -print | sort)
+          echo "checked $n Cargo lockfile(s)"
+
+  actions-pins:
+    name: Newly added actions are pinned
+    needs: changes
+    if: needs.changes.outputs.actions == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Newly added actions must be pinned (structural YAML check)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
+          cat > /tmp/action-pins.py <<'PY'
+          import os, re, subprocess, sys, yaml
+          from collections import Counter
+          # Newly-added-action pin policy (CAT-299 / ADR-0014). Structural, not textual:
+          # every workflow/action YAML changed in the PR is parsed at BASE and at HEAD,
+          # the `uses:` of every executable node -- steps (jobs.*.steps, composite
+          # runs.steps) and job-level reusable-workflow calls (jobs.<job>.uses), block or
+          # flow style, quoted or bare keys; never with:/env:/inputs: data -- are counted
+          # per occurrence, and
+          # only occurrences NEW at HEAD are judged: floating branch ref or no version -> fail;
+          # docker:// without @sha256 digest -> fail; tag pin -> warning; SHA -> ok.
+          # Local (./) and HagaleTechnologies/ refs are the repo's own code.
+          base, head = sys.argv[1], sys.argv[2]
+          def changed_paths():
+              """(base_paths, head_paths) of changed workflow/action YAML, rename-aware:
+              -M pairs a moved file with its old path so its grandfathered refs count at
+              BASE too (local gate round 11). -z: NUL-delimited, whitespace-safe."""
+              raw = subprocess.run(["git", "diff", "-z", "--name-status", "-M", base, head, "--", ".github/workflows", ".github/actions"],
+                                   capture_output=True, text=True, check=True).stdout.split("\0")
+              base_paths, head_paths, i = [], [], 0
+              while i < len(raw) and raw[i]:
+                  status = raw[i]; i += 1
+                  if status[0] in "RC":            # R100\told\tnew
+                      old, new = raw[i], raw[i + 1]; i += 2
+                      if status[0] == "R": base_paths.append(old)
+                      head_paths.append(new)
+                  else:                            # A / M / D
+                      path = raw[i]; i += 1
+                      if status[0] != "A": base_paths.append(path)
+                      if status[0] != "D": head_paths.append(path)
+              yml = lambda ps: [p for p in ps if p.endswith((".yml", ".yaml"))]
+              return yml(base_paths), yml(head_paths)
+          def uses_in(doc, acc):
+              # Only EXECUTABLE nodes carry an action reference: each job's own `uses`
+              # (reusable workflow, jobs.<job>.uses) and every entry of a `steps` list
+              # (jobs.<job>.steps / composite runs.steps). Nothing else is traversed, so
+              # a data key that merely happens to be named `uses` inside with:/env:/
+              # inputs: cannot false-positive (local review gate round 8). Counted per
+              # occurrence, so duplicating a grandfathered floating ref is still a new
+              # execution (round 7).
+              if not isinstance(doc, dict):
+                  return
+              def steps(lst):
+                  for st in lst or []:
+                      if isinstance(st, dict) and isinstance(st.get("uses"), str):
+                          acc[st["uses"].strip()] += 1
+              jobs = doc.get("jobs")
+              if isinstance(jobs, dict):
+                  for job in jobs.values():
+                      if isinstance(job, dict):
+                          if isinstance(job.get("uses"), str):
+                              acc[job["uses"].strip()] += 1
+                          if isinstance(job.get("steps"), list):
+                              steps(job["steps"])
+              runs = doc.get("runs")
+              if isinstance(runs, dict) and isinstance(runs.get("steps"), list):
+                  steps(runs["steps"])
+          def uses_at(rev, path):
+              r = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True, text=True)
+              if r.returncode != 0:
+                  return Counter()        # file absent at that rev (A/D handled by changed_paths)
+              acc = Counter()
+              try:
+                  uses_in(yaml.safe_load(r.stdout), acc)
+              except yaml.YAMLError as e:
+                  print(f"::error::{path}@{rev[:8]}: unparseable YAML ({e}) -- refusing to judge it"); sys.exit(1)
+              return acc
+          base_paths, head_paths = changed_paths()
+          before, after = Counter(), Counter()
+          for f in base_paths: before += uses_at(base, f)
+          for f in head_paths: after += uses_at(head, f)
+          new = after - before      # Counter subtraction: only refs with MORE occurrences after the change
+          fail = 0
+          for ref in sorted(new.elements()):
+              if ref.startswith("./") or ref.startswith("HagaleTechnologies/"):
+                  continue
+              if ref.startswith("docker://"):
+                  if re.search(r"@sha256:[0-9a-f]{64}$", ref): print(f"pinned by digest: {ref}")
+                  else: print(f"::error::docker action without an immutable @sha256 digest: {ref}"); fail = 1
+                  continue
+              if "@" not in ref:
+                  print(f"::error::unpinned action (no @version): {ref}"); fail = 1; continue
+              ver = ref.rsplit("@", 1)[1]
+              if re.fullmatch(r"[0-9a-f]{40}", ver): print(f"pinned by SHA: {ref}")
+              elif re.fullmatch(r"v?[0-9]+(\.[0-9]+)*", ver): print(f"::warning::tag-pinned (mutable) action added: {ref} -- prefer a full commit SHA")
+              else: print(f"::error::floating ref (branch) action added: {ref}"); fail = 1
+          print("added-action pin check " + ("FAILED" if fail else "passed"))
+          sys.exit(fail)
+          PY
+          python3 /tmp/action-pins.py "$BASE" "$HEAD"
 
   # Fan-in gate. Its check context is "Supply Chain" -- the branch ruleset's
   # required status check. NEVER rename this job. Runs with if: always() so a
@@ -88,26 +327,31 @@ jobs:
   supply-chain:
     name: Supply Chain
     if: always()
-    needs: [changes, osv, install-policy]
+    needs: [changes, osv, install-policy, actions-pins]
     runs-on: ubuntu-latest
     steps:
       - name: Gate
         env:
           CHANGES: ${{ needs.changes.result }}
           DEPS: ${{ needs.changes.outputs.deps }}
+          ACTIONS: ${{ needs.changes.outputs.actions }}
           OSV: ${{ needs.osv.result }}
           POLICY: ${{ needs.install-policy.result }}
+          PINS: ${{ needs.actions-pins.result }}
         run: |
-          echo "changes=$CHANGES deps=$DEPS osv=$OSV install-policy=$POLICY"
+          echo "changes=$CHANGES deps=$DEPS actions=$ACTIONS osv=$OSV install-policy=$POLICY actions-pins=$PINS"
           if [ "$CHANGES" != success ]; then
             echo "::error::dependency change detection did not succeed ($CHANGES)"; exit 1
           fi
           if [ "$DEPS" != true ]; then
-            echo "No dependency manifest or lockfile changed -- nothing to scan."; exit 0
+            echo "No dependency manifest, lockfile, or workflow changed -- nothing to scan."; exit 0
           fi
           for r in "$OSV" "$POLICY"; do
             if [ "$r" != success ]; then
               echo "::error::a supply-chain scan did not succeed -- this PR must not merge until it does"; exit 1
             fi
           done
+          if [ "$ACTIONS" = true ] && [ "$PINS" != success ]; then
+            echo "::error::newly added actions are not acceptably pinned"; exit 1
+          fi
           echo "All supply-chain scans passed."
