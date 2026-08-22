@@ -231,16 +231,36 @@ mod ap_eval_mode_tests {
     }
 }
 
-/// PAN-40: half-width (Hz) tolerance used to decide whether two decodes
-/// from the two different decoder backends (`ft8lib`, native) plausibly
-/// came from the same physical signal, for hash-placeholder twin
-/// detection ([`drop_unresolved_hash_twins`]). Reuses the precedent set
-/// by `a7_freq_window_hz` in `pancetta-ft8/src/decoder.rs`: the
-/// spectrogram bin step is 3.125 Hz, so a handful of bins comfortably
-/// absorbs independent frequency-estimate quantization between the two
-/// backends while staying far tighter than typical FT8 station spacing
-/// on a busy band.
-const HASH_TWIN_FREQ_TOLERANCE_HZ: f64 = 10.0;
+/// PAN-40 round-2 review (Codex finding 2): the unresolved placeholder
+/// `"<...>"` has erased the underlying 12-bit hash entirely, so on a busy
+/// band two DIFFERENT stations replying to the same third party in the
+/// same slot (e.g. simultaneous `<...> YS/WE9G RR73` and `<K1ABC>
+/// YS/WE9G RR73` from two distinct callers) can look like a hash twin
+/// under frequency-proximity-plus-normalized-text alone. Neither decoder
+/// backend exposes the raw hash value or a payload-level fingerprint at
+/// this layer (ft8lib is a black-box FFI call returning only rendered
+/// text + freq/SNR/DT; see `DecodedMessage::from_ft8lib`), so real
+/// hash/payload identity isn't available here — per PAN-40's own bias
+/// ("dropping a real decode can silently kill a live QSO"), the fix is
+/// to tighten proximity requirements substantially rather than keep the
+/// old, much looser gate.
+///
+/// Max `frequency_offset` difference (Hz) to consider two decodes the
+/// same physical signal. Tight: one FFT bin width (`pancetta-ft8`'s
+/// spectrogram bin step is 3.125 Hz — see `a7_freq_window_hz` in
+/// `pancetta-ft8/src/decoder.rs`), just enough to absorb independent
+/// sub-bin peak-fit rounding between the two backends while being far
+/// tighter than realistic distinct-station spacing on a busy band.
+const HASH_TWIN_FREQ_TOLERANCE_HZ: f64 = 3.125;
+
+/// Max `time_offset` (DT, seconds) difference to consider two decodes the
+/// same physical signal. Two backends independently sync-detecting the
+/// SAME burst should agree on its arrival time to a small fraction of an
+/// FT8 symbol (~0.16 s); two different transmitting stations essentially
+/// never coincidentally share both near-identical frequency AND
+/// near-identical DT AND matching non-hash text. Combined with the tight
+/// freq gate above, this is the substitute for real payload identity.
+const HASH_TWIN_TIME_TOLERANCE_S: f64 = 0.1;
 
 /// PAN-40: is `word` the literal unresolved i3=4 hash-miss placeholder
 /// token? Mirrors the `None`-branch semantics of
@@ -282,14 +302,22 @@ fn normalize_hash_bracket_word(word: &str) -> &str {
 /// actually replying the whole time (see PR body for the live-log
 /// evidence: QSO `d8bc41ca-0da8-4e6b-bef9-23ae05ccbeb2` vs 3B9/SQ9UM).
 ///
-/// Declares two decodes twins of the same signal only when BOTH hold:
+/// Declares two decodes twins of the same signal only when ALL hold:
 ///   - their `frequency_offset`s agree within
-///     [`HASH_TWIN_FREQ_TOLERANCE_HZ`], AND
+///     [`HASH_TWIN_FREQ_TOLERANCE_HZ`] (checked by the caller,
+///     [`drop_unresolved_hash_twins`], since that's where the full
+///     `DecodedMessage` — not just text — is available), AND
+///   - their `time_offset` (DT)s agree within
+///     [`HASH_TWIN_TIME_TOLERANCE_S`] (also checked by the caller), AND
 ///   - after normalizing away hash-resolution differences (unwrapping
 ///     resolved `"<CALL>"` renders to plain `"CALL"`, and treating the
 ///     literal unresolved placeholder `"<...>"` as a wildcard that
 ///     matches any single token at that position), the texts are
 ///     token-for-token identical.
+///
+/// This function itself only judges the text dimension; see
+/// [`drop_unresolved_hash_twins`] for the freq+DT gating that must also
+/// pass before a pair is treated as twins.
 ///
 /// When a pair is declared twins, only the more-resolved side (the one
 /// without the placeholder) is kept. Deliberately conservative: any
@@ -357,10 +385,28 @@ fn hash_twin_keep_first(a: &str, b: &str) -> Option<bool> {
 }
 
 /// PAN-40 — drop the unresolved-hash-placeholder half of any decode pair
-/// in `messages` that [`hash_twin_keep_first`] confidently identifies as
-/// the same physical signal decoded twice (once resolved, once not) by
-/// the two decoder backends. See that function's doc comment for the
-/// full rationale and the conservative-by-default policy.
+/// in `messages` that is confidently the same physical signal decoded
+/// twice (once resolved, once not) by the two decoder backends: their
+/// `frequency_offset`s agree within [`HASH_TWIN_FREQ_TOLERANCE_HZ`],
+/// their `time_offset` (DT)s agree within [`HASH_TWIN_TIME_TOLERANCE_S`],
+/// and [`hash_twin_keep_first`] confirms the texts are twins modulo hash
+/// resolution. See both constants' and that function's doc comments for
+/// the full rationale and the conservative-by-default policy — a pair
+/// that fails ANY of the three checks keeps both messages.
+///
+/// PAN-40 round-2 review (Codex finding 1): callers MUST run this pass
+/// AFTER `partition_ap_eval_decodes`, never before. `[decoder].
+/// ap_eval_mode`'s guarantee is that every `ap_level == 0` decode reaches
+/// every consumer unaffected. If this pass ran first and paired a
+/// non-AP (`ap_level == 0`) placeholder decode with an AP-derived
+/// (`ap_level > 0`) resolved twin, it would keep the AP copy and drop
+/// the non-AP copy — `partition_ap_eval_decodes` then suppresses that
+/// surviving AP copy too (it's `ap_level > 0`), so BOTH decodes vanish,
+/// breaking the eval-mode guarantee for exactly the case eval mode
+/// exists to observe (a resolved AP candidate that might be a phantom).
+/// Running this pass on the post-partition "delivered" set instead means
+/// it never sees (and so can never be tricked by) a decode AP-eval-mode
+/// has already decided to suppress.
 ///
 /// Returns `(kept_messages, dropped_count)`. Order of the surviving
 /// messages is preserved.
@@ -380,6 +426,11 @@ fn drop_unresolved_hash_twins(
             }
             if (messages[i].frequency_offset - messages[j].frequency_offset).abs()
                 > HASH_TWIN_FREQ_TOLERANCE_HZ
+            {
+                continue;
+            }
+            if (messages[i].time_offset - messages[j].time_offset).abs()
+                > HASH_TWIN_TIME_TOLERANCE_S
             {
                 continue;
             }
@@ -416,7 +467,11 @@ mod hash_twin_dedup_tests {
     use pancetta_ft8::{DecodedMessage, Ft8Message};
 
     fn decoded_at(freq_hz: f64, text: &str) -> DecodedMessage {
-        let mut d = DecodedMessage::new(Ft8Message::default(), -10.0, 0.5, freq_hz, 0.1);
+        decoded_at_dt(freq_hz, 0.1, text)
+    }
+
+    fn decoded_at_dt(freq_hz: f64, time_offset: f64, text: &str) -> DecodedMessage {
+        let mut d = DecodedMessage::new(Ft8Message::default(), -10.0, 0.5, freq_hz, time_offset);
         d.text = text.to_string();
         d
     }
@@ -534,6 +589,98 @@ mod hash_twin_dedup_tests {
         assert_eq!(dropped, 1);
         let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, vec!["CQ K1ABC FN42", "3B9/SQ9UM <K5ARH>"]);
+    }
+
+    /// PAN-40 round-2 review (Codex finding 2), exact counter-example
+    /// given: two DISTINCT callers replying to the same third party
+    /// (`YS/WE9G`) in the same slot, at close-but-distinct frequencies.
+    /// Post-render text alone can't tell these apart from a real hash
+    /// twin -- frequency proximity must be strict enough to reject this.
+    /// 6 Hz apart is within the OLD 10 Hz tolerance (would have wrongly
+    /// merged) but outside the tightened one-bin (3.125 Hz) tolerance.
+    #[test]
+    fn close_but_distinct_frequencies_are_not_conflated() {
+        let messages = vec![
+            decoded_at(2700.0, "<...> YS/WE9G RR73"),
+            decoded_at(2706.0, "<K1ABC> YS/WE9G RR73"),
+        ];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        assert_eq!(
+            dropped, 0,
+            "two different callers 6 Hz apart must not be conflated as a hash twin"
+        );
+        assert_eq!(kept.len(), 2);
+    }
+
+    /// PAN-40 round-2 review (Codex finding 2): same frequency bin is not
+    /// enough on its own either -- two different callers can coincide in
+    /// frequency. Their DT (arrival time within the window) essentially
+    /// never coincidentally matches too, so the DT gate independently
+    /// guards against this case.
+    #[test]
+    fn same_freq_bin_but_distinct_dt_is_not_conflated() {
+        let messages = vec![
+            decoded_at_dt(2700.0, 0.05, "<...> YS/WE9G RR73"),
+            decoded_at_dt(2700.0, 0.65, "<K1ABC> YS/WE9G RR73"),
+        ];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        assert_eq!(
+            dropped, 0,
+            "same freq bin but 0.6s-apart DT must not be conflated as a hash twin"
+        );
+        assert_eq!(kept.len(), 2);
+    }
+
+    /// PAN-40 round-2 review (Codex finding 3): the decoder-merge summary
+    /// log (`"FT8 decoder: {N} messages decoded ({ft8lib} ft8lib + ...")`)
+    /// captures `ft8lib_count`/`native_added_count`/`cross_seq_recovered`
+    /// — and logs against `decoded_messages.len()` — BEFORE this pass
+    /// ever runs (see `drop_unresolved_hash_twins`'s doc comment: it must
+    /// run after `partition_ap_eval_decodes`, which is itself well after
+    /// that summary log). This test locks in the ordering invariant that
+    /// makes the summary self-consistent: replaying the production
+    /// coordinator's exact merge arithmetic (one ft8lib decode, one
+    /// distinct-text native decode) shows the breakdown already sums to
+    /// the pre-dedup total at the point the log fires, and this pass only
+    /// shrinks the set LATER, after that number has already been logged
+    /// -- so it can never retroactively invalidate it.
+    #[test]
+    fn merge_count_breakdown_sums_correctly_before_this_pass_ever_runs() {
+        let ft8lib_messages = vec![decoded_at(2700.0, "3B9/SQ9UM <...>")];
+        let native_messages = vec![decoded_at(2700.0, "3B9/SQ9UM <K5ARH>")];
+
+        // Mirrors the real merge loop in `start_ft8_pipeline` exactly.
+        let ft8lib_count = ft8lib_messages.len();
+        let mut seen_texts: std::collections::HashSet<String> =
+            ft8lib_messages.iter().map(|m| m.text.clone()).collect();
+        let mut decoded_messages = ft8lib_messages;
+        let mut native_added_count = 0usize;
+        for msg in native_messages {
+            if seen_texts.insert(msg.text.clone()) {
+                decoded_messages.push(msg);
+                native_added_count += 1;
+            }
+        }
+        let cross_seq_recovered = 0usize; // no cross-sequence A7 in this scenario
+
+        // This is the exact invariant the summary `info!` log depends on
+        // at the moment it fires -- BEFORE hash-twin dedup has run.
+        assert_eq!(
+            ft8lib_count + native_added_count + cross_seq_recovered,
+            decoded_messages.len(),
+            "logged breakdown must sum to the logged total at log time"
+        );
+        assert_eq!(ft8lib_count, 1);
+        assert_eq!(native_added_count, 1);
+        assert_eq!(decoded_messages.len(), 2);
+
+        // Only afterward (post-AP-partition, in production) does this
+        // pass shrink the delivered set -- which is fine precisely
+        // because the summary log already captured the correct numbers
+        // for what was true at ITS point in the pipeline.
+        let (kept, dropped) = drop_unresolved_hash_twins(decoded_messages);
+        assert_eq!(dropped, 1);
+        assert_eq!(kept.len(), 1);
     }
 }
 
@@ -1436,32 +1583,6 @@ impl super::ApplicationCoordinator {
                             }
                         }
 
-                        // PAN-40: exact-text dedup above does NOT catch the
-                        // case where the two backends decode the SAME
-                        // physical signal differently — one resolving an
-                        // i3=4 hash-callsign render, one leaving it the
-                        // unresolved "<...>" placeholder. Those survive as
-                        // two distinct texts and both get forwarded
-                        // downstream, where `callsigns_match` correctly (but
-                        // uselessly) rejects the unresolved twin every
-                        // cycle — silently starving an active QSO of every
-                        // reply from its partner until the watchdog times
-                        // it out. See `drop_unresolved_hash_twins` for the
-                        // full rationale; this can only ever *remove* a
-                        // decode that's a confident duplicate of one we're
-                        // keeping, never drop a decode with no surviving
-                        // twin.
-                        let (deduped_messages, hash_twins_dropped) =
-                            drop_unresolved_hash_twins(decoded_messages);
-                        decoded_messages = deduped_messages;
-                        if hash_twins_dropped > 0 {
-                            debug!(
-                                target: "ft8.decode",
-                                "PAN-40: dropped {} unresolved-hash-placeholder twin(s) at decoder merge",
-                                hash_twins_dropped,
-                            );
-                        }
-
                         // hb-237 cross-sequence A7 — consumer invocation
                         // (Session 3). Runs AFTER the main decode merge so
                         // the post-pass only attempts to recover decodes
@@ -1668,6 +1789,41 @@ impl super::ApplicationCoordinator {
                             info!(
                                 "AP eval-mode: decode suppressed (ap_level={}, text='{}', SNR: {:.0}, freq: {:.1})",
                                 msg.ap_level, msg.text, msg.snr_db, msg.frequency_offset
+                            );
+                        }
+
+                        // PAN-40: the ft8lib+native merge above dedupes only
+                        // by *exact* decode text. When the two backends
+                        // decode the same physical signal differently — one
+                        // resolving an i3=4 hash-callsign render, one
+                        // leaving it the unresolved "<...>" placeholder —
+                        // the texts differ, so both survive the merge and
+                        // both would get forwarded downstream, where
+                        // `callsigns_match` correctly (but uselessly)
+                        // rejects the unresolved twin every cycle — silently
+                        // starving an active QSO of every reply from its
+                        // partner until the watchdog times it out. See
+                        // `drop_unresolved_hash_twins` for the full
+                        // rationale; it can only ever *remove* a decode
+                        // that's a confident duplicate of one we're keeping,
+                        // never drop a decode with no surviving twin.
+                        //
+                        // PAN-40 round-2 review (Codex finding 1): this MUST
+                        // run here, after `partition_ap_eval_decodes` above
+                        // — not before — so it operates only on the
+                        // already-AP-vetted "delivered" stream and can never
+                        // let an AP-derived resolved decode outrank (and
+                        // cause the removal of) the non-AP copy that
+                        // `[decoder].ap_eval_mode` guarantees always reaches
+                        // consumers. See `drop_unresolved_hash_twins`'s doc
+                        // comment for the full ordering rationale.
+                        let (decoded_messages, hash_twins_dropped) =
+                            drop_unresolved_hash_twins(decoded_messages);
+                        if hash_twins_dropped > 0 {
+                            debug!(
+                                target: "ft8.decode",
+                                "PAN-40: dropped {} unresolved-hash-placeholder twin(s) post AP-partition",
+                                hash_twins_dropped,
                             );
                         }
 
