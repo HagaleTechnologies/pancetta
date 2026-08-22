@@ -1344,6 +1344,20 @@ impl QsoManager {
                 ),
             });
         }
+        // PAN-23: refuse FT8's literal unresolved-hash placeholder "<...>"
+        // outright — shared by `respond_to_cq` (autonomous),
+        // `respond_to_cq_manual` (StartQso/DX-Hunter), and `engage_hound`.
+        // It carries no identity information and can never be encoded into
+        // a transmittable message (see `callsign_is_wire_representable`),
+        // so a QSO opened for it is guaranteed to fail later at encode
+        // time. Defense in depth: the TUI already filters "<...>" out of
+        // every station list an operator can select from (PAN-16/PAN-23);
+        // this guards any other path.
+        if target_callsign == "<...>" {
+            return Err(QsoManagerError::InvalidCallsign {
+                callsign: target_callsign,
+            });
+        }
         // Check for duplicate — but only for autonomous calls. A manual
         // call is an explicit operator decision to work (or re-work) this
         // station, so the self-duplicate gate must not block it.
@@ -1565,6 +1579,25 @@ impl QsoManager {
         remote_origin: bool,
     ) -> Result<QsoId, QsoManagerError> {
         use pancetta_core::ResponseStep;
+
+        // PAN-23: refuse FT8's literal unresolved-hash placeholder "<...>"
+        // up front, before branching on `step`. This is the exact failure
+        // mode observed on-air (production logs 2026-08-20..22): an
+        // operator selected "<...>" from the TUI Callers panel at step
+        // ReportAck, pancetta queued/started the QSO, and the eventual
+        // encode attempt failed with "callsign '<...>' cannot be
+        // represented in any FT8 message format". The `step == Grid` branch
+        // below would also be caught by the identical guard in
+        // `respond_to_cq_with`, but checking here first (a) covers every
+        // other step (Report/ReportAck/Rr73/SeventyThree) that bypasses
+        // `respond_to_cq_with` entirely, and (b) fails fast before any
+        // logging/queueing work happens. Defense in depth: the TUI already
+        // filters "<...>" out of the Callers list an operator can select
+        // from (PAN-16/PAN-23); this guards any other path — present or
+        // future — that might route a `RespondToCaller` command here.
+        if target == "<...>" {
+            return Err(QsoManagerError::InvalidCallsign { callsign: target });
+        }
 
         // Grid is exactly the historical manual-call behavior; route through
         // the existing path so there is a single source of truth for it.
@@ -6297,56 +6330,37 @@ mod tests {
         ));
     }
 
-    /// PAN-17: a QSO whose DX callsign can never be encoded onto the FT8
-    /// wire (here, the decoder's own hash-miss placeholder `<...>` leaking
-    /// into the partner field — invalid characters, not just "long") must
-    /// be retired on the very first watchdog pass, with a reason distinct
-    /// from `Timeout`, instead of consuming the full manual-call watchdog
-    /// window re-arming an identical message that will never transmit.
+    /// PAN-17 → PAN-23: a manual call whose DX callsign can never be
+    /// encoded onto the FT8 wire (here, the decoder's own hash-miss
+    /// placeholder `<...>` — invalid characters, not just "long") must
+    /// never even create a QSO in the first place.
+    ///
+    /// This supersedes PAN-17's original fix, which let `respond_to_cq_manual`
+    /// create the QSO and relied on the very next watchdog pass to retire it
+    /// with `MessageUnencodable` (consuming a full TX-worker round trip and
+    /// briefly showing a doomed QSO in the UI). PAN-23 closes that off at the
+    /// door: `respond_to_cq_with`'s `InvalidCallsign` guard rejects the
+    /// literal placeholder synchronously, before any `QsoId` is minted or any
+    /// `MessageToSend` is emitted — the failure mode observed on-air
+    /// (production logs 2026-08-20..22) where the operator's selection led
+    /// straight to a guaranteed-to-fail encode attempt.
+    ///
+    /// The watchdog's fast-retirement guarantee is still exercised
+    /// separately by `genuinely_unresolvable_caller_hash_retires_fast_not_a_hang`,
+    /// which reaches the same `their_callsign == "<...>"` state through
+    /// inbound decode traffic (latched, not requested) — a path this guard
+    /// does not and cannot cover, since the placeholder never passes through
+    /// `respond_to_cq_with`/`respond_to_caller` as a `target_callsign` there.
     #[tokio::test]
-    async fn unencodable_dx_callsign_retires_immediately_not_via_manual_watchdog() {
-        let mut config = test_config();
-        // Both generic watchdogs set very long, so a pass at PAN-17's
-        // near-immediate retirement can only be explained by the new check.
-        config.timeouts.manual_call_max_calls = 1000;
-        config.timeouts.manual_call_watchdog_minutes = 60;
-        config.timeouts.repetitive_tx_timeout_secs = 100_000;
-        let manager = QsoManager::new(config);
-        let mut events = manager.subscribe();
-
-        let qso_id = manager
+    async fn unencodable_dx_callsign_rejected_immediately_not_via_manual_watchdog() {
+        let manager = QsoManager::new(test_config());
+        let err = manager
             .respond_to_cq_manual("<...>".to_string(), 14074000.0, None)
             .await
-            .unwrap();
-        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
-
-        // A single watchdog pass, one second later, is enough.
-        manager
-            .check_timeouts_at(start + Duration::seconds(1))
-            .await;
-
-        assert!(matches!(
-            manager.get_qso(qso_id).await,
-            Err(QsoManagerError::QsoNotFound { .. })
-        ));
-
-        let mut reason = None;
-        while let Ok(ev) = events.try_recv() {
-            if let QsoEvent::QsoFailed {
-                qso_id: id,
-                reason: r,
-                ..
-            } = ev
-            {
-                if id == qso_id {
-                    reason = Some(r);
-                }
-            }
-        }
+            .unwrap_err();
         assert!(
-            matches!(reason, Some(QsoFailureReason::MessageUnencodable(_))),
-            "expected MessageUnencodable, got {:?}",
-            reason
+            matches!(&err, QsoManagerError::InvalidCallsign { callsign } if callsign == "<...>"),
+            "expected InvalidCallsign for the unresolved hash placeholder, got {err:?}"
         );
     }
 
@@ -11025,6 +11039,47 @@ mod reply_emitter_tests {
         assert_eq!(
             progress.metadata.partner_freq, None,
             "Grid/Tx=Rx path: partner_freq must be None (regression)"
+        );
+    }
+
+    /// PAN-23: `respond_to_caller` — the TUI Callers "reply" path — must
+    /// refuse the literal unresolved-hash placeholder `"<...>"` regardless
+    /// of which sequence step the operator (or a queued replay) opens at.
+    /// This is the exact failure mode observed on-air (production logs
+    /// 2026-08-20..22): the operator selected `"<...>"` from the Callers
+    /// panel at step `ReportAck`, pancetta queued/started the QSO, and the
+    /// eventual encode attempt failed with "callsign '<...>' cannot be
+    /// represented in any FT8 message format". The TUI-side fix (PAN-23,
+    /// `app.rs`'s `displayed_callers`) means the operator can no longer
+    /// select it, but this backend guard is belt-and-suspenders against any
+    /// other path reaching `RespondToCaller` with that target — and it
+    /// short-circuits BEFORE any `MessageToSend` is emitted, so no doomed
+    /// encode is ever attempted.
+    #[tokio::test]
+    async fn respond_to_caller_rejects_unresolved_hash_placeholder() {
+        let manager = manager();
+        let mut rx = manager.subscribe();
+        let err = manager
+            .respond_to_caller(
+                "<...>".to_string(),
+                FREQ,
+                None,
+                ResponseStep::ReportAck,
+                Some(-8.0),
+                None,
+                None,
+                false,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, QsoManagerError::InvalidCallsign { callsign } if callsign == "<...>"),
+            "expected InvalidCallsign for the unresolved hash placeholder, got {err:?}"
+        );
+        assert!(
+            messages_to_send(&drain(&mut rx)).is_empty(),
+            "no MessageToSend may be emitted for the unresolved hash placeholder \
+             (it can never be encoded into a valid FT8 message)"
         );
     }
 }

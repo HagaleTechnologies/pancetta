@@ -3123,6 +3123,17 @@ impl App {
             if call.is_empty() {
                 continue;
             }
+            // PAN-23: never surface `"<...>"`, FT8's literal placeholder for
+            // an i3=4 nonstandard-callsign hash the local hash table
+            // couldn't resolve (see PAN-16, app.rs's dx_stations insert
+            // filter, applied to the exact same string). It's a legitimate,
+            // correctly decoded frame — left in `decoded_messages` for
+            // logs/QSO context — but it isn't a callsign at all and can
+            // never actually be called, so it must not become a selectable
+            // Callers-panel row (`selected_caller` reads this same list).
+            if call.as_str() == "<...>" {
+                continue;
+            }
             let key = call.to_uppercase();
             if seen.insert(key) {
                 out.push(msg);
@@ -6053,6 +6064,54 @@ mod tests {
         // K9ZZ's row is the NEWER decode (R-10), and it's newest-first.
         assert_eq!(callers[0].call_sign.as_deref(), Some("K9ZZ"));
         assert_eq!(callers[0].message, "K5ARH K9ZZ R-10");
+    }
+
+    /// PAN-23: the unresolved-hash placeholder `"<...>"` must never surface
+    /// as a selectable Caller. PAN-16 (#249) filtered it out of the
+    /// DX-Hunter list's underlying `dx_stations` store, but a Codex round-2
+    /// review of that PR flagged that `displayed_callers`/`selected_caller`
+    /// were NOT covered by the same filter — they read directly from
+    /// `decoded_messages`, which deliberately still retains the placeholder
+    /// decode for logs/QSO context. Production logs (2026-08-20..22) show
+    /// the gap firing for real: an operator selected `"<...>"` from the
+    /// Callers panel and pancetta tried (and failed) to transmit to it.
+    #[tokio::test]
+    async fn displayed_callers_excludes_unresolved_hash_placeholder() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+
+        let placeholder = fixture_view_directed("<...>", -10);
+        let real = fixture_view_directed("K9ZZ", -8);
+        app.add_decoded_message(placeholder).await.unwrap();
+        app.add_decoded_message(real).await.unwrap();
+
+        let callers = app.displayed_callers();
+        assert!(
+            !callers
+                .iter()
+                .any(|m| m.call_sign.as_deref() == Some("<...>")),
+            "unresolved hash placeholder must never appear in displayed_callers"
+        );
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].call_sign.as_deref(), Some("K9ZZ"));
+
+        // selected_caller() derives from displayed_callers(), so with the
+        // placeholder filtered, the cursor at index 0 resolves to the real
+        // caller, never the placeholder.
+        app.callers_scroll = 0;
+        assert_eq!(
+            app.selected_caller().and_then(|m| m.call_sign.as_deref()),
+            Some("K9ZZ")
+        );
+
+        // The decode itself must still be retained in decoded_messages for
+        // logs/QSO context (mirrors PAN-16's dx_stations behavior).
+        assert!(
+            app.decoded_messages
+                .iter()
+                .any(|m| m.call_sign.as_deref() == Some("<...>")),
+            "the decode itself must still be retained for logs/QSO context"
+        );
     }
 
     #[tokio::test]
