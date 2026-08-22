@@ -6,10 +6,11 @@ human reviewer) — not one shared counter across all reviewers on a PR. A PR
 can have more than one active reviewer, and a shared counter misclassifies
 a second reviewer's genuinely-first-look findings as a late round.
 
-**What counts as a "round":** one push that triggers a new *remote* review
-pass from that reviewer. A local review-gate run (e.g. `codex exec review
---uncommitted`, or a repo's override command — see "Local review gate"
-below) does **not** increment the round counter — only the remote
+**What counts as a "round":** a push, or an explicit reviewer retrigger with no new push
+(e.g. a workflow rerun plus an `@`-mention comment — see `land-pr`'s Codex-retrigger
+sequence), that produces a new *remote* review response from that reviewer. A local
+review-gate run (e.g. `codex exec review --uncommitted`, or a repo's override command — see
+"Local review gate" below) does **not** increment the round counter — only the remote
 reviewer's response does.
 
 ## Schedule
@@ -33,6 +34,12 @@ reviewer's response does.
 - **Round 25 is a hard stop:** escalate to a human rather than opening a
   26th round unilaterally.
 
+A finding that was already raised in an earlier round and simply never got fixed (omitted,
+or the fix didn't actually land) is still owed from that round — it does not become newly
+eligible for ticketing just because it resurfaces in a later round. Ticketing is for
+genuinely new or reopened findings, not a way for an incomplete earlier-round fix to escape
+via a later round's looser rules.
+
 ## Severity
 
 Classify by substance, not by the reviewer's own label — many bots use
@@ -52,6 +59,16 @@ ticket filing fails (no ticketing system configured, or it's unreachable),
 don't let that block the thread indefinitely — fall back to fixing the
 finding inline instead. An optional dependency should never become
 load-bearing for getting a PR unstuck.
+
+## What this does not do
+
+- **Does not mean P2 findings get ignored.** They land in a real ticket, not silently
+  dropped — the trade is "fixed later, deliberately" instead of "fixed now, chased
+  indefinitely."
+- **Does not relax P1 handling before round 16.** Every round through 15 still fixes every
+  P1 finding it sees; round 16+ still fixes critical/blocking P1s regardless.
+- **Does not override a human reviewer's explicit CHANGES_REQUESTED.** That still needs the
+  reviewer's own sign-off, not just a filed ticket.
 
 ## Local review gate
 
@@ -82,17 +99,48 @@ collision, just don't mistake it for one if you invoked `land-pr` earlier
 in the same session.
 
 ```bash
-BRANCH="$(git branch --show-current)"
-LOCAL_SHA="$(git rev-parse HEAD)"
-git fetch origin "$BRANCH" --quiet 2>/dev/null || true
+BRANCH="$(git symbolic-ref --short -q HEAD || true)"
+if [ -z "$BRANCH" ]; then
+  echo "HEAD is detached — this check assumes a checked-out branch matching the PR's remote head." >&2
+  echo "Check out that branch explicitly before running it, rather than guessing at a ref." >&2
+  exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
+fi
+FETCH_ERR="$(mktemp)"
+trap 'rm -f "$FETCH_ERR"' EXIT
+if ! git fetch origin "$BRANCH" --quiet 2>"$FETCH_ERR"; then
+  echo "Could not fetch origin/${BRANCH} — remote state is unverifiable: $(cat "$FETCH_ERR")" >&2
+  echo "Pausing rather than treating an unreachable remote as collision-free." >&2
+  exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
+fi
 REMOTE_SHA="$(git rev-parse "origin/${BRANCH}" 2>/dev/null || echo "")"
-if [ -n "$REMOTE_SHA" ] && [ "$REMOTE_SHA" != "$LOCAL_SHA" ]; then
+# Compare by ancestry, not equality: HEAD is expected to run ahead of
+# origin/$BRANCH once you've committed this round's local fixes but
+# haven't pushed yet — that's normal mid-round state, not a collision.
+# Only flag when origin/$BRANCH holds a commit your local history
+# doesn't contain (i.e. it is NOT an ancestor of HEAD) — that's the
+# actual signal that someone else pushed.
+if [ -n "$REMOTE_SHA" ] && ! git merge-base --is-ancestor "$REMOTE_SHA" HEAD; then
   RECENT_AUTHOR="$(git log -1 --format='%an <%ae> at %ad' "$REMOTE_SHA" 2>/dev/null || echo "unknown")"
-  echo "origin/${BRANCH} has moved since our last known commit (${RECENT_AUTHOR}) and we did not push it." >&2
+  echo "origin/${BRANCH} has a commit our local history doesn't contain (${RECENT_AUTHOR})." >&2
   echo "Possible concurrent session on this PR. Pausing — do not race it." >&2
   exit 0  # deliberate: pausing is not a failure, so a caller checking status sees success
 fi
 ```
+
+Deliberately stateless — no baseline file. A persisted "last known remote
+SHA" sounds stronger, but it has to be scoped correctly (per-branch,
+per-repo-checkout, per-work-session) to avoid becoming its own source of
+false positives/negatives, and gets that scoping wrong in ways that are
+easy to miss (a prior session's stale baseline outliving the session that
+wrote it, a slash in the branch name breaking a naive filename). The
+ancestry check above accepts one known gap in exchange for that
+simplicity: it won't catch a force-push that moves `origin/$BRANCH`
+*backward* to an ancestor of HEAD. That's a deliberately-adversarial
+action against a PR branch, not an ordinary review-loop event, and this
+fleet's own hygiene rules already discourage it ("Main moves only by PR
+merge", branch isolation). If you suspect it happened, verify directly
+(`gh pr view --json commits`, or compare `origin/$BRANCH`'s commit count
+against what you expect) rather than trusting this heuristic alone.
 
 If detected, do not race it — pause and surface it (hand off, split scope
 explicitly, or stand down) rather than pushing a competing fix round.
