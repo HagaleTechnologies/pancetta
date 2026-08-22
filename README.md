@@ -135,23 +135,27 @@ Pancetta pairs with **[cqdx.io](https://cqdx.io)**, the DX/logbook layer around
 the station:
 
 - **Hunting.** The needed-DXCC feed from cqdx.io flows straight into the
-  priority scorer, so DX Hunter ranks every decoded CQ against what you
-  actually still need — not just what's loudest. Needed-grid is wired on the
-  Pancetta side but has no live cqdx.io endpoint yet, so it doesn't affect
-  rankings today.
+  priority scorer, so DX Hunter weighs decoded CQs by what you actually
+  still need — not just what's loudest. Matching is prefix-based, so a
+  needed entity represented by a short/overlapping prefix can occasionally
+  mismatch (e.g. a needed `K` entry can false-match `KH6`/`KL7`/`KP4`);
+  treat rankings as a strong hint, not a guarantee. Needed-grid is wired on
+  the Pancetta side but has no live cqdx.io endpoint yet, so it doesn't
+  affect rankings today.
 - **Scoring.** Rarity and live-spot data from cqdx.io feed the same scorer
   alongside signal and recent activity, so the top of the list is the contact
   worth working right now.
-- **Logbook.** Every completed QSO and spot report uploads to cqdx.io
-  directly — no ADIF export/import round-trip. (This tracks *completed*
-  QSOs, not LoTW/ClubLog-confirmed ones — confirmation status arrives
-  separately.)
+- **Logbook.** Opt in via `[network.cqdx]` (with a token) and every
+  completed QSO and spot report uploads to cqdx.io directly — no ADIF
+  export/import round-trip. (This tracks *completed* QSOs, not
+  LoTW/ClubLog-confirmed ones — confirmation status arrives separately.)
 - **Remote rig access.** cqdx.io also brokers authorization for remote
   control: an operator can grant a delegate device — panino, the companion
   remote-control client, or a browser — scoped, revocable access to the
-  pancetta-controlled rig. Delegated guests get status/QSY visibility only;
-  they can never arm TX. Only the station's own client can request TX,
-  subject to the remote-TX arm described above.
+  pancetta-controlled rig. Delegated guests get status/QSY visibility and
+  can request a QSO/TX action, but never authorization to actually key the
+  radio — only the station's own (non-delegated) client can arm TX, subject
+  to the remote-TX arm described above.
 
 Not every path is equally mature yet — see [Why not (yet)](#why-not-yet) for
 current status.
