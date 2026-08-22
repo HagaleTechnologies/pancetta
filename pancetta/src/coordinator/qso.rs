@@ -7069,9 +7069,10 @@ mod replay_local_log_tests {
 mod respond_to_caller_admission_tests {
     //! PAN-23 round-2 (Codex review of PR #283): the backend guards added to
     //! `qso_manager::respond_to_caller`/`respond_to_cq_with` only fire when
-    //! a call is actually PROCESSED. But `RespondToCaller`'s admission path
-    //! (the `if matches!(admit_new_qso(...), TxAdmission::Queue)` block
-    //! above, guarding `pending_manual_calls`) can queue a request FIRST —
+    //! a call is actually PROCESSED. But `RespondToCaller`'s (and
+    //! `StartQso`'s — round-3 finding) admission path (the
+    //! `if matches!(admit_new_qso(...), TxAdmission::Queue)` block above,
+    //! guarding `pending_manual_calls`) can queue a request FIRST —
     //! whenever both TX parities are contested (an active QSO occupies the
     //! side opposite the one this caller wants) — and only run the
     //! `qso_manager` guard later, at promotion time
@@ -7084,14 +7085,44 @@ mod respond_to_caller_admission_tests {
     //! `QUEUED_CALL_TTL` (10 minutes).
     //!
     //! The fix (this module proves it): reject the placeholder at
-    //! ADMISSION time, in the `RespondToCaller` match arm itself, BEFORE
-    //! the opposite-parity queueing check ever runs — so it can never
-    //! occupy a slot in the first place. This exercises the REAL
-    //! `start_qso_component` message loop end to end (real coordinator,
-    //! real message bus, real admission logic), not a synthetic
-    //! reproduction — a lower-level unit test of `qso_manager`'s guards
-    //! alone (see `pancetta-qso/src/qso_manager.rs`) cannot see this gap,
-    //! since it never goes through the queueing path at all.
+    //! ADMISSION time, in both match arms, BEFORE the opposite-parity
+    //! queueing check ever runs — so it can never occupy a slot in the
+    //! first place. This exercises the REAL `start_qso_component` message
+    //! loop end to end (real coordinator, real message bus, real admission
+    //! logic), not a synthetic reproduction — a lower-level unit test of
+    //! `qso_manager`'s guards alone (see `pancetta-qso/src/qso_manager.rs`)
+    //! cannot see this gap, since it never goes through the queueing path
+    //! at all.
+    //!
+    //! PAN-23 round-3 (Codex review, two more findings):
+    //!
+    //! 1. **Never touch the operator's real logbook.** `start_qso_component`
+    //!    in its normal (non-`--replay`) mode opens/creates
+    //!    `~/.pancetta/qsos.adi` and `~/.pancetta/qso.db` unconditionally
+    //!    (see `start_local_qso_log_writers`'s `replay` gate above). Running
+    //!    these tests on an operator's real workstation must never touch
+    //!    that file, and two tests racing `AdifLogWriter::open`'s
+    //!    existence check could even corrupt it. `test_coordinator` below
+    //!    passes `replay_path: Some(..)` (mirroring
+    //!    `coordinator::mod`'s own `build_coordinator_with_replay` /
+    //!    `replay_mode_tracks_the_replay_path` pattern — the SAME dummy,
+    //!    never-read path value) so `self.replay_mode()` is `true` and
+    //!    `start_local_qso_log_writers` returns `(None, None)` without ever
+    //!    opening `adif_path`/`db_path`. Confirmed this doesn't interfere
+    //!    with anything these tests exercise: `replay_mode` only gates the
+    //!    local ADIF/DB writers and the (here, unconfigured) upload
+    //!    subscriber — never the `RespondToCaller`/`StartQso` admission
+    //!    logic, the Tui message-bus channel, or diagnostic emission.
+    //! 2. **Don't discard messages while polling.** The original
+    //!    `poll_until` consumed messages from the channel while searching
+    //!    for the wanted diagnostic and discarded every non-matching one —
+    //!    so a regression that emitted the forbidden `"Queued <...>"`
+    //!    status BEFORE the diagnostic would have that status silently
+    //!    thrown away by the search itself, and the later separate
+    //!    "must never have seen Queued" check would find nothing (already
+    //!    consumed), giving a false pass. `drain_all` below instead
+    //!    collects EVERY message observed into one `Vec` regardless of
+    //!    order, and both assertions inspect that same complete buffer.
     use super::super::ApplicationCoordinator;
     use crate::message_bus::{ComponentId, ComponentMessage, MessageType, QsoMessage};
     use pancetta_config::Config;
@@ -7103,7 +7134,12 @@ mod respond_to_caller_admission_tests {
 
     /// Local copy of the `test_coordinator` pattern used elsewhere in this
     /// crate (`coordinator::health`, `coordinator::hamlib`) — no shared
-    /// helper exists yet.
+    /// helper exists yet — EXCEPT for `replay_path`, which (unlike those
+    /// other copies) is deliberately `Some(..)`: see this module's
+    /// doc-comment, finding 1. The path itself is never read (only
+    /// `.is_some()` matters to `replay_mode()`); the value mirrors
+    /// `coordinator::mod`'s own replay-mode tests
+    /// (`build_coordinator_with_replay`).
     async fn test_coordinator() -> ApplicationCoordinator {
         let config = Config::default();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -7114,9 +7150,9 @@ mod respond_to_caller_admission_tests {
             true,  // headless
             false, // metrics
             9090,
-            None, // no WAV
-            None, // no replay
-            None, // no test-tx
+            None,                                                // no WAV
+            Some(std::path::PathBuf::from("/some/capture/dir")), // --replay: never touch the real logbook
+            None,                                                // no test-tx
             1500.0,
             shutdown,
             Vec::new(), // no config warnings
@@ -7125,25 +7161,59 @@ mod respond_to_caller_admission_tests {
         .expect("coordinator creation should succeed")
     }
 
-    /// Poll the Tui channel (bounded crossbeam queue, not broadcast — a
+    /// Drain the Tui channel (bounded crossbeam queue, not broadcast — a
     /// message sent before the consuming loop starts polling simply waits
-    /// in the queue, so no readiness handshake is needed here) until `pred`
-    /// matches, or give up after `max_tries` (10ms apart).
-    async fn poll_until(
+    /// in the queue, so no readiness handshake is needed here), collecting
+    /// EVERY message observed — not just ones matching some predicate — so
+    /// callers can run multiple independent assertions against the same
+    /// complete stream afterward (see this module's doc-comment, finding
+    /// 2). Polls every 10ms up to `max_tries`, but exits early once the
+    /// channel has gone quiet for `idle_stop` consecutive empty polls after
+    /// at least one message has been seen — keeps the common case fast
+    /// without truncating a slow-arriving message burst.
+    async fn drain_all(
         rx: &crossbeam_channel::Receiver<ComponentMessage>,
         max_tries: u32,
-        mut pred: impl FnMut(&ComponentMessage) -> bool,
-    ) -> Option<ComponentMessage> {
+        idle_stop: u32,
+    ) -> Vec<ComponentMessage> {
+        let mut out = Vec::new();
+        let mut idle = 0u32;
         for _ in 0..max_tries {
-            if let Ok(msg) = rx.try_recv() {
-                if pred(&msg) {
-                    return Some(msg);
+            match rx.try_recv() {
+                Ok(msg) => {
+                    out.push(msg);
+                    idle = 0;
                 }
-                continue;
+                Err(_) => {
+                    idle += 1;
+                    if !out.is_empty() && idle >= idle_stop {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
             }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
-        None
+        out
+    }
+
+    fn rejects_placeholder_at_admission(messages: &[ComponentMessage]) -> bool {
+        messages.iter().any(|m| {
+            matches!(
+                &m.message_type,
+                MessageType::DiagnosticEvent { target, callsign, .. }
+                    if *target == "qso.security" && callsign.as_deref() == Some("<...>")
+            )
+        })
+    }
+
+    fn ever_queued_placeholder(messages: &[ComponentMessage]) -> bool {
+        messages.iter().any(|m| {
+            matches!(
+                &m.message_type,
+                MessageType::StatusUpdate(text)
+                    if text.contains("Queued") && text.contains("<...>")
+            )
+        })
     }
 
     #[tokio::test]
@@ -7193,38 +7263,22 @@ mod respond_to_caller_admission_tests {
         );
         coordinator.message_bus.send_message(msg).await.unwrap();
 
-        // The admission-time rejection diagnostic must land on the Tui
-        // channel — proves the guard fired before any queueing decision.
-        let rejection = poll_until(&tui_rx, 200, |m| {
-            matches!(
-                &m.message_type,
-                MessageType::DiagnosticEvent { target, callsign, .. }
-                    if *target == "qso.security" && callsign.as_deref() == Some("<...>")
-            )
-        })
-        .await;
+        // Capture the WHOLE Tui-bound stream this command produced, then
+        // check both properties against that one complete buffer — neither
+        // assertion can miss a message the other one consumed.
+        let messages = drain_all(&tui_rx, 200, 5).await;
         assert!(
-            rejection.is_some(),
+            rejects_placeholder_at_admission(&messages),
             "expected a qso.security DiagnosticEvent refusing the unresolved \
-             hash placeholder at admission time"
+             hash placeholder at admission time; observed: {messages:?}"
         );
-
-        // And it must never have been queued: no "Queued <callsign> ..."
-        // status update naming the placeholder may have been emitted.
-        let mut saw_queued = false;
-        while let Ok(m) = tui_rx.try_recv() {
-            if let MessageType::StatusUpdate(text) = &m.message_type {
-                if text.contains("Queued") && text.contains("<...>") {
-                    saw_queued = true;
-                }
-            }
-        }
         assert!(
-            !saw_queued,
+            !ever_queued_placeholder(&messages),
             "the unresolved hash placeholder must never be queued — even \
              when the opposite-parity gate would otherwise defer the call — \
              or it would repeatedly hold the parity slot against legitimate \
-             opposite-parity calls for up to the full queue TTL"
+             opposite-parity calls for up to the full queue TTL; observed: \
+             {messages:?}"
         );
 
         // Cleanup (best-effort, not asserted): retire the priming QSO.
@@ -7287,38 +7341,21 @@ mod respond_to_caller_admission_tests {
         );
         coordinator.message_bus.send_message(msg).await.unwrap();
 
-        // The admission-time rejection diagnostic must land on the Tui
-        // channel — proves the guard fired before any queueing decision.
-        let rejection = poll_until(&tui_rx, 200, |m| {
-            matches!(
-                &m.message_type,
-                MessageType::DiagnosticEvent { target, callsign, .. }
-                    if *target == "qso.security" && callsign.as_deref() == Some("<...>")
-            )
-        })
-        .await;
+        // Capture the WHOLE Tui-bound stream this command produced, then
+        // check both properties against that one complete buffer.
+        let messages = drain_all(&tui_rx, 200, 5).await;
         assert!(
-            rejection.is_some(),
+            rejects_placeholder_at_admission(&messages),
             "expected a qso.security DiagnosticEvent refusing the unresolved \
-             hash placeholder at admission time"
+             hash placeholder at admission time; observed: {messages:?}"
         );
-
-        // And it must never have been queued: no "Queued <callsign> ..."
-        // status update naming the placeholder may have been emitted.
-        let mut saw_queued = false;
-        while let Ok(m) = tui_rx.try_recv() {
-            if let MessageType::StatusUpdate(text) = &m.message_type {
-                if text.contains("Queued") && text.contains("<...>") {
-                    saw_queued = true;
-                }
-            }
-        }
         assert!(
-            !saw_queued,
+            !ever_queued_placeholder(&messages),
             "the unresolved hash placeholder must never be queued — even \
              when the opposite-parity gate would otherwise defer the call — \
              or it would repeatedly hold the parity slot against legitimate \
-             opposite-parity calls for up to the full queue TTL"
+             opposite-parity calls for up to the full queue TTL; observed: \
+             {messages:?}"
         );
 
         // Cleanup (best-effort, not asserted): retire the priming QSO.
