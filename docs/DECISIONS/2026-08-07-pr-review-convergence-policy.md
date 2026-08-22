@@ -136,10 +136,10 @@ if [ -z "${PR_NUMBER:-}" ]; then
   echo "Cannot verify remote state without it. Pausing rather than guessing." >&2
   exit 0  # deliberate: inconclusive pause, not a detected collision — see the exit-code contract below
 fi
-COLLISION_REF="refs/hag-collision-check/pr-${PR_NUMBER}-$$"
+COLLISION_REF="refs/hag-collision-check/pr-${PR_NUMBER}-${BASHPID:-$$}"
 FETCH_ERR="$(mktemp)"
 trap 'rm -f "$FETCH_ERR"; git update-ref -d "$COLLISION_REF" >/dev/null 2>&1 || true' EXIT
-if ! git fetch origin "refs/pull/${PR_NUMBER}/head:${COLLISION_REF}" --quiet --force 2>"$FETCH_ERR"; then
+if ! git fetch origin "refs/pull/${PR_NUMBER}/head:${COLLISION_REF}" --quiet --force --no-write-fetch-head 2>"$FETCH_ERR"; then
   echo "Could not fetch the PR's head ref (refs/pull/${PR_NUMBER}/head) — remote state is unverifiable: $(cat "$FETCH_ERR")" >&2
   echo "Pausing rather than treating an unreachable remote as collision-free." >&2
   exit 0  # deliberate: inconclusive pause, not a detected collision — see the exit-code contract below
@@ -167,8 +167,16 @@ fi
 ```
 
 This fetches `refs/pull/${PR_NUMBER}/head` directly into a unique
-per-invocation ref (`refs/hag-collision-check/pr-${PR_NUMBER}-$$`, `$$`
-being this process's PID) — no local branch or `origin/$BRANCH` ref
+per-invocation ref (`refs/hag-collision-check/pr-${PR_NUMBER}-${BASHPID:-$$}`)
+— `$BASHPID` (falling back to `$$` if unset) rather than plain `$$`, since
+`$$` is the PARENT shell's PID and is inherited unchanged by subshells, so
+two invocations backgrounded from the same parent shell would otherwise
+compute the identical ref name and race each other (HAG-8). The fetch also
+passes `--no-write-fetch-head`, since fetching to an explicit destination
+ref does not by itself suppress git's default behavior of ALSO writing
+`FETCH_HEAD` — without that flag this check's own fetch would silently
+recreate the same race for any other process in the checkout relying on
+`FETCH_HEAD` (also HAG-8). No local branch or `origin/$BRANCH` ref
 needed, so it works identically for same-repo and fork PRs (a fork PR's
 head branch doesn't exist as `origin/$BRANCH` at all — it lives in the
 contributor's fork), and is immune to `--single-branch` clone limitations
@@ -307,6 +315,12 @@ miscategorized as a confirmed collision instead of an inconclusive pause; fixed 
 SIGPIPE bug in the collision scan (`grep -q` piped from `echo` could SIGPIPE-kill the upstream
 `echo` and silently flip a real collision into "no collision"; replaced with a herestring);
 removed the now-dead detached-HEAD guard, which no longer served any function after HAG-5's
-fetch-mechanism rewrite). Edit
+fetch-mechanism rewrite); corrected a fifth time 2026-08-22 (HAG-8: the per-invocation ref
+name now uses `$BASHPID` instead of `$$`, since `$$` is the parent shell's PID and is
+identical across subshells of the same process — two backgrounded invocations from one shell
+session would otherwise race on the same ref name; the fetch also now passes
+`--no-write-fetch-head`, since an explicit destination ref does not by itself suppress git's
+default `FETCH_HEAD` write, which would otherwise recreate the same race for any other
+process in the checkout relying on `FETCH_HEAD`). Edit
 `credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`,
 not a per-repo copy.
