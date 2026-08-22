@@ -3899,7 +3899,12 @@ pub fn classify_caller_reply(msg_text: &str, _our_call: &str) -> pancetta_core::
 /// Count the unique callsigns that are calling US (directed-at-us decodes) in a
 /// decoded-message snapshot — i.e. the number of rows the Callers panel would
 /// show. Used to phrase the "restored N callers from Nm ago" status on a
-/// band-return. Mirrors the de-dup in [`App::displayed_callers`].
+/// band-return. Mirrors the de-dup (AND, PAN-23 round-4, the unresolved-hash
+/// placeholder exclusion) in [`App::displayed_callers`], so this count always
+/// matches what the Callers panel actually displays once the cached snapshot
+/// is restored — otherwise a cached band snapshot containing a directed
+/// `"<...>"` decode could report "restored 1 caller" while the Callers panel
+/// renders empty (or overcount a mixed list of real callers + placeholders).
 fn directed_caller_count(messages: &VecDeque<DecodedMessageView>) -> usize {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for msg in messages.iter() {
@@ -3907,7 +3912,7 @@ fn directed_caller_count(messages: &VecDeque<DecodedMessageView>) -> usize {
             continue;
         }
         if let Some(call) = msg.call_sign.as_ref() {
-            if !call.is_empty() {
+            if !call.is_empty() && call.as_str() != "<...>" {
                 seen.insert(call.to_uppercase());
             }
         }
@@ -6521,6 +6526,52 @@ mod tests {
         assert!(
             app.status_message.contains("restored") && app.status_message.contains("2 caller"),
             "restore should be visible in status: {:?}",
+            app.status_message
+        );
+    }
+
+    /// PAN-23 round-4 (Codex review of #283): the "restored N caller(s)"
+    /// status must count only what the Callers panel will actually show on
+    /// return — the unresolved-hash placeholder `"<...>"` is excluded from
+    /// `displayed_callers()` (PAN-23 round 1), so `directed_caller_count`
+    /// (which phrases this status) must apply the identical exclusion.
+    /// Without it, a cached snapshot containing a directed `"<...>"` decode
+    /// among real callers could report "restored 3 callers" while only 2
+    /// rows actually render.
+    #[tokio::test]
+    async fn band_return_restored_caller_count_excludes_unresolved_hash_placeholder() {
+        let mut app = fixture_app().await;
+        app.add_decoded_message(fixture_view_directed("AA1AA", -5))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view_directed("CC3CC", -7))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view_directed("<...>", -9))
+            .await
+            .unwrap();
+        // Precondition: the placeholder decode is retained (for logs/QSO
+        // context) but never rendered as a Caller.
+        assert_eq!(app.displayed_callers().len(), 2);
+
+        app.band_up(); // leave 20M (snapshot stashed, including the placeholder)
+        app.band_down(); // back to 20M within TTL → restore
+
+        assert_eq!(
+            app.displayed_callers().len(),
+            2,
+            "the placeholder must still be excluded from the restored Callers panel"
+        );
+        assert!(
+            app.status_message.contains("restored") && app.status_message.contains("2 caller"),
+            "restored-count status must match the displayed rows (2), not the raw \
+             directed-decode count (3, which would wrongly include the placeholder): {:?}",
+            app.status_message
+        );
+        assert!(
+            !app.status_message.contains("3 caller"),
+            "restored-count status must never count the unresolved hash \
+             placeholder as a caller: {:?}",
             app.status_message
         );
     }
