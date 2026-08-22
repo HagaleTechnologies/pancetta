@@ -22,13 +22,15 @@ name: Supply Chain
 #                       malware gate, not just a CVE gate.
 #   * install-policy -- `cargo fetch --locked` (every crate must still resolve to exactly the
 #                       pinned checksum; no build.rs runs) and no git/path crate sources.
-#   * actions-pins   -- when a workflow/action file changed: every NEWLY ADDED
-#                       third-party `uses:` (parsed from the YAML at base and head,
-#                       so flow-style/quoted keys are seen too) must be version-
-#                       pinned: a floating branch ref or a docker:// image without
-#                       an @sha256 digest fails; a tag pin warns -- SHA pinning of
-#                       the whole fleet's workflows is a separate decision,
-#                       ADR-0014 open questions.
+#   * actions-pins   -- when a workflow or action manifest changed: every NEWLY
+#                       ADDED executable reference (parsed from the YAML at the
+#                       merge-base and head, per file and per occurrence: step
+#                       and reusable-workflow `uses:`, job container / service
+#                       images, local ./actions expanded, docker-action images)
+#                       must be pinned: a floating branch ref, no version, or an
+#                       image without an @sha256 digest fails; a tag pin warns --
+#                       SHA pinning of the whole fleet's workflows is a separate
+#                       decision, ADR-0014 open questions.
 #
 # THREAT MODEL / KNOWN LIMIT: this gate defends against malicious DEPENDENCY
 # CONTENT. It does not defend against a PR author who rewrites this file --
@@ -68,14 +70,24 @@ jobs:
         with:
           filters: |
             deps:
+              - '**/package.json'
+              - '**/package-lock.json'
+              - '**/npm-shrinkwrap.json'
+              - '**/pnpm-lock.yaml'
+              - '**/pnpm-workspace.yaml'
+              - '**/.npmrc'
+              - '**/yarn.lock'
+              - '**/bun.lock'
+              - '**/bun.lockb'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
-              - '**/npm-shrinkwrap.json'
               - '.github/workflows/**'
-              - '.github/actions/**'
+              - '**/action.yml'
+              - '**/action.yaml'
             actions:
               - '.github/workflows/**'
-              - '.github/actions/**'
+              - '**/action.yml'
+              - '**/action.yaml'
 
   osv:
     name: OSV advisories (incl. malicious-package MAL-*)
@@ -99,9 +111,13 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      # 0. Every Cargo.toml must sit under a validated Cargo.lock; JS lockfiles
-      #    would be refused here because this gate does not validate them
-      #    (local review gate, round 10).
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # 0. Every manifest must be covered by a lockfile this gate validates
+      #    (pnpm importer / sibling package-lock.json / a package of the Cargo
+      #    workspace its Cargo.lock actually locks); yarn/bun/shrinkwrap are
+      #    refused rather than silently passed. Every manifest and lockfile
+      #    kind named here is also in the detector above, so a PR that adds
+      #    only a refused kind still reaches this step.
       - name: Every manifest is covered by a validated lockfile
         run: |
           python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
@@ -136,46 +152,45 @@ jobs:
               for f in ("yarn.lock", "bun.lock", "bun.lockb"):
                   if f in files:
                       refused.append(os.path.join(rel, f))
-          # Cargo manifests (local gate round 10): every Cargo.toml must sit at or below a
-          # directory holding a Cargo.lock (workspace members live under the workspace
-          # root's lockfile). Refused outright if this gate does not validate Cargo.
-          cargo_manifests, cargo_locks = [], set()
+          # Cargo manifests: a Cargo.toml is covered only if it is a package of the
+          # workspace that some Cargo.lock actually locks (cargo metadata --locked from
+          # that lock's directory; an ancestor lock does NOT cover a nested standalone
+          # project -- Codex round 2). Refused outright if this gate does not validate Cargo.
+          import json, subprocess
+          cargo_manifests, cargo_locks = [], []
           for root, dirs, files in os.walk("."):
               dirs[:] = [d for d in dirs if d not in PRUNE]
               rel = os.path.normpath(root)
-              if "Cargo.toml" in files:
-                  cargo_manifests.append(rel)
-              if "Cargo.lock" in files:
-                  cargo_locks.add(rel)
-          def cargo_covered(m):
-              cur = m
-              while True:
-                  if cur in cargo_locks:
-                      return True
-                  if cur in (".", ""):
-                      return False
-                  cur = os.path.normpath(os.path.dirname(cur)) or "."
+              if "Cargo.toml" in files: cargo_manifests.append(os.path.normpath(os.path.join(rel, "Cargo.toml")))
+              if "Cargo.lock" in files: cargo_locks.append(rel)
+          cargo_covered = set()
+          if "cargo" in ACCEPT:
+              for d in cargo_locks:
+                  r = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"], cwd=d, capture_output=True, text=True)
+                  if r.returncode != 0:
+                      print(f"::error::{d}/Cargo.lock: cargo metadata --locked failed (manifest/lockfile drift?)\n{r.stderr.strip()[:400]}"); sys.exit(1)
+                  cargo_covered.add(os.path.normpath(os.path.join(d, "Cargo.toml")))   # the workspace root manifest itself
+                  for pkg in json.loads(r.stdout)["packages"]:
+                      cargo_covered.add(os.path.normpath(os.path.relpath(pkg["manifest_path"], ".")))
           if cargo_manifests and "cargo" not in ACCEPT:
-              refused += [os.path.join(m, "Cargo.toml") for m in cargo_manifests]
+              refused += cargo_manifests
           bad = [m for m in manifests if m not in covered]
-          bad += [os.path.join(m, "Cargo.toml") for m in cargo_manifests if "cargo" in ACCEPT and not cargo_covered(m)]
+          bad += [m for m in cargo_manifests if "cargo" in ACCEPT and m not in cargo_covered]
           manifests = manifests + (cargo_manifests if "cargo" in ACCEPT else [])
           if refused:
               print("::error::lockfile format(s) this gate does not validate -- add validation or remove them:")
               print("\n".join("  " + r for r in refused))
           if bad:
-              print("::error::package.json manifest(s) with no covering lockfile (not installed, not signature-audited, not source-checked):")
+              print("::error::manifest(s) with no covering validated lockfile (not installed, not signature-audited, not source-checked):")
               print("\n".join("  " + b for b in bad))
           if refused or bad:
               sys.exit(1)
           print(f"all {len(manifests)} manifest(s) are covered by a validated lockfile")
           PY
-      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
-      # Nothing may come from outside a registry: a path crate has NO `source`
-      # field in Cargo.lock, so "no git source" is not enough -- every locked
-      # package must be a workspace member (by name AND version) or a registry
-      # crate (tomllib + `cargo metadata`; local review gate rounds 1-2).
-      # EVERY Cargo.lock in the repo is checked (round 3).
+      # Per Cargo project: the parsed source policy (registry crates or
+      # (name, version) workspace members only; cargo metadata --no-deps --locked,
+      # no download) runs BEFORE cargo fetch --locked resolves and
+      # checksum-verifies the crates of THAT project.
       - name: Crate source policy + cargo fetch --locked (every Cargo.lock)
         run: |
           cat > /tmp/cargo-sources.py <<'PY'
@@ -207,9 +222,6 @@ jobs:
           PY
           n=0
           while IFS= read -r lock; do
-            # source policy first (no download: cargo metadata --no-deps --locked), THEN
-            # cargo fetch --locked resolves + checksum-verifies every crate of THIS
-            # project (a nested Cargo project gets its own fetch -- local gate round 11).
             n=$((n+1)); echo "== $lock"; ( cd "$(dirname "$lock")" && python3 /tmp/cargo-sources.py && cargo fetch --locked )
           done < <(find . \( -name node_modules -o -name target -o -name .git \) -prune -o -name 'Cargo.lock' -print | sort)
           echo "checked $n Cargo lockfile(s)"
@@ -233,90 +245,124 @@ jobs:
           import os, re, subprocess, sys, yaml
           from collections import Counter
           # Newly-added-action pin policy (CAT-299 / ADR-0014). Structural, not textual:
-          # every workflow/action YAML changed in the PR is parsed at BASE and at HEAD,
-          # the `uses:` of every executable node -- steps (jobs.*.steps, composite
-          # runs.steps) and job-level reusable-workflow calls (jobs.<job>.uses), block or
-          # flow style, quoted or bare keys; never with:/env:/inputs: data -- are counted
-          # per occurrence, and
-          # only occurrences NEW at HEAD are judged: floating branch ref or no version -> fail;
-          # docker:// without @sha256 digest -> fail; tag pin -> warning; SHA -> ok.
-          # Local (./) and HagaleTechnologies/ refs are the repo's own code.
-          base, head = sys.argv[1], sys.argv[2]
-          def changed_paths():
-              """(base_paths, head_paths) of changed workflow/action YAML, rename-aware:
-              -M pairs a moved file with its old path so its grandfathered refs count at
-              BASE too (local gate round 11). -z: NUL-delimited, whitespace-safe."""
-              raw = subprocess.run(["git", "diff", "-z", "--name-status", "-M", base, head, "--", ".github/workflows", ".github/actions"],
-                                   capture_output=True, text=True, check=True).stdout.split("\0")
-              base_paths, head_paths, i = [], [], 0
+          # every workflow (.github/workflows/*.yml) and every action manifest
+          # (**/action.yml|yaml) changed in the PR is parsed at the PR's MERGE-BASE and at
+          # HEAD; the executable references of each file -- step `uses`, job-level
+          # reusable-workflow `uses`, job `container`/`services.*.image`, composite/docker
+          # action `runs.image`, with local `./path` actions expanded recursively -- are
+          # counted PER FILE, and only occurrences new in that file are judged: floating
+          # branch ref or no version -> fail; docker:// or container image without an
+          # immutable @sha256 digest -> fail; tag pin -> warning; SHA -> ok. Local
+          # references are expanded per invocation (cycle-safe, fail-closed on depth) and
+          # a file renamed INTO an executable location is judged as new.
+          # HagaleTechnologies/ refs are the fleet's own code.
+          base_arg, head = sys.argv[1], sys.argv[2]
+          def sh(*a):
+              r = subprocess.run(a, capture_output=True, text=True); return r.returncode, r.stdout
+          rc, mb = sh("git", "merge-base", base_arg, head)
+          base = mb.strip() if rc == 0 and mb.strip() else base_arg   # judge only the PR's own additions
+          def is_target(p):
+              return (p.startswith(".github/workflows/") and p.endswith((".yml", ".yaml"))) or os.path.basename(p) in ("action.yml", "action.yaml")
+          def changed_pairs():
+              """[(base_path|None, head_path|None)] rename-aware, NUL-safe."""
+              _, raw = sh("git", "diff", "-z", "--name-status", "-M", base, head, "--", ".")
+              raw = raw.split("\0"); pairs, i = [], 0
               while i < len(raw) and raw[i]:
-                  status = raw[i]; i += 1
-                  if status[0] in "RC":            # R100\told\tnew
+                  st = raw[i]; i += 1
+                  if st[0] in "RC":
                       old, new = raw[i], raw[i + 1]; i += 2
-                      if status[0] == "R": base_paths.append(old)
-                      head_paths.append(new)
-                  else:                            # A / M / D
-                      path = raw[i]; i += 1
-                      if status[0] != "A": base_paths.append(path)
-                      if status[0] != "D": head_paths.append(path)
-              yml = lambda ps: [p for p in ps if p.endswith((".yml", ".yaml"))]
-              return yml(base_paths), yml(head_paths)
-          def uses_in(doc, acc):
-              # Only EXECUTABLE nodes carry an action reference: each job's own `uses`
-              # (reusable workflow, jobs.<job>.uses) and every entry of a `steps` list
-              # (jobs.<job>.steps / composite runs.steps). Nothing else is traversed, so
-              # a data key that merely happens to be named `uses` inside with:/env:/
-              # inputs: cannot false-positive (local review gate round 8). Counted per
-              # occurrence, so duplicating a grandfathered floating ref is still a new
-              # execution (round 7).
-              if not isinstance(doc, dict):
-                  return
+                      pairs.append((old if st[0] == "R" else None, new))
+                  else:
+                      p = raw[i]; i += 1
+                      pairs.append((None if st[0] == "A" else p, None if st[0] == "D" else p))
+              out = []
+              for b, h in pairs:
+                  if h is not None and not is_target(h): continue
+                  if h is None and not is_target(b): continue
+                  # a file renamed INTO an executable location was not executable before:
+                  # judge it as new rather than subtracting its old, inert contents
+                  if b is not None and not is_target(b): b = None
+                  out.append((b, h))
+              return out
+          def show(rev, path):
+              rc, out = sh("git", "show", f"{rev}:{path}"); return out if rc == 0 else None
+          def load(rev, path):
+              txt = show(rev, path)
+              if txt is None: return None
+              try: return yaml.safe_load(txt)
+              except yaml.YAMLError as e:
+                  print(f"::error::{path}@{rev[:8]}: unparseable YAML ({e}) -- refusing to judge it"); sys.exit(1)
+          def image_ref(v):
+              if isinstance(v, dict): v = v.get("image")
+              return f"container:{v.strip()}" if isinstance(v, str) and v.strip() else None
+          MAX_DEPTH = 12
+          def refs_of(rev, doc, acc, stack, depth=0):
+              if not isinstance(doc, dict): return
+              def expand(path, label):
+                  # every invocation is expanded (per-occurrence policy); `stack` is the
+                  # current recursion path only, so a cycle is cut but a repeated
+                  # invocation is still counted; too-deep chains FAIL rather than vanish.
+                  if path in stack:
+                      return
+                  if depth >= MAX_DEPTH:
+                      print(f"::error::local reference chain deeper than {MAX_DEPTH} at {label} -- refusing to skip it"); acc["MISSING:" + label] += 1; return
+                  sub = load(rev, path)
+                  if sub is None:
+                      print(f"::error::local reference {label} has no {path} at {rev[:8]}"); acc["MISSING:" + label] += 1; return
+                  refs_of(rev, sub, acc, stack | {path}, depth + 1)
+              def add(ref, job_level=False):
+                  ref = ref.strip()
+                  if ref.startswith("./"):
+                      local = ref[2:].rstrip("/")
+                      if job_level and local.endswith((".yml", ".yaml")):      # local reusable workflow
+                          expand(local, ref)
+                      else:                                                    # local action directory
+                          cand = [f"{local}/action.yml", f"{local}/action.yaml"]
+                          hit = next((c for c in cand if show(rev, c) is not None), None)
+                          expand(hit if hit else cand[0], ref)
+                  else: acc[ref] += 1
               def steps(lst):
                   for st in lst or []:
-                      if isinstance(st, dict) and isinstance(st.get("uses"), str):
-                          acc[st["uses"].strip()] += 1
+                      if isinstance(st, dict) and isinstance(st.get("uses"), str): add(st["uses"])
               jobs = doc.get("jobs")
               if isinstance(jobs, dict):
                   for job in jobs.values():
-                      if isinstance(job, dict):
-                          if isinstance(job.get("uses"), str):
-                              acc[job["uses"].strip()] += 1
-                          if isinstance(job.get("steps"), list):
-                              steps(job["steps"])
+                      if not isinstance(job, dict): continue
+                      if isinstance(job.get("uses"), str): add(job["uses"], job_level=True)
+                      if isinstance(job.get("steps"), list): steps(job["steps"])
+                      c = image_ref(job.get("container"))
+                      if c: acc[c] += 1
+                      svcs = job.get("services")
+                      if isinstance(svcs, dict):
+                          for sv in svcs.values():
+                              c = image_ref(sv)
+                              if c: acc[c] += 1
               runs = doc.get("runs")
-              if isinstance(runs, dict) and isinstance(runs.get("steps"), list):
-                  steps(runs["steps"])
-          def uses_at(rev, path):
-              r = subprocess.run(["git", "show", f"{rev}:{path}"], capture_output=True, text=True)
-              if r.returncode != 0:
-                  return Counter()        # file absent at that rev (A/D handled by changed_paths)
-              acc = Counter()
-              try:
-                  uses_in(yaml.safe_load(r.stdout), acc)
-              except yaml.YAMLError as e:
-                  print(f"::error::{path}@{rev[:8]}: unparseable YAML ({e}) -- refusing to judge it"); sys.exit(1)
+              if isinstance(runs, dict):
+                  if isinstance(runs.get("steps"), list): steps(runs["steps"])
+                  img = runs.get("image")
+                  if isinstance(img, str) and img.startswith("docker://"): acc[img.strip()] += 1
+          def refs_at(rev, path):
+              acc = Counter(); doc = load(rev, path)
+              if doc is not None: refs_of(rev, doc, acc, frozenset({path}))
               return acc
-          base_paths, head_paths = changed_paths()
-          before, after = Counter(), Counter()
-          for f in base_paths: before += uses_at(base, f)
-          for f in head_paths: after += uses_at(head, f)
-          new = after - before      # Counter subtraction: only refs with MORE occurrences after the change
-          fail = 0
-          for ref in sorted(new.elements()):
-              if ref.startswith("./") or ref.startswith("HagaleTechnologies/"):
-                  continue
-              if ref.startswith("docker://"):
+          fail = 0; new = Counter()
+          for b, h in changed_pairs():
+              if h is None: continue                               # deleted file: nothing new runs
+              new += refs_at(head, h) - (refs_at(base, b) if b else Counter())   # per file, per occurrence
+          for ref in sorted(new):            # one verdict per distinct ref (a ref reached via a local action AND its own changed manifest is reported once)
+              if ref.startswith("MISSING:"): fail = 1; continue
+              if ref.startswith("HagaleTechnologies/"): continue
+              if ref.startswith(("docker://", "container:")):
                   if re.search(r"@sha256:[0-9a-f]{64}$", ref): print(f"pinned by digest: {ref}")
-                  else: print(f"::error::docker action without an immutable @sha256 digest: {ref}"); fail = 1
+                  else: print(f"::error::image without an immutable @sha256 digest: {ref}"); fail = 1
                   continue
-              if "@" not in ref:
-                  print(f"::error::unpinned action (no @version): {ref}"); fail = 1; continue
+              if "@" not in ref: print(f"::error::unpinned action (no @version): {ref}"); fail = 1; continue
               ver = ref.rsplit("@", 1)[1]
               if re.fullmatch(r"[0-9a-f]{40}", ver): print(f"pinned by SHA: {ref}")
               elif re.fullmatch(r"v?[0-9]+(\.[0-9]+)*", ver): print(f"::warning::tag-pinned (mutable) action added: {ref} -- prefer a full commit SHA")
               else: print(f"::error::floating ref (branch) action added: {ref}"); fail = 1
-          print("added-action pin check " + ("FAILED" if fail else "passed"))
-          sys.exit(fail)
+          print("added-action pin check " + ("FAILED" if fail else "passed")); sys.exit(fail)
           PY
           python3 /tmp/action-pins.py "$BASE" "$HEAD"
 
