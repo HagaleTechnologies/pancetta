@@ -245,22 +245,89 @@ mod ap_eval_mode_tests {
 /// to tighten proximity requirements substantially rather than keep the
 /// old, much looser gate.
 ///
+/// PAN-40 round-3 review (Codex finding 3): a fixed FT8-tuned Hz
+/// tolerance is wrong for FT4. This coordinator path decodes whatever
+/// `[decoder].protocol` is currently active (see `last_protocol` at the
+/// call site) — FT8's sub-bin spacing is `tone_spacing(6.25) /
+/// FREQ_OSR(2) = 3.125 Hz`; FT4's is `tone_spacing(20.8333) / FREQ_OSR(2)
+/// ≈ 10.42 Hz` (`pancetta_ft8::ProtocolParams::ft4`). `FREQ_OSR` itself
+/// is NOT protocol-dependent — it's a fixed `2` in both the native
+/// decoder (`decoder.rs::FREQ_OSR`) and the ft8lib FFI's
+/// `monitor_config_t` (`ft8_lib_ffi.rs`) — so deriving from
+/// `tone_spacing` alone (without threading `FREQ_OSR` across the crate
+/// boundary) exactly reproduces both backends' real sub-bin grid for
+/// whichever protocol is active.
+///
 /// Max `frequency_offset` difference (Hz) to consider two decodes the
-/// same physical signal. Tight: one FFT bin width (`pancetta-ft8`'s
-/// spectrogram bin step is 3.125 Hz — see `a7_freq_window_hz` in
-/// `pancetta-ft8/src/decoder.rs`), just enough to absorb independent
-/// sub-bin peak-fit rounding between the two backends while being far
-/// tighter than realistic distinct-station spacing on a busy band.
-const HASH_TWIN_FREQ_TOLERANCE_HZ: f64 = 3.125;
+/// same physical signal: one sub-bin width for the active protocol, just
+/// enough to absorb independent sub-bin peak-fit rounding between the
+/// two backends while being far tighter than realistic distinct-station
+/// spacing on a busy band.
+fn hash_twin_freq_tolerance_hz(protocol: pancetta_ft8::Protocol) -> f64 {
+    const FREQ_OSR: f64 = 2.0;
+    pancetta_ft8::ProtocolParams::from_protocol(protocol).tone_spacing / FREQ_OSR
+}
 
-/// Max `time_offset` (DT, seconds) difference to consider two decodes the
-/// same physical signal. Two backends independently sync-detecting the
-/// SAME burst should agree on its arrival time to a small fraction of an
-/// FT8 symbol (~0.16 s); two different transmitting stations essentially
+/// Max `time_offset` (DT, seconds) difference to consider two decodes
+/// (after [`normalized_time_offset`] puts them on the same convention)
+/// the same physical signal. Two backends independently sync-detecting
+/// the SAME burst should agree on its arrival time to a small fraction
+/// of a symbol period; two different transmitting stations essentially
 /// never coincidentally share both near-identical frequency AND
-/// near-identical DT AND matching non-hash text. Combined with the tight
-/// freq gate above, this is the substitute for real payload identity.
-const HASH_TWIN_TIME_TOLERANCE_S: f64 = 0.1;
+/// near-identical DT AND matching non-hash text. `0.625` of a symbol
+/// period reproduces the original FT8-only tolerance exactly (`0.16 s *
+/// 0.625 = 0.1 s`) while scaling correctly for FT4's much shorter
+/// (0.048 s) symbol period.
+fn hash_twin_time_tolerance_s(protocol: pancetta_ft8::Protocol) -> f64 {
+    pancetta_ft8::ProtocolParams::from_protocol(protocol).symbol_period * 0.625
+}
+
+/// PAN-40 round-3 review (Codex finding 1): does `msg` look like it came
+/// from the ft8lib FFI backend (`DecodedMessage::from_ft8lib`) rather
+/// than the native pipeline? `confidence_features` is only ever
+/// populated by the native BP/OSD pipeline's `stamp_decode_origin` —
+/// per that field's own doc comment, `None` means "predates stamping or
+/// came from a path that doesn't stamp (FFI, tests constructing messages
+/// directly)". ft8lib's FFI wrapper never touches this field (it stays
+/// at the `Ft8Message::default()`-adjacent `None` `from_ft8lib` sets), so
+/// this is a reliable, already-available discriminator — no new
+/// plumbing needed.
+fn is_ft8lib_origin_decode(msg: &pancetta_ft8::DecodedMessage) -> bool {
+    msg.confidence_features.is_none()
+}
+
+/// PAN-40 round-3 review (Codex finding 1) — the actual bug: the DT
+/// proximity gate compared `time_offset` values that use DIFFERENT
+/// reporting conventions between the two backends for the SAME physical
+/// candidate, so it could never pass for the real ft8lib/native twin
+/// this whole PR exists to fix.
+///
+/// `ft8lib_decode_audio_protocol` (`pancetta-ft8/src/ft8_lib_ffi.rs`)
+/// reports the raw upstream `time_sec = (time_offset + time_sub/osr) *
+/// symbol_period` — ft8_lib's own convention, with no look-back
+/// correction. The native decoder's `candidate_offset_samples`
+/// (`pancetta-ft8/src/decoder.rs`) subtracts `SLIDING_FRAME_LOOKBACK_
+/// STEPS` (2 time-steps at `TIME_OSR=2`, i.e. exactly **one symbol
+/// period**) before converting to seconds — documented there as fixing
+/// ft8lib's convention being measured "one symbol period late" against
+/// synthetic ground truth. So for the SAME physical signal, ft8lib's
+/// raw DT is systematically `+1 symbol period` relative to the native
+/// decoder's corrected DT — 0.16 s for FT8, 0.048 s for FT4 — which
+/// exceeds even the OLD, un-protocol-scaled 0.1 s tolerance, so the DT
+/// gate silently rejected every real cross-backend twin.
+///
+/// Normalizes an ft8lib-origin decode's `time_offset` onto the native
+/// decoder's (corrected) convention by subtracting one symbol period;
+/// leaves a native-origin decode's `time_offset` untouched. Comparing
+/// two NORMALIZED values is then apples-to-apples regardless of which
+/// backend(s) produced them.
+fn normalized_time_offset(msg: &pancetta_ft8::DecodedMessage, symbol_period_s: f64) -> f64 {
+    if is_ft8lib_origin_decode(msg) {
+        msg.time_offset - symbol_period_s
+    } else {
+        msg.time_offset
+    }
+}
 
 /// PAN-40: is `word` the literal unresolved i3=4 hash-miss placeholder
 /// token? Mirrors the `None`-branch semantics of
@@ -304,11 +371,15 @@ fn normalize_hash_bracket_word(word: &str) -> &str {
 ///
 /// Declares two decodes twins of the same signal only when ALL hold:
 ///   - their `frequency_offset`s agree within
-///     [`HASH_TWIN_FREQ_TOLERANCE_HZ`] (checked by the caller,
-///     [`drop_unresolved_hash_twins`], since that's where the full
-///     `DecodedMessage` — not just text — is available), AND
-///   - their `time_offset` (DT)s agree within
-///     [`HASH_TWIN_TIME_TOLERANCE_S`] (also checked by the caller), AND
+///     [`hash_twin_freq_tolerance_hz`] for the active protocol (checked
+///     by the caller, [`drop_unresolved_hash_twins`], since that's where
+///     the full `DecodedMessage` — not just text — is available), AND
+///   - their [`normalized_time_offset`] (DT, put on a common convention
+///     across backends) agree within [`hash_twin_time_tolerance_s`] for
+///     the active protocol (also checked by the caller), AND
+///   - neither side is a cross-sequence-A7 speculative candidate
+///     (`via_cross_sequence_a7 == true`; also checked by the caller —
+///     see its doc comment, PAN-40 round-3 review finding 2), AND
 ///   - after normalizing away hash-resolution differences (unwrapping
 ///     resolved `"<CALL>"` renders to plain `"CALL"`, and treating the
 ///     literal unresolved placeholder `"<...>"` as a wildcard that
@@ -387,12 +458,21 @@ fn hash_twin_keep_first(a: &str, b: &str) -> Option<bool> {
 /// PAN-40 — drop the unresolved-hash-placeholder half of any decode pair
 /// in `messages` that is confidently the same physical signal decoded
 /// twice (once resolved, once not) by the two decoder backends: their
-/// `frequency_offset`s agree within [`HASH_TWIN_FREQ_TOLERANCE_HZ`],
-/// their `time_offset` (DT)s agree within [`HASH_TWIN_TIME_TOLERANCE_S`],
-/// and [`hash_twin_keep_first`] confirms the texts are twins modulo hash
-/// resolution. See both constants' and that function's doc comments for
-/// the full rationale and the conservative-by-default policy — a pair
-/// that fails ANY of the three checks keeps both messages.
+/// `frequency_offset`s agree within [`hash_twin_freq_tolerance_hz`],
+/// their [`normalized_time_offset`]s agree within
+/// [`hash_twin_time_tolerance_s`], neither side is a cross-sequence-A7
+/// speculative candidate, and [`hash_twin_keep_first`] confirms the texts
+/// are twins modulo hash resolution. See those functions' doc comments
+/// for the full rationale and the conservative-by-default policy — a
+/// pair that fails ANY check keeps both messages.
+///
+/// `protocol` is the coordinator's currently-active decode protocol
+/// (`last_protocol` at the call site) — PAN-40 round-3 review finding 3:
+/// this coordinator path also decodes FT4, whose tone spacing and symbol
+/// period differ substantially from FT8's, so the freq/DT tolerances
+/// MUST be derived per-call from the active protocol rather than
+/// hardcoded to FT8's numbers (see [`hash_twin_freq_tolerance_hz`] /
+/// [`hash_twin_time_tolerance_s`]).
 ///
 /// PAN-40 round-2 review (Codex finding 1): callers MUST run this pass
 /// AFTER `partition_ap_eval_decodes`, never before. `[decoder].
@@ -408,11 +488,29 @@ fn hash_twin_keep_first(a: &str, b: &str) -> Option<bool> {
 /// it never sees (and so can never be tricked by) a decode AP-eval-mode
 /// has already decided to suppress.
 ///
+/// PAN-40 round-3 review (Codex finding 2): a pair is never eligible for
+/// twin-removal if EITHER side is a cross-sequence-A7 candidate
+/// (`via_cross_sequence_a7 == true`, appended to `decoded_messages`
+/// before this pass runs — see `invoke_cross_sequence_consumer`). A7
+/// candidates are speculative template hypotheses, not confirmed
+/// CRC-valid decodes from either normal backend; if one were allowed to
+/// "win" a twin comparison it could cause a real, CRC-valid decode
+/// (e.g. the genuine unresolved-hash frame this whole pass exists to
+/// rescue) to be discarded in favor of a guess. Excluding A7 candidates
+/// entirely (rather than merely never letting one survive) is the
+/// simplest option that fully closes this — it also means an A7
+/// candidate can never cause the REAL decode to be dropped either.
+///
 /// Returns `(kept_messages, dropped_count)`. Order of the surviving
 /// messages is preserved.
 fn drop_unresolved_hash_twins(
     messages: Vec<pancetta_ft8::DecodedMessage>,
+    protocol: pancetta_ft8::Protocol,
 ) -> (Vec<pancetta_ft8::DecodedMessage>, usize) {
+    let freq_tolerance_hz = hash_twin_freq_tolerance_hz(protocol);
+    let time_tolerance_s = hash_twin_time_tolerance_s(protocol);
+    let symbol_period_s = pancetta_ft8::ProtocolParams::from_protocol(protocol).symbol_period;
+
     let n = messages.len();
     let mut drop = vec![false; n];
 
@@ -424,14 +522,17 @@ fn drop_unresolved_hash_twins(
             if drop[j] || messages[i].text == messages[j].text {
                 continue;
             }
+            if messages[i].via_cross_sequence_a7 || messages[j].via_cross_sequence_a7 {
+                continue;
+            }
             if (messages[i].frequency_offset - messages[j].frequency_offset).abs()
-                > HASH_TWIN_FREQ_TOLERANCE_HZ
+                > freq_tolerance_hz
             {
                 continue;
             }
-            if (messages[i].time_offset - messages[j].time_offset).abs()
-                > HASH_TWIN_TIME_TOLERANCE_S
-            {
+            let dt_i = normalized_time_offset(&messages[i], symbol_period_s);
+            let dt_j = normalized_time_offset(&messages[j], symbol_period_s);
+            if (dt_i - dt_j).abs() > time_tolerance_s {
                 continue;
             }
             match hash_twin_keep_first(&messages[i].text, &messages[j].text) {
@@ -464,7 +565,7 @@ fn drop_unresolved_hash_twins(
 #[cfg(test)]
 mod hash_twin_dedup_tests {
     use super::{drop_unresolved_hash_twins, hash_twin_keep_first};
-    use pancetta_ft8::{DecodedMessage, Ft8Message};
+    use pancetta_ft8::{ConfidenceFeatures, DecodedMessage, Ft8Message, Protocol};
 
     fn decoded_at(freq_hz: f64, text: &str) -> DecodedMessage {
         decoded_at_dt(freq_hz, 0.1, text)
@@ -473,6 +574,27 @@ mod hash_twin_dedup_tests {
     fn decoded_at_dt(freq_hz: f64, time_offset: f64, text: &str) -> DecodedMessage {
         let mut d = DecodedMessage::new(Ft8Message::default(), -10.0, 0.5, freq_hz, time_offset);
         d.text = text.to_string();
+        d
+    }
+
+    /// Marks a test-constructed message as native-pipeline-origin (as
+    /// opposed to the default ft8lib-FFI-origin every `decoded_at*`
+    /// message starts as) by giving it a `confidence_features` stamp,
+    /// exactly like the native decoder's `stamp_decode_origin` does.
+    /// Needed to test [`super::normalized_time_offset`]'s asymmetric
+    /// per-backend DT correction (PAN-40 round-3 review finding 1).
+    fn native_origin(mut d: DecodedMessage) -> DecodedMessage {
+        d.confidence_features = Some(ConfidenceFeatures {
+            decode_origin: Some(0),
+            ..Default::default()
+        });
+        d
+    }
+
+    /// Marks a test-constructed message as a cross-sequence-A7
+    /// speculative candidate (PAN-40 round-3 review finding 2).
+    fn a7_origin(mut d: DecodedMessage) -> DecodedMessage {
+        d.via_cross_sequence_a7 = true;
         d
     }
 
@@ -534,7 +656,7 @@ mod hash_twin_dedup_tests {
             decoded_at(2700.0, "3B9/SQ9UM <...>"),
             decoded_at(2700.0, "3B9/SQ9UM <K5ARH>"),
         ];
-        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
         assert_eq!(dropped, 1);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].text, "3B9/SQ9UM <K5ARH>");
@@ -546,7 +668,7 @@ mod hash_twin_dedup_tests {
             decoded_at(1200.0, "3B9/SQ9UM <...>"),
             decoded_at(2700.0, "3B9/SQ9UM <K5ARH>"),
         ];
-        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
         assert_eq!(dropped, 0);
         assert_eq!(kept.len(), 2);
     }
@@ -557,7 +679,7 @@ mod hash_twin_dedup_tests {
             decoded_at(2700.0, "CQ K1ABC FN42"),
             decoded_at(2700.0, "W2XYZ K3DEF -05"),
         ];
-        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
         assert_eq!(dropped, 0);
         assert_eq!(kept.len(), 2);
     }
@@ -569,7 +691,7 @@ mod hash_twin_dedup_tests {
         // never reach this pass with two entries in practice, but the
         // pass itself must be a no-op on an already-single-copy list).
         let messages = vec![decoded_at(2700.0, "CQ K1ABC FN42")];
-        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
         assert_eq!(dropped, 0);
         assert_eq!(kept.len(), 1);
         assert_eq!(kept[0].text, "CQ K1ABC FN42");
@@ -585,7 +707,7 @@ mod hash_twin_dedup_tests {
             decoded_at(1500.0, "CQ K1ABC FN42"),
             decoded_at(2700.0, "3B9/SQ9UM <K5ARH>"),
         ];
-        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
         assert_eq!(dropped, 1);
         let texts: Vec<&str> = kept.iter().map(|m| m.text.as_str()).collect();
         assert_eq!(texts, vec!["CQ K1ABC FN42", "3B9/SQ9UM <K5ARH>"]);
@@ -604,7 +726,7 @@ mod hash_twin_dedup_tests {
             decoded_at(2700.0, "<...> YS/WE9G RR73"),
             decoded_at(2706.0, "<K1ABC> YS/WE9G RR73"),
         ];
-        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
         assert_eq!(
             dropped, 0,
             "two different callers 6 Hz apart must not be conflated as a hash twin"
@@ -623,7 +745,7 @@ mod hash_twin_dedup_tests {
             decoded_at_dt(2700.0, 0.05, "<...> YS/WE9G RR73"),
             decoded_at_dt(2700.0, 0.65, "<K1ABC> YS/WE9G RR73"),
         ];
-        let (kept, dropped) = drop_unresolved_hash_twins(messages);
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
         assert_eq!(
             dropped, 0,
             "same freq bin but 0.6s-apart DT must not be conflated as a hash twin"
@@ -678,9 +800,122 @@ mod hash_twin_dedup_tests {
         // pass shrink the delivered set -- which is fine precisely
         // because the summary log already captured the correct numbers
         // for what was true at ITS point in the pipeline.
-        let (kept, dropped) = drop_unresolved_hash_twins(decoded_messages);
+        let (kept, dropped) = drop_unresolved_hash_twins(decoded_messages, Protocol::Ft8);
         assert_eq!(dropped, 1);
         assert_eq!(kept.len(), 1);
+    }
+
+    /// PAN-40 round-3 review (Codex finding 1), the actual motivating
+    /// regression: reproduce the TRUE per-backend DT conventions (not
+    /// pre-normalized test fixtures) for the SAME physical candidate.
+    /// ft8lib's raw DT is one symbol period (0.16 s for FT8) LATER than
+    /// the native decoder's corrected DT for the identical signal (see
+    /// `normalized_time_offset`'s doc comment) — prior to this fix that
+    /// 0.16 s gap always exceeded the DT tolerance, so the motivating
+    /// 3B9/SQ9UM unresolved/resolved pair was NEVER recognized as a
+    /// twin and the live QSO starvation this whole PR exists to fix
+    /// remained unfixed. This test proves the real-world case now
+    /// passes.
+    #[test]
+    fn real_backend_dt_conventions_are_normalized_before_comparison() {
+        const FT8_SYMBOL_PERIOD_S: f64 = 0.16;
+        let native_true_dt = 0.34; // the corrected, true arrival time
+        let ft8lib_raw_dt = native_true_dt + FT8_SYMBOL_PERIOD_S; // ft8lib's own (uncorrected) convention = 0.50
+
+        let messages = vec![
+            // ft8lib-origin (default `decoded_at_dt`): unresolved,
+            // raw/late DT convention -- exactly what
+            // `decode_window_ft8lib_protocol` reports.
+            decoded_at_dt(2700.0, ft8lib_raw_dt, "3B9/SQ9UM <...>"),
+            // native-origin: resolved, already-corrected DT convention
+            // -- exactly what `candidate_offset_samples` reports.
+            native_origin(decoded_at_dt(2700.0, native_true_dt, "3B9/SQ9UM <K5ARH>")),
+        ];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
+        assert_eq!(
+            dropped, 1,
+            "the real ft8lib/native twin must be recognized once DT conventions are normalized \
+             onto a common basis before comparison"
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "3B9/SQ9UM <K5ARH>");
+    }
+
+    /// PAN-40 round-3 review (Codex finding 2): a cross-sequence-A7
+    /// candidate is a SPECULATIVE template hypothesis, not a confirmed
+    /// CRC-valid decode -- it must never be allowed to "win" a twin
+    /// comparison and cause a real decode to be discarded in its favor.
+    /// The real decode here still carries the unresolved hash
+    /// placeholder (the exact case this whole pass exists to rescue);
+    /// without the A7 exclusion this pair would look exactly like an
+    /// ordinary hash twin (same freq/DT, texts differ only by the
+    /// placeholder) and the A7 guess would wrongly displace the real
+    /// decode.
+    #[test]
+    fn cross_sequence_a7_candidate_never_displaces_a_real_decode() {
+        let messages = vec![
+            // Real, CRC-valid decode from the standard pipeline -- still
+            // carries the unresolved hash placeholder.
+            decoded_at(2700.0, "<...> YS/WE9G RR73"),
+            // Speculative A7 template hypothesis at the same freq/DT,
+            // "resolving" the hash to a guessed callsign.
+            a7_origin(decoded_at(2700.0, "<K1ABC> YS/WE9G RR73")),
+        ];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft8);
+        assert_eq!(
+            dropped, 0,
+            "a cross-sequence-A7 candidate must never participate in hash-twin removal, \
+             on either side of the pair"
+        );
+        assert_eq!(kept.len(), 2);
+        assert!(
+            kept.iter().any(|m| m.text == "<...> YS/WE9G RR73"),
+            "the real CRC-valid decode must survive regardless of the A7 guess; kept={:?}",
+            kept.iter().map(|m| m.text.as_str()).collect::<Vec<_>>()
+        );
+    }
+
+    /// PAN-40 round-3 review (Codex finding 3): FT4's tone spacing
+    /// (20.8333 Hz) and therefore its sub-bin frequency-estimate spacing
+    /// (`tone_spacing / FREQ_OSR` ≈ 10.42 Hz) is much wider than FT8's
+    /// (3.125 Hz). A near-boundary FT4 signal where the two backends'
+    /// independent sync searches land in neighboring sub-bins can differ
+    /// by nearly that whole ~10.42 Hz — the old FT8-tuned fixed 3.125 Hz
+    /// tolerance would have rejected this pair as "too far apart" and
+    /// left both the unresolved and resolved copies downstream. Proves
+    /// the protocol-derived tolerance now recognizes it for FT4, and
+    /// that the identical gap correctly does NOT merge under FT8 (where
+    /// it exceeds the tighter, FT8-appropriate tolerance).
+    #[test]
+    fn ft4_near_boundary_hash_twin_is_recognized_with_protocol_scaled_tolerance() {
+        let messages = vec![
+            decoded_at(2700.0, "3B9/SQ9UM <...>"),
+            // 10 Hz away: within FT4's ~10.42 Hz sub-bin tolerance,
+            // outside FT8's 3.125 Hz one.
+            decoded_at(2710.0, "3B9/SQ9UM <K5ARH>"),
+        ];
+        let (kept, dropped) = drop_unresolved_hash_twins(messages, Protocol::Ft4);
+        assert_eq!(
+            dropped, 1,
+            "an FT4 near-boundary twin 10 Hz apart must be recognized under the FT4-scaled \
+             frequency tolerance"
+        );
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].text, "3B9/SQ9UM <K5ARH>");
+
+        // Sanity: the identical pair, evaluated as FT8, must NOT merge --
+        // proves the tolerance is genuinely protocol-scoped, not just
+        // loosened globally.
+        let messages_ft8 = vec![
+            decoded_at(2700.0, "3B9/SQ9UM <...>"),
+            decoded_at(2710.0, "3B9/SQ9UM <K5ARH>"),
+        ];
+        let (kept_ft8, dropped_ft8) = drop_unresolved_hash_twins(messages_ft8, Protocol::Ft8);
+        assert_eq!(
+            dropped_ft8, 0,
+            "the same 10 Hz gap must NOT merge under FT8's tighter (3.125 Hz) tolerance"
+        );
+        assert_eq!(kept_ft8.len(), 2);
     }
 }
 
@@ -1817,8 +2052,13 @@ impl super::ApplicationCoordinator {
                         // `[decoder].ap_eval_mode` guarantees always reaches
                         // consumers. See `drop_unresolved_hash_twins`'s doc
                         // comment for the full ordering rationale.
+                        //
+                        // `last_protocol` is passed through so the freq/DT
+                        // tolerances are correctly scaled for whichever
+                        // protocol (FT8 or FT4) this window actually decoded
+                        // (PAN-40 round-3 review finding 3).
                         let (decoded_messages, hash_twins_dropped) =
-                            drop_unresolved_hash_twins(decoded_messages);
+                            drop_unresolved_hash_twins(decoded_messages, last_protocol);
                         if hash_twins_dropped > 0 {
                             debug!(
                                 target: "ft8.decode",
