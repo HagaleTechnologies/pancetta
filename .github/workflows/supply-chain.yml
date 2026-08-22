@@ -46,6 +46,10 @@ name: Supply Chain
 on:
   pull_request:
     branches: [main]
+  # A merge queue requests the same required context for its temporary
+  # merge-group SHA; the scans then run against merge_group.base_sha/head_sha.
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -64,9 +68,13 @@ jobs:
       deps: ${{ steps.filter.outputs.deps }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
+          base: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           filters: |
             deps:
               - '**/package.json'
@@ -153,6 +161,13 @@ jobs:
                                   elif pattern.startswith("**", i): out += ".*"; i += 2
                                   elif c == "*": out += "[^/]*"; i += 1
                                   elif c == "?": out += "[^/]"; i += 1
+                                  elif c == "[":
+                                      j = pattern.find("]", i + 2)
+                                      if j == -1: out += _re.escape(c); i += 1
+                                      else:
+                                          cls = pattern[i + 1:j]
+                                          cls = ("^" + cls[1:]) if cls.startswith("!") else cls          # [!ab] -> [^ab]
+                                          out += "[" + cls.replace("\\", "\\\\") + "]"; i = j + 1
                                   elif c == "{":
                                       j = pattern.find("}", i)
                                       if j == -1: out += _re.escape(c); i += 1
@@ -299,8 +314,8 @@ jobs:
           fetch-depth: 0
       - name: Newly added actions must be pinned (structural YAML check)
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
           cat > /tmp/action-pins.py <<'PY'
@@ -395,7 +410,7 @@ jobs:
                   # ordinary command text such as `RUN echo from=x` is never an image.
                   srcs = []
                   fm = re.match(r"\s*(?:ONBUILD\s+)?(COPY|ADD)\s+((?:--\S+\s+)*)", line, re.I)
-                  if fm: srcs += re.findall(r"--from=(\S+)", fm.group(2))
+                  if fm: srcs += [v.strip("'\"") for v in re.findall(r"--from=(\S+)", fm.group(2))]   # Docker removes quotes: --from="build"
                   rm = re.match(r"\s*(?:ONBUILD\s+)?RUN\s+((?:--\S+\s+)*)", line, re.I)
                   if rm:
                       for mnt in re.findall(r"--mount=(\S+)", rm.group(1)):
