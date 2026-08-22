@@ -61,8 +61,10 @@ deferred review findings`. Body: each finding pasted verbatim (reviewer's
 exact comment text, file:line, thread URL), linked back to the PR. If
 ticket filing fails (no ticketing system configured, or it's unreachable),
 don't let that block the thread indefinitely — fall back to fixing the
-finding inline instead. An optional dependency should never become
-load-bearing for getting a PR unstuck.
+finding inline instead, except at round 25, where fixing inline would
+require a push that opens the prohibited 26th round; escalate to a human
+instead of either fixing inline or filing a ticket. An optional dependency
+should never become load-bearing for getting a PR unstuck.
 
 ## What this does not do
 
@@ -83,6 +85,12 @@ the equivalent review locally first and iterate until clean:
 codex exec review --uncommitted
 ```
 
+If this round's fixes are already committed locally (not just
+staged/unstaged/untracked), `--uncommitted` won't see them — review the
+actual diff about to be pushed instead (a commit-range review against the
+PR's base, not just the working tree; check the reviewer's own docs for
+the right invocation if `--uncommitted` doesn't cover a commit range).
+
 If a repo's `.claude/review-policy-override.md` defines a `## Local review
 gate` section with its own command, use that instead (a repo's own hard
 constraints can legitimately conflict with running `codex exec review`
@@ -99,6 +107,9 @@ free. A local finding has no PR review thread, so the ticketing mechanics above 
 the local reviewer's finding verbatim same as any other, write `(found by local review gate,
 no PR thread)` in place of the thread URL, and skip the reply-and-resolve-thread step (there
 is no thread to resolve) — filing to the single follow-up ticket is what clears it.
+"Iterate until clean" means clean of un-ticketed findings — once a finding is correctly
+deferred per the round-based schedule above, it no longer blocks the gate even if the local
+reviewer keeps re-flagging it on every re-run.
 
 ## Collision awareness
 
@@ -109,7 +120,15 @@ check whether the remote branch has moved since your last known commit in
 a way you didn't cause. Note: a `land-pr` `update-branch` call you
 yourself just triggered also moves the remote branch — that's not a
 collision, just don't mistake it for one if you invoked `land-pr` earlier
-in the same session.
+in the same session. `$PR_NUMBER` must be in scope for this check —
+`resolve-review-feedback`'s Step 3 ("Collision check before starting any
+round") is what invokes this check today and already establishes
+`$PR_NUMBER` in its own Step 1. `land-pr` does not call this check itself
+as of this writing (its own SKILL.md has no reference to it), though it
+does establish its own `PR_NUMBER` for its polling loop, and its
+`diagnose_behind` sync (below) exists specifically to keep this check
+accurate for whichever caller does invoke it after `land-pr` has acted in
+the same session.
 
 ```bash
 BRANCH="$(git symbolic-ref --short -q HEAD || true)"
@@ -118,27 +137,51 @@ if [ -z "$BRANCH" ]; then
   echo "Check out that branch explicitly before running it, rather than guessing at a ref." >&2
   exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
 fi
+if [ -z "${PR_NUMBER:-}" ]; then
+  echo "PR_NUMBER is not set — this check requires it (both resolve-review-feedback and land-pr establish it in their own Step 1)." >&2
+  echo "Cannot verify remote state without it. Pausing rather than guessing." >&2
+  exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
+fi
 FETCH_ERR="$(mktemp)"
 trap 'rm -f "$FETCH_ERR"' EXIT
-if ! git fetch origin "$BRANCH" --quiet 2>"$FETCH_ERR"; then
-  echo "Could not fetch origin/${BRANCH} — remote state is unverifiable: $(cat "$FETCH_ERR")" >&2
+if ! git fetch origin "refs/pull/${PR_NUMBER}/head" --quiet 2>"$FETCH_ERR"; then
+  echo "Could not fetch the PR's head ref (refs/pull/${PR_NUMBER}/head) — remote state is unverifiable: $(cat "$FETCH_ERR")" >&2
   echo "Pausing rather than treating an unreachable remote as collision-free." >&2
   exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
 fi
-REMOTE_SHA="$(git rev-parse "origin/${BRANCH}" 2>/dev/null || echo "")"
-# Compare by ancestry, not equality: HEAD is expected to run ahead of
-# origin/$BRANCH once you've committed this round's local fixes but
-# haven't pushed yet — that's normal mid-round state, not a collision.
-# Only flag when origin/$BRANCH holds a commit your local history
-# doesn't contain (i.e. it is NOT an ancestor of HEAD) — that's the
-# actual signal that someone else pushed.
-if [ -n "$REMOTE_SHA" ] && ! git merge-base --is-ancestor "$REMOTE_SHA" HEAD; then
-  RECENT_AUTHOR="$(git log -1 --format='%an <%ae> at %ad' "$REMOTE_SHA" 2>/dev/null || echo "unknown")"
-  echo "origin/${BRANCH} has a commit our local history doesn't contain (${RECENT_AUTHOR})." >&2
-  echo "Possible concurrent session on this PR. Pausing — do not race it." >&2
-  exit 0  # deliberate: pausing is not a failure, so a caller checking status sees success
+REMOTE_SHA="$(git rev-parse FETCH_HEAD 2>/dev/null || echo "")"
+if [ -z "$REMOTE_SHA" ]; then
+  echo "Could not resolve FETCH_HEAD after a successful fetch — remote state is unverifiable." >&2
+  echo "Pausing rather than treating an unreachable remote as collision-free." >&2
+  exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
+fi
+LOCAL_SHA="$(git rev-parse HEAD)"
+if [ "$REMOTE_SHA" != "$LOCAL_SHA" ] && ! git merge-base --is-ancestor "$REMOTE_SHA" HEAD 2>/dev/null; then
+  CHERRY_OUT="$(git cherry HEAD "$REMOTE_SHA" 2>/dev/null)" || CHERRY_OUT="+ unverifiable"
+  if ! echo "$CHERRY_OUT" | grep -q '^+'; then
+    : # every commit unique to $REMOTE_SHA is patch-equivalent to something already in our
+      # history (git cherry reports no '+' lines) — this is our own rebase/amend of content
+      # we already have, not new content from someone else
+  else
+    RECENT_AUTHOR="$(git log -1 --format='%an <%ae> at %ad' "$REMOTE_SHA" 2>/dev/null || echo "unknown")"
+    echo "The PR's remote head (${REMOTE_SHA}) is not reachable from our local history and we didn't produce it (${RECENT_AUTHOR})." >&2
+    echo "Possible concurrent session on this PR. Pausing — do not race it." >&2
+    exit 2  # see the exit-code contract below — distinct from 0 (clean, or couldn't verify) so an automated caller can tell them apart
+  fi
 fi
 ```
+
+This fetches `refs/pull/${PR_NUMBER}/head` directly into `FETCH_HEAD` — no
+local branch or `origin/$BRANCH` ref needed, so it works identically for
+same-repo and fork PRs (a fork PR's head branch doesn't exist as
+`origin/$BRANCH` at all — it lives in the contributor's fork), and is
+immune to `--single-branch` clone limitations (a `--single-branch`
+clone's `remote.origin.fetch` refspec may not map the current branch
+name, so fetching `origin "$BRANCH"` can succeed without actually
+updating the `origin/$BRANCH` ref; `git fetch origin <explicit-ref>`
+bypasses the configured refspec entirely). `FETCH_HEAD` is also always
+exactly the commit this fetch just retrieved, so there's no separate
+"which ref did we actually just fetch" ambiguity to track.
 
 Deliberately stateless — no baseline file. A persisted "last known remote
 SHA" sounds stronger, but it has to be scoped correctly (per-branch,
@@ -146,14 +189,58 @@ per-repo-checkout, per-work-session) to avoid becoming its own source of
 false positives/negatives, and gets that scoping wrong in ways that are
 easy to miss (a prior session's stale baseline outliving the session that
 wrote it, a slash in the branch name breaking a naive filename). The
-ancestry check above accepts one known gap in exchange for that
-simplicity: it won't catch a force-push that moves `origin/$BRANCH`
-*backward* to an ancestor of HEAD. That's a deliberately-adversarial
-action against a PR branch, not an ordinary review-loop event, and this
-fleet's own hygiene rules already discourage it ("Main moves only by PR
-merge", branch isolation). If you suspect it happened, verify directly
-(`gh pr view --json commits`, or compare `origin/$BRANCH`'s commit count
-against what you expect) rather than trusting this heuristic alone.
+`git cherry HEAD "$REMOTE_SHA"` check above covers the legitimate-local-
+rebase/amend case without needing a baseline file either: it asks the
+actual right question — "is every commit unique to the remote's head
+patch-equivalent to something already in our own history, or is at least
+one of them genuinely new content?" — rather than "did this exact SHA
+pass through somewhere we've been," which is what an earlier version of
+this check (comparing against `git reflog show HEAD`) got wrong: two
+sessions sharing the same checkout (not a worktree) can leave a foreign
+commit's SHA sitting in the shared reflog (e.g. via a `git pull` later
+discarded with `git reset --hard`), which would make the reflog check
+wrongly wave through a real collision. `git cherry` doesn't have that
+failure mode since it compares content, not history-traversal.
+
+This check has several known, accepted gaps rather than one: (1) it won't
+catch a force-push that moves the PR's remote head *backward* to an
+ancestor of HEAD — that produces a `REMOTE_SHA` which the ancestry check
+(the `git merge-base --is-ancestor` test, before `git cherry` ever runs)
+treats as "fine, no collision." That's a deliberately-adversarial action
+against a PR branch, not an ordinary review-loop event, and this fleet's
+own hygiene rules already discourage it ("Main moves only by PR merge",
+branch isolation). If you suspect it happened, verify directly
+(`gh pr view --json commits`, or compare the PR's commit count against
+what you expect) rather than trusting this heuristic alone. (2) `git
+cherry`'s patch-equivalence is a patch-id hash of each commit's diff
+against its first parent — a rebase onto a sufficiently different base
+can shift enough surrounding context to change the patch-id even for a
+logically-identical change, which would surface as a `+` line and this
+check would (correctly conservatively) pause on it as if it were new
+content; that's a false-positive-toward-caution, not a missed collision,
+consistent with this check's overall bias to pause when unsure. (3) the
+check always fetches from the literal `origin` remote, assuming that's
+the PR's actual base repo — in a fork-clone topology where `origin` is
+itself a fork (this fleet's own "clone-topology trap"), the check could
+end up comparing against the wrong repo's PR-numbering namespace
+entirely; resolving that needs broader remote-resolution work and is out
+of scope for this fix. (4) `git cherry` does not evaluate merge commits
+at all — a foreign session's merge commit (e.g. merging base into the PR
+branch and resolving real conflicts) that carries content beyond its
+parents is invisible to this check if all of that merge's non-merge
+parent commits are otherwise already known to us.
+
+**Exit-code contract.** Exit 2 means a real collision was detected and the
+worker paused — an automated caller can distinguish this from exit 0
+(checked clean, or could not verify and paused defensively) without
+parsing stderr. Both still count as "don't proceed" for a human/agent
+caller; the distinction is only for a scripted wrapper that wants to log
+or alert differently on an actual collision versus an inconclusive check.
+Every pause-without-a-detected-collision case above — detached HEAD,
+unset `PR_NUMBER`, a failed fetch, and an unresolvable `FETCH_HEAD` after
+an ostensibly successful fetch — stays `exit 0`: they're "couldn't
+verify, pausing defensively," not "detected a real collision." Only the
+actual-collision-detected branch uses `exit 2`.
 
 If detected, do not race it — pause and surface it (hand off, split scope
 explicitly, or stand down) rather than pushing a competing fix round.
@@ -189,6 +276,20 @@ schedule (rounds 6-15/16-25, local-review gate, collision-awareness); canonicali
 credenza 2026-08-21 (this file becomes the single source, synced into each repo's
 `docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md`); corrected 2026-08-22 (restored
 several clauses a rewrite had silently dropped, fixed a false-positive bug in the
-collision-awareness check). Edit
+collision-awareness check); corrected again 2026-08-22 (HAG-5: collision check now fetches
+`refs/pull/${PR_NUMBER}/head` instead of `origin/$BRANCH`, fixing an indefinite-pause failure
+mode on fork PRs and `--single-branch` clones (the old fetch of `origin/$BRANCH` either failed
+outright or silently didn't update the ref it then compared against); distinct exit 2 for a
+detected collision; round-25 ticket-fallback conflict, committed-but-unpushed local-gate
+coverage, and ticketed-local-P2 gate-clearing clarified; `land-pr`'s `diagnose_behind` now
+syncs the local checkout after a successful `update-branch` call; rebase/self-rewrite
+detection replaced reflog-SHA-membership with `git cherry` patch-equivalence after review
+found the reflog version could wrongly wave through a real collision in a shared-checkout,
+non-worktree scenario); corrected a third time 2026-08-22 (HAG-5: `git cherry`'s own failure
+no longer fails open — its exit status is captured explicitly rather than inherited from the
+downstream `grep`; added the `git cherry`-skips-merge-commits gap to the known-gaps list;
+exit-code-contract prose and inline comments now cover all four `exit 0` pause sites, not just
+the original two; `land-pr`'s `diagnose_behind` sync no longer silently no-ops when the
+`refs/pull/${PR_NUMBER}/head` fetch itself fails). Edit
 `credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`,
 not a per-repo copy.
