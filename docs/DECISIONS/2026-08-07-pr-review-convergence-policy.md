@@ -1,146 +1,194 @@
 # PR review convergence policy
 
-## Decision
+Applies to any iterative bot or human reviewer (Codex, CodeRabbit, human)
+on a pull request. Round is counted **per reviewer** (per bot login, or per
+human reviewer) — not one shared counter across all reviewers on a PR. A PR
+can have more than one active reviewer, and a shared counter misclassifies
+a second reviewer's genuinely-first-look findings as a late round.
 
-Apply a four-tier round-based schedule to every iterative bot/human
-code-review loop on a PR (Codex, CodeRabbit, human reviewers). Track the
-round **per reviewer** (per bot login, or per human reviewer) — not one
-counter shared across all reviewers on the PR. A PR can have more than one
-active reviewer, and collapsing their counts into one shared number
-misclassifies a second reviewer's genuinely-first-look findings as if they
-arrived at whatever round the busiest reviewer has already reached.
+**What counts as a "round":** a push, or an explicit reviewer retrigger with no new push
+(e.g. a workflow rerun plus an `@`-mention comment — see `land-pr`'s Codex-retrigger
+sequence), that produces a new *remote* review response from that reviewer. A local
+review-gate run (e.g. `codex exec review --uncommitted`, or a repo's override command — see
+"Local review gate" below) does **not** increment the round counter — only the remote
+reviewer's response does.
 
-- **Rounds 1-5** (per reviewer): fix everything reasonable, P1 and P2
-  alike. No ticket filing yet.
-- **Rounds 6-15**: fix P1 findings inline as usual. For genuinely new (or
-  reopened) P2-or-lower findings, don't fix inline — file or append to a
-  single follow-up ticket for this PR, with the finding pasted verbatim
-  (reviewer's exact wording, file:line). Reply on the review thread
-  linking the ticket, then resolve the thread.
-- **Rounds 16-25**: ticket both P1 and P2 findings by default, using the
-  same verbatim-finding/single-ticket mechanics — UNLESS the P1 is
-  critical (security vulnerability, data loss/corruption, broken
-  build/tests) or blocks the PR's own stated purpose outright (it
-  literally can't do the thing it exists to do without this fix). Those
-  still get fixed inline regardless of round. When genuinely unsure
-  whether a P1 clears that bar, fix it inline rather than ticket it.
-- **Round 25 is a hard stop**: escalate to a human rather than opening a
+## Schedule
+
+- **Rounds 1-5:** fix everything reasonable, P1 and P2 alike. No ticket
+  filing yet.
+- **Rounds 6-15:** fix P1s inline as usual. For genuinely new (or reopened)
+  P2-or-lower findings, don't fix inline — file or append to a single
+  follow-up ticket for this PR, with the finding pasted verbatim (reviewer's
+  exact wording, file:line). Reply on the review thread linking the ticket,
+  then resolve the thread.
+- **Rounds 16-25:** ticket both P1 and P2 findings by default, same
+  verbatim-finding/single-ticket mechanics — UNLESS the P1 is critical
+  (security vulnerability, data loss/corruption, broken build/tests) or
+  blocks the PR's own stated purpose outright. "Blocks the PR's own stated
+  purpose" means: check the finding against the PR's own plan/research doc
+  or ticket description — the PR literally cannot do the thing it exists to
+  do without this fix, not merely "this would be more correct." When
+  genuinely unsure whether a P1 clears that bar, fix it inline rather than
+  ticket it.
+- **Round 25 is a hard stop:** escalate to a human rather than opening a
   26th round unilaterally.
 
-A finding that was already raised in an earlier round and simply never got
-fixed (omitted, or the fix didn't actually land) is still owed from that
-round — it does not become newly eligible for ticketing just because it
-resurfaces in a later round. Ticketing is for genuinely new or reopened
-findings, not a way for an incomplete earlier-round fix to escape via a
-later round's looser rules.
+A finding that was already raised in an earlier round and simply never got fixed (omitted,
+or the fix didn't actually land) is still owed from that round — it does not become newly
+eligible for ticketing just because it resurfaces in a later round. Ticketing is for
+genuinely new or reopened findings, not a way for an incomplete earlier-round fix to escape
+via a later round's looser rules.
 
-One follow-up ticket per PR, not one per finding — append later rounds'
-deferred findings to the same ticket.
-
-## Why
-
-Chasing progressively finer findings across review rounds burns real time
-without moving correctness forward — a PR can cycle far past what's
-reasonable over formatting and naming preferences while review attention
-drifts away from whatever actually blocks merge. The four-tier schedule
-front-loads full attention (rounds 1-5), tightens what's owed inline as
-rounds accumulate (6-15, 16-25), and forces human escalation rather than
-unbounded looping (round 25). Bounding what each subsequent tier demands
-inline gives a PR a monotonically shrinking blocker list — it converges
-toward mergeable instead of oscillating.
-
-## Severity definitions
-
-**P1 (fix every round, until round 16, where only critical/blocking P1
-survives the ticket-by-default rule):** correctness bugs, security
-vulnerabilities, data loss/corruption, broken build or tests, spec/contract
-violations — anything that would block merge on its own merits.
-
-**P2-and-lower (ticket after round 5):** style, naming, structure/
-simplification preferences, unverified micro-optimizations, documentation
-nits, subjective "nice to have" suggestions.
+## Severity
 
 Classify by substance, not by the reviewer's own label — many bots use
 "P2" for an ordinary real correctness bug, not a style nit. Reconcile
-against the definitions above. Only defer to an explicit tag when its
-vocabulary maps cleanly onto blocking-vs-not (e.g. `critical`/`blocking` →
-P1, `minor`/`nit`/`suggestion` → P2). When genuinely unsure, treat it as
+against: **P1** = correctness bugs, security vulnerabilities, data
+loss/corruption, broken build/tests, spec/contract violations. **P2** =
+style, naming, structure preferences, unverified micro-optimizations, doc
+nits, subjective suggestions. A finding's own substance always wins over
+its label — use an explicit tag (e.g. `critical`/`blocking` → P1,
+`minor`/`nit`/`suggestion` → P2) only as a shortcut when nothing about the
+finding itself contradicts that tag. When genuinely unsure, treat it as
 P1 — the failure mode to avoid is silently deferring a real bug.
+
+## Ticketing mechanics
+
+One follow-up ticket per PR, not one per finding — append later rounds'
+deferred findings to the same ticket. Title: `[follow-up] <PR title> —
+deferred review findings`. Body: each finding pasted verbatim (reviewer's
+exact comment text, file:line, thread URL), linked back to the PR. If
+ticket filing fails (no ticketing system configured, or it's unreachable),
+don't let that block the thread indefinitely — fall back to fixing the
+finding inline instead. An optional dependency should never become
+load-bearing for getting a PR unstuck.
+
+## What this does not do
+
+- **Does not mean P2 findings get ignored.** They land in a real ticket, not silently
+  dropped — the trade is "fixed later, deliberately" instead of "fixed now, chased
+  indefinitely."
+- **Does not relax P1 handling before round 16.** Every round through 15 still fixes every
+  P1 finding it sees; round 16+ still fixes critical/blocking P1s regardless.
+- **Does not override a human reviewer's explicit CHANGES_REQUESTED.** That still needs the
+  reviewer's own sign-off, not just a filed ticket.
 
 ## Local review gate
 
 Before pushing a fix round and consuming a real reviewer round-trip, run
-the equivalent review locally first and iterate until clean. If the
-reviewer is Codex, that's:
+the equivalent review locally first and iterate until clean:
 
 ```bash
-codex exec review --base main       # full branch diff vs. base
-codex exec review --uncommitted     # just staged/unstaged/untracked
+codex exec review --uncommitted
 ```
 
-Treat local findings with the same severity/round mechanics as remote
-ones. This doesn't replace the remote check — it's still required and
-still the authoritative round counter — it just means the remote round
-should usually come back clean, so a round that does find something is
-genuinely new signal, not something a first local look would have caught
-for free.
+If a repo's `.claude/review-policy-override.md` defines a `## Local review
+gate` section with its own command, use that instead (a repo's own hard
+constraints can legitimately conflict with running `codex exec review`
+directly). This doesn't replace the remote round — it's still the
+authoritative round counter (see "What counts as a round" above) — it just
+means the remote round should usually come back clean, so a round that does
+find something is genuinely new signal.
+
+Treat local findings with the same severity/round mechanics as remote ones. This doesn't
+replace the remote check — it's still required and still the authoritative round counter —
+it just means the remote round should usually come back clean, so a round that does find
+something is genuinely new signal, not something a first local look would have caught for
+free. A local finding has no PR review thread, so the ticketing mechanics above adapt: paste
+the local reviewer's finding verbatim same as any other, write `(found by local review gate,
+no PR thread)` in place of the thread URL, and skip the reply-and-resolve-thread step (there
+is no thread to resolve) — filing to the single follow-up ticket is what clears it.
 
 ## Collision awareness
 
 Round-based reasoning assumes one worker driving one PR through its review
-loop. It breaks down the moment a second session or worker is independently
-active on the same PR — "round N" stops meaning anything coherent once two
-threads are pushing fixes and re-triggering reviews out of sync with each
-other. Before starting a review-fix round:
+loop — it breaks down the moment a second session is independently active
+on the same PR. Before starting work on any round (including round 1),
+check whether the remote branch has moved since your last known commit in
+a way you didn't cause. Note: a `land-pr` `update-branch` call you
+yourself just triggered also moves the remote branch — that's not a
+collision, just don't mistake it for one if you invoked `land-pr` earlier
+in the same session.
 
-- Check for signs another session is already active on this PR (recent
-  commits you didn't make, an in-flight push, a teammate/session
-  announcing work on the same PR/ticket). In the Catalyst orchestrator,
-  this is `broker_claim_pr` — claim the PR before working it; if the
-  broker reports it's already claimed by another session, that's your
-  signal.
-- If you detect one, don't race it. Pause and coordinate (hand off, split
-  scope explicitly, or stand down) before pushing another fix round, or go
-  do other work and revisit once the collision is resolved. Never assume
-  the other session will notice and back off first.
+```bash
+BRANCH="$(git symbolic-ref --short -q HEAD || true)"
+if [ -z "$BRANCH" ]; then
+  echo "HEAD is detached — this check assumes a checked-out branch matching the PR's remote head." >&2
+  echo "Check out that branch explicitly before running it, rather than guessing at a ref." >&2
+  exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
+fi
+FETCH_ERR="$(mktemp)"
+trap 'rm -f "$FETCH_ERR"' EXIT
+if ! git fetch origin "$BRANCH" --quiet 2>"$FETCH_ERR"; then
+  echo "Could not fetch origin/${BRANCH} — remote state is unverifiable: $(cat "$FETCH_ERR")" >&2
+  echo "Pausing rather than treating an unreachable remote as collision-free." >&2
+  exit 0  # deliberate: same "pause, don't fail the caller" contract as a detected collision
+fi
+REMOTE_SHA="$(git rev-parse "origin/${BRANCH}" 2>/dev/null || echo "")"
+# Compare by ancestry, not equality: HEAD is expected to run ahead of
+# origin/$BRANCH once you've committed this round's local fixes but
+# haven't pushed yet — that's normal mid-round state, not a collision.
+# Only flag when origin/$BRANCH holds a commit your local history
+# doesn't contain (i.e. it is NOT an ancestor of HEAD) — that's the
+# actual signal that someone else pushed.
+if [ -n "$REMOTE_SHA" ] && ! git merge-base --is-ancestor "$REMOTE_SHA" HEAD; then
+  RECENT_AUTHOR="$(git log -1 --format='%an <%ae> at %ad' "$REMOTE_SHA" 2>/dev/null || echo "unknown")"
+  echo "origin/${BRANCH} has a commit our local history doesn't contain (${RECENT_AUTHOR})." >&2
+  echo "Possible concurrent session on this PR. Pausing — do not race it." >&2
+  exit 0  # deliberate: pausing is not a failure, so a caller checking status sees success
+fi
+```
+
+Deliberately stateless — no baseline file. A persisted "last known remote
+SHA" sounds stronger, but it has to be scoped correctly (per-branch,
+per-repo-checkout, per-work-session) to avoid becoming its own source of
+false positives/negatives, and gets that scoping wrong in ways that are
+easy to miss (a prior session's stale baseline outliving the session that
+wrote it, a slash in the branch name breaking a naive filename). The
+ancestry check above accepts one known gap in exchange for that
+simplicity: it won't catch a force-push that moves `origin/$BRANCH`
+*backward* to an ancestor of HEAD. That's a deliberately-adversarial
+action against a PR branch, not an ordinary review-loop event, and this
+fleet's own hygiene rules already discourage it ("Main moves only by PR
+merge", branch isolation). If you suspect it happened, verify directly
+(`gh pr view --json commits`, or compare `origin/$BRANCH`'s commit count
+against what you expect) rather than trusting this heuristic alone.
+
+If detected, do not race it — pause and surface it (hand off, split scope
+explicitly, or stand down) rather than pushing a competing fix round.
 
 ## Communication guardrails win
 
-Filing a ticket in the repo's own tracker and replying on a PR review
-thread are development-workflow actions, not "outbound communication" in
-the sense of no-email/no-social-post guardrails — but if a repo's guardrail
-is written broadly enough to make that genuinely ambiguous, don't guess:
-hand off to a human.
+Filing a ticket in the repo's own tracker and replying on a PR review thread are
+development-workflow actions, not "outbound communication" in the sense of no-email/
+no-social-post guardrails — but if a repo's guardrail is written broadly enough to make
+that genuinely ambiguous, don't guess: hand off to a human.
 
-## What this does NOT do
+## Two check-in triggers that override the round math regardless of count
 
-- **Does not mean P2 findings get ignored.** They land in a real ticket,
-  not silently dropped — the trade is "fixed later, deliberately" instead
-  of "fixed now, chased indefinitely."
-- **Does not relax P1 handling before round 16.** Every round through 15
-  still fixes every P1 finding it sees; round 16+ still fixes critical/
-  blocking P1s regardless.
-- **Does not override a human reviewer's explicit CHANGES_REQUESTED.**
-  That still needs the reviewer's own sign-off, not just a filed ticket.
+These are structural red flags, not schedule math, and can fire well before
+round 25:
 
-## Rollout
+- **The fix strategy itself needs to change.** The same code region
+  produces a genuinely new bug shape on 3+ consecutive rounds even though
+  each individual fix was locally correct — that signals the abstraction
+  itself is wrong, not that you're almost done patching it. Check in and
+  consider proposing a redesign rather than another point patch.
+- **A "finding" is actually a scope-expansion request in disguise, not a
+  defect.** Check the finding against the PR's own plan/research doc — did
+  the current behavior violate what this PR said it would do, or could
+  almost anything theoretically be made more correct with enough added
+  machinery? Ticket it as a fresh design-needed follow-up rather than
+  expanding in-PR.
 
-Adopted fleet-wide 2026-08-07 (two-tier: round 1 unrestricted, round 2+
-defers new P2-or-lower). **Revised 2026-08-19**: expanded to the four-tier
-schedule above (adds rounds 6-15 / 16-25 / round-25 hard-stop distinctions,
-a mandatory local-review gate before each push, and the collision-awareness
-section), after real-world review loops kept running past what a two-tier
-schedule usefully bounded. Round counting is explicitly per-reviewer as of
-this revision (the 2026-08-07 version described a single shared counter as
-the ideal with per-tool approximation allowed; per-reviewer counting is now
-the standard, not an approximation, matching what the Catalyst pipeline
-already did in practice).
+## Provenance
 
-Implemented in the Catalyst orchestrator's `review-comments` and
-`phase-review` skills (round-tracking plus follow-up-ticket filing) and
-stated as house policy in every HagaleTechnologies repo's CLAUDE.md/
-AGENTS.md. Where a repo's bot reviewer (e.g. Codex) reads `AGENTS.md`
-specifically rather than `CLAUDE.md`, the pointer is mirrored there too
-(or `AGENTS.md` is a symlink to `CLAUDE.md`, per this fleet's standing
-convention) — a bot reviewer that never sees the instructions can't follow
-them.
+Adopted fleet-wide 2026-08-07 (two-tier schedule); revised 2026-08-19 to the four-tier
+schedule (rounds 6-15/16-25, local-review gate, collision-awareness); canonicalized into
+credenza 2026-08-21 (this file becomes the single source, synced into each repo's
+`docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md`); corrected 2026-08-22 (restored
+several clauses a rewrite had silently dropped, fixed a false-positive bug in the
+collision-awareness check). Edit
+`credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`,
+not a per-repo copy.
