@@ -22,7 +22,7 @@ name: Supply Chain
 #                       malware gate, not just a CVE gate.
 #   * install-policy -- `cargo fetch --locked` (every crate must still resolve to exactly the
 #                       pinned checksum; no build.rs runs) and no git/path crate sources.
-#   * actions-pins   -- when a workflow or action manifest changed: every NEWLY
+#   * actions-pins   -- on EVERY PR: every NEWLY
 #                       ADDED executable reference (parsed from the YAML at the
 #                       merge-base and head, per file and per occurrence: step
 #                       and reusable-workflow `uses:`, job container / service
@@ -62,7 +62,6 @@ jobs:
       pull-requests: read
     outputs:
       deps: ${{ steps.filter.outputs.deps }}
-      actions: ${{ steps.filter.outputs.actions }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
@@ -84,11 +83,10 @@ jobs:
               - '.github/workflows/**'
               - '**/action.yml'
               - '**/action.yaml'
-            actions:
-              - '.github/workflows/**'
-              - '**/action.yml'
-              - '**/action.yaml'
-
+              - '**/Dockerfile*'
+              - '**/dockerfile*'
+              - '**/*.Dockerfile'
+              - '**/*.dockerfile'
   osv:
     name: OSV advisories (incl. malicious-package MAL-*)
     needs: changes
@@ -226,10 +224,11 @@ jobs:
           done < <(find . \( -name node_modules -o -name target -o -name .git \) -prune -o -name 'Cargo.lock' -print | sort)
           echo "checked $n Cargo lockfile(s)"
 
+  # Runs on EVERY PR (~10s): no path filter can know the custom filenames a
+  # Docker action's runs.image may point at, so the script classifies every
+  # changed file itself (local review gate, round 3).
   actions-pins:
     name: Newly added actions are pinned
-    needs: changes
-    if: needs.changes.outputs.actions == 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -249,7 +248,9 @@ jobs:
           # (**/action.yml|yaml) changed in the PR is parsed at the PR's MERGE-BASE and at
           # HEAD; the executable references of each file -- step `uses`, job-level
           # reusable-workflow `uses`, job `container`/`services.*.image`, composite/docker
-          # action `runs.image`, with local `./path` actions expanded recursively -- are
+          # action `runs.image` (a Dockerfile-backed action's FROM images; any changed
+          # Dockerfile, or any file an action manifest names as its runs.image, whatever its
+          # filename), with local `./path` actions expanded recursively -- are
           # counted PER FILE, and only occurrences new in that file are judged: floating
           # branch ref or no version -> fail; docker:// or container image without an
           # immutable @sha256 digest -> fail; tag pin -> warning; SHA -> ok. Local
@@ -261,8 +262,65 @@ jobs:
               r = subprocess.run(a, capture_output=True, text=True); return r.returncode, r.stdout
           rc, mb = sh("git", "merge-base", base_arg, head)
           base = mb.strip() if rc == 0 and mb.strip() else base_arg   # judge only the PR's own additions
+          def dockerfile_images(text):
+              """container:<image> for every FROM that is not `scratch`, an earlier build
+              stage (alias OR numeric index), honouring a leading `# escape=` directive for
+              line continuations; `ARG NAME=default` declared before a FROM is substituted
+              ($NAME / ${NAME} / ${NAME:-fallback}); an unresolved variable stays in the
+              ref and fails the digest check (fail closed)."""
+              esc = "\\"
+              for raw in text.splitlines():
+                  m = re.match(r"\s*#\s*escape\s*=\s*(\S)", raw, re.I)
+                  if m: esc = m.group(1); continue
+                  if raw.strip() and not raw.lstrip().startswith("#"): break           # directives only precede instructions
+              logical, buf = [], ""
+              for raw in text.splitlines():
+                  if raw.lstrip().startswith("#"): continue
+                  if raw.rstrip().endswith(esc):
+                      buf += raw.rstrip()[:-1] + " "; continue
+                  logical.append(buf + raw); buf = ""
+              if buf: logical.append(buf)
+              args, stages, out, index = {}, set(), [], 0
+              for line in logical:
+                  m = re.match(r"\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?\s*$", line, re.I)
+                  if m: args[m.group(1)] = (m.group(2) or "").strip().strip("\"'"); continue
+                  m = re.match(r"\s*FROM\s+((?:--\S+\s+)*)(\S+)(?:\s+AS\s+(\S+))?", line, re.I)
+                  if not m: continue
+                  img, alias = m.group(2), m.group(3)
+                  img = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
+                               lambda v: (args.get(v.group(1)) or (v.group(2) if v.group(2) is not None else args.get(v.group(1), v.group(0)))) if v.group(2) is not None or v.group(1) in args else v.group(0), img)
+                  img = re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda v: args.get(v.group(1), v.group(0)), img)
+                  is_stage_index = img.isdigit() and int(img) < index
+                  if img.lower() != "scratch" and img.lower() not in stages and not is_stage_index:
+                      out.append("container:" + img)
+                  if alias: stages.add(alias.lower())
+                  index += 1
+              return out
+          def manifests_at(rev):
+              _, out = sh("git", "ls-tree", "-r", "--name-only", "-z", rev)
+              return [p for p in out.split("\0") if os.path.basename(p) in ("action.yml", "action.yaml")]
+          def image_files_at(rev):
+              """Every file an action manifest at `rev` builds from (runs.image as a relative
+              path, any filename) -- a change to such a file changes what executes."""
+              refs = set()
+              for m in manifests_at(rev):
+                  doc = load(rev, m)
+                  runs = doc.get("runs") if isinstance(doc, dict) else None
+                  img = runs.get("image") if isinstance(runs, dict) else None
+                  if isinstance(img, str) and img.strip() and not img.startswith("docker://"):
+                      refs.add(os.path.normpath(os.path.join(os.path.dirname(m), img.strip())))
+              return refs
+          REF_CACHE = {}
+          def referenced_at(rev):
+              if rev not in REF_CACHE: REF_CACHE[rev] = image_files_at(rev)
+              return REF_CACHE[rev]
+          REFERENCED = None
           def is_target(p):
-              return (p.startswith(".github/workflows/") and p.endswith((".yml", ".yaml"))) or os.path.basename(p) in ("action.yml", "action.yaml")
+              global REFERENCED
+              if REFERENCED is None: REFERENCED = referenced_at(head) | referenced_at(base)   # union: classify the CHANGE
+              b = os.path.basename(p); bl = b.lower()
+              return ((p.startswith(".github/workflows/") and p.endswith((".yml", ".yaml"))) or b in ("action.yml", "action.yaml")
+                      or bl.startswith("dockerfile") or bl.endswith(".dockerfile") or p in REFERENCED)
           def changed_pairs():
               """[(base_path|None, head_path|None)] rename-aware, NUL-safe."""
               _, raw = sh("git", "diff", "-z", "--name-status", "-M", base, head, "--", ".")
@@ -296,7 +354,7 @@ jobs:
               if isinstance(v, dict): v = v.get("image")
               return f"container:{v.strip()}" if isinstance(v, str) and v.strip() else None
           MAX_DEPTH = 12
-          def refs_of(rev, doc, acc, stack, depth=0):
+          def refs_of(rev, doc, acc, stack, depth=0, manifest_path=""):
               if not isinstance(doc, dict): return
               def expand(path, label):
                   # every invocation is expanded (per-occurrence policy); `stack` is the
@@ -309,7 +367,7 @@ jobs:
                   sub = load(rev, path)
                   if sub is None:
                       print(f"::error::local reference {label} has no {path} at {rev[:8]}"); acc["MISSING:" + label] += 1; return
-                  refs_of(rev, sub, acc, stack | {path}, depth + 1)
+                  refs_of(rev, sub, acc, stack | {path}, depth + 1, path)
               def add(ref, job_level=False):
                   ref = ref.strip()
                   if ref.startswith("./"):
@@ -342,9 +400,23 @@ jobs:
                   if isinstance(runs.get("steps"), list): steps(runs["steps"])
                   img = runs.get("image")
                   if isinstance(img, str) and img.startswith("docker://"): acc[img.strip()] += 1
+                  elif isinstance(img, str) and img.strip():
+                      # Dockerfile-backed action: GitHub builds it, so its FROM images run (round 3)
+                      df = os.path.normpath(os.path.join(os.path.dirname(manifest_path), img.strip()))
+                      txt = show(rev, df)
+                      if txt is None: print(f"::error::action {manifest_path} references missing {df}"); acc["MISSING:" + df] += 1
+                      else:
+                          for c in dockerfile_images(txt): acc[c] += 1
           def refs_at(rev, path):
-              acc = Counter(); doc = load(rev, path)
-              if doc is not None: refs_of(rev, doc, acc, frozenset({path}))
+              acc = Counter()
+              b = os.path.basename(path).lower()
+              if b.startswith("dockerfile") or b.endswith(".dockerfile") or path in referenced_at(rev):   # per revision: what EXECUTES there
+                  txt = show(rev, path)
+                  if txt is not None:
+                      for c in dockerfile_images(txt): acc[c] += 1
+                  return acc
+              doc = load(rev, path)
+              if doc is not None: refs_of(rev, doc, acc, frozenset({path}), 0, path)
               return acc
           fail = 0; new = Counter()
           for b, h in changed_pairs():
@@ -380,24 +452,23 @@ jobs:
         env:
           CHANGES: ${{ needs.changes.result }}
           DEPS: ${{ needs.changes.outputs.deps }}
-          ACTIONS: ${{ needs.changes.outputs.actions }}
           OSV: ${{ needs.osv.result }}
           POLICY: ${{ needs.install-policy.result }}
           PINS: ${{ needs.actions-pins.result }}
         run: |
-          echo "changes=$CHANGES deps=$DEPS actions=$ACTIONS osv=$OSV install-policy=$POLICY actions-pins=$PINS"
+          echo "changes=$CHANGES deps=$DEPS osv=$OSV install-policy=$POLICY actions-pins=$PINS"
           if [ "$CHANGES" != success ]; then
             echo "::error::dependency change detection did not succeed ($CHANGES)"; exit 1
           fi
+          if [ "$PINS" != success ]; then
+            echo "::error::newly added actions/images are not acceptably pinned ($PINS)"; exit 1
+          fi
           if [ "$DEPS" != true ]; then
-            echo "No dependency manifest, lockfile, or workflow changed -- nothing to scan."; exit 0
+            echo "No dependency manifest, lockfile, or workflow changed -- nothing more to scan."; exit 0
           fi
           for r in "$OSV" "$POLICY"; do
             if [ "$r" != success ]; then
               echo "::error::a supply-chain scan did not succeed -- this PR must not merge until it does"; exit 1
             fi
           done
-          if [ "$ACTIONS" = true ] && [ "$PINS" != success ]; then
-            echo "::error::newly added actions are not acceptably pinned"; exit 1
-          fi
           echo "All supply-chain scans passed."
