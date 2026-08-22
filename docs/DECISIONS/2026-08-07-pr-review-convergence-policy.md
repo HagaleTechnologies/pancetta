@@ -47,7 +47,10 @@ Classify by substance, not by the reviewer's own label — many bots use
 against: **P1** = correctness bugs, security vulnerabilities, data
 loss/corruption, broken build/tests, spec/contract violations. **P2** =
 style, naming, structure preferences, unverified micro-optimizations, doc
-nits, subjective suggestions. When unsure, treat it as P1.
+nits, subjective suggestions. Only defer to an explicit tag when its
+vocabulary maps cleanly onto blocking-vs-not (e.g. `critical`/`blocking` →
+P1, `minor`/`nit`/`suggestion` → P2). When genuinely unsure, treat it as
+P1 — the failure mode to avoid is silently deferring a real bug.
 
 ## Ticketing mechanics
 
@@ -86,6 +89,12 @@ directly). This doesn't replace the remote round — it's still the
 authoritative round counter (see "What counts as a round" above) — it just
 means the remote round should usually come back clean, so a round that does
 find something is genuinely new signal.
+
+Treat local findings with the same severity/round mechanics as remote ones. This doesn't
+replace the remote check — it's still required and still the authoritative round counter —
+it just means the remote round should usually come back clean, so a round that does find
+something is genuinely new signal, not something a first local look would have caught for
+free.
 
 ## Collision awareness
 
@@ -145,6 +154,13 @@ against what you expect) rather than trusting this heuristic alone.
 If detected, do not race it — pause and surface it (hand off, split scope
 explicitly, or stand down) rather than pushing a competing fix round.
 
+## Communication guardrails win
+
+Filing a ticket in the repo's own tracker and replying on a PR review thread are
+development-workflow actions, not "outbound communication" in the sense of no-email/
+no-social-post guardrails — but if a repo's guardrail is written broadly enough to make
+that genuinely ambiguous, don't guess: hand off to a human.
+
 ## Two check-in triggers that override the round math regardless of count
 
 These are structural red flags, not schedule math, and can fire well before
@@ -161,3 +177,12 @@ round 25:
   almost anything theoretically be made more correct with enough added
   machinery? Ticket it as a fresh design-needed follow-up rather than
   expanding in-PR.
+
+## Provenance
+
+Adopted fleet-wide 2026-08-07 (two-tier schedule); revised 2026-08-19 to the four-tier
+schedule (rounds 6-15/16-25, local-review gate, collision-awareness); canonicalized into
+credenza 2026-08-21 (this file becomes the single source, synced into each repo's
+`docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md`); corrected 2026-08-22 (restored
+several clauses a rewrite had silently dropped, fixed a false-positive bug in the
+collision-awareness check). Edit this file, not a per-repo copy.
