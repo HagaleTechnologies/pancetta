@@ -80,6 +80,8 @@ jobs:
               - '**/bun.lockb'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
+              - '**/.cargo/config'
+              - '**/.cargo/config.toml'
               - '.github/workflows/**'
               - '**/action.yml'
               - '**/action.yaml'
@@ -228,6 +230,30 @@ jobs:
       # checksum-verifies the crates of THAT project.
       - name: Crate source policy + cargo fetch --locked (every Cargo.lock)
         run: |
+          # .cargo/config(.toml) is parsed as TOML and may not override crate
+          # sources, registries, or network transport (dotted keys included).
+          python3 - <<'CCP'
+          import os, sys, tomllib
+          # .cargo/config(.toml) can redirect crate fetching (source replacement,
+          # registries, registry.default, net.git-fetch-with-cli...) without touching
+          # Cargo.toml/Cargo.lock. Parsed as TOML (dotted keys included), any of those
+          # top-level tables is refused; benign tables (env, build, test, alias...) pass.
+          FORBIDDEN = {"source", "registries", "registry", "net", "http"}
+          bad = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in ("node_modules", "target", ".git")]
+              if os.path.basename(root) != ".cargo": continue
+              for f in ("config", "config.toml"):
+                  if f in files:
+                      p = os.path.join(root, f)
+                      try: cfg = tomllib.load(open(p, "rb"))
+                      except tomllib.TOMLDecodeError as e: bad.append(f"{p}: unparseable TOML ({e})"); continue
+                      hit = sorted(FORBIDDEN & set(cfg))
+                      if hit: bad.append(f"{p}: overrides {', '.join(hit)} -- crate sources/registries/network may only come from Cargo.toml + Cargo.lock")
+          if bad:
+              print("::error::Cargo configuration overrides are not allowed:"); print("\n".join("  " + b for b in bad)); sys.exit(1)
+          print("no Cargo source/registry/network overrides in any .cargo/config")
+          CCP
           cat > /tmp/cargo-sources.py <<'PY'
           import json, subprocess, sys, tomllib
           # Registry-only source policy for Cargo.lock (CAT-299 / ADR-0014). A path
@@ -306,11 +332,14 @@ jobs:
               line continuations; heredoc-bearing instructions fail closed; `ARG NAME=default` declared before a FROM is substituted
               ($NAME / ${NAME} / ${NAME:-fallback}); an unresolved variable stays in the
               ref and fails the digest check (fail closed)."""
-              esc = "\\"
+              esc, out = "\\", []
               for raw in text.splitlines():
                   m = re.match(r"\s*#\s*escape\s*=\s*(\S)", raw, re.I)
                   if m: esc = m.group(1); continue
-                  if raw.strip() and not raw.lstrip().startswith("#"): break           # directives only precede instructions
+                  m = re.match(r"\s*#\s*syntax\s*=\s*(\S+)", raw, re.I)
+                  if m: out.append("container:" + m.group(1)); continue            # BuildKit frontend image: pulled and executed first
+                  if not raw.strip(): continue
+                  break                                                            # Docker: directives end at the first comment/instruction
               logical, buf = [], ""
               for raw in text.splitlines():
                   if raw.lstrip().startswith("#"): continue
@@ -329,10 +358,12 @@ jobs:
               # move the script into a file ADDed from the context). The fleet has no
               # Dockerfile-backed action today, so the cost is zero and the bypass
               # surface is closed.
-              for line in logical:
-                  if re.match(r"\s*(ONBUILD\s+)?(RUN|COPY|ADD)\b", line, re.I):
+              for line in logical if hard_fail is not None else []:   # the BASE parse never refuses: it only feeds subtraction
+                  m = re.match(r"\s*(?:ONBUILD\s+)?(?:RUN|COPY|ADD)\s+((?:--\S+\s+)*)(.*)$", line, re.I | re.S)
+                  if m:
+                      if m.group(2).lstrip().startswith("["): continue                  # JSON (exec) form: no shell, no heredoc
                       try:
-                          lex = shlex.shlex(line, posix=False, punctuation_chars=True); lex.whitespace_split = True; toks = list(lex)
+                          lex = shlex.shlex(line, posix=False, punctuation_chars=True); lex.whitespace_split = True; lex.commenters = ""; toks = list(lex)
                       except ValueError:
                           toks = line.split()
                       if any("<<" in t and "<<<" not in t and not t.startswith(("'", '"')) for t in toks):   # `<<<` is a here-string, not a heredoc
@@ -341,7 +372,7 @@ jobs:
                           if hard_fail is not None:
                               hard_fail.add(f"{label}: a RUN/COPY/ADD instruction uses a heredoc (`<<`) -- this gate refuses to parse heredocs; rewrite the instruction without one")
                           return []
-              global_args, stage_args, stages, out, index = {}, {}, set(), [], 0
+              global_args, stage_args, stages, index = {}, {}, set(), 0
               in_stage = False
               def expand(v, scope):
                   v = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
@@ -363,9 +394,9 @@ jobs:
                   # (inside the --mount option value only) pull X when it is not a stage;
                   # ordinary command text such as `RUN echo from=x` is never an image.
                   srcs = []
-                  fm = re.match(r"\s*(COPY|ADD)\s+((?:--\S+\s+)*)", line, re.I)
+                  fm = re.match(r"\s*(?:ONBUILD\s+)?(COPY|ADD)\s+((?:--\S+\s+)*)", line, re.I)
                   if fm: srcs += re.findall(r"--from=(\S+)", fm.group(2))
-                  rm = re.match(r"\s*RUN\s+((?:--\S+\s+)*)", line, re.I)
+                  rm = re.match(r"\s*(?:ONBUILD\s+)?RUN\s+((?:--\S+\s+)*)", line, re.I)
                   if rm:
                       for mnt in re.findall(r"--mount=(\S+)", rm.group(1)):
                           mnt = mnt.strip("'\"")                         # --mount="from=img,target=/x" is valid BuildKit syntax
