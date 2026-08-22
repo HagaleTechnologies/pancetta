@@ -1,0 +1,107 @@
+name: Supply Chain
+
+# (CAT-299) Supply-chain gate for dependency changes.
+#
+# WHY THIS RUNS ON EVERY PR: the job named "Supply Chain" below is a
+# ruleset-required status check on main. A required check that only ran on
+# some PRs would leave every other PR stuck at "Expected -- waiting for
+# status" forever, so this workflow runs on every PR and passes trivially
+# when no dependency manifest or lockfile changed. When one DID change, the
+# scanners run and GitHub's native auto-merge (armed by auto-merge.yml /
+# dependabot-auto-merge.yml via `gh pr merge --auto`) cannot fire until they
+# pass -- that is the "dependency bumps are excluded from blanket standing
+# auto-merge until a scan passes" carve-out, enforced by the ruleset rather
+# than by convention. See dispensa ADR-0014.
+#
+# What runs when dependencies changed:
+#   * osv            -- google/osv-scanner PR diff against OSV.dev. Fails only
+#                       on advisories NEW in this PR (pre-existing ones don't
+#                       block the fix). OSV.dev carries the OpenSSF
+#                       malicious-packages feed (MAL-* ids), e.g. the Aug 2026
+#                       keyv@6.0.0 compromise is MAL-2026-11524 -- so this is a
+#                       malware gate, not just a CVE gate.
+#   * install-policy -- `cargo fetch --locked`: every crate in Cargo.lock must
+#                       still resolve to exactly the pinned checksum (crates.io
+#                       has no per-package signature step to verify yet).
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect dependency changes
+    runs-on: ubuntu-latest
+    outputs:
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            deps:
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '.github/workflows/supply-chain.yml'
+
+  osv:
+    name: OSV advisories (incl. malicious-package MAL-*)
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@v2.5.0
+    with:
+      # The job conclusion is the gate; code-scanning upload needs GitHub
+      # Advanced Security on private repos and is not what we're relying on.
+      upload-sarif: false
+      fail-on-vuln: true
+
+  install-policy:
+    name: Lockfile integrity (cargo fetch --locked)
+    needs: changes
+    if: needs.changes.outputs.deps == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      # Resolves every crate in Cargo.lock against the registry index without
+      # building (no build.rs runs). Fails if the lockfile is out of date or a
+      # pinned crate/checksum no longer matches what the registry serves.
+      - run: cargo fetch --locked
+
+  # Fan-in gate. Its check context is "Supply Chain" -- the branch ruleset's
+  # required status check. NEVER rename this job. Runs with if: always() so a
+  # failed/cancelled upstream job FAILS this check instead of skipping it (a
+  # skipped required check does NOT block merge).
+  supply-chain:
+    name: Supply Chain
+    if: always()
+    needs: [changes, osv, install-policy]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          DEPS: ${{ needs.changes.outputs.deps }}
+          OSV: ${{ needs.osv.result }}
+          POLICY: ${{ needs.install-policy.result }}
+        run: |
+          echo "changes=$CHANGES deps=$DEPS osv=$OSV install-policy=$POLICY"
+          if [ "$CHANGES" != success ]; then
+            echo "::error::dependency change detection did not succeed ($CHANGES)"; exit 1
+          fi
+          if [ "$DEPS" != true ]; then
+            echo "No dependency manifest or lockfile changed -- nothing to scan."; exit 0
+          fi
+          for r in "$OSV" "$POLICY"; do
+            if [ "$r" != success ]; then
+              echo "::error::a supply-chain scan did not succeed -- this PR must not merge until it does"; exit 1
+            fi
+          done
+          echo "All supply-chain scans passed."
