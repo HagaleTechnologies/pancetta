@@ -241,7 +241,7 @@ jobs:
         run: |
           python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
           cat > /tmp/action-pins.py <<'PY'
-          import os, re, subprocess, sys, yaml
+          import os, re, shlex, subprocess, sys, yaml
           from collections import Counter
           # Newly-added-action pin policy (CAT-299 / ADR-0014). Structural, not textual:
           # every workflow (.github/workflows/*.yml) and every action manifest
@@ -263,10 +263,10 @@ jobs:
               r = subprocess.run(a, capture_output=True, text=True); return r.returncode, r.stdout
           rc, mb = sh("git", "merge-base", base_arg, head)
           base = mb.strip() if rc == 0 and mb.strip() else base_arg   # judge only the PR's own additions
-          def dockerfile_images(text):
+          def dockerfile_images(text, hard_fail=None, label="Dockerfile"):
               """container:<image> for every FROM that is not `scratch`, an earlier build
               stage (alias OR numeric index), honouring a leading `# escape=` directive for
-              line continuations; `ARG NAME=default` declared before a FROM is substituted
+              line continuations; heredoc-bearing instructions fail closed; `ARG NAME=default` declared before a FROM is substituted
               ($NAME / ${NAME} / ${NAME:-fallback}); an unresolved variable stays in the
               ref and fails the digest check (fail closed)."""
               esc = "\\"
@@ -281,6 +281,29 @@ jobs:
                       buf += raw.rstrip()[:-1] + " "; continue
                   logical.append(buf + raw); buf = ""
               if buf: logical.append(buf)
+              # Docker heredocs (`RUN <<EOF ... EOF`, `COPY <<X ...`) are NOT parsed by this
+              # gate: getting shell heredoc grammar exactly right (quoting, grouped
+              # operators, escapes, dash delimiters) is a bypass surface in itself, and a
+              # body line can forge a stage alias. Any unquoted `<<` token in a RUN/COPY/ADD
+              # instruction therefore fails closed with an explicit message. ACCEPTED
+              # OVER-APPROXIMATION (policy, not a bug): this also refuses rare non-heredoc
+              # uses such as `$((1 << 2))` or an escaped `\<<`: the instruction must be
+              # rewritten without a `<<` operator (e.g. multiply instead of shift, or
+              # move the script into a file ADDed from the context). The fleet has no
+              # Dockerfile-backed action today, so the cost is zero and the bypass
+              # surface is closed.
+              for line in logical:
+                  if re.match(r"\s*(ONBUILD\s+)?(RUN|COPY|ADD)\b", line, re.I):
+                      try:
+                          lex = shlex.shlex(line, posix=False, punctuation_chars=True); lex.whitespace_split = True; toks = list(lex)
+                      except ValueError:
+                          toks = line.split()
+                      if any("<<" in t and "<<<" not in t and not t.startswith(("'", '"')) for t in toks):   # `<<<` is a here-string, not a heredoc
+                          # an UNCONDITIONAL failure at HEAD (never a subtractable reference):
+                          # a heredoc that already existed at the base must still fail the PR
+                          if hard_fail is not None:
+                              hard_fail.add(f"{label}: a RUN/COPY/ADD instruction uses a heredoc (`<<`) -- this gate refuses to parse heredocs; rewrite the instruction without one")
+                          return []
               args, stages, out, index = {}, set(), [], 0
               def expand(v):
                   v = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
@@ -370,6 +393,7 @@ jobs:
                   return None
               rc, out = sh("git", "show", f"{rev}:{path}"); return out if rc == 0 else None
           SYMLINKED = set()
+          HARD_FAIL = set()   # unconditional HEAD failures (never subtracted against the base)
           def load(rev, path):
               txt = show(rev, path)
               if txt is None: return None
@@ -432,14 +456,14 @@ jobs:
                       txt = show(rev, df)
                       if txt is None: print(f"::error::action {manifest_path} references missing {df}"); acc["MISSING:" + df] += 1
                       else:
-                          for c in dockerfile_images(txt): acc[c] += 1
+                          for c in dockerfile_images(txt, HARD_FAIL if rev == head else None, df): acc[c] += 1
           def refs_at(rev, path):
               acc = Counter()
               b = os.path.basename(path).lower()
               if b.startswith("dockerfile") or b.endswith(".dockerfile") or path in referenced_at(rev):   # per revision: what EXECUTES there
                   txt = show(rev, path)
                   if txt is not None:
-                      for c in dockerfile_images(txt): acc[c] += 1
+                      for c in dockerfile_images(txt, HARD_FAIL if rev == head else None, path): acc[c] += 1
                   return acc
               doc = load(rev, path)
               if doc is not None: refs_of(rev, doc, acc, frozenset({path}), 0, path)
@@ -449,6 +473,7 @@ jobs:
               if h is None: continue                               # deleted file: nothing new runs
               new += refs_at(head, h) - (refs_at(base, b) if b else Counter())   # per file, per occurrence
           if SYMLINKED: fail = 1
+          for msg in sorted(HARD_FAIL): print(f"::error::{msg}"); fail = 1
           for ref in sorted(new):            # one verdict per distinct ref (a ref reached via a local action AND its own changed manifest is reported once)
               if ref.startswith("MISSING:"): fail = 1; continue
               if ref.startswith("HagaleTechnologies/"): continue
