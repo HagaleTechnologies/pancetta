@@ -221,9 +221,11 @@ Honest gaps, so you can judge whether it fits your station:
   crate an integration stub; `pancetta-cqdx` awaits live API validation;
   LoTW/eQSL upload is scaffolded where ClubLog/QRZ/cqdx paths are live.
 - **Platform coverage is narrow.** Developed on macOS (Apple Silicon), CI on
-  Linux, deployed on a Windows 11 MiniPC. Pi-class ARM is a design target of
-  the effort-budget work but unvalidated on real hardware, and there are no
-  prebuilt binaries yet — you build from source.
+  Linux, deployed on a Windows 11 MiniPC. Prebuilt Linux aarch64 binaries are
+  published for Pi-class ARM, but real-hardware validation (the
+  effort-budget work's actual target) hasn't happened yet — CI only proves
+  the binary builds and decodes correctly on an ARM64 cloud runner, not on a
+  Raspberry Pi.
 - **One radio, well tested.** CAT/PTT is exercised against a Yaesu FTdx10.
   Other hamlib-supported rigs should work; nobody has proven it.
 - **`pancetta-research`** is a local-only decoder harness, excluded from CI
