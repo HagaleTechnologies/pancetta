@@ -1436,24 +1436,23 @@ impl AutonomousOperator {
                 return best.offset_hz;
             }
 
-            // Codex review (PR #277, round 2): if the hard exclusion above
+            // Codex review (PR #277, round 3): if the hard exclusion above
             // filters out every ranked candidate (e.g. min_separation_hz
-            // configured larger than the available spectral spread), don't
-            // fall through to the legacy `allocate_cq_frequency()` below —
-            // it has no notion of `avoid_hz` and could reselect exactly the
-            // abandoned frequency. Fall back to the best-ranked candidate
-            // farthest from `avoid_hz` instead, so occupancy-aware ranking
-            // still applies even when nothing clears the full exclusion
-            // radius.
+            // configured larger than the available spectral spread), there
+            // is genuinely no frequency that honors the exclusion. Don't
+            // fall through to the legacy `allocate_cq_frequency()` below
+            // (avoid_hz-blind, could reselect exactly the abandoned
+            // frequency) — and don't pick a "farthest available"
+            // compromise either (round 2's fix), since that still openly
+            // violates the configured separation the caller asked for.
+            // Return `avoid` itself unchanged: the caller (the
+            // no-response-streak switch path in `decide_at`) treats a
+            // no-op result as "no valid relocation" and skips the switch
+            // entirely, matching the existing "stale occupancy data" skip
+            // path rather than committing to a frequency that isn't
+            // actually excluded.
             if let Some(avoid) = avoid_hz {
-                if let Some(farthest) = candidates.iter().max_by(|a, b| {
-                    (a.offset_hz - avoid)
-                        .abs()
-                        .partial_cmp(&(b.offset_hz - avoid).abs())
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                }) {
-                    return farthest.offset_hz;
-                }
+                return avoid;
             }
         }
 
@@ -2016,6 +2015,26 @@ impl AutonomousOperator {
                                     .unwrap_or(self.config.tx_offset_hz);
                                 let new_offset =
                                     self.allocate_smart_frequency(None, None, Some(avoid));
+
+                                // Codex review (PR #277, round 3): a no-op
+                                // result (new_offset == avoid) means
+                                // allocate_smart_frequency found no
+                                // candidate honoring the hard exclusion —
+                                // committing to it anyway would transmit
+                                // right back on the abandoned frequency
+                                // while claiming a successful switch. Treat
+                                // this exactly like the "stale occupancy
+                                // data" case above: skip the window and
+                                // listen instead, preserving the streak so
+                                // the switch is retried once conditions
+                                // improve.
+                                if (new_offset - avoid).abs() < f64::EPSILON {
+                                    self.state = OperatingState::Hunting;
+                                    actions.push(OperatorAction::Listen);
+                                    actions.push(self.status_action());
+                                    return actions;
+                                }
+
                                 self.cq_no_response_streak = 0;
                                 actions.push(OperatorAction::FrequencyShift {
                                     new_offset_hz: new_offset,
@@ -2140,15 +2159,32 @@ impl AutonomousOperator {
                 // collision avoidance, silently postponing the real
                 // no-response-driven switch indefinitely.
                 if (new_offset - prev_offset).abs() > f64::EPSILON {
-                    // Codex review (PR #276, round 6): also reset the
-                    // no-response streak. Without this, an idle Auto operator
-                    // that already reached the switch threshold — collision
-                    // jitter fires first and moves the offset — would still
-                    // have a streak sitting at/above the threshold, so the very
-                    // next self-CQ immediately re-enters the switch branch and
-                    // moves away again without ever trying the frequency
-                    // collision avoidance just picked.
-                    self.cq_no_response_streak = 0;
+                    // Codex review (PR #277, round 3): a nonzero jitter
+                    // isn't necessarily a nonzero jitter AWAY from the
+                    // interferer — a small draw (e.g. ±1 Hz) can leave
+                    // `new_offset` still within the collision detector's
+                    // tolerance of the same decoded station. Only reset the
+                    // no-response streak once we've actually escaped every
+                    // interferer that triggered this collision check;
+                    // otherwise the next CQ would still be colliding while
+                    // the threshold-driven smart switch has been postponed
+                    // for another full streak.
+                    let still_colliding = decoded.iter().any(|msg| {
+                        (msg.frequency_hz - new_offset).abs()
+                            <= self.collision_detector.tolerance_hz
+                    });
+
+                    if !still_colliding {
+                        // Codex review (PR #276, round 6): also reset the
+                        // no-response streak. Without this, an idle Auto operator
+                        // that already reached the switch threshold — collision
+                        // jitter fires first and moves the offset — would still
+                        // have a streak sitting at/above the threshold, so the very
+                        // next self-CQ immediately re-enters the switch branch and
+                        // moves away again without ever trying the frequency
+                        // collision avoidance just picked.
+                        self.cq_no_response_streak = 0;
+                    }
 
                     actions.push(OperatorAction::FrequencyShift {
                         new_offset_hz: new_offset,
@@ -2413,10 +2449,22 @@ mod tests {
                                        // matter what the real jitter draws, without weakening the test to
                                        // a synthetic clamp scenario.
         op.current_cq_offset_hz = Some(1000.0);
+        // Codex review (PR #277, round 3): the streak reset is now also
+        // gated on having escaped the interferer's collision tolerance
+        // (not just "the offset moved at all"). With the interferer placed
+        // near tx_offset_hz=1500 (required to trigger detection at all,
+        // since the detector checks against tx_offset_hz) and jitter always
+        // landing new_offset in [1300, 1700], a real jitter draw could
+        // coincidentally still land within 50 Hz of the interferer,
+        // flaking this assertion. Decouple detection from the jitter base
+        // by pointing the detector's own tracked offset at a frequency far
+        // from tx_offset_hz's jitter range, so every possible new_offset
+        // guarantees escape regardless of the real jitter draw.
+        op.collision_detector.our_tx_offset_hz = 700.0;
 
         let messages = vec![DecodedMessageInfo {
             callsign: Some("K1DEF".into()),
-            frequency_hz: 1520.0, // within the 50 Hz collision tolerance of 1500
+            frequency_hz: 710.0, // within the 50 Hz collision tolerance of 700 (detector's offset)
             snr: -10,
             message_text: "CQ K1DEF FN31".into(),
             slot_parity: None,
@@ -2436,6 +2484,57 @@ mod tests {
             op.cq_no_response_streak, 0,
             "the streak must reset when collision avoidance moves the frequency"
         );
+    }
+
+    #[test]
+    fn collision_jitter_preserves_streak_when_the_new_offset_is_still_within_collision_range() {
+        // Codex review (PR #277, round 3): a nonzero jitter can still land
+        // within the collision detector's tolerance of the same interferer
+        // (e.g. a small draw). `simple_jitter()` has no test injection
+        // point, so this asserts the actual gating INVARIANT — whichever
+        // way any given real jitter draw falls — across many trials rather
+        // than depending on one draw landing in either bucket, giving
+        // deterministic coverage of both branches of the new
+        // `still_colliding` check.
+        for _ in 0..100 {
+            let mut config = AutonomousConfig::default();
+            config.enabled = true;
+            config.tx_offset_hz = 1500.0;
+            let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+            op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                pancetta_core::TxFreqMode::Auto.as_u8(),
+            )));
+            op.cq_no_response_streak = 10;
+            op.current_cq_offset_hz = Some(1000.0); // outside jitter's [1300,1700] range
+
+            let messages = vec![DecodedMessageInfo {
+                callsign: Some("K1DEF".into()),
+                frequency_hz: 1520.0, // within the 50 Hz collision tolerance of 1500
+                snr: -10,
+                message_text: "CQ K1DEF FN31".into(),
+                slot_parity: None,
+                confidence: None,
+                time_offset_s: None,
+                decode_origin: None,
+            }];
+            op.process_collision_listen(&messages);
+
+            let new_offset = op.current_cq_offset_hz.expect("jitter always sets this");
+            let still_colliding = (1520.0_f64 - new_offset).abs() <= 50.0;
+            if still_colliding {
+                assert_eq!(
+                    op.cq_no_response_streak, 10,
+                    "new_offset {new_offset} is still within 50 Hz of the 1520 Hz \
+                     interferer — the streak must NOT reset"
+                );
+            } else {
+                assert_eq!(
+                    op.cq_no_response_streak, 0,
+                    "new_offset {new_offset} escaped the 1520 Hz interferer's \
+                     collision range — the streak must reset"
+                );
+            }
+        }
     }
 
     #[test]
@@ -2755,19 +2854,18 @@ mod tests {
     }
 
     #[test]
-    fn allocate_smart_frequency_never_returns_inside_the_exclusion_when_the_hard_filter_empties_out(
-    ) {
-        // Codex review (PR #277, round 2): if `min_separation_hz` is
+    fn allocate_smart_frequency_returns_avoid_hz_unchanged_when_the_hard_filter_empties_out() {
+        // Codex review (PR #277, round 3): if `min_separation_hz` is
         // configured large enough that every ranked candidate falls inside
         // the exclusion radius, the hard filter empties the candidate list.
-        // The pre-fix fallthrough to `allocate_cq_frequency()` (avoid_hz-
-        // blind, and with no own/observed frequencies recorded, always
-        // returns the allocation range's minimum — 200 Hz here) ignores
-        // avoid_hz entirely. Set min_separation_hz far larger than the
-        // whole allocation range so NOTHING can pass the hard filter, and
-        // confirm the farthest-candidate fallback picks 2800 Hz (the far
-        // edge from avoid_hz=1000, unambiguously farther than 200 Hz)
-        // instead of falling through to the legacy allocator's 200 Hz.
+        // Round 2's "farthest candidate" fallback still openly violated the
+        // configured separation; the caller (`decide_at`'s switch path)
+        // must instead be able to tell "no valid relocation exists" apart
+        // from a real pick. Signal that by returning `avoid_hz` itself
+        // unchanged, distinct from both the farthest-candidate compromise
+        // and the avoid_hz-blind legacy allocator's fallback (which, with
+        // no own/observed frequencies recorded, always returns the
+        // allocation range's minimum — 200 Hz here, not 1000 Hz).
         let mut config = AutonomousConfig::default();
         config.enabled = true;
         config.frequency.min_separation_hz = 10_000.0;
@@ -2784,9 +2882,9 @@ mod tests {
         let chosen = op.allocate_smart_frequency(None, None, Some(1000.0));
 
         assert_eq!(
-            chosen, 2800.0,
-            "must fall back to the farthest ranked candidate from avoid_hz, not the \
-             avoid_hz-blind legacy allocator (which would return 200.0 here)"
+            chosen, 1000.0,
+            "must return avoid_hz unchanged (a detectable no-op) rather than the \
+             avoid_hz-blind legacy allocator's 200.0 or a farther-but-still-excluded compromise"
         );
     }
 
@@ -2838,6 +2936,72 @@ mod tests {
             all.push(op.decide_at(even_ts));
         }
         all
+    }
+
+    #[test]
+    fn switch_skips_and_listens_when_no_frequency_honors_the_exclusion() {
+        // Codex review (PR #277, round 3): when min_separation_hz is
+        // configured too large for any candidate to honor the exclusion,
+        // allocate_smart_frequency returns avoid_hz unchanged. Committing to
+        // that as if it were a real switch would reset the streak and
+        // transmit right back on the abandoned frequency. This must instead
+        // fall back to the same "skip the window and listen" path as the
+        // stale-occupancy-data case, preserving the streak.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 2;
+        config.cq_no_response_switch_after = 3;
+        config.listen_cycle.initial_interval = 100;
+        config.frequency.min_separation_hz = 10_000.0; // impossible to honor
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let rounds = run_cq_rounds(&mut op, 4);
+
+        for (i, round) in rounds.iter().enumerate() {
+            assert!(
+                !round
+                    .iter()
+                    .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+                "round {i}: must never report a FrequencyShift when no candidate honors \
+                 the exclusion, got {round:?}"
+            );
+        }
+        // The threshold round (index 3, 0-based — matching
+        // auto_mode_switches_frequency_after_streak_threshold's established
+        // "4th round" cadence for switch_after=3) must listen instead of
+        // transmitting.
+        assert!(
+            rounds[3]
+                .iter()
+                .any(|a| matches!(a, OperatorAction::Listen)),
+            "expected the threshold round to skip and listen, got {:?}",
+            rounds[3]
+        );
+        assert!(
+            !rounds[3]
+                .iter()
+                .any(|a| matches!(a, OperatorAction::Transmit { .. })),
+            "must not transmit on the round where the switch is skipped, got {:?}",
+            rounds[3]
+        );
+        assert_eq!(
+            op.cq_no_response_streak, 3,
+            "the streak must be preserved (not reset, not incremented further) while \
+             the switch keeps being skipped"
+        );
     }
 
     #[test]
