@@ -138,7 +138,44 @@ jobs:
               if "package.json" in files:
                   manifests.append(rel)
               if "package-lock.json" in files:
-                  (covered.add(rel) if "npm" in ACCEPT else refused.append(os.path.join(rel, "package-lock.json")))
+                  if "npm" in ACCEPT:
+                      covered.add(rel)
+                      try:
+                          import json, re as _re
+                          def ws_match(pattern, path):
+                              """npm/minimatch-style: `*`/`?` never cross `/`, `**` does, `{a,b}` alternates."""
+                              out, i = "", 0
+                              while i < len(pattern):
+                                  c = pattern[i]
+                                  if pattern.startswith("**/", i): out += "(?:.*/)?"; i += 3      # globstar spans zero or more directories
+                                  elif pattern.startswith("**", i): out += ".*"; i += 2
+                                  elif c == "*": out += "[^/]*"; i += 1
+                                  elif c == "?": out += "[^/]"; i += 1
+                                  elif c == "{":
+                                      j = pattern.find("}", i)
+                                      if j == -1: out += _re.escape(c); i += 1
+                                      else: out += "(" + "|".join(_re.escape(a) for a in pattern[i + 1:j].split(",")) + ")"; i = j + 1
+                                  else: out += _re.escape(c); i += 1
+                              return _re.fullmatch(out, path) is not None
+                          lock = json.load(open(os.path.join(root, "package-lock.json")))
+                          pkgs = lock.get("packages") or {}
+                          ws = (json.load(open(os.path.join(root, "package.json"))) if os.path.exists(os.path.join(root, "package.json")) else {}).get("workspaces") or []
+                          if isinstance(ws, dict): ws = ws.get("packages") or []
+                          ws = [os.path.normpath(g) for g in ws if isinstance(g, str)]
+                          includes = [g for g in ws if not g.startswith("!")]; excludes = [g[1:] for g in ws if g.startswith("!")]
+                          link_targets = {os.path.normpath(m["resolved"]) for m in pkgs.values() if isinstance(m, dict) and m.get("link") and isinstance(m.get("resolved"), str)}
+                          for key in pkgs:
+                              # an npm workspace member is covered only when the ROOT manifest
+                              # declares it (workspaces globs) AND the lock links to it -- a
+                              # handcrafted lock key alone grants nothing
+                              nk = os.path.normpath(key)
+                              if key and "node_modules/" not in key and not nk.startswith("..") and nk in link_targets \
+                                      and any(ws_match(g, nk) for g in includes) and not any(ws_match(g, nk) for g in excludes):
+                                  covered.add(os.path.normpath(os.path.join(rel, nk)))
+                      except (ValueError, OSError):
+                          pass                                                 # the verifier step rejects an unparseable lock
+                  else:
+                      refused.append(os.path.join(rel, "package-lock.json"))
               if "pnpm-lock.yaml" in files:
                   if "pnpm" in ACCEPT:
                       covered.add(rel)
@@ -304,14 +341,24 @@ jobs:
                           if hard_fail is not None:
                               hard_fail.add(f"{label}: a RUN/COPY/ADD instruction uses a heredoc (`<<`) -- this gate refuses to parse heredocs; rewrite the instruction without one")
                           return []
-              args, stages, out, index = {}, set(), [], 0
-              def expand(v):
+              global_args, stage_args, stages, out, index = {}, {}, set(), [], 0
+              in_stage = False
+              def expand(v, scope):
                   v = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
-                             lambda m: (args.get(m.group(1)) or (m.group(2) if m.group(2) is not None else args.get(m.group(1), m.group(0)))) if m.group(2) is not None or m.group(1) in args else m.group(0), v)
-                  return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda m: args.get(m.group(1), m.group(0)), v)
+                             lambda m: (scope.get(m.group(1)) or (m.group(2) if m.group(2) is not None else scope.get(m.group(1), m.group(0)))) if m.group(2) is not None or m.group(1) in scope else m.group(0), v)
+                  return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda m: scope.get(m.group(1), m.group(0)), v)
               for line in logical:
                   m = re.match(r"\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?\s*$", line, re.I)
-                  if m: args[m.group(1)] = (m.group(2) or "").strip().strip("\"'"); continue
+                  if m:
+                      name, val = m.group(1), m.group(2)
+                      val = None if val is None else val.strip().strip("\"'")
+                      if not in_stage:
+                          global_args[name] = val or ""                              # pre-FROM: global default
+                      elif val is not None:
+                          stage_args[name] = val                                     # stage-local value
+                      else:
+                          stage_args[name] = global_args.get(name, "")               # valueless: inherits the GLOBAL default only
+                      continue
                   # COPY/ADD --from=X (instruction FLAGS only) and RUN --mount=...,from=X
                   # (inside the --mount option value only) pull X when it is not a stage;
                   # ordinary command text such as `RUN echo from=x` is never an image.
@@ -321,14 +368,16 @@ jobs:
                   rm = re.match(r"\s*RUN\s+((?:--\S+\s+)*)", line, re.I)
                   if rm:
                       for mnt in re.findall(r"--mount=(\S+)", rm.group(1)):
-                          srcs += re.findall(r"(?:^|,)from=([^,]+)", mnt)
+                          mnt = mnt.strip("'\"")                         # --mount="from=img,target=/x" is valid BuildKit syntax
+                          srcs += [v.strip("'\"") for v in re.findall(r"(?:^|,)from=([^,]+)", mnt)]
                   for src in srcs:
-                      src = expand(src)
+                      src = expand(src, stage_args)                                  # instructions inside a stage see the stage scope
                       if src.lower() not in stages and not (src.isdigit() and int(src) < index):
                           out.append("container:" + src)
                   m = re.match(r"\s*FROM\s+((?:--\S+\s+)*)(\S+)(?:\s+AS\s+(\S+))?", line, re.I)
                   if not m: continue
-                  img, alias = expand(m.group(2)), m.group(3)
+                  img, alias = expand(m.group(2), global_args), m.group(3)            # FROM sees only global ARGs
+                  in_stage, stage_args = True, {}                                    # a new stage starts with an empty ARG scope
                   is_stage_index = img.isdigit() and int(img) < index
                   if img.lower() != "scratch" and img.lower() not in stages and not is_stage_index:
                       out.append("container:" + img)
@@ -469,6 +518,9 @@ jobs:
               if doc is not None: refs_of(rev, doc, acc, frozenset({path}), 0, path)
               return acc
           fail = 0; new = Counter()
+          for mpath in sorted(set(manifests_at(head)) | referenced_at(head)):
+              if is_symlink(head, mpath) and mpath not in SYMLINKED:
+                  print(f"::error::{mpath} is a symlink -- executable manifests and action image files must be real files (a change to the target would otherwise escape review)"); SYMLINKED.add(mpath)
           for b, h in changed_pairs():
               if h is None: continue                               # deleted file: nothing new runs
               new += refs_at(head, h) - (refs_at(base, b) if b else Counter())   # per file, per occurrence
