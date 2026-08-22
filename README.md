@@ -129,6 +129,27 @@ licensed control operator is at the keyboard and can stop it instantly:
 Regulatory notes, including FCC §97.221 automatic-control considerations:
 [`docs/fcc-part97-compliance.md`](docs/fcc-part97-compliance.md).
 
+## cqdx.io integration
+
+Pancetta pairs with **[cqdx.io](https://cqdx.io)**, the DX/logbook layer around
+the station:
+
+- **Hunting.** Needed-DXCC and needed-grid feeds from cqdx.io flow straight
+  into the priority scorer, so DX Hunter ranks every decoded CQ against what
+  you actually still need — not just what's loudest.
+- **Scoring.** Rarity and live-spot data from cqdx.io feed the same scorer
+  alongside signal and recent activity, so the top of the list is the contact
+  worth working right now.
+- **Logbook.** Confirmed QSOs and spot reports upload to cqdx.io directly —
+  no ADIF export/import round-trip.
+- **Remote rig access.** cqdx.io also brokers authorization for remote
+  control: an operator can grant a delegate device — panino, the companion
+  remote-control client, or a browser — scoped, revocable access to the
+  pancetta-controlled rig, gated by the same remote-TX arm described above.
+
+Not every path is equally mature yet — see [Why not (yet)](#why-not-yet) for
+current status.
+
 ## Quick start
 
 **1. Dependencies.**
