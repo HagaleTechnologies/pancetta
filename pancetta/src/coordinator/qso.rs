@@ -2072,7 +2072,21 @@ impl super::ApplicationCoordinator {
                 //   2. Replay: index missing or older than ADIF → drop + replay so duplicate
                 //      detection sees every prior contact.
                 //   3. Open as-is: normal startup; index is current.
-                {
+                //
+                // Gated on `replay_mode` (PAN-41): unlike `start_local_qso_log_writers`
+                // above, this block previously opened `db_path`/`adif_path`
+                // unconditionally — every path here is the *real*
+                // `~/.pancetta/qsos.adi` / `qso.db`, not anything derived from
+                // `--replay`'s capture-dir argument. `QsoDatabase::open` runs
+                // `PRAGMA`s and `CREATE TABLE IF NOT EXISTS` even on an
+                // already-current DB, i.e. a write-mode connection against
+                // the operator's live logbook — for both a genuine `--replay`
+                // run and any in-process test that only sets `replay_path` to
+                // satisfy `replay_mode()`. Skipping the seed under replay
+                // means duplicate-checking starts empty for that run, which
+                // matches "--replay must not even create/touch the real log"
+                // (see `replay_local_log_tests` below).
+                if !replay_mode {
                     use pancetta_qso::async_database::QsoDatabase;
 
                     // Determine the current band from the rig's operating frequency,

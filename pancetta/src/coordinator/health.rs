@@ -862,7 +862,16 @@ mod supervisor_tests {
     /// `test_coordinator_creation` / `autonomous.rs`'s `build_coordinator`:
     /// `Config::default()`, `no_audio=true`, `headless=true`. No shared
     /// helper exists yet for `health.rs` (this is its first test module),
-    /// so this is a local copy of that same pattern rather than a new one.
+    /// so this is a local copy of that same pattern rather than a new one —
+    /// EXCEPT for `replay_path`, which (unlike those other copies) is
+    /// deliberately `Some(..)`: several tests below call the real
+    /// `start_qso_component`, which in its normal (non-`--replay`) mode
+    /// opens/creates the operator's real `~/.pancetta/qsos.adi` and
+    /// `qso.db` (PAN-41). Mirrors `coordinator::mod`'s own
+    /// `build_coordinator_with_replay` / `coordinator::qso`'s
+    /// `replay_local_log_tests::test_coordinator` pattern — the SAME dummy,
+    /// never-read path value — so `self.replay_mode()` is `true` and the
+    /// real logbook is never touched.
     async fn test_coordinator() -> ApplicationCoordinator {
         let config = Config::default();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -873,9 +882,9 @@ mod supervisor_tests {
             true,  // headless
             false, // metrics
             9090,
-            None, // no WAV
-            None, // no replay
-            None, // no test-tx
+            None,                                                // no WAV
+            Some(std::path::PathBuf::from("/some/capture/dir")), // --replay: never touch the real logbook
+            None,                                                // no test-tx
             1500.0,
             shutdown,
             Vec::new(), // no config warnings
