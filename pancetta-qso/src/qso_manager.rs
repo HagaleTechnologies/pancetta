@@ -916,6 +916,27 @@ impl QsoManager {
         tx_parity: Option<pancetta_core::slot::SlotParity>,
         remote_origin: bool,
     ) -> Result<QsoId, QsoManagerError> {
+        self.start_cq_with_id(Uuid::new_v4(), frequency, tx_parity, remote_origin)
+            .await
+    }
+
+    /// PAN-38 round 2 (Codex): same as [`Self::start_cq`], but lets the
+    /// caller supply `qso_id` up front instead of having this function
+    /// generate it internally. The autonomous coordinator uses this to
+    /// register the qso_id<->cq_attempt_id association (`AutonomousCqOpened`)
+    /// BEFORE this call's own `MessageToSend` becomes visible to the
+    /// independently-scheduled event-forwarding task — otherwise a
+    /// same-instant downstream failure's `TransmitComplete` could reach the
+    /// autonomous task before the association does, silently dropping the
+    /// rollback (and then registering a stale, never-cleaned-up entry when
+    /// the late `AutonomousCqOpened` finally arrives).
+    pub async fn start_cq_with_id(
+        &self,
+        qso_id: QsoId,
+        frequency: f64,
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
+        remote_origin: bool,
+    ) -> Result<QsoId, QsoManagerError> {
         if self.config.our_callsign == "NOCALL" || self.config.our_callsign == "N0CALL" {
             return Err(QsoManagerError::Configuration {
                 message: format!(
@@ -924,7 +945,6 @@ impl QsoManager {
                 ),
             });
         }
-        let qso_id = Uuid::new_v4();
         let now = Utc::now();
         // BUG 1 fix (docs/qso-engine-bugs.md): latch a concrete parity ONCE at
         // QSO creation when the caller has no fixed preference (`None`, the

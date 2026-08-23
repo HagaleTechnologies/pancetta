@@ -1965,6 +1965,28 @@ impl super::ApplicationCoordinator {
                                             ) => {
                                                 let mut op = operator.lock().await;
                                                 op.restore_cq_state_for_attempt(attempt_id);
+                                                drop(op);
+                                                // PAN-38 round 2: since
+                                                // AutonomousCqOpened is now
+                                                // sent BEFORE dispatch
+                                                // (round 2), a synchronous
+                                                // start_cq_with_id failure
+                                                // (or a cross-parity
+                                                // deferral before dispatch)
+                                                // can leave a
+                                                // pending_self_cq_qsos entry
+                                                // for a QSO that was never
+                                                // actually created — no
+                                                // TransmitComplete will ever
+                                                // arrive to remove it.
+                                                // Linear scan-and-remove by
+                                                // value is fine: this map
+                                                // holds at most one or two
+                                                // entries in practice (a
+                                                // self-CQ only fires when
+                                                // idle).
+                                                pending_self_cq_qsos
+                                                    .retain(|_, id| *id != attempt_id);
                                             }
                                             // PAN-38 round 1: record the
                                             // qso_id <-> attempt_id link for a

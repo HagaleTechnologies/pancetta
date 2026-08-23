@@ -4575,7 +4575,9 @@ impl super::ApplicationCoordinator {
                                                     .await;
                                                 }
                                             }
-                                            for text in item_texts {
+                                            for (text, qso_id) in
+                                                item_texts.into_iter().zip(encoded_qso_ids)
+                                            {
                                                 let complete_msg = ComponentMessage::new(
                                                     ComponentId::Ft8Transmitter,
                                                     ComponentId::Autonomous,
@@ -4583,7 +4585,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: text,
                                                         duration_ms: 0,
-                                                        qso_id: None, // bundle item; per-item qso_id not threaded through this loop
+                                                        qso_id,
                                                     },
                                                     Instant::now(),
                                                 );
@@ -4803,7 +4805,10 @@ impl super::ApplicationCoordinator {
                                                             Vec::new(),
                                                         )
                                                         .await;
-                                                        for text in rebuilt_texts {
+                                                        for (text, qso_id) in rebuilt_texts
+                                                            .into_iter()
+                                                            .zip(rebuilt_qso_ids)
+                                                        {
                                                             let complete_msg =
                                                                 ComponentMessage::new(
                                                                     ComponentId::Ft8Transmitter,
@@ -4812,7 +4817,7 @@ impl super::ApplicationCoordinator {
                                                                         success: false,
                                                                         message_text: text,
                                                                         duration_ms: 0,
-                                                                        qso_id: None, // bundle item; per-item qso_id not threaded through this loop
+                                                                        qso_id,
                                                                     },
                                                                     Instant::now(),
                                                                 );
@@ -5120,7 +5125,10 @@ impl super::ApplicationCoordinator {
                                                         Vec::new(),
                                                     )
                                                     .await;
-                                                    for text in rebuilt_texts {
+                                                    for (text, qso_id) in rebuilt_texts
+                                                        .into_iter()
+                                                        .zip(rebuilt_qso_ids)
+                                                    {
                                                         let complete_msg = ComponentMessage::new(
                                                             ComponentId::Ft8Transmitter,
                                                             ComponentId::Autonomous,
@@ -5128,7 +5136,7 @@ impl super::ApplicationCoordinator {
                                                                 success: false,
                                                                 message_text: text,
                                                                 duration_ms: 0,
-                                                                qso_id: None, // bundle item; per-item qso_id not threaded through this loop
+                                                                qso_id,
                                                             },
                                                             Instant::now(),
                                                         );
@@ -5278,7 +5286,9 @@ impl super::ApplicationCoordinator {
                                             .await;
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        for text in item_texts {
+                                        for (text, qso_id) in
+                                            item_texts.into_iter().zip(encoded_qso_ids_final)
+                                        {
                                             let complete_msg = ComponentMessage::new(
                                                 ComponentId::Ft8Transmitter,
                                                 ComponentId::Autonomous,
@@ -5286,7 +5296,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: text,
                                                     duration_ms: 0,
-                                                    qso_id: None, // bundle item; per-item qso_id not threaded through this loop
+                                                    qso_id,
                                                 },
                                                 Instant::now(),
                                             );
@@ -5525,7 +5535,9 @@ impl super::ApplicationCoordinator {
                                     ptt_guard.disarm();
 
                                     // --- Step 10: Send TransmitComplete for each item ---
-                                    for text in item_texts {
+                                    for (text, qso_id) in
+                                        item_texts.into_iter().zip(encoded_qso_ids_final)
+                                    {
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Autonomous,
@@ -5533,7 +5545,7 @@ impl super::ApplicationCoordinator {
                                                 success,
                                                 message_text: text,
                                                 duration_ms,
-                                                qso_id: None, // bundle item; per-item qso_id not threaded through item_texts
+                                                qso_id,
                                             },
                                             Instant::now(),
                                         );

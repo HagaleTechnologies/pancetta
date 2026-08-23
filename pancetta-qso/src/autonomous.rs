@@ -834,6 +834,16 @@ pub struct CqStateSnapshot {
     /// restoring an absolute pre-attempt baseline, which would corrupt
     /// whatever legitimately happened after it).
     did_switch: bool,
+    /// PAN-38 round 2 (Codex): the `tx_freq_mode` generation counter this
+    /// operator had last observed at snapshot time (mirrors
+    /// `AutonomousOperator::last_seen_tx_freq_mode_generation`). A later
+    /// `decide_at` cycle's own Hold/Auto-transition check (see the top of
+    /// `decide_at`) can legitimately clear `current_cq_offset_hz` to `None`
+    /// AFTER this snapshot was taken but BEFORE it's restored -- an
+    /// unconditional restore would silently resurrect the stale
+    /// pre-transition offset the invalidation had just correctly cleared.
+    /// Restoring only proceeds when the generation is unchanged since.
+    tx_freq_mode_generation: u32,
 }
 
 /// The per-cycle decision-making brain.
@@ -1066,7 +1076,15 @@ impl AutonomousOperator {
             return;
         };
         self.cq_no_response_streak = snapshot.streak;
-        self.current_cq_offset_hz = snapshot.current_cq_offset_hz;
+        // PAN-38 round 2 (Codex): only restore the sticky offset if no
+        // Hold/Auto transition was observed since the snapshot was taken --
+        // otherwise `current_cq_offset_hz` was already correctly cleared to
+        // `None` by a later `decide_at` cycle's generation check, and
+        // restoring the snapshot's (now-stale) value would silently
+        // resurrect it.
+        if self.last_seen_tx_freq_mode_generation == snapshot.tx_freq_mode_generation {
+            self.current_cq_offset_hz = snapshot.current_cq_offset_hz;
+        }
         self.config.tx_offset_hz = snapshot.tx_offset_hz;
         self.collision_detector.our_tx_offset_hz = snapshot.tx_offset_hz;
     }
@@ -2152,6 +2170,7 @@ impl AutonomousOperator {
                                 tx_offset_hz: self.config.tx_offset_hz,
                                 attempt_id: self.cq_attempt_counter,
                                 did_switch: false,
+                                tx_freq_mode_generation: self.last_seen_tx_freq_mode_generation,
                             });
 
                             let should_switch = self.tx_freq_auto()
@@ -3747,6 +3766,70 @@ mod tests {
                 .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
             "restoring via the attempt-id path must roll the streak back \
              exactly like restore_cq_state(), not just pause it"
+        );
+    }
+
+    #[test]
+    fn restore_cq_state_for_attempt_does_not_resurrect_an_offset_a_later_generation_bump_invalidated(
+    ) {
+        // PAN-38 round 2 (Codex): a downstream dispatch-failure report for an
+        // attempt that is STILL the latest snapshot (no newer self-CQ has
+        // superseded it) used to unconditionally restore the snapshot's
+        // sticky offset via restore_cq_state's full restore. But an
+        // intervening decide_at cycle's own Hold/Auto-transition generation
+        // check (PAN-39) can have already (correctly) cleared
+        // current_cq_offset_hz to None in between the snapshot and the
+        // restore -- the old unconditional restore would silently
+        // resurrect the stale pre-transition value, undoing that correct
+        // invalidation.
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        ));
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 2;
+        config.listen_cycle.initial_interval = 100;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(mode.clone());
+        op.set_tx_freq_mode_generation_source(generation.clone());
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle 1, establishes the operator's baseline generation
+        op.decide_at(even_ts); // idle 2 -> CQ #1 fires, streak -> 1, snapshot taken
+        let attempt_id = op
+            .last_cq_attempt_id()
+            .expect("a self-CQ ran this cycle and took a snapshot");
+        assert!(
+            op.current_cq_offset_hz.is_some(),
+            "CQ #1 must have picked a sticky offset"
+        );
+
+        // A Hold entry+exit happens entirely between polls -- invisible to a
+        // direct mode-atomic read, same as PAN-39's scenario.
+        generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        op.decide_at(even_ts); // idle cycle: observes the bump, clears the sticky offset
+        assert!(
+            op.current_cq_offset_hz.is_none(),
+            "the generation bump must have invalidated the sticky offset already"
+        );
+        // No new self-CQ has fired (idle cycle only) -- attempt_id is still
+        // the latest unresolved snapshot.
+        assert_eq!(op.last_cq_attempt_id(), Some(attempt_id));
+
+        // A late downstream dispatch-failure report for CQ #1 arrives now.
+        op.restore_cq_state_for_attempt(attempt_id);
+
+        assert!(
+            op.current_cq_offset_hz.is_none(),
+            "restoring a stale attempt must not resurrect an offset a later \
+             generation bump already (correctly) invalidated"
         );
     }
 

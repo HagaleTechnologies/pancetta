@@ -3636,8 +3636,50 @@ impl super::ApplicationCoordinator {
                                                     // Calling CQ ourselves: `parity` is our TX
                                                     // parity (not a DX parity). Autonomous CQ is
                                                     // a LOCAL initiation, never remote.
+                                                    //
+                                                    // PAN-38 round 2 (Codex): pre-generate the
+                                                    // qso_id and register the
+                                                    // qso_id<->cq_attempt_id association
+                                                    // (AutonomousCqOpened) BEFORE dispatching
+                                                    // start_cq_with_id, not after it returns --
+                                                    // start_cq's own MessageToSend becomes
+                                                    // visible to the independently-scheduled
+                                                    // event-forwarding task as soon as it's
+                                                    // emitted, and a same-instant downstream
+                                                    // failure's TransmitComplete could otherwise
+                                                    // reach the autonomous task before this
+                                                    // association did.
+                                                    let pre_generated_qso_id =
+                                                        pancetta_qso::QsoId::new_v4();
+                                                    if let Some(attempt_id) = cq_attempt_id {
+                                                        let opened_msg = ComponentMessage::new(
+                                                            ComponentId::Qso,
+                                                            ComponentId::Autonomous,
+                                                            MessageType::QsoMessage(
+                                                                crate::message_bus::QsoMessage::AutonomousCqOpened {
+                                                                    qso_id: pre_generated_qso_id.to_string(),
+                                                                    attempt_id,
+                                                                },
+                                                            ),
+                                                            Instant::now(),
+                                                        );
+                                                        if let Err(e) = message_bus
+                                                            .send_message(opened_msg)
+                                                            .await
+                                                        {
+                                                            warn!(
+                                                                "Failed to send AutonomousCqOpened: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
                                                     qso_manager
-                                                        .start_cq(frequency, parity, false)
+                                                        .start_cq_with_id(
+                                                            pre_generated_qso_id,
+                                                            frequency,
+                                                            parity,
+                                                            false,
+                                                        )
                                                         .await
                                                 }
                                             };
@@ -3650,45 +3692,18 @@ impl super::ApplicationCoordinator {
                                                         dx, frequency, qso_id
                                                     ),
                                                     None => {
+                                                        // PAN-38 round 2: the
+                                                        // AutonomousCqOpened
+                                                        // registration now
+                                                        // happens BEFORE
+                                                        // dispatch, above --
+                                                        // see the comment
+                                                        // there.
                                                         info!(
                                                             target: "qso.autonomous",
                                                             "Autonomous CQ QSO opened on {:.0} Hz: {}",
                                                             frequency, qso_id
                                                         );
-                                                        // PAN-38 round 1: record the
-                                                        // qso_id <-> attempt_id
-                                                        // association so the autonomous
-                                                        // coordinator can correlate a
-                                                        // later downstream TransmitComplete
-                                                        // failure (radio/CAT error) back to
-                                                        // this attempt — start_cq succeeding
-                                                        // here only means the QSO object was
-                                                        // created and handed to the TX
-                                                        // worker, not that it actually went
-                                                        // out over the air.
-                                                        if let Some(attempt_id) = cq_attempt_id
-                                                        {
-                                                            let opened_msg = ComponentMessage::new(
-                                                                ComponentId::Qso,
-                                                                ComponentId::Autonomous,
-                                                                MessageType::QsoMessage(
-                                                                    crate::message_bus::QsoMessage::AutonomousCqOpened {
-                                                                        qso_id: qso_id.to_string(),
-                                                                        attempt_id,
-                                                                    },
-                                                                ),
-                                                                Instant::now(),
-                                                            );
-                                                            if let Err(e) = message_bus
-                                                                .send_message(opened_msg)
-                                                                .await
-                                                            {
-                                                                warn!(
-                                                                    "Failed to send AutonomousCqOpened: {}",
-                                                                    e
-                                                                );
-                                                            }
-                                                        }
                                                     }
                                                 },
                                                 Err(e) => {
