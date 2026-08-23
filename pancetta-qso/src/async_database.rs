@@ -327,16 +327,6 @@ impl QsoDatabase {
         Self::open(":memory:").await
     }
 
-    /// Gracefully close every connection in the pool and wait for it to
-    /// finish, rather than relying on `Drop` (which does not await the
-    /// underlying workers' shutdown). Needed before deleting an on-disk
-    /// database file out from under it — on Windows, a still-open file
-    /// handle can turn that delete into a sharing-violation error instead
-    /// of the safe no-op it is on Unix.
-    pub async fn close(self) {
-        self.pool.close().await;
-    }
-
     /// Initialize database schema
     async fn initialize_schema(&mut self) -> Result<(), AsyncDatabaseError> {
         // Enable WAL mode and relaxed synchronous for better concurrent performance.
