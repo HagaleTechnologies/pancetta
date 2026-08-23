@@ -222,6 +222,41 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # The npm/pnpm workspace-glob matchers below are themselves a dependency
+      # of this gate's own trust chain, same reasoning as the pnpm bootstrap
+      # above: each installed from a pinned version + byte-verified tarball
+      # digest, into an ISOLATED prefix (never the repo's own node_modules or
+      # lockfile), with --ignore-scripts, so neither becomes the unverified
+      # root of a gate that claims pre-install trust. Delegates real
+      # npm/pnpm workspace-glob resolution to npm's and pnpm's own published
+      # tools instead of a hand-maintained reimplementation, after an
+      # extended chase of hand-rolled-parser edge cases (CAT-314/315/316)
+      # made clear that reproducing minimatch/pnpm's real (sometimes
+      # pathological) semantics by hand doesn't converge. Also closes a real
+      # gap this repo's pnpm-side coverage check had (see below): it trusted
+      # every pnpm-lock.yaml importer as covered with no cross-check against
+      # pnpm-workspace.yaml's globs at all -- cqdx#349 already fixed this
+      # class of issue for cqdx specifically; it never propagated here
+      # (CAT-318).
+      - name: Bootstrap real npm/pnpm workspace resolvers from pinned + verified tarballs
+        run: |
+          set -euo pipefail
+          prefix=$(mktemp -d)
+          bootstrap_pkg() {
+            local spec="$1" want="$2"
+            local work; work=$(mktemp -d)
+            npm pack "$spec" --pack-destination "$work" --ignore-scripts --no-audit --no-fund --loglevel=error >/dev/null 2>&1
+            local tgz; tgz=$(find "$work" -name '*.tgz')
+            local got; got=$(shasum -a 512 "$tgz" | cut -d' ' -f1)
+            if [ "$got" != "$want" ]; then
+              echo "::error::${spec} tarball sha512 ${got:0:16}... does not match the pinned ${want:0:16}... -- refusing to install"; exit 1
+            fi
+            npm install --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$tgz" >/dev/null
+          }
+          bootstrap_pkg "@npmcli/map-workspaces@6.0.0" "0ec7b1ed705e6b40681516df00b31b36e68da9e23791b649c6204c42116f3d4365bafd3211e28c77914b217cb4342b0eb863184242dafa2db5f4269d9e8a8b6e"
+          bootstrap_pkg "@pnpm/find-workspace-packages@6.0.9" "f34b7a9bac3711f3a0e64f3c091f04c9ae9a3898b6b97c981854afd98fb70ea180583db1e8214b337928a76662d672fd4c7318a5817784b9c145ba9c27cae646"
+          echo "WS_RESOLVERS_PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "Bootstrapped @npmcli/map-workspaces and @pnpm/find-workspace-packages from byte-verified tarballs into $prefix"
       # 0. Every manifest must be covered by a lockfile this gate validates
       #    (pnpm importer / sibling package-lock.json / a package of the Cargo
       #    workspace its Cargo.lock actually locks); yarn/bun/shrinkwrap are
@@ -248,6 +283,50 @@ jobs:
           # follow the link, but a change to its differently-named target would not be
           # detected as a dependency change
           SYMLINK_NAMES = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", ".pnpmfile.cjs", "Cargo.toml", "Cargo.lock", "yarn.lock", "bun.lock", "bun.lockb"}
+
+          import json, subprocess
+
+          def _resolve_workspace_dirs(root, raw_patterns, kind):
+              """Delegates workspace-glob resolution to the REAL npm/pnpm tool
+              (bootstrapped from a pinned + byte-verified tarball -- see the
+              'Bootstrap real npm/pnpm workspace resolvers' step) instead of a
+              hand-maintained reimplementation (CAT-318). Returns the set of
+              real, existing directories (relative to root, normalized) the
+              tool actually selects -- extglobs, negation (npm's resurrection
+              model and pnpm's distinct order-independent-absolute model
+              alike), and every other real semantic by construction, since
+              this IS the same code npm/pnpm itself uses."""
+              if not raw_patterns:
+                  return set()
+              prefix = os.environ["WS_RESOLVERS_PREFIX"]
+              abs_root = os.path.abspath(root)
+              if kind == "npm":
+                  script = (
+                      "const path = require('path');"
+                      "const mapWorkspaces = require(process.env.WS_RESOLVERS_PREFIX + '/node_modules/@npmcli/map-workspaces');"
+                      "(async () => {"
+                      "  const cwd = process.argv[1];"
+                      "  const workspaces = JSON.parse(process.argv[2]);"
+                      "  const m = await mapWorkspaces({ cwd, pkg: { workspaces } });"
+                      "  process.stdout.write(JSON.stringify([...m.values()].map(p => path.relative(cwd, p) || '.')));"
+                      "})().catch(e => { console.error(e); process.exit(1); });"
+                  )
+              else:
+                  script = (
+                      "const path = require('path');"
+                      "const { findWorkspacePackagesNoCheck } = require(process.env.WS_RESOLVERS_PREFIX + '/node_modules/@pnpm/find-workspace-packages');"
+                      "(async () => {"
+                      "  const cwd = process.argv[1];"
+                      "  const patterns = JSON.parse(process.argv[2]);"
+                      "  const pkgs = await findWorkspacePackagesNoCheck(cwd, { patterns });"
+                      "  process.stdout.write(JSON.stringify(pkgs.map(p => path.relative(cwd, p.dir) || '.')));"
+                      "})().catch(e => { console.error(e); process.exit(1); });"
+                  )
+              result = subprocess.run(["node", "-e", script, "--", abs_root, json.dumps(raw_patterns)], capture_output=True, text=True, timeout=60)
+              if result.returncode != 0:
+                  raise RuntimeError(f"workspace resolution ({kind}) failed for {root}: {result.stderr}")
+              return {os.path.normpath(p) for p in json.loads(result.stdout)}
+
           for root, dirs, files in os.walk("."):
               dirs[:] = [d for d in dirs if d not in PRUNE]
               for f in files:
@@ -267,273 +346,13 @@ jobs:
                   if "npm" in ACCEPT:
                       covered.add(rel)
                       try:
-                          import json, re as _re
-                          def ws_match(pattern, path):
-                              """npm/minimatch-style: `*`/`?` never cross `/`, `**` does, `{a,b}` alternates
-                              (brace groups are expanded into separate full patterns first -- matching
-                              minimatch/brace-expansion order -- so an alternative that itself begins with
-                              a literal `.` is judged independently). Dotfile rule (npm's workspace mapper
-                              calls glob without dot:true): `*`, `?`, `**`, or an extglob/bracket token that
-                              does not ITSELF spell a literal leading `.` does not match a `.`-prefixed path
-                              SEGMENT (verified against the real `minimatch` 10.2.5 npm ships: `{.internal,x}`,
-                              `@(.internal|x)` and `[.]internal` all match `.internal`; a bare `*`/`?`/`[!.]`
-                              does not -- Codex round, widdershins #219)."""
-                              def _numeric_brace_range(m):
-                                  # npm's bundled brace-expansion supports descending ranges
-                                  # (`{3..1}` -> 3,2,1) and pads every member to the wider
-                                  # operand's width whenever EITHER side has a real leading
-                                  # zero (a bare "0" alone does not count) -- `range(start,
-                                  # end+1)` silently produced nothing for a descending range,
-                                  # and plain str(i) always dropped padding (verified against
-                                  # real npm 11.4.2 brace-expansion; Codex round, pancetta #291,
-                                  # panino #101).
-                                  lo_s, hi_s = m.group(1), m.group(2)
-                                  lo, hi = int(lo_s), int(hi_s)
-                                  width = max(len(lo_s), len(hi_s)) if ((len(lo_s) > 1 and lo_s[0] == "0") or (len(hi_s) > 1 and hi_s[0] == "0")) else 0
-                                  rng = range(lo, hi + 1) if lo <= hi else range(lo, hi - 1, -1)
-                                  return "{" + ",".join(str(i).zfill(width) for i in rng) + "}"
-                              pattern = _re.sub(r"\{(\d+)\.\.(\d+)\}", _numeric_brace_range, pattern)   # {1..3} / {3..1} / {01..03}
-                              def _alpha_brace_range(m):
-                                  lo, hi = ord(m.group(1)), ord(m.group(2))
-                                  rng = range(lo, hi + 1) if lo <= hi else range(lo, hi - 1, -1)
-                                  # a mixed-case range (e.g. `{a..Z}`) walks through the
-                                  # non-letter code points between 'Z' (90) and 'a' (97) --
-                                  # npm's bundled brace-expansion collapses the backslash code
-                                  # point (92) to an empty-string alternative rather than a
-                                  # literal backslash char (verified directly against real npm
-                                  # 11's brace-expansion for {Z..a}/{a..Z}; Codex round,
-                                  # pancetta #291).
-                                  return "{" + ",".join(("" if i == 92 else chr(i)) for i in rng) + "}"
-                              pattern = _re.sub(r"\{([A-Za-z])\.\.([A-Za-z])\}", _alpha_brace_range, pattern)   # {a..c} / {c..a}
-                              def brace_expand(pat):
-                                  m = _re.search(r"\{([^{}]*)\}", pat)
-                                  if not m: return [pat]
-                                  out = []
-                                  for alt in m.group(1).split(","):
-                                      out.extend(brace_expand(pat[:m.start()] + alt + pat[m.end():]))
-                                  return out
-                              def _bracket_end(s, i):
-                                  # s[i] == "[" -- returns the index just past the class's
-                                  # matching "]" (same convention as translate()'s own bracket
-                                  # branch below: the search starts at i+2 so a "]" immediately
-                                  # after "[" is treated as literal class content, not a
-                                  # close), or i+1 if unterminated (treated as a literal "[").
-                                  # Shared by _extglob_close and _split_top_level so a "("/")"/
-                                  # "|" INSIDE a bracket class (`[(]`, `[a|b]`) is class
-                                  # content, not extglob/alternation structure (Codex round,
-                                  # CAT-314 follow-up).
-                                  j = s.find("]", i + 2)
-                                  return (j + 1) if j != -1 else (i + 1)
-                              def _extglob_close(s, open_idx):
-                                  # s[open_idx] == "(" -- balanced-paren search for the matching
-                                  # close, so a NESTED extglob like +(bar|baz) inside an outer
-                                  # @(...) group doesn't truncate the outer group at the first ")"
-                                  # (Codex round, widdershins #219 / CAT-314). A "(" or ")"
-                                  # inside a bracket class (`[(]`) is class content, not
-                                  # nesting -- skip the whole class so it doesn't perturb the
-                                  # depth count (Codex round, CAT-314 follow-up).
-                                  # A "\" escapes the next character (`\(`, `\|`, etc) to a
-                                  # literal -- it doesn't open/close nesting or split an
-                                  # alternative, matching real minimatch (Codex round, CAT-314
-                                  # follow-up 2). Skip both characters as one atomic unit, same
-                                  # treatment as a bracket class.
-                                  depth = 0
-                                  idx = open_idx
-                                  n = len(s)
-                                  while idx < n:
-                                      ch = s[idx]
-                                      if ch == "\\":
-                                          idx += 2 if idx + 1 < n else 1; continue
-                                      if ch == "[":
-                                          idx = _bracket_end(s, idx); continue
-                                      if ch == "(": depth += 1
-                                      elif ch == ")":
-                                          depth -= 1
-                                          if depth == 0: return idx
-                                      idx += 1
-                                  return -1
-                              def _split_top_level(s):
-                                  # split on "|" at paren-depth 0 only, so a nested extglob's OWN
-                                  # "|" alternatives aren't torn apart by the outer split. A "|"
-                                  # (or "("/")") inside a bracket class (`[a|b]`) is class
-                                  # content, not a split point or nesting -- skip the whole
-                                  # class (Codex round, CAT-314 follow-up). Same for an escaped
-                                  # character (`\|`, `\(`) -- literal, not a split/nesting point
-                                  # (Codex round, CAT-314 follow-up 2).
-                                  parts, depth, cur, i = [], 0, [], 0
-                                  n = len(s)
-                                  while i < n:
-                                      ch = s[i]
-                                      if ch == "\\":
-                                          j = i + 2 if i + 1 < n else i + 1
-                                          cur.append(s[i:j]); i = j; continue
-                                      if ch == "[":
-                                          j = _bracket_end(s, i)
-                                          cur.append(s[i:j]); i = j; continue
-                                      if ch == "(": depth += 1; cur.append(ch)
-                                      elif ch == ")": depth -= 1; cur.append(ch)
-                                      elif ch == "|" and depth == 0: parts.append("".join(cur)); cur = []
-                                      else: cur.append(ch)
-                                      i += 1
-                                  parts.append("".join(cur))
-                                  return parts
-                              def translate(pattern, start_seg=True, in_extglob=False):
-                                  # an extglob ALTERNATIVE's own leading character is not a new
-                                  # segment start -- the dot-exclusion decision for that position
-                                  # was already made one level up (by the dotalts/rest split and
-                                  # the guard() wrapper there, using the OUTER seg_start); every
-                                  # recursive translate(a, ...) call for an alt therefore passes
-                                  # start_seg=False so it never re-applies its own internal
-                                  # (?!\.) to a wildcard that happens to be the alt's first
-                                  # character (`x@(*|y)` matching `x.foo` -- Codex local round,
-                                  # panino #101).
-                                  out, i, seg_start = "", 0, start_seg
-                                  guard = lambda tok: ("(?!\\.)" + tok) if seg_start else tok
-                                  while i < len(pattern):
-                                      c = pattern[i]
-                                      # a "\" escapes the next character to a literal (glob escape
-                                      # semantics, not regex) -- `\(` matches a literal "(", not a
-                                      # 2-char "\(" sequence, and doesn't trigger extglob/wildcard
-                                      # handling. A trailing lone "\" with nothing to escape is
-                                      # itself literal (matches real minimatch; Codex round,
-                                      # CAT-314 follow-up 2).
-                                      if c == "\\":
-                                          if i + 1 < len(pattern):
-                                              out += _re.escape(pattern[i + 1]); i += 2
-                                          else:
-                                              out += _re.escape(c); i += 1
-                                          seg_start = False; continue
-                                      # extglobs @(a|b) +(x) *(x) ?(x) !(x) -- balanced-paren close
-                                      # search (not a non-greedy regex) so a NESTED extglob like
-                                      # `@(foo|+(bar|baz))` doesn't get truncated at the first ")"
-                                      # (Codex round, widdershins #219 / CAT-314).
-                                      eg_close = _extglob_close(pattern, i + 1) if c in "@+*?!" and i + 1 < len(pattern) and pattern[i + 1] == "(" else -1
-                                      if eg_close != -1:
-                                          alts = _split_top_level(pattern[i + 2:eg_close])
-                                          # each alternative is itself a glob (`@(a*|b*)` -- `*`/`?`/`[...]`/
-                                          # nested extglobs inside an alternative are NOT literal text; only
-                                          # `_re.escape`-ing them broke every wildcarded alternative (Codex
-                                          # round 9, panino #101). Recurse through the same translate() used
-                                          # for the rest of the pattern.
-                                          if c == "!":
-                                              inner = "|".join(translate(a, False, True) for a in alts)
-                                              # what immediately follows this !(...) close in
-                                              # THIS alt/pattern is the real "not this" boundary
-                                              # -- nesting lets more than "/ or end of path"
-                                              # follow a !(...) close (e.g. `!(private|secret)-*`
-                                              # inside `@(!(private|secret)-*|public)`), so
-                                              # translate the actual suffix instead of hardcoding
-                                              # it (Codex round, CAT-314 follow-up). Nothing left
-                                              # in this alt still means end-of-segment.
-                                              suffix_pattern = pattern[eg_close + 1:]
-                                              suffix = ("(?:" + translate(suffix_pattern, False, True) + ")") if suffix_pattern else "(?:/|$)"
-                                              out += guard("(?:(?!(?:" + inner + ")" + suffix + ")[^/]+)")   # one segment that is not any alternative
-                                          else:
-                                              def is_dot_explicit(a):
-                                                  # a literal leading '.', the exact singleton bracket class
-                                                  # `[.]` (matching minimatch's own narrow rule -- `[.a]`/`[a.]`
-                                                  # still get the dot guard; Codex round, cqdx #349), OR a nested
-                                                  # `@(...)` extglob spanning the WHOLE alternative -- kind '@'
-                                                  # consumes exactly one alternative, so its leading character is
-                                                  # structurally determined by ITS OWN alternatives, recursively.
-                                                  # Checking only the alt's first textual character wrongly
-                                                  # guards `@(.hidden)` nested inside a larger group, e.g.
-                                                  # `@(@(.hidden)|public)` (Codex round, CAT-314 follow-up /
-                                                  # panino #107).
-                                                  if a.startswith(".") or bool(_re.match(r"^\[\.\]", a)): return True
-                                                  if a.startswith("@(") and a.endswith(")") and _extglob_close(a, 1) == len(a) - 1:
-                                                      return any(is_dot_explicit(ia) for ia in _split_top_level(a[2:-1]))
-                                                  return False
-                                              dotalts = [a for a in alts if is_dot_explicit(a)]         # explicit -- not guarded
-                                              rest = [a for a in alts if not is_dot_explicit(a)]
-                                              mixed = "(?:" + "|".join(translate(a, False, True) for a in alts) + ")"   # ANY alt, unguarded -- used
-                                              # once we are past the first character of the segment, so later
-                                              # repetitions of +()/*() may freely mix dotted and undotted
-                                              # alternatives (`+(.internal|x)` matches `.internalx` too --
-                                              # splitting into separately-repeated per-class groups broke this;
-                                              # Codex round, vanity #153).
-                                              def first_choice():
-                                                  parts = []
-                                                  if dotalts: parts.append("(?:" + "|".join(translate(a, False, True) for a in dotalts) + ")")
-                                                  if rest: parts.append(guard("(?:" + "|".join(translate(a, False, True) for a in rest) + ")"))
-                                                  return "(?:" + "|".join(parts) + ")" if len(parts) > 1 else (parts[0] if parts else "(?!x)x")
-                                              kind = c
-                                              if kind in ("@", "?"):
-                                                  out += first_choice() + ({"@": "", "?": "?"}[kind])
-                                              elif kind == "+":
-                                                  out += first_choice() + mixed + "*"
-                                              else:  # "*" -- zero or more, mixed freely once started
-                                                  out += "(?:" + first_choice() + mixed + "*)?"
-                                          i = eg_close + 1; seg_start = False; continue
-                                      if not in_extglob and pattern.startswith("**/", i): out += "(?:(?!\\.)[^/]+/)*"; i += 3; seg_start = True; continue      # zero or more non-dot directories
-                                      elif not in_extglob and pattern.startswith("**", i): out += guard("(?:[^/]+(?:/(?!\\.)[^/]+)*)?"); i += 2; seg_start = False; continue
-                                      # `**` inside an extglob alternative is NOT a globstar to minimatch/pnpm --
-                                      # it's just two ordinary stars and stays segment-local (falls through to
-                                      # the plain "*" handling below, one star at a time) (Codex round, CAT-314
-                                      # follow-up / panino #107).
-                                      elif c == "*": out += guard("[^/]*"); i += 1; seg_start = False; continue
-                                      elif c == "?": out += guard("[^/]"); i += 1; seg_start = False; continue
-                                      elif c == "[":
-                                          j = pattern.find("]", i + 2)
-                                          if j == -1: out += _re.escape(c); i += 1; seg_start = False
-                                          else:
-                                              cls = pattern[i + 1:j]
-                                              negated = cls.startswith("!")
-                                              core = cls[1:] if negated else cls
-                                              # minimatch's dot-exclusion bypass is narrower than "contains a
-                                              # dot": ONLY the exact singleton class `[.]` counts as explicit --
-                                              # `[.a]`/`[a.]` (a dot among OTHER options) still gets the (?!\.)
-                                              # guard, verified against the real library (Codex round, cqdx #349).
-                                              allows_dot = (core == ".") and not negated
-                                              cls = ("^" + core) if negated else cls
-                                              tok = "[" + cls.replace("\\", "\\\\") + "]"
-                                              out += tok if allows_dot else guard(tok); i = j + 1; seg_start = False
-                                          continue
-                                      elif c == "/": out += "/"; i += 1; seg_start = True; continue
-                                      else: out += _re.escape(c); i += 1; seg_start = False; continue
-                                  return out
-                              return any(_re.fullmatch(translate(p), path) for p in brace_expand(pattern))
+                          import json
                           lock = json.load(open(os.path.join(root, "package-lock.json")))
                           pkgs = lock.get("packages") or {}
                           ws = (json.load(open(os.path.join(root, "package.json"))) if os.path.exists(os.path.join(root, "package.json")) else {}).get("workspaces") or []
                           if isinstance(ws, dict): ws = ws.get("packages") or []
-                          ws = [os.path.normpath(g) for g in ws if isinstance(g, str)]
-                          def _ws_prepare(raw_patterns):
-                              """Faithfully mirrors @npmcli/map-workspaces's appendNegatedPatterns:
-                              negation is NOT a simple per-path last-match-wins toggle. A later
-                              POSITIVE pattern cancels an earlier negation only when the positive
-                              pattern's own literal text would itself be matched AS A PATH by that
-                              negated glob (e.g. an exact re-list, or a negation of `pkg/b/**`
-                              cancelled by the specific `pkg/b/a`) -- a broader wildcard like
-                              `packages/*` following `!packages/private` does NOT resurrect it
-                              (verified against the real @npmcli/map-workspaces 5.0.3; Codev round,
-                              widdershins #219)."""
-                              positive, negated = [], []
-                              for raw in raw_patterns:
-                                  if not isinstance(raw, str): continue
-                                  m = _re.match(r"^(!+)", raw)
-                                  excl = m.group(1) if m else ""
-                                  pat = _re.sub(r"^\.?/+", "", raw[len(excl):])   # strip a leading ./ or /
-                                  if len(excl) % 2 == 1:
-                                      negated.append(pat)
-                                  else:
-                                      # mirror npm's own for-loop-with-splice EXACTLY, including its
-                                      # off-by-one: the loop index always advances even after a
-                                      # deletion shifts the list, so an element that shifts into the
-                                      # just-vacated slot is never re-checked -- an adjacent DUPLICATE
-                                      # negation only ever cancels once, leaving one copy to still
-                                      # exclude the path (Codex local round, widdershins #219).
-                                      i = 0
-                                      while i < len(negated):
-                                          if ws_match(negated[i], pat): del negated[i]
-                                          i += 1
-                                      positive.append(pat)
-                              positive = [p for p in positive if not any(ws_match(np, p) for np in negated)]
-                              return positive, negated
-                          _ws_positive, _ws_negated = _ws_prepare(ws)
-                          def ws_selected(path):
-                              if any(ws_match(np, path) for np in _ws_negated): return False
-                              return any(ws_match(p, path) for p in _ws_positive)
+                          ws = [g for g in ws if isinstance(g, str)]
+                          real_dirs = _resolve_workspace_dirs(root, ws, "npm")
                           link_targets = {os.path.normpath(m["resolved"]) for m in pkgs.values() if isinstance(m, dict) and m.get("link") and isinstance(m.get("resolved"), str)}
                           for key in pkgs:
                               # an npm workspace member is covered only when the ROOT manifest
@@ -541,7 +360,7 @@ jobs:
                               # handcrafted lock key alone grants nothing
                               nk = os.path.normpath(key)
                               if key and "node_modules/" not in key and not nk.startswith("..") and nk in link_targets \
-                                      and ws_selected(nk):
+                                      and nk in real_dirs:
                                   covered.add(os.path.normpath(os.path.join(rel, nk)))
                       except (ValueError, OSError):
                           pass                                                 # the verifier step rejects an unparseable lock
@@ -551,8 +370,22 @@ jobs:
                   if "pnpm" in ACCEPT:
                       covered.add(rel)
                       lock = yaml.safe_load(open(os.path.join(root, "pnpm-lock.yaml"))) or {}
+                      # an importer other than the root (".") is covered only when
+                      # pnpm-workspace.yaml's `packages` globs actually select it -- a
+                      # hand-added lock-only importer key with no matching workspace
+                      # declaration is ignored by `pnpm install --frozen-lockfile` (it
+                      # only installs importers pnpm itself resolves from the workspace
+                      # globs), so trusting the raw importers map alone previously granted
+                      # coverage to a manifest pnpm never actually installs or verifies
+                      # (cqdx#349's class of finding, closed here too via CAT-318).
+                      pwy_path = os.path.join(root, "pnpm-workspace.yaml")
+                      pwy = (yaml.safe_load(open(pwy_path)) or {}) if os.path.exists(pwy_path) else {}
+                      pnpm_ws = [g for g in (pwy.get("packages") or []) if isinstance(g, str)]
+                      real_dirs = _resolve_workspace_dirs(root, pnpm_ws, "pnpm")
                       for imp in (lock.get("importers") or {}):
-                          covered.add(os.path.normpath(os.path.join(rel, imp)))
+                          nimp = os.path.normpath(imp)
+                          if nimp == "." or nimp in real_dirs:
+                              covered.add(os.path.normpath(os.path.join(rel, imp)))
                   else:
                       refused.append(os.path.join(rel, "pnpm-lock.yaml"))
               for f in ("yarn.lock", "bun.lock", "bun.lockb"):
