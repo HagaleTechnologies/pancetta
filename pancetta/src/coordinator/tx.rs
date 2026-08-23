@@ -11,6 +11,7 @@
 
 use anyhow::Result;
 use pancetta_ft8::{Ft8Encoder, Ft8Modulator};
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
@@ -1090,7 +1091,9 @@ pub(crate) fn tx_hard_mute_reason(
     tx_policy: &std::sync::Arc<std::sync::atomic::AtomicU8>,
     restart_inhibit: &std::sync::Arc<std::sync::atomic::AtomicU32>,
     hamlib_loop_ready: &std::sync::Arc<std::sync::atomic::AtomicBool>,
-    hamlib_pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    hamlib_pending_frequency: &std::sync::Arc<
+        std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>,
+    >,
     hamlib_pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicU32>,
 ) -> Option<&'static str> {
@@ -1118,12 +1121,16 @@ pub(crate) fn tx_hard_mute_reason(
 /// transmission), so an unknown state must never be treated as "safe to
 /// key".
 fn has_undelivered_pending_hamlib_state(
-    pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    pending_frequency: &std::sync::Arc<
+        std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>,
+    >,
     pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
 ) -> bool {
+    // PAN-35: any VFO with an undelivered pending command must still mute
+    // TX -- not just "the shared slot happens to be occupied".
     pending_frequency
         .lock()
-        .map(|slot| slot.is_some())
+        .map(|slots| !slots.is_empty())
         .unwrap_or(true)
         || pending_split
             .lock()
@@ -1145,6 +1152,13 @@ mod tx_hard_mute_reason_tests {
     /// a prior failed teardown replay).
     fn no_pending() -> Arc<Mutex<Option<ComponentMessage>>> {
         Arc::new(Mutex::new(None))
+    }
+
+    /// The frequency sibling of `no_pending()` -- PAN-35 keyed the
+    /// frequency pending slot by VFO, so its empty state is an empty map
+    /// rather than `None`.
+    fn no_pending_frequency() -> Arc<Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>> {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 
     fn pending_split_msg() -> ComponentMessage {
@@ -1174,7 +1188,7 @@ mod tx_hard_mute_reason_tests {
                 &policy,
                 &restart_inhibit,
                 &hamlib_loop_ready,
-                &no_pending(),
+                &no_pending_frequency(),
                 &no_pending(),
                 &not_in_flight(),
             ),
@@ -1191,7 +1205,7 @@ mod tx_hard_mute_reason_tests {
             &policy,
             &restart_inhibit,
             &hamlib_loop_ready,
-            &no_pending(),
+            &no_pending_frequency(),
             &no_pending(),
             &not_in_flight(),
         )
@@ -1222,7 +1236,7 @@ mod tx_hard_mute_reason_tests {
             &policy,
             &restart_inhibit,
             &hamlib_loop_ready,
-            &no_pending(),
+            &no_pending_frequency(),
             &no_pending(),
             &not_in_flight(),
         );
@@ -1254,7 +1268,7 @@ mod tx_hard_mute_reason_tests {
             &policy,
             &restart_inhibit,
             &hamlib_loop_ready,
-            &no_pending(),
+            &no_pending_frequency(),
             &pending_split,
             &not_in_flight(),
         );
@@ -1273,7 +1287,7 @@ mod tx_hard_mute_reason_tests {
                 &policy,
                 &restart_inhibit,
                 &hamlib_loop_ready,
-                &no_pending(),
+                &no_pending_frequency(),
                 &pending_split,
                 &not_in_flight(),
             ),
@@ -1289,15 +1303,20 @@ mod tx_hard_mute_reason_tests {
         let policy = policy(pancetta_core::TxPolicy::Full);
         let restart_inhibit = Arc::new(AtomicU32::new(0));
         let hamlib_loop_ready = Arc::new(AtomicBool::new(true));
-        let pending_frequency = Arc::new(Mutex::new(Some(ComponentMessage::new(
-            ComponentId::Hamlib,
-            ComponentId::Hamlib,
-            MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
-                vfo: 0,
-                frequency: 14_074_000,
-            }),
-            std::time::Instant::now(),
-        ))));
+        let mut pending_frequency_map = HashMap::new();
+        pending_frequency_map.insert(
+            pancetta_hamlib::Vfo::A,
+            ComponentMessage::new(
+                ComponentId::Hamlib,
+                ComponentId::Hamlib,
+                MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                    vfo: 0,
+                    frequency: 14_074_000,
+                }),
+                std::time::Instant::now(),
+            ),
+        );
+        let pending_frequency = Arc::new(Mutex::new(pending_frequency_map));
 
         assert!(tx_hard_mute_reason(
             &policy,
@@ -1310,6 +1329,49 @@ mod tx_hard_mute_reason_tests {
         .is_some());
     }
 
+    /// PAN-35 regression guard: a pending command for ONE VFO must still
+    /// mute TX even though the OTHER VFO's slot is empty -- before this
+    /// fix, both VFOs shared a single slot, so this distinction didn't
+    /// exist; now that the slot is keyed by VFO, `has_undelivered_pending_
+    /// hamlib_state` must check the map as a whole (any entry), not
+    /// assume a specific VFO's entry.
+    #[test]
+    fn undelivered_pending_frequency_on_either_vfo_alone_still_mutes_tx() {
+        let policy = policy(pancetta_core::TxPolicy::Full);
+        let restart_inhibit = Arc::new(AtomicU32::new(0));
+        let hamlib_loop_ready = Arc::new(AtomicBool::new(true));
+
+        for vfo in [pancetta_hamlib::Vfo::A, pancetta_hamlib::Vfo::B] {
+            let mut pending_frequency_map = HashMap::new();
+            pending_frequency_map.insert(
+                vfo,
+                ComponentMessage::new(
+                    ComponentId::Hamlib,
+                    ComponentId::Hamlib,
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                        vfo: if vfo == pancetta_hamlib::Vfo::A { 0 } else { 1 },
+                        frequency: 14_074_000,
+                    }),
+                    std::time::Instant::now(),
+                ),
+            );
+            let pending_frequency = Arc::new(Mutex::new(pending_frequency_map));
+
+            assert!(
+                tx_hard_mute_reason(
+                    &policy,
+                    &restart_inhibit,
+                    &hamlib_loop_ready,
+                    &pending_frequency,
+                    &no_pending(),
+                    &not_in_flight(),
+                )
+                .is_some(),
+                "a pending command for {vfo:?} alone must still mute TX"
+            );
+        }
+    }
+
     #[test]
     fn tx_policy_disabled_still_mutes_when_everything_else_is_ready() {
         let policy = policy(pancetta_core::TxPolicy::Disabled);
@@ -1320,7 +1382,7 @@ mod tx_hard_mute_reason_tests {
                 &policy,
                 &restart_inhibit,
                 &hamlib_loop_ready,
-                &no_pending(),
+                &no_pending_frequency(),
                 &no_pending(),
                 &not_in_flight(),
             ),
@@ -1349,7 +1411,7 @@ mod tx_hard_mute_reason_tests {
                 &policy,
                 &restart_inhibit,
                 &hamlib_loop_ready,
-                &no_pending(),
+                &no_pending_frequency(),
                 &pending_split,
                 &not_in_flight(),
             )
@@ -1379,7 +1441,7 @@ mod tx_hard_mute_reason_tests {
             &policy,
             &restart_inhibit,
             &hamlib_loop_ready,
-            &no_pending(),
+            &no_pending_frequency(),
             &no_pending(),
             &in_flight,
         );
@@ -1398,7 +1460,7 @@ mod tx_hard_mute_reason_tests {
                 &policy,
                 &restart_inhibit,
                 &hamlib_loop_ready,
-                &no_pending(),
+                &no_pending_frequency(),
                 &no_pending(),
                 &in_flight,
             ),

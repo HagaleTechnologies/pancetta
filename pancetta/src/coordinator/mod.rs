@@ -639,8 +639,17 @@ pub struct ApplicationCoordinator {
     /// thread-safely-mutable state both that task and
     /// `start_hamlib_component`/`replay_or_fallback` can reach without
     /// `&mut self` -- same shape as `last_freq_command` below.
+    ///
+    /// PAN-35 (round-16 review, Codex P2): keyed by `pancetta_hamlib::Vfo`
+    /// (A vs B), not a single shared slot. The remote QSY path
+    /// (`station_agent`) can send `SetFrequency` for either VFO; a single
+    /// shared slot/supersession domain let a newer VFO-A command wrongly
+    /// discard (as "superseded") an older still-pending VFO-B command, or
+    /// let one VFO's retry silently overwrite the other's tracking --
+    /// changing A must never affect B's pending state or vice versa.
     #[cfg(feature = "pancetta-hamlib")]
-    pub(crate) hamlib_pending_frequency: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    pub(crate) hamlib_pending_frequency:
+        Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>>,
     #[cfg(feature = "pancetta-hamlib")]
     pub(crate) hamlib_pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     /// Authorization refresh child owned by the current StationAgent generation.
@@ -1718,7 +1727,7 @@ impl ApplicationCoordinator {
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_orphans: Vec::new(),
             #[cfg(feature = "pancetta-hamlib")]
-            hamlib_pending_frequency: Arc::new(std::sync::Mutex::new(None)),
+            hamlib_pending_frequency: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_pending_split: Arc::new(std::sync::Mutex::new(None)),
             station_agent_poll: None,
