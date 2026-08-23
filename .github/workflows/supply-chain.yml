@@ -206,12 +206,18 @@ jobs:
     # osv-merge-group is ALWAYS 'skipped' by design, that implicit check would
     # fail on every run and this job would never execute at all (Codex round 8,
     # cqdx #349) -- ci.yml's analogous gate already uses always() for the same
-    # reason.
+    # reason. Event-specific success, not "either succeeded or skipped": the
+    # earlier form tolerated BOTH osv-pr and osv-merge-group being 'skipped'
+    # simultaneously, so an unexpected event where neither OSV job actually ran
+    # still let this job proceed. Require the ACTIVE event's own OSV job to
+    # have succeeded; the inactive counterpart's result is never even checked,
+    # since it's expected to be 'skipped' by its own if: gate (Codex round,
+    # vanity #153 / CAT-315).
     if: |
       always() &&
       needs.changes.outputs.deps == 'true' &&
-      (needs.osv-pr.result == 'success' || needs.osv-pr.result == 'skipped') &&
-      (needs.osv-merge-group.result == 'success' || needs.osv-merge-group.result == 'skipped')
+      ((github.event_name == 'pull_request' && needs.osv-pr.result == 'success') ||
+       (github.event_name == 'merge_group' && needs.osv-merge-group.result == 'success'))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -306,6 +312,29 @@ jobs:
                                   for alt in m.group(1).split(","):
                                       out.extend(brace_expand(pat[:m.start()] + alt + pat[m.end():]))
                                   return out
+                              def _extglob_close(s, open_idx):
+                                  # s[open_idx] == "(" -- balanced-paren search for the matching
+                                  # close, so a NESTED extglob like +(bar|baz) inside an outer
+                                  # @(...) group doesn't truncate the outer group at the first ")"
+                                  # (Codex round, widdershins #219 / CAT-314).
+                                  depth = 0
+                                  for idx in range(open_idx, len(s)):
+                                      if s[idx] == "(": depth += 1
+                                      elif s[idx] == ")":
+                                          depth -= 1
+                                          if depth == 0: return idx
+                                  return -1
+                              def _split_top_level(s):
+                                  # split on "|" at paren-depth 0 only, so a nested extglob's OWN
+                                  # "|" alternatives aren't torn apart by the outer split.
+                                  parts, depth, cur = [], 0, []
+                                  for ch in s:
+                                      if ch == "(": depth += 1; cur.append(ch)
+                                      elif ch == ")": depth -= 1; cur.append(ch)
+                                      elif ch == "|" and depth == 0: parts.append("".join(cur)); cur = []
+                                      else: cur.append(ch)
+                                  parts.append("".join(cur))
+                                  return parts
                               def translate(pattern, start_seg=True):
                                   # an extglob ALTERNATIVE's own leading character is not a new
                                   # segment start -- the dot-exclusion decision for that position
@@ -320,15 +349,19 @@ jobs:
                                   guard = lambda tok: ("(?!\\.)" + tok) if seg_start else tok
                                   while i < len(pattern):
                                       c = pattern[i]
-                                      eg = _re.match(r"([@+*?!])\((.*?)\)", pattern[i:])     # extglobs @(a|b) +(x) *(x) ?(x) !(x)
-                                      if eg:
-                                          alts = eg.group(2).split("|")
+                                      # extglobs @(a|b) +(x) *(x) ?(x) !(x) -- balanced-paren close
+                                      # search (not a non-greedy regex) so a NESTED extglob like
+                                      # `@(foo|+(bar|baz))` doesn't get truncated at the first ")"
+                                      # (Codex round, widdershins #219 / CAT-314).
+                                      eg_close = _extglob_close(pattern, i + 1) if c in "@+*?!" and i + 1 < len(pattern) and pattern[i + 1] == "(" else -1
+                                      if eg_close != -1:
+                                          alts = _split_top_level(pattern[i + 2:eg_close])
                                           # each alternative is itself a glob (`@(a*|b*)` -- `*`/`?`/`[...]`/
                                           # nested extglobs inside an alternative are NOT literal text; only
                                           # `_re.escape`-ing them broke every wildcarded alternative (Codex
                                           # round 9, panino #101). Recurse through the same translate() used
                                           # for the rest of the pattern.
-                                          if eg.group(1) == "!":
+                                          if c == "!":
                                               inner = "|".join(translate(a, False) for a in alts)
                                               out += guard("(?:(?!(?:" + inner + ")(?:/|$))[^/]+)")   # one segment that is not any alternative
                                           else:
@@ -350,14 +383,14 @@ jobs:
                                                   if dotalts: parts.append("(?:" + "|".join(translate(a, False) for a in dotalts) + ")")
                                                   if rest: parts.append(guard("(?:" + "|".join(translate(a, False) for a in rest) + ")"))
                                                   return "(?:" + "|".join(parts) + ")" if len(parts) > 1 else (parts[0] if parts else "(?!x)x")
-                                              kind = eg.group(1)
+                                              kind = c
                                               if kind in ("@", "?"):
                                                   out += first_choice() + ({"@": "", "?": "?"}[kind])
                                               elif kind == "+":
                                                   out += first_choice() + mixed + "*"
                                               else:  # "*" -- zero or more, mixed freely once started
                                                   out += "(?:" + first_choice() + mixed + "*)?"
-                                          i += eg.end(); seg_start = False; continue
+                                          i = eg_close + 1; seg_start = False; continue
                                       if pattern.startswith("**/", i): out += "(?:(?!\\.)[^/]+/)*"; i += 3; seg_start = True; continue      # zero or more non-dot directories
                                       elif pattern.startswith("**", i): out += guard("(?:[^/]+(?:/(?!\\.)[^/]+)*)?"); i += 2; seg_start = False; continue
                                       elif c == "*": out += guard("[^/]*"); i += 1; seg_start = False; continue
