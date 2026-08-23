@@ -306,6 +306,20 @@ fn now_ms() -> i64 {
 /// the crash as `OperatorDisarm`. `normal_exit` is owned exclusively by this
 /// task and flipped only on its own verified clean-return path, so it can't
 /// be raced by anything outside this task.
+///
+/// PAN-36 round 2: `normal_exit` alone under-covers a second ordinary exit
+/// path -- `run_one_session` never checks `cfg.shutdown` itself, so a
+/// session with an established peer can still be mid-flight when shutdown is
+/// requested. `shutdown.rs` gives every named task a 1s grace period, then
+/// force-`abort()`s it (the only abort site for this task in the whole
+/// coordinator). That abort drops this guard immediately, well before
+/// `mark_normal_exit` -- with `normal_exit` as the sole signal, EVERY such
+/// shutdown misattributes as `ComponentCrash`, not just the rare unrelated-
+/// task race the flag was originally introduced to fix. `Drop::drop` now
+/// also treats `!std::thread::panicking()` as normal: a task abort drops its
+/// locals via ordinary (non-unwinding) `Drop`, so this thread is never
+/// "panicking" during that drop, while a genuine panic always is -- this
+/// distinguishes the two without reading any flag shared across tasks.
 struct RemoteTxDisarmGuard {
     arm: Arc<Mutex<ArmState>>,
     audit: AuditLog,
@@ -323,7 +337,7 @@ impl RemoteTxDisarmGuard {
 
 impl Drop for RemoteTxDisarmGuard {
     fn drop(&mut self) {
-        let reason = if self.normal_exit {
+        let reason = if self.normal_exit || !std::thread::panicking() {
             DisarmReason::OperatorDisarm
         } else {
             DisarmReason::ComponentCrash
@@ -2129,12 +2143,15 @@ mod tests {
         );
     }
 
-    /// The flip side of the test above: outside of a verified clean return
-    /// (a real panic/unwind), the guard must still correctly attribute the
-    /// disarm to `ComponentCrash` -- this is the scenario
-    /// `RemoteTxDisarmGuard` exists for in the first place.
+    /// The flip side of the test above, updated for PAN-36 round 2: a drop
+    /// with `normal_exit` unset is not on its own proof of a crash --
+    /// `shutdown.rs` force-`abort()`s a task that overran its 1s grace
+    /// period, which drops this guard via ordinary (non-unwinding) cleanup,
+    /// same as a ordinary drop. That must still audit as `OperatorDisarm`,
+    /// not `ComponentCrash` -- a genuine panic is covered separately below
+    /// (`drop_during_genuine_panic_...`), which actually unwinds.
     #[test]
-    fn drop_outside_shutdown_still_audits_a_component_crash() {
+    fn drop_without_normal_exit_but_not_panicking_still_audits_operator_disarm() {
         let arm = Arc::new(Mutex::new(armed_state()));
         let audit = AuditLog::new(audit_tmp());
 
@@ -2144,13 +2161,50 @@ mod tests {
                 audit: audit.clone(),
                 normal_exit: false,
             };
+            // Guard drops here via ordinary scope exit -- simulating a
+            // shutdown.rs `abort()`-triggered cancellation, not a panic.
         }
 
         let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
         assert!(
+            !log.contains("component-crash"),
+            "a non-panicking drop (e.g. shutdown.rs's abort-on-timeout) must never be \
+             misattributed as a component crash: {log:?}"
+        );
+        assert!(
+            log.contains("operator-disarm"),
+            "expected a non-panicking, non-normal-exit drop to still audit as operator-disarm: \
+             {log:?}"
+        );
+    }
+
+    /// The scenario `RemoteTxDisarmGuard` exists for in the first place: a
+    /// real panic/unwind, with `normal_exit` never reached. Drives an actual
+    /// panic through `catch_unwind` so `std::thread::panicking()` is
+    /// genuinely true while the guard drops, unlike the ordinary-drop test
+    /// above.
+    #[test]
+    fn drop_during_genuine_panic_audits_a_component_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+        let arm_for_panic = arm.clone();
+        let audit_for_panic = audit.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm_for_panic,
+                audit: audit_for_panic,
+                normal_exit: false,
+            };
+            panic!("simulated genuine task panic");
+        }));
+        assert!(result.is_err(), "the closure must have actually panicked");
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
             log.contains("component-crash"),
-            "a disarm outside of shutdown (panic/unwind) must still be attributed to a \
-             component crash: {log:?}"
+            "a disarm during a genuine panic/unwind must still be attributed to a component \
+             crash: {log:?}"
         );
     }
 
@@ -2173,16 +2227,22 @@ mod tests {
         // must have no bearing on this guard's disposition since the guard
         // no longer reads any shared shutdown flag at all.
         let unrelated_task_shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let arm_for_panic = arm.clone();
+        let audit_for_panic = audit.clone();
+        let flag_for_panic = unrelated_task_shutdown_flag.clone();
 
-        {
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let _guard = RemoteTxDisarmGuard {
-                arm: arm.clone(),
-                audit: audit.clone(),
+                arm: arm_for_panic,
+                audit: audit_for_panic,
                 normal_exit: false,
             };
-            // Guard drops here as if unwinding from a panic.
-            let _ = &unrelated_task_shutdown_flag;
-        }
+            // A real panic, so the guard drops while genuinely unwinding --
+            // `unrelated_task_shutdown_flag` being true must have no bearing.
+            let _ = &flag_for_panic;
+            panic!("simulated genuine task panic racing an unrelated shutdown flag");
+        }));
+        assert!(result.is_err(), "the closure must have actually panicked");
 
         let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
         assert!(
@@ -2194,6 +2254,50 @@ mod tests {
             !log.contains("operator-disarm"),
             "a genuine panic must never be misattributed to operator-disarm just because a \
              concurrent, unrelated shutdown flag happens to be true: {log:?}"
+        );
+    }
+
+    /// PAN-36 round 2 (Codex finding on this PR): reproduces the actual
+    /// shutdown.rs mechanism end-to-end rather than just the `Drop` logic in
+    /// isolation. `run_one_session` never checks `cfg.shutdown` itself, so a
+    /// session with an established peer can still be mid-flight when
+    /// shutdown is requested; `shutdown.rs` gives the task a 1s grace
+    /// period, then force-`abort()`s it -- dropping this guard before
+    /// `mark_normal_exit` is ever reached. That must audit as
+    /// `OperatorDisarm`, not `ComponentCrash`.
+    #[tokio::test]
+    async fn task_abort_mid_session_drops_the_guard_as_operator_disarm_not_a_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+        let arm_for_task = arm.clone();
+        let audit_for_task = audit.clone();
+
+        let handle = tokio::spawn(async move {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm_for_task,
+                audit: audit_for_task,
+                normal_exit: false,
+            };
+            // Stand-in for `run_one_session` still mid-flight (e.g. awaiting
+            // a peer message) when shutdown.rs's grace period elapses.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+
+        // Let the task actually start and construct the guard before
+        // aborting it, mirroring shutdown.rs's abort-after-timeout shape.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            !log.contains("component-crash"),
+            "a shutdown.rs-style task abort must never be misattributed as a component crash: \
+             {log:?}"
+        );
+        assert!(
+            log.contains("operator-disarm"),
+            "expected the abort-triggered drop to audit as operator-disarm: {log:?}"
         );
     }
 
