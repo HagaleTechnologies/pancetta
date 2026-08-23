@@ -170,35 +170,66 @@ jobs:
                       try:
                           import json, re as _re
                           def ws_match(pattern, path):
-                              """npm/minimatch-style: `*`/`?` never cross `/`, `**` does, `{a,b}` alternates."""
-                              out, i = "", 0
+                              """npm/minimatch-style: `*`/`?` never cross `/`, `**` does, `{a,b}` alternates
+                              (brace groups are expanded into separate full patterns first -- matching
+                              minimatch/brace-expansion order -- so an alternative that itself begins with
+                              a literal `.` is judged independently). Dotfile rule (npm's workspace mapper
+                              calls glob without dot:true): `*`, `?`, `**`, or an extglob/bracket token that
+                              does not ITSELF spell a literal leading `.` does not match a `.`-prefixed path
+                              SEGMENT (verified against the real `minimatch` 10.2.5 npm ships: `{.internal,x}`,
+                              `@(.internal|x)` and `[.]internal` all match `.internal`; a bare `*`/`?`/`[!.]`
+                              does not -- Codex round, widdershins #219)."""
                               pattern = _re.sub(r"\{(\d+)\.\.(\d+)\}", lambda m: "{" + ",".join(str(i) for i in range(int(m.group(1)), int(m.group(2)) + 1)) + "}", pattern)   # {1..3}
                               pattern = _re.sub(r"\{([A-Za-z])\.\.([A-Za-z])\}", lambda m: "{" + ",".join(chr(i) for i in range(ord(m.group(1)), ord(m.group(2)) + 1)) + "}", pattern)   # {a..c}
-                              while i < len(pattern):
-                                  c = pattern[i]
-                                  eg = _re.match(r"([@+*?!])\((.*?)\)", pattern[i:])     # extglobs @(a|b) +(x) *(x) ?(x) !(x)
-                                  if eg:
-                                      inner = "|".join(_re.escape(a) for a in eg.group(2).split("|"))
-                                      if eg.group(1) == "!": out += "(?:(?!(?:" + inner + ")(?:/|$))[^/]+)"   # one segment that is not any alternative
-                                      else: out += "(?:" + inner + ")" + {"@": "", "+": "+", "*": "*", "?": "?"}[eg.group(1)]
-                                      i += eg.end(); continue
-                                  if pattern.startswith("**/", i): out += "(?:.*/)?"; i += 3      # globstar spans zero or more directories
-                                  elif pattern.startswith("**", i): out += ".*"; i += 2
-                                  elif c == "*": out += "[^/]*"; i += 1
-                                  elif c == "?": out += "[^/]"; i += 1
-                                  elif c == "[":
-                                      j = pattern.find("]", i + 2)
-                                      if j == -1: out += _re.escape(c); i += 1
-                                      else:
-                                          cls = pattern[i + 1:j]
-                                          cls = ("^" + cls[1:]) if cls.startswith("!") else cls          # [!ab] -> [^ab]
-                                          out += "[" + cls.replace("\\", "\\\\") + "]"; i = j + 1
-                                  elif c == "{":
-                                      j = pattern.find("}", i)
-                                      if j == -1: out += _re.escape(c); i += 1
-                                      else: out += "(" + "|".join(_re.escape(a) for a in pattern[i + 1:j].split(",")) + ")"; i = j + 1
-                                  else: out += _re.escape(c); i += 1
-                              return _re.fullmatch(out, path) is not None
+                              def brace_expand(pat):
+                                  m = _re.search(r"\{([^{}]*)\}", pat)
+                                  if not m: return [pat]
+                                  out = []
+                                  for alt in m.group(1).split(","):
+                                      out.extend(brace_expand(pat[:m.start()] + alt + pat[m.end():]))
+                                  return out
+                              def translate(pattern):
+                                  out, i, seg_start = "", 0, True
+                                  guard = lambda tok: ("(?!\\.)" + tok) if seg_start else tok
+                                  while i < len(pattern):
+                                      c = pattern[i]
+                                      eg = _re.match(r"([@+*?!])\((.*?)\)", pattern[i:])     # extglobs @(a|b) +(x) *(x) ?(x) !(x)
+                                      if eg:
+                                          alts = eg.group(2).split("|")
+                                          if eg.group(1) == "!":
+                                              inner = "|".join(_re.escape(a) for a in alts)
+                                              out += guard("(?:(?!(?:" + inner + ")(?:/|$))[^/]+)")   # one segment that is not any alternative
+                                          else:
+                                              rep = {"@": "", "+": "+", "*": "*", "?": "?"}[eg.group(1)]
+                                              dotalts = [a for a in alts if a.startswith(".")]         # explicit -- not guarded
+                                              rest = [a for a in alts if not a.startswith(".")]
+                                              parts = []
+                                              if dotalts: parts.append("(?:" + "|".join(_re.escape(a) for a in dotalts) + ")" + rep)
+                                              if rest:
+                                                  grp = "(?:" + "|".join(_re.escape(a) for a in rest) + ")" + rep
+                                                  parts.append(guard(grp))
+                                              out += "(?:" + "|".join(parts) + ")" if len(parts) > 1 else (parts[0] if parts else "(?!x)x")
+                                          i += eg.end(); seg_start = False; continue
+                                      if pattern.startswith("**/", i): out += "(?:(?!\\.)[^/]+/)*"; i += 3; seg_start = True; continue      # zero or more non-dot directories
+                                      elif pattern.startswith("**", i): out += guard("(?:[^/]+(?:/(?!\\.)[^/]+)*)?"); i += 2; seg_start = False; continue
+                                      elif c == "*": out += guard("[^/]*"); i += 1; seg_start = False; continue
+                                      elif c == "?": out += guard("[^/]"); i += 1; seg_start = False; continue
+                                      elif c == "[":
+                                          j = pattern.find("]", i + 2)
+                                          if j == -1: out += _re.escape(c); i += 1; seg_start = False
+                                          else:
+                                              cls = pattern[i + 1:j]
+                                              negated = cls.startswith("!")
+                                              core = cls[1:] if negated else cls
+                                              allows_dot = ("." in core) and not negated                  # e.g. [.] or [.abc] -- explicit
+                                              cls = ("^" + core) if negated else cls
+                                              tok = "[" + cls.replace("\\", "\\\\") + "]"
+                                              out += tok if allows_dot else guard(tok); i = j + 1; seg_start = False
+                                          continue
+                                      elif c == "/": out += "/"; i += 1; seg_start = True; continue
+                                      else: out += _re.escape(c); i += 1; seg_start = False; continue
+                                  return out
+                              return any(_re.fullmatch(translate(p), path) for p in brace_expand(pattern))
                           lock = json.load(open(os.path.join(root, "package-lock.json")))
                           pkgs = lock.get("packages") or {}
                           ws = (json.load(open(os.path.join(root, "package.json"))) if os.path.exists(os.path.join(root, "package.json")) else {}).get("workspaces") or []
