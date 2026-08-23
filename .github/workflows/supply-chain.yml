@@ -255,6 +255,17 @@ jobs:
           }
           bootstrap_pkg "@npmcli/map-workspaces@6.0.0" "0ec7b1ed705e6b40681516df00b31b36e68da9e23791b649c6204c42116f3d4365bafd3211e28c77914b217cb4342b0eb863184242dafa2db5f4269d9e8a8b6e"
           bootstrap_pkg "@pnpm/find-workspace-packages@6.0.9" "f34b7a9bac3711f3a0e64f3c091f04c9ae9a3898b6b97c981854afd98fb70ea180583db1e8214b337928a76662d672fd4c7318a5817784b9c145ba9c27cae646"
+          # Byte-verifying the two top-level tarballs isn't enough: `npm install`
+          # also resolves and installs each tool's own transitive dependencies,
+          # which are outside this repo's own lockfile/OSV/byte-verification
+          # coverage entirely -- a compromised transitive would execute its
+          # require()'d code on the next step with no check catching it (Codex
+          # round, CAT-318 follow-up). Verify every package actually installed
+          # in the closure (not just the two roots) carries a valid npm
+          # registry signature before either resolver is ever require()'d.
+          if ! npm audit signatures --prefix "$prefix" >/dev/null; then
+            echo "::error::one or more packages in the workspace-resolver dependency closure failed registry signature verification -- refusing to use them"; exit 1
+          fi
           echo "WS_RESOLVERS_PREFIX=$prefix" >> "$GITHUB_ENV"
           echo "Bootstrapped @npmcli/map-workspaces and @pnpm/find-workspace-packages from byte-verified tarballs into $prefix"
       # 0. Every manifest must be covered by a lockfile this gate validates
