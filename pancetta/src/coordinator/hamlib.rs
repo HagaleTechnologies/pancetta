@@ -619,21 +619,21 @@ mod hamlib_command_in_flight_guard_tests {
 /// possible -- the second read is far more likely to already reflect a
 /// flip that caused it.
 ///
-/// The ordering itself lives in `crashed_by_check_order` below, generic
-/// over the two reads, so the check-order regression test
+/// PAN-28 (Codex round-1 on PR #303): generic over the two reads, rather
+/// than a concrete `&AtomicBool`/`&[JoinHandle]` wrapper delegating to a
+/// separately-tested ordering helper, so the check-order regression test
 /// (`child_task_crashed_tests::fixed_order_survives_a_shutdown_flip_the_old_order_misses`)
-/// can drive this exact logic with scripted reads instead of a real race.
+/// drives THIS EXACT function with scripted reads instead of a real race
+/// -- a prior version split the ordering into an extracted
+/// `crashed_by_check_order` helper that the test drove directly, which
+/// left the WIRING at each real call site (which closure is passed as
+/// `is_finished` vs `shutdown_is_set`, or whether a future edit bypasses
+/// the helper and inlines the check differently) completely untested: the
+/// helper's own test would keep passing even if a call site's wiring, or
+/// the body here, regressed to the old (broken) order. Collapsing them
+/// into one generic function closes that gap — there is no other place
+/// the ordering logic could live.
 pub(crate) fn child_task_crashed(
-    shutdown: &std::sync::atomic::AtomicBool,
-    spawned_handles: &[tokio::task::JoinHandle<()>],
-) -> bool {
-    crashed_by_check_order(
-        || spawned_handles.iter().any(|handle| handle.is_finished()),
-        || shutdown.load(Ordering::Acquire),
-    )
-}
-
-fn crashed_by_check_order(
     mut is_finished: impl FnMut() -> bool,
     mut shutdown_is_set: impl FnMut() -> bool,
 ) -> bool {
@@ -1984,7 +1984,10 @@ impl super::ApplicationCoordinator {
                 // for the ABA race this closes.
                 let _hamlib_loop_ready_guard =
                     if publish_loop_readiness_if_children_alive(&hamlib_command_loop_ready, || {
-                        child_task_crashed(&shutdown, &spawned_handles)
+                        child_task_crashed(
+                            || spawned_handles.iter().any(|handle| handle.is_finished()),
+                            || shutdown.load(Ordering::Acquire),
+                        )
                     }) {
                         let _ = loop_ready_tx.send(());
                         Some(HamlibLoopReadyGuard::new(
@@ -2004,7 +2007,10 @@ impl super::ApplicationCoordinator {
 
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
-                    if child_task_crashed(&shutdown, &spawned_handles) {
+                    if child_task_crashed(
+                        || spawned_handles.iter().any(|handle| handle.is_finished()),
+                        || shutdown.load(Ordering::Acquire),
+                    ) {
                         anyhow::bail!("Hamlib polling or PTT-watchdog child terminated");
                     }
                     match hamlib_rx.try_recv() {
@@ -3333,7 +3339,12 @@ mod child_task_crashed_tests {
         );
 
         assert!(
-            !child_task_crashed(&shutdown, std::slice::from_ref(&handle)),
+            !child_task_crashed(
+                || std::slice::from_ref(&handle)
+                    .iter()
+                    .any(|h| h.is_finished()),
+                || shutdown.load(Ordering::Acquire),
+            ),
             "a child observed exiting during shutdown must not be treated as a crash"
         );
     }
@@ -3356,7 +3367,12 @@ mod child_task_crashed_tests {
         );
 
         assert!(
-            child_task_crashed(&shutdown, std::slice::from_ref(&handle)),
+            child_task_crashed(
+                || std::slice::from_ref(&handle)
+                    .iter()
+                    .any(|h| h.is_finished()),
+                || shutdown.load(Ordering::Acquire),
+            ),
             "a child that exits outside of shutdown must still be flagged as a crash"
         );
     }
@@ -3370,8 +3386,10 @@ mod child_task_crashed_tests {
         assert!(!handle.is_finished());
 
         assert!(!child_task_crashed(
-            &shutdown,
-            std::slice::from_ref(&handle)
+            || std::slice::from_ref(&handle)
+                .iter()
+                .any(|h| h.is_finished()),
+            || shutdown.load(Ordering::Acquire),
         ));
         handle.abort();
     }
@@ -3399,18 +3417,21 @@ mod child_task_crashed_tests {
     /// landed both-pre-flip or both-post-flip, `old_order_misfired` could
     /// stay false forever even though `child_task_crashed` was correct,
     /// and the test's own failure message admitted as much. There's no
-    /// timer to pause and no yield point inside `crashed_by_check_order`'s
+    /// timer to pause and no yield point inside `child_task_crashed`'s
     /// synchronous body to synchronize a real thread race on, so instead
     /// this scripts the two reads directly: `FlipTrace::read()` returns
     /// `false` on its first call and `true` on every call after --
     /// modelling "the shutdown flip (and the child exit it causes) lands
     /// in the single gap between whichever two reads the checked ordering
-    /// performs" -- with zero dependence on real scheduling. Driving
-    /// `crashed_by_check_order` (the exact ordering `child_task_crashed`
-    /// delegates to) through that trace proves the fixed order never
-    /// misfires; driving the old order through an identical trace proves
-    /// it does, so reverting the production order flips this test's first
-    /// assertion from pass to fail.
+    /// performs" -- with zero dependence on real scheduling.
+    ///
+    /// PAN-28 round 1 (Codex): drives `child_task_crashed` ITSELF, not a
+    /// separately-tested ordering helper it merely delegates to -- see
+    /// that function's doc comment for why the two used to be split (and
+    /// why splitting them left the wiring at each real call site
+    /// untested). Reverting the production order flips this test's first
+    /// assertion from pass to fail, no matter where in `child_task_crashed`
+    /// that reversion happens.
     #[test]
     fn fixed_order_survives_a_shutdown_flip_the_old_order_misses() {
         struct FlipTrace(std::cell::Cell<u32>);
@@ -3426,7 +3447,7 @@ mod child_task_crashed_tests {
 
         let trace = FlipTrace::new();
         assert!(
-            !crashed_by_check_order(|| trace.read(), || trace.read()),
+            !child_task_crashed(|| trace.read(), || trace.read()),
             "fixed order (is_finished first) misclassified a shutdown flip landing \
              between the two reads as a crash"
         );
@@ -3653,7 +3674,10 @@ mod children_publish_race_tests {
 
         // Mirrors the real (fixed) call site exactly: check liveness
         // BEFORE reporting readiness.
-        if child_task_crashed(&shutdown, &spawned_handles) {
+        if child_task_crashed(
+            || spawned_handles.iter().any(|handle| handle.is_finished()),
+            || shutdown.load(Ordering::Acquire),
+        ) {
             // Withhold: neither the atomic flag nor the oneshot send.
             // Explicitly drop `loop_ready_tx` without sending, mirroring
             // the real task going on to bail and end.
