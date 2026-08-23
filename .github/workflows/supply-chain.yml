@@ -312,30 +312,60 @@ jobs:
                                   for alt in m.group(1).split(","):
                                       out.extend(brace_expand(pat[:m.start()] + alt + pat[m.end():]))
                                   return out
+                              def _bracket_end(s, i):
+                                  # s[i] == "[" -- returns the index just past the class's
+                                  # matching "]" (same convention as translate()'s own bracket
+                                  # branch below: the search starts at i+2 so a "]" immediately
+                                  # after "[" is treated as literal class content, not a
+                                  # close), or i+1 if unterminated (treated as a literal "[").
+                                  # Shared by _extglob_close and _split_top_level so a "("/")"/
+                                  # "|" INSIDE a bracket class (`[(]`, `[a|b]`) is class
+                                  # content, not extglob/alternation structure (Codex round,
+                                  # CAT-314 follow-up).
+                                  j = s.find("]", i + 2)
+                                  return (j + 1) if j != -1 else (i + 1)
                               def _extglob_close(s, open_idx):
                                   # s[open_idx] == "(" -- balanced-paren search for the matching
                                   # close, so a NESTED extglob like +(bar|baz) inside an outer
                                   # @(...) group doesn't truncate the outer group at the first ")"
-                                  # (Codex round, widdershins #219 / CAT-314).
+                                  # (Codex round, widdershins #219 / CAT-314). A "(" or ")"
+                                  # inside a bracket class (`[(]`) is class content, not
+                                  # nesting -- skip the whole class so it doesn't perturb the
+                                  # depth count (Codex round, CAT-314 follow-up).
                                   depth = 0
-                                  for idx in range(open_idx, len(s)):
-                                      if s[idx] == "(": depth += 1
-                                      elif s[idx] == ")":
+                                  idx = open_idx
+                                  n = len(s)
+                                  while idx < n:
+                                      ch = s[idx]
+                                      if ch == "[":
+                                          idx = _bracket_end(s, idx); continue
+                                      if ch == "(": depth += 1
+                                      elif ch == ")":
                                           depth -= 1
                                           if depth == 0: return idx
+                                      idx += 1
                                   return -1
                               def _split_top_level(s):
                                   # split on "|" at paren-depth 0 only, so a nested extglob's OWN
-                                  # "|" alternatives aren't torn apart by the outer split.
-                                  parts, depth, cur = [], 0, []
-                                  for ch in s:
+                                  # "|" alternatives aren't torn apart by the outer split. A "|"
+                                  # (or "("/")") inside a bracket class (`[a|b]`) is class
+                                  # content, not a split point or nesting -- skip the whole
+                                  # class (Codex round, CAT-314 follow-up).
+                                  parts, depth, cur, i = [], 0, [], 0
+                                  n = len(s)
+                                  while i < n:
+                                      ch = s[i]
+                                      if ch == "[":
+                                          j = _bracket_end(s, i)
+                                          cur.append(s[i:j]); i = j; continue
                                       if ch == "(": depth += 1; cur.append(ch)
                                       elif ch == ")": depth -= 1; cur.append(ch)
                                       elif ch == "|" and depth == 0: parts.append("".join(cur)); cur = []
                                       else: cur.append(ch)
+                                      i += 1
                                   parts.append("".join(cur))
                                   return parts
-                              def translate(pattern, start_seg=True):
+                              def translate(pattern, start_seg=True, in_extglob=False):
                                   # an extglob ALTERNATIVE's own leading character is not a new
                                   # segment start -- the dot-exclusion decision for that position
                                   # was already made one level up (by the dotalts/rest split and
@@ -362,17 +392,37 @@ jobs:
                                           # round 9, panino #101). Recurse through the same translate() used
                                           # for the rest of the pattern.
                                           if c == "!":
-                                              inner = "|".join(translate(a, False) for a in alts)
-                                              out += guard("(?:(?!(?:" + inner + ")(?:/|$))[^/]+)")   # one segment that is not any alternative
+                                              inner = "|".join(translate(a, False, True) for a in alts)
+                                              # what immediately follows this !(...) close in
+                                              # THIS alt/pattern is the real "not this" boundary
+                                              # -- nesting lets more than "/ or end of path"
+                                              # follow a !(...) close (e.g. `!(private|secret)-*`
+                                              # inside `@(!(private|secret)-*|public)`), so
+                                              # translate the actual suffix instead of hardcoding
+                                              # it (Codex round, CAT-314 follow-up). Nothing left
+                                              # in this alt still means end-of-segment.
+                                              suffix_pattern = pattern[eg_close + 1:]
+                                              suffix = ("(?:" + translate(suffix_pattern, False, True) + ")") if suffix_pattern else "(?:/|$)"
+                                              out += guard("(?:(?!(?:" + inner + ")" + suffix + ")[^/]+)")   # one segment that is not any alternative
                                           else:
                                               def is_dot_explicit(a):
-                                                  # a literal leading '.', or the exact singleton bracket class
+                                                  # a literal leading '.', the exact singleton bracket class
                                                   # `[.]` (matching minimatch's own narrow rule -- `[.a]`/`[a.]`
-                                                  # still get the dot guard; Codex round, cqdx #349).
-                                                  return a.startswith(".") or bool(_re.match(r"^\[\.\]", a))
+                                                  # still get the dot guard; Codex round, cqdx #349), OR a nested
+                                                  # `@(...)` extglob spanning the WHOLE alternative -- kind '@'
+                                                  # consumes exactly one alternative, so its leading character is
+                                                  # structurally determined by ITS OWN alternatives, recursively.
+                                                  # Checking only the alt's first textual character wrongly
+                                                  # guards `@(.hidden)` nested inside a larger group, e.g.
+                                                  # `@(@(.hidden)|public)` (Codex round, CAT-314 follow-up /
+                                                  # panino #107).
+                                                  if a.startswith(".") or bool(_re.match(r"^\[\.\]", a)): return True
+                                                  if a.startswith("@(") and a.endswith(")") and _extglob_close(a, 1) == len(a) - 1:
+                                                      return any(is_dot_explicit(ia) for ia in _split_top_level(a[2:-1]))
+                                                  return False
                                               dotalts = [a for a in alts if is_dot_explicit(a)]         # explicit -- not guarded
                                               rest = [a for a in alts if not is_dot_explicit(a)]
-                                              mixed = "(?:" + "|".join(translate(a, False) for a in alts) + ")"   # ANY alt, unguarded -- used
+                                              mixed = "(?:" + "|".join(translate(a, False, True) for a in alts) + ")"   # ANY alt, unguarded -- used
                                               # once we are past the first character of the segment, so later
                                               # repetitions of +()/*() may freely mix dotted and undotted
                                               # alternatives (`+(.internal|x)` matches `.internalx` too --
@@ -380,8 +430,8 @@ jobs:
                                               # Codex round, vanity #153).
                                               def first_choice():
                                                   parts = []
-                                                  if dotalts: parts.append("(?:" + "|".join(translate(a, False) for a in dotalts) + ")")
-                                                  if rest: parts.append(guard("(?:" + "|".join(translate(a, False) for a in rest) + ")"))
+                                                  if dotalts: parts.append("(?:" + "|".join(translate(a, False, True) for a in dotalts) + ")")
+                                                  if rest: parts.append(guard("(?:" + "|".join(translate(a, False, True) for a in rest) + ")"))
                                                   return "(?:" + "|".join(parts) + ")" if len(parts) > 1 else (parts[0] if parts else "(?!x)x")
                                               kind = c
                                               if kind in ("@", "?"):
@@ -391,8 +441,12 @@ jobs:
                                               else:  # "*" -- zero or more, mixed freely once started
                                                   out += "(?:" + first_choice() + mixed + "*)?"
                                           i = eg_close + 1; seg_start = False; continue
-                                      if pattern.startswith("**/", i): out += "(?:(?!\\.)[^/]+/)*"; i += 3; seg_start = True; continue      # zero or more non-dot directories
-                                      elif pattern.startswith("**", i): out += guard("(?:[^/]+(?:/(?!\\.)[^/]+)*)?"); i += 2; seg_start = False; continue
+                                      if not in_extglob and pattern.startswith("**/", i): out += "(?:(?!\\.)[^/]+/)*"; i += 3; seg_start = True; continue      # zero or more non-dot directories
+                                      elif not in_extglob and pattern.startswith("**", i): out += guard("(?:[^/]+(?:/(?!\\.)[^/]+)*)?"); i += 2; seg_start = False; continue
+                                      # `**` inside an extglob alternative is NOT a globstar to minimatch/pnpm --
+                                      # it's just two ordinary stars and stays segment-local (falls through to
+                                      # the plain "*" handling below, one star at a time) (Codex round, CAT-314
+                                      # follow-up / panino #107).
                                       elif c == "*": out += guard("[^/]*"); i += 1; seg_start = False; continue
                                       elif c == "?": out += guard("[^/]"); i += 1; seg_start = False; continue
                                       elif c == "[":
