@@ -1837,6 +1837,12 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                     Ok(a) => a,
                     Err(e) => {
                         debug!(target: "agent.control", "malformed control frame: {e}");
+                        // PAN-34: this `continue` must not skip the
+                        // end-of-loop revocation broadcast below, or a
+                        // client that keeps resending bad frames can
+                        // suppress it for every OTHER connected peer
+                        // indefinitely.
+                        broadcast_pending_revocation(ctx, &mut sess);
                         continue;
                     }
                 };
@@ -1903,22 +1909,27 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
             }
         }
 
-        // Round-1 review fix (PR #261): a concurrent `poll_authorizations_loop`
-        // cycle may have just disarmed the live controller
-        // (`DisarmReason::AuthorizationRevoked`) — it flags this here via
-        // `ctx.revocation_pending` because it runs in a separate tokio task
-        // and cannot call `deliver_sends` itself. Check (and clear) the flag
-        // once per tick, same granularity as every other per-tick concern in
-        // this loop, and broadcast the CURRENT (already-disarmed) control
-        // state to every established peer — matching this module's existing
-        // rule that every arm transition fans `control_state_sends` out
-        // immediately, so an already-connected peer's `transmitArmed` never
-        // goes stale until its next heartbeat/TX request happens to refresh
-        // it.
-        if ctx.revocation_pending.swap(false, Ordering::AcqRel) {
-            let sends = control_state_sends(ctx, now_ms(), None);
-            deliver_sends(&mut sess, &sends);
-        }
+        // Round-1 review fix (PR #261), broadcast now factored into
+        // `broadcast_pending_revocation` (PAN-34) so the malformed-frame
+        // `continue` above can't bypass it — see that fn's doc comment.
+        broadcast_pending_revocation(ctx, &mut sess);
+    }
+}
+
+/// Broadcast the current (already-disarmed) control state to every
+/// established peer if a concurrent `poll_authorizations_loop` cycle flagged
+/// `ctx.revocation_pending` since the last check. Factored out of
+/// `run_one_session` so both the normal end-of-tick path AND the
+/// malformed-control-frame `continue` (PAN-34) run it — a persistently
+/// misbehaving client must not be able to suppress the broadcast to other
+/// connected peers by never reaching the bottom of the loop.
+fn broadcast_pending_revocation<W: pancetta_agent::relay::WsConn>(
+    ctx: &ArmContext,
+    sess: &mut MultiPeerSession<'_, W>,
+) {
+    if ctx.revocation_pending.swap(false, Ordering::AcqRel) {
+        let sends = control_state_sends(ctx, now_ms(), None);
+        deliver_sends(sess, &sends);
     }
 }
 
@@ -4963,6 +4974,204 @@ mod tests {
             "the poll-driven disarm must broadcast an updated controlState with \
              transmitArmed: false to the already-connected peer — not just mutate \
              ArmState/the audit log"
+        );
+    }
+
+    /// PAN-34: a persistently misbehaving established client (one that keeps
+    /// sending frames that decrypt fine but fail `map_client_frame`) must not
+    /// be able to suppress the poll-driven revocation broadcast to OTHER,
+    /// well-behaved connected peers. Before the fix, the malformed-frame arm
+    /// of `run_one_session`'s match `continue`d straight back to the top of
+    /// the loop, skipping the trailing `revocation_pending` check entirely —
+    /// so PEER_B here would still see its stale pre-revocation `controlState`
+    /// with no way to learn the station was disarmed until its own traffic
+    /// happened to touch the loop's tail.
+    ///
+    /// Drives a REAL two-peer `run_one_session` (real Noise handshakes for
+    /// both peers) so the malformed frame from PEER_A genuinely decrypts
+    /// under ITS OWN completed transport (a Noise-level decrypt failure would
+    /// instead hit `Poll::PeerDown`, a different code path this test is not
+    /// about) and only fails at the `map_client_frame` (non-JSON plaintext)
+    /// step — exactly the "malformed encrypted control frame" the ticket
+    /// describes.
+    #[tokio::test]
+    async fn malformed_frame_does_not_suppress_revocation_broadcast_to_other_peers() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let agent_pub = identity.agreement_public_raw();
+
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        allow.insert(PEER_B.to_string());
+        let mut ctx = fresh_ctx(&agent_kid, allow);
+
+        // Pre-arm as CLIENT_KEY_ID (PEER_A) so its establishment greeting
+        // shows `transmitArmed: true`, giving the later broadcast a real
+        // true→false transition to prove for PEER_B.
+        let real_now = now_ms();
+        ctx.arm.lock().unwrap().set_local_consent(true, real_now);
+        ctx.arm.lock().unwrap().arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: OPERATOR.to_string(),
+                ttl_ms: 3_600_000,
+                scope_tx: true,
+                jti: "malformed-frame-test-jti".to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
+            },
+            real_now,
+        );
+
+        let poll_arm = ctx.arm.clone();
+        let poll_revocation_pending = ctx.revocation_pending.clone();
+        let revocation_pending_after = ctx.revocation_pending.clone();
+
+        let bus = MessageBus::new(64).unwrap();
+        let mut init_a = fresh_initiator(&agent_pub);
+        let mut init_b = fresh_initiator(&agent_pub);
+        let msg1_a = init_a.write_msg1(b"");
+        let msg1_b = init_b.write_msg1(b"");
+
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[13u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let env_a = RelayFrame::Env {
+            dst: agent_kid.clone(),
+            payload: b64url(&msg1_a),
+            src: Some(CLIENT_KEY_ID.to_string()),
+        }
+        .to_json()
+        .unwrap();
+        let env_b = RelayFrame::Env {
+            dst: agent_kid.clone(),
+            payload: b64url(&msg1_b),
+            src: Some(PEER_B.to_string()),
+        }
+        .to_json()
+        .unwrap();
+
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        // Only the handshake frames are scripted up front — the malformed
+        // follow-up from PEER_A can't be pre-built because it must be
+        // encrypted under PEER_A's real completed transport, which only
+        // exists after the agent's msg2 (emitted mid-session) is observed.
+        let mock = MockWs::new(vec![hello, env_a, env_b], outbound.clone());
+        let ws_handle = mock.clone();
+        let trigger_outbound = outbound.clone();
+        let trigger_agent_kid = agent_kid.clone();
+        let ws = TriggerAfterWs::new(mock, 4, move || {
+            // Simulate the concurrent poll disarming the live controller
+            // between ticks, exactly like the single-peer broadcast test.
+            let effects = poll_arm
+                .lock()
+                .unwrap()
+                .disarm_with_reason(DisarmReason::AuthorizationRevoked, now_ms());
+            assert!(
+                !effects.is_empty(),
+                "setup sanity: the simulated poll disarm must actually find a live arm"
+            );
+            poll_revocation_pending.store(true, Ordering::Release);
+
+            // Recover PEER_A's msg2 (the first env addressed to CLIENT_KEY_ID
+            // so far — sent during env_a's handshake bootstrap, before env_b
+            // was processed) to complete a REAL client-side transport for it.
+            let out = trigger_outbound.lock().unwrap().clone();
+            let msg2_a = out
+                .iter()
+                .find_map(|s| match parse_frame(s).unwrap() {
+                    RelayFrame::Env { dst, payload, .. } if dst == CLIENT_KEY_ID => Some(
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(&payload)
+                            .unwrap(),
+                    ),
+                    _ => None,
+                })
+                .expect("PEER_A's msg2 must already be on the wire by the 4th tick");
+            init_a.read_msg2(&msg2_a);
+            let mut client_transport_a = init_a.into_transport();
+
+            // Genuinely non-JSON plaintext — decrypts fine under PEER_A's
+            // real transport, but fails `map_client_frame`'s
+            // `serde_json::from_slice`, taking the malformed-frame `continue`
+            // arm this test targets (not a Noise-level decrypt failure).
+            let plaintext = b"not valid json{{{";
+            let mut ct = vec![0u8; plaintext.len() + 16];
+            let n = client_transport_a
+                .write_message(plaintext, &mut ct)
+                .unwrap();
+            ct.truncate(n);
+            let malformed_env = RelayFrame::Env {
+                dst: trigger_agent_kid.clone(),
+                payload: b64url(&ct),
+                src: Some(CLIENT_KEY_ID.to_string()),
+            }
+            .to_json()
+            .unwrap();
+            ws_handle.push_inbound(malformed_env);
+        });
+
+        run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
+
+        assert!(
+            ctx.peers.contains_key(CLIENT_KEY_ID),
+            "a malformed control frame must not disconnect the established peer \
+             that sent it (only a Noise-level decrypt failure would)"
+        );
+        assert!(
+            ctx.peers.contains_key(PEER_B),
+            "PEER_B must remain established throughout"
+        );
+        assert!(
+            !revocation_pending_after.load(Ordering::Acquire),
+            "revocation_pending must have been cleared by the broadcast"
+        );
+
+        // PEER_B never sent anything malformed — its wire traffic must show
+        // msg2, the establishment greeting (armed=true), and the poll-driven
+        // broadcast (armed=false), proving PEER_A's malformed frame did not
+        // suppress the broadcast to PEER_B.
+        let out = outbound.lock().unwrap().clone();
+        let envs_b: Vec<Vec<u8>> = out
+            .iter()
+            .filter_map(|s| match parse_frame(s).unwrap() {
+                RelayFrame::Env { dst, payload, .. } if dst == PEER_B => Some(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(&payload)
+                        .unwrap(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            envs_b.len(),
+            3,
+            "PEER_B: msg2 + establishment greeting + the poll-driven broadcast \
+             (PAN-34 regression: PEER_A's malformed frame must not swallow this)"
+        );
+
+        init_b.read_msg2(&envs_b[0]);
+        let mut transport_b = init_b.into_transport();
+        let mut decrypt = |ct: &[u8]| -> serde_json::Value {
+            let mut buf = vec![0u8; ct.len().max(1)];
+            let n = transport_b.read_message(ct, &mut buf).unwrap();
+            buf.truncate(n);
+            serde_json::from_slice(&buf).unwrap()
+        };
+
+        let greeting = decrypt(&envs_b[1]);
+        assert_eq!(greeting["event"]["event"], "controlState");
+        assert_eq!(
+            greeting["event"]["transmitArmed"], true,
+            "the establishment greeting must reflect the pre-armed state"
+        );
+
+        let broadcast = decrypt(&envs_b[2]);
+        assert_eq!(broadcast["event"]["event"], "controlState");
+        assert_eq!(
+            broadcast["event"]["transmitArmed"], false,
+            "the poll-driven disarm must still broadcast to PEER_B even while \
+             PEER_A is stuck resending a malformed frame"
         );
     }
 
