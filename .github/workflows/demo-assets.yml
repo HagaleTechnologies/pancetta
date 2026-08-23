@@ -106,7 +106,7 @@ jobs:
 
       - name: Commit updated GIF
         if: steps.diff.outputs.changed == 'true'
-        uses: stefanzweifel/git-auto-commit-action@v5
+        uses: stefanzweifel/git-auto-commit-action@v7
         with:
           # Deliberately NO `[skip ci]` here. The GIF is not byte-reproducible
           # (embedded timestamps, live waterfall), so this step fires on
