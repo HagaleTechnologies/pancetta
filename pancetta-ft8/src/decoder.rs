@@ -3385,7 +3385,15 @@ impl Ft8Decoder {
             // shared tail would change behavior whenever that flag is on.
             let mut ft8lib_seed_keys: std::collections::HashSet<(usize, usize, usize)> =
                 std::collections::HashSet::new();
-            if self.config.ft8lib_sync_seeds_enabled && pass == 0 && self.current_budget.has_time()
+            // PAN-32: FT2 has no ft8_lib counterpart, so every seed is rejected
+            // downstream by the translator's block_size guard anyway — skip the
+            // FFI search entirely rather than pay its wall-clock cost for zero
+            // surviving seeds (and, under a finite `DecodeBudget`, at the expense
+            // of legitimate candidate decoding).
+            if self.config.ft8lib_sync_seeds_enabled
+                && pass == 0
+                && self.current_budget.has_time()
+                && !self.protocol_params.protocol.is_ft2()
             {
                 let seed_start = std::time::Instant::now();
 
@@ -3409,9 +3417,7 @@ impl Ft8Decoder {
 
                 let protocol = match self.protocol_params.protocol {
                     Protocol::Ft4 => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT4,
-                    // FT2 has no ft8_lib counterpart. The translator's
-                    // block_size guard then rejects every seed, so this is
-                    // inert rather than wrong.
+                    // Ft2 is excluded by the `is_ft2()` guard above.
                     _ => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT8,
                 };
 
@@ -3491,29 +3497,11 @@ impl Ft8Decoder {
                     }
                 }
 
-                // Dedup exact (time,freq,sub) collisions keeping the highest
-                // score, then re-sort best-first and restore the configured
-                // cap. The two-level sort is a HARD PRECONDITION, not style:
-                // `dedup_by_key` removes only CONSECUTIVE equal keys, and the
-                // descending secondary sort is what makes the retained member
-                // of each group the highest-scoring one. Do not reorder it.
-                sync_candidates.sort_by(|a, b| {
-                    (a.time_step, a.freq_bin, a.freq_sub)
-                        .cmp(&(b.time_step, b.freq_bin, b.freq_sub))
-                        .then(
-                            b.sync_score
-                                .partial_cmp(&a.sync_score)
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                        )
-                });
-                sync_candidates.dedup_by_key(|c| (c.time_step, c.freq_bin, c.freq_sub));
-                sync_candidates.sort_by(|a, b| {
-                    b.sync_score
-                        .partial_cmp(&a.sync_score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let after_dedup = sync_candidates.len();
-                sync_candidates.truncate(self.config.max_sync_candidates);
+                // Dedup exact-key collisions, cap, and (PAN-31) re-run NMS
+                // over the native+seed union. See
+                // `finalize_native_and_seed_candidate_union` for the mechanics.
+                let after_dedup =
+                    self.finalize_native_and_seed_candidate_union(&mut sync_candidates);
 
                 // Seeds that were BOTH novel AND survived the cap. These
                 // counters are LOAD-BEARING, not diagnostics: at the default
@@ -6548,6 +6536,60 @@ impl Ft8Decoder {
         }
 
         best_score
+    }
+
+    /// Dedup exact `(time_step, freq_bin, freq_sub)` collisions in a
+    /// native+ft8_lib-seed candidate union (keeping the highest score),
+    /// re-sort best-first, restore the configured cap, then (PAN-31)
+    /// re-run non-max suppression over the resulting union.
+    ///
+    /// Extracted so the PAN-31 fix — NMS applying to seeded candidates, not
+    /// just native ones — is independently unit-testable without going
+    /// through a full audio decode + the ft8_lib FFI seed search (which,
+    /// per PAN-7's own measurement, almost never produces a seed at a
+    /// distinct-but-nearby key on real audio: the native sweep is exhaustive
+    /// on the same representable lattice, so seeds usually land exactly on
+    /// an existing native key and get removed by the exact-key dedup below
+    /// rather than surviving to exercise NMS).
+    ///
+    /// The two-level sort before `dedup_by_key` is a HARD PRECONDITION, not
+    /// style: `dedup_by_key` removes only CONSECUTIVE equal keys, and the
+    /// descending secondary sort is what makes the retained member of each
+    /// group the highest-scoring one. Do not reorder it. Returns the
+    /// candidate count after dedup but before the cap/NMS, for diagnostics.
+    fn finalize_native_and_seed_candidate_union(
+        &self,
+        candidates: &mut Vec<CostasCandidate>,
+    ) -> usize {
+        candidates.sort_by(|a, b| {
+            (a.time_step, a.freq_bin, a.freq_sub)
+                .cmp(&(b.time_step, b.freq_bin, b.freq_sub))
+                .then(
+                    b.sync_score
+                        .partial_cmp(&a.sync_score)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        });
+        candidates.dedup_by_key(|c| (c.time_step, c.freq_bin, c.freq_sub));
+        candidates.sort_by(|a, b| {
+            b.sync_score
+                .partial_cmp(&a.sync_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let after_dedup = candidates.len();
+        candidates.truncate(self.config.max_sync_candidates);
+
+        // PAN-31: NMS runs inside `costas_sync_search_with_threshold_and_partner`
+        // on the native-only set, before ft8_lib seeds are appended by the
+        // caller — so a seed landing near a stronger native candidate would
+        // otherwise bypass suppression entirely (only exact-key dedup above
+        // applies to it). Re-run NMS now over the union, sorted-descending
+        // per `nms_candidates`'s precondition (already true post-truncate).
+        if self.config.nms_enabled {
+            self.nms_candidates(candidates);
+        }
+
+        after_dedup
     }
 
     /// Non-maximum suppression: remove weaker candidates near stronger ones.
@@ -24463,6 +24505,145 @@ mod pan7_ft8lib_sync_seed_tests {
             key(&a),
             key(&b),
             "on a stub build the seed helper returns nothing, so the flag must be inert"
+        );
+    }
+
+    /// PAN-31: NMS ran only over the native set (inside
+    /// `costas_sync_search_with_threshold_and_partner`) before ft8_lib seeds
+    /// were appended, so a seed within another candidate's suppression
+    /// radius survived — only exact-key duplicates were removed. Fixed by
+    /// re-running `nms_candidates` over the native+seed union, via the
+    /// extracted `finalize_native_and_seed_candidate_union` helper.
+    ///
+    /// Exercises that helper directly with a synthetic native+seed pair
+    /// rather than through a full audio decode. An end-to-end repro was
+    /// tried first and found to be effectively unreproducible on real
+    /// audio: PAN-7's own measurement (`docs/superpowers/specs/\
+    /// 2026-08-03-ft8lib-sync-seed-union-design.md` §4.1) already
+    /// establishes the native sweep is exhaustive on the same representable
+    /// lattice ft8_lib searches, so on real signals an ft8_lib seed almost
+    /// always lands on an EXACT existing native key (and is removed by the
+    /// exact-key dedup, never reaching NMS) rather than at a distinct key
+    /// merely within radius of one — empirically confirmed here: a densely
+    /// populated native sweep (`min_sync_score: 0.0`, cap 60) over a noisy
+    /// synthetic window produced zero novel (distinct-key) seeds at all.
+    /// The synthetic pair below reproduces the exact geometry the bug
+    /// requires deterministically: same `(time_step, freq_bin)` as a
+    /// stronger "native" candidate (trivially within any configured NMS
+    /// radius), one sub-bin over — a distinct `freq_sub`, so the earlier
+    /// exact-key dedup pass does not remove it — and a strictly lower score.
+    #[test]
+    fn pan31_seed_within_nms_radius_of_stronger_candidate_is_suppressed() {
+        let native = CostasCandidate {
+            time_step: 100,
+            freq_bin: 50,
+            freq_sub: 0,
+            sync_score: 5.0,
+            time_refinement: 0.0,
+        };
+        let seed = CostasCandidate {
+            time_step: 100,
+            freq_bin: 50,
+            freq_sub: 1,
+            sync_score: 3.0,
+            time_refinement: 0.0,
+        };
+
+        // Sanity: with NMS off, exact-key dedup alone must not remove the
+        // seed — proves the two-candidate setup is not vacuously already
+        // suppressed before NMS ever runs.
+        let dec_off = Ft8Decoder::new(Ft8Config {
+            nms_enabled: false,
+            max_sync_candidates: 10,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let mut candidates_off = vec![native, seed];
+        let after_dedup_off = dec_off.finalize_native_and_seed_candidate_union(&mut candidates_off);
+        assert_eq!(
+            after_dedup_off, 2,
+            "distinct exact keys must both survive the exact-key dedup pass"
+        );
+        assert_eq!(
+            candidates_off.len(),
+            2,
+            "with NMS off, both the native and seeded candidate must survive"
+        );
+
+        // Fixed behavior: with NMS on, the weaker seed must be suppressed
+        // by the stronger native candidate within radius.
+        let dec_on = Ft8Decoder::new(Ft8Config {
+            nms_enabled: true,
+            max_sync_candidates: 10,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let mut candidates_on = vec![native, seed];
+        let after_dedup_on = dec_on.finalize_native_and_seed_candidate_union(&mut candidates_on);
+        assert_eq!(
+            after_dedup_on, 2,
+            "distinct exact keys must both survive the exact-key dedup pass"
+        );
+        assert_eq!(
+            candidates_on.len(),
+            1,
+            "PAN-31: seed within NMS radius of a stronger candidate must be \
+             suppressed by NMS, not merely left alone by exact-key dedup"
+        );
+        assert_eq!(
+            candidates_on[0].time_step, native.time_step,
+            "the surviving candidate must be the stronger native one"
+        );
+        assert_eq!(candidates_on[0].sync_score, native.sync_score);
+    }
+
+    /// PAN-32: FT2 has no `ftx_protocol_t` counterpart, so every seed the
+    /// FFI search would produce is rejected downstream by the translator's
+    /// block_size guard — the search is skipped entirely rather than run
+    /// and discarded. The `S0-ft8lib-seed` budget stage is pushed only from
+    /// inside the guarded block, so its absence in the report is direct
+    /// proof the FFI call never happened, not merely that it found nothing.
+    #[cfg(feature = "ft2")]
+    #[test]
+    fn pan32_ft8lib_seed_search_is_skipped_entirely_for_ft2() {
+        use crate::{DecodeBudget, Protocol};
+
+        let params = ProtocolParams::ft2();
+        let mut encoder = crate::Ft8Encoder::with_protocol(params.clone());
+        let symbols = encoder
+            .encode_message_protocol("CQ W1ABC FN42", None)
+            .expect("encode");
+        let mut modulator = crate::Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE,
+            1500.0,
+            0.5,
+            crate::PulseShape::Rectangular,
+        )
+        .expect("modulator");
+        let mut audio = modulator
+            .modulate_symbols_protocol(&symbols, 0.0, &params)
+            .expect("modulate");
+        audio.resize(params.window_samples(SAMPLE_RATE), 0.0);
+
+        let mut dec = Ft8Decoder::new(Ft8Config {
+            protocol: Protocol::Ft2,
+            ft8lib_sync_seeds_enabled: true,
+            max_decode_passes: 1,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+
+        let (_msgs, report) = dec
+            .decode_window_budgeted(&audio, DecodeBudget::unlimited())
+            .expect("decode");
+
+        assert!(
+            report
+                .stages
+                .iter()
+                .all(|(name, ..)| *name != "S0-ft8lib-seed"),
+            "S0-ft8lib-seed stage was pushed for Protocol::Ft2 — the ft8_lib \
+             FFI search ran despite every seed being unusable for this protocol"
         );
     }
 }
