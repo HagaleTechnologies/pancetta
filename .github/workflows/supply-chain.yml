@@ -577,6 +577,15 @@ jobs:
           cat > /tmp/action-pins.py <<'PY'
           import json, os, re, shlex, subprocess, sys, yaml
           from collections import Counter
+          # Built from two concatenated halves, never spelled as one contiguous token
+          # anywhere in this file (comments included): GitHub evaluates any
+          # dollar-brace-brace ... brace-brace expression sequence appearing anywhere
+          # in a run: block's raw text -- even inside a Python string literal or a
+          # comment -- before bash/python ever sees it. Spelling that sequence out
+          # literally here previously broke this entire workflow file (every trigger
+          # failed with zero jobs, "workflow file issue") because GitHub tried to
+          # evaluate it as a real expression (Codex round, cqdx #349).
+          EXPR_MARK = "$" + "{{"
           # Newly-added-action pin policy (CAT-299 / ADR-0014). Structural, not textual:
           # every workflow (.github/workflows/*.yml) and every action manifest
           # (**/action.yml|yaml) changed in the PR is parsed at the PR's MERGE-BASE and at
@@ -853,13 +862,17 @@ jobs:
                       if not isinstance(job, dict): continue
                       if isinstance(job.get("uses"), str): add(job["uses"], job_level=True)
                       if isinstance(job.get("steps"), list): steps(job["steps"])
-                      # an expression-valued image (`${{ matrix.image }}`, inputs, vars) is
-                      # unchanged text whose VALUE a PR can change elsewhere, so base/head
-                      # would cancel: it cannot be verified and fails closed at HEAD
-                      # (Codex round 8). Write the digest-pinned image literally.
+                      # an expression-valued image (a matrix/input/vars-templated ref --
+                      # literal dollar-brace-brace syntax deliberately not spelled out here:
+                      # GitHub evaluates ANY such sequence appearing anywhere in this run:
+                      # block's raw text, even inside a comment, which is exactly what broke
+                      # this workflow file until this line was reworded) is unchanged text
+                      # whose VALUE a PR can change elsewhere, so base/head would cancel: it
+                      # cannot be verified and fails closed at HEAD (Codex round 8). Write the
+                      # digest-pinned image literally.
                       def image(v, what):
                           c = image_ref(v)
-                          if c and "${{" in c:
+                          if c and EXPR_MARK in c:
                               if rev == head: HARD_FAIL.add(f"{manifest_path or 'workflow'}: {what} image is an expression ({c[len('container:'):]}) -- the gate cannot verify what it resolves to; write the @sha256-pinned image literally")
                               return
                           if c: acc[c] += 1
@@ -872,7 +885,7 @@ jobs:
                   if isinstance(runs.get("steps"), list): steps(runs["steps"])
                   img = runs.get("image")
                   if isinstance(img, str) and img.startswith("docker://"):
-                      if "${{" in img:
+                      if EXPR_MARK in img:
                           if rev == head: HARD_FAIL.add(f"{manifest_path or 'action'}: runs.image is an expression ({img.strip()}) -- write the @sha256-pinned image literally")
                       else: acc[img.strip()] += 1
                   elif isinstance(img, str) and img.strip():
