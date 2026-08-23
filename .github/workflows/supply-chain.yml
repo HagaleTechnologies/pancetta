@@ -433,22 +433,23 @@ jobs:
                       # coverage to a manifest pnpm never actually installs or verifies
                       # (cqdx#349's class of finding, closed here too via CAT-318).
                       pwy_path = os.path.join(root, "pnpm-workspace.yaml")
-                      pwy_exists = os.path.exists(pwy_path)
-                      pwy = (yaml.safe_load(open(pwy_path)) or {}) if pwy_exists else {}
-                      # An EXISTING pnpm-workspace.yaml that omits `packages` is NOT the
-                      # same as no workspace file at all: the former means "let pnpm
-                      # apply its own default" (root + every subdirectory) and must reach
-                      # _resolve_workspace_dirs as None -- see that function's docstring.
-                      # A pnpm-lock.yaml with NO pnpm-workspace.yaml at all is a standalone
-                      # project (`pnpm install --frozen-lockfile` there only ever installs
-                      # the root importer, never scans subdirectories for members) -- an
-                      # empty list short-circuits to root-only, matching that real
-                      # behaviour, rather than incorrectly inheriting the workspace-file
-                      # default (Codex round, CAT-318 follow-up).
-                      if not pwy_exists:
-                          pnpm_ws = []
-                      else:
-                          pnpm_ws = [g for g in (pwy.get("packages") or []) if isinstance(g, str)] if "packages" in pwy else None
+                      pwy = (yaml.safe_load(open(pwy_path)) or {}) if os.path.exists(pwy_path) else {}
+                      # The pinned pnpm CLI normalizes a missing/omitted `packages` key --
+                      # whether pnpm-workspace.yaml is absent entirely, present but omits
+                      # the key, or sets it to an explicit `[]` -- to root-only before any
+                      # install; it does NOT fall through to @pnpm/fs.find-packages' own
+                      # library-level recursive ['.', '**'] default the way calling
+                      # findWorkspacePackagesNoCheck directly (with patterns=None) does.
+                      # Verified against the pinned pnpm 11.22.0 binary itself, not just
+                      # its source: `pnpm install --lockfile-only` and `pnpm -r list`
+                      # against a workspace file with no `packages` key both show only the
+                      # "." importer -- identical to no workspace file at all. This
+                      # reverses the earlier round-3 "let pnpm apply its own default" fix,
+                      # which relied on the library's coded fallback rather than the CLI's
+                      # actual behaviour (Codex round, CAT-318 follow-up). A stale or
+                      # hand-added subdirectory importer must not be granted coverage a
+                      # real `pnpm install --frozen-lockfile` would never check.
+                      pnpm_ws = [g for g in (pwy.get("packages") or []) if isinstance(g, str)]
                       real_dirs = _resolve_workspace_dirs(root, pnpm_ws, "pnpm")
                       for imp in (lock.get("importers") or {}):
                           nimp = os.path.normpath(imp)
