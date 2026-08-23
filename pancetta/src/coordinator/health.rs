@@ -871,11 +871,22 @@ mod supervisor_tests {
     /// `build_coordinator_with_replay` / `coordinator::qso`'s
     /// `replay_local_log_tests::test_coordinator` pattern — the SAME dummy,
     /// never-read path value — so `self.replay_mode()` is `true` and the
-    /// real logbook is never touched.
+    /// real logbook is never touched for WRITES.
+    ///
+    /// PAN-41 round 4: `replay_path` above only satisfies `replay_mode()` --
+    /// it is never itself read as a filesystem path. `--replay`'s own
+    /// documented contract is to still READ real history for duplicate/
+    /// DX-Hunter seeding, so without `pancetta_home_override` these tests
+    /// would read whatever real `~/.pancetta/qsos.adi` happens to exist on
+    /// the machine running them. Point that read at a per-call, process-
+    /// lifetime-scoped temp dir instead -- deliberately leaked (not a
+    /// `TempDir` guard) since this helper has many callers today that hold
+    /// no guard for the returned coordinator; the directory is empty, so
+    /// history-seeding simply finds nothing, same as a fresh install.
     async fn test_coordinator() -> ApplicationCoordinator {
         let config = Config::default();
         let shutdown = Arc::new(AtomicBool::new(false));
-        ApplicationCoordinator::new(
+        let mut coordinator = ApplicationCoordinator::new(
             config,
             None,
             true,  // no_audio
@@ -890,7 +901,15 @@ mod supervisor_tests {
             Vec::new(), // no config warnings
         )
         .await
-        .expect("coordinator creation should succeed")
+        .expect("coordinator creation should succeed");
+
+        coordinator.pancetta_home_override = Some(std::env::temp_dir().join(format!(
+            "pancetta-test-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )));
+
+        coordinator
     }
 
     async fn assert_decode_component_restarts(component: ComponentId) {

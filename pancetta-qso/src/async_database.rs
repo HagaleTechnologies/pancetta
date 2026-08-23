@@ -918,8 +918,10 @@ impl QsoDatabase {
     /// Build a fresh index at `db_path` by replaying every record in `adif_path`.
     ///
     /// If `db_path` exists, it is deleted first — caller should only invoke this
-    /// when the DB is known to be stale or missing. Returns the new database
-    /// handle, ready for queries.
+    /// when the DB is known to be stale or missing. `db_path` may also be the
+    /// literal `":memory:"` sentinel (see [`Self::open`]) for a throwaway,
+    /// on-disk-file-free rebuild; that case is never `try_exists`/`remove_file`d.
+    /// Returns the new database handle, ready for queries.
     pub async fn replay_from_adif(
         db_path: impl AsRef<std::path::Path>,
         adif_path: impl AsRef<std::path::Path>,
@@ -927,8 +929,15 @@ impl QsoDatabase {
         let db_path = db_path.as_ref();
         let adif_path = adif_path.as_ref();
 
+        // `:memory:` is `Self::open`'s special in-memory sentinel, not a real
+        // path -- never `try_exists`/`remove_file` it. On Unix that pair would
+        // otherwise happily delete an unrelated regular file that literally
+        // happens to be named `:memory:` in the process's current directory
+        // (`open` below only recognizes the sentinel AFTER this check).
+        let is_in_memory = db_path == std::path::Path::new(":memory:");
+
         // Drop any existing index so the rebuild is from scratch.
-        if tokio::fs::try_exists(db_path).await.unwrap_or(false) {
+        if !is_in_memory && tokio::fs::try_exists(db_path).await.unwrap_or(false) {
             tokio::fs::remove_file(db_path)
                 .await
                 .map_err(|source| AsyncDatabaseError::Io {
@@ -1667,6 +1676,53 @@ mod tests {
             calls.contains(&"W9ZZZ".to_string()),
             "a missing real index must not prevent in-memory seeding from ADIF: {:?}",
             calls
+        );
+    }
+
+    /// PAN-41 round 4 (P1 Codex finding): `replay_from_adif(":memory:", ..)`
+    /// must never reach the `try_exists`/`remove_file` step at all -- on Unix,
+    /// those would happily delete a REAL regular file that just happens to be
+    /// named `:memory:` relative to the process's current directory, since
+    /// `Self::open` only recognizes the sentinel afterward. This can't safely
+    /// simulate "a file literally named `:memory:` sits in cwd" (mutating the
+    /// process-wide current directory is unsound under `cargo test`'s default
+    /// parallel execution), so it instead proves the function has no
+    /// filesystem side effects at all: an unrelated real file's mtime is
+    /// unchanged, and repeated in-memory calls never leave any file behind.
+    #[tokio::test]
+    async fn replay_from_adif_into_memory_never_touches_the_filesystem_for_db_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adif_path = tmp.path().join("qsos.adi");
+        tokio::fs::write(
+            &adif_path,
+            "Pancetta replay-seed test\n<ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n<EOH>\n",
+        )
+        .await
+        .unwrap();
+
+        // An unrelated real file, standing in for "a file that happens to be
+        // named `:memory:`" -- if the guard regressed and `try_exists`/
+        // `remove_file` ran against a real path, a bug in the guard's own
+        // comparison logic touching the wrong variable would be far more
+        // likely to hit this file (present, in a shared dir) than silently
+        // do nothing.
+        let sentinel = tmp.path().join("do-not-touch");
+        tokio::fs::write(&sentinel, b"precious").await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mtime_before = std::fs::metadata(&sentinel).unwrap().modified().unwrap();
+
+        for _ in 0..3 {
+            let db = QsoDatabase::replay_from_adif(":memory:", &adif_path)
+                .await
+                .unwrap();
+            drop(db);
+        }
+
+        assert!(sentinel.exists(), "an unrelated file must never be deleted");
+        let mtime_after = std::fs::metadata(&sentinel).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "an unrelated file must never be modified by an in-memory replay rebuild"
         );
     }
 
