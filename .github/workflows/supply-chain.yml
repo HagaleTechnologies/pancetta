@@ -20,8 +20,9 @@ name: Supply Chain
 #                       malicious-packages feed (MAL-* ids), e.g. the Aug 2026
 #                       keyv@6.0.0 compromise is MAL-2026-11524 -- so this is a
 #                       malware gate, not just a CVE gate.
-#   * install-policy -- `cargo fetch --locked` (every crate must still resolve to exactly the
-#                       pinned checksum; no build.rs runs) and no git/path crate sources.
+#   * install-policy -- every Cargo.toml covered by its workspace's Cargo.lock; crate sources
+#                       registry-only (cargo metadata --locked); .cargo/config may not
+#                       override sources/registries/transport; cargo fetch --locked.
 #   * actions-pins   -- on EVERY PR: every NEWLY
 #                       ADDED executable reference (parsed from the YAML at the
 #                       merge-base and head, per file and per occurrence: step
@@ -46,6 +47,10 @@ name: Supply Chain
 on:
   pull_request:
     branches: [main]
+  # A merge queue requests the same required context for its temporary
+  # merge-group SHA; the scans then run against merge_group.base_sha/head_sha.
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -64,9 +69,13 @@ jobs:
       deps: ${{ steps.filter.outputs.deps }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
+          base: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           filters: |
             deps:
               - '**/package.json'
@@ -75,11 +84,14 @@ jobs:
               - '**/pnpm-lock.yaml'
               - '**/pnpm-workspace.yaml'
               - '**/.npmrc'
+              - '**/.pnpmfile.cjs'
               - '**/yarn.lock'
               - '**/bun.lock'
               - '**/bun.lockb'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
+              - '**/.cargo/config'
+              - '**/.cargo/config.toml'
               - '.github/workflows/**'
               - '**/action.yml'
               - '**/action.yaml'
@@ -104,8 +116,9 @@ jobs:
 
   install-policy:
     name: Lockfile integrity (cargo fetch --locked) + source policy
-    needs: changes
-    if: needs.changes.outputs.deps == 'true'
+    # Runs only after OSV has PASSED (see the pnpm repos' gate for the rationale).
+    needs: [changes, osv]
+    if: needs.changes.outputs.deps == 'true' && needs.osv.result == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -132,13 +145,86 @@ jobs:
           ACCEPT = set((sys.argv[1] if len(sys.argv) > 1 else "pnpm,npm").split(","))
           PRUNE = {"node_modules", "target", ".git", ".worktrees"}
           manifests, covered, refused = [], set(), []
+          # a symlinked manifest / lockfile / package-manager config is refused: the tools
+          # follow the link, but a change to its differently-named target would not be
+          # detected as a dependency change
+          SYMLINK_NAMES = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", ".pnpmfile.cjs", "Cargo.toml", "Cargo.lock", "yarn.lock", "bun.lock", "bun.lockb"}
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in PRUNE]
+              for f in files:
+                  if f in SYMLINK_NAMES and os.path.islink(os.path.join(root, f)):
+                      refused.append(os.path.normpath(os.path.join(root, f)) + " (symlink)")
+              for d in list(dirs):
+                  if d == ".cargo" and os.path.islink(os.path.join(root, d)): refused.append(os.path.normpath(os.path.join(root, d)) + " (symlinked .cargo dir)")
+              if os.path.basename(root) == ".cargo":
+                  for f in ("config", "config.toml"):
+                      if f in files and os.path.islink(os.path.join(root, f)): refused.append(os.path.normpath(os.path.join(root, f)) + " (symlink)")
           for root, dirs, files in os.walk("."):
               dirs[:] = [d for d in dirs if d not in PRUNE]
               rel = os.path.normpath(root)
               if "package.json" in files:
                   manifests.append(rel)
               if "package-lock.json" in files:
-                  (covered.add(rel) if "npm" in ACCEPT else refused.append(os.path.join(rel, "package-lock.json")))
+                  if "npm" in ACCEPT:
+                      covered.add(rel)
+                      try:
+                          import json, re as _re
+                          def ws_match(pattern, path):
+                              """npm/minimatch-style: `*`/`?` never cross `/`, `**` does, `{a,b}` alternates."""
+                              out, i = "", 0
+                              pattern = _re.sub(r"\{(\d+)\.\.(\d+)\}", lambda m: "{" + ",".join(str(i) for i in range(int(m.group(1)), int(m.group(2)) + 1)) + "}", pattern)   # {1..3}
+                              pattern = _re.sub(r"\{([A-Za-z])\.\.([A-Za-z])\}", lambda m: "{" + ",".join(chr(i) for i in range(ord(m.group(1)), ord(m.group(2)) + 1)) + "}", pattern)   # {a..c}
+                              while i < len(pattern):
+                                  c = pattern[i]
+                                  eg = _re.match(r"([@+*?!])\((.*?)\)", pattern[i:])     # extglobs @(a|b) +(x) *(x) ?(x) !(x)
+                                  if eg:
+                                      inner = "|".join(_re.escape(a) for a in eg.group(2).split("|"))
+                                      if eg.group(1) == "!": out += "(?:(?!(?:" + inner + ")(?:/|$))[^/]+)"   # one segment that is not any alternative
+                                      else: out += "(?:" + inner + ")" + {"@": "", "+": "+", "*": "*", "?": "?"}[eg.group(1)]
+                                      i += eg.end(); continue
+                                  if pattern.startswith("**/", i): out += "(?:.*/)?"; i += 3      # globstar spans zero or more directories
+                                  elif pattern.startswith("**", i): out += ".*"; i += 2
+                                  elif c == "*": out += "[^/]*"; i += 1
+                                  elif c == "?": out += "[^/]"; i += 1
+                                  elif c == "[":
+                                      j = pattern.find("]", i + 2)
+                                      if j == -1: out += _re.escape(c); i += 1
+                                      else:
+                                          cls = pattern[i + 1:j]
+                                          cls = ("^" + cls[1:]) if cls.startswith("!") else cls          # [!ab] -> [^ab]
+                                          out += "[" + cls.replace("\\", "\\\\") + "]"; i = j + 1
+                                  elif c == "{":
+                                      j = pattern.find("}", i)
+                                      if j == -1: out += _re.escape(c); i += 1
+                                      else: out += "(" + "|".join(_re.escape(a) for a in pattern[i + 1:j].split(",")) + ")"; i = j + 1
+                                  else: out += _re.escape(c); i += 1
+                              return _re.fullmatch(out, path) is not None
+                          lock = json.load(open(os.path.join(root, "package-lock.json")))
+                          pkgs = lock.get("packages") or {}
+                          ws = (json.load(open(os.path.join(root, "package.json"))) if os.path.exists(os.path.join(root, "package.json")) else {}).get("workspaces") or []
+                          if isinstance(ws, dict): ws = ws.get("packages") or []
+                          ws = [os.path.normpath(g) for g in ws if isinstance(g, str)]
+                          def ws_selected(path):
+                              """npm processes workspace patterns IN ORDER: the last matching pattern wins."""
+                              sel = False
+                              for g in ws:
+                                  if g.startswith("!"):
+                                      if ws_match(g[1:], path): sel = False
+                                  elif ws_match(g, path): sel = True
+                              return sel
+                          link_targets = {os.path.normpath(m["resolved"]) for m in pkgs.values() if isinstance(m, dict) and m.get("link") and isinstance(m.get("resolved"), str)}
+                          for key in pkgs:
+                              # an npm workspace member is covered only when the ROOT manifest
+                              # declares it (workspaces globs) AND the lock links to it -- a
+                              # handcrafted lock key alone grants nothing
+                              nk = os.path.normpath(key)
+                              if key and "node_modules/" not in key and not nk.startswith("..") and nk in link_targets \
+                                      and ws_selected(nk):
+                                  covered.add(os.path.normpath(os.path.join(rel, nk)))
+                      except (ValueError, OSError):
+                          pass                                                 # the verifier step rejects an unparseable lock
+                  else:
+                      refused.append(os.path.join(rel, "package-lock.json"))
               if "pnpm-lock.yaml" in files:
                   if "pnpm" in ACCEPT:
                       covered.add(rel)
@@ -191,6 +277,30 @@ jobs:
       # checksum-verifies the crates of THAT project.
       - name: Crate source policy + cargo fetch --locked (every Cargo.lock)
         run: |
+          # .cargo/config(.toml) is parsed as TOML and may not override crate
+          # sources, registries, or network transport (dotted keys included).
+          python3 - <<'CCP'
+          import os, sys, tomllib
+          # .cargo/config(.toml) can redirect crate fetching (source replacement,
+          # registries, registry.default, net.git-fetch-with-cli...) without touching
+          # Cargo.toml/Cargo.lock. Parsed as TOML (dotted keys included), any of those
+          # top-level tables is refused; benign tables (env, build, test, alias...) pass.
+          FORBIDDEN = {"source", "registries", "registry", "net", "http"}
+          bad = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in ("node_modules", "target", ".git")]
+              if os.path.basename(root) != ".cargo": continue
+              for f in ("config", "config.toml"):
+                  if f in files:
+                      p = os.path.join(root, f)
+                      try: cfg = tomllib.load(open(p, "rb"))
+                      except tomllib.TOMLDecodeError as e: bad.append(f"{p}: unparseable TOML ({e})"); continue
+                      hit = sorted(FORBIDDEN & set(cfg))
+                      if hit: bad.append(f"{p}: overrides {', '.join(hit)} -- crate sources/registries/network may only come from Cargo.toml + Cargo.lock")
+          if bad:
+              print("::error::Cargo configuration overrides are not allowed:"); print("\n".join("  " + b for b in bad)); sys.exit(1)
+          print("no Cargo source/registry/network overrides in any .cargo/config")
+          CCP
           cat > /tmp/cargo-sources.py <<'PY'
           import json, subprocess, sys, tomllib
           # Registry-only source policy for Cargo.lock (CAT-299 / ADR-0014). A path
@@ -223,7 +333,6 @@ jobs:
             n=$((n+1)); echo "== $lock"; ( cd "$(dirname "$lock")" && python3 /tmp/cargo-sources.py && cargo fetch --locked )
           done < <(find . \( -name node_modules -o -name target -o -name .git \) -prune -o -name 'Cargo.lock' -print | sort)
           echo "checked $n Cargo lockfile(s)"
-
   # Runs on EVERY PR (~10s): no path filter can know the custom filenames a
   # Docker action's runs.image may point at, so the script classifies every
   # changed file itself (local review gate, round 3).
@@ -236,12 +345,12 @@ jobs:
           fetch-depth: 0
       - name: Newly added actions must be pinned (structural YAML check)
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
           cat > /tmp/action-pins.py <<'PY'
-          import os, re, shlex, subprocess, sys, yaml
+          import json, os, re, shlex, subprocess, sys, yaml
           from collections import Counter
           # Newly-added-action pin policy (CAT-299 / ADR-0014). Structural, not textual:
           # every workflow (.github/workflows/*.yml) and every action manifest
@@ -269,11 +378,22 @@ jobs:
               line continuations; heredoc-bearing instructions fail closed; `ARG NAME=default` declared before a FROM is substituted
               ($NAME / ${NAME} / ${NAME:-fallback}); an unresolved variable stays in the
               ref and fails the digest check (fail closed)."""
-              esc = "\\"
+              esc, out, seen = "\\", [], set()
+              # Parser directives (Docker reference): only at the very top, one per line, no
+              # continuation; the block ENDS at the first empty line, ordinary comment,
+              # UNKNOWN directive (treated as a comment) or instruction -- a later
+              # `# syntax=` is then an inert comment. A directive given twice is invalid;
+              # refused rather than guessed (Codex local round, sync PRs).
               for raw in text.splitlines():
-                  m = re.match(r"\s*#\s*escape\s*=\s*(\S)", raw, re.I)
-                  if m: esc = m.group(1); continue
-                  if raw.strip() and not raw.lstrip().startswith("#"): break           # directives only precede instructions
+                  m = re.match(r"\s*#\s*([A-Za-z]+)\s*=\s*(\S+)\s*$", raw)
+                  if not m or m.group(1).lower() not in ("syntax", "escape", "check"): break
+                  key, val = m.group(1).lower(), m.group(2)
+                  if key in seen:
+                      if hard_fail is not None: hard_fail.add(f"{label}: parser directive `{key}` appears twice -- invalid Dockerfile, refused")
+                      break
+                  seen.add(key)
+                  if key == "escape": esc = val[0]
+                  elif key == "syntax": out.append("container:" + val)              # BuildKit frontend image: pulled and executed first
               logical, buf = [], ""
               for raw in text.splitlines():
                   if raw.lstrip().startswith("#"): continue
@@ -292,10 +412,17 @@ jobs:
               # move the script into a file ADDed from the context). The fleet has no
               # Dockerfile-backed action today, so the cost is zero and the bypass
               # surface is closed.
-              for line in logical:
-                  if re.match(r"\s*(ONBUILD\s+)?(RUN|COPY|ADD)\b", line, re.I):
+              for line in logical:                                   # HEAD: refuse heredocs; BASE: a heredoc-bearing base is
+
+                  m = re.match(r"\s*(?:ONBUILD\s+)?(?:RUN|COPY|ADD)\s+((?:--\S+\s+)*)(.*)$", line, re.I | re.S)
+                  if m:
+                      if m.group(2).lstrip().startswith("["):
+                          try:
+                              if isinstance(json.loads(m.group(2).strip()), list): continue   # JSON (exec) form: no shell, no heredoc
+                          except ValueError:
+                              pass                                                          # `RUN [ -e x ] || …` is shell form
                       try:
-                          lex = shlex.shlex(line, posix=False, punctuation_chars=True); lex.whitespace_split = True; toks = list(lex)
+                          lex = shlex.shlex(line, posix=False, punctuation_chars=True); lex.whitespace_split = True; lex.commenters = ""; toks = list(lex)
                       except ValueError:
                           toks = line.split()
                       if any("<<" in t and "<<<" not in t and not t.startswith(("'", '"')) for t in toks):   # `<<<` is a here-string, not a heredoc
@@ -303,32 +430,62 @@ jobs:
                           # a heredoc that already existed at the base must still fail the PR
                           if hard_fail is not None:
                               hard_fail.add(f"{label}: a RUN/COPY/ADD instruction uses a heredoc (`<<`) -- this gate refuses to parse heredocs; rewrite the instruction without one")
+                          # UNAVAILABLE for subtraction (fail closed): body text could otherwise
+                          # cancel a genuinely new reference, and such a base can only predate
+                          # this gate -- a cleanup PR must pin everything it keeps.
                           return []
-              args, stages, out, index = {}, set(), [], 0
-              def expand(v):
+              global_args, stage_args, stages, index = {}, {}, set(), 0
+              in_stage = False
+              def expand(v, scope):
                   v = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
-                             lambda m: (args.get(m.group(1)) or (m.group(2) if m.group(2) is not None else args.get(m.group(1), m.group(0)))) if m.group(2) is not None or m.group(1) in args else m.group(0), v)
-                  return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda m: args.get(m.group(1), m.group(0)), v)
+                             lambda m: (scope.get(m.group(1)) or (m.group(2) if m.group(2) is not None else scope.get(m.group(1), m.group(0)))) if m.group(2) is not None or m.group(1) in scope else m.group(0), v)
+                  return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda m: scope.get(m.group(1), m.group(0)), v)
               for line in logical:
                   m = re.match(r"\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?\s*$", line, re.I)
-                  if m: args[m.group(1)] = (m.group(2) or "").strip().strip("\"'"); continue
+                  if m:
+                      name, val = m.group(1), m.group(2)
+                      val = None if val is None else val.strip().strip("\"'")
+                      if not in_stage:
+                          global_args[name] = val or ""                              # pre-FROM: global default
+                      elif val is not None:
+                          stage_args[name] = val                                     # stage-local value
+                      else:
+                          stage_args[name] = global_args.get(name, "")               # valueless: inherits the GLOBAL default only
+                      continue
                   # COPY/ADD --from=X (instruction FLAGS only) and RUN --mount=...,from=X
                   # (inside the --mount option value only) pull X when it is not a stage;
                   # ordinary command text such as `RUN echo from=x` is never an image.
                   srcs = []
-                  fm = re.match(r"\s*(COPY|ADD)\s+((?:--\S+\s+)*)", line, re.I)
-                  if fm: srcs += re.findall(r"--from=(\S+)", fm.group(2))
-                  rm = re.match(r"\s*RUN\s+((?:--\S+\s+)*)", line, re.I)
+                  am = re.match(r"\s*(?:ONBUILD\s+)?ADD\s+((?:--\S+\s+)*)(.*)$", line, re.I | re.S)
+                  if am:
+                      flags, rest = am.group(1), am.group(2).strip()
+                      try: parts = json.loads(rest) if rest.startswith("[") else shlex.split(rest, posix=True)
+                      except ValueError: parts = rest.split()
+                      for src in parts[:-1]:                                             # last word is the destination
+                          src = expand(str(src), stage_args)
+                          if "$" in src:                                                 # ENV/unknown-variable source: cannot be judged -> refused
+                              out.append("container:ADD-UNRESOLVED-SOURCE(" + src + ")"); continue
+                          if re.match(r"(?i)^(https?://|git@|ssh://|git://)", src) or src.endswith(".git") or ".git#" in src:
+                              # remote content baked into the action image: a URL needs an
+                              # immutable --checksum=sha256:…, a git source is never pinned enough
+                              if re.match(r"(?i)^https://", src) and re.search(r"--checksum=sha256:[0-9a-f]{64}", flags): continue   # plaintext http is never acceptable
+                              out.append("container:ADD-REMOTE-UNPINNED(" + src + ")")
+                  fm = re.match(r"\s*(?:ONBUILD\s+)?(COPY|ADD)\s+((?:--\S+\s+)*)", line, re.I)
+                  if fm: srcs += [v.strip("'\"") for v in re.findall(r"--from=(\S+)", fm.group(2))]   # Docker removes quotes: --from="build"
+                  rm = re.match(r"\s*(?:ONBUILD\s+)?RUN\s+((?:--\S+\s+)*)", line, re.I)
                   if rm:
                       for mnt in re.findall(r"--mount=(\S+)", rm.group(1)):
-                          srcs += re.findall(r"(?:^|,)from=([^,]+)", mnt)
+                          mnt = mnt.strip("'\"")                         # --mount="from=img,target=/x" is valid BuildKit syntax
+                          srcs += [v.strip("'\"") for v in re.findall(r"(?:^|,)from=([^,]+)", mnt)]
                   for src in srcs:
-                      src = expand(src)
-                      if src.lower() not in stages and not (src.isdigit() and int(src) < index):
+                      src = expand(src, stage_args)                                  # instructions inside a stage see the stage scope
+                      onbuild = bool(re.match(r"\s*ONBUILD\b", line, re.I))   # a deferred trigger runs DOWNSTREAM: a stage name is an external image there
+                      if onbuild or (src.lower() not in stages and not (src.isdigit() and int(src) < index)):
                           out.append("container:" + src)
                   m = re.match(r"\s*FROM\s+((?:--\S+\s+)*)(\S+)(?:\s+AS\s+(\S+))?", line, re.I)
                   if not m: continue
-                  img, alias = expand(m.group(2)), m.group(3)
+                  img, alias = expand(m.group(2), global_args), m.group(3)            # FROM sees only global ARGs
+                  in_stage, stage_args = True, {}                                    # a new stage starts with an empty ARG scope
                   is_stage_index = img.isdigit() and int(img) < index
                   if img.lower() != "scratch" and img.lower() not in stages and not is_stage_index:
                       out.append("container:" + img)
@@ -438,18 +595,28 @@ jobs:
                       if not isinstance(job, dict): continue
                       if isinstance(job.get("uses"), str): add(job["uses"], job_level=True)
                       if isinstance(job.get("steps"), list): steps(job["steps"])
-                      c = image_ref(job.get("container"))
-                      if c: acc[c] += 1
+                      # an expression-valued image (`${{ matrix.image }}`, inputs, vars) is
+                      # unchanged text whose VALUE a PR can change elsewhere, so base/head
+                      # would cancel: it cannot be verified and fails closed at HEAD
+                      # (Codex round 8). Write the digest-pinned image literally.
+                      def image(v, what):
+                          c = image_ref(v)
+                          if c and "${{" in c:
+                              if rev == head: HARD_FAIL.add(f"{manifest_path or 'workflow'}: {what} image is an expression ({c[len('container:'):]}) -- the gate cannot verify what it resolves to; write the @sha256-pinned image literally")
+                              return
+                          if c: acc[c] += 1
+                      image(job.get("container"), "job container")
                       svcs = job.get("services")
                       if isinstance(svcs, dict):
-                          for sv in svcs.values():
-                              c = image_ref(sv)
-                              if c: acc[c] += 1
+                          for name, sv in svcs.items(): image(sv, f"service `{name}`")
               runs = doc.get("runs")
               if isinstance(runs, dict):
                   if isinstance(runs.get("steps"), list): steps(runs["steps"])
                   img = runs.get("image")
-                  if isinstance(img, str) and img.startswith("docker://"): acc[img.strip()] += 1
+                  if isinstance(img, str) and img.startswith("docker://"):
+                      if "${{" in img:
+                          if rev == head: HARD_FAIL.add(f"{manifest_path or 'action'}: runs.image is an expression ({img.strip()}) -- write the @sha256-pinned image literally")
+                      else: acc[img.strip()] += 1
                   elif isinstance(img, str) and img.strip():
                       # Dockerfile-backed action: GitHub builds it, so its FROM images run (round 3)
                       df = os.path.normpath(os.path.join(os.path.dirname(manifest_path), img.strip()))
@@ -469,6 +636,9 @@ jobs:
               if doc is not None: refs_of(rev, doc, acc, frozenset({path}), 0, path)
               return acc
           fail = 0; new = Counter()
+          for mpath in sorted(set(manifests_at(head)) | referenced_at(head)):
+              if is_symlink(head, mpath) and mpath not in SYMLINKED:
+                  print(f"::error::{mpath} is a symlink -- executable manifests and action image files must be real files (a change to the target would otherwise escape review)"); SYMLINKED.add(mpath)
           for b, h in changed_pairs():
               if h is None: continue                               # deleted file: nothing new runs
               new += refs_at(head, h) - (refs_at(base, b) if b else Counter())   # per file, per occurrence
