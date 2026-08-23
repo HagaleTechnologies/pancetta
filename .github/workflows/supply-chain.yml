@@ -717,7 +717,13 @@ jobs:
                           if re.match(r"(?i)^(https?://|git@[\w.-]+:|ssh://|git://)", src):
                               # remote content baked into the action image: a URL needs an
                               # immutable --checksum=sha256:…, a git source is never pinned enough
-                              if re.match(r"(?i)^https://", src) and re.search(r"--checksum=sha256:[0-9a-f]{64}", flags): continue   # plaintext http is never acceptable
+                              # unanchored re.search over the whole flags string let a single
+                              # token like --exclude=nomatch--checksum=sha256:<64hex> (no space
+                              # before --checksum, so still ONE --\S+ token) satisfy the check
+                              # via substring match even though it names --exclude, not
+                              # --checksum -- require a COMPLETE token to equal the checksum
+                              # flag exactly (Codex round, pancetta #291).
+                              if re.match(r"(?i)^https://", src) and any(re.fullmatch(r"--checksum=sha256:[0-9a-f]{64}", f) for f in flags.split()): continue   # plaintext http is never acceptable
                               out.append("container:ADD-REMOTE-UNPINNED(" + src + ")")
                   fm = re.match(r"\s*(?:ONBUILD\s+)?(COPY|ADD)\s+((?:--\S+\s+)*)", line, re.I)
                   if fm: srcs += [v.strip("'\"") for v in re.findall(r"--from=(\S+)", fm.group(2))]   # Docker removes quotes: --from="build"
