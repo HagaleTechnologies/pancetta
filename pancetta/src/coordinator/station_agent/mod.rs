@@ -4428,7 +4428,7 @@ mod tests {
 
     #[test]
     fn authorizations_filter_matches_only_this_agents_edges() {
-        let edges = vec![
+        let edges = [
             pancetta_cqdx::AuthorizationEdge {
                 id: "1".to_string(),
                 agent_key_id: "agent_this".to_string(),
@@ -4465,7 +4465,7 @@ mod tests {
     /// connection-admission filter (`agentKeyId` only) keeps ALL THREE.
     #[test]
     fn tx_arm_filter_excludes_delegated_edges_but_admission_filter_keeps_them() {
-        let edges = vec![
+        let edges = [
             // Owner edge, delegatedBy field entirely absent from the wire —
             // deserializes to `None` (mirrors `pancetta-cqdx`'s absent-field
             // fixture).

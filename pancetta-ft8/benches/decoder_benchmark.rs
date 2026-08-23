@@ -10,11 +10,12 @@
 // setup; sequential assignment reads clearer than a struct-update splat.
 #![allow(clippy::field_reassign_with_default)]
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 use pancetta_ft8::{
     Ft8Config, Ft8Decoder, NUM_SYMBOLS, SAMPLE_RATE, SYMBOL_DURATION, WINDOW_SAMPLES,
 };
 use std::f64::consts::PI;
+use std::hint::black_box;
 
 /// Generate synthetic FT8 signal for benchmarking
 fn generate_benchmark_signal(num_signals: usize, base_snr: f32, frequency_spread: f64) -> Vec<f32> {

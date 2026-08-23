@@ -2,8 +2,9 @@
 //!
 //! Run with: cargo bench
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
+use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
 use pancetta_ft8::{Ft8Config, Ft8Decoder};
+use std::hint::black_box;
 use std::time::Duration;
 
 /// Benchmark FT8 decoder with various signal conditions
