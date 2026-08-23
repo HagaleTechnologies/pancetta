@@ -143,8 +143,26 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
+      # google/osv-scanner-action's scanner/reporter run as Docker container
+      # actions, which only see $GITHUB_WORKSPACE (not $RUNNER_TEMP -- a host
+      # path the container can't reach), so scan outputs must live INSIDE the
+      # checkout. An unpredictable, per-run directory name means a PR cannot
+      # pre-commit a colliding tracked path, so the later `git checkout -f`
+      # (which only overwrites paths the target commit itself tracks) leaves it
+      # alone -- closing the tamperable-results-file gap without breaking the
+      # scan under a Docker action (Codex round, widdershins #219).
+      - name: "Prepare an unpredictable scan-output directory"
+        run: |
+          dir=".osv-scan-${GITHUB_RUN_ID}-${RANDOM}${RANDOM}"
+          mkdir -p "$dir"
+          echo "OSV_SCAN_DIR=$dir" >> "$GITHUB_ENV"
       - name: "Checkout base of the merge group"
         run: git checkout ${{ github.event.merge_group.base_sha }}
+      # Written under $RUNNER_TEMP, outside the checkout -- a PR that commits a
+      # tracked file literally named old-results.json would otherwise have it
+      # replace this step's genuine output the moment `git checkout -f` runs
+      # next, letting the reporter treat a PR-fabricated "no advisories"
+      # baseline as the real pre-PR scan (Codex round, widdershins #219).
       - name: "Run scanner on existing code"
         uses: google/osv-scanner-action/osv-scanner-action@baa4139e56d6312335d899e6ba045fa16d1d3d0b # v2.5.1
         env:
@@ -153,7 +171,7 @@ jobs:
         with:
           scan-args: |-
             --format=json
-            --output=old-results.json
+            --output=${{ env.OSV_SCAN_DIR }}/old-results.json
             -r
             ./
       - name: "Checkout head of the merge group"
@@ -166,16 +184,16 @@ jobs:
         with:
           scan-args: |-
             --format=json
-            --output=new-results.json
+            --output=${{ env.OSV_SCAN_DIR }}/new-results.json
             -r
             ./
       - name: "Run osv-scanner-reporter"
         uses: google/osv-scanner-action/osv-reporter-action@baa4139e56d6312335d899e6ba045fa16d1d3d0b # v2.5.1
         with:
           scan-args: |-
-            --output=results.sarif
-            --old=old-results.json
-            --new=new-results.json
+            --output=${{ env.OSV_SCAN_DIR }}/results.sarif
+            --old=${{ env.OSV_SCAN_DIR }}/old-results.json
+            --new=${{ env.OSV_SCAN_DIR }}/new-results.json
             --gh-annotations=true
             --fail-on-vuln=true
 
