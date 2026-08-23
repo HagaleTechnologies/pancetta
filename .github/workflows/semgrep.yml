@@ -6,8 +6,8 @@ on:
   push:
     branches:
       - main
-    paths:
-      - .github/workflows/semgrep.yml
+  merge_group:
+    types: [checks_requested]
   schedule:
     # random HH:MM to avoid a load spike on GitHub Actions at 00:00
     - cron: "12 15 * * *"
@@ -22,7 +22,22 @@ jobs:
       SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
     container:
       image: semgrep/semgrep@sha256:67319956da3dcb58baf5b322899c15458e3963e7018a86aeeb5cd224e69cb77a
-    if: (github.actor != 'dependabot[bot]')
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-      - run: semgrep ci
+      # GitHub withholds repo Actions secrets from a fork-triggered pull_request and (unless
+      # separately provisioned as a Dependabot secret) from Dependabot-authored runs -- either
+      # case leaves SEMGREP_APP_TOKEN empty here, and semgrep ci has no local --config fallback,
+      # so it would otherwise fail every fork PR's and every dependency-bump PR's check outright
+      # (Codex round, cqdx #360/panino #109/widdershins #234/pancetta #297/coppa #87). Skip
+      # gracefully instead of either excluding those authors up front (which silently drops the
+      # exact PRs -- especially Dependabot's -- this scanner most needs to cover) or letting the
+      # run fail hard. Once SEMGREP_APP_TOKEN is added as a Dependabot secret (not yet done --
+      # CAT-307 follow-up), Dependabot PRs start getting scanned automatically with no further
+      # change here.
+      - name: Run semgrep ci
+        run: |
+          if [ -z "$SEMGREP_APP_TOKEN" ]; then
+            echo "SEMGREP_APP_TOKEN not available (fork PR, or Dependabot secret not yet provisioned) -- skipping this run."
+            exit 0
+          fi
+          semgrep ci
