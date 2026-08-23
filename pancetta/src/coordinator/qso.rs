@@ -2230,55 +2230,80 @@ impl super::ApplicationCoordinator {
                         .unwrap_or_else(|| "20m".to_string())
                         .to_uppercase();
 
-                    let adif_exists = tokio::fs::try_exists(&adif_path).await.unwrap_or(false);
-                    // Set only on the migration-copy path -- cleaned up AFTER
-                    // querying `seeded` below, never before: on Windows (a real
-                    // deployment target, see AGENTS.md), deleting a file while
-                    // sqlx still holds it open is not the same safe no-op it is
-                    // on Unix, so the copy must outlive every query against it.
-                    let mut copy_to_clean_up: Option<std::path::PathBuf> = None;
-
-                    let seeded = if adif_exists {
-                        QsoDatabase::replay_from_adif(":memory:", &adif_path)
-                            .await
-                            .ok()
-                    } else {
-                        // Migration state (case 1 above, but under replay): no ADIF
-                        // yet, only a legacy on-disk qso.db. Seed from a throwaway
-                        // COPY of it instead of opening the real file directly --
-                        // `fs::copy` only ever READS db_path; every write lands on
-                        // the ephemeral destination, so the real SQLite directory
-                        // stays untouched. A hand-rolled unique path avoids adding
-                        // `tempfile` as a production dependency.
+                    // Seed from a throwaway COPY of the real db_path index --
+                    // `fs::copy` only ever READS db_path; every write lands on
+                    // the ephemeral destination, so the real SQLite directory
+                    // stays untouched. Used both for the migration state (no
+                    // ADIF yet) and as a fallback when an ADIF rebuild fails
+                    // (round 5 — mirrors case 3 above, which falls back to the
+                    // existing index the same way on the live/non-replay path).
+                    // A hand-rolled unique path avoids adding `tempfile` as a
+                    // production dependency.
+                    async fn seed_snapshot_of_legacy_db(
+                        db_path: &std::path::Path,
+                    ) -> (
+                        Option<pancetta_qso::async_database::QsoDatabase>,
+                        Option<std::path::PathBuf>,
+                    ) {
                         let tmp_path = std::env::temp_dir().join(format!(
                             "pancetta-replay-seed-{}-{}.db",
                             std::process::id(),
                             uuid::Uuid::new_v4()
                         ));
-                        match tokio::fs::copy(&db_path, &tmp_path).await {
-                            Ok(_) => {
-                                // `open`'s own WAL mode means recent writes can
-                                // still be sitting in `-wal` (not yet checkpointed
-                                // into the main file) — copy those sidecars too,
-                                // best-effort, or the snapshot can silently miss
-                                // the legacy db's most recent contacts. Missing
-                                // siblings (already checkpointed/cleanly closed)
-                                // are the common case and not an error.
-                                let _ = tokio::fs::copy(
-                                    db_path.with_extension("db-wal"),
-                                    tmp_path.with_extension("db-wal"),
-                                )
-                                .await;
-                                let _ = tokio::fs::copy(
-                                    db_path.with_extension("db-shm"),
-                                    tmp_path.with_extension("db-shm"),
-                                )
-                                .await;
-                                copy_to_clean_up = Some(tmp_path.clone());
-                                QsoDatabase::open(&tmp_path).await.ok()
-                            }
-                            Err(_) => None,
+                        if tokio::fs::copy(db_path, &tmp_path).await.is_err() {
+                            return (None, None);
                         }
+                        // `open`'s own WAL mode means recent writes can still be
+                        // sitting in `-wal` (not yet checkpointed into the main
+                        // file) — copy those sidecars too, best-effort, or the
+                        // snapshot can silently miss the legacy db's most recent
+                        // contacts. Missing siblings (already checkpointed/
+                        // cleanly closed) are the common case and not an error.
+                        let _ = tokio::fs::copy(
+                            db_path.with_extension("db-wal"),
+                            tmp_path.with_extension("db-wal"),
+                        )
+                        .await;
+                        let _ = tokio::fs::copy(
+                            db_path.with_extension("db-shm"),
+                            tmp_path.with_extension("db-shm"),
+                        )
+                        .await;
+                        let db = pancetta_qso::async_database::QsoDatabase::open(&tmp_path)
+                            .await
+                            .ok();
+                        (db, Some(tmp_path))
+                    }
+
+                    let adif_exists = tokio::fs::try_exists(&adif_path).await.unwrap_or(false);
+                    // Set whenever the legacy-copy path ran -- cleaned up AFTER
+                    // querying/closing `seeded` below, never before: on Windows
+                    // (a real deployment target, see AGENTS.md), deleting a file
+                    // while sqlx still holds it open is not the safe no-op it is
+                    // on Unix, so the copy must outlive every use of the handle.
+                    let mut copy_to_clean_up: Option<std::path::PathBuf> = None;
+
+                    let seeded = if adif_exists {
+                        match QsoDatabase::replay_from_adif(":memory:", &adif_path).await {
+                            Ok(db) => Some(db),
+                            Err(e) => {
+                                info!(
+                                    "Replay: ADIF rebuild failed ({}) — falling back to a \
+                                     snapshot of the existing index at {}",
+                                    e,
+                                    db_path.display(),
+                                );
+                                let (db, tmp) = seed_snapshot_of_legacy_db(&db_path).await;
+                                copy_to_clean_up = tmp;
+                                db
+                            }
+                        }
+                    } else {
+                        // Migration state (case 1 above, but under replay): no
+                        // ADIF yet, only a legacy on-disk qso.db.
+                        let (db, tmp) = seed_snapshot_of_legacy_db(&db_path).await;
+                        copy_to_clean_up = tmp;
+                        db
                     };
 
                     match seeded {
@@ -2295,6 +2320,14 @@ impl super::ApplicationCoordinator {
 
                             let band_grid_pairs = db.get_worked_bands_and_grids().await;
                             qso_lookup.seed_worked_grids_from_list(band_grid_pairs);
+
+                            // Explicitly await the pool's shutdown (round 5) --
+                            // relying on `Drop` doesn't wait for the underlying
+                            // connection workers to actually release the file,
+                            // which on Windows can turn the cleanup delete below
+                            // into a sharing-violation error, silently discarded,
+                            // leaking a copy in %TEMP% on every replay run.
+                            db.close().await;
                         }
                         None => {
                             info!(
@@ -2305,10 +2338,11 @@ impl super::ApplicationCoordinator {
                             );
                         }
                     }
-                    // `db` (if any) is dropped by here, closing its connection
-                    // pool -- now safe to delete the throwaway copy, if one was
-                    // made. Also removes any `-wal`/`-shm` sidecars `open`
-                    // created next to it (best-effort; harmless if absent).
+                    // Now safe to delete the throwaway copy, if one was made --
+                    // its `QsoDatabase` (if the open succeeded) was explicitly
+                    // closed above. Also removes any `-wal`/`-shm` sidecars
+                    // `open` created next to it (best-effort; harmless if
+                    // absent, including when the copy's `open` itself failed).
                     if let Some(tmp_path) = copy_to_clean_up {
                         let _ = tokio::fs::remove_file(&tmp_path).await;
                         let _ = tokio::fs::remove_file(tmp_path.with_extension("db-wal")).await;
@@ -7364,6 +7398,49 @@ mod replay_history_seed_tests {
             calls.contains(&"W9LEGACY".to_string()),
             "the real legacy db must be left intact: {:?}",
             calls
+        );
+    }
+
+    /// Round 5 (P2 Codex finding): a corrupt/unreadable `qsos.adi` must not
+    /// throw away a perfectly good existing index -- mirrors the live
+    /// (non-replay) case 3 path, which falls back to the existing index the
+    /// same way when a rebuild attempt fails.
+    #[tokio::test]
+    async fn replay_falls_back_to_the_legacy_index_when_adif_rebuild_fails() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pancetta_dir = tmp.path().join(".pancetta");
+        tokio::fs::create_dir_all(&pancetta_dir).await.unwrap();
+
+        // Non-UTF-8 bytes: `replay_from_adif`'s `read_to_string` fails
+        // outright, well before ADIF parsing even starts -- a real, if
+        // extreme, case of "adif_path exists but is unreadable."
+        tokio::fs::write(pancetta_dir.join("qsos.adi"), [0xFFu8, 0xFE, 0x00, 0x01])
+            .await
+            .unwrap();
+
+        let db_path = pancetta_dir.join("qso.db");
+        {
+            let db = QsoDatabase::open(&db_path).await.unwrap();
+            let mut progress = sample_progress("W8CORRUPT");
+            db.insert_qso(&progress).await.unwrap();
+            progress.state = QsoState::Completed {
+                their_callsign: "W8CORRUPT".to_string(),
+                their_report: -5,
+                our_report: -7,
+                frequency: FREQ_20M_HZ,
+                grid_square: None,
+                completed_at: chrono::Utc::now(),
+                duration_seconds: 60,
+            };
+            db.update_qso(&progress).await.unwrap();
+        }
+
+        let mut coordinator = test_coordinator_with_home(tmp.path()).await;
+        coordinator.start_qso_component().await.unwrap();
+
+        assert!(
+            wait_for_duplicate(&coordinator.cached_lookup, "W8CORRUPT", FREQ_20M_HZ).await,
+            "an unreadable ADIF must fall back to seeding from the existing legacy index"
         );
     }
 
