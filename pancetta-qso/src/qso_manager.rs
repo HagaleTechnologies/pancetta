@@ -659,6 +659,25 @@ pub fn admit_new_qso(
 }
 
 impl QsoManager {
+    /// Current true RF frequency for an audio-offset frequency, using the
+    /// live rig dial (+ split TX dial if active) -- the same `effective_tx_dial`
+    /// pattern used to stamp a Completed QSO's `metadata.frequency` (PAN-25).
+    /// Falls back to the bare offset when no dial source is available
+    /// (`dial == 0`, e.g. unit tests / no rig), matching that same stamping
+    /// fallback exactly, so a completed QSO whose frequency was never
+    /// dial-adjusted still compares consistently against a same-session
+    /// incoming (also un-adjusted) frequency.
+    fn current_rf_frequency(&self, audio_offset_hz: f64) -> f64 {
+        let rx_dial = self.dial_frequency_hz.load(Ordering::Relaxed);
+        let split = self.split_tx_frequency_hz.load(Ordering::Relaxed);
+        let dial = effective_tx_dial(rx_dial, split);
+        if dial > 0 {
+            audio_offset_hz + dial as f64
+        } else {
+            audio_offset_hz
+        }
+    }
+
     /// The parity our currently-active QSOs are committed to transmitting on,
     /// or `None` when idle.
     ///
@@ -1899,6 +1918,14 @@ impl QsoManager {
             let dial = effective_tx_dial(rx_dial, split);
             if dial > 0 {
                 metadata.frequency += dial as f64;
+                // PAN-25: `progress` (with the un-adjusted audio-offset
+                // frequency) was already inserted into `self.qsos` above --
+                // write the dial-adjusted value back so the STORED metadata
+                // matches what's emitted here, same reasoning as the
+                // `process_message_for_qso` completion path.
+                if let Some(stored) = self.qsos.write().await.get_mut(&qso_id) {
+                    stored.metadata.frequency = metadata.frequency;
+                }
             }
             self.emit_event(QsoEvent::QsoCompleted {
                 qso_id,
@@ -2682,18 +2709,28 @@ impl QsoManager {
             }
 
             let completed_metadata = if matches!(&new_state, QsoState::Completed { .. }) {
-                let mut m = progress.metadata.clone();
-                // `m.frequency` is the audio offset within the slot. The logged
-                // RF frequency is the rig dial plus that offset (WSJT-X logs the
-                // actual on-air frequency, not the dial). Without this the ADIF
-                // recorded BAND 0MHZ / FREQ ~0.001 from the bare offset.
+                // `progress.metadata.frequency` is the audio offset within the
+                // slot. The logged RF frequency is the rig dial plus that
+                // offset (WSJT-X logs the actual on-air frequency, not the
+                // dial). Without this the ADIF recorded BAND 0MHZ / FREQ
+                // ~0.001 from the bare offset.
+                //
+                // PAN-25 (Codex round-1 review of this fix): stamp the STORED
+                // metadata too, not just the locally-cloned copy used for the
+                // emitted event -- `find_qsos_for_message`'s recent-completed
+                // suppression compares `frequency_to_band` against this same
+                // field, and an un-stamped audio offset always maps to band
+                // "0MHZ" regardless of the real RF band, silently defeating
+                // that comparison. A Completed QSO is terminal (no further
+                // TX/QSY/Hound logic reads its audio offset), so replacing it
+                // in place with the true RF frequency is safe.
                 let rx_dial = self.dial_frequency_hz.load(Ordering::Relaxed);
                 let split = self.split_tx_frequency_hz.load(Ordering::Relaxed);
                 let dial = effective_tx_dial(rx_dial, split);
                 if dial > 0 {
-                    m.frequency += dial as f64;
+                    progress.metadata.frequency += dial as f64;
                 }
-                Some(m)
+                Some(progress.metadata.clone())
             } else {
                 None
             };
@@ -3829,8 +3866,18 @@ impl QsoManager {
             // legitimate new QSO on the new band is silently dropped. The
             // active arm above is intentionally left unscoped by band — an
             // active QSO can only exist on the band currently being decoded.
+            //
+            // PAN-25 round 1 (Codex): `frequency` here is an audio offset (a
+            // few hundred/thousand Hz), and so -- pre-fix -- was the stored
+            // `p.metadata.frequency` for a Completed QSO; comparing two audio
+            // offsets via `frequency_to_band` always yields the same "0MHZ"
+            // bucket regardless of the real RF band, silently defeating this
+            // check. A Completed QSO's `metadata.frequency` is now stamped
+            // with the true RF frequency (dial + offset) at completion time
+            // (see `process_message_for_qso`), so `frequency` must be
+            // adjusted the same way here for a fair comparison.
             let now = Utc::now();
-            let want_band = crate::utils::frequency_to_band(frequency);
+            let want_band = crate::utils::frequency_to_band(self.current_rf_frequency(frequency));
             let sender_has_other_active_or_recent_partner =
                 message_type.sender_callsign().is_some_and(|sender| {
                     qsos.values().any(|p| {
@@ -4367,6 +4414,12 @@ impl QsoManager {
 
     /// Explicit-`now` variant of [`Self::find_recently_completed_manual_qso_for`]
     /// (for testability — see its doc comment).
+    ///
+    /// PAN-25 (Codex round-1 review): `frequency` here is an audio offset,
+    /// but the COMPLETED QSOs this scans against now have their
+    /// `metadata.frequency` stamped with the true RF frequency (dial +
+    /// offset) at completion time — `frequency` must be adjusted the same
+    /// way for the band comparison below to mean anything.
     async fn find_recently_completed_manual_qso_for_at(
         &self,
         callsign: &str,
@@ -4374,7 +4427,7 @@ impl QsoManager {
         within: chrono::Duration,
         now: DateTime<Utc>,
     ) -> Option<QsoId> {
-        let want_band = crate::utils::frequency_to_band(frequency);
+        let want_band = crate::utils::frequency_to_band(self.current_rf_frequency(frequency));
         let key = callsign.to_uppercase();
         let ids = self.qsos_by_callsign.read().await.get(&key).cloned()?;
         let qsos = self.qsos.read().await;
@@ -4529,20 +4582,21 @@ impl QsoManager {
 
             // On completion, stamp reports/end-time and prepare the completed
             // metadata (with the real RF frequency = dial + offset) to log.
+            // PAN-25: stamp the STORED metadata in place (not just a local
+            // clone) -- see the matching comment in `process_message_for_qso`.
             let completed_metadata = if is_completed {
                 progress.metadata.reports = SignalReports {
                     sent: Some(our_report),
                     received: Some(their_report_val),
                 };
                 progress.metadata.end_time = Some(now);
-                let mut m = progress.metadata.clone();
                 let rx_dial = self.dial_frequency_hz.load(Ordering::Relaxed);
                 let split = self.split_tx_frequency_hz.load(Ordering::Relaxed);
                 let dial = effective_tx_dial(rx_dial, split);
                 if dial > 0 {
-                    m.frequency += dial as f64;
+                    progress.metadata.frequency += dial as f64;
                 }
-                Some(m)
+                Some(progress.metadata.clone())
             } else {
                 None
             };
@@ -7881,6 +7935,188 @@ mod tests {
         assert!(
             matches!(p_b.state, QsoState::WaitingForReport { .. }),
             "qso_b must advance — K1DEF's 20m completion must not reserve it on 40m, got {:?}",
+            p_b.state
+        );
+    }
+
+    /// PAN-25 round 1 (Codex): the test above proves the *comparison logic*
+    /// but supplies full RF frequencies (14074000.0, 7074000.0) directly as
+    /// `frequency` — in the live coordinator path `frequency` is always a
+    /// small AUDIO OFFSET (a few hundred/thousand Hz), and pre-this-round the
+    /// stored `metadata.frequency` for a Completed QSO was too, so
+    /// `frequency_to_band` returned the same "0MHZ" bucket for both
+    /// regardless of the real RF band — the fix looked correct but was
+    /// inert in production. This test uses realistic small offsets and a
+    /// shared dial-frequency source that changes between the two QSOs
+    /// (exactly the "operator changes bands" scenario PAN-25 describes),
+    /// proving the actual dial-adjustment mechanism the production code
+    /// path uses.
+    #[tokio::test]
+    async fn recently_completed_qso_on_a_different_dial_band_does_not_reserve_the_sender() {
+        let mut manager = QsoManager::new(test_config());
+        let dial = std::sync::Arc::new(AtomicU64::new(14_074_000)); // 20m
+        manager.set_dial_frequency_source(dial.clone());
+        let audio_offset = 1500.0; // realistic small in-passband offset
+
+        // Complete a full CQ exchange with K1DEF on 20m (dial 14.074 MHz).
+        let qso_a = manager.start_cq(audio_offset, None, false).await.unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                audio_offset,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -12,
+                },
+                "W1ABC K1DEF R-12".to_string(),
+                audio_offset,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                },
+                "W1ABC K1DEF 73".to_string(),
+                audio_offset,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        let completed = manager.get_qso(qso_a).await.unwrap();
+        assert!(matches!(completed.state, QsoState::Completed { .. }));
+        // The stored metadata must now hold the true RF frequency, not the
+        // bare audio offset.
+        assert_eq!(
+            completed.metadata.frequency,
+            14_074_000.0 + audio_offset,
+            "completed QSO's stored frequency must be stamped with dial + offset"
+        );
+
+        // Operator moves to 40m — a real dial change, within the grace window.
+        dial.store(7_074_000, Ordering::Relaxed);
+
+        // A NEW, unrelated CQ at the SAME small audio offset (plausible: the
+        // new CQ just happens to land in a similar spot in the passband).
+        let qso_b = manager
+            .start_cq(audio_offset + 5.0, None, false)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                audio_offset + 5.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+
+        let p_b = manager.get_qso(qso_b).await.unwrap();
+        assert!(
+            matches!(p_b.state, QsoState::WaitingForReport { .. }),
+            "qso_b must advance — K1DEF's 20m completion (different dial band) must not \
+             reserve it on 40m, got {:?}",
+            p_b.state
+        );
+    }
+
+    /// Companion to the test above: the SAME dial (no band change) must
+    /// still correctly suppress, proving the dial-adjustment doesn't
+    /// accidentally defeat the original PAN-14 same-band protection.
+    #[tokio::test]
+    async fn recently_completed_qso_on_the_same_dial_band_still_reserves_the_sender() {
+        let mut manager = QsoManager::new(test_config());
+        let dial = std::sync::Arc::new(AtomicU64::new(14_074_000)); // 20m, unchanged throughout
+        manager.set_dial_frequency_source(dial);
+        let audio_offset = 1500.0;
+
+        let qso_a = manager.start_cq(audio_offset, None, false).await.unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                audio_offset,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -12,
+                },
+                "W1ABC K1DEF R-12".to_string(),
+                audio_offset,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                },
+                "W1ABC K1DEF 73".to_string(),
+                audio_offset,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_a).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
+
+        let qso_b = manager
+            .start_cq(audio_offset + 5.0, None, false)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                audio_offset + 5.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+
+        let p_b = manager.get_qso(qso_b).await.unwrap();
+        assert!(
+            matches!(p_b.state, QsoState::CallingCq { .. }),
+            "qso_b must remain un-advanced — K1DEF is reserved by its recent same-band \
+             completion, got {:?}",
             p_b.state
         );
     }
