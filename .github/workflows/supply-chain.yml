@@ -99,10 +99,18 @@ jobs:
               - '**/dockerfile*'
               - '**/*.Dockerfile'
               - '**/*.dockerfile'
-  osv:
+  # The differential PR scan (osv-scanner-reusable-pr.yml) relies on
+  # GITHUB_BASE_REF to check out the base ref -- that variable is only
+  # populated for pull_request(_target) events and is EMPTY for merge_group,
+  # so calling it there checks out nothing and silently fails to compute a
+  # base scan (Codex round 1, pancetta #291). merge_group gets its own job
+  # running a full (non-diff) scan of the merge commit instead: every
+  # constituent PR was already diff-scanned before entering the queue, so a
+  # full scan here is a correct, simpler final gate, not a downgrade.
+  osv-pr:
     name: OSV advisories (incl. malicious-package MAL-*)
     needs: changes
-    if: needs.changes.outputs.deps == 'true'
+    if: needs.changes.outputs.deps == 'true' && github.event_name == 'pull_request'
     permissions:
       actions: read
       contents: read
@@ -114,11 +122,27 @@ jobs:
       upload-sarif: false
       fail-on-vuln: true
 
+  osv-merge-group:
+    name: OSV advisories (incl. malicious-package MAL-*) -- merge group
+    needs: changes
+    if: needs.changes.outputs.deps == 'true' && github.event_name == 'merge_group'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable.yml@8deb546fdb875b9996d27d4950be7312dac076a1 # v2.5.0
+    with:
+      upload-sarif: false
+      fail-on-vuln: true
+
   install-policy:
     name: Lockfile integrity (cargo fetch --locked) + source policy
     # Runs only after OSV has PASSED (see the pnpm repos' gate for the rationale).
-    needs: [changes, osv]
-    if: needs.changes.outputs.deps == 'true' && needs.osv.result == 'success'
+    needs: [changes, osv-pr, osv-merge-group]
+    if: |
+      needs.changes.outputs.deps == 'true' &&
+      (needs.osv-pr.result == 'success' || needs.osv-pr.result == 'skipped') &&
+      (needs.osv-merge-group.result == 'success' || needs.osv-merge-group.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -448,6 +472,10 @@ jobs:
               line continuations; heredoc-bearing instructions fail closed; `ARG NAME=default` declared before a FROM is substituted
               ($NAME / ${NAME} / ${NAME:-fallback}); an unresolved variable stays in the
               ref and fails the digest check (fail closed)."""
+              text = text.lstrip("\ufeff")   # Docker strips a leading BOM before parsing
+              # directives; a raw \ufeff before "#" would otherwise stop the directive
+              # regexes from matching a legitimate `# syntax=` on line 1 (Codex round 1,
+              # pancetta #291).
               esc, out, seen = "\\", [], set()
               # Parser directives (Docker reference): only at the very top, one per line, no
               # continuation; the block ENDS at the first empty line, ordinary comment,
@@ -540,7 +568,13 @@ jobs:
                           if "$" in src:
                               if hard_fail is not None: hard_fail.add(f"{label}: ADD source `{src}` uses a variable -- ENV can override any ARG (including from the base image), so the gate cannot know what is fetched; write the source literally")
                               continue
-                          if re.match(r"(?i)^(https?://|git@|ssh://|git://)", src) or src.endswith(".git") or ".git#" in src:
+                          # a bare local path/dirname ending in ".git" (e.g. a fixture named
+                          # "repo.git") is NOT a remote source -- Docker's own docs show git
+                          # sources ONLY via an explicit transport (git@host:, ssh://, git://)
+                          # or an http(s):// URL; there is no documented bare-hostname
+                          # shorthand for ADD, so `.endswith(".git")` alone over-matched local
+                          # paths (Codex round 1, pancetta #291).
+                          if re.match(r"(?i)^(https?://|git@[\w.-]+:|ssh://|git://)", src):
                               # remote content baked into the action image: a URL needs an
                               # immutable --checksum=sha256:…, a git source is never pinned enough
                               if re.match(r"(?i)^https://", src) and re.search(r"--checksum=sha256:[0-9a-f]{64}", flags): continue   # plaintext http is never acceptable
@@ -744,18 +778,22 @@ jobs:
   supply-chain:
     name: Supply Chain
     if: always()
-    needs: [changes, osv, install-policy, actions-pins]
+    needs: [changes, osv-pr, osv-merge-group, install-policy, actions-pins]
     runs-on: ubuntu-latest
     steps:
       - name: Gate
         env:
           CHANGES: ${{ needs.changes.result }}
           DEPS: ${{ needs.changes.outputs.deps }}
-          OSV: ${{ needs.osv.result }}
+          OSV_PR: ${{ needs.osv-pr.result }}
+          OSV_MG: ${{ needs.osv-merge-group.result }}
           POLICY: ${{ needs.install-policy.result }}
           PINS: ${{ needs.actions-pins.result }}
         run: |
-          echo "changes=$CHANGES deps=$DEPS osv=$OSV install-policy=$POLICY actions-pins=$PINS"
+          # exactly one of osv-pr/osv-merge-group runs per event (each is
+          # if-gated on github.event_name); the other reports 'skipped'.
+          OSV="$OSV_PR"; [ "$OSV" != skipped ] || OSV="$OSV_MG"
+          echo "changes=$CHANGES deps=$DEPS osv=$OSV (pr=$OSV_PR mg=$OSV_MG) install-policy=$POLICY actions-pins=$PINS"
           if [ "$CHANGES" != success ]; then
             echo "::error::dependency change detection did not succeed ($CHANGES)"; exit 1
           fi
