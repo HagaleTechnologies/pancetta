@@ -1040,6 +1040,15 @@ impl super::ApplicationCoordinator {
                 }
 
                 let mut slot_messages: Vec<pancetta_qso::DecodedMessageInfo> = Vec::new();
+                // PAN-38 round 1: qso_id -> cq_attempt_id for self-CQs whose
+                // `start_cq` succeeded but haven't yet been confirmed
+                // transmitted (see `QsoMessage::AutonomousCqOpened`). Entries
+                // are removed on the matching `TransmitComplete` (success or
+                // failure) so this never grows past the number of self-CQs
+                // genuinely in flight at once (in practice at most one or
+                // two, since a self-CQ only fires when idle).
+                let mut pending_self_cq_qsos: std::collections::HashMap<String, u64> =
+                    std::collections::HashMap::new();
                 // Task 15: coordinator-local edge-trigger baseline for the
                 // persistent tx.placement DiagnosticEvent, scoped to THIS
                 // task's own loop. Deliberately separate from the TUI-side
@@ -1956,6 +1965,50 @@ impl super::ApplicationCoordinator {
                                             ) => {
                                                 let mut op = operator.lock().await;
                                                 op.restore_cq_state_for_attempt(attempt_id);
+                                            }
+                                            // PAN-38 round 1: record the
+                                            // qso_id <-> attempt_id link for a
+                                            // self-CQ whose `start_cq`
+                                            // succeeded, so a later
+                                            // TransmitComplete failure for
+                                            // this exact QSO can be
+                                            // correlated back to it below.
+                                            MessageType::QsoMessage(
+                                                crate::message_bus::QsoMessage::AutonomousCqOpened {
+                                                    qso_id,
+                                                    attempt_id,
+                                                },
+                                            ) => {
+                                                pending_self_cq_qsos.insert(qso_id, attempt_id);
+                                            }
+                                            // PAN-38 round 1 (Codex): `start_cq`
+                                            // succeeding only means the QSO
+                                            // object was created and its
+                                            // opening MessageToSend handed to
+                                            // the TX worker -- the actual
+                                            // radio/CAT transmission can still
+                                            // fail, reported here. If it
+                                            // belongs to a still-pending
+                                            // self-CQ, roll back the same way
+                                            // a synchronous start_cq failure
+                                            // already does. Every completion
+                                            // (success or failure) for a
+                                            // tracked qso_id clears the entry
+                                            // either way, so this map never
+                                            // grows unbounded.
+                                            MessageType::TransmitComplete {
+                                                success,
+                                                qso_id: Some(qso_id),
+                                                ..
+                                            } => {
+                                                if let Some(attempt_id) =
+                                                    pending_self_cq_qsos.remove(&qso_id)
+                                                {
+                                                    if !success {
+                                                        let mut op = operator.lock().await;
+                                                        op.restore_cq_state_for_attempt(attempt_id);
+                                                    }
+                                                }
                                             }
                                             _ => {}
                                         }

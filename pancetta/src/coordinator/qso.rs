@@ -1190,6 +1190,34 @@ pub(crate) async fn emit_skip_diagnostic(message_bus: &MessageBus, site: SkipSit
     .await;
 }
 
+/// PAN-38 round 1 (Codex): tell the autonomous operator a self-CQ attempt
+/// never actually transmitted, so it rolls back the streak/offset it
+/// mutated speculatively for this attempt — same notification used for a
+/// downstream `start_cq` failure, but here for a self-CQ that never even
+/// reached `start_cq` (deferred by the cross-parity admission gate before
+/// dispatch). A pounce (`callsign: Some(_)`) has no such state to roll back,
+/// so `cq_attempt_id` is only ever `Some` for a genuine self-CQ.
+async fn notify_autonomous_cq_dispatch_failed_if_self_cq(
+    message_bus: &MessageBus,
+    callsign: &Option<String>,
+    cq_attempt_id: Option<u64>,
+) {
+    let (None, Some(attempt_id)) = (callsign, cq_attempt_id) else {
+        return;
+    };
+    let fail_msg = ComponentMessage::new(
+        ComponentId::Qso,
+        ComponentId::Autonomous,
+        MessageType::QsoMessage(crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
+            attempt_id,
+        }),
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(fail_msg).await {
+        warn!("Failed to send AutonomousCqDispatchFailed: {}", e);
+    }
+}
+
 #[cfg(test)]
 mod pan6_diagnostic_tests {
     use super::*;
@@ -3547,6 +3575,24 @@ impl super::ApplicationCoordinator {
                                                     },
                                                 )
                                                 .await;
+                                                // PAN-38 round 1: this self-CQ
+                                                // never reached `start_cq` at
+                                                // all (deferred here, before
+                                                // dispatch) -- no QSO or
+                                                // transmission was created,
+                                                // but the streak/offset
+                                                // `decide_at` mutated
+                                                // speculatively for this
+                                                // attempt is still live and
+                                                // must be rolled back the
+                                                // same way a downstream
+                                                // failure is.
+                                                notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                    &message_bus,
+                                                    &callsign,
+                                                    cq_attempt_id,
+                                                )
+                                                .await;
                                                 continue;
                                             }
                                             let result = match &callsign {
@@ -3603,11 +3649,47 @@ impl super::ApplicationCoordinator {
                                                          (auto-sequencing to completion)",
                                                         dx, frequency, qso_id
                                                     ),
-                                                    None => info!(
-                                                        target: "qso.autonomous",
-                                                        "Autonomous CQ QSO opened on {:.0} Hz: {}",
-                                                        frequency, qso_id
-                                                    ),
+                                                    None => {
+                                                        info!(
+                                                            target: "qso.autonomous",
+                                                            "Autonomous CQ QSO opened on {:.0} Hz: {}",
+                                                            frequency, qso_id
+                                                        );
+                                                        // PAN-38 round 1: record the
+                                                        // qso_id <-> attempt_id
+                                                        // association so the autonomous
+                                                        // coordinator can correlate a
+                                                        // later downstream TransmitComplete
+                                                        // failure (radio/CAT error) back to
+                                                        // this attempt — start_cq succeeding
+                                                        // here only means the QSO object was
+                                                        // created and handed to the TX
+                                                        // worker, not that it actually went
+                                                        // out over the air.
+                                                        if let Some(attempt_id) = cq_attempt_id
+                                                        {
+                                                            let opened_msg = ComponentMessage::new(
+                                                                ComponentId::Qso,
+                                                                ComponentId::Autonomous,
+                                                                MessageType::QsoMessage(
+                                                                    crate::message_bus::QsoMessage::AutonomousCqOpened {
+                                                                        qso_id: qso_id.to_string(),
+                                                                        attempt_id,
+                                                                    },
+                                                                ),
+                                                                Instant::now(),
+                                                            );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(opened_msg)
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send AutonomousCqOpened: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
+                                                    }
                                                 },
                                                 Err(e) => {
                                                     warn!(
@@ -3632,32 +3714,12 @@ impl super::ApplicationCoordinator {
                                                     // back the streak/offset
                                                     // it mutated speculatively
                                                     // for this attempt.
-                                                    // (A failed pounce has no
-                                                    // such state, so
-                                                    // `cq_attempt_id` is only
-                                                    // ever `Some` here.)
-                                                    if let (None, Some(attempt_id)) =
-                                                        (&callsign, cq_attempt_id)
-                                                    {
-                                                        let fail_msg = ComponentMessage::new(
-                                                            ComponentId::Qso,
-                                                            ComponentId::Autonomous,
-                                                            MessageType::QsoMessage(
-                                                                crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
-                                                                    attempt_id,
-                                                                },
-                                                            ),
-                                                            Instant::now(),
-                                                        );
-                                                        if let Err(e) =
-                                                            message_bus.send_message(fail_msg).await
-                                                        {
-                                                            warn!(
-                                                                "Failed to send AutonomousCqDispatchFailed: {}",
-                                                                e
-                                                            );
-                                                        }
-                                                    }
+                                                    notify_autonomous_cq_dispatch_failed_if_self_cq(
+                                                        &message_bus,
+                                                        &callsign,
+                                                        cq_attempt_id,
+                                                    )
+                                                    .await;
                                                 }
                                             }
                                         }
@@ -4363,6 +4425,16 @@ impl super::ApplicationCoordinator {
                                         // never routed back to this inbound loop.
                                         // Present only for match exhaustiveness.
                                         crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
+                                            ..
+                                        } => {}
+                                        // PAN-38 round 1: same reasoning —
+                                        // this component SENDS AutonomousCqOpened
+                                        // (see the StartAutonomousQso Ok arm
+                                        // above), addressed to
+                                        // ComponentId::Autonomous, never routed
+                                        // back here. Present only for match
+                                        // exhaustiveness.
+                                        crate::message_bus::QsoMessage::AutonomousCqOpened {
                                             ..
                                         } => {}
                                     }

@@ -3087,6 +3087,7 @@ impl super::ApplicationCoordinator {
                                                 success: false,
                                                 message_text,
                                                 duration_ms: 0,
+                                                qso_id: qso_id.clone(),
                                             },
                                             Instant::now(),
                                         );
@@ -3132,6 +3133,7 @@ impl super::ApplicationCoordinator {
                                                 success: false,
                                                 message_text,
                                                 duration_ms: 0,
+                                                qso_id: qso_id.clone(),
                                             },
                                             Instant::now(),
                                         );
@@ -3204,6 +3206,7 @@ impl super::ApplicationCoordinator {
                                                 success: false,
                                                 message_text,
                                                 duration_ms: 0,
+                                                qso_id: qso_id.clone(),
                                             },
                                             Instant::now(),
                                         );
@@ -3277,6 +3280,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text,
                                                     duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -3333,6 +3337,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text,
                                                         duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -3424,6 +3429,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text,
                                                         duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -3512,6 +3518,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text,
                                                     duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -3549,6 +3556,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text,
                                                     duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -3581,6 +3589,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text,
                                                     duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -3644,6 +3653,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text,
                                                     duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -4162,6 +4172,7 @@ impl super::ApplicationCoordinator {
                                                 success,
                                                 message_text,
                                                 duration_ms,
+                                                qso_id: qso_id.clone(),
                                             },
                                             Instant::now(),
                                         );
@@ -4236,6 +4247,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: item.message_text.clone(),
                                                         duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -4304,6 +4316,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: item.message_text.clone(),
                                                     duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -4376,6 +4389,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: item.message_text.clone(),
                                                     duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -4424,6 +4438,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: item.message_text.clone(),
                                                         duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -4505,6 +4520,7 @@ impl super::ApplicationCoordinator {
                                                 success: false,
                                                 message_text: item.message_text.clone(),
                                                 duration_ms: 0,
+                                                qso_id: item.qso_id.clone(),
                                             },
                                             Instant::now(),
                                         );
@@ -4567,6 +4583,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: text,
                                                         duration_ms: 0,
+                                                        qso_id: None, // bundle item; per-item qso_id not threaded through this loop
                                                     },
                                                     Instant::now(),
                                                 );
@@ -4660,6 +4677,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: item.message_text.clone(),
                                                         duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -4703,6 +4721,7 @@ impl super::ApplicationCoordinator {
                                                                     .message_text
                                                                     .clone(),
                                                                 duration_ms: 0,
+                                                                qso_id: item.qso_id.clone(),
                                                             },
                                                             Instant::now(),
                                                         );
@@ -4743,6 +4762,7 @@ impl super::ApplicationCoordinator {
                                                             success: false,
                                                             message_text: item.message_text.clone(),
                                                             duration_ms: 0,
+                                                            qso_id: item.qso_id.clone(),
                                                         },
                                                         Instant::now(),
                                                     );
@@ -4792,6 +4812,7 @@ impl super::ApplicationCoordinator {
                                                                         success: false,
                                                                         message_text: text,
                                                                         duration_ms: 0,
+                                                                        qso_id: None, // bundle item; per-item qso_id not threaded through this loop
                                                                     },
                                                                     Instant::now(),
                                                                 );
@@ -4909,6 +4930,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: item.message_text.clone(),
                                                     duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -5017,6 +5039,7 @@ impl super::ApplicationCoordinator {
                                                             success: false,
                                                             message_text: item.message_text.clone(),
                                                             duration_ms: 0,
+                                                            qso_id: item.qso_id.clone(),
                                                         },
                                                         Instant::now(),
                                                     );
@@ -5057,6 +5080,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: item.message_text.clone(),
                                                         duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -5104,6 +5128,7 @@ impl super::ApplicationCoordinator {
                                                                 success: false,
                                                                 message_text: text,
                                                                 duration_ms: 0,
+                                                                qso_id: None, // bundle item; per-item qso_id not threaded through this loop
                                                             },
                                                             Instant::now(),
                                                         );
@@ -5157,6 +5182,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: item.message_text.clone(),
                                                     duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -5193,6 +5219,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: item.message_text.clone(),
                                                     duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -5259,6 +5286,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: text,
                                                     duration_ms: 0,
+                                                    qso_id: None, // bundle item; per-item qso_id not threaded through this loop
                                                 },
                                                 Instant::now(),
                                             );
@@ -5505,6 +5533,7 @@ impl super::ApplicationCoordinator {
                                                 success,
                                                 message_text: text,
                                                 duration_ms,
+                                                qso_id: None, // bundle item; per-item qso_id not threaded through item_texts
                                             },
                                             Instant::now(),
                                         );

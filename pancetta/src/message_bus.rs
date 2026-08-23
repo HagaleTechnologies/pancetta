@@ -237,6 +237,16 @@ pub enum MessageType {
         success: bool,
         message_text: String,
         duration_ms: u64,
+        /// PAN-38 round 1 (Codex): the QSO this transmission belongs to, when
+        /// known at the emission site — `None` for a multi-item bundle (each
+        /// item's own `qso_id` isn't threaded through the shared
+        /// `item_texts` completion loop; not needed for PAN-38's own use
+        /// case, since a self-CQ's opening transmission is always a single
+        /// item, never a bundle) or a manual/tune TX with no QSO. Lets the
+        /// autonomous coordinator correlate a downstream transmit failure
+        /// back to the self-CQ attempt that dispatched it (see
+        /// [`QsoMessage::AutonomousCqOpened`]).
+        qso_id: Option<String>,
     },
 
     /// TX-active indicator for the TUI title-bar badge (Batch 93).
@@ -799,6 +809,17 @@ pub enum QsoMessage {
         /// The `cq_attempt_id` from the `StartAutonomousQso` that failed.
         attempt_id: u64,
     },
+    /// PAN-38 round 1 (Codex): `QsoManager::start_cq` SUCCEEDED for a
+    /// dispatched self-CQ (a QSO was opened, `qso_id` assigned, and its
+    /// opening `MessageToSend` handed to the TX worker) -- but the actual
+    /// radio/CAT transmission can still fail downstream, reported later as
+    /// `MessageType::TransmitComplete { success: false, .. }`, which carries
+    /// no `cq_attempt_id` (it isn't self-CQ-specific machinery). This lets
+    /// the autonomous coordinator task record the `qso_id` <-> `attempt_id`
+    /// association up front, so it can correlate a later matching
+    /// `TransmitComplete` failure back to this attempt and roll it back the
+    /// same way a synchronous `start_cq` failure already does.
+    AutonomousCqOpened { qso_id: String, attempt_id: u64 },
     /// Enable or disable Fox (DXpedition operator) mode.
     ///
     /// `on: true` — sets the `fox_mode` flag, starts a repeating CQ
