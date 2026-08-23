@@ -1900,6 +1900,10 @@ impl super::ApplicationCoordinator {
         // the operator's real log?" gate consults. Read once here; both the
         // upload subscriber and the LOCAL ADIF/DB writers below take it.
         let replay_mode = self.replay_mode();
+        // PAN-41 round 3: test-only override for where the replay-history-seed
+        // read (below) and the non-replay writers look for `~/.pancetta` --
+        // always `None` in production (see the field's own doc comment).
+        let pancetta_home_override = self.pancetta_home_override.clone();
         let upload_enabled = logbook_upload_enabled(
             clublog_cfg.enabled,
             qrz_cfg.enabled,
@@ -2015,17 +2019,20 @@ impl super::ApplicationCoordinator {
                     return Err(anyhow::anyhow!("QSO manager startup failed"));
                 }
 
+                // `pancetta_home_override` is always `None` in production (see its
+                // own doc comment) -- tests point it at an isolated temp dir so
+                // the replay-history-seed read below (and, outside replay, the
+                // real writers) never touch the operator's actual `~/.pancetta`.
+                let pancetta_home = pancetta_home_override
+                    .clone()
+                    .or_else(dirs::home_dir)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+
                 // Rebuildable SQLite index at ~/.pancetta/qso.db.
-                let db_path = dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".pancetta")
-                    .join("qso.db");
+                let db_path = pancetta_home.join(".pancetta").join("qso.db");
 
                 // ADIF source of truth at ~/.pancetta/qsos.adi.
-                let adif_path = dirs::home_dir()
-                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".pancetta")
-                    .join("qsos.adi");
+                let adif_path = pancetta_home.join(".pancetta").join("qsos.adi");
 
                 // Both LOCAL source-of-truth writers (ADIF appender + SQLite
                 // index) live behind one helper so the `--replay` suppression
@@ -2066,15 +2073,35 @@ impl super::ApplicationCoordinator {
                 // Seed worked-station history from the QSO database so that
                 // previously-worked stations are recognised as duplicates across restarts.
                 //
-                // Three-case startup decision:
+                // Three-case startup decision (non-replay only):
                 //   1. Migration: ADIF missing but legacy DB exists → dump DB to ADIF first
                 //      so contacts are not lost; future runs use ADIF as source of truth.
-                //   2. Replay: index missing or older than ADIF → drop + replay so duplicate
-                //      detection sees every prior contact.
+                //   2. Replay-rebuild: index missing or older than ADIF → drop + rebuild the
+                //      index so duplicate detection sees every prior contact.
                 //   3. Open as-is: normal startup; index is current.
-                {
-                    use pancetta_qso::async_database::QsoDatabase;
+                //
+                // Every path above is a write against the *real* `~/.pancetta/qsos.adi` /
+                // `qso.db` (`QsoDatabase::open` itself runs `PRAGMA`s and `CREATE TABLE IF
+                // NOT EXISTS`, a write-mode connection even on an already-current DB) — not
+                // anything derived from `--replay`'s capture-dir argument, so it's gated on
+                // `!replay_mode` (PAN-41).
+                //
+                // PAN-41 round 2: `--replay`'s own contract (coordinator/mod.rs,
+                // CHANGELOG.md) is "no writes to the real log, but still read history so
+                // DX-Hunter/duplicate scoring behaves like a live station" — skipping the
+                // seed entirely under replay contradicted that.
+                //
+                // PAN-41 round 3: a plain `mode=ro` connection against the real `db_path`
+                // (round 2's fix) still had two gaps -- it read stale/missing history
+                // instead of rebuilding like case 2 above, and SQLite's `mode=ro` can
+                // itself create `-wal`/`-shm` sidecar files against a WAL-mode db if
+                // they're missing, still a write under the real directory. The `else`
+                // branch below instead rebuilds fresh straight from the real ADIF (only
+                // ever read, never written) into a `:memory:` database — always current,
+                // and creates no file of any kind.
+                use pancetta_qso::async_database::QsoDatabase;
 
+                if !replay_mode {
                     // Determine the current band from the rig's operating frequency,
                     // falling back to "20m".  This is a best-effort seed — the
                     // autonomous operator will always re-validate against the live
@@ -2188,6 +2215,66 @@ impl super::ApplicationCoordinator {
                              until re-worked this session",
                             db_path.display(),
                         );
+                    }
+                } else {
+                    // Replay (round 3): seed from the real ADIF by rebuilding a
+                    // throwaway index in `:memory:` -- always fresh (unlike a
+                    // stale/missing real index, which a plain read-only connection
+                    // against `db_path` would silently miss) and creates no file
+                    // of any kind (no WAL/`-shm` sidecar risk against the real
+                    // directory, unlike `mode=ro` against a WAL-mode db). ADIF
+                    // itself is only ever read (see the block-level comment
+                    // above) -- nothing is written anywhere under `~/.pancetta`.
+                    //
+                    // Rounds 4-6 explored a "snapshot the legacy qso.db to a temp
+                    // file and seed from that" fallback for two narrow edge cases
+                    // (no ADIF yet -- an upgrading operator's migration state --
+                    // and an unreadable/corrupt ADIF). That fallback kept
+                    // surfacing genuinely new correctness/security gaps three
+                    // rounds running (WAL-sidecar staleness, non-atomic
+                    // multi-file copy racing a concurrent writer, pool-shutdown
+                    // ordering on Windows, world-readable temp-file permissions
+                    // on Unix) -- the per-PR review policy's own guidance for
+                    // that shape ("the same code region produces a genuinely new
+                    // bug shape on 3+ consecutive rounds... the abstraction
+                    // itself is wrong, not that you're almost done patching it")
+                    // is to change strategy rather than patch again. Both edge
+                    // cases are narrow (require replay AND a missing/corrupt
+                    // ADIF specifically) and their failure mode is already fully
+                    // graceful -- duplicate/DX-Hunter history simply starts
+                    // empty for that one run, exactly like any other seed-miss
+                    // here, never data loss or a crash. Given that, the
+                    // proportionate fix is to drop the fallback rather than keep
+                    // hardening it: seed from ADIF when it parses, otherwise log
+                    // and seed nothing.
+                    let freq_hz = operating_frequency_hz.load(std::sync::atomic::Ordering::Relaxed);
+                    let band = pancetta_cqdx::frequency_to_band(freq_hz)
+                        .unwrap_or_else(|| "20m".to_string())
+                        .to_uppercase();
+
+                    match QsoDatabase::replay_from_adif(":memory:", &adif_path).await {
+                        Ok(db) => {
+                            let callsigns = db.get_worked_callsigns(&band).await;
+                            if !callsigns.is_empty() {
+                                qso_lookup.seed_worked_from_list(&band, callsigns);
+                            }
+
+                            let band_callsign_pairs = db.get_worked_bands_and_callsigns().await;
+                            if !band_callsign_pairs.is_empty() {
+                                qso_lookup.seed_worked_dxcc_from_list(band_callsign_pairs);
+                            }
+
+                            let band_grid_pairs = db.get_worked_bands_and_grids().await;
+                            qso_lookup.seed_worked_grids_from_list(band_grid_pairs);
+                        }
+                        Err(e) => {
+                            info!(
+                                "Replay: no QSO history available to seed from {} ({}) — \
+                                 duplicate/DX-Hunter seeding starts empty for this run",
+                                adif_path.display(),
+                                e,
+                            );
+                        }
                     }
                 }
 
@@ -7065,6 +7152,254 @@ mod replay_local_log_tests {
     }
 }
 
+/// PAN-41 round 4: coverage for the actual replay-history-seed branch in
+/// `start_qso_component` (introduced round 2, revised rounds 3-4) —
+/// `replay_local_log_tests` above only proves the LOCAL WRITERS stay off
+/// under `--replay`; these tests prove the READ side actually seeds
+/// duplicate-detection state, from an isolated directory rather than the
+/// operator's real `~/.pancetta`.
+#[cfg(test)]
+mod replay_history_seed_tests {
+    use super::super::ApplicationCoordinator;
+    use pancetta_config::Config;
+    use pancetta_qso::async_database::QsoDatabase;
+    use pancetta_qso::priority::WorkedStationLookup;
+    use pancetta_qso::{GridSquares, QsoMetadata, QsoProgress, QsoState, SignalReports};
+    use std::collections::HashMap;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
+
+    /// 14.074 MHz — a real 20m FT8 frequency; `is_duplicate` and the seeding
+    /// code both resolve this to the "20M" band via their own (different,
+    /// but for this frequency equivalent) frequency→band helpers.
+    const FREQ_20M_HZ: f64 = 14_074_000.0;
+
+    async fn test_coordinator_with_home(home: &std::path::Path) -> ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut coordinator = ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None,                                                // no WAV
+            Some(std::path::PathBuf::from("/some/capture/dir")), // --replay
+            None,                                                // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed");
+        coordinator.pancetta_home_override = Some(home.to_path_buf());
+        coordinator
+    }
+
+    fn sample_progress(callsign: &str) -> QsoProgress {
+        QsoProgress {
+            state: QsoState::Idle,
+            state_history: vec![],
+            messages: vec![],
+            metadata: QsoMetadata {
+                qso_id: uuid::Uuid::new_v4(),
+                our_callsign: "W1ABC".to_string(),
+                their_callsign: Some(callsign.to_string()),
+                frequency: FREQ_20M_HZ,
+                mode: "FT8".to_string(),
+                start_time: chrono::Utc::now(),
+                end_time: None,
+                reports: SignalReports::default(),
+                grids: GridSquares::default(),
+                contest_info: None,
+                tags: HashMap::new(),
+                notes: None,
+                tx_parity: None,
+                initiated_by: Default::default(),
+                role: Default::default(),
+                call_count: 0,
+                first_call_at: None,
+                last_call_at: None,
+                progressed_this_cycle: false,
+                last_rx_text: None,
+                dx_repeat_count: 0,
+                hound: false,
+                partner_freq: None,
+                pending_freq_drift: None,
+                hound_qsyed: false,
+                remote_origin: false,
+                tx_parity_provisional: false,
+            },
+        }
+    }
+
+    /// The seeding work runs inside `start_qso_component`'s own spawned
+    /// task, not before it returns -- poll for up to ~5s (mirrors
+    /// `replay_local_log_tests::wait_for_adif_record`'s same rationale)
+    /// rather than assuming it's synchronous.
+    async fn wait_for_duplicate(
+        lookup: &crate::priority_evaluator::CachedStationLookup,
+        callsign: &str,
+        freq_hz: f64,
+    ) -> bool {
+        for _ in 0..100 {
+            if lookup.is_duplicate(callsign, freq_hz) {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        lookup.is_duplicate(callsign, freq_hz)
+    }
+
+    /// The primary path: a real ADIF in the override dir seeds duplicate
+    /// detection, and the operator's actual `~/.pancetta` (wherever this
+    /// test happens to run) is never consulted -- proven by the seed
+    /// succeeding purely off the isolated fixture.
+    #[tokio::test]
+    async fn replay_seeds_duplicate_detection_from_the_override_dir_adif() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pancetta_dir = tmp.path().join(".pancetta");
+        tokio::fs::create_dir_all(&pancetta_dir).await.unwrap();
+        tokio::fs::write(
+            pancetta_dir.join("qsos.adi"),
+            "Pancetta round-4 seed test\n\
+             <ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n\
+             <EOH>\n\
+             \n\
+             <CALL:5>K2DEF <QSO_DATE:8>20250101 <TIME_ON:6>120000 \
+             <MODE:3>FT8 <FREQ:9>14.074000 <BAND:3>20m\n\
+             <EOR>\n",
+        )
+        .await
+        .unwrap();
+
+        let mut coordinator = test_coordinator_with_home(tmp.path()).await;
+        coordinator.start_qso_component().await.unwrap();
+
+        assert!(
+            wait_for_duplicate(&coordinator.cached_lookup, "K2DEF", FREQ_20M_HZ).await,
+            "a replay run must seed duplicate detection from the (isolated) real ADIF"
+        );
+    }
+
+    /// Rounds 4-6 tried a "snapshot the legacy `qso.db` to a temp file and
+    /// seed from that" fallback for this exact scenario (no ADIF yet, only a
+    /// legacy on-disk `qso.db` -- an upgrading operator's migration state).
+    /// That fallback kept surfacing new correctness/security gaps three
+    /// rounds running, so it was dropped in favor of graceful degradation
+    /// (see the block-level comment in `qso.rs` for the full rationale) --
+    /// this proves the degradation is genuinely graceful: no panic, no
+    /// error, and the legacy db itself is left completely untouched.
+    #[tokio::test]
+    async fn replay_with_no_adif_but_a_legacy_db_starts_cleanly_without_seeding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pancetta_dir = tmp.path().join(".pancetta");
+        tokio::fs::create_dir_all(&pancetta_dir).await.unwrap();
+        let db_path = pancetta_dir.join("qso.db");
+        // No qsos.adi in pancetta_dir at all -- the migration state.
+
+        {
+            let db = QsoDatabase::open(&db_path).await.unwrap();
+            let mut progress = sample_progress("W9LEGACY");
+            db.insert_qso(&progress).await.unwrap();
+            progress.state = QsoState::Completed {
+                their_callsign: "W9LEGACY".to_string(),
+                their_report: -9,
+                our_report: -12,
+                frequency: FREQ_20M_HZ,
+                grid_square: None,
+                completed_at: chrono::Utc::now(),
+                duration_seconds: 90,
+            };
+            db.update_qso(&progress).await.unwrap();
+        }
+
+        let mut coordinator = test_coordinator_with_home(tmp.path()).await;
+        coordinator.start_qso_component().await.unwrap();
+
+        // Give the (non-)seeding a moment to settle, same window the
+        // positive-seeding tests give the spawned task, before asserting
+        // the negative.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !coordinator
+                .cached_lookup
+                .is_duplicate("W9LEGACY", FREQ_20M_HZ),
+            "with no ADIF, the legacy db alone must not be seeded from (dropped fallback)"
+        );
+        // The legacy db itself must be completely untouched.
+        let db = QsoDatabase::open(&db_path).await.unwrap();
+        let calls = db.get_worked_callsigns("20M").await;
+        assert!(
+            calls.contains(&"W9LEGACY".to_string()),
+            "the real legacy db must be left intact: {:?}",
+            calls
+        );
+    }
+
+    /// Same rationale as the test above: a corrupt/unreadable `qsos.adi`
+    /// (even with a legacy `qso.db` present) now degrades gracefully to "no
+    /// history seeded" rather than falling back to a copy of the legacy db.
+    #[tokio::test]
+    async fn replay_with_unreadable_adif_starts_cleanly_without_seeding() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pancetta_dir = tmp.path().join(".pancetta");
+        tokio::fs::create_dir_all(&pancetta_dir).await.unwrap();
+
+        // Non-UTF-8 bytes: `replay_from_adif`'s `read_to_string` fails
+        // outright, well before ADIF parsing even starts -- a real, if
+        // extreme, case of "adif_path exists but is unreadable."
+        tokio::fs::write(pancetta_dir.join("qsos.adi"), [0xFFu8, 0xFE, 0x00, 0x01])
+            .await
+            .unwrap();
+
+        let db_path = pancetta_dir.join("qso.db");
+        {
+            let db = QsoDatabase::open(&db_path).await.unwrap();
+            let mut progress = sample_progress("W8CORRUPT");
+            db.insert_qso(&progress).await.unwrap();
+            progress.state = QsoState::Completed {
+                their_callsign: "W8CORRUPT".to_string(),
+                their_report: -5,
+                our_report: -7,
+                frequency: FREQ_20M_HZ,
+                grid_square: None,
+                completed_at: chrono::Utc::now(),
+                duration_seconds: 60,
+            };
+            db.update_qso(&progress).await.unwrap();
+        }
+
+        let mut coordinator = test_coordinator_with_home(tmp.path()).await;
+        coordinator.start_qso_component().await.unwrap();
+
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        assert!(
+            !coordinator
+                .cached_lookup
+                .is_duplicate("W8CORRUPT", FREQ_20M_HZ),
+            "an unreadable ADIF must not seed from the legacy db either (dropped fallback)"
+        );
+    }
+
+    /// Neither an ADIF nor a legacy db exists (fresh install under
+    /// `--replay`) -- must not panic or error, just seed nothing.
+    #[tokio::test]
+    async fn replay_with_no_history_at_all_starts_cleanly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut coordinator = test_coordinator_with_home(tmp.path()).await;
+        coordinator.start_qso_component().await.unwrap();
+
+        assert!(
+            !coordinator
+                .cached_lookup
+                .is_duplicate("ANYONE", FREQ_20M_HZ),
+            "with no history at all, nothing should be seeded as a duplicate"
+        );
+    }
+}
+
 #[cfg(test)]
 mod respond_to_caller_admission_tests {
     //! PAN-23 round-2 (Codex review of PR #283): the backend guards added to
@@ -7140,10 +7475,16 @@ mod respond_to_caller_admission_tests {
     /// `.is_some()` matters to `replay_mode()`); the value mirrors
     /// `coordinator::mod`'s own replay-mode tests
     /// (`build_coordinator_with_replay`).
+    ///
+    /// PAN-41 round 4: `pancetta_home_override` points the replay-history-
+    /// seed read (which DOES still read real history by `--replay`'s own
+    /// contract — see `coordinator::health`'s `test_coordinator` sibling
+    /// copy for the full explanation) at an isolated, empty temp dir instead
+    /// of the operator's real `~/.pancetta`.
     async fn test_coordinator() -> ApplicationCoordinator {
         let config = Config::default();
         let shutdown = Arc::new(AtomicBool::new(false));
-        ApplicationCoordinator::new(
+        let mut coordinator = ApplicationCoordinator::new(
             config,
             None,
             true,  // no_audio
@@ -7158,7 +7499,15 @@ mod respond_to_caller_admission_tests {
             Vec::new(), // no config warnings
         )
         .await
-        .expect("coordinator creation should succeed")
+        .expect("coordinator creation should succeed");
+
+        coordinator.pancetta_home_override = Some(std::env::temp_dir().join(format!(
+            "pancetta-test-home-{}-{}",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        )));
+
+        coordinator
     }
 
     /// Drain the Tui channel (bounded crossbeam queue, not broadcast — a

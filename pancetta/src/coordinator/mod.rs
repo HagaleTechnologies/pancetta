@@ -835,6 +835,18 @@ pub struct ApplicationCoordinator {
     /// branches.
     pub(crate) replay_path: Option<PathBuf>,
 
+    /// PAN-41 round 3: test-only override for the `~/.pancetta` directory
+    /// `start_qso_component` otherwise always derives from `dirs::home_dir()`
+    /// -- including under `--replay`, whose own documented contract is to
+    /// still *read* the real ADIF/index for duplicate/DX-Hunter history
+    /// seeding (only writes are suppressed). Without this, an in-process
+    /// test that merely sets `replay_path` to a dummy value (to satisfy
+    /// `replay_mode()`) still reads whatever real `~/.pancetta/qsos.adi`
+    /// happens to exist on the machine running the test. Always `None` in
+    /// production (nothing outside `#[cfg(test)]` code ever sets it); test
+    /// helpers set this to an isolated temp dir.
+    pub(crate) pancetta_home_override: Option<PathBuf>,
+
     /// One-shot test transmission. If Some, after startup the coordinator
     /// injects a single TransmitRequest with this message text and shuts
     /// down on TransmitComplete. Used for hardware bench validation.
@@ -1674,6 +1686,7 @@ impl ApplicationCoordinator {
             metrics_port,
             wav_path,
             replay_path,
+            pancetta_home_override: None,
             test_tx,
             test_tx_offset,
             cached_lookup: std::sync::Arc::new(
