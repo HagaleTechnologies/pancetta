@@ -750,6 +750,22 @@ jobs:
               rc, out = sh("git", "show", f"{rev}:{path}"); return out if rc == 0 else None
           SYMLINKED = set()
           HARD_FAIL = set()   # unconditional HEAD failures (never subtracted against the base)
+          DEP_SYMLINK_NAMES = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", ".pnpmfile.cjs", "Cargo.toml", "Cargo.lock", "yarn.lock", "bun.lock", "bun.lockb"}
+          def check_dependency_symlinks(rev):
+              # `changes`'s paths-filter only fires install-policy when one of these exact
+              # PATHS shows a changed git blob -- a symlinked lockfile whose TARGET file is
+              # what the PR actually edits (the symlink itself untouched) never matches that
+              # filter, so install-policy (and its own, narrower symlink refusal) is skipped
+              # entirely; pnpm/npm/cargo transparently follow the symlink and read the new
+              # content regardless. This runs unconditionally, on every PR, like the rest of
+              # this script (Codex round, panino #101).
+              rc, out = sh("git", "ls-tree", "-r", rev)
+              if rc != 0: return
+              for line in out.splitlines():
+                  meta, _, path = line.partition("\t")
+                  if not path or not meta.split(): continue
+                  if meta.split()[0] == "120000" and os.path.basename(path) in DEP_SYMLINK_NAMES:
+                      HARD_FAIL.add(f"{path}: a dependency manifest/lockfile must not be a symlink -- its target could change without the path-filter that gates install-policy ever noticing")
           def load(rev, path):
               txt = show(rev, path)
               if txt is None: return None
@@ -842,6 +858,7 @@ jobs:
               if h is None: continue                               # deleted file: nothing new runs
               new += refs_at(head, h) - (refs_at(base, b) if b else Counter())   # per file, per occurrence
           if SYMLINKED: fail = 1
+          check_dependency_symlinks(head)
           for msg in sorted(HARD_FAIL): print(f"::error::{msg}"); fail = 1
           for ref in sorted(new):            # one verdict per distinct ref (a ref reached via a local action AND its own changed manifest is reported once)
               if ref.startswith("MISSING:"): fail = 1; continue
