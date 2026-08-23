@@ -200,15 +200,26 @@ jobs:
                                               inner = "|".join(_re.escape(a) for a in alts)
                                               out += guard("(?:(?!(?:" + inner + ")(?:/|$))[^/]+)")   # one segment that is not any alternative
                                           else:
-                                              rep = {"@": "", "+": "+", "*": "*", "?": "?"}[eg.group(1)]
                                               dotalts = [a for a in alts if a.startswith(".")]         # explicit -- not guarded
                                               rest = [a for a in alts if not a.startswith(".")]
-                                              parts = []
-                                              if dotalts: parts.append("(?:" + "|".join(_re.escape(a) for a in dotalts) + ")" + rep)
-                                              if rest:
-                                                  grp = "(?:" + "|".join(_re.escape(a) for a in rest) + ")" + rep
-                                                  parts.append(guard(grp))
-                                              out += "(?:" + "|".join(parts) + ")" if len(parts) > 1 else (parts[0] if parts else "(?!x)x")
+                                              mixed = "(?:" + "|".join(_re.escape(a) for a in alts) + ")"   # ANY alt, unguarded -- used
+                                              # once we are past the first character of the segment, so later
+                                              # repetitions of +()/*() may freely mix dotted and undotted
+                                              # alternatives (`+(.internal|x)` matches `.internalx` too --
+                                              # splitting into separately-repeated per-class groups broke this;
+                                              # Codex round, vanity #153).
+                                              def first_choice():
+                                                  parts = []
+                                                  if dotalts: parts.append("(?:" + "|".join(_re.escape(a) for a in dotalts) + ")")
+                                                  if rest: parts.append(guard("(?:" + "|".join(_re.escape(a) for a in rest) + ")"))
+                                                  return "(?:" + "|".join(parts) + ")" if len(parts) > 1 else (parts[0] if parts else "(?!x)x")
+                                              kind = eg.group(1)
+                                              if kind in ("@", "?"):
+                                                  out += first_choice() + ({"@": "", "?": "?"}[kind])
+                                              elif kind == "+":
+                                                  out += first_choice() + mixed + "*"
+                                              else:  # "*" -- zero or more, mixed freely once started
+                                                  out += "(?:" + first_choice() + mixed + "*)?"
                                           i += eg.end(); seg_start = False; continue
                                       if pattern.startswith("**/", i): out += "(?:(?!\\.)[^/]+/)*"; i += 3; seg_start = True; continue      # zero or more non-dot directories
                                       elif pattern.startswith("**", i): out += guard("(?:[^/]+(?:/(?!\\.)[^/]+)*)?"); i += 2; seg_start = False; continue
