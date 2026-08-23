@@ -2082,10 +2082,16 @@ impl super::ApplicationCoordinator {
                 // PAN-41 round 2: `--replay`'s own contract (coordinator/mod.rs,
                 // CHANGELOG.md) is "no writes to the real log, but still read history so
                 // DX-Hunter/duplicate scoring behaves like a live station" — skipping the
-                // seed entirely under replay contradicted that. The `else` branch below
-                // does a genuinely read-only (`mode=ro`) connection against the same real
-                // `db_path` -- no schema writes, no migration, no index rebuild -- and
-                // performs the exact same read-only seed queries as case 3 above.
+                // seed entirely under replay contradicted that.
+                //
+                // PAN-41 round 3: a plain `mode=ro` connection against the real `db_path`
+                // (round 2's fix) still had two gaps -- it read stale/missing history
+                // instead of rebuilding like case 2 above, and SQLite's `mode=ro` can
+                // itself create `-wal`/`-shm` sidecar files against a WAL-mode db if
+                // they're missing, still a write under the real directory. The `else`
+                // branch below instead rebuilds fresh straight from the real ADIF (only
+                // ever read, never written) into a `:memory:` database — always current,
+                // and creates no file of any kind.
                 use pancetta_qso::async_database::QsoDatabase;
 
                 if !replay_mode {
@@ -2204,15 +2210,20 @@ impl super::ApplicationCoordinator {
                         );
                     }
                 } else {
-                    // Replay: read-only seed from the real history so scoring matches a
-                    // live station, without migrating, rebuilding, or otherwise writing
-                    // anything (see the block-level comment above).
+                    // Replay (round 3): seed from the real ADIF by rebuilding a
+                    // throwaway index in `:memory:` -- always fresh (unlike a
+                    // stale/missing real index, which a plain read-only connection
+                    // against `db_path` would silently miss) and creates no file
+                    // of any kind (no WAL/`-shm` sidecar risk against the real
+                    // directory, unlike `mode=ro` against a WAL-mode db). ADIF
+                    // itself is only ever read (see the block-level comment
+                    // above) -- nothing is written anywhere under `~/.pancetta`.
                     let freq_hz = operating_frequency_hz.load(std::sync::atomic::Ordering::Relaxed);
                     let band = pancetta_cqdx::frequency_to_band(freq_hz)
                         .unwrap_or_else(|| "20m".to_string())
                         .to_uppercase();
 
-                    match QsoDatabase::open_read_only(&db_path).await {
+                    match QsoDatabase::replay_from_adif(":memory:", &adif_path).await {
                         Ok(db) => {
                             let callsigns = db.get_worked_callsigns(&band).await;
                             if !callsigns.is_empty() {
@@ -2229,9 +2240,9 @@ impl super::ApplicationCoordinator {
                         }
                         Err(e) => {
                             info!(
-                                "Replay: no read-only QSO history available at {} ({}) — \
+                                "Replay: no QSO history available to seed from {} ({}) — \
                                  duplicate/DX-Hunter seeding starts empty for this run",
-                                db_path.display(),
+                                adif_path.display(),
                                 e,
                             );
                         }
