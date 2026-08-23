@@ -1,4 +1,5 @@
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -926,6 +927,7 @@ impl super::ApplicationCoordinator {
             // logs-and-drops as a last resort.
             match &pending.message_type {
                 MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                    vfo,
                     ..
                 }) => {
                     warn!(
@@ -939,9 +941,15 @@ impl super::ApplicationCoordinator {
                     // uses, reused here (not reimplemented) so this
                     // SEPARATE overwrite site can't revert an already-
                     // retained NEWER pending command to a stale older one.
-                    if let Ok(mut slot) = self.hamlib_pending_frequency.lock() {
-                        if should_replace_pending_slot(&pending, slot.as_ref()) {
-                            *slot = Some(pending);
+                    //
+                    // PAN-35: keyed by the message's own VFO -- an older
+                    // VFO-A command draining through this fallback must
+                    // never clobber (or be judged against) a still-correct
+                    // pending VFO-B command, and vice versa.
+                    let vfo = frequency_vfo(*vfo);
+                    if let Ok(mut slots) = self.hamlib_pending_frequency.lock() {
+                        if should_replace_pending_slot(&pending, slots.get(&vfo)) {
+                            slots.insert(vfo, pending);
                         }
                     }
                 }
@@ -1318,8 +1326,11 @@ impl super::ApplicationCoordinator {
         // correctly compared against whatever the NEW generation applies,
         // since the compared `id`s are globally monotonic, not
         // per-generation.
-        let last_applied_frequency_id: Arc<std::sync::Mutex<Option<u64>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        // PAN-35: keyed by `pancetta_hamlib::Vfo` -- see that field's doc
+        // comment on `hamlib_pending_frequency` in `coordinator/mod.rs` for
+        // why a single shared value conflated VFO A and VFO B.
+        let last_applied_frequency_id: Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>> =
+            Arc::new(std::sync::Mutex::new(HashMap::new()));
         let last_applied_split_id: Arc<std::sync::Mutex<Option<u64>>> =
             Arc::new(std::sync::Mutex::new(None));
         let last_applied_frequency_id_for_polling = last_applied_frequency_id.clone();
@@ -1345,8 +1356,13 @@ impl super::ApplicationCoordinator {
         // `take_producer_mark_if_matching`'s doc comment for the full
         // reasoning. Same per-generation-fresh, per-kind-separate shape as
         // `last_applied_frequency_id`/`last_applied_split_id` above.
-        let producer_marked_frequency_id: Arc<std::sync::Mutex<Option<u64>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        // PAN-35: keyed by VFO, same reasoning as `last_applied_frequency_id`
+        // above -- otherwise a VFO-B handoff's mark could overwrite VFO-A's
+        // still-unretired one when `deliver_pending_hamlib_state` delivers
+        // both in the same pass, stranding VFO-A's in-flight increment.
+        let producer_marked_frequency_id: Arc<
+            std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let producer_marked_split_id: Arc<std::sync::Mutex<Option<u64>>> =
             Arc::new(std::sync::Mutex::new(None));
         let producer_marked_frequency_id_for_polling = producer_marked_frequency_id.clone();
@@ -1984,6 +2000,12 @@ impl super::ApplicationCoordinator {
                                         vfo,
                                         frequency,
                                     } => {
+                                        // PAN-35: which VFO this specific
+                                        // command targets -- every
+                                        // supersession/in-flight-mark check
+                                        // below is scoped to just this VFO's
+                                        // own tracking, never the other's.
+                                        let vfo_enum = frequency_vfo(*vfo);
                                         // PAN-19 round-11/12 review (Codex
                                         // P1): re-check supersession right
                                         // here, at the loop's single
@@ -1995,7 +2017,11 @@ impl super::ApplicationCoordinator {
                                         // `deliver_pending_hamlib_state`
                                         // can't see) still gets dropped
                                         // instead of applied.
-                                        if is_superseded(&message, &last_applied_frequency_id) {
+                                        if is_frequency_superseded(
+                                            &message,
+                                            vfo_enum,
+                                            &last_applied_frequency_id,
+                                        ) {
                                             // PAN-19 round-19 review (Codex
                                             // P1): "retire the handoff
                                             // marker when discarding stale
@@ -2008,8 +2034,9 @@ impl super::ApplicationCoordinator {
                                             // constructed on this
                                             // `continue` path), so retire
                                             // it here directly.
-                                            if take_producer_mark_if_matching(
+                                            if take_frequency_producer_mark_if_matching(
                                                 &message,
+                                                vfo_enum,
                                                 &producer_marked_frequency_id,
                                             ) {
                                                 hamlib_command_in_flight
@@ -2022,11 +2049,6 @@ impl super::ApplicationCoordinator {
                                             );
                                             continue;
                                         }
-                                        let vfo_enum = if *vfo == 0 {
-                                            pancetta_hamlib::Vfo::A
-                                        } else {
-                                            pancetta_hamlib::Vfo::B
-                                        };
                                         // PAN-19 round-15 review (Codex P1):
                                         // "keep TX muted until restored rig
                                         // state is applied". Only record
@@ -2074,18 +2096,20 @@ impl super::ApplicationCoordinator {
                                             // is a fresh send with nothing
                                             // to adopt, so count it
                                             // ourselves.
-                                            let _in_flight_guard = if take_producer_mark_if_matching(
-                                                &message,
-                                                &producer_marked_frequency_id,
-                                            ) {
-                                                HamlibCommandInFlightGuard::adopt(
-                                                    hamlib_command_in_flight.clone(),
-                                                )
-                                            } else {
-                                                HamlibCommandInFlightGuard::new(
-                                                    hamlib_command_in_flight.clone(),
-                                                )
-                                            };
+                                            let _in_flight_guard =
+                                                if take_frequency_producer_mark_if_matching(
+                                                    &message,
+                                                    vfo_enum,
+                                                    &producer_marked_frequency_id,
+                                                ) {
+                                                    HamlibCommandInFlightGuard::adopt(
+                                                        hamlib_command_in_flight.clone(),
+                                                    )
+                                                } else {
+                                                    HamlibCommandInFlightGuard::new(
+                                                        hamlib_command_in_flight.clone(),
+                                                    )
+                                                };
                                             match rig_poll.set_frequency(vfo_enum, *frequency).await
                                             {
                                                 Ok(()) => true,
@@ -2095,9 +2119,10 @@ impl super::ApplicationCoordinator {
                                                 }
                                             }
                                         };
-                                        finish_rig_command(
+                                        finish_frequency_command(
                                             io_ok,
                                             &message,
+                                            vfo_enum,
                                             &last_applied_frequency_id,
                                             &hamlib_pending_frequency_for_loop,
                                         );
@@ -2498,6 +2523,122 @@ impl super::ApplicationCoordinator {
     }
 }
 
+/// PAN-35 (round-16 review, Codex P2): maps a `SetFrequency` message's raw
+/// `vfo: u8` wire field to the physical VFO it targets. Single source for
+/// the `0 => A, else => B` convention every SetFrequency call site already
+/// used inline (the rig-I/O call below, and now the pending/supersession
+/// bookkeeping too) -- reused rather than duplicated so the two can never
+/// silently disagree about which VFO a given message means.
+fn frequency_vfo(vfo: u8) -> pancetta_hamlib::Vfo {
+    if vfo == 0 {
+        pancetta_hamlib::Vfo::A
+    } else {
+        pancetta_hamlib::Vfo::B
+    }
+}
+
+/// PAN-35 (round-16 review, Codex P2): the VFO-aware sibling of
+/// [`is_superseded`]. A single shared `last_applied_id` conflated VFO A and
+/// VFO B -- a newer VFO-A command applying would wrongly mark an older,
+/// still-correct, still-pending VFO-B command as superseded (changing A
+/// does not supersede B). Looks up only the entry for `vfo`, so each VFO's
+/// supersession history is tracked and compared independently.
+fn is_frequency_superseded(
+    message: &ComponentMessage,
+    vfo: pancetta_hamlib::Vfo,
+    last_applied_id: &std::sync::Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>>,
+) -> bool {
+    last_applied_id
+        .lock()
+        .ok()
+        .and_then(|last| last.get(&vfo).copied())
+        .is_some_and(|last_id| last_id > message.id)
+}
+
+/// PAN-35: the VFO-aware sibling of [`record_applied`].
+fn record_frequency_applied(
+    message: &ComponentMessage,
+    vfo: pancetta_hamlib::Vfo,
+    last_applied_id: &std::sync::Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>>,
+) {
+    if let Ok(mut last) = last_applied_id.lock() {
+        last.insert(vfo, message.id);
+    }
+}
+
+/// PAN-35: the VFO-aware sibling of [`finish_rig_command`]. Reuses
+/// [`should_replace_pending_slot`] unchanged (it only ever compared two
+/// messages by id, never cared about storage shape) against this VFO's own
+/// map entry, so a failed VFO-A retry can never be preserved over -- or
+/// clobbered by -- VFO-B's independent retry state.
+fn finish_frequency_command(
+    io_ok: bool,
+    message: &ComponentMessage,
+    vfo: pancetta_hamlib::Vfo,
+    last_applied_id: &std::sync::Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>>,
+    pending_slots: &std::sync::Arc<
+        std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>,
+    >,
+) {
+    if io_ok {
+        record_frequency_applied(message, vfo, last_applied_id);
+    } else if let Ok(mut slots) = pending_slots.lock() {
+        if should_replace_pending_slot(message, slots.get(&vfo)) {
+            slots.insert(vfo, message.clone());
+        }
+    }
+}
+
+/// PAN-35: the VFO-aware sibling of [`mark_in_flight_then_send`]. Marking
+/// the in-flight handoff under a single shared `producer_marked_id` (as
+/// `mark_in_flight_then_send` does for SetSplit, which has no VFO
+/// dimension) would let a VFO-B handoff overwrite VFO-A's still-unretired
+/// mark whenever both are delivered in the same
+/// `deliver_pending_hamlib_state` pass -- stranding VFO-A's
+/// `hamlib_command_in_flight` increment forever (the same failure class
+/// round 19 fixed for the single-slot case). Keying by `vfo` keeps the two
+/// handoffs' marks independent.
+#[allow(clippy::result_large_err)] // ComponentMessage returned so it can be requeued; see mark_in_flight_then_send's own allow.
+fn mark_frequency_in_flight_then_send(
+    message: ComponentMessage,
+    vfo: pancetta_hamlib::Vfo,
+    hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicU32>,
+    producer_marked_id: &std::sync::Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>>,
+    mut send: impl FnMut(ComponentMessage) -> Result<(), ComponentMessage>,
+) -> Result<(), ComponentMessage> {
+    hamlib_command_in_flight.fetch_add(1, Ordering::AcqRel);
+    if let Ok(mut marked) = producer_marked_id.lock() {
+        marked.insert(vfo, message.id);
+    }
+    match send(message) {
+        Ok(()) => Ok(()),
+        Err(returned) => {
+            hamlib_command_in_flight.fetch_sub(1, Ordering::AcqRel);
+            if let Ok(mut marked) = producer_marked_id.lock() {
+                marked.remove(&vfo);
+            }
+            Err(returned)
+        }
+    }
+}
+
+/// PAN-35: the VFO-aware sibling of [`take_producer_mark_if_matching`].
+fn take_frequency_producer_mark_if_matching(
+    message: &ComponentMessage,
+    vfo: pancetta_hamlib::Vfo,
+    producer_marked_id: &std::sync::Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>>,
+) -> bool {
+    let Ok(mut marked) = producer_marked_id.lock() else {
+        return false;
+    };
+    if marked.get(&vfo) == Some(&message.id) {
+        marked.remove(&vfo);
+        true
+    } else {
+        false
+    }
+}
+
 /// Deliver any pending `SetFrequency`/`SetSplit` command left over from a
 /// prior failed teardown replay (see `replay_or_fallback`) onto `sender`,
 /// instead of leaving it silently lost.
@@ -2579,9 +2720,16 @@ impl super::ApplicationCoordinator {
 ///
 /// PAN-19 round-12 review (Codex P1): hoisted out of
 /// `deliver_pending_hamlib_state` (was a nested fn there) so the message
-/// loop's own SetFrequency/SetSplit arms can share it as their pre-I/O
-/// supersession gate -- see those arms' comments, and [`record_applied`],
-/// for the post-I/O half of the mechanism (round 15).
+/// loop's own SetSplit arm can share it as its pre-I/O supersession gate --
+/// see that arm's comments, and [`record_applied`], for the post-I/O half
+/// of the mechanism (round 15).
+///
+/// PAN-35: SetFrequency no longer uses this directly -- a single shared
+/// `last_applied_id` conflated VFO A and VFO B (changing A wrongly
+/// superseded a pending B, or vice versa). Its VFO-keyed sibling,
+/// [`is_frequency_superseded`], does the same comparison scoped to one
+/// VFO's own tracking. Kept here, unchanged, for SetSplit (which has no
+/// VFO dimension).
 fn is_superseded(
     message: &ComponentMessage,
     last_applied_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
@@ -2775,25 +2923,38 @@ fn orphan_release_is_safe(confirmed_safe: bool, replacement_watchdog_alive: bool
 // call site -- allowed rather than forcing an artificial grouping.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn deliver_pending_hamlib_state(
-    pending_frequency: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    pending_frequency: &std::sync::Arc<
+        std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>,
+    >,
     pending_split: &std::sync::Arc<std::sync::Mutex<Option<ComponentMessage>>>,
-    last_applied_frequency_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+    last_applied_frequency_id: &std::sync::Arc<
+        std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>,
+    >,
     last_applied_split_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
     sender: &crossbeam_channel::Sender<ComponentMessage>,
     hamlib_command_in_flight: &std::sync::Arc<std::sync::atomic::AtomicU32>,
-    producer_marked_frequency_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
+    producer_marked_frequency_id: &std::sync::Arc<
+        std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>,
+    >,
     producer_marked_split_id: &std::sync::Arc<std::sync::Mutex<Option<u64>>>,
 ) {
-    if let Ok(mut slot) = pending_frequency.lock() {
-        if let Some(message) = slot.take() {
-            if is_superseded(&message, last_applied_frequency_id) {
+    // PAN-35: iterate every VFO with a pending command, not just one shared
+    // slot -- a pending VFO-A command and a pending VFO-B command are both
+    // delivered here, each judged against (and recorded into) only its own
+    // VFO's supersession/in-flight-mark tracking, so neither can supersede
+    // or clobber the other's independent retry state.
+    if let Ok(mut slots) = pending_frequency.lock() {
+        let mut retry = HashMap::new();
+        for (vfo, message) in slots.drain() {
+            if is_frequency_superseded(&message, vfo, last_applied_frequency_id) {
                 info!(
                     target: "rig",
                     "Hamlib restart: dropping a pending SetFrequency command superseded by a \
                      newer command that already went through -- not reverting good state"
                 );
-            } else if let Err(returned) = mark_in_flight_then_send(
+            } else if let Err(returned) = mark_frequency_in_flight_then_send(
                 message,
+                vfo,
                 hamlib_command_in_flight,
                 producer_marked_frequency_id,
                 |m| sender.try_send(m).map_err(|e| e.into_inner()),
@@ -2802,7 +2963,7 @@ fn deliver_pending_hamlib_state(
                     "Hamlib restart: failed to deliver pending SetFrequency command -- \
                      keeping it queued for the next attempt"
                 );
-                *slot = Some(returned);
+                retry.insert(vfo, returned);
             } else {
                 info!(
                     target: "rig",
@@ -2811,6 +2972,7 @@ fn deliver_pending_hamlib_state(
                 );
             }
         }
+        *slots = retry;
     }
     if let Ok(mut slot) = pending_split.lock() {
         if let Some(message) = slot.take() {
@@ -4259,6 +4421,14 @@ mod teardown_replay_tests {
         std::sync::Arc::new(std::sync::Mutex::new(None))
     }
 
+    /// The frequency sibling of `no_supersession()` -- PAN-35 keyed
+    /// `last_applied_frequency_id` by VFO, so its "nothing applied yet"
+    /// state is an empty map rather than `None`.
+    fn no_frequency_supersession(
+    ) -> std::sync::Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
     /// PAN-19 round-17 review (Codex P1), updated round-19 (now a count,
     /// not a boolean): a fresh, not-in-flight tracker for
     /// `deliver_pending_hamlib_state`'s `hamlib_command_in_flight` param --
@@ -4274,6 +4444,13 @@ mod teardown_replay_tests {
     /// this.
     fn no_producer_mark() -> std::sync::Arc<std::sync::Mutex<Option<u64>>> {
         std::sync::Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// The frequency sibling of `no_producer_mark()` -- PAN-35 keyed
+    /// `producer_marked_frequency_id` by VFO.
+    fn no_frequency_producer_mark(
+    ) -> std::sync::Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, u64>>> {
+        std::sync::Arc::new(std::sync::Mutex::new(HashMap::new()))
     }
 
     /// The exact mechanism: `try_send` on a full bounded channel returns
@@ -4460,7 +4637,7 @@ mod teardown_replay_tests {
             .hamlib_pending_frequency
             .lock()
             .unwrap()
-            .is_none());
+            .is_empty());
 
         let (sender, _receiver) = crossbeam_channel::bounded::<ComponentMessage>(1);
         sender
@@ -4472,11 +4649,11 @@ mod teardown_replay_tests {
             .await;
 
         assert!(
-            coordinator
+            !coordinator
                 .hamlib_pending_frequency
                 .lock()
                 .unwrap()
-                .is_some(),
+                .is_empty(),
             "a SetFrequency that couldn't be replayed must be queued, not dropped"
         );
     }
@@ -4653,7 +4830,11 @@ mod teardown_replay_tests {
     async fn deliver_pending_hamlib_state_sends_queued_commands_to_the_new_generation() {
         let coordinator = test_coordinator().await;
 
-        *coordinator.hamlib_pending_frequency.lock().unwrap() = Some(set_freq_msg());
+        coordinator
+            .hamlib_pending_frequency
+            .lock()
+            .unwrap()
+            .insert(pancetta_hamlib::Vfo::A, set_freq_msg());
         let split_msg = ComponentMessage::new(
             ComponentId::Hamlib,
             ComponentId::Hamlib,
@@ -4669,11 +4850,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &no_supersession(),
             &sender,
             &not_in_flight(),
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
 
@@ -4682,7 +4863,7 @@ mod teardown_replay_tests {
                 .hamlib_pending_frequency
                 .lock()
                 .unwrap()
-                .is_none(),
+                .is_empty(),
             "the pending frequency slot must be drained once delivered"
         );
         assert!(
@@ -4737,11 +4918,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &no_supersession(),
             &sender,
             &in_flight,
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
 
@@ -4774,11 +4955,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &no_supersession(),
             &sender,
             &in_flight,
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
 
@@ -4841,11 +5022,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &no_supersession(),
             &sender,
             &in_flight,
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &producer_marked_split_id,
         );
 
@@ -4890,11 +5071,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &no_supersession(),
             &sender,
             &in_flight,
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
 
@@ -5080,11 +5261,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &no_supersession(),
             &sender,
             &not_in_flight(),
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
 
@@ -5099,11 +5280,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &no_supersession(),
             &sender,
             &not_in_flight(),
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
 
@@ -5174,11 +5355,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &last_applied_split_id,
             &sender,
             &not_in_flight(),
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
 
@@ -5225,11 +5406,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &last_applied_split_id,
             &sender,
             &not_in_flight(),
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
 
@@ -5240,6 +5421,223 @@ mod teardown_replay_tests {
         assert!(
             receiver.try_recv().is_ok(),
             "a non-superseded pending command must land on the channel"
+        );
+    }
+
+    /// PAN-35 regression guard: `hamlib_pending_frequency` and
+    /// `last_applied_frequency_id` are keyed by VFO -- a pending VFO-B
+    /// command must survive a NEWER VFO-A command already having been
+    /// applied (changing A does not supersede B). Before this fix, a
+    /// single shared slot/tracker conflated the two VFOs, so this exact
+    /// scenario would have wrongly dropped the still-correct pending
+    /// VFO-B command as "superseded".
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_does_not_let_vfo_a_supersede_a_pending_vfo_b_command() {
+        let coordinator = test_coordinator().await;
+
+        // A pending VFO-B command, carried over from a prior failed replay.
+        let pending_b = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                vfo: 1,
+                frequency: 7_074_000,
+            }),
+            Instant::now(),
+        );
+        let pending_b_id = pending_b.id;
+        coordinator
+            .hamlib_pending_frequency
+            .lock()
+            .unwrap()
+            .insert(pancetta_hamlib::Vfo::B, pending_b);
+
+        // A NEWER VFO-A command has already been applied through the
+        // normal path -- recorded ONLY under VFO-A's own key, exactly what
+        // the real message loop's SetFrequency arm does.
+        let applied_a = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: 14_074_000,
+            }),
+            Instant::now(),
+        );
+        assert!(
+            applied_a.id > pending_b_id,
+            "test setup invariant: the applied VFO-A command must be genuinely newer"
+        );
+        let last_applied_frequency_id = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            pancetta_hamlib::Vfo::A,
+            applied_a.id,
+        )])));
+
+        let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &last_applied_frequency_id,
+            &no_supersession(),
+            &sender,
+            &not_in_flight(),
+            &no_frequency_producer_mark(),
+            &no_producer_mark(),
+        );
+
+        assert!(
+            coordinator
+                .hamlib_pending_frequency
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the pending VFO-B command must still be delivered (slot drained) -- a newer \
+             VFO-A command must never supersede it"
+        );
+        let delivered = receiver
+            .try_recv()
+            .expect("the pending VFO-B command must have been delivered onto the channel");
+        assert_eq!(
+            delivered.id, pending_b_id,
+            "the delivered message must be the SAME pending VFO-B command"
+        );
+    }
+
+    /// The mirror image of the test above: a pending VFO-A command must
+    /// survive a newer VFO-B command already having been applied.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_does_not_let_vfo_b_supersede_a_pending_vfo_a_command() {
+        let coordinator = test_coordinator().await;
+
+        let pending_a = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: 14_074_000,
+            }),
+            Instant::now(),
+        );
+        let pending_a_id = pending_a.id;
+        coordinator
+            .hamlib_pending_frequency
+            .lock()
+            .unwrap()
+            .insert(pancetta_hamlib::Vfo::A, pending_a);
+
+        let applied_b = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                vfo: 1,
+                frequency: 7_074_000,
+            }),
+            Instant::now(),
+        );
+        assert!(
+            applied_b.id > pending_a_id,
+            "test setup invariant: the applied VFO-B command must be genuinely newer"
+        );
+        let last_applied_frequency_id = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            pancetta_hamlib::Vfo::B,
+            applied_b.id,
+        )])));
+
+        let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &last_applied_frequency_id,
+            &no_supersession(),
+            &sender,
+            &not_in_flight(),
+            &no_frequency_producer_mark(),
+            &no_producer_mark(),
+        );
+
+        assert!(
+            coordinator
+                .hamlib_pending_frequency
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the pending VFO-A command must still be delivered (slot drained) -- a newer \
+             VFO-B command must never supersede it"
+        );
+        let delivered = receiver
+            .try_recv()
+            .expect("the pending VFO-A command must have been delivered onto the channel");
+        assert_eq!(
+            delivered.id, pending_a_id,
+            "the delivered message must be the SAME pending VFO-A command"
+        );
+    }
+
+    /// The flip side of the two tests above: genuine SAME-VFO supersession
+    /// must still work -- the VFO-keying fix must not accidentally disable
+    /// the original round-11/12 supersession protection. A pending VFO-A
+    /// command must still be dropped once a NEWER command for that SAME
+    /// VFO-A has already been applied.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn deliver_pending_hamlib_state_still_drops_a_stale_same_vfo_frequency_command() {
+        let coordinator = test_coordinator().await;
+
+        let stale_a = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: 14_078_000, // stale, wrong frequency
+            }),
+            Instant::now(),
+        );
+        coordinator
+            .hamlib_pending_frequency
+            .lock()
+            .unwrap()
+            .insert(pancetta_hamlib::Vfo::A, stale_a);
+
+        let newer_a = ComponentMessage::new(
+            ComponentId::Hamlib,
+            ComponentId::Hamlib,
+            MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                vfo: 0,
+                frequency: 14_074_000, // the correct, current frequency
+            }),
+            Instant::now(),
+        );
+        let last_applied_frequency_id = Arc::new(std::sync::Mutex::new(HashMap::from([(
+            pancetta_hamlib::Vfo::A,
+            newer_a.id,
+        )])));
+
+        let (sender, receiver) = crossbeam_channel::bounded::<ComponentMessage>(4);
+        deliver_pending_hamlib_state(
+            &coordinator.hamlib_pending_frequency,
+            &coordinator.hamlib_pending_split,
+            &last_applied_frequency_id,
+            &no_supersession(),
+            &sender,
+            &not_in_flight(),
+            &no_frequency_producer_mark(),
+            &no_producer_mark(),
+        );
+
+        assert!(
+            coordinator
+                .hamlib_pending_frequency
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "the stale same-VFO pending command must be dropped (cleared), not left queued"
+        );
+        assert!(
+            receiver.try_recv().is_err(),
+            "the stale same-VFO pending command must never be delivered onto the channel once \
+             a newer command for that SAME VFO has already been applied"
         );
     }
 
@@ -5381,8 +5779,9 @@ mod teardown_replay_tests {
         ));
         let tx_restart_inhibit = Arc::new(std::sync::atomic::AtomicU32::new(0));
         let hamlib_loop_ready = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let no_pending_frequency: Arc<std::sync::Mutex<Option<ComponentMessage>>> =
-            Arc::new(std::sync::Mutex::new(None));
+        let no_pending_frequency: Arc<
+            std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>,
+        > = Arc::new(std::sync::Mutex::new(HashMap::new()));
         let not_in_flight = Arc::new(std::sync::atomic::AtomicU32::new(0));
         assert!(
             super::super::tx::tx_hard_mute_reason(
@@ -5581,11 +5980,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &no_supersession(),
             &new_sender,
             &not_in_flight(),
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
 
@@ -5643,11 +6042,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &no_supersession(),
             &sender,
             &not_in_flight(),
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
         assert!(
@@ -5665,11 +6064,11 @@ mod teardown_replay_tests {
         deliver_pending_hamlib_state(
             &coordinator.hamlib_pending_frequency,
             &coordinator.hamlib_pending_split,
-            &no_supersession(),
+            &no_frequency_supersession(),
             &no_supersession(),
             &sender,
             &not_in_flight(),
-            &no_producer_mark(),
+            &no_frequency_producer_mark(),
             &no_producer_mark(),
         );
 

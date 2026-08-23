@@ -2413,7 +2413,9 @@ fn ptt_on_refusal(
     tx_policy: &Arc<std::sync::atomic::AtomicU8>,
     tx_restart_inhibit: &Arc<std::sync::atomic::AtomicU32>,
     hamlib_command_loop_ready: &Arc<std::sync::atomic::AtomicBool>,
-    hamlib_pending_frequency: &Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    hamlib_pending_frequency: &Arc<
+        std::sync::Mutex<std::collections::HashMap<pancetta_hamlib::Vfo, ComponentMessage>>,
+    >,
     hamlib_pending_split: &Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     hamlib_command_in_flight: &Arc<std::sync::atomic::AtomicU32>,
 ) -> Option<String> {
@@ -2437,6 +2439,15 @@ mod tui_relay_tests {
     /// a prior failed teardown replay).
     fn no_pending() -> Arc<std::sync::Mutex<Option<ComponentMessage>>> {
         Arc::new(std::sync::Mutex::new(None))
+    }
+
+    /// The frequency sibling of `no_pending()` -- PAN-35 keyed the
+    /// frequency pending slot by VFO, so its empty state is an empty map
+    /// rather than `None`.
+    fn no_pending_frequency(
+    ) -> Arc<std::sync::Mutex<std::collections::HashMap<pancetta_hamlib::Vfo, ComponentMessage>>>
+    {
+        Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()))
     }
 
     /// Not in flight -- the common case (no CAT call currently executing).
@@ -2465,7 +2476,7 @@ mod tui_relay_tests {
             &tx_policy,
             &tx_restart_inhibit,
             &hamlib_command_loop_ready,
-            &no_pending(),
+            &no_pending_frequency(),
             &no_pending(),
             &not_in_flight(),
         );
@@ -2505,7 +2516,7 @@ mod tui_relay_tests {
                 &tx_policy,
                 &tx_restart_inhibit,
                 &hamlib_command_loop_ready,
-                &no_pending(),
+                &no_pending_frequency(),
                 &pending_split,
                 &not_in_flight(),
             )
@@ -2523,7 +2534,7 @@ mod tui_relay_tests {
                 &tx_policy,
                 &tx_restart_inhibit,
                 &hamlib_command_loop_ready,
-                &no_pending(),
+                &no_pending_frequency(),
                 &pending_split,
                 &not_in_flight(),
             ),
@@ -2552,7 +2563,7 @@ mod tui_relay_tests {
                 &tx_policy,
                 &tx_restart_inhibit,
                 &hamlib_command_loop_ready,
-                &no_pending(),
+                &no_pending_frequency(),
                 &no_pending(),
                 &in_flight,
             )
@@ -2567,7 +2578,7 @@ mod tui_relay_tests {
                 &tx_policy,
                 &tx_restart_inhibit,
                 &hamlib_command_loop_ready,
-                &no_pending(),
+                &no_pending_frequency(),
                 &no_pending(),
                 &in_flight,
             ),
@@ -2589,7 +2600,7 @@ mod tui_relay_tests {
                 &tx_policy,
                 &tx_restart_inhibit,
                 &hamlib_command_loop_ready,
-                &no_pending(),
+                &no_pending_frequency(),
                 &no_pending(),
                 &not_in_flight(),
             ),
@@ -2597,6 +2608,47 @@ mod tui_relay_tests {
             "PTT-on must be permitted once TX policy allows it, restart isn't inhibiting, and \
              the Hamlib command loop has confirmed readiness"
         );
+    }
+
+    /// PAN-35 regression guard: a pending command for just ONE VFO must
+    /// still refuse a manual PTT key-up -- the pending slot is keyed by
+    /// VFO now, so `ptt_on_refusal` (via `tx_hard_mute_reason`) must check
+    /// the map as a whole rather than assuming a specific VFO's entry.
+    #[test]
+    fn ptt_on_refusal_blocks_a_key_up_while_either_vfo_alone_is_pending() {
+        let tx_policy = Arc::new(AtomicU8::new(pancetta_core::TxPolicy::Full.as_u8()));
+        let tx_restart_inhibit = Arc::new(AtomicU32::new(0));
+        let hamlib_command_loop_ready = Arc::new(AtomicBool::new(true));
+
+        for vfo in [pancetta_hamlib::Vfo::A, pancetta_hamlib::Vfo::B] {
+            let mut pending_frequency_map = std::collections::HashMap::new();
+            pending_frequency_map.insert(
+                vfo,
+                ComponentMessage::new(
+                    ComponentId::Hamlib,
+                    ComponentId::Hamlib,
+                    MessageType::RigControl(crate::message_bus::RigControlMessage::SetFrequency {
+                        vfo: if vfo == pancetta_hamlib::Vfo::A { 0 } else { 1 },
+                        frequency: 14_074_000,
+                    }),
+                    std::time::Instant::now(),
+                ),
+            );
+            let pending_frequency = Arc::new(std::sync::Mutex::new(pending_frequency_map));
+
+            assert!(
+                ptt_on_refusal(
+                    &tx_policy,
+                    &tx_restart_inhibit,
+                    &hamlib_command_loop_ready,
+                    &pending_frequency,
+                    &no_pending(),
+                    &not_in_flight(),
+                )
+                .is_some(),
+                "a pending command for {vfo:?} alone must still refuse a manual PTT key-up"
+            );
+        }
     }
 
     /// Batch 94: the relay's snapshot→banner mapping must carry every
