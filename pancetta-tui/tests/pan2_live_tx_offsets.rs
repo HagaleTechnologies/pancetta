@@ -429,8 +429,8 @@ fn marker_row(buf: &Buffer) -> String {
             r.contains('\u{2502}')
                 && !r.starts_with("QSO: ")
                 && !r.contains("NEXT TX")
-                && r.contains("Hz") == false
-                && r.contains('@') == false
+                && !r.contains("Hz")
+                && !r.contains('@')
                 && (r.contains("JA1ABC") || r.contains("K1ABC"))
         })
         .unwrap_or_else(|| "<<no marker row>>".into())

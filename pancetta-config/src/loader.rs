@@ -997,8 +997,10 @@ report_decodes = true
         let parsed = loader
             .parse_toml(toml_content)
             .expect("partial [network.psk_reporter] table must now parse");
-        let mut expected = crate::network::PskReporterConfig::default();
-        expected.enabled = true;
+        let expected = crate::network::PskReporterConfig {
+            enabled: true,
+            ..Default::default()
+        };
         assert_eq!(
             parsed.network.psk_reporter.enabled, expected.enabled,
             "the one field present in the table must be honored"
@@ -1024,9 +1026,11 @@ token   = "pat_xxx"
         let parsed = loader
             .parse_toml(toml_content)
             .expect("partial [network.cqdx] table must parse");
-        let mut expected = crate::network::CqdxConfig::default();
-        expected.enabled = true;
-        expected.token = Some("pat_xxx".to_string());
+        let expected = crate::network::CqdxConfig {
+            enabled: true,
+            token: Some("pat_xxx".to_string()),
+            ..Default::default()
+        };
         assert_eq!(
             toml::to_string(&parsed.network.cqdx).unwrap(),
             toml::to_string(&expected).unwrap(),

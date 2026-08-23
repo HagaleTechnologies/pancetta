@@ -9496,9 +9496,9 @@ mod sender_verification_tests {
         let mut events = manager.subscribe();
         let qso_id = manager
             .engage_hound(
-                "D2UY".into(),
+                "D2UY",
                 1800.0,
-                Some("JI64".into()),
+                Some("JI64"),
                 Some(pancetta_core::slot::SlotParity::Even),
             )
             .await

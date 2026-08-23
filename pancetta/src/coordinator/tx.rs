@@ -6758,7 +6758,7 @@ mod supersede_rekey_tests {
         let ptt_active = Arc::new(AtomicBool::new(true));
         let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
 
-        let in_flight = vec![crate::message_bus::TransmitRequestItem {
+        let in_flight = [crate::message_bus::TransmitRequestItem {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
@@ -6965,7 +6965,7 @@ mod supersede_rekey_tests {
             );
             let ptt_active = Arc::new(AtomicBool::new(true));
             let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
-            let in_flight = vec![crate::message_bus::TransmitRequestItem {
+            let in_flight = [crate::message_bus::TransmitRequestItem {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1000.0,
                 qso_id: Some("qso-1".to_string()),
@@ -7101,7 +7101,7 @@ mod supersede_rekey_tests {
         let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
 
         // The bundle currently on the air.
-        let in_flight = vec![crate::message_bus::TransmitRequestItem {
+        let in_flight = [crate::message_bus::TransmitRequestItem {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
@@ -7195,7 +7195,7 @@ mod supersede_rekey_tests {
     fn bundle_add_succeeds_when_frequencies_are_well_separated() {
         let mut encoder = super::Ft8Encoder::new();
         let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
-        let in_flight = vec![crate::message_bus::TransmitRequestItem {
+        let in_flight = [crate::message_bus::TransmitRequestItem {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),
@@ -7231,7 +7231,7 @@ mod supersede_rekey_tests {
     fn bundle_add_falls_back_when_frequencies_collide() {
         let mut encoder = super::Ft8Encoder::new();
         let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
-        let in_flight = vec![crate::message_bus::TransmitRequestItem {
+        let in_flight = [crate::message_bus::TransmitRequestItem {
             message_text: "KA1ABC K5ARH R-15".to_string(),
             frequency_offset: 1000.0,
             qso_id: Some("qso-1".to_string()),

@@ -18,10 +18,12 @@ const HEADER: &str = "\
 ";
 
 fn render_defaults_toml() -> String {
-    let mut cfg = Config::default();
     // metadata carries a fresh uuid + timestamp per construction — per-run
     // noise, not schema. Config's serde skips it when None.
-    cfg.metadata = None;
+    let cfg = Config {
+        metadata: None,
+        ..Default::default()
+    };
     // Route through `toml::Value` (not `toml::to_string_pretty(&cfg)` directly)
     // before rendering. `Config::ui::keyboard::shortcuts` is a
     // `HashMap<String, KeyboardShortcut>` (pancetta-config/src/ui.rs); serde's
@@ -77,8 +79,10 @@ fn generated_defaults_round_trip() {
     // to what produced it — guards against serialize-only fields.
     let text = render_defaults_toml();
     let reparsed: Config = toml::from_str(&text).expect("generated defaults.toml must parse");
-    let mut original = Config::default();
-    original.metadata = None;
+    let original = Config {
+        metadata: None,
+        ..Default::default()
+    };
     let mut reparsed = reparsed;
     reparsed.metadata = None;
     assert_eq!(stable_toml(&reparsed), stable_toml(&original));
