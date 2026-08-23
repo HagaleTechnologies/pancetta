@@ -561,11 +561,33 @@ impl Ft8Encoder {
                     call
                 ))
             })?;
-            if let Some(grid) = parts.get(2) {
+            if let Some(&third) = parts.get(2) {
+                // PAN-26: only a genuine grid locator is safe to drop (the
+                // icq shape has no field for it, but a distinct "bare CQ"
+                // frame is still an honest degrade). Anything else (a
+                // mistyped grid, or an unrelated exchange field like
+                // "RR73") must fail loudly instead of silently discarding
+                // it — dropping it here would transmit an unrelated, valid-
+                // looking bare CQ instead of the requested message.
+                //
+                // Reserved close/report tokens are checked FIRST and
+                // rejected outright, even though "RR73" happens to also
+                // satisfy `extra_is_grid_locator`'s pure shape check (R is
+                // a valid Maidenhead letter, so "RR73" parses as a
+                // syntactically valid grid) — a CQ frame never legitimately
+                // carries one of these, so treating it as a grid would
+                // silently launder an obvious mistake into a different,
+                // valid-looking message.
+                if matches!(third, "RRR" | "RR73" | "73") || !extra_is_grid_locator(third) {
+                    return Err(Ft8Error::MessageDecodingError(format!(
+                        "'{}' is not a valid grid locator for a compound-callsign CQ",
+                        third
+                    )));
+                }
                 debug!(
                     "i3=4 CQ encode: dropping grid '{}' (icq shape has no room \
                      for it) for '{}'",
-                    grid, text
+                    third, text
                 );
             }
             return Ok(pack_nonstandard(0, n58, 0, 0, 1));
@@ -1323,9 +1345,44 @@ fn pack_eu_vhf_14bit(exchange: &str) -> u16 {
 /// decode side's own shape rule, `Ft8Message::looks_like_callsign`
 /// (message.rs's suffix-letters-after-the-last-digit check), so the two
 /// paths agree on what a plausible callsign looks like.
+///
+/// PAN-22 (round 3+ finding): a trailing `/<digits>` is the call-area
+/// reassignment convention (`K1ABC/4`, `W1AW/8`) — `pack28` only special-
+/// cases `/P`/`/R`, so this genuinely needs the i3=4 fallback, and
+/// `pancetta-qso::exchange::validate_callsign` already treats it as a valid
+/// compound form. Strip it and validate the base call underneath.
+///
+/// PAN-27 (round 4 finding): the suffix-after-digit rule alone still
+/// misclassifies ordinary words like `"ABC1D"`/`"EFG2H"` as callsign-shaped
+/// (they satisfy it too). Real callsign/DXCC prefixes are at most 2 letters
+/// before the first digit (`K1`, `W1`, `AB1`), or a digit-led international
+/// form with none at all (`8G8...`, `3E4...`) — a longer all-letter run
+/// before the first digit is an ordinary word, not a prefix.
 fn looks_like_callsign(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() < 3 {
+    if s.len() < 3 {
+        return false;
+    }
+    if let Some(slash_pos) = s.rfind('/') {
+        let base = &s[..slash_pos];
+        let suffix = &s[slash_pos + 1..];
+        if base.is_empty() {
+            return false;
+        }
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return looks_like_callsign(base);
+        }
+        // Compound prefix/homecall form (e.g. "YS/WE9G", "PJ4/KA1ABC"):
+        // validate the shape of the final component; earlier components
+        // (the DXCC prefix) just need to be present.
+        return looks_like_callsign_shape(suffix.as_bytes());
+    }
+    looks_like_callsign_shape(s.as_bytes())
+}
+
+/// Digit/letter shape check shared by `looks_like_callsign`'s branches — see
+/// that function's doc for the rationale of each rule.
+fn looks_like_callsign_shape(bytes: &[u8]) -> bool {
+    if bytes.len() < 2 {
         return false;
     }
     let Some(last_digit_pos) = bytes.iter().rposition(u8::is_ascii_digit) else {
@@ -1339,8 +1396,11 @@ fn looks_like_callsign(s: &str) -> bool {
     {
         return false;
     }
-    // At least one prefix letter before the digit block.
-    bytes[..last_digit_pos].iter().any(u8::is_ascii_alphabetic)
+    // The prefix before the FIRST digit must be a plausible callsign/DXCC
+    // prefix: at most 2 letters (or none, for a digit-led form).
+    let first_digit_pos = bytes.iter().position(u8::is_ascii_digit).unwrap();
+    let prefix = &bytes[..first_digit_pos];
+    prefix.len() <= 2 && prefix.iter().all(u8::is_ascii_alphabetic)
 }
 
 /// Does `s` look like a 4-character Maidenhead grid locator (`AA00`..`RR99`)?
@@ -2271,5 +2331,116 @@ mod tests {
         // at all.
         let encoder = Ft8Encoder::new();
         assert!(encoder.try_encode_nonstandard("HELLO WORLD").is_err());
+    }
+
+    #[test]
+    fn test_looks_like_callsign_accepts_numeral_call_area_suffix() {
+        // PAN-22 finding 1 (round 3+ review): "K1ABC/4"/"W1AW/8" are the
+        // call-area reassignment convention -- `pack28` only special-cases
+        // /P and /R, so these need the i3=4 fallback, and
+        // `pancetta-qso::exchange::validate_callsign` already treats them
+        // as valid compound forms. Must not regress to unencodable.
+        assert!(looks_like_callsign("K1ABC/4"));
+        assert!(looks_like_callsign("W1AW/8"));
+        // A digit suffix with no plausible base underneath must still fail.
+        assert!(!looks_like_callsign("AB/4"));
+    }
+
+    #[test]
+    fn test_encode_message_numeral_call_area_suffix_compound_call() {
+        // PAN-22 finding 1 live scenario: a compound call using the
+        // call-area reassignment suffix must still encode via i3=4, not
+        // regress to an Err (pack28 can't represent it either).
+        let mut encoder = Ft8Encoder::new();
+        for msg in ["CQ K1ABC/4", "K1ABC/4 K5ARH EM10", "CQ W1AW/8"] {
+            assert!(
+                encoder.encode_message(msg, None).is_ok(),
+                "'{}' (numeral call-area suffix) failed to encode",
+                msg
+            );
+        }
+
+        let payload = encoder.try_encode_nonstandard("CQ K1ABC/4").unwrap();
+        let msg = decode_payload(&payload);
+        assert_eq!(msg.to_callsign, Some("CQ".to_string()));
+        assert_eq!(msg.from_callsign, Some("K1ABC/4".to_string()));
+    }
+
+    #[test]
+    fn test_try_encode_nonstandard_cq_rejects_non_grid_third_token() {
+        // PAN-26 finding 2: a three-token compound CQ whose third token is
+        // NOT a valid grid must fail loudly, not silently drop it and
+        // transmit the unrelated bare "CQ <call>" message. Previously any
+        // third token was unconditionally dropped.
+        let encoder = Ft8Encoder::new();
+        for msg in ["CQ YS/WE9G RR73", "CQ YS/WE9G HELLO", "CQ YS/WE9G AA9"] {
+            assert!(
+                encoder.try_encode_nonstandard(msg).is_err(),
+                "'{}' has a non-grid third token and must fail, not silently drop it",
+                msg
+            );
+        }
+        // A genuine grid is still accepted and dropped (existing behavior).
+        assert!(encoder.try_encode_nonstandard("CQ YS/WE9G EM10").is_ok());
+    }
+
+    #[test]
+    fn test_encode_message_report_to_compound_call_via_cq_fails_cleanly_overall() {
+        // The full encode_message fallback chain for the PAN-26 finding 2
+        // scenario: standard fails (compound call), nonstandard now
+        // correctly refuses the bogus third token, and free text also
+        // fails (too long). The overall result must be an honest Err.
+        let mut encoder = Ft8Encoder::new();
+        assert!(encoder.encode_message("CQ YS/WE9G RR73", None).is_err());
+    }
+
+    #[test]
+    fn test_looks_like_callsign_rejects_ambiguous_free_text_words() {
+        // PAN-27 finding 1 (round 4 review): "ABC1D"/"EFG2H" satisfy the
+        // suffix-after-digit rule (like "HELLO1"/"WORLD2" did before that
+        // fix) but are ordinary words, not callsigns -- a real
+        // callsign/DXCC prefix is at most 2 letters before the first digit.
+        assert!(!looks_like_callsign("ABC1D"));
+        assert!(!looks_like_callsign("EFG2H"));
+        // Sanity: genuine callsign shapes (short prefix, or digit-led
+        // international forms) still pass.
+        assert!(looks_like_callsign("K1ABC"));
+        assert!(looks_like_callsign("8G81PA"));
+        assert!(looks_like_callsign("3E40CDW"));
+        assert!(looks_like_callsign("YS/WE9G"));
+    }
+
+    #[test]
+    fn test_encode_message_ambiguous_free_text_routes_to_free_text_not_nonstdcall() {
+        // PAN-27 finding 1 live scenario: "ABC1D EFG2H" is valid 11-char
+        // free text. Before this fix, both tokens satisfied
+        // looks_like_callsign, fit pack58, and neither fit pack28 -- so
+        // encode_message transmitted an unrelated type-4 callsign frame
+        // instead of the requested free text.
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("ABC1D EFG2H", None)
+            .expect("valid free text must encode");
+
+        let payload = encoder.encode_free_text("ABC1D EFG2H").unwrap();
+        let expected_symbols = encoder.payload_to_symbols(&payload).unwrap();
+        assert_eq!(
+            symbols, expected_symbols,
+            "encode_message must choose the free-text encoding, not i3=4"
+        );
+
+        let msg = decode_payload(&payload);
+        assert_eq!(msg.message_type, crate::message::MessageType::FreeText);
+
+        // And compound calls (the OTHER direction PAN-27 requires still
+        // hold) must still route to i3=4, not free text.
+        assert!(encoder.try_encode_nonstandard("CQ YS/WE9G").is_ok());
+        let cq_symbols = encoder.encode_message("CQ YS/WE9G", None).unwrap();
+        let cq_payload = encoder.try_encode_nonstandard("CQ YS/WE9G").unwrap();
+        let expected_cq_symbols = encoder.payload_to_symbols(&cq_payload).unwrap();
+        assert_eq!(
+            cq_symbols, expected_cq_symbols,
+            "a genuine compound-callsign CQ must still route to i3=4, not free text"
+        );
     }
 }

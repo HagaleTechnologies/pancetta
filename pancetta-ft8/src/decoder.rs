@@ -2640,6 +2640,13 @@ impl Ft8Decoder {
         self.message_parser.add_callsign(callsign);
     }
 
+    /// All callsigns this decoder's i3=4 hash table has learned so far
+    /// (PAN-27 finding 2) — used to carry accumulated learning into a
+    /// freshly-rebuilt decoder rather than discarding it.
+    pub fn learned_callsigns(&self) -> Vec<String> {
+        self.message_parser.learned_callsigns()
+    }
+
     /// Create a new decoder with custom message handler
     pub fn with_message_handler(
         config: Ft8Config,
@@ -4423,6 +4430,32 @@ impl Ft8Decoder {
             .flatten()
             {
                 if call != "CQ" && call != "DE" && call != "QRZ" && !call.starts_with("CQ ") {
+                    self.message_parser.add_callsign(call);
+                }
+            }
+        }
+
+        // PAN-27 finding 4: a type-4 (NonStdCall) frame's exact 58-bit
+        // field is already trustworthy plaintext (e.g. decoding
+        // "CQ YS/WE9G" reveals the full compound callsign) — learn it too,
+        // not just `MessageType::Standard` decodes, so a LATER exchange
+        // that hashes the same callsign into the lossy 12-bit slot still
+        // resolves. Skip the hash-rendered slot itself (`"<K5ARH>"`
+        // resolved or `"<...>"` unresolved) — that's not a real callsign,
+        // just this same table's own prior render of one — and the bare
+        // `"CQ"` addressee token.
+        for msg in &all_decoded_messages {
+            if msg.message.message_type != MessageType::NonStdCall {
+                continue;
+            }
+            for call in [
+                msg.message.to_callsign.as_deref(),
+                msg.message.from_callsign.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if call != "CQ" && !call.starts_with('<') {
                     self.message_parser.add_callsign(call);
                 }
             }
@@ -15234,6 +15267,68 @@ mod tests {
             Some("<K1DEF>"),
             "K1DEF must resolve via the hash table seeded from step 1's \
              standard decode, not render as the unrecoverable <...> placeholder"
+        );
+    }
+
+    /// PAN-27 finding 4 (round 4 review): the seeding loop was restricted
+    /// to `MessageType::Standard` decodes, discarding trustworthy plaintext
+    /// already carried in a type-4 (`NonStdCall`) frame's exact 58-bit
+    /// field. Decoding "CQ YS/WE9G" reveals the full compound callsign in
+    /// plaintext; a LATER type-4 exchange between two DIFFERENT compound
+    /// stations that places "YS/WE9G" in the hashed slot must resolve it,
+    /// not render the unrecoverable `<...>` placeholder.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn decoder_seeds_hash_table_from_nonstdcall_exact_field_too() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let cfg = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(cfg).expect("decoder");
+        // Deliberately do NOT call seed_hash_callsign at all -- the fix
+        // must work purely from decoding YS/WE9G's own type-4 CQ.
+
+        // Step 1: decode a type-4 CQ from the compound-callsign operator
+        // YS/WE9G. Their full callsign lands in the exact 58-bit field.
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ YS/WE9G", None)
+            .expect("encode compound CQ");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        let decoded = decoder.decode_window(&tx).expect("decode compound CQ");
+        assert!(
+            decoded
+                .iter()
+                .any(|d| d.message.from_callsign.as_deref() == Some("YS/WE9G")),
+            "must decode YS/WE9G's type-4 CQ"
+        );
+
+        // Step 2: two OTHER compound stations work each other; the message
+        // exchange puts PJ4/KA1ABC in the exact slot (it wins the
+        // deterministic tiebreak) and hashes YS/WE9G into the 12-bit slot.
+        let symbols2 = encoder
+            .encode_message("PJ4/KA1ABC YS/WE9G RR73", None)
+            .expect("encode second compound exchange");
+        let mut tx2 = modulator
+            .modulate_symbols(&symbols2, 900.0)
+            .expect("modulate");
+        tx2.resize(WINDOW_SAMPLES, 0.0);
+        let decoded2 = decoder
+            .decode_window(&tx2)
+            .expect("decode second compound exchange");
+
+        let hit = decoded2
+            .iter()
+            .find(|d| d.message.to_callsign.as_deref() == Some("PJ4/KA1ABC"))
+            .expect("must decode the second compound exchange");
+        assert_eq!(
+            hit.message.from_callsign.as_deref(),
+            Some("<YS/WE9G>"),
+            "YS/WE9G must resolve via the hash table seeded from step 1's \
+             type-4 CQ exact field, not render as <...>"
         );
     }
 

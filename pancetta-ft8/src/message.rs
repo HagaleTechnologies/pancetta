@@ -1007,6 +1007,13 @@ impl Ft8Message {
     ///     both a digit and a letter present (the same coarse "is this
     ///     shaped like a real callsign" sanity check the ENCODE side uses,
     ///     `encoder::looks_like_callsign` — keeping the two in agreement).
+    ///
+    /// PAN-22 (round 3+ finding): `unpack58` already trims leading/trailing
+    /// padding before this is called, so any space still present here is
+    /// INTERIOR (e.g. `"A1 B"`) — that can never occur in a real callsign,
+    /// only in a CRC-valid noise decode. Reject it rather than accepting it
+    /// alongside the wire charset, which would weaken false-positive
+    /// rejection of such decodes.
     fn looks_like_nonstandard_callsign(s: &str) -> bool {
         if s == "CQ" {
             return true;
@@ -1018,10 +1025,7 @@ impl Ft8Message {
         if !(3..=11).contains(&len) {
             return false;
         }
-        if !s
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '/' || c == ' ')
-        {
+        if !s.chars().all(|c| c.is_ascii_alphanumeric() || c == '/') {
             return false;
         }
         s.chars().any(|c| c.is_ascii_digit()) && s.chars().any(|c| c.is_ascii_alphabetic())
@@ -1351,6 +1355,14 @@ struct HashTable {
     hash_12bit: HashMap<u32, String>,
     /// 22-bit hash lookup for special operations (4M entries)
     hash_22bit: HashMap<u32, String>,
+    /// Buckets known to have collided between two DIFFERENT callsigns in
+    /// each table (e.g. `K0AAA`/`K0BAP` both hash to 1699 under the 12-bit
+    /// table) — PAN-26 finding 1. Once a bucket collides, seeding no longer
+    /// overwrites it (the ambiguity would just flip to whichever callsign
+    /// was learned last), and lookups stay unresolved (`None`) for it.
+    collided_10bit: std::collections::HashSet<u32>,
+    collided_12bit: std::collections::HashSet<u32>,
+    collided_22bit: std::collections::HashSet<u32>,
 }
 
 impl HashTable {
@@ -1359,6 +1371,32 @@ impl HashTable {
             hash_10bit: HashMap::new(),
             hash_12bit: HashMap::new(),
             hash_22bit: HashMap::new(),
+            collided_10bit: std::collections::HashSet::new(),
+            collided_12bit: std::collections::HashSet::new(),
+            collided_22bit: std::collections::HashSet::new(),
+        }
+    }
+
+    /// Seed one hash bucket, preserving collision ambiguity (PAN-26,
+    /// finding 1) instead of letting a later callsign silently overwrite an
+    /// earlier, different one at the same hash.
+    fn seed(
+        table: &mut HashMap<u32, String>,
+        collided: &mut std::collections::HashSet<u32>,
+        hash: u32,
+        callsign: &str,
+    ) {
+        if collided.contains(&hash) {
+            return; // already known-ambiguous; don't pretend to resolve it
+        }
+        match table.get(&hash) {
+            Some(existing) if existing != callsign => {
+                table.remove(&hash);
+                collided.insert(hash);
+            }
+            _ => {
+                table.insert(hash, callsign.to_string());
+            }
         }
     }
 
@@ -1368,9 +1406,24 @@ impl HashTable {
         let hash_12 = self.calculate_hash_12bit(callsign);
         let hash_22 = self.calculate_hash_22bit(callsign);
 
-        self.hash_10bit.insert(hash_10, callsign.to_string());
-        self.hash_12bit.insert(hash_12, callsign.to_string());
-        self.hash_22bit.insert(hash_22, callsign.to_string());
+        Self::seed(
+            &mut self.hash_10bit,
+            &mut self.collided_10bit,
+            hash_10,
+            callsign,
+        );
+        Self::seed(
+            &mut self.hash_12bit,
+            &mut self.collided_12bit,
+            hash_12,
+            callsign,
+        );
+        Self::seed(
+            &mut self.hash_22bit,
+            &mut self.collided_22bit,
+            hash_22,
+            callsign,
+        );
     }
 
     /// Lookup 10-bit hash
@@ -1386,6 +1439,24 @@ impl HashTable {
     /// Lookup 22-bit hash
     pub fn lookup_22bit_hash(&self, hash: u32) -> Option<String> {
         self.hash_22bit.get(&hash).cloned()
+    }
+
+    /// All distinct callsigns learned so far, across all three hash widths
+    /// — used to reseed a freshly-rebuilt decoder's table (PAN-27 finding 2)
+    /// instead of restarting empty. A callsign whose 12-bit bucket collided
+    /// may still be recoverable from a wider table that didn't collide for
+    /// it, so this unions all three rather than reading one.
+    pub fn learned_callsigns(&self) -> Vec<String> {
+        let mut seen = std::collections::HashSet::new();
+        for call in self
+            .hash_10bit
+            .values()
+            .chain(self.hash_12bit.values())
+            .chain(self.hash_22bit.values())
+        {
+            seen.insert(call.clone());
+        }
+        seen.into_iter().collect()
     }
 
     /// Calculate the 22-bit hash for a callsign, matching ft8_lib's `save_callsign()`.
@@ -1493,6 +1564,12 @@ impl MessageParser {
     /// Add callsign to hash table
     pub fn add_callsign(&mut self, callsign: &str) {
         self.hash_table.add_callsign(callsign);
+    }
+
+    /// All distinct callsigns learned so far — see
+    /// `HashTable::learned_callsigns` (PAN-27 finding 2).
+    pub fn learned_callsigns(&self) -> Vec<String> {
+        self.hash_table.learned_callsigns()
     }
 
     /// Parse 77-bit payload into FT8 message
@@ -2702,6 +2779,47 @@ mod tests {
         assert_eq!(lookup_10, Some("K1ABC".to_string()));
     }
 
+    /// PAN-26 finding 1 (round 4 review): "K0AAA" and "K0BAP" are a
+    /// confirmed 12-bit hash collision (both hash to 1699). Before the
+    /// fix, seeding both unconditionally overwrote the earlier entry, so a
+    /// later i3=4 frame from whichever station was seeded FIRST silently
+    /// rendered as the OTHER (colliding) callsign. The fix must instead
+    /// leave the bucket unresolved once the collision is detected.
+    #[test]
+    fn test_hash_table_collision_renders_unresolved_not_silently_overwritten() {
+        let mut hash_table = HashTable::new();
+
+        let hash_a = hash_table.calculate_hash_12bit("K0AAA");
+        let hash_b = hash_table.calculate_hash_12bit("K0BAP");
+        assert_eq!(
+            hash_a, hash_b,
+            "K0AAA and K0BAP must be a confirmed 12-bit hash collision \
+             for this test to exercise the right code path"
+        );
+        assert_eq!(hash_a, 1699, "confirmed collision bucket");
+
+        hash_table.add_callsign("K0AAA");
+        assert_eq!(
+            hash_table.lookup_12bit_hash(hash_a),
+            Some("K0AAA".to_string())
+        );
+
+        // Seeding the SECOND, DIFFERENT callsign at the same bucket must
+        // NOT silently overwrite the first -- it must render unresolved.
+        hash_table.add_callsign("K0BAP");
+        assert_eq!(
+            hash_table.lookup_12bit_hash(hash_a),
+            None,
+            "a known collision must render unresolved, not silently pick \
+             whichever callsign was seeded last"
+        );
+
+        // Once collided, re-seeding EITHER callsign again must not
+        // resurrect a (now ambiguous) resolution.
+        hash_table.add_callsign("K0AAA");
+        assert_eq!(hash_table.lookup_12bit_hash(hash_a), None);
+    }
+
     #[test]
     fn test_bits_to_u64() {
         let bits = bitvec![
@@ -3219,6 +3337,36 @@ mod tests {
         assert!(
             !m2.is_plausible(),
             "FreeText must be rejected even with sensible words"
+        );
+    }
+
+    /// PAN-22 finding 2 (round 4 review): `unpack58` already trims
+    /// leading/trailing padding before `looks_like_nonstandard_callsign`
+    /// ever sees the field, so any space still present is INTERIOR (e.g. a
+    /// CRC-valid noise decode unpacking to `"A1 B"`) and can never occur in
+    /// a real callsign. Must be rejected, not accepted alongside the wire
+    /// charset.
+    #[test]
+    fn looks_like_nonstandard_callsign_rejects_interior_space() {
+        assert!(!Ft8Message::looks_like_nonstandard_callsign("A1 B"));
+        assert!(!Ft8Message::looks_like_nonstandard_callsign("K1 ABC"));
+        // Sanity: genuine (space-free) exact-field values still pass.
+        assert!(Ft8Message::looks_like_nonstandard_callsign("YS/WE9G"));
+        assert!(Ft8Message::looks_like_nonstandard_callsign("K1ABC"));
+    }
+
+    #[test]
+    fn nonstdcall_with_interior_space_field_is_not_plausible() {
+        // Simulates a CRC-valid type-4 noise decode whose exact field
+        // unpacks to a value with an interior space -- must be rejected
+        // by is_plausible, not treated as a plausible NonStdCall frame.
+        let mut m = Ft8Message::default();
+        m.message_type = MessageType::NonStdCall;
+        m.to_callsign = Some("CQ".to_string());
+        m.from_callsign = Some("A1 B".to_string());
+        assert!(
+            !m.is_plausible(),
+            "a NonStdCall exact field with an interior space must not be plausible"
         );
     }
 

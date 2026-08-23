@@ -148,15 +148,21 @@ fn callsign_is_plausibly_pack28_standard(callsign: &str) -> bool {
 /// other state (nothing report-shaped to check).
 ///
 /// `SendingReport`/`WaitingForReport` always transmit or re-send our own
-/// numeric `SignalReport`; `WaitingForConfirmation` re-sends our numeric
-/// `ReportAck` (`R±NN`) if the DX repeats their report. `SendingConfirmation`
-/// is deliberately excluded — it only ever sends RR73/73, both representable
-/// via i3=4 regardless of callsign shape.
+/// numeric `SignalReport`/`ReportAck`. `WaitingForConfirmation` is
+/// deliberately excluded (PAN-27 finding 3, round-4 review): the message it
+/// currently has queued is always `FinalConfirmation` (RR73-class,
+/// representable via i3=4 regardless of callsign shape) — a numeric
+/// report/ack only re-enters the picture via a state REGRESSION back to
+/// `SendingReport`, which changes `progress.state`'s variant itself, so the
+/// `SendingReport` arm above already catches it once that happens. Checking
+/// WaitingForConfirmation here as well falsely retired QSOs on the
+/// skip-rung `RespondingToCq + ReportAck → WaitingForConfirmation` path,
+/// which was about to complete cleanly with RR73. `SendingConfirmation` is
+/// likewise excluded — it only ever sends RR73/73.
 fn report_stage_partner_callsign(state: &QsoState) -> Option<&str> {
     match state {
         QsoState::SendingReport { their_callsign, .. }
-        | QsoState::WaitingForReport { their_callsign, .. }
-        | QsoState::WaitingForConfirmation { their_callsign, .. } => Some(their_callsign.as_str()),
+        | QsoState::WaitingForReport { their_callsign, .. } => Some(their_callsign.as_str()),
         _ => None,
     }
 }
@@ -5059,9 +5065,10 @@ impl QsoManager {
             // moved to the other callsign.
             //
             // Round 3 (Codex re-review, finding 1): ALSO fast-fails a
-            // report-bearing rung (SendingReport / WaitingForReport /
-            // WaitingForConfirmation — see `report_stage_partner_callsign`)
-            // whose partner isn't plausibly pack28-standard
+            // report-bearing rung (SendingReport / WaitingForReport — see
+            // `report_stage_partner_callsign`; PAN-27 finding 3 removed
+            // WaitingForConfirmation from that set) whose partner isn't
+            // plausibly pack28-standard
             // (`callsign_is_plausibly_pack28_standard`), even though the
             // partner's callsign passes the plain wire-representability
             // check above (fits the i3=4 hash field fine). The round-1
@@ -6501,6 +6508,11 @@ mod tests {
             }),
             Some("YS/WE9G")
         );
+        // PAN-27 finding 3: WaitingForConfirmation is deliberately excluded
+        // -- its queued message is always FinalConfirmation (RR73-class),
+        // representable via i3=4 regardless of callsign shape. A numeric
+        // report only re-enters via a regression to SendingReport, which
+        // changes the state variant itself (covered by the arm above).
         assert_eq!(
             report_stage_partner_callsign(&QsoState::WaitingForConfirmation {
                 their_callsign: "YS/WE9G".to_string(),
@@ -6510,7 +6522,7 @@ mod tests {
                 grid_square: None,
                 started_at: now,
             }),
-            Some("YS/WE9G")
+            None
         );
         // SendingConfirmation only ever sends RR73/73 (both representable
         // via i3=4 regardless of callsign shape) -- deliberately excluded.
@@ -6858,6 +6870,52 @@ mod tests {
         assert!(
             manager.get_qso(qso_id).await.is_ok(),
             "a /P-suffix partner is pack28-representable and must NOT retire early"
+        );
+    }
+
+    /// PAN-27 finding 3 (round 4 review): the skip-rung path
+    /// `RespondingToCq + ReportAck → WaitingForConfirmation` (a compound-
+    /// call DX sends their R-report directly, skipping the plain-report
+    /// rung) leaves `their_callsign` compound-shaped in a
+    /// `WaitingForConfirmation` state — but the message that state actually
+    /// has queued is `FinalConfirmation` (RR73), always representable via
+    /// i3=4 regardless of callsign shape. The report-stage watchdog must
+    /// NOT retire this QSO; it was about to complete cleanly.
+    #[tokio::test]
+    async fn report_stage_watchdog_does_not_retire_compound_partner_waiting_for_confirmation() {
+        let mut config = test_config();
+        config.timeouts.manual_call_max_calls = 1000;
+        config.timeouts.manual_call_watchdog_minutes = 60;
+        config.timeouts.repetitive_tx_timeout_secs = 100_000;
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("YS/WE9G".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        let start = manager.get_qso(qso_id).await.unwrap().metadata.start_time;
+
+        {
+            let mut qsos = manager.qsos.write().await;
+            let progress = qsos.get_mut(&qso_id).unwrap();
+            progress.state = QsoState::WaitingForConfirmation {
+                their_callsign: "YS/WE9G".to_string(),
+                their_report: -10,
+                our_report: -10,
+                frequency: 14074000.0,
+                grid_square: None,
+                started_at: start,
+            };
+        }
+
+        manager
+            .check_timeouts_at(start + Duration::seconds(1))
+            .await;
+
+        assert!(
+            manager.get_qso(qso_id).await.is_ok(),
+            "WaitingForConfirmation against a compound partner has RR73 (not a \
+             numeric report) queued and must NOT retire early"
         );
     }
 

@@ -1588,6 +1588,19 @@ impl super::ApplicationCoordinator {
                                         // after the next tier/protocol
                                         // config change.
                                         d.seed_hash_callsign(&station_callsign);
+                                        // PAN-27 finding 2: also carry over
+                                        // every OTHER caller this decoder
+                                        // instance had already learned (the
+                                        // round-2/round-4 seeding loops
+                                        // below) — otherwise a compound
+                                        // operator learned earlier this
+                                        // session decodes as unresolved
+                                        // again immediately after a rebuild,
+                                        // even though the hash had already
+                                        // resolved once.
+                                        for call in decoder.learned_callsigns() {
+                                            d.seed_hash_callsign(&call);
+                                        }
                                         decoder = d;
                                         last_max_passes = cur_max;
                                         last_osd_depth = cur_osd;
@@ -2674,6 +2687,60 @@ mod cross_sequence_invocation_tests {
         assert!(
             seen.contains(reply_text),
             "wrapper must update the seen-texts dedup set with recovered decodes"
+        );
+    }
+
+    /// PAN-27 finding 2 (round 4 review): a decoder rebuild (tier probe /
+    /// live protocol/OSD/pass change, this file's decoder-thread loop
+    /// around `Ft8Decoder::new(new_cfg)`) used to only reseed the new
+    /// decoder with the station's own callsign, discarding every OTHER
+    /// caller the round-2 standard-decode seeding loop had already
+    /// learned. This reproduces the fix: carry
+    /// `Ft8Decoder::learned_callsigns()` from the OLD decoder into the NEW
+    /// one, the same way the rebuild path does.
+    #[test]
+    fn decoder_rebuild_carries_learned_callsigns_forward() {
+        let cfg = Ft8Config::default();
+        let mut old_decoder = Ft8Decoder::new(cfg.clone()).expect("decoder ctor");
+
+        // The round-2 seeding loop learned K1DEF from an earlier standard
+        // decode this session (decoder.rs's own tests already cover that
+        // seeding path end-to-end via decode_window; seeded directly here
+        // to isolate the rebuild-carryover behavior under test).
+        old_decoder.seed_hash_callsign("K1DEF");
+
+        // Rebuild: a fresh decoder built the way the tier-probe/protocol-
+        // change path does, PLUS the fix -- carry the old table's learned
+        // callsigns forward, mirroring the rebuild arm in this file.
+        let mut new_decoder = Ft8Decoder::new(cfg).expect("decoder ctor");
+        new_decoder.seed_hash_callsign("K5ARH"); // station's own callsign
+        for call in old_decoder.learned_callsigns() {
+            new_decoder.seed_hash_callsign(&call);
+        }
+
+        // A compound-call CQer's reply that hashes K1DEF into the 12-bit
+        // slot must resolve on the NEW (rebuilt) decoder, not render
+        // <...> as it did before the fix.
+        let mut encoder = pancetta_ft8::Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("YS/WE9G K1DEF RR73", None)
+            .expect("encode i3=4 reply");
+        let mut modulator = pancetta_ft8::Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+
+        let decoded = new_decoder.decode_window(&tx).expect("decode i3=4 reply");
+        let hit = decoded
+            .iter()
+            .find(|d| d.message.to_callsign.as_deref() == Some("YS/WE9G"))
+            .expect("must decode the i3=4 reply addressed to YS/WE9G");
+        assert_eq!(
+            hit.message.from_callsign.as_deref(),
+            Some("<K1DEF>"),
+            "K1DEF must resolve on the REBUILT decoder via carried-over \
+             learned callsigns, not render as <...>"
         );
     }
 
