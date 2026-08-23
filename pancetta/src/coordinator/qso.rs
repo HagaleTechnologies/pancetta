@@ -2066,29 +2066,29 @@ impl super::ApplicationCoordinator {
                 // Seed worked-station history from the QSO database so that
                 // previously-worked stations are recognised as duplicates across restarts.
                 //
-                // Three-case startup decision:
+                // Three-case startup decision (non-replay only):
                 //   1. Migration: ADIF missing but legacy DB exists → dump DB to ADIF first
                 //      so contacts are not lost; future runs use ADIF as source of truth.
-                //   2. Replay: index missing or older than ADIF → drop + replay so duplicate
-                //      detection sees every prior contact.
+                //   2. Replay-rebuild: index missing or older than ADIF → drop + rebuild the
+                //      index so duplicate detection sees every prior contact.
                 //   3. Open as-is: normal startup; index is current.
                 //
-                // Gated on `replay_mode` (PAN-41): unlike `start_local_qso_log_writers`
-                // above, this block previously opened `db_path`/`adif_path`
-                // unconditionally — every path here is the *real*
-                // `~/.pancetta/qsos.adi` / `qso.db`, not anything derived from
-                // `--replay`'s capture-dir argument. `QsoDatabase::open` runs
-                // `PRAGMA`s and `CREATE TABLE IF NOT EXISTS` even on an
-                // already-current DB, i.e. a write-mode connection against
-                // the operator's live logbook — for both a genuine `--replay`
-                // run and any in-process test that only sets `replay_path` to
-                // satisfy `replay_mode()`. Skipping the seed under replay
-                // means duplicate-checking starts empty for that run, which
-                // matches "--replay must not even create/touch the real log"
-                // (see `replay_local_log_tests` below).
-                if !replay_mode {
-                    use pancetta_qso::async_database::QsoDatabase;
+                // Every path above is a write against the *real* `~/.pancetta/qsos.adi` /
+                // `qso.db` (`QsoDatabase::open` itself runs `PRAGMA`s and `CREATE TABLE IF
+                // NOT EXISTS`, a write-mode connection even on an already-current DB) — not
+                // anything derived from `--replay`'s capture-dir argument, so it's gated on
+                // `!replay_mode` (PAN-41).
+                //
+                // PAN-41 round 2: `--replay`'s own contract (coordinator/mod.rs,
+                // CHANGELOG.md) is "no writes to the real log, but still read history so
+                // DX-Hunter/duplicate scoring behaves like a live station" — skipping the
+                // seed entirely under replay contradicted that. The `else` branch below
+                // does a genuinely read-only (`mode=ro`) connection against the same real
+                // `db_path` -- no schema writes, no migration, no index rebuild -- and
+                // performs the exact same read-only seed queries as case 3 above.
+                use pancetta_qso::async_database::QsoDatabase;
 
+                if !replay_mode {
                     // Determine the current band from the rig's operating frequency,
                     // falling back to "20m".  This is a best-effort seed — the
                     // autonomous operator will always re-validate against the live
@@ -2202,6 +2202,39 @@ impl super::ApplicationCoordinator {
                              until re-worked this session",
                             db_path.display(),
                         );
+                    }
+                } else {
+                    // Replay: read-only seed from the real history so scoring matches a
+                    // live station, without migrating, rebuilding, or otherwise writing
+                    // anything (see the block-level comment above).
+                    let freq_hz = operating_frequency_hz.load(std::sync::atomic::Ordering::Relaxed);
+                    let band = pancetta_cqdx::frequency_to_band(freq_hz)
+                        .unwrap_or_else(|| "20m".to_string())
+                        .to_uppercase();
+
+                    match QsoDatabase::open_read_only(&db_path).await {
+                        Ok(db) => {
+                            let callsigns = db.get_worked_callsigns(&band).await;
+                            if !callsigns.is_empty() {
+                                qso_lookup.seed_worked_from_list(&band, callsigns);
+                            }
+
+                            let band_callsign_pairs = db.get_worked_bands_and_callsigns().await;
+                            if !band_callsign_pairs.is_empty() {
+                                qso_lookup.seed_worked_dxcc_from_list(band_callsign_pairs);
+                            }
+
+                            let band_grid_pairs = db.get_worked_bands_and_grids().await;
+                            qso_lookup.seed_worked_grids_from_list(band_grid_pairs);
+                        }
+                        Err(e) => {
+                            info!(
+                                "Replay: no read-only QSO history available at {} ({}) — \
+                                 duplicate/DX-Hunter seeding starts empty for this run",
+                                db_path.display(),
+                                e,
+                            );
+                        }
                     }
                 }
 

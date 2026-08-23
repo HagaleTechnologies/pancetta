@@ -322,6 +322,28 @@ impl QsoDatabase {
         Ok(db)
     }
 
+    /// Open an EXISTING database read-only: no `PRAGMA` writes, no `CREATE
+    /// TABLE IF NOT EXISTS`, fails if the file doesn't already exist -- a
+    /// genuinely non-mutating connection (`mode=ro`), unlike [`Self::open`]
+    /// which always connects read-write (`mode=rwc`) even to run schema
+    /// setup on an already-current database. Used to seed in-memory
+    /// duplicate/DX-Hunter history from the real database during `--replay`,
+    /// whose contract is "no writes to the operator's real log, but still
+    /// read history so scoring matches a live station."
+    pub async fn open_read_only<P: AsRef<Path>>(path: P) -> Result<Self, AsyncDatabaseError> {
+        let database_url = format!("sqlite:{}?mode=ro", path.as_ref().display());
+        let pool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&database_url)
+            .await?;
+
+        Ok(Self {
+            pool,
+            adif_processor: AdifProcessor::new(),
+            schema_version: 1,
+        })
+    }
+
     /// Create an in-memory database for testing
     pub async fn new_in_memory() -> Result<Self, AsyncDatabaseError> {
         Self::open(":memory:").await
@@ -1591,6 +1613,123 @@ mod tests {
             calls.contains(&"K9DEF".to_string()),
             "missing K9DEF in {:?}",
             calls
+        );
+    }
+
+    /// PAN-41 round 2: `open_read_only` must actually read existing history
+    /// -- seed a real db via the normal write path, then verify a fresh
+    /// read-only connection sees the same data.
+    #[tokio::test]
+    async fn open_read_only_reads_existing_history() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("qso.db");
+
+        {
+            let db = QsoDatabase::open(&db_path).await.unwrap();
+            let mut progress = QsoProgress {
+                state: QsoState::Idle,
+                state_history: vec![],
+                messages: vec![],
+                metadata: QsoMetadata {
+                    qso_id: Uuid::new_v4(),
+                    our_callsign: "W1ABC".to_string(),
+                    their_callsign: Some("K2DEF".to_string()),
+                    frequency: 14074000.0,
+                    mode: "FT8".to_string(),
+                    start_time: Utc::now(),
+                    end_time: None,
+                    reports: SignalReports::default(),
+                    grids: GridSquares::default(),
+                    contest_info: None,
+                    tags: HashMap::new(),
+                    notes: None,
+                    tx_parity: None,
+                    initiated_by: Default::default(),
+                    role: Default::default(),
+                    call_count: 0,
+                    first_call_at: None,
+                    last_call_at: None,
+                    progressed_this_cycle: false,
+                    last_rx_text: None,
+                    dx_repeat_count: 0,
+                    hound: false,
+                    partner_freq: None,
+                    pending_freq_drift: None,
+                    hound_qsyed: false,
+                    remote_origin: false,
+                    tx_parity_provisional: false,
+                },
+            };
+            db.insert_qso(&progress).await.unwrap();
+            progress.state = QsoState::Completed {
+                their_callsign: "K2DEF".to_string(),
+                their_report: -10,
+                our_report: -15,
+                frequency: 14074000.0,
+                grid_square: Some("FN42".to_string()),
+                completed_at: Utc::now(),
+                duration_seconds: 120,
+            };
+            db.update_qso(&progress).await.unwrap();
+        }
+
+        let ro = QsoDatabase::open_read_only(&db_path).await.unwrap();
+        let calls = ro.get_worked_callsigns("20M").await;
+        assert!(
+            calls.contains(&"K2DEF".to_string()),
+            "read-only connection must see history written before it opened: {:?}",
+            calls
+        );
+    }
+
+    /// PAN-41 round 2: `open_read_only` must never create or write anything
+    /// -- most importantly, it must not silently create the database file
+    /// itself the way `open`'s `mode=rwc` would. Fails cleanly on a path
+    /// that doesn't already exist.
+    #[tokio::test]
+    async fn open_read_only_fails_without_creating_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("does-not-exist.db");
+
+        let result = QsoDatabase::open_read_only(&db_path).await;
+        assert!(
+            result.is_err(),
+            "open_read_only must fail on a nonexistent path, not silently create one"
+        );
+        assert!(
+            !db_path.exists(),
+            "open_read_only must never create the database file: {}",
+            db_path.display()
+        );
+    }
+
+    /// PAN-41 round 2: unlike `open`, a read-only connection must not touch
+    /// the main database file's mtime -- the whole point is that it's safe
+    /// to point at the operator's real, live database during `--replay`.
+    /// (`open`'s own `PRAGMA journal_mode = WAL` already creates the `-wal`
+    /// sidecar on the write path above, so this only asserts on the file
+    /// the read-only connection is actually forbidden from touching.)
+    #[tokio::test]
+    async fn open_read_only_does_not_modify_the_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("qso.db");
+
+        {
+            let db = QsoDatabase::open(&db_path).await.unwrap();
+            drop(db);
+        }
+        // Let the filesystem settle so the mtime comparison below is stable.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        let mtime_before = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+
+        let ro = QsoDatabase::open_read_only(&db_path).await.unwrap();
+        let _ = ro.get_worked_callsigns("20M").await;
+        drop(ro);
+
+        let mtime_after = std::fs::metadata(&db_path).unwrap().modified().unwrap();
+        assert_eq!(
+            mtime_before, mtime_after,
+            "a read-only connection must never modify the real database file's mtime"
         );
     }
 
