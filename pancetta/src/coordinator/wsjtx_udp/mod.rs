@@ -1873,6 +1873,7 @@ mod qso_logged_tests {
             our_callsign: "K5ARH".to_string(),
             their_callsign: Some("K1ABC".to_string()),
             frequency: 14_074_200.4,
+            completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
             start_time: start,
             end_time: Some(end),

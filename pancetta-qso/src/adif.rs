@@ -550,6 +550,13 @@ impl AdifProcessor {
                 Some(adif_qso.call.clone())
             },
             frequency,
+            // `frequency` above is already the true RF frequency read back
+            // from ADIF (not an audio offset — this reconstructs a
+            // historical, already-completed record, never a live/active
+            // QSO), so the `completed_rf_frequency_hz.unwrap_or(frequency)`
+            // fallback used by the band-scoped suppression checks resolves
+            // correctly without needing this set explicitly.
+            completed_rf_frequency_hz: None,
             mode: adif_qso
                 .submode
                 .clone()
@@ -1209,6 +1216,7 @@ ADIF Export for Test Program
             our_callsign: "K5ARH".into(),
             their_callsign: Some("D2UY".into()),
             frequency: 14_074_000.0,
+            completed_rf_frequency_hz: None,
             mode: "FT8".into(),
             start_time: Utc::now(),
             end_time: None,

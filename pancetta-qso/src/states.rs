@@ -386,8 +386,30 @@ pub struct QsoMetadata {
     /// Their callsign (if known)
     pub their_callsign: Option<String>,
 
-    /// Operating frequency in Hz
+    /// Operating frequency in Hz — always the AUDIO OFFSET within the slot
+    /// (e.g. ~200-3000 Hz), even after the QSO completes. Every TX-path
+    /// consumer (the modulator's ~3100 Hz limit, `resend_last_tx`, QSY,
+    /// Hound offset logic, duplicate-checking) depends on this invariant
+    /// holding for the QSO's ENTIRE lifetime, not just while active — do not
+    /// overwrite it with a dial-adjusted RF value after completion (PAN-25
+    /// round 2 regression: doing so made a close-step retry/73-recovery try
+    /// to transmit at the ~14 MHz RF frequency, which the TX worker
+    /// correctly rejected as exceeding its modulation limit, so the 73 never
+    /// keyed). See `completed_rf_frequency_hz` for the true RF frequency.
     pub frequency: f64,
+
+    /// The true RF frequency (dial + `frequency`) at the moment this QSO
+    /// completed, stamped once by the completion-transition sites in
+    /// `qso_manager.rs` (PAN-25 round 2) — separate from `frequency` so the
+    /// audio-offset invariant above stays intact for every other consumer.
+    /// `None` for an active QSO, or a completed QSO stamped before this
+    /// field existed / with no dial source configured. Used only for
+    /// band-scoping the recently-completed-QSO suppression checks
+    /// (`find_qsos_for_message`, `find_recently_completed_manual_qso_for_at`)
+    /// — falls back to `frequency` itself (audio-offset comparison, matching
+    /// pre-PAN-25 behavior) when unset.
+    #[serde(default)]
+    pub completed_rf_frequency_hz: Option<f64>,
 
     /// Operating mode (should be "FT8")
     pub mode: String,

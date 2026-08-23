@@ -171,6 +171,7 @@ mod tests {
             our_callsign: "K1ABC".to_string(),
             their_callsign: Some("W1AW".to_string()),
             frequency: 14_074_000.0,
+            completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
             start_time: chrono::Utc::now(),
             end_time: Some(chrono::Utc::now()),

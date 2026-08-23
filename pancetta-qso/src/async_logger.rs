@@ -930,6 +930,12 @@ impl QsoLogger {
                 },
                 their_callsign: Some(adif_qso.call.clone()),
                 frequency: adif_qso.freq * 1_000_000.0,
+                // Already the true RF frequency read back from ADIF (a
+                // historical, already-completed record) — the
+                // `completed_rf_frequency_hz.unwrap_or(frequency)` fallback
+                // resolves correctly without this set; see the matching
+                // comment in `adif.rs`'s `adif_to_qso`.
+                completed_rf_frequency_hz: None,
                 mode: adif_qso.mode.clone(),
                 start_time: adif_qso.qso_date,
                 end_time: adif_qso.qso_date_off,
@@ -1041,6 +1047,7 @@ mod tests {
             our_callsign: "W1ABC".to_string(),
             their_callsign: Some(their_callsign.to_string()),
             frequency: 14074000.0,
+            completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
             start_time: now,
             end_time: Some(now),

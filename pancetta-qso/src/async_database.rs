@@ -1278,6 +1278,7 @@ mod tests {
                 our_callsign: "W1ABC".to_string(),
                 their_callsign: Some("K2DEF".to_string()),
                 frequency: 14074000.0,
+                completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
                 start_time: Utc::now(),
                 end_time: None,
@@ -1396,6 +1397,7 @@ mod tests {
                 our_callsign: "W1ABC".to_string(),
                 their_callsign: Some(callsign.to_string()),
                 frequency,
+                completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
                 // Strictly in the past relative to a check_duplicate call
                 // made moments after insert — the query's upper time bound
@@ -1516,6 +1518,7 @@ mod tests {
                 our_callsign: "W1ABC".to_string(),
                 their_callsign: Some("K2DEF".to_string()),
                 frequency: 14074000.0,
+                completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
                 start_time: Utc::now(),
                 end_time: None,
