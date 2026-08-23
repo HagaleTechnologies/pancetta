@@ -908,10 +908,10 @@ impl TuiRunner {
     /// Abort the currently selected/pinned QSO (`App::selected_qso_id`),
     /// echoing the target callsign, or fall back to the standard "nothing to
     /// abort" hint when no QSO is active. Shared by `k`'s global handler (any
-    /// panel) and the Diagnostics/Recent-QSOs/station-health overlays, which
-    /// all let `k` fall through to this even while open (PAN-21) since
-    /// they're read-only informational views, not modals the operator is
-    /// editing.
+    /// panel) and the Diagnostics/Recent-QSOs/station-health/Help overlays,
+    /// which all let `k` fall through to this even while open (PAN-21;
+    /// Help added PAN-24) since they're read-only informational views, not
+    /// modals the operator is editing.
     fn abort_selected_qso(&self, app: &mut App) -> Result<()> {
         match (app.selected_qso_id(), app.selected_qso_callsign()) {
             (Some(qso_id), Some(call)) => {
@@ -969,11 +969,21 @@ impl TuiRunner {
             return Ok(true);
         }
 
-        // If help overlay is visible, route keys to help handler
+        // If help overlay is visible, route keys to help handler. Same
+        // read-only-overlay rationale as the Diagnostics/Recent-QSOs/
+        // station-health overlays below: `k` falls through to the global
+        // QSO-abort even while help is open (PAN-24) — otherwise the help
+        // text's own "k — abort QSO (any panel)" line would be false while
+        // the panel advertising it is on screen.
         if app.help_visible {
             match key.code {
                 KeyCode::Esc | KeyCode::Char('?') => {
                     app.toggle_help();
+                }
+                // Bare `k` only — see the modifier-guard comment on the
+                // global abort handler below for why.
+                KeyCode::Char('k') if key.modifiers.is_empty() => {
+                    self.abort_selected_qso(&mut app)?;
                 }
                 _ => {} // swallow all other keys while help is open
             }
@@ -3650,15 +3660,17 @@ mod key_tests {
         ));
     }
 
-    /// Same modifier guard, exercised from the Diagnostics, Recent-QSOs, and
-    /// station-health overlays (the fall-through sites added by the round-1
-    /// remediation) — Ctrl+K/Alt+K must not abort there either.
+    /// Same modifier guard, exercised from the Diagnostics, Recent-QSOs,
+    /// station-health, and Help overlays (the fall-through sites added by
+    /// the round-1/round-2/PAN-24 remediations) — Ctrl+K/Alt+K must not
+    /// abort there either.
     #[tokio::test]
     async fn ctrl_k_and_alt_k_do_not_abort_through_overlays() {
         for set_overlay in [
             (|a: &mut crate::app::App| a.show_diagnostics = true) as fn(&mut crate::app::App),
             |a: &mut crate::app::App| a.show_recent_qsos = true,
             |a: &mut crate::app::App| a.show_health = true,
+            |a: &mut crate::app::App| a.help_visible = true,
         ] {
             for modified_key in [key_ctrl('k'), key_alt('k')] {
                 let (mut r, cmd_rx, app) = make_runner().await;
@@ -3794,6 +3806,29 @@ mod key_tests {
             Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
         ));
         assert!(app.read().await.show_health, "overlay stays open");
+    }
+
+    /// PAN-24 (Codex round-2 P2 on PR #252): the help overlay (`?`) is the
+    /// same shape as Diagnostics/Recent-QSOs/station-health — a read-only
+    /// informational view, not a modal the operator is editing — but had
+    /// been left out of the `k`-falls-through wiring, so the help text's own
+    /// "k works from any panel" line was false while help was open. `k`
+    /// must abort here too, and Esc/`?` must remain the only way to close
+    /// the overlay.
+    #[tokio::test]
+    async fn help_overlay_lets_k_fall_through_to_abort() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut a = app.write().await;
+            a.apply_active_qsos(vec![banner("W1AW", "qso-1")], Vec::new());
+            a.help_visible = true;
+        }
+        r.handle_key_event(key('k')).await.unwrap();
+        assert!(matches!(
+            cmd_rx.try_recv(),
+            Ok(TuiCommand::AbortQso { qso_id }) if qso_id == "qso-1"
+        ));
+        assert!(app.read().await.help_visible, "overlay stays open");
     }
 
     /// `r` (re-send) is still gated to the QSO Status panel — out of scope
