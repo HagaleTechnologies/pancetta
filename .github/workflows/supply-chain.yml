@@ -332,11 +332,18 @@ jobs:
                                   # inside a bracket class (`[(]`) is class content, not
                                   # nesting -- skip the whole class so it doesn't perturb the
                                   # depth count (Codex round, CAT-314 follow-up).
+                                  # A "\" escapes the next character (`\(`, `\|`, etc) to a
+                                  # literal -- it doesn't open/close nesting or split an
+                                  # alternative, matching real minimatch (Codex round, CAT-314
+                                  # follow-up 2). Skip both characters as one atomic unit, same
+                                  # treatment as a bracket class.
                                   depth = 0
                                   idx = open_idx
                                   n = len(s)
                                   while idx < n:
                                       ch = s[idx]
+                                      if ch == "\\":
+                                          idx += 2 if idx + 1 < n else 1; continue
                                       if ch == "[":
                                           idx = _bracket_end(s, idx); continue
                                       if ch == "(": depth += 1
@@ -350,11 +357,16 @@ jobs:
                                   # "|" alternatives aren't torn apart by the outer split. A "|"
                                   # (or "("/")") inside a bracket class (`[a|b]`) is class
                                   # content, not a split point or nesting -- skip the whole
-                                  # class (Codex round, CAT-314 follow-up).
+                                  # class (Codex round, CAT-314 follow-up). Same for an escaped
+                                  # character (`\|`, `\(`) -- literal, not a split/nesting point
+                                  # (Codex round, CAT-314 follow-up 2).
                                   parts, depth, cur, i = [], 0, [], 0
                                   n = len(s)
                                   while i < n:
                                       ch = s[i]
+                                      if ch == "\\":
+                                          j = i + 2 if i + 1 < n else i + 1
+                                          cur.append(s[i:j]); i = j; continue
                                       if ch == "[":
                                           j = _bracket_end(s, i)
                                           cur.append(s[i:j]); i = j; continue
@@ -379,6 +391,18 @@ jobs:
                                   guard = lambda tok: ("(?!\\.)" + tok) if seg_start else tok
                                   while i < len(pattern):
                                       c = pattern[i]
+                                      # a "\" escapes the next character to a literal (glob escape
+                                      # semantics, not regex) -- `\(` matches a literal "(", not a
+                                      # 2-char "\(" sequence, and doesn't trigger extglob/wildcard
+                                      # handling. A trailing lone "\" with nothing to escape is
+                                      # itself literal (matches real minimatch; Codex round,
+                                      # CAT-314 follow-up 2).
+                                      if c == "\\":
+                                          if i + 1 < len(pattern):
+                                              out += _re.escape(pattern[i + 1]); i += 2
+                                          else:
+                                              out += _re.escape(c); i += 1
+                                          seg_start = False; continue
                                       # extglobs @(a|b) +(x) *(x) ?(x) !(x) -- balanced-paren close
                                       # search (not a non-greedy regex) so a NESTED extglob like
                                       # `@(foo|+(bar|baz))` doesn't get truncated at the first ")"
