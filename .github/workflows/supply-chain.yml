@@ -252,37 +252,35 @@ jobs:
       # (CAT-318). Only runs when WORKSPACE_ACCEPT actually names npm/pnpm
       # (see the job env above) -- this repo's gate never accepts either
       # today, so the step is a no-op skip here (Codex round, CAT-318).
-      - name: Bootstrap real npm/pnpm workspace resolvers from pinned + verified tarballs
+      - name: Bootstrap real npm/pnpm workspace resolvers from a pinned, integrity-verified lockfile
         if: contains(env.WORKSPACE_ACCEPT, 'npm') || contains(env.WORKSPACE_ACCEPT, 'pnpm')
         run: |
+          # Byte-verifying just the two top-level tarballs isn't enough: a plain
+          # `npm install` also resolves and installs each tool's own transitive
+          # dependencies fresh on every run, unpinned -- a dependency range could
+          # resolve to a different, validly-signed-but-compromised release on a
+          # later run and execute its require()'d code with no check catching it
+          # (Codex round, CAT-318 follow-up). Instead, install from a checked-in
+          # package-lock.json (.github/workflows/vendor/workspace-resolvers/) that
+          # pins an exact resolved version + integrity hash for the FULL
+          # transitive closure (210 packages) -- `npm ci` refuses to proceed if
+          # anything it downloads doesn't match the lockfile's pinned integrity
+          # hash, byte-for-byte, deterministically every run. This is npm's own
+          # standard mechanism for exactly this problem, not a hand-rolled one --
+          # the same "delegate to the real tool" reasoning CAT-318 itself is
+          # built on. `npm audit signatures` on top additionally verifies registry
+          # provenance (the lockfile pins integrity, not who published it).
           set -euo pipefail
           prefix=$(mktemp -d)
-          bootstrap_pkg() {
-            local spec="$1" want="$2"
-            local work; work=$(mktemp -d)
-            npm pack "$spec" --pack-destination "$work" --ignore-scripts --no-audit --no-fund --loglevel=error >/dev/null 2>&1
-            local tgz; tgz=$(find "$work" -name '*.tgz')
-            local got; got=$(shasum -a 512 "$tgz" | cut -d' ' -f1)
-            if [ "$got" != "$want" ]; then
-              echo "::error::${spec} tarball sha512 ${got:0:16}... does not match the pinned ${want:0:16}... -- refusing to install"; exit 1
-            fi
-            npm install --prefix "$prefix" --ignore-scripts --no-audit --no-fund "$tgz" >/dev/null
-          }
-          bootstrap_pkg "@npmcli/map-workspaces@6.0.0" "0ec7b1ed705e6b40681516df00b31b36e68da9e23791b649c6204c42116f3d4365bafd3211e28c77914b217cb4342b0eb863184242dafa2db5f4269d9e8a8b6e"
-          bootstrap_pkg "@pnpm/find-workspace-packages@6.0.9" "f34b7a9bac3711f3a0e64f3c091f04c9ae9a3898b6b97c981854afd98fb70ea180583db1e8214b337928a76662d672fd4c7318a5817784b9c145ba9c27cae646"
-          # Byte-verifying the two top-level tarballs isn't enough: `npm install`
-          # also resolves and installs each tool's own transitive dependencies,
-          # which are outside this repo's own lockfile/OSV/byte-verification
-          # coverage entirely -- a compromised transitive would execute its
-          # require()'d code on the next step with no check catching it (Codex
-          # round, CAT-318 follow-up). Verify every package actually installed
-          # in the closure (not just the two roots) carries a valid npm
-          # registry signature before either resolver is ever require()'d.
+          cp .github/workflows/vendor/workspace-resolvers/package.json \
+             .github/workflows/vendor/workspace-resolvers/package-lock.json \
+             "$prefix/"
+          (cd "$prefix" && npm ci --ignore-scripts --no-audit --no-fund --loglevel=error)
           if ! npm audit signatures --prefix "$prefix" >/dev/null; then
             echo "::error::one or more packages in the workspace-resolver dependency closure failed registry signature verification -- refusing to use them"; exit 1
           fi
           echo "WS_RESOLVERS_PREFIX=$prefix" >> "$GITHUB_ENV"
-          echo "Bootstrapped @npmcli/map-workspaces and @pnpm/find-workspace-packages from byte-verified tarballs into $prefix"
+          echo "Bootstrapped @npmcli/map-workspaces and @pnpm/find-workspace-packages from a pinned, integrity-verified lockfile into $prefix"
       # 0. Every manifest must be covered by a lockfile this gate validates
       #    (pnpm importer / sibling package-lock.json / a package of the Cargo
       #    workspace its Cargo.lock actually locks); yarn/bun/shrinkwrap are
@@ -316,7 +314,7 @@ jobs:
 
           def _resolve_workspace_dirs(root, raw_patterns, kind):
               """Delegates workspace-glob resolution to the REAL npm/pnpm tool
-              (bootstrapped from a pinned + byte-verified tarball -- see the
+              (bootstrapped from a pinned, integrity-verified lockfile -- see the
               'Bootstrap real npm/pnpm workspace resolvers' step) instead of a
               hand-maintained reimplementation (CAT-318). Returns the set of
               real, existing directories (relative to root, normalized) the

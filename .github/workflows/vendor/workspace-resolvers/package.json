@@ -1,0 +1,9 @@
+{
+  "name": "cat318-workspace-resolvers",
+  "private": true,
+  "description": "Pinned, integrity-verified dependency closure for the supply-chain gate's workspace-glob resolvers (CAT-318). Not published, not installed by the repo itself -- npm ci'd in isolation by the gate's bootstrap step.",
+  "dependencies": {
+    "@npmcli/map-workspaces": "6.0.0",
+    "@pnpm/find-workspace-packages": "6.0.9"
+  }
+}
