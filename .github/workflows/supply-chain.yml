@@ -323,8 +323,25 @@ jobs:
               tool actually selects -- extglobs, negation (npm's resurrection
               model and pnpm's distinct order-independent-absolute model
               alike), and every other real semantic by construction, since
-              this IS the same code npm/pnpm itself uses."""
-              if not raw_patterns:
+              this IS the same code npm/pnpm itself uses.
+
+              raw_patterns is None for pnpm when pnpm-workspace.yaml omits
+              `packages` entirely: pnpm's own documented default is then
+              "root + every subdirectory" (@pnpm/find-workspace-packages
+              re-reads the manifest itself and falls through to
+              @pnpm/fs.find-packages' ['.', '**'] default -- verified against
+              the pinned tarballs' installed source, not guessed), so that
+              case is passed straight through to let pnpm apply its own
+              default rather than being shortcut here to zero (which
+              previously made this gate refuse every default-configured pnpm
+              workspace member, Codex round, CAT-318 follow-up). raw_patterns
+              is an explicit empty list for npm's missing/absent `workspaces`
+              field (npm has no implicit default -- absent means none) and
+              for pnpm's `packages: []` (an explicit, real zero); either
+              short-circuits below without invoking node."""
+              if raw_patterns == []:
+                  return set()
+              if raw_patterns is None and kind == "npm":
                   return set()
               prefix = os.environ["WS_RESOLVERS_PREFIX"]
               abs_root = os.path.abspath(root)
@@ -408,7 +425,12 @@ jobs:
                       # (cqdx#349's class of finding, closed here too via CAT-318).
                       pwy_path = os.path.join(root, "pnpm-workspace.yaml")
                       pwy = (yaml.safe_load(open(pwy_path)) or {}) if os.path.exists(pwy_path) else {}
-                      pnpm_ws = [g for g in (pwy.get("packages") or []) if isinstance(g, str)]
+                      # `packages` absent entirely (no pnpm-workspace.yaml, or one that
+                      # doesn't set it) is NOT the same as `packages: []`: the former
+                      # means "let pnpm apply its own default" (root + every
+                      # subdirectory) and must reach _resolve_workspace_dirs as None,
+                      # never collapsed to [] here -- see that function's docstring.
+                      pnpm_ws = [g for g in (pwy.get("packages") or []) if isinstance(g, str)] if "packages" in pwy else None
                       real_dirs = _resolve_workspace_dirs(root, pnpm_ws, "pnpm")
                       for imp in (lock.get("importers") or {}):
                           nimp = os.path.normpath(imp)
