@@ -20,8 +20,9 @@ name: Supply Chain
 #                       malicious-packages feed (MAL-* ids), e.g. the Aug 2026
 #                       keyv@6.0.0 compromise is MAL-2026-11524 -- so this is a
 #                       malware gate, not just a CVE gate.
-#   * install-policy -- `cargo fetch --locked` (every crate must still resolve to exactly the
-#                       pinned checksum; no build.rs runs) and no git/path crate sources.
+#   * install-policy -- every Cargo.toml covered by its workspace's Cargo.lock; crate sources
+#                       registry-only (cargo metadata --locked); .cargo/config may not
+#                       override sources/registries/transport; cargo fetch --locked.
 #   * actions-pins   -- on EVERY PR: every NEWLY
 #                       ADDED executable reference (parsed from the YAML at the
 #                       merge-base and head, per file and per occurrence: step
@@ -46,6 +47,10 @@ name: Supply Chain
 on:
   pull_request:
     branches: [main]
+  # A merge queue requests the same required context for its temporary
+  # merge-group SHA; the scans then run against merge_group.base_sha/head_sha.
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -64,9 +69,13 @@ jobs:
       deps: ${{ steps.filter.outputs.deps }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
       - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
         id: filter
         with:
+          base: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
           filters: |
             deps:
               - '**/package.json'
@@ -75,11 +84,14 @@ jobs:
               - '**/pnpm-lock.yaml'
               - '**/pnpm-workspace.yaml'
               - '**/.npmrc'
+              - '**/.pnpmfile.cjs'
               - '**/yarn.lock'
               - '**/bun.lock'
               - '**/bun.lockb'
               - '**/Cargo.toml'
               - '**/Cargo.lock'
+              - '**/.cargo/config'
+              - '**/.cargo/config.toml'
               - '.github/workflows/**'
               - '**/action.yml'
               - '**/action.yaml'
@@ -87,10 +99,18 @@ jobs:
               - '**/dockerfile*'
               - '**/*.Dockerfile'
               - '**/*.dockerfile'
-  osv:
+  # The differential PR scan (osv-scanner-reusable-pr.yml) relies on
+  # GITHUB_BASE_REF to check out the base ref -- that variable is only
+  # populated for pull_request(_target) events and is EMPTY for merge_group,
+  # so calling it there checks out nothing and silently fails to compute a
+  # base scan (Codex round 1, pancetta #291). merge_group gets its own job
+  # running a full (non-diff) scan of the merge commit instead: every
+  # constituent PR was already diff-scanned before entering the queue, so a
+  # full scan here is a correct, simpler final gate, not a downgrade.
+  osv-pr:
     name: OSV advisories (incl. malicious-package MAL-*)
     needs: changes
-    if: needs.changes.outputs.deps == 'true'
+    if: needs.changes.outputs.deps == 'true' && github.event_name == 'pull_request'
     permissions:
       actions: read
       contents: read
@@ -102,10 +122,96 @@ jobs:
       upload-sarif: false
       fail-on-vuln: true
 
+  # A full (non-diff) scan here would ALSO fail on any advisory already
+  # present on main before this merge group -- exactly what the PR-diff scan
+  # is designed to tolerate -- rejecting every dependency-changing merge-queue
+  # entry forever once one exists on main (Codex round 2, pancetta #291).
+  # GITHUB_SHA (used below) IS correctly the merge group's own SHA for this
+  # event; only GITHUB_BASE_REF is empty (pull_request(_target)-only), so
+  # this mirrors osv-scanner-reusable-pr.yml's own steps -- same pinned
+  # action SHAs -- substituting merge_group.base_sha for the base checkout.
+  osv-merge-group:
+    name: OSV advisories (incl. malicious-package MAL-*) -- merge group
+    needs: changes
+    if: needs.changes.outputs.deps == 'true' && github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # google/osv-scanner-action's scanner/reporter run as Docker container
+      # actions, which only see $GITHUB_WORKSPACE (not $RUNNER_TEMP -- a host
+      # path the container can't reach), so scan outputs must live INSIDE the
+      # checkout. An unpredictable, per-run directory name means a PR cannot
+      # pre-commit a colliding tracked path, so the later `git checkout -f`
+      # (which only overwrites paths the target commit itself tracks) leaves it
+      # alone -- closing the tamperable-results-file gap without breaking the
+      # scan under a Docker action (Codex round, widdershins #219).
+      - name: "Prepare an unpredictable scan-output directory"
+        run: |
+          dir=".osv-scan-${GITHUB_RUN_ID}-${RANDOM}${RANDOM}"
+          mkdir -p "$dir"
+          echo "OSV_SCAN_DIR=$dir" >> "$GITHUB_ENV"
+      - name: "Checkout base of the merge group"
+        run: git checkout ${{ github.event.merge_group.base_sha }}
+      # Written under $RUNNER_TEMP, outside the checkout -- a PR that commits a
+      # tracked file literally named old-results.json would otherwise have it
+      # replace this step's genuine output the moment `git checkout -f` runs
+      # next, letting the reporter treat a PR-fabricated "no advisories"
+      # baseline as the real pre-PR scan (Codex round, widdershins #219).
+      - name: "Run scanner on existing code"
+        uses: google/osv-scanner-action/osv-scanner-action@baa4139e56d6312335d899e6ba045fa16d1d3d0b # v2.5.1
+        env:
+          GOTOOLCHAIN: auto
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=json
+            --output=${{ env.OSV_SCAN_DIR }}/old-results.json
+            -r
+            ./
+      - name: "Checkout head of the merge group"
+        run: git checkout -f "$GITHUB_SHA"
+      - name: "Run scanner on new code"
+        uses: google/osv-scanner-action/osv-scanner-action@baa4139e56d6312335d899e6ba045fa16d1d3d0b # v2.5.1
+        env:
+          GOTOOLCHAIN: auto
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=json
+            --output=${{ env.OSV_SCAN_DIR }}/new-results.json
+            -r
+            ./
+      - name: "Run osv-scanner-reporter"
+        uses: google/osv-scanner-action/osv-reporter-action@baa4139e56d6312335d899e6ba045fa16d1d3d0b # v2.5.1
+        with:
+          scan-args: |-
+            --output=${{ env.OSV_SCAN_DIR }}/results.sarif
+            --old=${{ env.OSV_SCAN_DIR }}/old-results.json
+            --new=${{ env.OSV_SCAN_DIR }}/new-results.json
+            --gh-annotations=true
+            --fail-on-vuln=true
+
   install-policy:
     name: Lockfile integrity (cargo fetch --locked) + source policy
-    needs: changes
-    if: needs.changes.outputs.deps == 'true'
+    # Runs only after OSV has PASSED (see the pnpm repos' gate for the rationale).
+    needs: [changes, osv-pr, osv-merge-group]
+    # always(): without an explicit status-check function, GH Actions implicitly
+    # ANDs "&& success()" onto a custom `if:` -- since exactly one of osv-pr/
+    # osv-merge-group is ALWAYS 'skipped' by design, that implicit check would
+    # fail on every run and this job would never execute at all (Codex round 8,
+    # cqdx #349) -- ci.yml's analogous gate already uses always() for the same
+    # reason.
+    if: |
+      always() &&
+      needs.changes.outputs.deps == 'true' &&
+      (needs.osv-pr.result == 'success' || needs.osv-pr.result == 'skipped') &&
+      (needs.osv-merge-group.result == 'success' || needs.osv-merge-group.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
@@ -132,13 +238,204 @@ jobs:
           ACCEPT = set((sys.argv[1] if len(sys.argv) > 1 else "pnpm,npm").split(","))
           PRUNE = {"node_modules", "target", ".git", ".worktrees"}
           manifests, covered, refused = [], set(), []
+          # a symlinked manifest / lockfile / package-manager config is refused: the tools
+          # follow the link, but a change to its differently-named target would not be
+          # detected as a dependency change
+          SYMLINK_NAMES = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", ".pnpmfile.cjs", "Cargo.toml", "Cargo.lock", "yarn.lock", "bun.lock", "bun.lockb"}
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in PRUNE]
+              for f in files:
+                  if f in SYMLINK_NAMES and os.path.islink(os.path.join(root, f)):
+                      refused.append(os.path.normpath(os.path.join(root, f)) + " (symlink)")
+              for d in list(dirs):
+                  if d == ".cargo" and os.path.islink(os.path.join(root, d)): refused.append(os.path.normpath(os.path.join(root, d)) + " (symlinked .cargo dir)")
+              if os.path.basename(root) == ".cargo":
+                  for f in ("config", "config.toml"):
+                      if f in files and os.path.islink(os.path.join(root, f)): refused.append(os.path.normpath(os.path.join(root, f)) + " (symlink)")
           for root, dirs, files in os.walk("."):
               dirs[:] = [d for d in dirs if d not in PRUNE]
               rel = os.path.normpath(root)
               if "package.json" in files:
                   manifests.append(rel)
               if "package-lock.json" in files:
-                  (covered.add(rel) if "npm" in ACCEPT else refused.append(os.path.join(rel, "package-lock.json")))
+                  if "npm" in ACCEPT:
+                      covered.add(rel)
+                      try:
+                          import json, re as _re
+                          def ws_match(pattern, path):
+                              """npm/minimatch-style: `*`/`?` never cross `/`, `**` does, `{a,b}` alternates
+                              (brace groups are expanded into separate full patterns first -- matching
+                              minimatch/brace-expansion order -- so an alternative that itself begins with
+                              a literal `.` is judged independently). Dotfile rule (npm's workspace mapper
+                              calls glob without dot:true): `*`, `?`, `**`, or an extglob/bracket token that
+                              does not ITSELF spell a literal leading `.` does not match a `.`-prefixed path
+                              SEGMENT (verified against the real `minimatch` 10.2.5 npm ships: `{.internal,x}`,
+                              `@(.internal|x)` and `[.]internal` all match `.internal`; a bare `*`/`?`/`[!.]`
+                              does not -- Codex round, widdershins #219)."""
+                              def _numeric_brace_range(m):
+                                  # npm's bundled brace-expansion supports descending ranges
+                                  # (`{3..1}` -> 3,2,1) and pads every member to the wider
+                                  # operand's width whenever EITHER side has a real leading
+                                  # zero (a bare "0" alone does not count) -- `range(start,
+                                  # end+1)` silently produced nothing for a descending range,
+                                  # and plain str(i) always dropped padding (verified against
+                                  # real npm 11.4.2 brace-expansion; Codex round, pancetta #291,
+                                  # panino #101).
+                                  lo_s, hi_s = m.group(1), m.group(2)
+                                  lo, hi = int(lo_s), int(hi_s)
+                                  width = max(len(lo_s), len(hi_s)) if ((len(lo_s) > 1 and lo_s[0] == "0") or (len(hi_s) > 1 and hi_s[0] == "0")) else 0
+                                  rng = range(lo, hi + 1) if lo <= hi else range(lo, hi - 1, -1)
+                                  return "{" + ",".join(str(i).zfill(width) for i in rng) + "}"
+                              pattern = _re.sub(r"\{(\d+)\.\.(\d+)\}", _numeric_brace_range, pattern)   # {1..3} / {3..1} / {01..03}
+                              def _alpha_brace_range(m):
+                                  lo, hi = ord(m.group(1)), ord(m.group(2))
+                                  rng = range(lo, hi + 1) if lo <= hi else range(lo, hi - 1, -1)
+                                  # a mixed-case range (e.g. `{a..Z}`) walks through the
+                                  # non-letter code points between 'Z' (90) and 'a' (97) --
+                                  # npm's bundled brace-expansion collapses the backslash code
+                                  # point (92) to an empty-string alternative rather than a
+                                  # literal backslash char (verified directly against real npm
+                                  # 11's brace-expansion for {Z..a}/{a..Z}; Codex round,
+                                  # pancetta #291).
+                                  return "{" + ",".join(("" if i == 92 else chr(i)) for i in rng) + "}"
+                              pattern = _re.sub(r"\{([A-Za-z])\.\.([A-Za-z])\}", _alpha_brace_range, pattern)   # {a..c} / {c..a}
+                              def brace_expand(pat):
+                                  m = _re.search(r"\{([^{}]*)\}", pat)
+                                  if not m: return [pat]
+                                  out = []
+                                  for alt in m.group(1).split(","):
+                                      out.extend(brace_expand(pat[:m.start()] + alt + pat[m.end():]))
+                                  return out
+                              def translate(pattern, start_seg=True):
+                                  # an extglob ALTERNATIVE's own leading character is not a new
+                                  # segment start -- the dot-exclusion decision for that position
+                                  # was already made one level up (by the dotalts/rest split and
+                                  # the guard() wrapper there, using the OUTER seg_start); every
+                                  # recursive translate(a, ...) call for an alt therefore passes
+                                  # start_seg=False so it never re-applies its own internal
+                                  # (?!\.) to a wildcard that happens to be the alt's first
+                                  # character (`x@(*|y)` matching `x.foo` -- Codex local round,
+                                  # panino #101).
+                                  out, i, seg_start = "", 0, start_seg
+                                  guard = lambda tok: ("(?!\\.)" + tok) if seg_start else tok
+                                  while i < len(pattern):
+                                      c = pattern[i]
+                                      eg = _re.match(r"([@+*?!])\((.*?)\)", pattern[i:])     # extglobs @(a|b) +(x) *(x) ?(x) !(x)
+                                      if eg:
+                                          alts = eg.group(2).split("|")
+                                          # each alternative is itself a glob (`@(a*|b*)` -- `*`/`?`/`[...]`/
+                                          # nested extglobs inside an alternative are NOT literal text; only
+                                          # `_re.escape`-ing them broke every wildcarded alternative (Codex
+                                          # round 9, panino #101). Recurse through the same translate() used
+                                          # for the rest of the pattern.
+                                          if eg.group(1) == "!":
+                                              inner = "|".join(translate(a, False) for a in alts)
+                                              out += guard("(?:(?!(?:" + inner + ")(?:/|$))[^/]+)")   # one segment that is not any alternative
+                                          else:
+                                              def is_dot_explicit(a):
+                                                  # a literal leading '.', or the exact singleton bracket class
+                                                  # `[.]` (matching minimatch's own narrow rule -- `[.a]`/`[a.]`
+                                                  # still get the dot guard; Codex round, cqdx #349).
+                                                  return a.startswith(".") or bool(_re.match(r"^\[\.\]", a))
+                                              dotalts = [a for a in alts if is_dot_explicit(a)]         # explicit -- not guarded
+                                              rest = [a for a in alts if not is_dot_explicit(a)]
+                                              mixed = "(?:" + "|".join(translate(a, False) for a in alts) + ")"   # ANY alt, unguarded -- used
+                                              # once we are past the first character of the segment, so later
+                                              # repetitions of +()/*() may freely mix dotted and undotted
+                                              # alternatives (`+(.internal|x)` matches `.internalx` too --
+                                              # splitting into separately-repeated per-class groups broke this;
+                                              # Codex round, vanity #153).
+                                              def first_choice():
+                                                  parts = []
+                                                  if dotalts: parts.append("(?:" + "|".join(translate(a, False) for a in dotalts) + ")")
+                                                  if rest: parts.append(guard("(?:" + "|".join(translate(a, False) for a in rest) + ")"))
+                                                  return "(?:" + "|".join(parts) + ")" if len(parts) > 1 else (parts[0] if parts else "(?!x)x")
+                                              kind = eg.group(1)
+                                              if kind in ("@", "?"):
+                                                  out += first_choice() + ({"@": "", "?": "?"}[kind])
+                                              elif kind == "+":
+                                                  out += first_choice() + mixed + "*"
+                                              else:  # "*" -- zero or more, mixed freely once started
+                                                  out += "(?:" + first_choice() + mixed + "*)?"
+                                          i += eg.end(); seg_start = False; continue
+                                      if pattern.startswith("**/", i): out += "(?:(?!\\.)[^/]+/)*"; i += 3; seg_start = True; continue      # zero or more non-dot directories
+                                      elif pattern.startswith("**", i): out += guard("(?:[^/]+(?:/(?!\\.)[^/]+)*)?"); i += 2; seg_start = False; continue
+                                      elif c == "*": out += guard("[^/]*"); i += 1; seg_start = False; continue
+                                      elif c == "?": out += guard("[^/]"); i += 1; seg_start = False; continue
+                                      elif c == "[":
+                                          j = pattern.find("]", i + 2)
+                                          if j == -1: out += _re.escape(c); i += 1; seg_start = False
+                                          else:
+                                              cls = pattern[i + 1:j]
+                                              negated = cls.startswith("!")
+                                              core = cls[1:] if negated else cls
+                                              # minimatch's dot-exclusion bypass is narrower than "contains a
+                                              # dot": ONLY the exact singleton class `[.]` counts as explicit --
+                                              # `[.a]`/`[a.]` (a dot among OTHER options) still gets the (?!\.)
+                                              # guard, verified against the real library (Codex round, cqdx #349).
+                                              allows_dot = (core == ".") and not negated
+                                              cls = ("^" + core) if negated else cls
+                                              tok = "[" + cls.replace("\\", "\\\\") + "]"
+                                              out += tok if allows_dot else guard(tok); i = j + 1; seg_start = False
+                                          continue
+                                      elif c == "/": out += "/"; i += 1; seg_start = True; continue
+                                      else: out += _re.escape(c); i += 1; seg_start = False; continue
+                                  return out
+                              return any(_re.fullmatch(translate(p), path) for p in brace_expand(pattern))
+                          lock = json.load(open(os.path.join(root, "package-lock.json")))
+                          pkgs = lock.get("packages") or {}
+                          ws = (json.load(open(os.path.join(root, "package.json"))) if os.path.exists(os.path.join(root, "package.json")) else {}).get("workspaces") or []
+                          if isinstance(ws, dict): ws = ws.get("packages") or []
+                          ws = [os.path.normpath(g) for g in ws if isinstance(g, str)]
+                          def _ws_prepare(raw_patterns):
+                              """Faithfully mirrors @npmcli/map-workspaces's appendNegatedPatterns:
+                              negation is NOT a simple per-path last-match-wins toggle. A later
+                              POSITIVE pattern cancels an earlier negation only when the positive
+                              pattern's own literal text would itself be matched AS A PATH by that
+                              negated glob (e.g. an exact re-list, or a negation of `pkg/b/**`
+                              cancelled by the specific `pkg/b/a`) -- a broader wildcard like
+                              `packages/*` following `!packages/private` does NOT resurrect it
+                              (verified against the real @npmcli/map-workspaces 5.0.3; Codev round,
+                              widdershins #219)."""
+                              positive, negated = [], []
+                              for raw in raw_patterns:
+                                  if not isinstance(raw, str): continue
+                                  m = _re.match(r"^(!+)", raw)
+                                  excl = m.group(1) if m else ""
+                                  pat = _re.sub(r"^\.?/+", "", raw[len(excl):])   # strip a leading ./ or /
+                                  if len(excl) % 2 == 1:
+                                      negated.append(pat)
+                                  else:
+                                      # mirror npm's own for-loop-with-splice EXACTLY, including its
+                                      # off-by-one: the loop index always advances even after a
+                                      # deletion shifts the list, so an element that shifts into the
+                                      # just-vacated slot is never re-checked -- an adjacent DUPLICATE
+                                      # negation only ever cancels once, leaving one copy to still
+                                      # exclude the path (Codex local round, widdershins #219).
+                                      i = 0
+                                      while i < len(negated):
+                                          if ws_match(negated[i], pat): del negated[i]
+                                          i += 1
+                                      positive.append(pat)
+                              positive = [p for p in positive if not any(ws_match(np, p) for np in negated)]
+                              return positive, negated
+                          _ws_positive, _ws_negated = _ws_prepare(ws)
+                          def ws_selected(path):
+                              if any(ws_match(np, path) for np in _ws_negated): return False
+                              return any(ws_match(p, path) for p in _ws_positive)
+                          link_targets = {os.path.normpath(m["resolved"]) for m in pkgs.values() if isinstance(m, dict) and m.get("link") and isinstance(m.get("resolved"), str)}
+                          for key in pkgs:
+                              # an npm workspace member is covered only when the ROOT manifest
+                              # declares it (workspaces globs) AND the lock links to it -- a
+                              # handcrafted lock key alone grants nothing
+                              nk = os.path.normpath(key)
+                              if key and "node_modules/" not in key and not nk.startswith("..") and nk in link_targets \
+                                      and ws_selected(nk):
+                                  covered.add(os.path.normpath(os.path.join(rel, nk)))
+                      except (ValueError, OSError):
+                          pass                                                 # the verifier step rejects an unparseable lock
+                  else:
+                      refused.append(os.path.join(rel, "package-lock.json"))
               if "pnpm-lock.yaml" in files:
                   if "pnpm" in ACCEPT:
                       covered.add(rel)
@@ -191,6 +488,30 @@ jobs:
       # checksum-verifies the crates of THAT project.
       - name: Crate source policy + cargo fetch --locked (every Cargo.lock)
         run: |
+          # .cargo/config(.toml) is parsed as TOML and may not override crate
+          # sources, registries, or network transport (dotted keys included).
+          python3 - <<'CCP'
+          import os, sys, tomllib
+          # .cargo/config(.toml) can redirect crate fetching (source replacement,
+          # registries, registry.default, net.git-fetch-with-cli...) without touching
+          # Cargo.toml/Cargo.lock. Parsed as TOML (dotted keys included), any of those
+          # top-level tables is refused; benign tables (env, build, test, alias...) pass.
+          FORBIDDEN = {"source", "registries", "registry", "net", "http"}
+          bad = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in ("node_modules", "target", ".git")]
+              if os.path.basename(root) != ".cargo": continue
+              for f in ("config", "config.toml"):
+                  if f in files:
+                      p = os.path.join(root, f)
+                      try: cfg = tomllib.load(open(p, "rb"))
+                      except tomllib.TOMLDecodeError as e: bad.append(f"{p}: unparseable TOML ({e})"); continue
+                      hit = sorted(FORBIDDEN & set(cfg))
+                      if hit: bad.append(f"{p}: overrides {', '.join(hit)} -- crate sources/registries/network may only come from Cargo.toml + Cargo.lock")
+          if bad:
+              print("::error::Cargo configuration overrides are not allowed:"); print("\n".join("  " + b for b in bad)); sys.exit(1)
+          print("no Cargo source/registry/network overrides in any .cargo/config")
+          CCP
           cat > /tmp/cargo-sources.py <<'PY'
           import json, subprocess, sys, tomllib
           # Registry-only source policy for Cargo.lock (CAT-299 / ADR-0014). A path
@@ -206,13 +527,27 @@ jobs:
           ids = set(meta["workspace_members"])
           members = {(p["name"], p["version"]) for p in meta["packages"] if p["id"] in ids}
           lock = tomllib.load(open("Cargo.lock", "rb"))
+          # The only trusted registry sources -- crates.io's classic git index and its
+          # current sparse-protocol index. A manifest dependency can set the stable
+          # `registry-index` key directly (bypassing the separate .cargo/config.toml
+          # guard entirely, since this is a Cargo.toml-level override, not a config
+          # file one) to point Cargo at an arbitrary registry, including a plaintext
+          # http:// one; `src.startswith("registry+")` alone accepts that unchanged
+          # (Codex round 8, cqdx #349). Anything else -- a different host, a different
+          # protocol, plaintext http -- is refused, matching the pnpm/npm registry
+          # pin's "one trusted source, not any source that merely looks like one"
+          # posture used elsewhere in this gate.
+          CRATES_IO = {
+              "registry+https://github.com/rust-lang/crates.io-index",
+              "registry+sparse+https://index.crates.io/",
+          }
           bad = []
           for p in lock.get("package", []):
               src = p.get("source")
               if src is None:
                   if (p["name"], p["version"]) not in members:
                       bad.append(f"{p['name']} {p['version']}: path dependency (not a workspace member)")
-              elif not src.startswith("registry+"):
+              elif src not in CRATES_IO:
                   bad.append(f"{p['name']} {p['version']}: source={src}")
           if bad:
               print("::error::non-registry crate sources in Cargo.lock:"); print("\n".join("  " + b for b in bad)); sys.exit(1)
@@ -223,7 +558,6 @@ jobs:
             n=$((n+1)); echo "== $lock"; ( cd "$(dirname "$lock")" && python3 /tmp/cargo-sources.py && cargo fetch --locked )
           done < <(find . \( -name node_modules -o -name target -o -name .git \) -prune -o -name 'Cargo.lock' -print | sort)
           echo "checked $n Cargo lockfile(s)"
-
   # Runs on EVERY PR (~10s): no path filter can know the custom filenames a
   # Docker action's runs.image may point at, so the script classifies every
   # changed file itself (local review gate, round 3).
@@ -236,13 +570,22 @@ jobs:
           fetch-depth: 0
       - name: Newly added actions must be pinned (structural YAML check)
         env:
-          BASE: ${{ github.event.pull_request.base.sha }}
-          HEAD: ${{ github.event.pull_request.head.sha }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
         run: |
           python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
           cat > /tmp/action-pins.py <<'PY'
-          import os, re, shlex, subprocess, sys, yaml
+          import json, os, re, shlex, subprocess, sys, yaml
           from collections import Counter
+          # Built from two concatenated halves, never spelled as one contiguous token
+          # anywhere in this file (comments included): GitHub evaluates any
+          # dollar-brace-brace ... brace-brace expression sequence appearing anywhere
+          # in a run: block's raw text -- even inside a Python string literal or a
+          # comment -- before bash/python ever sees it. Spelling that sequence out
+          # literally here previously broke this entire workflow file (every trigger
+          # failed with zero jobs, "workflow file issue") because GitHub tried to
+          # evaluate it as a real expression (Codex round, cqdx #349).
+          EXPR_MARK = "$" + "{{"
           # Newly-added-action pin policy (CAT-299 / ADR-0014). Structural, not textual:
           # every workflow (.github/workflows/*.yml) and every action manifest
           # (**/action.yml|yaml) changed in the PR is parsed at the PR's MERGE-BASE and at
@@ -269,11 +612,26 @@ jobs:
               line continuations; heredoc-bearing instructions fail closed; `ARG NAME=default` declared before a FROM is substituted
               ($NAME / ${NAME} / ${NAME:-fallback}); an unresolved variable stays in the
               ref and fails the digest check (fail closed)."""
-              esc = "\\"
+              text = text.lstrip("\ufeff")   # Docker strips a leading BOM before parsing
+              # directives; a raw \ufeff before "#" would otherwise stop the directive
+              # regexes from matching a legitimate `# syntax=` on line 1 (Codex round 1,
+              # pancetta #291).
+              esc, out, seen = "\\", [], set()
+              # Parser directives (Docker reference): only at the very top, one per line, no
+              # continuation; the block ENDS at the first empty line, ordinary comment,
+              # UNKNOWN directive (treated as a comment) or instruction -- a later
+              # `# syntax=` is then an inert comment. A directive given twice is invalid;
+              # refused rather than guessed (Codex local round, sync PRs).
               for raw in text.splitlines():
-                  m = re.match(r"\s*#\s*escape\s*=\s*(\S)", raw, re.I)
-                  if m: esc = m.group(1); continue
-                  if raw.strip() and not raw.lstrip().startswith("#"): break           # directives only precede instructions
+                  m = re.match(r"\s*#\s*([A-Za-z]+)\s*=\s*(\S+)\s*$", raw)
+                  if not m or m.group(1).lower() not in ("syntax", "escape", "check"): break
+                  key, val = m.group(1).lower(), m.group(2)
+                  if key in seen:
+                      if hard_fail is not None: hard_fail.add(f"{label}: parser directive `{key}` appears twice -- invalid Dockerfile, refused")
+                      break
+                  seen.add(key)
+                  if key == "escape": esc = val[0]
+                  elif key == "syntax": out.append("container:" + val)              # BuildKit frontend image: pulled and executed first
               logical, buf = [], ""
               for raw in text.splitlines():
                   if raw.lstrip().startswith("#"): continue
@@ -292,10 +650,17 @@ jobs:
               # move the script into a file ADDed from the context). The fleet has no
               # Dockerfile-backed action today, so the cost is zero and the bypass
               # surface is closed.
-              for line in logical:
-                  if re.match(r"\s*(ONBUILD\s+)?(RUN|COPY|ADD)\b", line, re.I):
+              for line in logical:                                   # HEAD: refuse heredocs; BASE: a heredoc-bearing base is
+
+                  m = re.match(r"\s*(?:ONBUILD\s+)?(?:RUN|COPY|ADD)\s+((?:--\S+\s+)*)(.*)$", line, re.I | re.S)
+                  if m:
+                      if m.group(2).lstrip().startswith("["):
+                          try:
+                              if isinstance(json.loads(m.group(2).strip()), list): continue   # JSON (exec) form: no shell, no heredoc
+                          except ValueError:
+                              pass                                                          # `RUN [ -e x ] || …` is shell form
                       try:
-                          lex = shlex.shlex(line, posix=False, punctuation_chars=True); lex.whitespace_split = True; toks = list(lex)
+                          lex = shlex.shlex(line, posix=False, punctuation_chars=True); lex.whitespace_split = True; lex.commenters = ""; toks = list(lex)
                       except ValueError:
                           toks = line.split()
                       if any("<<" in t and "<<<" not in t and not t.startswith(("'", '"')) for t in toks):   # `<<<` is a here-string, not a heredoc
@@ -303,32 +668,81 @@ jobs:
                           # a heredoc that already existed at the base must still fail the PR
                           if hard_fail is not None:
                               hard_fail.add(f"{label}: a RUN/COPY/ADD instruction uses a heredoc (`<<`) -- this gate refuses to parse heredocs; rewrite the instruction without one")
+                          # UNAVAILABLE for subtraction (fail closed): body text could otherwise
+                          # cancel a genuinely new reference, and such a base can only predate
+                          # this gate -- a cleanup PR must pin everything it keeps.
                           return []
-              args, stages, out, index = {}, set(), [], 0
-              def expand(v):
+              global_args, stage_args, stages, index = {}, {}, set(), 0
+              in_stage = False
+              def expand(v, scope):
                   v = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
-                             lambda m: (args.get(m.group(1)) or (m.group(2) if m.group(2) is not None else args.get(m.group(1), m.group(0)))) if m.group(2) is not None or m.group(1) in args else m.group(0), v)
-                  return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda m: args.get(m.group(1), m.group(0)), v)
+                             lambda m: (scope.get(m.group(1)) or (m.group(2) if m.group(2) is not None else scope.get(m.group(1), m.group(0)))) if m.group(2) is not None or m.group(1) in scope else m.group(0), v)
+                  return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda m: scope.get(m.group(1), m.group(0)), v)
               for line in logical:
                   m = re.match(r"\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?\s*$", line, re.I)
-                  if m: args[m.group(1)] = (m.group(2) or "").strip().strip("\"'"); continue
+                  if m:
+                      name, val = m.group(1), m.group(2)
+                      val = None if val is None else val.strip().strip("\"'")
+                      if not in_stage:
+                          global_args[name] = val or ""                              # pre-FROM: global default
+                      elif val is not None:
+                          stage_args[name] = val                                     # stage-local value
+                      else:
+                          stage_args[name] = global_args.get(name, "")               # valueless: inherits the GLOBAL default only
+                      continue
                   # COPY/ADD --from=X (instruction FLAGS only) and RUN --mount=...,from=X
                   # (inside the --mount option value only) pull X when it is not a stage;
                   # ordinary command text such as `RUN echo from=x` is never an image.
                   srcs = []
-                  fm = re.match(r"\s*(COPY|ADD)\s+((?:--\S+\s+)*)", line, re.I)
-                  if fm: srcs += re.findall(r"--from=(\S+)", fm.group(2))
-                  rm = re.match(r"\s*RUN\s+((?:--\S+\s+)*)", line, re.I)
+                  am = re.match(r"\s*(?:ONBUILD\s+)?ADD\s+((?:--\S+\s+)*)(.*)$", line, re.I | re.S)
+                  if am:
+                      flags, rest = am.group(1), am.group(2).strip()
+                      try: parts = json.loads(rest) if rest.startswith("[") else shlex.split(rest, posix=True)
+                      except ValueError: parts = rest.split()
+                      for src in parts[:-1]:                                             # last word is the destination
+                          src = str(src)
+                          # NOT expanded: inside a stage, ENV overrides a same-named ARG (Docker
+                          # reference), and a base image's own ENV is invisible here, so an ARG
+                          # value is never proof of what Docker will use. A variable in an ADD
+                          # source fails closed; write it literally (Codex panino round 8).
+                          if "$" in src:
+                              if hard_fail is not None: hard_fail.add(f"{label}: ADD source `{src}` uses a variable -- ENV can override any ARG (including from the base image), so the gate cannot know what is fetched; write the source literally")
+                              continue
+                          # a bare local path/dirname ending in ".git" (e.g. a fixture named
+                          # "repo.git") is NOT a remote source -- Docker's own docs show git
+                          # sources ONLY via an explicit transport (git@host:, ssh://, git://)
+                          # or an http(s):// URL; there is no documented bare-hostname
+                          # shorthand for ADD, so `.endswith(".git")` alone over-matched local
+                          # paths (Codex round 1, pancetta #291).
+                          if re.match(r"(?i)^(https?://|git@[\w.-]+:|ssh://|git://)", src):
+                              # remote content baked into the action image: a URL needs an
+                              # immutable --checksum=sha256:…, a git source is never pinned enough
+                              # unanchored re.search over the whole flags string let a single
+                              # token like --exclude=nomatch--checksum=sha256:<64hex> (no space
+                              # before --checksum, so still ONE --\S+ token) satisfy the check
+                              # via substring match even though it names --exclude, not
+                              # --checksum -- require a COMPLETE token to equal the checksum
+                              # flag exactly (Codex round, pancetta #291).
+                              if re.match(r"(?i)^https://", src) and any(re.fullmatch(r"--checksum=sha256:[0-9a-f]{64}", f) for f in flags.split()): continue   # plaintext http is never acceptable
+                              out.append("container:ADD-REMOTE-UNPINNED(" + src + ")")
+                  fm = re.match(r"\s*(?:ONBUILD\s+)?(COPY|ADD)\s+((?:--\S+\s+)*)", line, re.I)
+                  if fm: srcs += [v.strip("'\"") for v in re.findall(r"--from=(\S+)", fm.group(2))]   # Docker removes quotes: --from="build"
+                  rm = re.match(r"\s*(?:ONBUILD\s+)?RUN\s+((?:--\S+\s+)*)", line, re.I)
                   if rm:
                       for mnt in re.findall(r"--mount=(\S+)", rm.group(1)):
-                          srcs += re.findall(r"(?:^|,)from=([^,]+)", mnt)
+                          mnt = mnt.strip("'\"")                         # --mount="from=img,target=/x" is valid BuildKit syntax
+                          srcs += [v.strip("'\"") for v in re.findall(r"(?:^|,)from=([^,]+)", mnt)]
                   for src in srcs:
-                      src = expand(src)
-                      if src.lower() not in stages and not (src.isdigit() and int(src) < index):
+                      if "$" in src:                                                 # same ENV-over-ARG argument: a variable stage/image ref is refused
+                          if hard_fail is not None: hard_fail.add(f"{label}: `{line.strip()[:60]}` references image/stage `{src}` through a variable -- ENV can override any ARG, so the gate cannot know what is pulled; write it literally")
+                          continue
+                      onbuild = bool(re.match(r"\s*ONBUILD\b", line, re.I))   # a deferred trigger runs DOWNSTREAM: a stage name is an external image there
+                      if onbuild or (src.lower() not in stages and not (src.isdigit() and int(src) < index)):
                           out.append("container:" + src)
                   m = re.match(r"\s*FROM\s+((?:--\S+\s+)*)(\S+)(?:\s+AS\s+(\S+))?", line, re.I)
                   if not m: continue
-                  img, alias = expand(m.group(2)), m.group(3)
+                  img, alias = expand(m.group(2), global_args), m.group(3)            # FROM sees only global ARGs
+                  in_stage, stage_args = True, {}                                    # a new stage starts with an empty ARG scope
                   is_stage_index = img.isdigit() and int(img) < index
                   if img.lower() != "scratch" and img.lower() not in stages and not is_stage_index:
                       out.append("container:" + img)
@@ -394,6 +808,22 @@ jobs:
               rc, out = sh("git", "show", f"{rev}:{path}"); return out if rc == 0 else None
           SYMLINKED = set()
           HARD_FAIL = set()   # unconditional HEAD failures (never subtracted against the base)
+          DEP_SYMLINK_NAMES = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", ".pnpmfile.cjs", "Cargo.toml", "Cargo.lock", "yarn.lock", "bun.lock", "bun.lockb"}
+          def check_dependency_symlinks(rev):
+              # `changes`'s paths-filter only fires install-policy when one of these exact
+              # PATHS shows a changed git blob -- a symlinked lockfile whose TARGET file is
+              # what the PR actually edits (the symlink itself untouched) never matches that
+              # filter, so install-policy (and its own, narrower symlink refusal) is skipped
+              # entirely; pnpm/npm/cargo transparently follow the symlink and read the new
+              # content regardless. This runs unconditionally, on every PR, like the rest of
+              # this script (Codex round, panino #101).
+              rc, out = sh("git", "ls-tree", "-r", rev)
+              if rc != 0: return
+              for line in out.splitlines():
+                  meta, _, path = line.partition("\t")
+                  if not path or not meta.split(): continue
+                  if meta.split()[0] == "120000" and os.path.basename(path) in DEP_SYMLINK_NAMES:
+                      HARD_FAIL.add(f"{path}: a dependency manifest/lockfile must not be a symlink -- its target could change without the path-filter that gates install-policy ever noticing")
           def load(rev, path):
               txt = show(rev, path)
               if txt is None: return None
@@ -438,18 +868,32 @@ jobs:
                       if not isinstance(job, dict): continue
                       if isinstance(job.get("uses"), str): add(job["uses"], job_level=True)
                       if isinstance(job.get("steps"), list): steps(job["steps"])
-                      c = image_ref(job.get("container"))
-                      if c: acc[c] += 1
+                      # an expression-valued image (a matrix/input/vars-templated ref --
+                      # literal dollar-brace-brace syntax deliberately not spelled out here:
+                      # GitHub evaluates ANY such sequence appearing anywhere in this run:
+                      # block's raw text, even inside a comment, which is exactly what broke
+                      # this workflow file until this line was reworded) is unchanged text
+                      # whose VALUE a PR can change elsewhere, so base/head would cancel: it
+                      # cannot be verified and fails closed at HEAD (Codex round 8). Write the
+                      # digest-pinned image literally.
+                      def image(v, what):
+                          c = image_ref(v)
+                          if c and EXPR_MARK in c:
+                              if rev == head: HARD_FAIL.add(f"{manifest_path or 'workflow'}: {what} image is an expression ({c[len('container:'):]}) -- the gate cannot verify what it resolves to; write the @sha256-pinned image literally")
+                              return
+                          if c: acc[c] += 1
+                      image(job.get("container"), "job container")
                       svcs = job.get("services")
                       if isinstance(svcs, dict):
-                          for sv in svcs.values():
-                              c = image_ref(sv)
-                              if c: acc[c] += 1
+                          for name, sv in svcs.items(): image(sv, f"service `{name}`")
               runs = doc.get("runs")
               if isinstance(runs, dict):
                   if isinstance(runs.get("steps"), list): steps(runs["steps"])
                   img = runs.get("image")
-                  if isinstance(img, str) and img.startswith("docker://"): acc[img.strip()] += 1
+                  if isinstance(img, str) and img.startswith("docker://"):
+                      if EXPR_MARK in img:
+                          if rev == head: HARD_FAIL.add(f"{manifest_path or 'action'}: runs.image is an expression ({img.strip()}) -- write the @sha256-pinned image literally")
+                      else: acc[img.strip()] += 1
                   elif isinstance(img, str) and img.strip():
                       # Dockerfile-backed action: GitHub builds it, so its FROM images run (round 3)
                       df = os.path.normpath(os.path.join(os.path.dirname(manifest_path), img.strip()))
@@ -469,10 +913,14 @@ jobs:
               if doc is not None: refs_of(rev, doc, acc, frozenset({path}), 0, path)
               return acc
           fail = 0; new = Counter()
+          for mpath in sorted(set(manifests_at(head)) | referenced_at(head)):
+              if is_symlink(head, mpath) and mpath not in SYMLINKED:
+                  print(f"::error::{mpath} is a symlink -- executable manifests and action image files must be real files (a change to the target would otherwise escape review)"); SYMLINKED.add(mpath)
           for b, h in changed_pairs():
               if h is None: continue                               # deleted file: nothing new runs
               new += refs_at(head, h) - (refs_at(base, b) if b else Counter())   # per file, per occurrence
           if SYMLINKED: fail = 1
+          check_dependency_symlinks(head)
           for msg in sorted(HARD_FAIL): print(f"::error::{msg}"); fail = 1
           for ref in sorted(new):            # one verdict per distinct ref (a ref reached via a local action AND its own changed manifest is reported once)
               if ref.startswith("MISSING:"): fail = 1; continue
@@ -497,18 +945,22 @@ jobs:
   supply-chain:
     name: Supply Chain
     if: always()
-    needs: [changes, osv, install-policy, actions-pins]
+    needs: [changes, osv-pr, osv-merge-group, install-policy, actions-pins]
     runs-on: ubuntu-latest
     steps:
       - name: Gate
         env:
           CHANGES: ${{ needs.changes.result }}
           DEPS: ${{ needs.changes.outputs.deps }}
-          OSV: ${{ needs.osv.result }}
+          OSV_PR: ${{ needs.osv-pr.result }}
+          OSV_MG: ${{ needs.osv-merge-group.result }}
           POLICY: ${{ needs.install-policy.result }}
           PINS: ${{ needs.actions-pins.result }}
         run: |
-          echo "changes=$CHANGES deps=$DEPS osv=$OSV install-policy=$POLICY actions-pins=$PINS"
+          # exactly one of osv-pr/osv-merge-group runs per event (each is
+          # if-gated on github.event_name); the other reports 'skipped'.
+          OSV="$OSV_PR"; [ "$OSV" != skipped ] || OSV="$OSV_MG"
+          echo "changes=$CHANGES deps=$DEPS osv=$OSV (pr=$OSV_PR mg=$OSV_MG) install-policy=$POLICY actions-pins=$PINS"
           if [ "$CHANGES" != success ]; then
             echo "::error::dependency change detection did not succeed ($CHANGES)"; exit 1
           fi
