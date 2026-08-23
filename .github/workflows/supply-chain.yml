@@ -183,7 +183,14 @@ jobs:
     name: Lockfile integrity (cargo fetch --locked) + source policy
     # Runs only after OSV has PASSED (see the pnpm repos' gate for the rationale).
     needs: [changes, osv-pr, osv-merge-group]
+    # always(): without an explicit status-check function, GH Actions implicitly
+    # ANDs "&& success()" onto a custom `if:` -- since exactly one of osv-pr/
+    # osv-merge-group is ALWAYS 'skipped' by design, that implicit check would
+    # fail on every run and this job would never execute at all (Codex round 8,
+    # cqdx #349) -- ci.yml's analogous gate already uses always() for the same
+    # reason.
     if: |
+      always() &&
       needs.changes.outputs.deps == 'true' &&
       (needs.osv-pr.result == 'success' || needs.osv-pr.result == 'skipped') &&
       (needs.osv-merge-group.result == 'success' || needs.osv-merge-group.result == 'skipped')
@@ -454,13 +461,27 @@ jobs:
           ids = set(meta["workspace_members"])
           members = {(p["name"], p["version"]) for p in meta["packages"] if p["id"] in ids}
           lock = tomllib.load(open("Cargo.lock", "rb"))
+          # The only trusted registry sources -- crates.io's classic git index and its
+          # current sparse-protocol index. A manifest dependency can set the stable
+          # `registry-index` key directly (bypassing the separate .cargo/config.toml
+          # guard entirely, since this is a Cargo.toml-level override, not a config
+          # file one) to point Cargo at an arbitrary registry, including a plaintext
+          # http:// one; `src.startswith("registry+")` alone accepts that unchanged
+          # (Codex round 8, cqdx #349). Anything else -- a different host, a different
+          # protocol, plaintext http -- is refused, matching the pnpm/npm registry
+          # pin's "one trusted source, not any source that merely looks like one"
+          # posture used elsewhere in this gate.
+          CRATES_IO = {
+              "registry+https://github.com/rust-lang/crates.io-index",
+              "registry+sparse+https://index.crates.io/",
+          }
           bad = []
           for p in lock.get("package", []):
               src = p.get("source")
               if src is None:
                   if (p["name"], p["version"]) not in members:
                       bad.append(f"{p['name']} {p['version']}: path dependency (not a workspace member)")
-              elif not src.startswith("registry+"):
+              elif src not in CRATES_IO:
                   bad.append(f"{p['name']} {p['version']}: source={src}")
           if bad:
               print("::error::non-registry crate sources in Cargo.lock:"); print("\n".join("  " + b for b in bad)); sys.exit(1)
