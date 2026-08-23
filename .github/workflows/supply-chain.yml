@@ -462,9 +462,14 @@ jobs:
                       try: parts = json.loads(rest) if rest.startswith("[") else shlex.split(rest, posix=True)
                       except ValueError: parts = rest.split()
                       for src in parts[:-1]:                                             # last word is the destination
-                          src = expand(str(src), stage_args)
-                          if "$" in src:                                                 # ENV/unknown-variable source: cannot be judged -> refused
-                              out.append("container:ADD-UNRESOLVED-SOURCE(" + src + ")"); continue
+                          src = str(src)
+                          # NOT expanded: inside a stage, ENV overrides a same-named ARG (Docker
+                          # reference), and a base image's own ENV is invisible here, so an ARG
+                          # value is never proof of what Docker will use. A variable in an ADD
+                          # source fails closed; write it literally (Codex panino round 8).
+                          if "$" in src:
+                              if hard_fail is not None: hard_fail.add(f"{label}: ADD source `{src}` uses a variable -- ENV can override any ARG (including from the base image), so the gate cannot know what is fetched; write the source literally")
+                              continue
                           if re.match(r"(?i)^(https?://|git@|ssh://|git://)", src) or src.endswith(".git") or ".git#" in src:
                               # remote content baked into the action image: a URL needs an
                               # immutable --checksum=sha256:…, a git source is never pinned enough
@@ -478,7 +483,9 @@ jobs:
                           mnt = mnt.strip("'\"")                         # --mount="from=img,target=/x" is valid BuildKit syntax
                           srcs += [v.strip("'\"") for v in re.findall(r"(?:^|,)from=([^,]+)", mnt)]
                   for src in srcs:
-                      src = expand(src, stage_args)                                  # instructions inside a stage see the stage scope
+                      if "$" in src:                                                 # same ENV-over-ARG argument: a variable stage/image ref is refused
+                          if hard_fail is not None: hard_fail.add(f"{label}: `{line.strip()[:60]}` references image/stage `{src}` through a variable -- ENV can override any ARG, so the gate cannot know what is pulled; write it literally")
+                          continue
                       onbuild = bool(re.match(r"\s*ONBUILD\b", line, re.I))   # a deferred trigger runs DOWNSTREAM: a stage name is an external image there
                       if onbuild or (src.lower() not in stages and not (src.isdigit() and int(src) < index)):
                           out.append("container:" + src)
