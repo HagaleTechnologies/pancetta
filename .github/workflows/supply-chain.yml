@@ -263,21 +263,40 @@ jobs:
                                   for alt in m.group(1).split(","):
                                       out.extend(brace_expand(pat[:m.start()] + alt + pat[m.end():]))
                                   return out
-                              def translate(pattern):
-                                  out, i, seg_start = "", 0, True
+                              def translate(pattern, start_seg=True):
+                                  # an extglob ALTERNATIVE's own leading character is not a new
+                                  # segment start -- the dot-exclusion decision for that position
+                                  # was already made one level up (by the dotalts/rest split and
+                                  # the guard() wrapper there, using the OUTER seg_start); every
+                                  # recursive translate(a, ...) call for an alt therefore passes
+                                  # start_seg=False so it never re-applies its own internal
+                                  # (?!\.) to a wildcard that happens to be the alt's first
+                                  # character (`x@(*|y)` matching `x.foo` -- Codex local round,
+                                  # panino #101).
+                                  out, i, seg_start = "", 0, start_seg
                                   guard = lambda tok: ("(?!\\.)" + tok) if seg_start else tok
                                   while i < len(pattern):
                                       c = pattern[i]
                                       eg = _re.match(r"([@+*?!])\((.*?)\)", pattern[i:])     # extglobs @(a|b) +(x) *(x) ?(x) !(x)
                                       if eg:
                                           alts = eg.group(2).split("|")
+                                          # each alternative is itself a glob (`@(a*|b*)` -- `*`/`?`/`[...]`/
+                                          # nested extglobs inside an alternative are NOT literal text; only
+                                          # `_re.escape`-ing them broke every wildcarded alternative (Codex
+                                          # round 9, panino #101). Recurse through the same translate() used
+                                          # for the rest of the pattern.
                                           if eg.group(1) == "!":
-                                              inner = "|".join(_re.escape(a) for a in alts)
+                                              inner = "|".join(translate(a, False) for a in alts)
                                               out += guard("(?:(?!(?:" + inner + ")(?:/|$))[^/]+)")   # one segment that is not any alternative
                                           else:
-                                              dotalts = [a for a in alts if a.startswith(".")]         # explicit -- not guarded
-                                              rest = [a for a in alts if not a.startswith(".")]
-                                              mixed = "(?:" + "|".join(_re.escape(a) for a in alts) + ")"   # ANY alt, unguarded -- used
+                                              def is_dot_explicit(a):
+                                                  # a literal leading '.', or the exact singleton bracket class
+                                                  # `[.]` (matching minimatch's own narrow rule -- `[.a]`/`[a.]`
+                                                  # still get the dot guard; Codex round, cqdx #349).
+                                                  return a.startswith(".") or bool(_re.match(r"^\[\.\]", a))
+                                              dotalts = [a for a in alts if is_dot_explicit(a)]         # explicit -- not guarded
+                                              rest = [a for a in alts if not is_dot_explicit(a)]
+                                              mixed = "(?:" + "|".join(translate(a, False) for a in alts) + ")"   # ANY alt, unguarded -- used
                                               # once we are past the first character of the segment, so later
                                               # repetitions of +()/*() may freely mix dotted and undotted
                                               # alternatives (`+(.internal|x)` matches `.internalx` too --
@@ -285,8 +304,8 @@ jobs:
                                               # Codex round, vanity #153).
                                               def first_choice():
                                                   parts = []
-                                                  if dotalts: parts.append("(?:" + "|".join(_re.escape(a) for a in dotalts) + ")")
-                                                  if rest: parts.append(guard("(?:" + "|".join(_re.escape(a) for a in rest) + ")"))
+                                                  if dotalts: parts.append("(?:" + "|".join(translate(a, False) for a in dotalts) + ")")
+                                                  if rest: parts.append(guard("(?:" + "|".join(translate(a, False) for a in rest) + ")"))
                                                   return "(?:" + "|".join(parts) + ")" if len(parts) > 1 else (parts[0] if parts else "(?!x)x")
                                               kind = eg.group(1)
                                               if kind in ("@", "?"):
@@ -307,7 +326,11 @@ jobs:
                                               cls = pattern[i + 1:j]
                                               negated = cls.startswith("!")
                                               core = cls[1:] if negated else cls
-                                              allows_dot = ("." in core) and not negated                  # e.g. [.] or [.abc] -- explicit
+                                              # minimatch's dot-exclusion bypass is narrower than "contains a
+                                              # dot": ONLY the exact singleton class `[.]` counts as explicit --
+                                              # `[.a]`/`[a.]` (a dot among OTHER options) still gets the (?!\.)
+                                              # guard, verified against the real library (Codex round, cqdx #349).
+                                              allows_dot = (core == ".") and not negated
                                               cls = ("^" + core) if negated else cls
                                               tok = "[" + cls.replace("\\", "\\\\") + "]"
                                               out += tok if allows_dot else guard(tok); i = j + 1; seg_start = False
