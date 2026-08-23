@@ -3820,7 +3820,17 @@ impl QsoManager {
             // unrelated CallingCq QSO's "any station" arm on a stray/
             // duplicate frame, opening a second QSO object for a station we
             // just worked seconds ago.
+            //
+            // PAN-25 (Codex round-2 review of PR #250): the completed arm must
+            // also match band, not just callsign — the uniqueness invariant
+            // (AGENTS.md) is per (callsign, band). Without this, a station
+            // worked on band A stays "accounted for" against a fresh CQ reply
+            // from the same call on band B for the whole grace window, so a
+            // legitimate new QSO on the new band is silently dropped. The
+            // active arm above is intentionally left unscoped by band — an
+            // active QSO can only exist on the band currently being decoded.
             let now = Utc::now();
+            let want_band = crate::utils::frequency_to_band(frequency);
             let sender_has_other_active_or_recent_partner =
                 message_type.sender_callsign().is_some_and(|sender| {
                     qsos.values().any(|p| {
@@ -3836,8 +3846,10 @@ impl QsoManager {
                             return true;
                         }
                         if let QsoState::Completed { completed_at, .. } = &p.state {
-                            return now.signed_duration_since(*completed_at).num_seconds()
-                                <= COMPLETED_QSO_REWORK_GRACE.num_seconds();
+                            return crate::utils::frequency_to_band(p.metadata.frequency)
+                                == want_band
+                                && now.signed_duration_since(*completed_at).num_seconds()
+                                    <= COMPLETED_QSO_REWORK_GRACE.num_seconds();
                         }
                         false
                     })
@@ -7785,6 +7797,90 @@ mod tests {
         assert!(
             matches!(p_b.state, QsoState::CallingCq { .. }),
             "qso_b must remain un-advanced — K1DEF is reserved by its recent completion, got {:?}",
+            p_b.state
+        );
+    }
+
+    /// PAN-25 (Codex round-2 review of PR #250): the recently-completed
+    /// suppression above must be scoped to the completed QSO's band — the
+    /// uniqueness invariant (AGENTS.md) is per (callsign, band), not per
+    /// callsign alone. A station worked on 20m and answering a fresh CQ on
+    /// 40m within the same grace window is a legitimate new QSO and must
+    /// advance normally.
+    #[tokio::test]
+    async fn recently_completed_qso_on_a_different_band_does_not_reserve_the_sender() {
+        let manager = QsoManager::new(test_config());
+        let freq_20m = 14074000.0;
+        let freq_40m = 7074000.0;
+
+        // Complete a full CQ exchange with K1DEF on 20m.
+        let qso_a = manager.start_cq(freq_20m, None, false).await.unwrap();
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                freq_20m,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::ReportAck {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                    report: -12,
+                },
+                "W1ABC K1DEF R-12".to_string(),
+                freq_20m,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: "W1ABC".to_string(),
+                    from_station: "K1DEF".to_string(),
+                },
+                "W1ABC K1DEF 73".to_string(),
+                freq_20m,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            manager.get_qso(qso_a).await.unwrap().state,
+            QsoState::Completed { .. }
+        ));
+
+        // Start a NEW, unrelated CQ on 40m — a different band from the
+        // just-completed 20m QSO.
+        let qso_b = manager.start_cq(freq_40m + 5.0, None, false).await.unwrap();
+
+        // K1DEF answers on 40m, well within the completed-QSO grace window.
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: "W1ABC".to_string(),
+                    responding_station: "K1DEF".to_string(),
+                    grid: Some("FN31".to_string()),
+                },
+                "W1ABC K1DEF FN31".to_string(),
+                freq_40m + 5.0,
+                Some(-10.0),
+            )
+            .await
+            .unwrap();
+
+        let p_b = manager.get_qso(qso_b).await.unwrap();
+        assert!(
+            matches!(p_b.state, QsoState::WaitingForReport { .. }),
+            "qso_b must advance — K1DEF's 20m completion must not reserve it on 40m, got {:?}",
             p_b.state
         );
     }
