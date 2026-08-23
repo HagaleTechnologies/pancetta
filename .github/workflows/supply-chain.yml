@@ -383,6 +383,17 @@ jobs:
           for root, dirs, files in os.walk("."):
               dirs[:] = [d for d in dirs if d not in PRUNE]
               rel = os.path.normpath(root)
+              # The npm/pnpm workspace-resolver bootstrap (CAT-318) is CI's own
+              # tooling, not an application dependency: it is pinned and
+              # signature-verified by its own dedicated install-policy step
+              # (ignore-scripts enforcement, per-entry registry-signature check,
+              # `npm ci`, `npm audit signatures` -- strictly more than this
+              # generic coverage check provides) whenever WORKSPACE_ACCEPT
+              # actually names npm/pnpm, and is unused dead weight otherwise
+              # (e.g. this Cargo-only gate) -- either way it should not be
+              # double-counted or refused here.
+              if rel == os.path.normpath(".github/workflows/vendor/workspace-resolvers"):
+                  continue
               if "package.json" in files:
                   manifests.append(rel)
               if "package-lock.json" in files:
