@@ -951,7 +951,11 @@ async fn maybe_answer_caller(
     //    StartQso / Space does NOT come through this function, so it is
     //    unaffected by this gate.
     if qso_manager
-        .has_active_or_recent_qso_with(&answer.their_call, std::time::Duration::from_secs(120))
+        .has_active_or_recent_qso_with(
+            &answer.their_call,
+            frequency_hz,
+            std::time::Duration::from_secs(120),
+        )
         .await
     {
         debug!(target: "qso", "Not auto-answering {} — active or recently-completed QSO exists", answer.their_call);
@@ -1203,6 +1207,7 @@ mod pan6_diagnostic_tests {
             our_callsign: "K5ARH".into(),
             their_callsign: Some("W1AW".into()),
             frequency: 14_074_000.0,
+            completed_rf_frequency_hz: None,
             mode: "FT8".into(),
             start_time: now,
             end_time: None,
@@ -1730,6 +1735,7 @@ mod ap_ranking_tests {
             our_callsign: our_callsign.to_string(),
             their_callsign: None,
             frequency: 14_074_000.0,
+            completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
             start_time: now,
             end_time: None,
@@ -5176,6 +5182,7 @@ mod snapshot_tests {
                 our_callsign: "K5ARH".to_string(),
                 their_callsign: Some(their_call),
                 frequency: 1500.0,
+                completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
                 start_time: start,
                 end_time: None,
@@ -6640,6 +6647,7 @@ mod cqdx_upload_tests {
             our_callsign: "K5ARH".to_string(),
             their_callsign: call.map(str::to_string),
             frequency: 14_074_000.0,
+            completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
             start_time: now,
             end_time: Some(now + chrono::Duration::seconds(90)),
@@ -6757,6 +6765,7 @@ mod qrz_enrichment_tests {
             our_callsign: "K5ARH".to_string(),
             their_callsign: Some("JA1ABC".to_string()),
             frequency: 14_074_000.0,
+            completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
             start_time: now,
             end_time: Some(now + chrono::Duration::seconds(90)),
@@ -7207,6 +7216,7 @@ mod replay_history_seed_tests {
                 our_callsign: "W1ABC".to_string(),
                 their_callsign: Some(callsign.to_string()),
                 frequency: FREQ_20M_HZ,
+                completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
                 start_time: chrono::Utc::now(),
                 end_time: None,
