@@ -699,6 +699,17 @@ pub struct ApplicationCoordinator {
     /// Number of active supervisor-owned hard mutes. Non-zero while Hamlib is
     /// being torn down and reacquired; separate from operator TX policy.
     pub(crate) tx_restart_inhibit: Arc<AtomicU32>,
+    /// PAN-33: count of `tx_restart_inhibit` increments `handle_finished_task`
+    /// has `mem::forget`'d (permanently leaked) for a Hamlib crash it believed
+    /// was terminal. A later successful restart of Hamlib -- reached via the
+    /// early-return guard's budget-aware fallthrough when that same crash is
+    /// rediscovered on a subsequent health pass -- pays every one of these
+    /// back (see `handle_finished_task`'s `Ok(())` restart-dispatch arm), so
+    /// `tx_restart_inhibit` doesn't get stuck above zero once Hamlib actually
+    /// recovers. Only ever touched from the single-threaded supervisor path
+    /// (`run_main_loop` -> `check_task_handles` -> `handle_finished_task`), so
+    /// a plain counter is enough -- no atomic/lock needed.
+    pub(crate) hamlib_leaked_tx_inhibits: u32,
     /// PAN-19 round-7 review (Codex P1): whether the CURRENT Hamlib
     /// generation's message loop has confirmed it's actually consuming
     /// commands. Independent of, and orthogonal to, `tx_restart_inhibit`
@@ -1641,6 +1652,7 @@ impl ApplicationCoordinator {
                 pancetta_core::TxPolicy::default().as_u8(),
             )),
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
+            hamlib_leaked_tx_inhibits: 0,
             hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
             hamlib_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hamlib_command_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),

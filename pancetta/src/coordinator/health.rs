@@ -523,13 +523,34 @@ impl super::ApplicationCoordinator {
                 ));
         let is_clean_exit = matches!(outcome, Ok(Ok(()))) && !unexpected_clean_exit;
 
+        // PAN-33: `start_*_component` (Hamlib in particular) can register a
+        // fresh task handle in `named_task_handles` and THEN bail (a
+        // startup-window crash/timeout in its own readiness handshake) --
+        // that handle is already finished, so a LATER health pass
+        // rediscovers it here, but by then the FIRST processing of the
+        // original crash already marked `status.state` `Failed` via
+        // `restart_component`'s own `Err(e)` branch. Unconditionally
+        // returning below would silently swallow that rediscovery forever,
+        // even with `RestartBudget` attempts left -- permanently stranding
+        // the component. Only treat this as a genuine no-op when there is
+        // truly nothing left to try (not restartable, or budget exhausted);
+        // otherwise fall through and give it a real, freshly-budgeted
+        // restart attempt below, exactly as if this were a fresh crash.
+        let can_retry_despite_prior_failure = matches!(
+            component_restart_policy(component_id),
+            RestartPolicy::Restartable
+        ) && self
+            .restart_budget
+            .may_restart(component_id, Instant::now());
+
         {
             let mut status_map = self.component_status.write().await;
             let status = status_map
                 .entry(component_id)
                 .or_insert_with(ComponentStatus::new_running);
-            if status.state != ComponentState::Running {
-                // Already recorded this failure/restart-exhaustion.
+            if status.state != ComponentState::Running && !can_retry_despite_prior_failure {
+                // Already recorded this failure/restart-exhaustion, and
+                // there is no budget left to retry with -- genuine no-op.
                 return;
             }
             status.error_count += 1;
@@ -630,6 +651,30 @@ impl super::ApplicationCoordinator {
                 match self.restart_component(component_id).await {
                     Ok(()) => {
                         info!("Component {} restarted successfully", component_id);
+                        // PAN-33: this call can be a rediscovery-driven retry
+                        // (see the early-return guard above) of a component
+                        // the FIRST processing of its crash already marked
+                        // `Failed` -- that pass also leaked a `TxInhibitGuard`
+                        // increment (Hamlib only) believing the component was
+                        // dead for good. Reaching a genuine success here means
+                        // it wasn't: reset `status.state` back to `Running`
+                        // (nothing else does, since a first-time crash that
+                        // restarts cleanly never left `Failed` set to begin
+                        // with) and pay back every such leaked increment now,
+                        // on top of this call's own `tx_inhibit` guard
+                        // dropping normally below -- otherwise TX would stay
+                        // permanently inhibited even after Hamlib recovers.
+                        {
+                            let mut status_map = self.component_status.write().await;
+                            if let Some(status) = status_map.get_mut(&component_id) {
+                                status.state = ComponentState::Running;
+                            }
+                        }
+                        if component_id == ComponentId::Hamlib && self.hamlib_leaked_tx_inhibits > 0
+                        {
+                            let owed = std::mem::take(&mut self.hamlib_leaked_tx_inhibits);
+                            self.tx_restart_inhibit.fetch_sub(owed, Ordering::AcqRel);
+                        }
                     }
                     Err(e) => {
                         error!("Component {} restart failed: {}", component_id, e);
@@ -718,6 +763,14 @@ impl super::ApplicationCoordinator {
         }
 
         if leak_tx_inhibit {
+            // PAN-33: track every leaked increment so a LATER successful
+            // restart (reached via the early-return guard's budget-aware
+            // fallthrough above, discovering this same crash on a
+            // subsequent health pass) knows exactly how much to pay back --
+            // see that `Ok(())` arm's comment.
+            if component_id == ComponentId::Hamlib {
+                self.hamlib_leaked_tx_inhibits += 1;
+            }
             std::mem::forget(tx_inhibit);
         }
     }
@@ -1032,6 +1085,167 @@ mod supervisor_tests {
              dead for good and nothing will restart it further, so un-muting TX here means \
              modulating audio with zero PTT control"
         );
+    }
+
+    /// PAN-33 regression guard. Reproduces the double-registration /
+    /// early-return-swallowing scenario: `start_hamlib_component` registers
+    /// a fresh task handle in `named_task_handles` and then bails (a
+    /// startup-window crash between publishing its child handles and
+    /// confirming message-loop readiness) -- `restart_component`'s own
+    /// `Err(e)` branch marks Hamlib `Failed` and leaks one
+    /// `TxInhibitGuard` increment (PAN-19 MEDIUM #3) synchronously, in the
+    /// SAME pass that dispatched the restart. That freshly-registered
+    /// handle is already finished, so it sits in `named_task_handles`
+    /// until the NEXT health pass rediscovers it -- this test simulates
+    /// exactly that end state (Failed status + leaked inhibit + a stale
+    /// finished handle under `ComponentId::Hamlib`, budget not exhausted)
+    /// and drives one more `check_task_handles()` pass over it, standing
+    /// in for that subsequent health pass.
+    ///
+    /// Before the fix, `handle_finished_task`'s early-return guard
+    /// unconditionally swallowed this rediscovery (`status.state !=
+    /// Running`), so Hamlib stayed permanently `Failed` despite
+    /// `RestartBudget` having attempts left. After the fix, the guard
+    /// falls through (budget remains), the REAL `start_hamlib_component`
+    /// runs again (mock-rig path, deterministic), succeeds, and the
+    /// earlier leaked `tx_restart_inhibit` increment is paid back --
+    /// proving both the restart itself and the TX-inhibit accounting
+    /// recover correctly.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn hamlib_stale_failed_status_gets_a_fresh_restart_when_budget_remains() {
+        let mut coordinator = test_coordinator().await;
+
+        // Simulate the FIRST pass's outcome: Hamlib already marked Failed,
+        // with one TxInhibitGuard increment leaked believing it was
+        // terminal.
+        {
+            let mut status_map = coordinator.component_status.write().await;
+            status_map.insert(
+                ComponentId::Hamlib,
+                super::ComponentStatus {
+                    state: super::ComponentState::Failed(
+                        "simulated startup-window crash".to_string(),
+                    ),
+                    last_seen: std::time::Instant::now(),
+                    error_count: 1,
+                },
+            );
+        }
+        coordinator
+            .tx_restart_inhibit
+            .fetch_add(1, Ordering::AcqRel);
+        coordinator.hamlib_leaked_tx_inhibits = 1;
+        assert!(
+            coordinator
+                .restart_budget
+                .may_restart(ComponentId::Hamlib, std::time::Instant::now()),
+            "test setup: restart budget must still have attempts left"
+        );
+
+        // Simulate the freshly-registered generation `start_hamlib_component`
+        // left behind in `named_task_handles` before its own readiness
+        // handshake bailed -- already finished by the time a later health
+        // pass discovers it.
+        let handle: tokio::task::JoinHandle<anyhow::Result<()>> =
+            tokio::spawn(async { Err(anyhow::anyhow!("simulated startup-window crash")) });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            handle.is_finished(),
+            "test setup: the stale handle must already be finished"
+        );
+        coordinator
+            .named_task_handles
+            .push((ComponentId::Hamlib, handle));
+
+        // The "subsequent health pass" that rediscovers it.
+        coordinator.check_task_handles().await;
+
+        assert_eq!(
+            coordinator
+                .component_status
+                .read()
+                .await
+                .get(&ComponentId::Hamlib)
+                .map(|s| &s.state),
+            Some(&super::ComponentState::Running),
+            "a rediscovered stale handle must get a fresh, successful restart attempt instead \
+             of staying permanently Failed while restart budget remained"
+        );
+        assert_eq!(
+            coordinator.tx_restart_inhibit.load(Ordering::Acquire),
+            0,
+            "the earlier leaked TxInhibitGuard increment must be paid back once Hamlib \
+             actually recovers -- otherwise TX would stay permanently inhibited even after a \
+             successful recovery"
+        );
+        assert_eq!(
+            coordinator.hamlib_leaked_tx_inhibits, 0,
+            "the leaked-increment ledger must be cleared once it's paid back"
+        );
+
+        coordinator.shutdown_signal.store(true, Ordering::Release);
+    }
+
+    /// PAN-33 companion guard: once `RestartBudget` is genuinely exhausted,
+    /// a rediscovered stale handle for an already-`Failed` component must
+    /// remain a true no-op -- the fix must not reopen restart attempts
+    /// forever, only when budget is actually available.
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn hamlib_stale_failed_status_stays_failed_once_budget_is_truly_exhausted() {
+        let mut coordinator = test_coordinator().await;
+
+        {
+            let mut status_map = coordinator.component_status.write().await;
+            status_map.insert(
+                ComponentId::Hamlib,
+                super::ComponentStatus {
+                    state: super::ComponentState::Failed(
+                        "simulated startup-window crash".to_string(),
+                    ),
+                    last_seen: std::time::Instant::now(),
+                    error_count: 1,
+                },
+            );
+        }
+        let now = std::time::Instant::now();
+        for _ in 0..5 {
+            coordinator
+                .restart_budget
+                .record_attempt_and_backoff(ComponentId::Hamlib, now);
+        }
+        assert!(
+            !coordinator
+                .restart_budget
+                .may_restart(ComponentId::Hamlib, now),
+            "test setup: restart budget must actually be exhausted"
+        );
+
+        let handle: tokio::task::JoinHandle<anyhow::Result<()>> =
+            tokio::spawn(async { Err(anyhow::anyhow!("simulated startup-window crash")) });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        coordinator
+            .named_task_handles
+            .push((ComponentId::Hamlib, handle));
+
+        coordinator.check_task_handles().await;
+
+        assert!(
+            matches!(
+                coordinator
+                    .component_status
+                    .read()
+                    .await
+                    .get(&ComponentId::Hamlib)
+                    .map(|s| &s.state),
+                Some(super::ComponentState::Failed(_))
+            ),
+            "once restart budget is genuinely exhausted, a rediscovered stale handle must \
+             remain a no-op, not silently reopen restart attempts forever"
+        );
+
+        coordinator.shutdown_signal.store(true, Ordering::Release);
     }
 
     #[cfg(feature = "pancetta-hamlib")]
