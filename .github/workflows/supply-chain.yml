@@ -272,8 +272,33 @@ jobs:
                               SEGMENT (verified against the real `minimatch` 10.2.5 npm ships: `{.internal,x}`,
                               `@(.internal|x)` and `[.]internal` all match `.internal`; a bare `*`/`?`/`[!.]`
                               does not -- Codex round, widdershins #219)."""
-                              pattern = _re.sub(r"\{(\d+)\.\.(\d+)\}", lambda m: "{" + ",".join(str(i) for i in range(int(m.group(1)), int(m.group(2)) + 1)) + "}", pattern)   # {1..3}
-                              pattern = _re.sub(r"\{([A-Za-z])\.\.([A-Za-z])\}", lambda m: "{" + ",".join(chr(i) for i in range(ord(m.group(1)), ord(m.group(2)) + 1)) + "}", pattern)   # {a..c}
+                              def _numeric_brace_range(m):
+                                  # npm's bundled brace-expansion supports descending ranges
+                                  # (`{3..1}` -> 3,2,1) and pads every member to the wider
+                                  # operand's width whenever EITHER side has a real leading
+                                  # zero (a bare "0" alone does not count) -- `range(start,
+                                  # end+1)` silently produced nothing for a descending range,
+                                  # and plain str(i) always dropped padding (verified against
+                                  # real npm 11.4.2 brace-expansion; Codex round, pancetta #291,
+                                  # panino #101).
+                                  lo_s, hi_s = m.group(1), m.group(2)
+                                  lo, hi = int(lo_s), int(hi_s)
+                                  width = max(len(lo_s), len(hi_s)) if ((len(lo_s) > 1 and lo_s[0] == "0") or (len(hi_s) > 1 and hi_s[0] == "0")) else 0
+                                  rng = range(lo, hi + 1) if lo <= hi else range(lo, hi - 1, -1)
+                                  return "{" + ",".join(str(i).zfill(width) for i in rng) + "}"
+                              pattern = _re.sub(r"\{(\d+)\.\.(\d+)\}", _numeric_brace_range, pattern)   # {1..3} / {3..1} / {01..03}
+                              def _alpha_brace_range(m):
+                                  lo, hi = ord(m.group(1)), ord(m.group(2))
+                                  rng = range(lo, hi + 1) if lo <= hi else range(lo, hi - 1, -1)
+                                  # a mixed-case range (e.g. `{a..Z}`) walks through the
+                                  # non-letter code points between 'Z' (90) and 'a' (97) --
+                                  # npm's bundled brace-expansion collapses the backslash code
+                                  # point (92) to an empty-string alternative rather than a
+                                  # literal backslash char (verified directly against real npm
+                                  # 11's brace-expansion for {Z..a}/{a..Z}; Codex round,
+                                  # pancetta #291).
+                                  return "{" + ",".join(("" if i == 92 else chr(i)) for i in rng) + "}"
+                              pattern = _re.sub(r"\{([A-Za-z])\.\.([A-Za-z])\}", _alpha_brace_range, pattern)   # {a..c} / {c..a}
                               def brace_expand(pat):
                                   m = _re.search(r"\{([^{}]*)\}", pat)
                                   if not m: return [pat]
