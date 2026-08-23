@@ -20,24 +20,28 @@ jobs:
       contents: read
     env:
       SEMGREP_APP_TOKEN: ${{ secrets.SEMGREP_APP_TOKEN }}
+      IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+      IS_DEPENDABOT: ${{ github.actor == 'dependabot[bot]' }}
     container:
       image: semgrep/semgrep@sha256:67319956da3dcb58baf5b322899c15458e3963e7018a86aeeb5cd224e69cb77a
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
       # GitHub withholds repo Actions secrets from a fork-triggered pull_request and (unless
-      # separately provisioned as a Dependabot secret) from Dependabot-authored runs -- either
-      # case leaves SEMGREP_APP_TOKEN empty here, and semgrep ci has no local --config fallback,
-      # so it would otherwise fail every fork PR's and every dependency-bump PR's check outright
-      # (Codex round, cqdx #360/panino #109/widdershins #234/pancetta #297/coppa #87). Skip
-      # gracefully instead of either excluding those authors up front (which silently drops the
-      # exact PRs -- especially Dependabot's -- this scanner most needs to cover) or letting the
-      # run fail hard. Once SEMGREP_APP_TOKEN is added as a Dependabot secret (not yet done --
-      # CAT-307 follow-up), Dependabot PRs start getting scanned automatically with no further
-      # change here.
+      # separately provisioned as a Dependabot secret) from Dependabot-authored runs -- both are
+      # LEGITIMATELY secretless and get a graceful skip. Every other context (same-repo PR, push,
+      # merge_group, schedule, workflow_dispatch) always has the org-level secret unless something
+      # is genuinely misconfigured, so those fail closed instead -- an unconditional "skip when
+      # empty" let a completely unconfigured Semgrep deployment report a passing check for every
+      # trusted trigger too, which would make the future required check meaningless (Codex round,
+      # panino #109 / vanity #164).
       - name: Run semgrep ci
         run: |
           if [ -z "$SEMGREP_APP_TOKEN" ]; then
-            echo "SEMGREP_APP_TOKEN not available (fork PR, or Dependabot secret not yet provisioned) -- skipping this run."
-            exit 0
+            if [ "$IS_FORK_PR" = "true" ] || [ "$IS_DEPENDABOT" = "true" ]; then
+              echo "SEMGREP_APP_TOKEN not available (fork PR, or Dependabot secret not yet provisioned) -- skipping this run."
+              exit 0
+            fi
+            echo "::error::SEMGREP_APP_TOKEN is unset for a trusted context (same-repo PR/push/merge_group/schedule/dispatch) -- the org-level secret should always be present here. Failing closed instead of silently skipping."
+            exit 1
           fi
           semgrep ci
