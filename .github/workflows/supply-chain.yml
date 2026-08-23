@@ -235,14 +235,42 @@ jobs:
                           ws = (json.load(open(os.path.join(root, "package.json"))) if os.path.exists(os.path.join(root, "package.json")) else {}).get("workspaces") or []
                           if isinstance(ws, dict): ws = ws.get("packages") or []
                           ws = [os.path.normpath(g) for g in ws if isinstance(g, str)]
+                          def _ws_prepare(raw_patterns):
+                              """Faithfully mirrors @npmcli/map-workspaces's appendNegatedPatterns:
+                              negation is NOT a simple per-path last-match-wins toggle. A later
+                              POSITIVE pattern cancels an earlier negation only when the positive
+                              pattern's own literal text would itself be matched AS A PATH by that
+                              negated glob (e.g. an exact re-list, or a negation of `pkg/b/**`
+                              cancelled by the specific `pkg/b/a`) -- a broader wildcard like
+                              `packages/*` following `!packages/private` does NOT resurrect it
+                              (verified against the real @npmcli/map-workspaces 5.0.3; Codev round,
+                              widdershins #219)."""
+                              positive, negated = [], []
+                              for raw in raw_patterns:
+                                  if not isinstance(raw, str): continue
+                                  m = _re.match(r"^(!+)", raw)
+                                  excl = m.group(1) if m else ""
+                                  pat = _re.sub(r"^\.?/+", "", raw[len(excl):])   # strip a leading ./ or /
+                                  if len(excl) % 2 == 1:
+                                      negated.append(pat)
+                                  else:
+                                      # mirror npm's own for-loop-with-splice EXACTLY, including its
+                                      # off-by-one: the loop index always advances even after a
+                                      # deletion shifts the list, so an element that shifts into the
+                                      # just-vacated slot is never re-checked -- an adjacent DUPLICATE
+                                      # negation only ever cancels once, leaving one copy to still
+                                      # exclude the path (Codex local round, widdershins #219).
+                                      i = 0
+                                      while i < len(negated):
+                                          if ws_match(negated[i], pat): del negated[i]
+                                          i += 1
+                                      positive.append(pat)
+                              positive = [p for p in positive if not any(ws_match(np, p) for np in negated)]
+                              return positive, negated
+                          _ws_positive, _ws_negated = _ws_prepare(ws)
                           def ws_selected(path):
-                              """npm processes workspace patterns IN ORDER: the last matching pattern wins."""
-                              sel = False
-                              for g in ws:
-                                  if g.startswith("!"):
-                                      if ws_match(g[1:], path): sel = False
-                                  elif ws_match(g, path): sel = True
-                              return sel
+                              if any(ws_match(np, path) for np in _ws_negated): return False
+                              return any(ws_match(p, path) for p in _ws_positive)
                           link_targets = {os.path.normpath(m["resolved"]) for m in pkgs.values() if isinstance(m, dict) and m.get("link") and isinstance(m.get("resolved"), str)}
                           for key in pkgs:
                               # an npm workspace member is covered only when the ROOT manifest
