@@ -446,6 +446,12 @@ pub(crate) struct AutonomousQsoStart {
     pub callsign: Option<String>,
     pub frequency: f64,
     pub parity: Option<SlotParity>,
+    /// PAN-38: `Some(id)` only for a self-CQ (`callsign: None`) — the
+    /// `AutonomousOperator`'s `CqStateSnapshot::attempt_id` this opening's
+    /// speculative streak/offset mutations belong to. `None` for a pounce
+    /// (no CQ-streak state to roll back) or when `decide_at` didn't record a
+    /// snapshot for this cycle.
+    pub cq_attempt_id: Option<u64>,
 }
 
 /// The fully-gated, routed result of one autonomous decision slot: which QSOs
@@ -519,6 +525,11 @@ pub(crate) fn plan_slot_transmissions(
     dry_run: bool,
     listen_messages: &[pancetta_qso::DecodedMessageInfo],
     operator_present: bool,
+    // PAN-38: `AutonomousOperator::last_cq_attempt_id()`, captured by the
+    // caller right after `decide()` — attached to the self-CQ opening (if
+    // one survives every gate below) so a downstream dispatch failure can
+    // be traced back to this attempt's speculative streak/offset mutations.
+    self_cq_attempt_id: Option<u64>,
 ) -> SlotPlan {
     // (1) Shift+Q runtime gate: closed → drop everything this cycle.
     let mut runtime_gate_dropped = 0;
@@ -569,10 +580,18 @@ pub(crate) fn plan_slot_transmissions(
             tx_parity,
             listen_messages,
         );
+        // `classify_autonomous_opening` returns `callsign: None` only for a
+        // CQ-shaped opening (self-CQ) — a pounce always carries `Some(dx)`.
+        let cq_attempt_id = if callsign.is_none() {
+            self_cq_attempt_id
+        } else {
+            None
+        };
         qso_starts.push(AutonomousQsoStart {
             callsign,
             frequency,
             parity,
+            cq_attempt_id,
         });
     }
 
@@ -913,6 +932,10 @@ impl super::ApplicationCoordinator {
             let op = operator.clone();
             let mut guard = op.lock().await;
             guard.set_tx_freq_mode_source(self.tx_freq_mode.clone());
+            // PAN-39: share the generation counter bumped alongside every
+            // `tx_freq_mode` store, so `decide_at` can detect a Hold/Auto
+            // transition it didn't directly observe.
+            guard.set_tx_freq_mode_generation_source(self.tx_freq_mode_generation.clone());
             // FQ-F6: also share the live parked-offset atomic so Hold-mode
             // frequency allocation reflects the operator's actual `o`-modal
             // parked offset, not just the static config value baked in at
@@ -1339,6 +1362,13 @@ impl super::ApplicationCoordinator {
                             } else {
                             let actions = op.decide();
                             let skip_records = op.take_skip_log();
+                            // PAN-38: captured before `drop(op)` — if a
+                            // self-CQ reached the radio this cycle (not
+                            // suppressed below), tag its `StartAutonomousQso`
+                            // dispatch with this id so a downstream dispatch
+                            // failure can be rolled back to exactly this
+                            // attempt's pre-mutation state.
+                            let self_cq_attempt_id = op.last_cq_attempt_id();
                             drop(op);
 
                             for record in skip_records {
@@ -1596,6 +1626,7 @@ impl super::ApplicationCoordinator {
                                 dry_run,
                                 &listen_messages,
                                 operator_present,
+                                self_cq_attempt_id,
                             );
 
                             // hb-161: the operator pressed Shift+Q — log the
@@ -1692,6 +1723,7 @@ impl super::ApplicationCoordinator {
                                             callsign: start.callsign,
                                             frequency: start.frequency,
                                             parity: start.parity,
+                                            cq_attempt_id: start.cq_attempt_id,
                                         },
                                     ),
                                     Instant::now(),
@@ -1887,23 +1919,45 @@ impl super::ApplicationCoordinator {
                             loop {
                                 match auto_rx.try_recv() {
                                     Ok(message) => {
-                                        if let MessageType::DecodedMessage(decoded_msg) = message.message_type {
-                                            slot_messages.push(pancetta_qso::DecodedMessageInfo {
-                                                callsign: decoded_msg.message.from_callsign.clone(),
-                                                frequency_hz: decoded_msg.frequency_offset,
-                                                snr: decoded_msg.snr_db as i32,
-                                                message_text: decoded_msg.text.clone(),
-                                                slot_parity: decoded_msg.slot_parity,
-                                                // hb-103 (Batch 32): plumb through for the
-                                                // content-score TX gate in autonomous.decide().
-                                                confidence: Some(decoded_msg.confidence),
-                                                time_offset_s: Some(decoded_msg.time_offset),
-                                                // hb-247 (Batch 81): v3 lateness term source.
-                                                decode_origin: decoded_msg
-                                                    .confidence_features
-                                                    .as_ref()
-                                                    .and_then(|c| c.decode_origin),
-                                            });
+                                        match message.message_type {
+                                            MessageType::DecodedMessage(decoded_msg) => {
+                                                slot_messages.push(pancetta_qso::DecodedMessageInfo {
+                                                    callsign: decoded_msg.message.from_callsign.clone(),
+                                                    frequency_hz: decoded_msg.frequency_offset,
+                                                    snr: decoded_msg.snr_db as i32,
+                                                    message_text: decoded_msg.text.clone(),
+                                                    slot_parity: decoded_msg.slot_parity,
+                                                    // hb-103 (Batch 32): plumb through for the
+                                                    // content-score TX gate in autonomous.decide().
+                                                    confidence: Some(decoded_msg.confidence),
+                                                    time_offset_s: Some(decoded_msg.time_offset),
+                                                    // hb-247 (Batch 81): v3 lateness term source.
+                                                    decode_origin: decoded_msg
+                                                        .confidence_features
+                                                        .as_ref()
+                                                        .and_then(|c| c.decode_origin),
+                                                });
+                                            }
+                                            // PAN-38: a dispatched self-CQ
+                                            // failed downstream (radio/CAT
+                                            // error, subsystem race) after
+                                            // every pre-dispatch gate had
+                                            // already permitted it — no QSO
+                                            // was actually opened, so roll
+                                            // back exactly this attempt's
+                                            // speculative streak/offset
+                                            // mutations. A no-op if a later
+                                            // self-CQ attempt has already
+                                            // superseded the snapshot.
+                                            MessageType::QsoMessage(
+                                                crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
+                                                    attempt_id,
+                                                },
+                                            ) => {
+                                                let mut op = operator.lock().await;
+                                                op.restore_cq_state_for_attempt(attempt_id);
+                                            }
+                                            _ => {}
                                         }
                                     }
                                     Err(crossbeam_channel::TryRecvError::Empty) => {
@@ -2269,7 +2323,7 @@ mod plan_slot_transmissions_tests {
             opening("VB7F K5ARH EM10", 600.0),
             in_progress("VB7F K5ARH R-09", "q1"),
         ];
-        let plan = plan_slot_transmissions(items, false, TxPolicy::Full, false, &[], true);
+        let plan = plan_slot_transmissions(items, false, TxPolicy::Full, false, &[], true, None);
         assert!(plan.qso_starts.is_empty(), "Shift+Q drops openings");
         assert!(plan.tx_items.is_empty(), "Shift+Q drops in-progress TX too");
         assert_eq!(plan.runtime_gate_dropped, 2);
@@ -2284,7 +2338,8 @@ mod plan_slot_transmissions_tests {
             opening("VB7F K5ARH EM10", 600.0),
             in_progress("VB7F K5ARH R-09", "q1"),
         ];
-        let plan = plan_slot_transmissions(items, true, TxPolicy::RespondOnly, false, &[], true);
+        let plan =
+            plan_slot_transmissions(items, true, TxPolicy::RespondOnly, false, &[], true, None);
         assert!(
             plan.qso_starts.is_empty(),
             "RespondOnly suppresses autonomous initiations (no new QSO opened)"
@@ -2309,7 +2364,7 @@ mod plan_slot_transmissions_tests {
             opening("VB7F K5ARH EM10", 600.0),
             in_progress("VB7F K5ARH R-09", "q1"),
         ];
-        let plan = plan_slot_transmissions(items, true, TxPolicy::Disabled, false, &[], true);
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Disabled, false, &[], true, None);
         assert!(plan.qso_starts.is_empty());
         assert_eq!(plan.policy_dropped, 1);
         assert_eq!(plan.tx_items.len(), 1);
@@ -2321,7 +2376,8 @@ mod plan_slot_transmissions_tests {
     fn full_policy_pounce_becomes_qso_start_on_dx_freq() {
         let decodes = [decode("VB7F", 1500.0, SlotParity::Odd)];
         let items = vec![opening("VB7F K5ARH EM10", 600.0)];
-        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &decodes, true);
+        let plan =
+            plan_slot_transmissions(items, true, TxPolicy::Full, false, &decodes, true, None);
         assert_eq!(plan.qso_starts.len(), 1, "the pounce became a QSO start");
         assert_eq!(plan.qso_starts[0].callsign.as_deref(), Some("VB7F"));
         assert_eq!(
@@ -2339,7 +2395,7 @@ mod plan_slot_transmissions_tests {
     #[test]
     fn full_policy_cq_becomes_qso_start_with_no_callsign() {
         let items = vec![opening("CQ K5ARH EM10", 1200.0)];
-        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &[], true);
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &[], true, None);
         assert_eq!(plan.qso_starts.len(), 1);
         assert_eq!(
             plan.qso_starts[0].callsign, None,
@@ -2353,9 +2409,39 @@ mod plan_slot_transmissions_tests {
     }
 
     #[test]
+    fn cq_attempt_id_attaches_to_self_cq_start_but_not_a_pounce_start() {
+        // PAN-38: the self-CQ opening (callsign: None) carries the caller's
+        // `self_cq_attempt_id` through to `StartAutonomousQso.cq_attempt_id`
+        // so a downstream `start_cq` failure can be traced back to the
+        // exact snapshot to roll back. A pounce opening has no CQ-streak
+        // state to roll back, so it must never carry one, even when the
+        // same slot also produced a self-CQ id.
+        let items = vec![opening("CQ K5ARH EM10", 1200.0)];
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &[], true, Some(42));
+        assert_eq!(plan.qso_starts.len(), 1);
+        assert_eq!(plan.qso_starts[0].callsign, None);
+        assert_eq!(
+            plan.qso_starts[0].cq_attempt_id,
+            Some(42),
+            "self-CQ start must carry the attempt id"
+        );
+
+        let decodes = [decode("VB7F", 1500.0, SlotParity::Odd)];
+        let items = vec![opening("VB7F K5ARH EM10", 600.0)];
+        let plan =
+            plan_slot_transmissions(items, true, TxPolicy::Full, false, &decodes, true, Some(42));
+        assert_eq!(plan.qso_starts.len(), 1);
+        assert_eq!(plan.qso_starts[0].callsign.as_deref(), Some("VB7F"));
+        assert_eq!(
+            plan.qso_starts[0].cq_attempt_id, None,
+            "a pounce start must never carry a cq_attempt_id"
+        );
+    }
+
+    #[test]
     fn full_policy_in_progress_item_stays_on_raw_tx_path() {
         let items = vec![in_progress("VB7F K5ARH R-09", "q1")];
-        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &[], true);
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &[], true, None);
         assert!(
             plan.qso_starts.is_empty(),
             "a qso_id=Some sequencer item is never a QSO start"
@@ -2374,7 +2460,8 @@ mod plan_slot_transmissions_tests {
             opening("VB7F K5ARH EM10", 600.0),
             in_progress("W1AW K5ARH R-12", "q7"),
         ];
-        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, false, &decodes, true);
+        let plan =
+            plan_slot_transmissions(items, true, TxPolicy::Full, false, &decodes, true, None);
         assert_eq!(plan.qso_starts.len(), 1, "the opening → start");
         assert_eq!(plan.tx_items.len(), 1, "the in-progress item → raw TX");
         assert_eq!(plan.tx_items[0].0.qso_id.as_deref(), Some("q7"));
@@ -2397,6 +2484,7 @@ mod plan_slot_transmissions_tests {
             false,
             &[],
             /*present*/ false,
+            None,
         );
         assert!(
             plan.qso_starts.is_empty(),
@@ -2425,6 +2513,7 @@ mod plan_slot_transmissions_tests {
             false,
             &decodes,
             /*present*/ true,
+            None,
         );
         assert_eq!(
             plan.qso_starts.len(),
@@ -2442,7 +2531,7 @@ mod plan_slot_transmissions_tests {
             opening("VB7F K5ARH EM10", 600.0),
             in_progress("W1AW K5ARH R-12", "q7"),
         ];
-        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, true, &[], true);
+        let plan = plan_slot_transmissions(items, true, TxPolicy::Full, true, &[], true, None);
         assert!(plan.qso_starts.is_empty(), "dry_run opens no QSOs");
         assert_eq!(
             plan.dry_run_openings,
@@ -2463,7 +2552,7 @@ mod plan_slot_transmissions_tests {
         // Even under Full policy, a closed runtime gate drops everything and
         // nothing is attributed to the policy.
         let items = vec![opening("VB7F K5ARH EM10", 600.0)];
-        let plan = plan_slot_transmissions(items, false, TxPolicy::Full, false, &[], true);
+        let plan = plan_slot_transmissions(items, false, TxPolicy::Full, false, &[], true, None);
         assert!(plan.qso_starts.is_empty());
         assert!(plan.tx_items.is_empty());
         assert_eq!(plan.runtime_gate_dropped, 1);

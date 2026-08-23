@@ -809,6 +809,16 @@ pub struct ApplicationCoordinator {
     /// (`f`). Orthogonal to [`Self::tx_policy`].
     tx_freq_mode: Arc<std::sync::atomic::AtomicU8>,
 
+    /// PAN-39: generation counter bumped alongside every `tx_freq_mode`
+    /// store (see `tui_relay.rs`'s `ToggleTxFreqMode`/`SetTxOffset`
+    /// handlers). Lets the autonomous operator detect a Hold/Auto
+    /// transition it didn't directly observe — e.g. an Auto -> Hold -> Auto
+    /// round trip that completed entirely between two `decide_at` polling
+    /// cycles — without needing a direct handle from `tui_relay.rs`'s
+    /// command handlers into the operator (which lives behind its own
+    /// `Arc<Mutex<..>>` elsewhere in this struct).
+    tx_freq_mode_generation: Arc<std::sync::atomic::AtomicU32>,
+
     /// Unix-epoch milliseconds of the operator's last console keypress (0 =
     /// never / headless). Stamped by the TUI key handler, read by the autonomous
     /// engine's FCC §97.221 presence gate (see [`operator_present_now`]).
@@ -1674,6 +1684,11 @@ impl ApplicationCoordinator {
             tx_freq_mode: Arc::new(std::sync::atomic::AtomicU8::new(
                 pancetta_core::TxFreqMode::default().as_u8(),
             )),
+            // PAN-39: bumped once per `tx_freq_mode` store (see the
+            // `ToggleTxFreqMode`/`SetTxOffset` handlers in `tui_relay.rs`) so
+            // the autonomous operator's `decide_at` can detect a Hold/Auto
+            // transition it didn't directly observe.
+            tx_freq_mode_generation: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // 0 = no console input seen yet → not present → respond-only
             // initiation until the operator touches the keyboard.
             last_operator_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),

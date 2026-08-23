@@ -3500,6 +3500,7 @@ impl super::ApplicationCoordinator {
                                             callsign,
                                             frequency,
                                             parity,
+                                            cq_attempt_id,
                                         } => {
                                             // Phase 5: the autonomous operator decided to open
                                             // a QSO. Create it in the QsoManager as an Auto QSO
@@ -3622,6 +3623,41 @@ impl super::ApplicationCoordinator {
                                                         },
                                                     )
                                                     .await;
+                                                    // PAN-38: a self-CQ
+                                                    // (`callsign: None`) that
+                                                    // failed downstream never
+                                                    // actually transmitted —
+                                                    // tell the autonomous
+                                                    // operator so it rolls
+                                                    // back the streak/offset
+                                                    // it mutated speculatively
+                                                    // for this attempt.
+                                                    // (A failed pounce has no
+                                                    // such state, so
+                                                    // `cq_attempt_id` is only
+                                                    // ever `Some` here.)
+                                                    if let (None, Some(attempt_id)) =
+                                                        (&callsign, cq_attempt_id)
+                                                    {
+                                                        let fail_msg = ComponentMessage::new(
+                                                            ComponentId::Qso,
+                                                            ComponentId::Autonomous,
+                                                            MessageType::QsoMessage(
+                                                                crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
+                                                                    attempt_id,
+                                                                },
+                                                            ),
+                                                            Instant::now(),
+                                                        );
+                                                        if let Err(e) =
+                                                            message_bus.send_message(fail_msg).await
+                                                        {
+                                                            warn!(
+                                                                "Failed to send AutonomousCqDispatchFailed: {}",
+                                                                e
+                                                            );
+                                                        }
+                                                    }
                                                 }
                                             }
                                         }
@@ -4320,6 +4356,15 @@ impl super::ApplicationCoordinator {
                                             qso_manager.set_active_mode(mode.clone());
                                             info!("QSO manager active mode set to {}", mode);
                                         }
+                                        // PAN-38: this component is the SENDER of
+                                        // AutonomousCqDispatchFailed (see the
+                                        // StartAutonomousQso Err arm above) — it is
+                                        // addressed to ComponentId::Autonomous and
+                                        // never routed back to this inbound loop.
+                                        // Present only for match exhaustiveness.
+                                        crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
+                                            ..
+                                        } => {}
                                     }
                                 }
 

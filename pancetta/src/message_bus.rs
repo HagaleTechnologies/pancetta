@@ -775,6 +775,29 @@ pub enum QsoMessage {
         /// For a pounce: the DX's slot parity (we reply on the opposite). For
         /// a CQ: our chosen TX parity (`None` → self-parity fallback).
         parity: Option<pancetta_core::slot::SlotParity>,
+        /// PAN-38: for a self-CQ (`callsign: None`) only, the
+        /// `AutonomousOperator`'s `CqStateSnapshot::attempt_id` this
+        /// dispatch corresponds to — echoed back on
+        /// [`QsoMessage::AutonomousCqDispatchFailed`] if `start_cq` fails, so
+        /// the operator can roll back exactly this attempt's speculative
+        /// streak/offset mutations. Always `None` for a pounce (no CQ-streak
+        /// state to roll back).
+        cq_attempt_id: Option<u64>,
+    },
+    /// PAN-38: `QsoManager::start_cq` failed for a dispatched self-CQ
+    /// (`StartAutonomousQso { callsign: None, .. }`) — a downstream
+    /// radio/CAT error or subsystem race — after the coordinator's own gates
+    /// (Shift+Q, TX policy, operator-presence, dry_run) had all already
+    /// permitted the transmission. No QSO was actually opened and nothing
+    /// was actually transmitted, so the CQ-no-response streak and any
+    /// frequency-switch offset `decide_at` mutated speculatively for this
+    /// attempt must be rolled back — same mechanism as a suppressed-before-
+    /// dispatch CQ ([`AutonomousOperator::restore_cq_state`]), routed back
+    /// through the message bus since the `QsoManager`/`start_cq` call lives
+    /// in the QSO component's task, not the autonomous operator's.
+    AutonomousCqDispatchFailed {
+        /// The `cq_attempt_id` from the `StartAutonomousQso` that failed.
+        attempt_id: u64,
     },
     /// Enable or disable Fox (DXpedition operator) mode.
     ///

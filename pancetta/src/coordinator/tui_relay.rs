@@ -838,6 +838,10 @@ impl super::ApplicationCoordinator {
         // atomic; the QSO engine and autonomous operator read it to gate
         // autonomous frequency moves.
         let cmd_tx_freq_mode = self.tx_freq_mode.clone();
+        // PAN-39: bumped alongside every `cmd_tx_freq_mode.store()` below so
+        // the autonomous operator can detect a transition it didn't directly
+        // observe (see `AutonomousOperator::set_tx_freq_mode_generation_source`).
+        let cmd_tx_freq_mode_generation = self.tx_freq_mode_generation.clone();
         // Held TX audio offset in Hz (0 = Auto/unset). Written by the `o`-modal
         // relay arm; read by the manual-call handler at QSO open to place our
         // TX audio offset when the operator has set one.
@@ -1714,6 +1718,7 @@ impl super::ApplicationCoordinator {
                             );
                             let next = prev.toggle();
                             cmd_tx_freq_mode.store(next.as_u8(), Ordering::Release);
+                            cmd_tx_freq_mode_generation.fetch_add(1, Ordering::Release);
                             info!(
                                 target: "tx.freq",
                                 "Operator toggled TX-frequency mode: {} -> {}",
@@ -1740,6 +1745,7 @@ impl super::ApplicationCoordinator {
                                         pancetta_core::TxFreqMode::Hold.as_u8(),
                                         Ordering::Release,
                                     );
+                                    cmd_tx_freq_mode_generation.fetch_add(1, Ordering::Release);
                                     info!(
                                         target: "tx.freq",
                                         "Operator set TX offset hold @ {} Hz (mode → Hold)",
@@ -1758,6 +1764,7 @@ impl super::ApplicationCoordinator {
                                         pancetta_core::TxFreqMode::Auto.as_u8(),
                                         Ordering::Release,
                                     );
+                                    cmd_tx_freq_mode_generation.fetch_add(1, Ordering::Release);
                                     info!(
                                         target: "tx.freq",
                                         "Operator cleared TX offset hold (mode → Auto)"
