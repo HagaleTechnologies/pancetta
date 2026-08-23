@@ -3471,6 +3471,29 @@ impl super::ApplicationCoordinator {
                                             // doesn't sit stale until the next status push.
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
+                                            // PAN-38 round 3 (Codex): an F8 abort here is the
+                                            // one path in this worker that previously sent NO
+                                            // TransmitComplete at all -- for a self-CQ whose
+                                            // QSO was already opened (AutonomousCqOpened
+                                            // registered it in the coordinator's
+                                            // pending_self_cq_qsos map), that left the entry
+                                            // permanently leaked and the speculative "+1"
+                                            // streak never rolled back, since nothing ever
+                                            // told the autonomous operator this attempt did
+                                            // not actually transmit. Report it exactly like
+                                            // the drop-stale-TX case above.
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: message_text.clone(),
+                                                    duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
                                             continue 'worker;
                                         }
 
@@ -4879,6 +4902,31 @@ impl super::ApplicationCoordinator {
                                             break;
                                         }
                                         info!("Multi-TX aborted before PTT by operator (F8)");
+                                        // PAN-38 round 3 (Codex): same gap as the single-item
+                                        // worker's F8-before-PTT path -- no TransmitComplete
+                                        // was ever sent for any bundle item, leaking a
+                                        // self-CQ's pending_self_cq_qsos entry and never
+                                        // rolling back its speculative streak/offset.
+                                        for (text, qso_id) in
+                                            item_texts.into_iter().zip(encoded_qso_ids)
+                                        {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: text,
+                                                    duration_ms: 0,
+                                                    qso_id,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(complete_msg).await
+                                            {
+                                                warn!("Failed to send TransmitComplete: {}", e);
+                                            }
+                                        }
                                         continue;
                                     }
 
