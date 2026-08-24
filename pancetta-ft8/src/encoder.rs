@@ -565,20 +565,25 @@ impl Ft8Encoder {
                 // PAN-26: only a genuine grid locator is safe to drop (the
                 // icq shape has no field for it, but a distinct "bare CQ"
                 // frame is still an honest degrade). Anything else (a
-                // mistyped grid, or an unrelated exchange field like
-                // "RR73") must fail loudly instead of silently discarding
-                // it — dropping it here would transmit an unrelated, valid-
-                // looking bare CQ instead of the requested message.
+                // mistyped grid, or an unrelated exchange field like a
+                // numeric report) must fail loudly instead of silently
+                // discarding it — dropping it here would transmit an
+                // unrelated, valid-looking bare CQ instead of the requested
+                // message.
                 //
-                // Reserved close/report tokens are checked FIRST and
-                // rejected outright, even though "RR73" happens to also
-                // satisfy `extra_is_grid_locator`'s pure shape check (R is
-                // a valid Maidenhead letter, so "RR73" parses as a
-                // syntactically valid grid) — a CQ frame never legitimately
-                // carries one of these, so treating it as a grid would
-                // silently launder an obvious mistake into a different,
-                // valid-looking message.
-                if matches!(third, "RRR" | "RR73" | "73") || !extra_is_grid_locator(third) {
+                // PAN-22 (Codex round-1 review of PR #305, finding 1): a CQ
+                // message's optional third token is ALWAYS the sender's
+                // grid — the underlying FT8 CQ grammar has no field at all
+                // for a close/report token (those only ever appear in a
+                // directed reply, never in a CQ). So "RR73" is not a
+                // "reserved close token" in this context; it's simply the
+                // (extremely rare, but real) Maidenhead square RR73, and
+                // must be accepted like any other shape-valid grid — same
+                // "drop it, the icq shape has no room" degrade as
+                // everything else here. Only reject when the token does NOT
+                // parse as a locator at all (mistyped grid, stray free
+                // text, etc.); do not special-case specific literal strings.
+                if !extra_is_grid_locator(third) {
                     return Err(Ft8Error::MessageDecodingError(format!(
                         "'{}' is not a valid grid locator for a compound-callsign CQ",
                         third
@@ -2372,8 +2377,15 @@ mod tests {
         // NOT a valid grid must fail loudly, not silently drop it and
         // transmit the unrelated bare "CQ <call>" message. Previously any
         // third token was unconditionally dropped.
+        //
+        // Note: "RR73" is deliberately NOT in this list — PAN-22 finding 1
+        // (Codex round-1 review of PR #305) established that a CQ's third
+        // token is always meant as a grid, and "RR73" is shape-valid
+        // Maidenhead (see `test_try_encode_nonstandard_cq_accepts_rr73_shaped_grid`
+        // below), so it must be accepted/dropped like any other grid, not
+        // rejected as a bogus close token.
         let encoder = Ft8Encoder::new();
-        for msg in ["CQ YS/WE9G RR73", "CQ YS/WE9G HELLO", "CQ YS/WE9G AA9"] {
+        for msg in ["CQ YS/WE9G HELLO", "CQ YS/WE9G AA9"] {
             assert!(
                 encoder.try_encode_nonstandard(msg).is_err(),
                 "'{}' has a non-grid third token and must fail, not silently drop it",
@@ -2387,11 +2399,48 @@ mod tests {
     #[test]
     fn test_encode_message_report_to_compound_call_via_cq_fails_cleanly_overall() {
         // The full encode_message fallback chain for the PAN-26 finding 2
-        // scenario: standard fails (compound call), nonstandard now
-        // correctly refuses the bogus third token, and free text also
+        // scenario: standard fails (compound call), nonstandard correctly
+        // refuses a bogus (non-grid-shaped) third token, and free text also
         // fails (too long). The overall result must be an honest Err.
         let mut encoder = Ft8Encoder::new();
-        assert!(encoder.encode_message("CQ YS/WE9G RR73", None).is_err());
+        assert!(encoder.encode_message("CQ YS/WE9G HELLO", None).is_err());
+    }
+
+    #[test]
+    fn test_try_encode_nonstandard_cq_accepts_rr73_shaped_grid() {
+        // PAN-22 finding 1 (Codex round-1 review of PR #305): a
+        // compound-callsign operator whose configured grid is the
+        // (extremely rare but syntactically valid) Maidenhead square
+        // "RR73" must still be able to encode a CQ. Previously this
+        // literal string was special-cased as a "reserved close token" and
+        // rejected outright before the locator shape check even ran, even
+        // though "R"/"R" are valid Maidenhead field letters and "7"/"3" are
+        // valid square digits — i.e. "RR73" legitimately parses as a grid.
+        // The icq shape still has no room to carry any third token, so
+        // (like every other grid) it is accepted and dropped, producing
+        // the same honest "bare CQ" degrade as any other grid-bearing
+        // compound CQ.
+        let encoder = Ft8Encoder::new();
+        let result = encoder.try_encode_nonstandard("CQ YS/WE9G RR73");
+        assert!(
+            result.is_ok(),
+            "'RR73' is a shape-valid grid and must not be rejected as a close token: {:?}",
+            result.err()
+        );
+        let payload = result.unwrap();
+        let msg = decode_payload(&payload);
+        assert_eq!(msg.to_callsign, Some("CQ".to_string()));
+        assert_eq!(msg.from_callsign, Some("YS/WE9G".to_string()));
+
+        // And via the actual public entry point a compound-callsign
+        // operator would use: `encode_cq` with grid_square == "RR73".
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_cq("YS/WE9G", "RR73", false);
+        assert!(
+            result.is_ok(),
+            "encode_cq with grid 'RR73' from a compound-callsign operator must encode: {:?}",
+            result.err()
+        );
     }
 
     #[test]

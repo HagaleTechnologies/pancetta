@@ -1363,6 +1363,26 @@ struct HashTable {
     collided_10bit: std::collections::HashSet<u32>,
     collided_12bit: std::collections::HashSet<u32>,
     collided_22bit: std::collections::HashSet<u32>,
+    /// EVERY distinct (canonical) callsign ever passed to [`Self::add_callsign`],
+    /// independent of whether it ended up resolvable in any of the three
+    /// maps above — PAN-22 finding 3 (Codex round-1 review of PR #305).
+    ///
+    /// `learned_callsigns()` used to union just the three maps' VALUES, so
+    /// a callsign that lost a collision (evicted from all three maps into
+    /// `collided_*`) was silently dropped from that export — not just its
+    /// resolution, but the very fact that it had ever been heard. Carrying
+    /// that (incomplete) export into a rebuilt decoder therefore lost all
+    /// collision knowledge: if the OTHER, still-real colliding station was
+    /// then re-learned in the rebuilt decoder, its hash bucket would
+    /// resolve unambiguously to just that one callsign, silently
+    /// mislabeling any subsequent frame actually from the dropped station.
+    ///
+    /// Replaying this full set (in any order) through `add_callsign` on a
+    /// fresh table deterministically reconstructs the identical
+    /// resolved/collided state: a bucket ends up in `collided_*` iff two OR
+    /// MORE distinct callsigns from the replayed set ever hash to it, which
+    /// depends only on set membership, not insertion order.
+    all_learned: std::collections::HashSet<String>,
 }
 
 impl HashTable {
@@ -1374,6 +1394,7 @@ impl HashTable {
             collided_10bit: std::collections::HashSet::new(),
             collided_12bit: std::collections::HashSet::new(),
             collided_22bit: std::collections::HashSet::new(),
+            all_learned: std::collections::HashSet::new(),
         }
     }
 
@@ -1400,8 +1421,27 @@ impl HashTable {
         }
     }
 
-    /// Add callsign to hash tables
+    /// Add callsign to hash tables.
+    ///
+    /// PAN-22 finding 2 (Codex round-1 review of PR #305): canonicalize to
+    /// uppercase FIRST, before either hashing or storing. `calculate_n22`
+    /// already uppercases internally, so the hash BUCKET was always
+    /// case-insensitive — but the STRING stored in the table (and compared
+    /// against in `seed()`) was whatever case the caller passed. A station
+    /// configured with a lowercase callsign (`StationConfig` accepts either
+    /// case) got seeded here as lowercase; a later standard decode of the
+    /// SAME station learns the uppercase spelling at the SAME hash bucket,
+    /// and `seed()`'s raw string comparison (`existing != callsign`) then
+    /// treated the two spellings of one real station as a genuine collision
+    /// between two DIFFERENT stations — evicting both from every table and
+    /// making all future i3=4 replies to that station resolve as `<...>`
+    /// forever. Canonicalizing here means every caller (config-seeded or
+    /// decode-learned) converges on the same stored spelling, so the same
+    /// station never collides with itself.
     pub fn add_callsign(&mut self, callsign: &str) {
+        let callsign = callsign.to_ascii_uppercase();
+        let callsign = callsign.as_str();
+        self.all_learned.insert(callsign.to_string());
         let hash_10 = self.calculate_hash_10bit(callsign);
         let hash_12 = self.calculate_hash_12bit(callsign);
         let hash_22 = self.calculate_hash_22bit(callsign);
@@ -1441,22 +1481,23 @@ impl HashTable {
         self.hash_22bit.get(&hash).cloned()
     }
 
-    /// All distinct callsigns learned so far, across all three hash widths
-    /// — used to reseed a freshly-rebuilt decoder's table (PAN-27 finding 2)
-    /// instead of restarting empty. A callsign whose 12-bit bucket collided
-    /// may still be recoverable from a wider table that didn't collide for
-    /// it, so this unions all three rather than reading one.
+    /// All distinct (canonical) callsigns ever learned — used to reseed a
+    /// freshly-rebuilt decoder's table (PAN-27 finding 2) instead of
+    /// restarting empty.
+    ///
+    /// PAN-22 finding 3 (Codex round-1 review of PR #305): this must return
+    /// EVERY callsign ever seen, including ones that lost a hash collision
+    /// and were evicted from all three resolvable maps into `collided_*`.
+    /// Reading `all_learned` directly (rather than unioning the three maps'
+    /// current values, as before) is what makes that possible — replaying
+    /// this full set through `add_callsign` on a freshly-rebuilt decoder's
+    /// (empty) table deterministically re-derives the same collision state,
+    /// so two real, distinct stations that share a hash bucket stay
+    /// correctly ambiguous (rendering `<...>`) across a rebuild, instead of
+    /// one of them silently winning the bucket outright the next time it's
+    /// heard again.
     pub fn learned_callsigns(&self) -> Vec<String> {
-        let mut seen = std::collections::HashSet::new();
-        for call in self
-            .hash_10bit
-            .values()
-            .chain(self.hash_12bit.values())
-            .chain(self.hash_22bit.values())
-        {
-            seen.insert(call.clone());
-        }
-        seen.into_iter().collect()
+        self.all_learned.iter().cloned().collect()
     }
 
     /// Calculate the 22-bit hash for a callsign, matching ft8_lib's `save_callsign()`.
@@ -2818,6 +2859,121 @@ mod tests {
         // resurrect a (now ambiguous) resolution.
         hash_table.add_callsign("K0AAA");
         assert_eq!(hash_table.lookup_12bit_hash(hash_a), None);
+    }
+
+    /// PAN-22 finding 2 (Codex round-1 review of PR #305): a
+    /// lowercase-configured station callsign (`StationConfig` accepts
+    /// either case) must not falsely "collide" with its own uppercase
+    /// decoded spelling. Before the fix, `add_callsign` stored whatever
+    /// case the caller passed, so seeding "k5arh" (config-seed) followed by
+    /// learning "K5ARH" (decode-learned) at the SAME hash bucket looked
+    /// like two DIFFERENT stations to `seed()`'s raw string comparison,
+    /// evicting the bucket into "collided" and leaving it permanently
+    /// unresolved for a single real station.
+    #[test]
+    fn test_hash_table_canonicalizes_case_no_false_self_collision() {
+        let mut hash_table = HashTable::new();
+
+        // Simulates `Ft8Decoder::seed_hash_callsign` at construction time
+        // with a lowercase-configured station callsign.
+        hash_table.add_callsign("k5arh");
+        // Simulates a later standard decode learning the SAME station's
+        // canonical (uppercase) spelling.
+        hash_table.add_callsign("K5ARH");
+
+        let hash_10 = hash_table.calculate_hash_10bit("K5ARH");
+        let hash_12 = hash_table.calculate_hash_12bit("K5ARH");
+        let hash_22 = hash_table.calculate_hash_22bit("K5ARH");
+
+        assert_eq!(
+            hash_table.lookup_10bit_hash(hash_10),
+            Some("K5ARH".to_string()),
+            "lowercase-then-uppercase re-seed of the SAME station must not \
+             collide"
+        );
+        assert_eq!(
+            hash_table.lookup_12bit_hash(hash_12),
+            Some("K5ARH".to_string())
+        );
+        assert_eq!(
+            hash_table.lookup_22bit_hash(hash_22),
+            Some("K5ARH".to_string())
+        );
+
+        // The stored spelling itself must be canonicalized to uppercase,
+        // and `learned_callsigns()` must reflect that single canonical
+        // entry -- not two entries, and not the lowercase spelling.
+        let learned = hash_table.learned_callsigns();
+        assert_eq!(
+            learned,
+            vec!["K5ARH".to_string()],
+            "expected exactly one canonical (uppercase) learned callsign, got {:?}",
+            learned
+        );
+    }
+
+    /// PAN-22 finding 3 (Codex round-1 review of PR #305): collision state
+    /// must survive a `learned_callsigns()` round-trip into a freshly
+    /// rebuilt decoder's table — the scenario `coordinator/ft8.rs`'s
+    /// decoder-rebuild path exercises for real. Before the fix,
+    /// `learned_callsigns()` unioned only the three maps' resolvable
+    /// VALUES; a callsign that had lost a collision (evicted into
+    /// `collided_12bit`) was silently absent from that export, so a
+    /// rebuilt table replayed from it would "forget" that station existed
+    /// at all — and if the OTHER, still-real colliding station were then
+    /// re-learned, the bucket would resolve unambiguously (and wrongly) to
+    /// just that one callsign.
+    #[test]
+    fn test_learned_callsigns_survives_collision_across_simulated_rebuild() {
+        // K0AAA and K0BAP are a confirmed 12-bit hash collision (see
+        // `test_hash_table_collision_renders_unresolved_not_silently_overwritten`).
+        let mut old_table = HashTable::new();
+        let hash_12 = old_table.calculate_hash_12bit("K0AAA");
+        assert_eq!(hash_12, old_table.calculate_hash_12bit("K0BAP"));
+
+        old_table.add_callsign("K0AAA");
+        old_table.add_callsign("K0BAP");
+        // Confirm the collision actually landed as intended before we rely
+        // on it: the bucket is unresolved, but BOTH callsigns are still
+        // present in the learned-so-far export.
+        assert_eq!(old_table.lookup_12bit_hash(hash_12), None);
+        let mut learned = old_table.learned_callsigns();
+        learned.sort();
+        assert_eq!(
+            learned,
+            vec!["K0AAA".to_string(), "K0BAP".to_string()],
+            "both colliding callsigns must still be exported, not just the \
+             resolvable map values"
+        );
+
+        // Simulate a decoder rebuild: a brand-new, empty table replayed
+        // from ONLY what the old table's `learned_callsigns()` exported —
+        // exactly what `coordinator/ft8.rs`'s rebuild arm does via
+        // `Ft8Decoder::seed_hash_callsign` in a loop.
+        let mut new_table = HashTable::new();
+        for call in old_table.learned_callsigns() {
+            new_table.add_callsign(&call);
+        }
+
+        // The collision must be preserved: the bucket is still unresolved
+        // on the rebuilt table...
+        assert_eq!(
+            new_table.lookup_12bit_hash(hash_12),
+            None,
+            "collision must survive the learned_callsigns() round-trip \
+             into a rebuilt table, not silently resolve to one station"
+        );
+        // ...and if K0AAA alone is then heard again post-rebuild (e.g. via
+        // a standard decode), it must NOT resolve the shared bucket to
+        // K0AAA alone -- that would mean K0BAP's frames get silently
+        // mislabeled as K0AAA's.
+        new_table.add_callsign("K0AAA");
+        assert_eq!(
+            new_table.lookup_12bit_hash(hash_12),
+            None,
+            "re-hearing one of the two colliding stations after rebuild \
+             must not resurrect a false single-station resolution"
+        );
     }
 
     #[test]
