@@ -249,7 +249,13 @@ impl Ft8Encoder {
     }
 
     /// Convert 77-bit payload to 79 FT8 transmission symbols (backward compatible)
-    fn payload_to_symbols(&self, payload: &[u8; 10]) -> Ft8Result<[u8; NUM_SYMBOLS]> {
+    ///
+    /// `pub(crate)`: also used directly by `decoder.rs` tests that need to
+    /// construct a raw nonstandard-callsign payload bypassing
+    /// `try_encode_nonstandard`'s `looks_like_callsign` guard (to simulate
+    /// a CRC-valid noise decode carrying a free-text-shaped exact field —
+    /// see the PAN-27 round-5 hash-seeding regression test).
+    pub(crate) fn payload_to_symbols(&self, payload: &[u8; 10]) -> Ft8Result<[u8; NUM_SYMBOLS]> {
         let ldpc_codeword = self.payload_to_ldpc(payload)?;
         self.generate_symbols(&ldpc_codeword)
     }
@@ -561,11 +567,43 @@ impl Ft8Encoder {
                     call
                 ))
             })?;
-            if let Some(grid) = parts.get(2) {
+            if let Some(&third) = parts.get(2) {
+                // PAN-26: only a genuine grid locator is safe to drop (the
+                // icq shape has no field for it, but a distinct "bare CQ"
+                // frame is still an honest degrade). Anything else (a
+                // mistyped grid, or an unrelated exchange field like a
+                // numeric report) must fail loudly instead of silently
+                // discarding it — dropping it here would transmit an
+                // unrelated, valid-looking bare CQ instead of the requested
+                // message.
+                //
+                // PAN-22 (Codex round-1 review of PR #305, finding 1): a CQ
+                // message's optional third token is ALWAYS the sender's
+                // grid — the underlying FT8 CQ grammar has no field at all
+                // for a close/report token (those only ever appear in a
+                // directed reply, never in a CQ). So "RR73" is not a
+                // "reserved close token" in this context; it's simply the
+                // (extremely rare, but real) Maidenhead square RR73, and
+                // must be accepted like any other shape-valid grid — same
+                // "drop it, the icq shape has no room" degrade as
+                // everything else here. Only reject when the token does NOT
+                // parse as a locator at all (mistyped grid, stray free
+                // text, etc.); do not special-case specific literal strings.
+                //
+                // PAN-26 round 2 (Codex round-2 review, finding 3): a
+                // 6/8-char EXTENDED grid (a valid `StationConfig` grid) must
+                // also be accepted here, not just the plain 4-char shape —
+                // see `extra_is_grid_locator_or_extended`.
+                if !extra_is_grid_locator_or_extended(third) {
+                    return Err(Ft8Error::MessageDecodingError(format!(
+                        "'{}' is not a valid grid locator for a compound-callsign CQ",
+                        third
+                    )));
+                }
                 debug!(
                     "i3=4 CQ encode: dropping grid '{}' (icq shape has no room \
                      for it) for '{}'",
-                    grid, text
+                    third, text
                 );
             }
             return Ok(pack_nonstandard(0, n58, 0, 0, 1));
@@ -647,10 +685,12 @@ impl Ft8Encoder {
             "RRR" => 1,
             "RR73" => 2,
             "73" => 3,
-            _ if extra_is_grid_locator(extra) => {
+            _ if extra_is_grid_locator_or_extended(extra) => {
                 // Grid square (the CqResponse reply-to-CQ step): dropping it
                 // still produces a valid, distinct "bare pairing" frame — an
                 // honest degrade, not a different message in disguise.
+                // PAN-26 round 2: also accept a 6/8-char extended-precision
+                // grid here, same reasoning as the CQ branch above.
                 debug!(
                     "i3=4 encode: dropping grid '{}' (nonstandard-call report \
                      field has no room for it) for '{}'",
@@ -1308,40 +1348,15 @@ fn pack_eu_vhf_14bit(exchange: &str) -> u16 {
     0 // fallback
 }
 
-/// "Is this token shaped like a real callsign" check, guarding the i3=4
-/// nonstandard-callsign path against being triggered by arbitrary free text.
-///
-/// PAN-17 round 2 (Codex review): the original version of this check (≥3
-/// chars, has a digit AND a letter, in any position) was too loose —
-/// `"HELLO1 WORLD2"` is valid 13-char free text, but both tokens pass that
-/// check and fit the 58-bit hash-callsign field, so `encode_message` would
-/// silently transmit a WRONG type-4 frame instead of the requested free
-/// text. Real callsigns (including compound forms) always have their digit
-/// "block" with letters on BOTH sides — a prefix before it and a suffix
-/// after it (`K1ABC`, `WE9G`, `8G81PA`, `3E40CDW`) — never a bare trailing
-/// digit with no suffix letters (`HELLO1`, `WORLD2`). This mirrors the
-/// decode side's own shape rule, `Ft8Message::looks_like_callsign`
-/// (message.rs's suffix-letters-after-the-last-digit check), so the two
-/// paths agree on what a plausible callsign looks like.
-fn looks_like_callsign(s: &str) -> bool {
-    let bytes = s.as_bytes();
-    if bytes.len() < 3 {
-        return false;
-    }
-    let Some(last_digit_pos) = bytes.iter().rposition(u8::is_ascii_digit) else {
-        return false; // no digit at all
-    };
-    // At least one suffix letter after the last digit.
-    if last_digit_pos + 1 >= bytes.len()
-        || !bytes[last_digit_pos + 1..]
-            .iter()
-            .all(u8::is_ascii_alphabetic)
-    {
-        return false;
-    }
-    // At least one prefix letter before the digit block.
-    bytes[..last_digit_pos].iter().any(u8::is_ascii_alphabetic)
-}
+// "Is this token shaped like a real (possibly compound) callsign" check —
+// guards the i3=4 nonstandard-callsign path against being triggered by
+// arbitrary free text, AND (PAN-27 round 5 / Codex round-2 finding 2) gates
+// what the decoder's type-4 hash-seeding loop is willing to learn into the
+// callsign hash table. Lives in `message.rs` (always compiled) rather than
+// here (feature-gated behind `transmit`) so `decoder.rs` can call the exact
+// same check without a feature-gate skew between transmit and receive-only
+// builds — see that module's doc comment for the full rationale.
+use crate::message::looks_like_compound_callsign as looks_like_callsign;
 
 /// Does `s` look like a 4-character Maidenhead grid locator (`AA00`..`RR99`)?
 /// Mirrors `packgrid`'s own grid-shape check — used by `try_encode_nonstandard`
@@ -1354,6 +1369,36 @@ fn extra_is_grid_locator(s: &str) -> bool {
         && (b'A'..=b'R').contains(&bytes[1])
         && bytes[2].is_ascii_digit()
         && bytes[3].is_ascii_digit()
+}
+
+/// Does `s` look like a grid locator that the i3=4 nonstandard-callsign
+/// path can safely drop — either a plain 4-char Maidenhead grid
+/// (`extra_is_grid_locator`), or a longer, valid EXTENDED-precision
+/// locator (6/8/10-char subsquare/extended-square/sub-extended-square,
+/// e.g. `"FN31PR"`) that `pancetta-config`'s `StationConfig` explicitly
+/// accepts as a configured operator grid.
+///
+/// PAN-26 round 2 (Codex round-2 review of PR #305, finding 3): round-1's
+/// fix made an UNRECOGNIZED third token fail loudly instead of silently
+/// dropping it — correct for a mistyped grid or stray free text, but
+/// `extra_is_grid_locator` only ever recognized the exact 4-char shape.
+/// That regressed a compound-callsign operator with an extended-precision
+/// configured grid from "grid silently dropped, bare CQ still sent" (the
+/// pre-round-1 behavior) to "no CQ transmitted at all" (round-1's hard
+/// error) — worse than before. The FT8 CQ grammar's third token is always
+/// a plain 4-char grid regardless of what precision the operator has
+/// configured, and it gets DROPPED either way here (i3=4's icq/report
+/// field has no room for it) — so an extended locator only needs to be
+/// recognized as shape-valid, never actually truncated and re-encoded.
+/// Reuses `pancetta_core::gridsquare::GridSquare`, the existing
+/// grid-precision validation/truncation helper, rather than duplicating
+/// its Maidenhead-shape rules here.
+fn extra_is_grid_locator_or_extended(s: &str) -> bool {
+    use pancetta_core::gridsquare::GridPrecision;
+    extra_is_grid_locator(s)
+        || pancetta_core::gridsquare::GridSquare::new(s)
+            .map(|g| (g.precision() as usize) > (GridPrecision::Square as usize))
+            .unwrap_or(false)
 }
 
 /// Does `s` look like a numeric signal report, with or without the `R`
@@ -1375,7 +1420,7 @@ fn extra_is_numeric_report(s: &str) -> bool {
 ///
 /// Layout (mirrors `MessageParser::parse_nonstd_call` in message.rs):
 /// n12(12) + n58(58) + iflip(1) + nrpt(2) + icq(1) + i3(3) = 77 bits.
-fn pack_nonstandard(n12: u32, n58: u64, iflip: u8, nrpt: u8, icq: u8) -> [u8; 10] {
+pub(crate) fn pack_nonstandard(n12: u32, n58: u64, iflip: u8, nrpt: u8, icq: u8) -> [u8; 10] {
     let mut bits: BitVec<u8, Msb0> = BitVec::with_capacity(80);
     for i in (0..12).rev() {
         bits.push((n12 >> i) & 1 != 0);
@@ -2271,5 +2316,251 @@ mod tests {
         // at all.
         let encoder = Ft8Encoder::new();
         assert!(encoder.try_encode_nonstandard("HELLO WORLD").is_err());
+    }
+
+    #[test]
+    fn test_looks_like_callsign_accepts_numeral_call_area_suffix() {
+        // PAN-22 finding 1 (round 3+ review): "K1ABC/4"/"W1AW/8" are the
+        // call-area reassignment convention -- `pack28` only special-cases
+        // /P and /R, so these need the i3=4 fallback, and
+        // `pancetta-qso::exchange::validate_callsign` already treats them
+        // as valid compound forms. Must not regress to unencodable.
+        assert!(looks_like_callsign("K1ABC/4"));
+        assert!(looks_like_callsign("W1AW/8"));
+        // A digit suffix with no plausible base underneath must still fail.
+        assert!(!looks_like_callsign("AB/4"));
+    }
+
+    #[test]
+    fn test_encode_message_numeral_call_area_suffix_compound_call() {
+        // PAN-22 finding 1 live scenario: a compound call using the
+        // call-area reassignment suffix must still encode via i3=4, not
+        // regress to an Err (pack28 can't represent it either).
+        let mut encoder = Ft8Encoder::new();
+        for msg in ["CQ K1ABC/4", "K1ABC/4 K5ARH EM10", "CQ W1AW/8"] {
+            assert!(
+                encoder.encode_message(msg, None).is_ok(),
+                "'{}' (numeral call-area suffix) failed to encode",
+                msg
+            );
+        }
+
+        let payload = encoder.try_encode_nonstandard("CQ K1ABC/4").unwrap();
+        let msg = decode_payload(&payload);
+        assert_eq!(msg.to_callsign, Some("CQ".to_string()));
+        assert_eq!(msg.from_callsign, Some("K1ABC/4".to_string()));
+    }
+
+    #[test]
+    fn test_try_encode_nonstandard_cq_rejects_non_grid_third_token() {
+        // PAN-26 finding 2: a three-token compound CQ whose third token is
+        // NOT a valid grid must fail loudly, not silently drop it and
+        // transmit the unrelated bare "CQ <call>" message. Previously any
+        // third token was unconditionally dropped.
+        //
+        // Note: "RR73" is deliberately NOT in this list — PAN-22 finding 1
+        // (Codex round-1 review of PR #305) established that a CQ's third
+        // token is always meant as a grid, and "RR73" is shape-valid
+        // Maidenhead (see `test_try_encode_nonstandard_cq_accepts_rr73_shaped_grid`
+        // below), so it must be accepted/dropped like any other grid, not
+        // rejected as a bogus close token.
+        let encoder = Ft8Encoder::new();
+        for msg in ["CQ YS/WE9G HELLO", "CQ YS/WE9G AA9"] {
+            assert!(
+                encoder.try_encode_nonstandard(msg).is_err(),
+                "'{}' has a non-grid third token and must fail, not silently drop it",
+                msg
+            );
+        }
+        // A genuine grid is still accepted and dropped (existing behavior).
+        assert!(encoder.try_encode_nonstandard("CQ YS/WE9G EM10").is_ok());
+    }
+
+    #[test]
+    fn test_encode_message_report_to_compound_call_via_cq_fails_cleanly_overall() {
+        // The full encode_message fallback chain for the PAN-26 finding 2
+        // scenario: standard fails (compound call), nonstandard correctly
+        // refuses a bogus (non-grid-shaped) third token, and free text also
+        // fails (too long). The overall result must be an honest Err.
+        let mut encoder = Ft8Encoder::new();
+        assert!(encoder.encode_message("CQ YS/WE9G HELLO", None).is_err());
+    }
+
+    #[test]
+    fn test_try_encode_nonstandard_cq_accepts_rr73_shaped_grid() {
+        // PAN-22 finding 1 (Codex round-1 review of PR #305): a
+        // compound-callsign operator whose configured grid is the
+        // (extremely rare but syntactically valid) Maidenhead square
+        // "RR73" must still be able to encode a CQ. Previously this
+        // literal string was special-cased as a "reserved close token" and
+        // rejected outright before the locator shape check even ran, even
+        // though "R"/"R" are valid Maidenhead field letters and "7"/"3" are
+        // valid square digits — i.e. "RR73" legitimately parses as a grid.
+        // The icq shape still has no room to carry any third token, so
+        // (like every other grid) it is accepted and dropped, producing
+        // the same honest "bare CQ" degrade as any other grid-bearing
+        // compound CQ.
+        let encoder = Ft8Encoder::new();
+        let result = encoder.try_encode_nonstandard("CQ YS/WE9G RR73");
+        assert!(
+            result.is_ok(),
+            "'RR73' is a shape-valid grid and must not be rejected as a close token: {:?}",
+            result.err()
+        );
+        let payload = result.unwrap();
+        let msg = decode_payload(&payload);
+        assert_eq!(msg.to_callsign, Some("CQ".to_string()));
+        assert_eq!(msg.from_callsign, Some("YS/WE9G".to_string()));
+
+        // And via the actual public entry point a compound-callsign
+        // operator would use: `encode_cq` with grid_square == "RR73".
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_cq("YS/WE9G", "RR73", false);
+        assert!(
+            result.is_ok(),
+            "encode_cq with grid 'RR73' from a compound-callsign operator must encode: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_looks_like_callsign_rejects_ambiguous_free_text_words() {
+        // PAN-27 finding 1 (round 4 review): "ABC1D"/"EFG2H" satisfy the
+        // suffix-after-digit rule (like "HELLO1"/"WORLD2" did before that
+        // fix) but are ordinary words, not callsigns -- a real
+        // callsign/DXCC prefix is at most 2 letters before the first digit.
+        assert!(!looks_like_callsign("ABC1D"));
+        assert!(!looks_like_callsign("EFG2H"));
+        // Sanity: genuine callsign shapes (short prefix, or digit-led
+        // international forms) still pass.
+        assert!(looks_like_callsign("K1ABC"));
+        assert!(looks_like_callsign("8G81PA"));
+        assert!(looks_like_callsign("3E40CDW"));
+        assert!(looks_like_callsign("YS/WE9G"));
+    }
+
+    #[test]
+    fn test_encode_message_ambiguous_free_text_routes_to_free_text_not_nonstdcall() {
+        // PAN-27 finding 1 live scenario: "ABC1D EFG2H" is valid 11-char
+        // free text. Before this fix, both tokens satisfied
+        // looks_like_callsign, fit pack58, and neither fit pack28 -- so
+        // encode_message transmitted an unrelated type-4 callsign frame
+        // instead of the requested free text.
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("ABC1D EFG2H", None)
+            .expect("valid free text must encode");
+
+        let payload = encoder.encode_free_text("ABC1D EFG2H").unwrap();
+        let expected_symbols = encoder.payload_to_symbols(&payload).unwrap();
+        assert_eq!(
+            symbols, expected_symbols,
+            "encode_message must choose the free-text encoding, not i3=4"
+        );
+
+        let msg = decode_payload(&payload);
+        assert_eq!(msg.message_type, crate::message::MessageType::FreeText);
+
+        // And compound calls (the OTHER direction PAN-27 requires still
+        // hold) must still route to i3=4, not free text.
+        assert!(encoder.try_encode_nonstandard("CQ YS/WE9G").is_ok());
+        let cq_symbols = encoder.encode_message("CQ YS/WE9G", None).unwrap();
+        let cq_payload = encoder.try_encode_nonstandard("CQ YS/WE9G").unwrap();
+        let expected_cq_symbols = encoder.payload_to_symbols(&cq_payload).unwrap();
+        assert_eq!(
+            cq_symbols, expected_cq_symbols,
+            "a genuine compound-callsign CQ must still route to i3=4, not free text"
+        );
+    }
+
+    #[test]
+    fn test_looks_like_callsign_rejects_all_digit_prefix() {
+        // Codex round-2 review of PR #305, finding 1: "1234A"/"5678B" have
+        // an EMPTY prefix before their first digit (the whole token starts
+        // with a digit run), which used to satisfy the "<=2 letters before
+        // the first digit" rule unconditionally -- an empty prefix trivially
+        // passes both `prefix.len() <= 2` and the vacuous `all()` over zero
+        // elements. A real digit-led DXCC prefix ("8G8...", "3E4...") always
+        // has a LETTER immediately after that leading digit; a pure digit
+        // run like "1234" does not.
+        assert!(!looks_like_callsign("1234A"));
+        assert!(!looks_like_callsign("5678B"));
+        // Sanity: genuine digit-led compound-callsign shapes must still pass.
+        assert!(looks_like_callsign("8G81PA"));
+        assert!(looks_like_callsign("3E40CDW"));
+    }
+
+    #[test]
+    fn test_encode_message_all_digit_prefix_free_text_routes_to_free_text_not_nonstdcall() {
+        // Codex round-2 review of PR #305, finding 1, live scenario:
+        // "1234A 5678B" is valid free text. Before this fix, both tokens
+        // satisfied `looks_like_callsign` (empty prefix passed the shape
+        // check), `pack28` rejected both (digits don't occupy valid
+        // callsign-suffix positions) but `pack58` accepted both fine, so
+        // `encode_message` stopped at the i3=4 nonstandard-callsign path
+        // and transmitted a bogus callsign-exchange frame instead of the
+        // requested free text.
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("1234A 5678B", None)
+            .expect("valid free text must encode");
+
+        let payload = encoder.encode_free_text("1234A 5678B").unwrap();
+        let expected_symbols = encoder.payload_to_symbols(&payload).unwrap();
+        assert_eq!(
+            symbols, expected_symbols,
+            "encode_message must choose the free-text encoding, not i3=4"
+        );
+
+        let msg = decode_payload(&payload);
+        assert_eq!(msg.message_type, crate::message::MessageType::FreeText);
+    }
+
+    #[test]
+    fn test_extra_is_grid_locator_or_extended_accepts_extended_grid() {
+        // Codex round-2 review of PR #305, finding 3: pancetta-config's
+        // `StationConfig` accepts 6/8-char EXTENDED Maidenhead locators
+        // (e.g. "FN31PR") as a valid configured operator grid, but
+        // `extra_is_grid_locator` only ever recognized the exact 4-char
+        // shape.
+        assert!(extra_is_grid_locator_or_extended("EM10"));
+        assert!(extra_is_grid_locator_or_extended("FN31PR"));
+        assert!(extra_is_grid_locator_or_extended("FN31PR12"));
+        // Garbage still must not pass.
+        assert!(!extra_is_grid_locator_or_extended("NOTAGRID"));
+        assert!(!extra_is_grid_locator_or_extended("-12"));
+    }
+
+    #[test]
+    fn test_compound_cq_with_extended_grid_encodes_instead_of_erroring() {
+        // Codex round-2 review of PR #305, finding 3, live scenario: this
+        // is a regression from round-1's own PAN-26 fix (only drop a
+        // compound CQ's optional third-token grid if `extra_is_grid_locator`
+        // actually accepts it, else error instead of silently dropping).
+        // Before round-1's fix, an extended-grid compound CQ silently
+        // degraded to a bare "CQ <call>". After round-1's fix (but before
+        // this one), the same CQ hard-errored instead -- no CQ was
+        // transmitted at all for any compound-callsign operator with an
+        // extended-precision configured grid, which is worse than before.
+        let mut encoder = Ft8Encoder::new();
+        let result = encoder.encode_cq("YS/WE9G", "FN31PR", false);
+        assert!(
+            result.is_ok(),
+            "encode_cq with an 8-char extended grid from a compound-callsign \
+             operator must encode, not hard-error: {:?}",
+            result.err()
+        );
+
+        // It must produce the same frame as the plain-4-char-grid CQ (the
+        // grid still gets dropped either way -- icq shape has no room for
+        // it), proving the extended grid didn't silently get treated as
+        // free text or otherwise change the encoded message.
+        let expected = encoder.encode_cq("YS/WE9G", "FN31", false).unwrap();
+        assert_eq!(
+            result.unwrap(),
+            expected,
+            "an extended-grid compound CQ must encode identically to the \
+             truncated 4-char-grid CQ (both drop the grid)"
+        );
     }
 }

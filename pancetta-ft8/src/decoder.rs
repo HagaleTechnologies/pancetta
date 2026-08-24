@@ -2640,6 +2640,13 @@ impl Ft8Decoder {
         self.message_parser.add_callsign(callsign);
     }
 
+    /// All callsigns this decoder's i3=4 hash table has learned so far
+    /// (PAN-27 finding 2) — used to carry accumulated learning into a
+    /// freshly-rebuilt decoder rather than discarding it.
+    pub fn learned_callsigns(&self) -> Vec<String> {
+        self.message_parser.learned_callsigns()
+    }
+
     /// Create a new decoder with custom message handler
     pub fn with_message_handler(
         config: Ft8Config,
@@ -4423,6 +4430,49 @@ impl Ft8Decoder {
             .flatten()
             {
                 if call != "CQ" && call != "DE" && call != "QRZ" && !call.starts_with("CQ ") {
+                    self.message_parser.add_callsign(call);
+                }
+            }
+        }
+
+        // PAN-27 finding 4: a type-4 (NonStdCall) frame's exact 58-bit
+        // field is already trustworthy plaintext (e.g. decoding
+        // "CQ YS/WE9G" reveals the full compound callsign) — learn it too,
+        // not just `MessageType::Standard` decodes, so a LATER exchange
+        // that hashes the same callsign into the lossy 12-bit slot still
+        // resolves. Skip the hash-rendered slot itself (`"<K5ARH>"`
+        // resolved or `"<...>"` unresolved) — that's not a real callsign,
+        // just this same table's own prior render of one — and the bare
+        // `"CQ"` addressee token.
+        //
+        // PAN-27 round 5 (Codex round-2 review of PR #305, finding 2): a
+        // CRC-valid noise decode can still produce a `NonStdCall` exact
+        // field that passed `is_plausible` (which only requires
+        // alphanumeric-plus-digit-plus-letter — much looser than a real
+        // callsign shape) but is actually free-text-shaped garbage (e.g.
+        // `"ABC1D"` — the same shape `looks_like_compound_callsign` in
+        // message.rs rejects on the encode side, finding 1's fix). Without
+        // this extra check, seeding it into `all_learned`/the hash table
+        // means a LATER real type-4 frame that happens to share its 12-bit
+        // hash renders as this bogus identity instead of resolving
+        // correctly. Apply the encoder's own (stricter) callsign-shape
+        // classifier here too, rather than trusting `is_plausible`'s looser
+        // gate a second time.
+        for msg in &all_decoded_messages {
+            if msg.message.message_type != MessageType::NonStdCall {
+                continue;
+            }
+            for call in [
+                msg.message.to_callsign.as_deref(),
+                msg.message.from_callsign.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if call != "CQ"
+                    && !call.starts_with('<')
+                    && crate::message::looks_like_compound_callsign(call)
+                {
                     self.message_parser.add_callsign(call);
                 }
             }
@@ -15234,6 +15284,146 @@ mod tests {
             Some("<K1DEF>"),
             "K1DEF must resolve via the hash table seeded from step 1's \
              standard decode, not render as the unrecoverable <...> placeholder"
+        );
+    }
+
+    /// PAN-27 finding 4 (round 4 review): the seeding loop was restricted
+    /// to `MessageType::Standard` decodes, discarding trustworthy plaintext
+    /// already carried in a type-4 (`NonStdCall`) frame's exact 58-bit
+    /// field. Decoding "CQ YS/WE9G" reveals the full compound callsign in
+    /// plaintext; a LATER type-4 exchange between two DIFFERENT compound
+    /// stations that places "YS/WE9G" in the hashed slot must resolve it,
+    /// not render the unrecoverable `<...>` placeholder.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn decoder_seeds_hash_table_from_nonstdcall_exact_field_too() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let cfg = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(cfg).expect("decoder");
+        // Deliberately do NOT call seed_hash_callsign at all -- the fix
+        // must work purely from decoding YS/WE9G's own type-4 CQ.
+
+        // Step 1: decode a type-4 CQ from the compound-callsign operator
+        // YS/WE9G. Their full callsign lands in the exact 58-bit field.
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ YS/WE9G", None)
+            .expect("encode compound CQ");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        let decoded = decoder.decode_window(&tx).expect("decode compound CQ");
+        assert!(
+            decoded
+                .iter()
+                .any(|d| d.message.from_callsign.as_deref() == Some("YS/WE9G")),
+            "must decode YS/WE9G's type-4 CQ"
+        );
+
+        // Step 2: two OTHER compound stations work each other; the message
+        // exchange puts PJ4/KA1ABC in the exact slot (it wins the
+        // deterministic tiebreak) and hashes YS/WE9G into the 12-bit slot.
+        let symbols2 = encoder
+            .encode_message("PJ4/KA1ABC YS/WE9G RR73", None)
+            .expect("encode second compound exchange");
+        let mut tx2 = modulator
+            .modulate_symbols(&symbols2, 900.0)
+            .expect("modulate");
+        tx2.resize(WINDOW_SAMPLES, 0.0);
+        let decoded2 = decoder
+            .decode_window(&tx2)
+            .expect("decode second compound exchange");
+
+        let hit = decoded2
+            .iter()
+            .find(|d| d.message.to_callsign.as_deref() == Some("PJ4/KA1ABC"))
+            .expect("must decode the second compound exchange");
+        assert_eq!(
+            hit.message.from_callsign.as_deref(),
+            Some("<YS/WE9G>"),
+            "YS/WE9G must resolve via the hash table seeded from step 1's \
+             type-4 CQ exact field, not render as <...>"
+        );
+    }
+
+    /// Codex round-2 review of PR #305, finding 2: a CRC-valid noise decode
+    /// can produce a `NonStdCall` exact field that passes `is_plausible`
+    /// (`looks_like_nonstandard_callsign` only requires alphanumeric plus
+    /// at least one digit and one letter -- much looser than a real
+    /// callsign shape) but is actually free-text-shaped garbage, e.g.
+    /// "ABC1D" (the same shape the encoder's `looks_like_compound_callsign`
+    /// rejects -- finding 1's fix, and PAN-27 round 4's original finding).
+    /// The hash-seeding loop added for PAN-27 finding 4 (see the test
+    /// above) must NOT unconditionally learn such a field into the hash
+    /// table, or a LATER, unrelated frame that happens to share its 12-bit
+    /// hash renders as this bogus identity instead of staying correctly
+    /// unresolved.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn decoder_hash_seeding_rejects_free_text_shaped_nonstdcall_exact_field() {
+        use crate::message::{hash12, pack58};
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let cfg = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(cfg).expect("decoder");
+        let encoder = Ft8Encoder::new();
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+
+        // Step 1: decode a bogus type-4 CQ whose exact 58-bit field is
+        // "ABC1D" -- not a real callsign, just free-text-shaped garbage
+        // that a CRC-14 false positive could land on. Built directly with
+        // `pack_nonstandard` + `pack58` (bypassing `try_encode_nonstandard`,
+        // which would refuse to encode "CQ ABC1D" at all thanks to PAN-27
+        // round 4's `looks_like_callsign` fix) to simulate exactly that
+        // noise-decode scenario.
+        let n58 = pack58("ABC1D").expect("fits the 58-bit hash-callsign field");
+        let payload = crate::encoder::pack_nonstandard(0, n58, 0, 0, 1); // icq CQ shape
+        let symbols = encoder
+            .payload_to_symbols(&payload)
+            .expect("payload to symbols");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        let decoded = decoder.decode_window(&tx).expect("decode bogus type-4 CQ");
+        assert!(
+            decoded
+                .iter()
+                .any(|d| d.message.from_callsign.as_deref() == Some("ABC1D")),
+            "must decode the bogus type-4 CQ's exact field as plain text 'ABC1D'"
+        );
+
+        // Step 2: a later type-4 exchange hashes "ABC1D" into the 12-bit
+        // slot (constructed directly with the same n12 = hash12("ABC1D"),
+        // reproducing the collision deterministically rather than needing
+        // a real second callsign that happens to share the bucket). If
+        // step 1 wrongly seeded "ABC1D" into the hash table, this resolves
+        // as "<ABC1D>"; with the fix it must stay unresolved ("<...>").
+        let n12 = hash12("ABC1D") & 0xFFF;
+        let n58_2 = pack58("PJ4/KA1ABC").expect("fits");
+        let payload2 = crate::encoder::pack_nonstandard(n12, n58_2, 1, 2, 0); // RR73
+        let symbols2 = encoder
+            .payload_to_symbols(&payload2)
+            .expect("payload to symbols");
+        let mut tx2 = modulator
+            .modulate_symbols(&symbols2, 900.0)
+            .expect("modulate");
+        tx2.resize(WINDOW_SAMPLES, 0.0);
+        let decoded2 = decoder.decode_window(&tx2).expect("decode second exchange");
+
+        let hit = decoded2
+            .iter()
+            .find(|d| d.message.to_callsign.as_deref() == Some("PJ4/KA1ABC"))
+            .expect("must decode the second exchange");
+        assert_eq!(
+            hit.message.from_callsign.as_deref(),
+            Some("<...>"),
+            "the free-text-shaped exact field 'ABC1D' must NOT have been \
+             seeded into the hash table -- it must remain unresolved, not \
+             wrongly render as <ABC1D>"
         );
     }
 
