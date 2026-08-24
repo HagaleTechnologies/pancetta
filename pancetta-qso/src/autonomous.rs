@@ -1122,7 +1122,19 @@ impl AutonomousOperator {
     /// been invalidated (e.g. a Hold/Auto transition or band hop, neither
     /// of which touches the streak), permanently under-counting a
     /// suppressed attempt's contribution in that case.
+    ///
+    /// PAN-38 round 5 (Codex): `offset_generation` is only advanced by
+    /// `refresh_tx_freq_offset_invalidation` -- which normally runs once
+    /// per `decide_at` poll. If the operator changes the TX-frequency
+    /// mode (or held offset) AFTER a snapshot was taken and a downstream
+    /// failure arrives BEFORE the next poll, `offset_generation` hasn't
+    /// caught up with the live `tx_freq_mode_generation` atomic yet, so
+    /// the check below would wrongly still match and restore a now-stale
+    /// offset/config/collision-detector state. Refresh first so this
+    /// restore is always evaluated against the CURRENT live state, not
+    /// whatever this operator last happened to poll.
     pub fn restore_cq_state(&mut self) {
+        self.refresh_tx_freq_offset_invalidation();
         let Some(snapshot) = self.last_cq_snapshot.take() else {
             return;
         };
@@ -1200,6 +1212,11 @@ impl AutonomousOperator {
     /// - A failure stale by MORE than one generation (evicted from both
     ///   slots) is unchanged from before this round: logged, not corrected.
     pub fn restore_cq_state_for_attempt(&mut self, attempt_id: u64) {
+        // PAN-38 round 5: refresh unconditionally, before either branch --
+        // see `restore_cq_state`'s doc comment for why a stale internal
+        // generation (relative to the LIVE tx_freq_mode_generation atomic)
+        // is unsafe to evaluate a restore against.
+        self.refresh_tx_freq_offset_invalidation();
         if self
             .last_cq_snapshot
             .is_some_and(|s| s.attempt_id == attempt_id)
@@ -2317,6 +2334,24 @@ impl AutonomousOperator {
                                 streak_generation: self.streak_generation,
                             });
 
+                            // PAN-38 round 5 (Codex): refresh HERE, before
+                            // `should_switch` is decided, not only later
+                            // right before `current_cq_offset_hz` is
+                            // consumed (round 4) -- the round-4 refresh
+                            // alone left `should_switch` computed from a
+                            // stale `tx_freq_auto()` read: an Auto->Hold
+                            // transition landing between this decision and
+                            // that later refresh would correctly clear the
+                            // sticky offset, but the STALE `should_switch
+                            // == true` would still enter the switch branch
+                            // below and dispatch an autonomously-selected
+                            // frequency despite Hold mode. One refresh
+                            // covers both this decision and the later
+                            // consumption -- see
+                            // `refresh_tx_freq_offset_invalidation`'s own
+                            // doc comment.
+                            self.refresh_tx_freq_offset_invalidation();
+
                             let should_switch = self.tx_freq_auto()
                                 && self.cq_no_response_streak
                                     >= self.config.cq_no_response_switch_after;
@@ -2358,17 +2393,26 @@ impl AutonomousOperator {
                             // frequency we just switched away from (nothing in
                             // the ranking inputs distinguishes "avoided because we
                             // chose to leave it" from "still the best spot").
-                            // PAN-38 round 4 (Codex): revalidate immediately
-                            // before `current_cq_offset_hz` is actually
-                            // consumed below (both the switch branch's
-                            // "avoid" value and the routine branch's reused
-                            // sticky offset) -- several hundred lines have
-                            // passed since the top-of-decide_at check, wide
-                            // enough that a concurrent Hold->Auto round trip
-                            // could complete in between and go unnoticed by
-                            // that earlier check alone.
-                            self.refresh_tx_freq_offset_invalidation();
-
+                            //
+                            // PAN-38 round 4 (Codex) originally revalidated
+                            // AGAIN here, right before `current_cq_offset_hz`
+                            // is consumed below. Round 5 (Codex) found that
+                            // refreshing the offset in a SECOND, separate call
+                            // without also recomputing `should_switch` just
+                            // moved the inconsistency window rather than
+                            // closing it: a mode flip landing between the two
+                            // calls would correctly re-clear the offset here
+                            // but leave `should_switch` (computed from the
+                            // FIRST, now-stale read, above) pointed at the old
+                            // decision -- still entering the switch branch
+                            // despite Hold mode. A single refresh, immediately
+                            // followed by deriving BOTH `should_switch` and
+                            // the offset consumption from that one consistent
+                            // read (moved up before `should_switch`'s
+                            // computation), is what actually closes this --
+                            // repeating the refresh without also re-deriving
+                            // every decision that depends on it doesn't
+                            // converge.
                             let cq_freq = if should_switch {
                                 let avoid = self
                                     .current_cq_offset_hz

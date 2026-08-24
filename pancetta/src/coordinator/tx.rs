@@ -4026,6 +4026,46 @@ impl super::ApplicationCoordinator {
                                                         // same reason -- otherwise the retry pairs
                                                         // the superseding frame's text with the
                                                         // ABORTED frame's qso_id.
+                                                        // PAN-38 round 5 (Codex): the ABANDONED
+                                                        // frame (in_flight_items[0], captured
+                                                        // before this supersede) never gets a
+                                                        // TransmitComplete -- only the eventual
+                                                        // replacement's new_qso_id is ever
+                                                        // reported. If the abandoned frame was a
+                                                        // tracked self-CQ, its pending_self_cq_qsos
+                                                        // entry deterministically leaks and its
+                                                        // untransmitted attempt is never rolled
+                                                        // back. Report it now, before the qso_id
+                                                        // local is overwritten below.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            let complete_msg =
+                                                                ComponentMessage::new(
+                                                                    ComponentId::Ft8Transmitter,
+                                                                    ComponentId::Autonomous,
+                                                                    MessageType::TransmitComplete {
+                                                                        success: false,
+                                                                        message_text: abandoned
+                                                                            .message_text
+                                                                            .clone(),
+                                                                        duration_ms: 0,
+                                                                        qso_id: abandoned
+                                                                            .qso_id
+                                                                            .clone(),
+                                                                    },
+                                                                    Instant::now(),
+                                                                );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(complete_msg)
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send TransmitComplete: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         origin = new_origin;
                                                         qso_id = new_qso_id;
                                                         rekey_schedule = Some(schedule);
@@ -4084,8 +4124,50 @@ impl super::ApplicationCoordinator {
                                                         }
                                                         // Frequency collision: single-item replace
                                                         // of the NEW item only, so gate with the new
-                                                        // request's own origin (C1 fix).
+                                                        // request's own origin (C1 fix). PAN-38
+                                                        // round 5 (Codex): carry its qso_id too --
+                                                        // `items.last()` is always the new request
+                                                        // (per this variant's doc comment), and the
+                                                        // working `message_text`/`frequency_offset`
+                                                        // were already mutated to it by
+                                                        // `supersede_and_rekey_or_bundle` -- without
+                                                        // this, the retry paired the new item's text
+                                                        // with the ABORTED frame's qso_id, same
+                                                        // failure shape as the `Replace` arm's fix.
+                                                        // PAN-38 round 5: report the abandoned
+                                                        // in-flight frame's TransmitComplete before
+                                                        // overwriting qso_id -- same reasoning as
+                                                        // the Replace arm's fix.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            let complete_msg =
+                                                                ComponentMessage::new(
+                                                                    ComponentId::Ft8Transmitter,
+                                                                    ComponentId::Autonomous,
+                                                                    MessageType::TransmitComplete {
+                                                                        success: false,
+                                                                        message_text: abandoned
+                                                                            .message_text
+                                                                            .clone(),
+                                                                        duration_ms: 0,
+                                                                        qso_id: abandoned
+                                                                            .qso_id
+                                                                            .clone(),
+                                                                    },
+                                                                    Instant::now(),
+                                                                );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(complete_msg)
+                                                                .await
+                                                            {
+                                                                warn!("Failed to send TransmitComplete: {}", e);
+                                                            }
+                                                        }
                                                         origin = new_origin;
+                                                        qso_id = items
+                                                            .last()
+                                                            .and_then(|item| item.qso_id.clone());
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -4207,6 +4289,46 @@ impl super::ApplicationCoordinator {
                                                         // request's origin so the retry's Step 4b-arm
                                                         // gates the frame actually transmitting (C1).
                                                         // PAN-38 round 4: re-point `qso_id` too.
+                                                        // PAN-38 round 5 (Codex): the ABANDONED
+                                                        // frame (in_flight_items[0], captured
+                                                        // before this supersede) never gets a
+                                                        // TransmitComplete -- only the eventual
+                                                        // replacement's new_qso_id is ever
+                                                        // reported. If the abandoned frame was a
+                                                        // tracked self-CQ, its pending_self_cq_qsos
+                                                        // entry deterministically leaks and its
+                                                        // untransmitted attempt is never rolled
+                                                        // back. Report it now, before the qso_id
+                                                        // local is overwritten below.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            let complete_msg =
+                                                                ComponentMessage::new(
+                                                                    ComponentId::Ft8Transmitter,
+                                                                    ComponentId::Autonomous,
+                                                                    MessageType::TransmitComplete {
+                                                                        success: false,
+                                                                        message_text: abandoned
+                                                                            .message_text
+                                                                            .clone(),
+                                                                        duration_ms: 0,
+                                                                        qso_id: abandoned
+                                                                            .qso_id
+                                                                            .clone(),
+                                                                    },
+                                                                    Instant::now(),
+                                                                );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(complete_msg)
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send TransmitComplete: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         origin = new_origin;
                                                         qso_id = new_qso_id;
                                                         rekey_schedule = Some(schedule);
@@ -4255,7 +4377,44 @@ impl super::ApplicationCoordinator {
                                                         }
                                                         // Frequency collision: single-item replace
                                                         // of the new item — gate with its own origin.
+                                                        // PAN-38 round 5: carry its qso_id too, same
+                                                        // reasoning as the other Bundle fallback arm.
+                                                        // Also report the abandoned in-flight
+                                                        // frame's TransmitComplete before
+                                                        // overwriting qso_id.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            let complete_msg =
+                                                                ComponentMessage::new(
+                                                                    ComponentId::Ft8Transmitter,
+                                                                    ComponentId::Autonomous,
+                                                                    MessageType::TransmitComplete {
+                                                                        success: false,
+                                                                        message_text: abandoned
+                                                                            .message_text
+                                                                            .clone(),
+                                                                        duration_ms: 0,
+                                                                        qso_id: abandoned
+                                                                            .qso_id
+                                                                            .clone(),
+                                                                    },
+                                                                    Instant::now(),
+                                                                );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(complete_msg)
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send TransmitComplete: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         origin = new_origin;
+                                                        qso_id = items
+                                                            .last()
+                                                            .and_then(|item| item.qso_id.clone());
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx

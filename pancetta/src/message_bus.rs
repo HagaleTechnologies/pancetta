@@ -1179,7 +1179,30 @@ impl MessageBus {
     }
 
     /// Send a message to a specific component
-    pub async fn send_message(&self, mut message: ComponentMessage) -> Result<()> {
+    pub async fn send_message(&self, message: ComponentMessage) -> Result<()> {
+        self.send_message_checked(message).await?;
+        Ok(())
+    }
+
+    /// Same delivery attempt as [`Self::send_message`], but the `bool`
+    /// distinguishes an actually-enqueued message (`true`) from every drop
+    /// reason `send_message` only logs and swallows into `Ok(())`
+    /// (`false`: expired, a full channel, a disconnected receiver, or no
+    /// registered channel for the destination).
+    ///
+    /// PAN-38 round 5 (Codex): `send_message`'s `Result<()>` is NEVER
+    /// actually `Err` for a delivery failure — `TrySendError::Full` (the
+    /// bounded-queue-drop case) is caught, logged, and mapped to `Ok(())`
+    /// just like every other drop reason. A caller checking `if let
+    /// Err(e) = ...` for "did this reach the destination" (e.g. the
+    /// autonomous self-CQ dispatch, which needs to roll back its
+    /// speculative streak/offset mutation if `StartAutonomousQso` never
+    /// reaches the QSO task) can never observe a drop through that API —
+    /// it always sees success. Callers that only want best-effort,
+    /// fire-and-forget delivery (the overwhelming majority of call sites)
+    /// should keep using `send_message`; this method is for the rarer
+    /// caller that needs to know.
+    pub async fn send_message_checked(&self, mut message: ComponentMessage) -> Result<bool> {
         // Check message expiration
         if message.is_expired(self.config.message_timeout_us) {
             self.expired_messages.fetch_add(1, Ordering::Relaxed);
@@ -1189,7 +1212,7 @@ impl MessageBus {
                 message.destination,
                 message.age_us()
             );
-            return Ok(());
+            return Ok(false);
         }
 
         // Mark message as sent
@@ -1222,16 +1245,19 @@ impl MessageBus {
                             transit
                         );
                     }
+                    Ok(true)
                 }
                 Err(crossbeam_channel::TrySendError::Full(_)) => {
                     channel.error_count.fetch_add(1, Ordering::Relaxed);
                     self.dropped_messages.fetch_add(1, Ordering::Relaxed);
                     warn!("Channel full, dropping message from {} to {}", src, dst);
+                    Ok(false)
                 }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                     channel.error_count.fetch_add(1, Ordering::Relaxed);
                     self.dropped_messages.fetch_add(1, Ordering::Relaxed);
                     error!("Channel disconnected for component: {}", dst);
+                    Ok(false)
                 }
             }
         } else {
@@ -1240,9 +1266,8 @@ impl MessageBus {
                 message.destination
             );
             self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+            Ok(false)
         }
-
-        Ok(())
     }
 
     /// Get health status for all components

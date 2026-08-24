@@ -1724,6 +1724,7 @@ impl super::ApplicationCoordinator {
                             // emits the opening TX + StateChanged). Sent INSTEAD
                             // OF a raw TransmitRequest — no double-send.
                             for start in plan.qso_starts {
+                                let cq_attempt_id = start.cq_attempt_id;
                                 let msg = ComponentMessage::new(
                                     ComponentId::Autonomous,
                                     ComponentId::Qso,
@@ -1737,8 +1738,34 @@ impl super::ApplicationCoordinator {
                                     ),
                                     Instant::now(),
                                 );
-                                if let Err(e) = message_bus.send_message(msg).await {
-                                    warn!("Failed to send StartAutonomousQso: {}", e);
+                                // PAN-38 round 5 (Codex): `send_message` swallows a
+                                // dropped (bounded-queue-full) delivery into
+                                // `Ok(())`, indistinguishable from success -- the
+                                // `if let Err` check below can therefore never
+                                // detect a drop. `send_message_checked` surfaces
+                                // it, so a genuine self-CQ (cq_attempt_id: Some)
+                                // that never reached the QSO task rolls back its
+                                // speculative streak/offset mutation exactly like
+                                // a downstream dispatch failure does, instead of
+                                // leaving it permanently uncorrected.
+                                match message_bus.send_message_checked(msg).await {
+                                    Ok(true) => {}
+                                    Ok(false) => {
+                                        warn!(
+                                            "StartAutonomousQso dropped (channel full or \
+                                             disconnected)"
+                                        );
+                                        if let Some(attempt_id) = cq_attempt_id {
+                                            let mut op = operator.lock().await;
+                                            op.restore_cq_state_for_attempt(attempt_id);
+                                            drop(op);
+                                            pending_self_cq_qsos
+                                                .retain(|_, id| *id != attempt_id);
+                                        }
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to send StartAutonomousQso: {}", e);
+                                    }
                                 }
                             }
 
