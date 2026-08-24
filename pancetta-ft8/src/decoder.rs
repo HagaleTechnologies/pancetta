@@ -3320,8 +3320,34 @@ impl Ft8Decoder {
             } else {
                 auto_passband_range.as_ref()
             };
-            let mut sync_candidates =
-                self.costas_sync_search_partner(&spectrogram, effective_scope, partner_freq_hz)?;
+            // Codex round-1 finding on PR #306 (PAN-31 follow-up): defer
+            // this call's own native-only NMS pass exactly when the
+            // pass-0 seed-union block below (`ft8lib_sync_seeds_enabled
+            // && pass == 0 && current_budget.has_time() &&
+            // !is_ft2()`) is ALSO about to run — that block's
+            // `finalize_native_and_seed_candidate_union` call is then the
+            // ONE NMS pass, over the complete native+seed union, instead
+            // of an early native-only pass that could permanently
+            // discard a candidate a later seed would have spared. This
+            // guard MUST mirror the seed-union block's guard exactly
+            // (see the `if self.config.ft8lib_sync_seeds_enabled &&
+            // pass == 0 ...` block below): if the two ever diverge, a
+            // deferred NMS pass could end up with no union pass to
+            // subsume it, leaving native candidates entirely
+            // unsuppressed. When the flag is off (production today),
+            // `defer_nms` is always `false` and behavior is
+            // byte-identical to before this fix.
+            let defer_nms = self.config.ft8lib_sync_seeds_enabled
+                && pass == 0
+                && self.current_budget.has_time()
+                && !self.protocol_params.protocol.is_ft2();
+            let mut sync_candidates = self.costas_sync_search_with_threshold_and_partner(
+                &spectrogram,
+                self.config.min_sync_score,
+                effective_scope,
+                partner_freq_hz,
+                defer_nms,
+            )?;
 
             // hb-228: 3-method spectral sweep. On the initial pass, also run the
             // Costas sync search over sqrt- and linear-compressed spectrograms
@@ -5953,6 +5979,7 @@ impl Ft8Decoder {
             self.config.min_sync_score,
             freq_bin_scope,
             None,
+            false,
         )
     }
 
@@ -5972,6 +5999,7 @@ impl Ft8Decoder {
             self.config.min_sync_score,
             freq_bin_scope,
             partner_freq_hz,
+            false,
         )
     }
 
@@ -5994,6 +6022,7 @@ impl Ft8Decoder {
             min_score,
             freq_bin_scope,
             None,
+            false,
         )
     }
 
@@ -6014,12 +6043,29 @@ impl Ft8Decoder {
     /// When `partner_freq_hz = None` OR the config radius is `None` the
     /// relaxed branch never fires and behaviour is byte-identical to
     /// `costas_sync_search_with_threshold`.
+    ///
+    /// `defer_nms`: when `true`, this call's own (native-only) NMS pass
+    /// below is skipped — the caller is responsible for running NMS
+    /// itself once a fuller candidate set (e.g. the native+ft8_lib-seed
+    /// union) is available. Every wrapper below passes `false`, so
+    /// existing callers are byte-identical; only the pass-0 seed-union
+    /// call site in `decode_window_with_ap_scoped_partner_impl` passes
+    /// `true`, and only when it has already verified
+    /// `finalize_native_and_seed_candidate_union` will run afterward
+    /// (see that call site for the exact guard). See the Codex
+    /// round-1 finding on PR #306 (PAN-31 follow-up): running NMS here
+    /// AND again in `finalize_native_and_seed_candidate_union` cannot
+    /// produce true union-wide suppression, because a native candidate
+    /// already discarded here (by a nearby native dominator) can never
+    /// be reconsidered even if a stronger seed later suppresses that
+    /// dominator instead.
     fn costas_sync_search_with_threshold_and_partner(
         &self,
         spectrogram: &Spectrogram,
         min_score: f64,
         freq_bin_scope: Option<&RangeInclusive<usize>>,
         partner_freq_hz: Option<f64>,
+        defer_nms: bool,
     ) -> Ft8Result<Vec<CostasCandidate>> {
         let mut candidates = Vec::new();
         let pp = &self.protocol_params;
@@ -6284,8 +6330,11 @@ impl Ft8Decoder {
         candidates.truncate(self.config.max_sync_candidates);
 
         // Non-maximum suppression: remove weaker candidates near stronger ones.
-        // Gated by config so hb-019-style audits can disable it.
-        if self.config.nms_enabled {
+        // Gated by config so hb-019-style audits can disable it. Also
+        // skipped when `defer_nms` is set — see this fn's doc comment and
+        // the pass-0 seed-union call site, which runs the ONE correct
+        // union-wide NMS pass itself afterward instead.
+        if self.config.nms_enabled && !defer_nms {
             self.nms_candidates(&mut candidates);
         }
 
@@ -7417,6 +7466,7 @@ impl Ft8Decoder {
             residual_min,
             freq_bin_scope,
             partner_freq_hz,
+            false,
         ) else {
             return Vec::new();
         };
@@ -16744,14 +16794,14 @@ mod tests {
         assert!(!config_off.per_bin_candidate_selection);
         let decoder_off = Ft8Decoder::new(config_off.clone()).unwrap();
         let baseline = decoder_off
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("baseline sync search");
 
         let mut config_explicit_off = config_off.clone();
         config_explicit_off.per_bin_candidate_selection = false;
         let decoder_explicit_off = Ft8Decoder::new(config_explicit_off).unwrap();
         let explicit_off = decoder_explicit_off
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("explicit-off sync search");
 
         assert_eq!(
@@ -16770,7 +16820,7 @@ mod tests {
         config_on.per_bin_candidate_selection = true;
         let decoder_on = Ft8Decoder::new(config_on).unwrap();
         let with_selection = decoder_on
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("flag-on sync search");
 
         assert!(
@@ -18049,7 +18099,7 @@ mod hb230_relaxed_sync_tests {
         let spec = build_synthetic_costas(&[0, 1, 2], -10.0, -40.0, f0);
 
         let without_partner = decoder
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("sync search no partner");
         let with_partner_default_off = decoder
             .costas_sync_search_with_threshold_and_partner(
@@ -18057,6 +18107,7 @@ mod hb230_relaxed_sync_tests {
                 MIN_SYNC_SCORE,
                 None,
                 Some(1500.0),
+                false,
             )
             .expect("sync search partner provided but feature off");
 
@@ -18095,7 +18146,7 @@ mod hb230_relaxed_sync_tests {
         let decoder = Ft8Decoder::new(config).unwrap();
 
         let baseline = decoder
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("baseline");
         let with_partner = decoder
             .costas_sync_search_with_threshold_and_partner(
@@ -18103,6 +18154,7 @@ mod hb230_relaxed_sync_tests {
                 MIN_SYNC_SCORE,
                 None,
                 Some(partner_hz),
+                false,
             )
             .expect("partner");
 
@@ -18163,6 +18215,7 @@ mod hb230_relaxed_sync_tests {
                 MIN_SYNC_SCORE,
                 None,
                 Some(partner_hz),
+                false,
             )
             .expect("partner");
 
@@ -18190,10 +18243,10 @@ mod hb230_relaxed_sync_tests {
         let decoder = Ft8Decoder::new(config).unwrap();
 
         let baseline = decoder
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("baseline");
         let same_baseline = decoder
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("repeat");
         assert_eq!(baseline.len(), same_baseline.len());
     }
@@ -21542,10 +21595,10 @@ mod auto_passband_tests {
         let decoder_off = Ft8Decoder::new(cfg_off).unwrap();
 
         let r_default = decoder_default
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("default sync search");
         let r_off = decoder_off
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("explicit-off sync search");
 
         assert_eq!(
@@ -24595,6 +24648,123 @@ mod pan7_ft8lib_sync_seed_tests {
             "the surviving candidate must be the stronger native one"
         );
         assert_eq!(candidates_on[0].sync_score, native.sync_score);
+    }
+
+    /// Codex round-1 finding on PR #306 (PAN-31 follow-up): PAN-31's fix
+    /// (above) re-runs NMS over the native+seed union in
+    /// `finalize_native_and_seed_candidate_union`, but
+    /// `costas_sync_search_with_threshold_and_partner` had ALREADY run its
+    /// own native-only NMS pass earlier, before any seed was known. That
+    /// earlier pass can permanently discard a native candidate that a
+    /// TRUE union-wide NMS pass would have kept.
+    ///
+    /// Concrete failure geometry (mirrors the finding): a strong native
+    /// candidate A suppresses a weaker native neighbor B during the EARLY
+    /// native-only pass. A stronger seed S later suppresses A during the
+    /// union pass — but S's own suppression radius does not reach B, so
+    /// the correct union-wide answer keeps B as a distinct signal. The
+    /// old two-pass approach (early native-only NMS, then a second NMS
+    /// over survivors+seeds) loses B forever: once discarded early, B
+    /// never gets a second chance.
+    ///
+    /// Exercised the same way as `pan31_seed_within_nms_radius_of_stronger_\
+    /// candidate_is_suppressed` above — directly driving `nms_candidates`
+    /// (standing in for the early native-only pass) and
+    /// `finalize_native_and_seed_candidate_union` (the union pass) with a
+    /// synthetic native+seed set, rather than a full audio decode (per
+    /// that test's own comment, real audio essentially never produces a
+    /// seed at a distinct-but-nearby key, so this geometry is not
+    /// reproducible end-to-end).
+    ///
+    /// Default NMS radii (`nms_time_radius = 8`, `nms_freq_radius = 2`,
+    /// `nms_score_delta_db = 0.0`) apply throughout, all at the same
+    /// `time_step` so only frequency-bin distance matters:
+    ///   - A: freq_bin 50, score 5.0 (native, strong)
+    ///   - B: freq_bin 52, score 4.0 (native, weak — |52-50|=2, within A's
+    ///     radius, so the early native-only pass suppresses it)
+    ///   - S: freq_bin 48, score 6.0 (seed — |48-50|=2, within A's radius,
+    ///     so it suppresses A; |48-52|=4, OUTSIDE B's radius, so it does
+    ///     NOT reach B even if B were still present)
+    #[test]
+    fn codex_round1_deferred_union_nms_saves_neighbor_that_early_native_only_nms_would_lose() {
+        let a = CostasCandidate {
+            time_step: 100,
+            freq_bin: 50,
+            freq_sub: 0,
+            sync_score: 5.0,
+            time_refinement: 0.0,
+        };
+        let b = CostasCandidate {
+            time_step: 100,
+            freq_bin: 52,
+            freq_sub: 0,
+            sync_score: 4.0,
+            time_refinement: 0.0,
+        };
+        let s = CostasCandidate {
+            time_step: 100,
+            freq_bin: 48,
+            freq_sub: 0,
+            sync_score: 6.0,
+            time_refinement: 0.0,
+        };
+
+        let dec = Ft8Decoder::new(Ft8Config {
+            nms_enabled: true,
+            max_sync_candidates: 10,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+
+        // Old (buggy) two-pass behavior: run NMS early over the
+        // native-only set [A, B] — exactly what
+        // `costas_sync_search_with_threshold_and_partner` did
+        // unconditionally before this fix — THEN append the seed and run
+        // the union pass. B is lost during the early pass and can never
+        // come back, even though S (which suppresses A) doesn't reach it.
+        let mut native_only = vec![a, b];
+        dec.nms_candidates(&mut native_only);
+        assert_eq!(
+            native_only.len(),
+            1,
+            "sanity: the early native-only pass must suppress B (within A's radius)"
+        );
+        assert_eq!(native_only[0].freq_bin, a.freq_bin);
+
+        let mut old_pipeline_union = native_only;
+        old_pipeline_union.push(s);
+        dec.finalize_native_and_seed_candidate_union(&mut old_pipeline_union);
+        let old_bins: std::collections::HashSet<usize> =
+            old_pipeline_union.iter().map(|c| c.freq_bin).collect();
+        assert_eq!(
+            old_bins,
+            std::collections::HashSet::from([s.freq_bin]),
+            "bug reproduction: the old two-pass approach loses B permanently — \
+             only the seed survives, even though a true union-wide NMS pass \
+             would have kept B"
+        );
+
+        // Fixed (deferred) behavior: the early native-only NMS pass is
+        // skipped entirely (this fix's `defer_nms` gate) — natives reach
+        // the union un-suppressed — and `finalize_native_and_seed_candidate_\
+        // union` runs the ONE correct NMS pass over the complete
+        // native+seed union [A, B, S].
+        let mut deferred_union = vec![a, b, s];
+        dec.finalize_native_and_seed_candidate_union(&mut deferred_union);
+        let new_bins: std::collections::HashSet<usize> =
+            deferred_union.iter().map(|c| c.freq_bin).collect();
+        assert_eq!(
+            new_bins,
+            std::collections::HashSet::from([s.freq_bin, b.freq_bin]),
+            "fix: with a single deferred union-wide NMS pass, S suppresses A \
+             (within radius) but B survives — it is outside S's own \
+             suppression radius and A was never given the chance to \
+             suppress it early"
+        );
+        assert!(
+            !new_bins.contains(&a.freq_bin),
+            "A must still be suppressed by the stronger seed S"
+        );
     }
 
     /// PAN-32: FT2 has no `ftx_protocol_t` counterpart, so every seed the
