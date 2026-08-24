@@ -937,6 +937,42 @@ async fn send_tx_queue_status(
     }
 }
 
+/// PAN-38 round 4 (Codex): report a failed `TransmitComplete` for a
+/// single-item `TransmitRequest` that's being abandoned before it was ever
+/// sent to the radio (operator F8 abort, shutdown-adjacent abandonment,
+/// etc.). A tracked self-CQ's `pending_self_cq_qsos` entry (see
+/// `coordinator/autonomous.rs`) is only ever cleared by a `TransmitComplete`
+/// or an explicit `AutonomousCqDispatchFailed` -- an abort path that
+/// silently `continue`s instead leaks that entry forever and never rolls
+/// back the speculative streak/offset mutation the attempt made. No-op for
+/// any other `MessageType` (Tune/Multi have their own completion paths).
+async fn emit_failed_transmit_complete_for_request(
+    message_bus: &MessageBus,
+    message_type: &MessageType,
+) {
+    if let MessageType::TransmitRequest {
+        message_text,
+        qso_id,
+        ..
+    } = message_type
+    {
+        let complete_msg = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Autonomous,
+            MessageType::TransmitComplete {
+                success: false,
+                message_text: message_text.clone(),
+                duration_ms: 0,
+                qso_id: qso_id.clone(),
+            },
+            Instant::now(),
+        );
+        if let Err(e) = message_bus.send_message(complete_msg).await {
+            warn!("Failed to send TransmitComplete: {}", e);
+        }
+    }
+}
+
 /// Surface a genuine TX-attempt failure (encode/modulate error, invalid
 /// frequency, etc.) as a RETAINED diagnostic so the operator can see "TX
 /// failed: <reason>" instead of a QSO silently sitting until the watchdog
@@ -2318,6 +2354,19 @@ enum SupersedeOutcome {
         /// origin and skipped the key-time arm gate entirely; the reverse —
         /// `Local` superseding `Remote` — wrongly kept gating a local frame.)
         origin: crate::message_bus::TxOrigin,
+        /// PAN-38 round 4 (Codex): the NEW superseding request's OWN
+        /// `qso_id` — `message_text`/`frequency_offset`/`schedule` are
+        /// mutated in place to the new request, but the caller's working
+        /// `qso_id` local is a SEPARATE variable this function never
+        /// touches. Without this, the caller's in-place retry paired the
+        /// superseding frame's text with the ABORTED frame's `qso_id`: a
+        /// successful re-key would clear the WRONG QSO's
+        /// `pending_self_cq_qsos` entry (if the aborted frame was a
+        /// tracked self-CQ) as though it had transmitted, while a
+        /// downstream failure would roll back the wrong attempt. The
+        /// caller must overwrite its `qso_id` local with this value
+        /// alongside `origin`.
+        qso_id: Option<String>,
     },
     /// Bundle-add is viable. The caller encodes `items` via
     /// `encode_and_modulate_multi_tx`; on success it re-enqueues a
@@ -2463,7 +2512,10 @@ async fn supersede_and_rekey_or_bundle(
         };
     }
 
-    SupersedeOutcome::Replace { origin: new_origin }
+    SupersedeOutcome::Replace {
+        origin: new_origin,
+        qso_id: new_qso_id,
+    }
 }
 
 /// Multi-TX arm's mid-TX supersede handler (Task 7 Step 4).
@@ -2480,8 +2532,9 @@ async fn supersede_and_rekey_or_bundle(
 /// - `Bundle` + encode Err (frequency collision) → re-enqueue just the new
 ///   item (the candidate bundle's last element) as a single `TransmitRequest`.
 /// - `Replace` (`max_concurrent_qsos == 1`, an edge for a bundle-in-flight) →
-///   re-enqueue the new single item; `qso_id` isn't threaded through `Replace`
-///   so it's re-enqueued as a manual (drop-stale-ungated) send.
+///   re-enqueue the new single item, carrying the new request's own `qso_id`
+///   (PAN-38 round 4: previously dropped, re-enqueued as a manual
+///   drop-stale-ungated send).
 /// - `NotViable` because the superseding message was itself a
 ///   `MultiTransmitRequest` → re-enqueue that whole incoming bundle unchanged
 ///   (it can't be folded by the single-item re-key path, but dropping a
@@ -2631,14 +2684,20 @@ async fn supersede_multi_reenqueue(
                 );
             }
         }
-        SupersedeOutcome::Replace { origin: new_origin } => {
+        SupersedeOutcome::Replace {
+            origin: new_origin,
+            qso_id: new_qso_id,
+        } => {
             let reenqueue = ComponentMessage::new(
                 ComponentId::Ft8Transmitter,
                 ComponentId::Ft8Transmitter,
                 MessageType::TransmitRequest {
                     message_text: scratch_text,
                     frequency_offset: scratch_freq,
-                    qso_id: None,
+                    // PAN-38 round 4 (Codex): now threaded through
+                    // `SupersedeOutcome::Replace` instead of always `None`
+                    // ("manual (drop-stale-ungated) send").
+                    qso_id: new_qso_id,
                     tx_parity: None,
                     // The re-enqueued replace carries the NEW request's origin so
                     // the pickup-time gate re-evaluates against IT, not the
@@ -2927,6 +2986,11 @@ impl super::ApplicationCoordinator {
                                     }
                                     info!("TX aborted during collection window by operator (F8)");
                                     send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                    emit_failed_transmit_complete_for_request(
+                                        &message_bus,
+                                        &message.message_type,
+                                    )
+                                    .await;
                                     continue;
                                 }
 
@@ -2986,6 +3050,11 @@ impl super::ApplicationCoordinator {
                                         "TX aborted during collection window extension by operator (F8)"
                                     );
                                     send_tx_queue_status(&message_bus, None, Vec::new()).await;
+                                    emit_failed_transmit_complete_for_request(
+                                        &message_bus,
+                                        &message.message_type,
+                                    )
+                                    .await;
                                     continue;
                                 }
 
@@ -3029,7 +3098,11 @@ impl super::ApplicationCoordinator {
                                 MessageType::TransmitRequest {
                                     mut message_text,
                                     mut frequency_offset,
-                                    qso_id,
+                                    // `mut`: a mid-TX supersede on the `Replace` path re-keys
+                                    // in place and reassigns this to the SUPERSEDING
+                                    // request's OWN qso_id too (PAN-38 round 4), same
+                                    // reasoning as `origin` below.
+                                    mut qso_id,
                                     tx_parity,
                                     // `mut`: a mid-TX supersede on the `Replace` path re-keys
                                     // in place and reassigns this to the SUPERSEDING request's
@@ -3087,6 +3160,7 @@ impl super::ApplicationCoordinator {
                                                 success: false,
                                                 message_text,
                                                 duration_ms: 0,
+                                                qso_id: qso_id.clone(),
                                             },
                                             Instant::now(),
                                         );
@@ -3132,6 +3206,7 @@ impl super::ApplicationCoordinator {
                                                 success: false,
                                                 message_text,
                                                 duration_ms: 0,
+                                                qso_id: qso_id.clone(),
                                             },
                                             Instant::now(),
                                         );
@@ -3204,6 +3279,7 @@ impl super::ApplicationCoordinator {
                                                 success: false,
                                                 message_text,
                                                 duration_ms: 0,
+                                                qso_id: qso_id.clone(),
                                             },
                                             Instant::now(),
                                         );
@@ -3277,6 +3353,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text,
                                                     duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -3333,6 +3410,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text,
                                                         duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -3424,6 +3502,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text,
                                                         duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -3465,6 +3544,29 @@ impl super::ApplicationCoordinator {
                                             // doesn't sit stale until the next status push.
                                             send_tx_queue_status(&message_bus, None, Vec::new())
                                                 .await;
+                                            // PAN-38 round 3 (Codex): an F8 abort here is the
+                                            // one path in this worker that previously sent NO
+                                            // TransmitComplete at all -- for a self-CQ whose
+                                            // QSO was already opened (AutonomousCqOpened
+                                            // registered it in the coordinator's
+                                            // pending_self_cq_qsos map), that left the entry
+                                            // permanently leaked and the speculative "+1"
+                                            // streak never rolled back, since nothing ever
+                                            // told the autonomous operator this attempt did
+                                            // not actually transmit. Report it exactly like
+                                            // the drop-stale-TX case above.
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: message_text.clone(),
+                                                    duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            let _ = message_bus.send_message(complete_msg).await;
                                             continue 'worker;
                                         }
 
@@ -3512,6 +3614,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text,
                                                     duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -3549,6 +3652,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text,
                                                     duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -3581,6 +3685,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text,
                                                     duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -3644,6 +3749,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text,
                                                     duration_ms: 0,
+                                                    qso_id: qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -3839,6 +3945,26 @@ impl super::ApplicationCoordinator {
                                             }
                                             SleepOutcome::AbortedByOperator => {
                                                 info!("TX aborted between PTT and slot by operator (F8)");
+                                                // PAN-38 round 4 (Codex): report the failed
+                                                // completion here too -- see the "aborted before
+                                                // PTT engage" comment earlier in this worker for
+                                                // the full leak this closes.
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
                                                 continue 'worker;
                                             }
                                             SleepOutcome::Superseded(new_request) => {
@@ -3884,6 +4010,7 @@ impl super::ApplicationCoordinator {
                                                     }
                                                     SupersedeOutcome::Replace {
                                                         origin: new_origin,
+                                                        qso_id: new_qso_id,
                                                     } => {
                                                         // Viable single-item re-key (Task 6): carry
                                                         // the recomputed schedule into the retry,
@@ -3894,8 +4021,53 @@ impl super::ApplicationCoordinator {
                                                         // Re-point `origin` at the SUPERSEDING
                                                         // request's origin so Step 4b-arm gates the
                                                         // frame that is actually about to transmit,
-                                                        // not the aborted one (C1 fix).
+                                                        // not the aborted one (C1 fix). PAN-38
+                                                        // round 4: re-point `qso_id` too, for the
+                                                        // same reason -- otherwise the retry pairs
+                                                        // the superseding frame's text with the
+                                                        // ABORTED frame's qso_id.
+                                                        // PAN-38 round 5 (Codex): the ABANDONED
+                                                        // frame (in_flight_items[0], captured
+                                                        // before this supersede) never gets a
+                                                        // TransmitComplete -- only the eventual
+                                                        // replacement's new_qso_id is ever
+                                                        // reported. If the abandoned frame was a
+                                                        // tracked self-CQ, its pending_self_cq_qsos
+                                                        // entry deterministically leaks and its
+                                                        // untransmitted attempt is never rolled
+                                                        // back. Report it now, before the qso_id
+                                                        // local is overwritten below.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            let complete_msg =
+                                                                ComponentMessage::new(
+                                                                    ComponentId::Ft8Transmitter,
+                                                                    ComponentId::Autonomous,
+                                                                    MessageType::TransmitComplete {
+                                                                        success: false,
+                                                                        message_text: abandoned
+                                                                            .message_text
+                                                                            .clone(),
+                                                                        duration_ms: 0,
+                                                                        qso_id: abandoned
+                                                                            .qso_id
+                                                                            .clone(),
+                                                                    },
+                                                                    Instant::now(),
+                                                                );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(complete_msg)
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send TransmitComplete: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         origin = new_origin;
+                                                        qso_id = new_qso_id;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -3952,8 +4124,50 @@ impl super::ApplicationCoordinator {
                                                         }
                                                         // Frequency collision: single-item replace
                                                         // of the NEW item only, so gate with the new
-                                                        // request's own origin (C1 fix).
+                                                        // request's own origin (C1 fix). PAN-38
+                                                        // round 5 (Codex): carry its qso_id too --
+                                                        // `items.last()` is always the new request
+                                                        // (per this variant's doc comment), and the
+                                                        // working `message_text`/`frequency_offset`
+                                                        // were already mutated to it by
+                                                        // `supersede_and_rekey_or_bundle` -- without
+                                                        // this, the retry paired the new item's text
+                                                        // with the ABORTED frame's qso_id, same
+                                                        // failure shape as the `Replace` arm's fix.
+                                                        // PAN-38 round 5: report the abandoned
+                                                        // in-flight frame's TransmitComplete before
+                                                        // overwriting qso_id -- same reasoning as
+                                                        // the Replace arm's fix.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            let complete_msg =
+                                                                ComponentMessage::new(
+                                                                    ComponentId::Ft8Transmitter,
+                                                                    ComponentId::Autonomous,
+                                                                    MessageType::TransmitComplete {
+                                                                        success: false,
+                                                                        message_text: abandoned
+                                                                            .message_text
+                                                                            .clone(),
+                                                                        duration_ms: 0,
+                                                                        qso_id: abandoned
+                                                                            .qso_id
+                                                                            .clone(),
+                                                                    },
+                                                                    Instant::now(),
+                                                                );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(complete_msg)
+                                                                .await
+                                                            {
+                                                                warn!("Failed to send TransmitComplete: {}", e);
+                                                            }
+                                                        }
                                                         origin = new_origin;
+                                                        qso_id = items
+                                                            .last()
+                                                            .and_then(|item| item.qso_id.clone());
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -4009,6 +4223,25 @@ impl super::ApplicationCoordinator {
                                                 info!(
                                                     "TX aborted during playback by operator (F8)"
                                                 );
+                                                // PAN-38 round 4 (Codex): report the failed
+                                                // completion here too -- see the "aborted before
+                                                // PTT engage" comment earlier in this worker.
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
                                                 continue 'worker;
                                             }
                                             SleepOutcome::Superseded(new_request) => {
@@ -4050,11 +4283,54 @@ impl super::ApplicationCoordinator {
                                                     }
                                                     SupersedeOutcome::Replace {
                                                         origin: new_origin,
+                                                        qso_id: new_qso_id,
                                                     } => {
                                                         // Re-point `origin` at the superseding
                                                         // request's origin so the retry's Step 4b-arm
                                                         // gates the frame actually transmitting (C1).
+                                                        // PAN-38 round 4: re-point `qso_id` too.
+                                                        // PAN-38 round 5 (Codex): the ABANDONED
+                                                        // frame (in_flight_items[0], captured
+                                                        // before this supersede) never gets a
+                                                        // TransmitComplete -- only the eventual
+                                                        // replacement's new_qso_id is ever
+                                                        // reported. If the abandoned frame was a
+                                                        // tracked self-CQ, its pending_self_cq_qsos
+                                                        // entry deterministically leaks and its
+                                                        // untransmitted attempt is never rolled
+                                                        // back. Report it now, before the qso_id
+                                                        // local is overwritten below.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            let complete_msg =
+                                                                ComponentMessage::new(
+                                                                    ComponentId::Ft8Transmitter,
+                                                                    ComponentId::Autonomous,
+                                                                    MessageType::TransmitComplete {
+                                                                        success: false,
+                                                                        message_text: abandoned
+                                                                            .message_text
+                                                                            .clone(),
+                                                                        duration_ms: 0,
+                                                                        qso_id: abandoned
+                                                                            .qso_id
+                                                                            .clone(),
+                                                                    },
+                                                                    Instant::now(),
+                                                                );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(complete_msg)
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send TransmitComplete: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         origin = new_origin;
+                                                        qso_id = new_qso_id;
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -4101,7 +4377,44 @@ impl super::ApplicationCoordinator {
                                                         }
                                                         // Frequency collision: single-item replace
                                                         // of the new item — gate with its own origin.
+                                                        // PAN-38 round 5: carry its qso_id too, same
+                                                        // reasoning as the other Bundle fallback arm.
+                                                        // Also report the abandoned in-flight
+                                                        // frame's TransmitComplete before
+                                                        // overwriting qso_id.
+                                                        if let Some(abandoned) =
+                                                            in_flight_items.first()
+                                                        {
+                                                            let complete_msg =
+                                                                ComponentMessage::new(
+                                                                    ComponentId::Ft8Transmitter,
+                                                                    ComponentId::Autonomous,
+                                                                    MessageType::TransmitComplete {
+                                                                        success: false,
+                                                                        message_text: abandoned
+                                                                            .message_text
+                                                                            .clone(),
+                                                                        duration_ms: 0,
+                                                                        qso_id: abandoned
+                                                                            .qso_id
+                                                                            .clone(),
+                                                                    },
+                                                                    Instant::now(),
+                                                                );
+                                                            if let Err(e) = message_bus
+                                                                .send_message(complete_msg)
+                                                                .await
+                                                            {
+                                                                warn!(
+                                                                    "Failed to send TransmitComplete: {}",
+                                                                    e
+                                                                );
+                                                            }
+                                                        }
                                                         origin = new_origin;
+                                                        qso_id = items
+                                                            .last()
+                                                            .and_then(|item| item.qso_id.clone());
                                                         rekey_schedule = Some(schedule);
                                                         is_rekey = true;
                                                         abort_current_tx
@@ -4133,6 +4446,31 @@ impl super::ApplicationCoordinator {
                                                 break 'worker;
                                             }
                                             info!("TX aborted during tail by operator (F8)");
+                                            // PAN-38 round 4 (Codex): the audio already fully
+                                            // played out before this trailing guard period, so
+                                            // `success`/`duration_ms` already reflect a genuine
+                                            // completed (or failed) transmission -- report it
+                                            // with those real values now rather than skipping
+                                            // TransmitComplete entirely (which would leak
+                                            // pending_self_cq_qsos and, if `success` is false,
+                                            // never roll back the streak) or fabricating a
+                                            // failure for a CQ that may have transmitted fine.
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success,
+                                                    message_text: message_text.clone(),
+                                                    duration_ms,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(complete_msg).await
+                                            {
+                                                warn!("Failed to send TransmitComplete: {}", e);
+                                            }
                                             continue 'worker;
                                         }
                                         let ptt_off_msg = ComponentMessage::new(
@@ -4162,6 +4500,7 @@ impl super::ApplicationCoordinator {
                                                 success,
                                                 message_text,
                                                 duration_ms,
+                                                qso_id: qso_id.clone(),
                                             },
                                             Instant::now(),
                                         );
@@ -4236,6 +4575,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: item.message_text.clone(),
                                                         duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -4304,6 +4644,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: item.message_text.clone(),
                                                     duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -4376,6 +4717,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: item.message_text.clone(),
                                                     duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -4424,6 +4766,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: item.message_text.clone(),
                                                         duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -4505,6 +4848,7 @@ impl super::ApplicationCoordinator {
                                                 success: false,
                                                 message_text: item.message_text.clone(),
                                                 duration_ms: 0,
+                                                qso_id: item.qso_id.clone(),
                                             },
                                             Instant::now(),
                                         );
@@ -4559,7 +4903,9 @@ impl super::ApplicationCoordinator {
                                                     .await;
                                                 }
                                             }
-                                            for text in item_texts {
+                                            for (text, qso_id) in
+                                                item_texts.into_iter().zip(encoded_qso_ids)
+                                            {
                                                 let complete_msg = ComponentMessage::new(
                                                     ComponentId::Ft8Transmitter,
                                                     ComponentId::Autonomous,
@@ -4567,6 +4913,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: text,
                                                         duration_ms: 0,
+                                                        qso_id,
                                                     },
                                                     Instant::now(),
                                                 );
@@ -4660,6 +5007,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: item.message_text.clone(),
                                                         duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -4703,6 +5051,7 @@ impl super::ApplicationCoordinator {
                                                                     .message_text
                                                                     .clone(),
                                                                 duration_ms: 0,
+                                                                qso_id: item.qso_id.clone(),
                                                             },
                                                             Instant::now(),
                                                         );
@@ -4743,6 +5092,7 @@ impl super::ApplicationCoordinator {
                                                             success: false,
                                                             message_text: item.message_text.clone(),
                                                             duration_ms: 0,
+                                                            qso_id: item.qso_id.clone(),
                                                         },
                                                         Instant::now(),
                                                     );
@@ -4783,7 +5133,10 @@ impl super::ApplicationCoordinator {
                                                             Vec::new(),
                                                         )
                                                         .await;
-                                                        for text in rebuilt_texts {
+                                                        for (text, qso_id) in rebuilt_texts
+                                                            .into_iter()
+                                                            .zip(rebuilt_qso_ids)
+                                                        {
                                                             let complete_msg =
                                                                 ComponentMessage::new(
                                                                     ComponentId::Ft8Transmitter,
@@ -4792,6 +5145,7 @@ impl super::ApplicationCoordinator {
                                                                         success: false,
                                                                         message_text: text,
                                                                         duration_ms: 0,
+                                                                        qso_id,
                                                                     },
                                                                     Instant::now(),
                                                                 );
@@ -4853,6 +5207,31 @@ impl super::ApplicationCoordinator {
                                             break;
                                         }
                                         info!("Multi-TX aborted before PTT by operator (F8)");
+                                        // PAN-38 round 3 (Codex): same gap as the single-item
+                                        // worker's F8-before-PTT path -- no TransmitComplete
+                                        // was ever sent for any bundle item, leaking a
+                                        // self-CQ's pending_self_cq_qsos entry and never
+                                        // rolling back its speculative streak/offset.
+                                        for (text, qso_id) in
+                                            item_texts.into_iter().zip(encoded_qso_ids)
+                                        {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success: false,
+                                                    message_text: text,
+                                                    duration_ms: 0,
+                                                    qso_id,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(complete_msg).await
+                                            {
+                                                warn!("Failed to send TransmitComplete: {}", e);
+                                            }
+                                        }
                                         continue;
                                     }
 
@@ -4909,6 +5288,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: item.message_text.clone(),
                                                     duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -5017,6 +5397,7 @@ impl super::ApplicationCoordinator {
                                                             success: false,
                                                             message_text: item.message_text.clone(),
                                                             duration_ms: 0,
+                                                            qso_id: item.qso_id.clone(),
                                                         },
                                                         Instant::now(),
                                                     );
@@ -5057,6 +5438,7 @@ impl super::ApplicationCoordinator {
                                                         success: false,
                                                         message_text: item.message_text.clone(),
                                                         duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
                                                     },
                                                     Instant::now(),
                                                 );
@@ -5096,7 +5478,10 @@ impl super::ApplicationCoordinator {
                                                         Vec::new(),
                                                     )
                                                     .await;
-                                                    for text in rebuilt_texts {
+                                                    for (text, qso_id) in rebuilt_texts
+                                                        .into_iter()
+                                                        .zip(rebuilt_qso_ids)
+                                                    {
                                                         let complete_msg = ComponentMessage::new(
                                                             ComponentId::Ft8Transmitter,
                                                             ComponentId::Autonomous,
@@ -5104,6 +5489,7 @@ impl super::ApplicationCoordinator {
                                                                 success: false,
                                                                 message_text: text,
                                                                 duration_ms: 0,
+                                                                qso_id,
                                                             },
                                                             Instant::now(),
                                                         );
@@ -5157,6 +5543,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: item.message_text.clone(),
                                                     duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -5193,6 +5580,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: item.message_text.clone(),
                                                     duration_ms: 0,
+                                                    qso_id: item.qso_id.clone(),
                                                 },
                                                 Instant::now(),
                                             );
@@ -5251,7 +5639,9 @@ impl super::ApplicationCoordinator {
                                             .await;
                                         }
                                         send_tx_queue_status(&message_bus, None, Vec::new()).await;
-                                        for text in item_texts {
+                                        for (text, qso_id) in
+                                            item_texts.into_iter().zip(encoded_qso_ids_final)
+                                        {
                                             let complete_msg = ComponentMessage::new(
                                                 ComponentId::Ft8Transmitter,
                                                 ComponentId::Autonomous,
@@ -5259,6 +5649,7 @@ impl super::ApplicationCoordinator {
                                                     success: false,
                                                     message_text: text,
                                                     duration_ms: 0,
+                                                    qso_id,
                                                 },
                                                 Instant::now(),
                                             );
@@ -5363,6 +5754,28 @@ impl super::ApplicationCoordinator {
                                         }
                                         SleepOutcome::AbortedByOperator => {
                                             info!("Multi-TX aborted between PTT and slot by operator (F8)");
+                                            // PAN-38 round 4 (Codex): report a failed
+                                            // completion for every bundle item -- see the
+                                            // "Multi-TX aborted before PTT" comment earlier
+                                            // in this worker for the full leak this closes.
+                                            for item in &items {
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                            }
                                             continue;
                                         }
                                         SleepOutcome::Superseded(new_request) => {
@@ -5435,6 +5848,28 @@ impl super::ApplicationCoordinator {
                                             info!(
                                                 "Multi-TX aborted during playback by operator (F8)"
                                             );
+                                            // PAN-38 round 4 (Codex): report a failed
+                                            // completion for every bundle item -- see the
+                                            // "Multi-TX aborted before PTT" comment earlier
+                                            // in this worker.
+                                            for item in &items {
+                                                let complete_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Autonomous,
+                                                    MessageType::TransmitComplete {
+                                                        success: false,
+                                                        message_text: item.message_text.clone(),
+                                                        duration_ms: 0,
+                                                        qso_id: item.qso_id.clone(),
+                                                    },
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(complete_msg).await
+                                                {
+                                                    warn!("Failed to send TransmitComplete: {}", e);
+                                                }
+                                            }
                                             continue;
                                         }
                                         SleepOutcome::Superseded(new_request) => {
@@ -5479,6 +5914,33 @@ impl super::ApplicationCoordinator {
                                             break;
                                         }
                                         info!("Multi-TX aborted during tail by operator (F8)");
+                                        // PAN-38 round 4 (Codex): the audio already fully
+                                        // played out before this trailing guard period, so
+                                        // `success`/`duration_ms` already reflect a genuine
+                                        // completed transmission -- report it with those
+                                        // real values now, per item, rather than skipping
+                                        // TransmitComplete entirely (leaking every bundle
+                                        // item's pending_self_cq_qsos entry).
+                                        for (text, qso_id) in
+                                            item_texts.into_iter().zip(encoded_qso_ids_final)
+                                        {
+                                            let complete_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Autonomous,
+                                                MessageType::TransmitComplete {
+                                                    success,
+                                                    message_text: text,
+                                                    duration_ms,
+                                                    qso_id,
+                                                },
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(complete_msg).await
+                                            {
+                                                warn!("Failed to send TransmitComplete: {}", e);
+                                            }
+                                        }
                                         continue;
                                     }
                                     let ptt_off_msg = ComponentMessage::new(
@@ -5497,7 +5959,9 @@ impl super::ApplicationCoordinator {
                                     ptt_guard.disarm();
 
                                     // --- Step 10: Send TransmitComplete for each item ---
-                                    for text in item_texts {
+                                    for (text, qso_id) in
+                                        item_texts.into_iter().zip(encoded_qso_ids_final)
+                                    {
                                         let complete_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Autonomous,
@@ -5505,6 +5969,7 @@ impl super::ApplicationCoordinator {
                                                 success,
                                                 message_text: text,
                                                 duration_ms,
+                                                qso_id,
                                             },
                                             Instant::now(),
                                         );
@@ -6889,13 +7354,24 @@ mod supersede_rekey_tests {
             .await;
 
             match outcome {
-                super::SupersedeOutcome::Replace { origin } => {
+                super::SupersedeOutcome::Replace { origin, qso_id } => {
                     assert_eq!(
                         origin, new_origin,
                         "Replace must carry the SUPERSEDING request's origin \
                          (in_flight={in_flight_origin:?}, new={new_origin:?}), not the \
                          aborted transmission's — otherwise the key-time arm gate is \
                          evaluated against the wrong origin"
+                    );
+                    // PAN-38 round 4 (Codex): Replace must ALSO carry the
+                    // superseding request's own qso_id, not the aborted
+                    // in-flight transmission's — otherwise the caller's
+                    // in-place retry pairs the new frame's text with the
+                    // WRONG QSO's id, misattributing its eventual
+                    // TransmitComplete.
+                    assert_eq!(
+                        qso_id,
+                        Some("qso-new".to_string()),
+                        "Replace must carry the SUPERSEDING request's own qso_id"
                     );
                 }
                 other => panic!("expected Replace, got {other:?}"),

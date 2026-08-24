@@ -838,6 +838,10 @@ impl super::ApplicationCoordinator {
         // atomic; the QSO engine and autonomous operator read it to gate
         // autonomous frequency moves.
         let cmd_tx_freq_mode = self.tx_freq_mode.clone();
+        // PAN-39: bumped alongside every `cmd_tx_freq_mode.store()` below so
+        // the autonomous operator can detect a transition it didn't directly
+        // observe (see `AutonomousOperator::set_tx_freq_mode_generation_source`).
+        let cmd_tx_freq_mode_generation = self.tx_freq_mode_generation.clone();
         // Held TX audio offset in Hz (0 = Auto/unset). Written by the `o`-modal
         // relay arm; read by the manual-call handler at QSO open to place our
         // TX audio offset when the operator has set one.
@@ -1713,7 +1717,19 @@ impl super::ApplicationCoordinator {
                                 cmd_tx_freq_mode.load(Ordering::Acquire),
                             );
                             let next = prev.toggle();
-                            cmd_tx_freq_mode.store(next.as_u8(), Ordering::Release);
+                            // PAN-38 round 3 (Codex): bump the generation
+                            // BEFORE storing the new mode, both SeqCst,
+                            // paired with `AutonomousOperator::tx_freq_auto`/
+                            // the PAN-39 generation check reading in
+                            // "mode first, generation second" order --
+                            // see those call sites' doc comments for why
+                            // this specific pairing (and not just Acquire/
+                            // Release on each independently) closes the
+                            // race where a concurrent reader could observe
+                            // the new mode but the pre-bump generation,
+                            // firing neither invalidation check.
+                            cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
+                            cmd_tx_freq_mode.store(next.as_u8(), Ordering::SeqCst);
                             info!(
                                 target: "tx.freq",
                                 "Operator toggled TX-frequency mode: {} -> {}",
@@ -1736,9 +1752,13 @@ impl super::ApplicationCoordinator {
                             match offset_hz {
                                 Some(hz) => {
                                     cmd_tx_offset_hold_hz.store(hz, Ordering::Relaxed);
+                                    // PAN-38 round 3: generation-before-mode,
+                                    // both SeqCst -- see ToggleTxFreqMode's
+                                    // comment above for the full reasoning.
+                                    cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
                                     cmd_tx_freq_mode.store(
                                         pancetta_core::TxFreqMode::Hold.as_u8(),
-                                        Ordering::Release,
+                                        Ordering::SeqCst,
                                     );
                                     info!(
                                         target: "tx.freq",
@@ -1754,9 +1774,13 @@ impl super::ApplicationCoordinator {
                                 }
                                 None => {
                                     cmd_tx_offset_hold_hz.store(0, Ordering::Relaxed);
+                                    // PAN-38 round 3: generation-before-mode,
+                                    // both SeqCst -- see ToggleTxFreqMode's
+                                    // comment above for the full reasoning.
+                                    cmd_tx_freq_mode_generation.fetch_add(1, Ordering::SeqCst);
                                     cmd_tx_freq_mode.store(
                                         pancetta_core::TxFreqMode::Auto.as_u8(),
-                                        Ordering::Release,
+                                        Ordering::SeqCst,
                                     );
                                     info!(
                                         target: "tx.freq",

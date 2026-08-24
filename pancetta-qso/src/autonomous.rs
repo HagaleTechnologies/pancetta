@@ -814,6 +814,46 @@ pub struct CqStateSnapshot {
     streak: u32,
     current_cq_offset_hz: Option<f64>,
     tx_offset_hz: f64,
+    /// PAN-38: identifies which self-CQ attempt this snapshot belongs to.
+    /// Monotonically assigned by [`AutonomousOperator::decide_at`] every
+    /// time it takes a fresh snapshot. Round-trips through the coordinator
+    /// on `StartAutonomousQso` and back on a downstream dispatch-failure
+    /// signal, so [`AutonomousOperator::restore_cq_state_for_attempt`] can
+    /// tell a late failure report for an OLD attempt apart from a newer
+    /// self-CQ that has since overwritten `last_cq_snapshot` — restoring
+    /// the wrong one would silently corrupt the newer attempt's state.
+    attempt_id: u64,
+    /// PAN-38 round 1 (Codex): whether THIS attempt's own dispatch performed
+    /// a threshold-driven frequency switch (reset the streak to a fresh
+    /// baseline and picked a new offset), set immediately after that
+    /// decision runs in `decide_at`. Lets a bounded compensating rollback
+    /// (see [`AutonomousOperator::restore_cq_state_for_attempt`]) tell a
+    /// routine failed attempt (safe to compensate: just decrement the
+    /// streak by the one increment it contributed) from a switching one
+    /// (unsafe to auto-compensate once superseded: undoing a switch means
+    /// restoring an absolute pre-attempt baseline, which would corrupt
+    /// whatever legitimately happened after it).
+    did_switch: bool,
+    /// PAN-38 round 4 (Codex): `AutonomousOperator::offset_generation` as
+    /// observed at snapshot time. Bumped by every event that invalidates
+    /// `current_cq_offset_hz`/`config.tx_offset_hz` OUTSIDE this snapshot's
+    /// own speculative mutations -- a Hold/Auto transition (both the direct
+    /// and the between-polls generation-mirrored case, PAN-39), a band hop,
+    /// or the offset half of a collision jitter. A restore only reinstates
+    /// the offset/config fields when this still matches the CURRENT
+    /// generation. Split from the streak generation below (round 3 gated
+    /// both on one shared counter, which over-blocked a safe streak
+    /// restore whenever only the offset had been invalidated).
+    offset_generation: u32,
+    /// PAN-38 round 4 (Codex): `AutonomousOperator::streak_generation` as
+    /// observed at snapshot time. Bumped by every event that invalidates
+    /// `cq_no_response_streak` OUTSIDE this snapshot's own speculative
+    /// mutations -- a genuine directed-reply reset, or the streak half of a
+    /// collision jitter. A restore only reinstates the streak when this
+    /// still matches the CURRENT generation. See
+    /// [`AutonomousOperator::restore_cq_state`] and
+    /// [`AutonomousOperator::restore_cq_state_for_attempt`].
+    streak_generation: u32,
 }
 
 /// The per-cycle decision-making brain.
@@ -859,6 +899,21 @@ pub struct AutonomousOperator {
     /// apply it when a downstream gate suppressed the self-CQ before it
     /// reached the radio. `None` on any cycle that didn't attempt a self-CQ.
     last_cq_snapshot: Option<CqStateSnapshot>,
+    /// PAN-38 round 1 (Codex): the PREVIOUS unresolved snapshot, kept for
+    /// exactly one more generation so a downstream failure report delayed
+    /// until a NEWER self-CQ attempt has already overwritten
+    /// `last_cq_snapshot` can still be bounded-compensated (see
+    /// [`Self::restore_cq_state_for_attempt`]) instead of silently dropped.
+    /// Shifted in from `last_cq_snapshot` whenever a new snapshot is taken
+    /// over a still-unresolved one; cleared whenever either snapshot is
+    /// consumed. Bounded to one generation deep — a failure report stale by
+    /// more than that is logged but not auto-corrected (see that method's
+    /// doc comment for why going further isn't safely boundable).
+    previous_cq_snapshot: Option<CqStateSnapshot>,
+    /// PAN-38: monotonic counter, incremented every time `decide_at` takes a
+    /// new `last_cq_snapshot`. The current value becomes that snapshot's
+    /// `CqStateSnapshot::attempt_id`.
+    cq_attempt_counter: u64,
     /// Real FT8 message parser, used by [`Self::is_directed_response`] to
     /// recognize a genuine reply (handles compound/hash-rendered callsigns
     /// and every valid rung shape correctly, instead of a hand-rolled text
@@ -916,6 +971,47 @@ pub struct AutonomousOperator {
     /// jitter is suppressed. `Auto` re-enables both. Defaults to a private
     /// `Hold` atomic so any caller that never injects a source holds frequency.
     tx_freq_mode: std::sync::Arc<std::sync::atomic::AtomicU8>,
+    /// Bumped by the coordinator every time it stores a new value into
+    /// `tx_freq_mode` (i.e. once per Hold/Auto transition), shared from the
+    /// coordinator. `decide_at` compares this against the generation it last
+    /// observed to detect a Hold entry+exit that happened entirely between
+    /// two polling cycles — a plain "is the mode Hold right now" read of the
+    /// mode atomic can't see that, since by the time `decide_at` next polls,
+    /// the mode is back to Auto. A generation counter catches it without
+    /// needing a direct handle from `tui_relay.rs`'s command handlers into
+    /// this operator (which lives behind its own `Arc<Mutex<..>>` elsewhere
+    /// in the coordinator). Defaults to a private counter that's never
+    /// bumped, matching `tx_freq_mode`'s own "unwired → today's behavior"
+    /// convention.
+    tx_freq_mode_generation: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    /// The generation value `decide_at` last observed. Any mismatch against
+    /// the live `tx_freq_mode_generation` means at least one Hold/Auto
+    /// transition happened since — the sticky offset is invalidated
+    /// regardless of what the CURRENT mode value reads as.
+    last_seen_tx_freq_mode_generation: u32,
+    /// PAN-38 round 4 (Codex): a plain (non-atomic — only ever touched while
+    /// this operator's own lock is held) counter bumped by every event that
+    /// invalidates `current_cq_offset_hz`/`config.tx_offset_hz` OUTSIDE of
+    /// `decide_at`'s own speculative self-CQ mutations: a Hold/Auto
+    /// transition (both the direct "mode reads Hold right now" case and the
+    /// generation-mirrored "squeezed entirely between two polls" case), a
+    /// band hop, or the offset half of a collision jitter.
+    /// `restore_cq_state`/`restore_cq_state_for_attempt` compare a
+    /// snapshot's stamped offset generation against this CURRENT value —
+    /// any mismatch means the snapshot's offset/config fields no longer
+    /// describe a state that's safe to restore. Split from
+    /// `streak_generation` below (round 3 gated both under one shared
+    /// counter, which over-blocked a safe streak restore whenever only the
+    /// offset had been invalidated).
+    offset_generation: u32,
+    /// PAN-38 round 4 (Codex): the streak counterpart to `offset_generation`
+    /// above — bumped by every event that invalidates
+    /// `cq_no_response_streak` OUTSIDE of `decide_at`'s own speculative
+    /// self-CQ mutations: a genuine directed-reply reset, or the streak
+    /// half of a collision jitter. Compared independently so a
+    /// pure-offset invalidation (Hold/Auto, band hop) no longer blocks a
+    /// safe streak restore/compensation, and vice versa.
+    streak_generation: u32,
     /// Operator's LIVE parked TX offset (Hz), shared from the coordinator's
     /// `tx_offset_hold_hz` atomic (the same one the `o` modal writes via
     /// `TuiCommand::SetTxOffset`). `0` is the "unset/unparked" sentinel —
@@ -956,6 +1052,8 @@ impl AutonomousOperator {
             cq_no_response_streak: 0,
             current_cq_offset_hz: None,
             last_cq_snapshot: None,
+            previous_cq_snapshot: None,
+            cq_attempt_counter: 0,
             exchange,
             our_callsign,
             our_grid,
@@ -973,6 +1071,10 @@ impl AutonomousOperator {
             tx_freq_mode: std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
                 pancetta_core::TxFreqMode::Hold.as_u8(),
             )),
+            tx_freq_mode_generation: std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0)),
+            last_seen_tx_freq_mode_generation: 0,
+            offset_generation: 0,
+            streak_generation: 0,
             tx_offset_hold_hz: None,
             watchlist,
             skip_log: Vec::new(),
@@ -1004,14 +1106,166 @@ impl AutonomousOperator {
     /// snapshot would "restore" a value Step 0's band-hop/Hold-mode
     /// handling had *just correctly invalidated* earlier in the very same
     /// cycle, e.g. `current_cq_offset_hz` cleared on a same-cycle band hop).
+    ///
+    /// PAN-38 round 3 (Codex): a restore of a given field is only safe when
+    /// its generation still matches what it was at snapshot time -- i.e.
+    /// nothing has touched THAT field since. A mismatch means the
+    /// snapshot's value for that field no longer describes a state that's
+    /// safe to restore (e.g. a genuine directed reply reset the streak to
+    /// 0; blindly restoring the pre-attempt streak would silently discard
+    /// that reset).
+    ///
+    /// PAN-38 round 4 (Codex): the streak and offset/config fields are
+    /// gated INDEPENDENTLY (`streak_generation` vs `offset_generation`),
+    /// not behind one shared flag -- round 3's single combined generation
+    /// over-blocked a safe streak restore whenever only the offset had
+    /// been invalidated (e.g. a Hold/Auto transition or band hop, neither
+    /// of which touches the streak), permanently under-counting a
+    /// suppressed attempt's contribution in that case.
+    ///
+    /// PAN-38 round 5 (Codex): `offset_generation` is only advanced by
+    /// `refresh_tx_freq_offset_invalidation` -- which normally runs once
+    /// per `decide_at` poll. If the operator changes the TX-frequency
+    /// mode (or held offset) AFTER a snapshot was taken and a downstream
+    /// failure arrives BEFORE the next poll, `offset_generation` hasn't
+    /// caught up with the live `tx_freq_mode_generation` atomic yet, so
+    /// the check below would wrongly still match and restore a now-stale
+    /// offset/config/collision-detector state. Refresh first so this
+    /// restore is always evaluated against the CURRENT live state, not
+    /// whatever this operator last happened to poll.
     pub fn restore_cq_state(&mut self) {
+        self.refresh_tx_freq_offset_invalidation();
         let Some(snapshot) = self.last_cq_snapshot.take() else {
             return;
         };
-        self.cq_no_response_streak = snapshot.streak;
-        self.current_cq_offset_hz = snapshot.current_cq_offset_hz;
-        self.config.tx_offset_hz = snapshot.tx_offset_hz;
-        self.collision_detector.our_tx_offset_hz = snapshot.tx_offset_hz;
+        if self.streak_generation == snapshot.streak_generation {
+            self.cq_no_response_streak = snapshot.streak;
+        } else {
+            debug!(
+                "Autonomous self-CQ attempt {} suppressed but the streak was independently \
+                 invalidated (directed reply or collision jitter) after the snapshot was \
+                 taken -- streak restore skipped to avoid resurrecting stale state",
+                snapshot.attempt_id
+            );
+        }
+        if self.offset_generation == snapshot.offset_generation {
+            self.current_cq_offset_hz = snapshot.current_cq_offset_hz;
+            self.config.tx_offset_hz = snapshot.tx_offset_hz;
+            self.collision_detector.our_tx_offset_hz = snapshot.tx_offset_hz;
+        } else {
+            debug!(
+                "Autonomous self-CQ attempt {} suppressed but the offset was independently \
+                 invalidated (Hold/Auto transition or band hop) after the snapshot was taken \
+                 -- offset/config restore skipped to avoid resurrecting stale state",
+                snapshot.attempt_id
+            );
+        }
+    }
+
+    /// The `attempt_id` of the most recent unresolved self-CQ snapshot, if
+    /// `decide_at` reached the self-CQ branch this cycle and the snapshot
+    /// hasn't since been consumed by [`Self::restore_cq_state`]. The
+    /// coordinator reads this right after `decide()`/`decide_at()` returns
+    /// (before any suppression check may consume it) so it can tag a
+    /// dispatched self-CQ with the attempt it belongs to — see
+    /// [`Self::restore_cq_state_for_attempt`].
+    pub fn last_cq_attempt_id(&self) -> Option<u64> {
+        self.last_cq_snapshot.map(|s| s.attempt_id)
+    }
+
+    /// PAN-38: undo a self-CQ's speculative mutations after it was dispatched
+    /// (survived every pre-dispatch gate) but then failed downstream — e.g. a
+    /// radio/CAT error or a subsystem race in `QsoManager::start_cq` — with
+    /// no QSO ever actually opened. The coordinator calls this from the
+    /// failure signal handler, passing back the `attempt_id` it received on
+    /// `StartAutonomousQso`.
+    ///
+    /// The common case reuses [`Self::restore_cq_state`] directly: the
+    /// failed attempt is still the LATEST snapshot, so a full restore to its
+    /// pre-attempt values is exactly correct.
+    ///
+    /// PAN-38 round 1 (Codex): a failure report delayed until a LATER
+    /// self-CQ attempt has already taken its own (newer) snapshot used to be
+    /// a silent no-op — permanently baking the failed attempt's speculative
+    /// "+1 streak" (and, if it switched, its offset change) into the newer
+    /// attempt's baseline. `previous_cq_snapshot` keeps exactly one extra
+    /// generation of history so this case can still be bounded-compensated:
+    /// - If the stale attempt did NOT itself trigger a frequency switch
+    ///   (`did_switch == false`), its only speculative effect was the simple
+    ///   `+1` to `cq_no_response_streak` every dispatch applies. Decrementing
+    ///   the CURRENT streak by 1 exactly undoes it PROVIDED `cq_state_
+    ///   generation` still matches this snapshot's -- i.e. nothing else
+    ///   (a directed-reply reset, collision jitter, a mode transition, a
+    ///   band hop) has touched the streak/offset since. A mismatch means the
+    ///   streak is no longer purely additive across that gap (PAN-38 round 3,
+    ///   Codex: e.g. a genuine directed reply zeroed it in between -- a
+    ///   blind `-1` would then wrongly eat into the newer reset instead of
+    ///   the failed attempt's own contribution), so the correction is
+    ///   skipped and logged instead of guessed.
+    /// - If the stale attempt DID switch, undoing it means restoring an
+    ///   ABSOLUTE pre-attempt baseline, which is only safe if nothing has
+    ///   changed since (i.e. it's still the effectively-latest switch). That
+    ///   additional bookkeeping isn't tracked — auto-correcting a stale
+    ///   *switching* attempt risks silently discarding a legitimate later
+    ///   switch, worse than the gap it would close. Logged instead, so the
+    ///   (rarer still) case at least has visibility instead of silent drift.
+    /// - A failure stale by MORE than one generation (evicted from both
+    ///   slots) is unchanged from before this round: logged, not corrected.
+    pub fn restore_cq_state_for_attempt(&mut self, attempt_id: u64) {
+        // PAN-38 round 5: refresh unconditionally, before either branch --
+        // see `restore_cq_state`'s doc comment for why a stale internal
+        // generation (relative to the LIVE tx_freq_mode_generation atomic)
+        // is unsafe to evaluate a restore against.
+        self.refresh_tx_freq_offset_invalidation();
+        if self
+            .last_cq_snapshot
+            .is_some_and(|s| s.attempt_id == attempt_id)
+        {
+            self.restore_cq_state();
+            return;
+        }
+        if let Some(snapshot) = self.previous_cq_snapshot {
+            if snapshot.attempt_id == attempt_id {
+                self.previous_cq_snapshot = None;
+                if snapshot.did_switch {
+                    warn!(
+                        "Autonomous self-CQ attempt {} failed downstream after a newer attempt \
+                         already superseded it, and it performed a frequency switch -- streak/\
+                         offset NOT auto-corrected (would risk discarding a legitimate later \
+                         switch); state may be off by one attempt",
+                        attempt_id
+                    );
+                } else if self.streak_generation == snapshot.streak_generation {
+                    // Only the streak generation matters here: a
+                    // non-switching attempt never touched the offset, so an
+                    // offset-only invalidation (Hold/Auto, band hop) since
+                    // this snapshot has no bearing on whether the streak
+                    // -1 is still correct (PAN-38 round 4).
+                    self.cq_no_response_streak = self.cq_no_response_streak.saturating_sub(1);
+                    debug!(
+                        "Autonomous self-CQ attempt {} failed downstream after a newer attempt \
+                         already superseded it -- compensated streak by -1 (attempt did not \
+                         switch, so offset needed no correction)",
+                        attempt_id
+                    );
+                } else {
+                    debug!(
+                        "Autonomous self-CQ attempt {} failed downstream after a newer attempt \
+                         already superseded it, but the streak was independently invalidated \
+                         (directed reply or collision jitter) since -- streak NOT \
+                         auto-corrected (no longer purely additive across that gap); state may \
+                         be off by one attempt",
+                        attempt_id
+                    );
+                }
+                return;
+            }
+        }
+        debug!(
+            "Autonomous self-CQ attempt {} failed downstream but is more than one generation \
+             stale -- state not corrected",
+            attempt_id
+        );
     }
 
     fn push_skip(&mut self, record: CqSkipRecord) {
@@ -1030,6 +1284,20 @@ impl AutonomousOperator {
         self.tx_freq_mode = source;
     }
 
+    /// Share the coordinator's TX-frequency-mode generation counter (PAN-39)
+    /// — bumped once per Hold/Auto transition, alongside `tx_freq_mode`
+    /// itself. Pass the same `Arc<AtomicU32>` `tui_relay.rs`'s command
+    /// handlers increment on every `tx_freq_mode` store. If never called,
+    /// the operator keeps a private counter that's never bumped, so the
+    /// generation check is always a no-op — same "unwired → today's
+    /// behavior" convention as `set_tx_freq_mode_source`.
+    pub fn set_tx_freq_mode_generation_source(
+        &mut self,
+        source: std::sync::Arc<std::sync::atomic::AtomicU32>,
+    ) {
+        self.tx_freq_mode_generation = source;
+    }
+
     /// Share the coordinator's live parked-TX-offset atomic
     /// (`tx_offset_hold_hz`) so Hold-mode frequency allocation reflects the
     /// operator's actual parked offset (set via the TUI's `o` modal) instead
@@ -1045,9 +1313,24 @@ impl AutonomousOperator {
     }
 
     /// Current TX-frequency mode (decoded from the shared atomic).
+    /// PAN-38 round 3 (Codex): `SeqCst`, paired with `SeqCst` on the
+    /// generation counter below and on `tui_relay.rs`'s writer side (which
+    /// now bumps the generation BEFORE storing the new mode). Plain
+    /// Acquire/Release on two independent atomics only synchronizes a
+    /// specific acquire with the specific release it observes -- it does
+    /// NOT guarantee that seeing this thread's mode-store also means
+    /// seeing an EARLIER store to the unrelated generation counter. `SeqCst`
+    /// gives a single total order across both atomics on both sides, which
+    /// is what `decide_at`'s "mode read first, generation read second"
+    /// sequence actually needs: if this load observes the NEW mode, the
+    /// generation load right after it is then guaranteed to observe the
+    /// writer's already-completed bump too, closing the window where a
+    /// concurrent Hold->Auto transition was visible via the mode read but
+    /// not yet via the generation read (in which case neither invalidation
+    /// check would have fired).
     fn tx_freq_auto(&self) -> bool {
         pancetta_core::TxFreqMode::from_u8(
-            self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
+            self.tx_freq_mode.load(std::sync::atomic::Ordering::SeqCst),
         )
         .allows_auto_change()
     }
@@ -1218,6 +1501,12 @@ impl AutonomousOperator {
             .any(|m| self.is_directed_response(&m.message_text))
         {
             self.cq_no_response_streak = 0;
+            // PAN-38 round 3/4: this reset happens OUTSIDE any decide_at
+            // snapshot's own speculative-mutation sequence -- a pending
+            // restore/bounded-compensation for an older attempt must not
+            // clobber a newer, genuine directed-reply reset. Streak-only
+            // (this reset never touches the offset).
+            self.streak_generation = self.streak_generation.wrapping_add(1);
         }
 
         // Extract CQ candidates.
@@ -1626,10 +1915,23 @@ impl AutonomousOperator {
     }
 
     /// Run one cycle at a specific unix timestamp (for testing).
-    pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
-        self.skip_log.clear();
-        let mut actions = Vec::new();
-
+    /// Invalidate `current_cq_offset_hz` if a Hold/Auto transition has been
+    /// observed (directly, or via the generation counter for one squeezed
+    /// entirely between polls). Called at the top of `decide_at` AND again
+    /// immediately before the routine (non-switching) self-CQ path actually
+    /// CONSUMES `current_cq_offset_hz`, several hundred lines later in the
+    /// same call.
+    ///
+    /// PAN-38 round 4 (Codex): a Hold->Auto round trip can complete AFTER
+    /// the top-of-`decide_at` check but BEFORE the self-CQ branch reads
+    /// `current_cq_offset_hz` -- both the mode store and its generation
+    /// bump are made by a writer thread (`tui_relay.rs`) that holds no lock
+    /// this operator's own mutation is serialized under, so nothing
+    /// prevents them from landing in the (admittedly narrow, since
+    /// `decide_at` never yields) window between the two checks. Revalidate
+    /// immediately before consumption rather than trusting a check from
+    /// earlier in the same call.
+    fn refresh_tx_freq_offset_invalidation(&mut self) {
         // Codex review (PR #276, round 6): invalidate any stale Auto-mode
         // sticky offset as soon as Hold mode is observed, every cycle — not
         // only when a Hold-mode self-CQ happens to run. Waiting for a
@@ -1639,7 +1941,55 @@ impl AutonomousOperator {
         // of re-ranking fresh.
         if !self.tx_freq_auto() {
             self.current_cq_offset_hz = None;
+            // PAN-38 round 3/4: bump the offset-invalidation generation so a
+            // pending restore of an OLDER snapshot (taken before this Hold
+            // observation) can no longer resurrect the offset just cleared.
+            self.offset_generation = self.offset_generation.wrapping_add(1);
         }
+
+        // PAN-39: the check above only catches Hold observed AT THIS POLL.
+        // An Auto -> Hold -> Auto round trip that completes entirely between
+        // two `decide_at` cycles is invisible to it — by the time this cycle
+        // polls, the atomic already reads Auto again. The generation counter
+        // catches that: any change since the last cycle we observed means at
+        // least one transition happened in between, so the pre-transition
+        // sticky offset can no longer be trusted, independent of what the
+        // mode reads as right now.
+        // PAN-39 round 1 (Codex): must pair with the writer's `Release`
+        // store (`tui_relay.rs`'s `fetch_add(1, Ordering::Release)`) via
+        // `Acquire`, not `Relaxed` -- on a weakly-ordered target a relaxed
+        // load can observe a newer `tx_freq_mode` value before the
+        // corresponding generation increment becomes visible to this
+        // thread, letting one more self-CQ reuse the stale offset before
+        // the next poll notices the generation change.
+        //
+        // PAN-38 round 3 (Codex): `Acquire` alone still isn't enough --
+        // this load and `tx_freq_auto()`'s mode load right above are two
+        // INDEPENDENT atomics, and a plain acquire only synchronizes with
+        // the specific release it happens to observe. `tui_relay.rs` now
+        // bumps this generation counter BEFORE storing the new mode value
+        // (SeqCst on both sides), and this load is upgraded to `SeqCst` to
+        // match -- see `tx_freq_auto()`'s doc comment for the full
+        // reasoning on why the combination closes the race Acquire/Release
+        // alone left open.
+        let current_tx_freq_mode_generation = self
+            .tx_freq_mode_generation
+            .load(std::sync::atomic::Ordering::SeqCst);
+        if current_tx_freq_mode_generation != self.last_seen_tx_freq_mode_generation {
+            self.current_cq_offset_hz = None;
+            self.last_seen_tx_freq_mode_generation = current_tx_freq_mode_generation;
+            // PAN-38 round 3/4: same reasoning as the direct Hold-mode check
+            // above -- an invisible-between-polls transition invalidates a
+            // pending restore's snapshot just as much as an observed one.
+            self.offset_generation = self.offset_generation.wrapping_add(1);
+        }
+    }
+
+    pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
+        self.skip_log.clear();
+        let mut actions = Vec::new();
+
+        self.refresh_tx_freq_offset_invalidation();
 
         if self.paused {
             actions.push(self.status_action());
@@ -1661,6 +2011,10 @@ impl AutonomousOperator {
             self.decode_history = DecodeHistory::new(self.config.frequency.decode_history_cycles);
             self.spectral_snapshot = None;
             self.current_cq_offset_hz = None;
+            // PAN-38 round 3/4: a band hop invalidates the old band's sticky
+            // offset exactly like a mode transition does -- a pending
+            // restore of a pre-hop snapshot must not resurrect it.
+            self.offset_generation = self.offset_generation.wrapping_add(1);
         }
 
         // Step 1: slot manager
@@ -1962,11 +2316,41 @@ impl AutonomousOperator {
                             // invalidated (e.g. `current_cq_offset_hz`
                             // cleared on a same-cycle band hop) if this
                             // cycle's CQ then got suppressed downstream.
+                            self.cq_attempt_counter += 1;
+                            // PAN-38 round 1: shift the still-unresolved
+                            // previous snapshot (if any) down before
+                            // overwriting `last_cq_snapshot`, so a failure
+                            // report for THAT attempt can still be found by
+                            // `restore_cq_state_for_attempt` one generation
+                            // later instead of being silently dropped.
+                            self.previous_cq_snapshot = self.last_cq_snapshot.take();
                             self.last_cq_snapshot = Some(CqStateSnapshot {
                                 streak: self.cq_no_response_streak,
                                 current_cq_offset_hz: self.current_cq_offset_hz,
                                 tx_offset_hz: self.config.tx_offset_hz,
+                                attempt_id: self.cq_attempt_counter,
+                                did_switch: false,
+                                offset_generation: self.offset_generation,
+                                streak_generation: self.streak_generation,
                             });
+
+                            // PAN-38 round 5 (Codex): refresh HERE, before
+                            // `should_switch` is decided, not only later
+                            // right before `current_cq_offset_hz` is
+                            // consumed (round 4) -- the round-4 refresh
+                            // alone left `should_switch` computed from a
+                            // stale `tx_freq_auto()` read: an Auto->Hold
+                            // transition landing between this decision and
+                            // that later refresh would correctly clear the
+                            // sticky offset, but the STALE `should_switch
+                            // == true` would still enter the switch branch
+                            // below and dispatch an autonomously-selected
+                            // frequency despite Hold mode. One refresh
+                            // covers both this decision and the later
+                            // consumption -- see
+                            // `refresh_tx_freq_offset_invalidation`'s own
+                            // doc comment.
+                            self.refresh_tx_freq_offset_invalidation();
 
                             let should_switch = self.tx_freq_auto()
                                 && self.cq_no_response_streak
@@ -2009,6 +2393,26 @@ impl AutonomousOperator {
                             // frequency we just switched away from (nothing in
                             // the ranking inputs distinguishes "avoided because we
                             // chose to leave it" from "still the best spot").
+                            //
+                            // PAN-38 round 4 (Codex) originally revalidated
+                            // AGAIN here, right before `current_cq_offset_hz`
+                            // is consumed below. Round 5 (Codex) found that
+                            // refreshing the offset in a SECOND, separate call
+                            // without also recomputing `should_switch` just
+                            // moved the inconsistency window rather than
+                            // closing it: a mode flip landing between the two
+                            // calls would correctly re-clear the offset here
+                            // but leave `should_switch` (computed from the
+                            // FIRST, now-stale read, above) pointed at the old
+                            // decision -- still entering the switch branch
+                            // despite Hold mode. A single refresh, immediately
+                            // followed by deriving BOTH `should_switch` and
+                            // the offset consumption from that one consistent
+                            // read (moved up before `should_switch`'s
+                            // computation), is what actually closes this --
+                            // repeating the refresh without also re-deriving
+                            // every decision that depends on it doesn't
+                            // converge.
                             let cq_freq = if should_switch {
                                 let avoid = self
                                     .current_cq_offset_hz
@@ -2036,6 +2440,15 @@ impl AutonomousOperator {
                                 }
 
                                 self.cq_no_response_streak = 0;
+                                // PAN-38 round 1: mark this attempt's own
+                                // snapshot as switch-performing, so a later
+                                // bounded compensating rollback (if this
+                                // attempt fails and is by then stale) knows
+                                // NOT to attempt a simple streak decrement --
+                                // see `restore_cq_state_for_attempt`.
+                                if let Some(snapshot) = self.last_cq_snapshot.as_mut() {
+                                    snapshot.did_switch = true;
+                                }
                                 actions.push(OperatorAction::FrequencyShift {
                                     new_offset_hz: new_offset,
                                 });
@@ -2159,6 +2572,14 @@ impl AutonomousOperator {
                 // collision avoidance, silently postponing the real
                 // no-response-driven switch indefinitely.
                 if (new_offset - prev_offset).abs() > f64::EPSILON {
+                    // PAN-38 round 3/4: a genuine (non-no-op) jitter changes
+                    // `current_cq_offset_hz` outside any decide_at snapshot's
+                    // own speculative-mutation sequence -- bump so a pending
+                    // restore of an older snapshot can't resurrect the
+                    // pre-jitter offset. Streak generation is bumped
+                    // separately below, only when the streak is actually
+                    // reset too.
+                    self.offset_generation = self.offset_generation.wrapping_add(1);
                     // Codex review (PR #277, round 3): a nonzero jitter
                     // isn't necessarily a nonzero jitter AWAY from the
                     // interferer — a small draw (e.g. ±1 Hz) can leave
@@ -2184,6 +2605,11 @@ impl AutonomousOperator {
                         // moves away again without ever trying the frequency
                         // collision avoidance just picked.
                         self.cq_no_response_streak = 0;
+                        // PAN-38 round 4: this streak reset happens OUTSIDE
+                        // any decide_at snapshot's own speculative-mutation
+                        // sequence -- bump the streak generation too, same
+                        // reasoning as the directed-reply reset.
+                        self.streak_generation = self.streak_generation.wrapping_add(1);
                     }
 
                     actions.push(OperatorAction::FrequencyShift {
@@ -3524,6 +3950,323 @@ mod tests {
     }
 
     #[test]
+    fn restore_cq_state_for_attempt_matches_restore_cq_state_for_the_current_attempt() {
+        // PAN-38: a downstream dispatch failure (QsoManager::start_cq
+        // returns Err after every pre-dispatch gate already permitted the
+        // self-CQ) must roll back the streak/offset exactly like an
+        // explicit pre-dispatch suppression (restore_cq_state) —
+        // restore_cq_state_for_attempt is the same underlying mechanism,
+        // additionally gated on the attempt_id the coordinator echoes back
+        // on the failure signal.
+        let mut op = primed_operator(2, 5, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #1, streak -> 1 (speculative, self-snapshotted)
+        let attempt_id = op
+            .last_cq_attempt_id()
+            .expect("a self-CQ ran this cycle and took a snapshot");
+        op.restore_cq_state_for_attempt(attempt_id); // simulate a downstream dispatch failure
+
+        op.decide_at(even_ts); // idle
+        let round = op.decide_at(even_ts); // CQ #2 (post-restore): entering streak 0, not 1
+        assert!(
+            !round
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "restoring via the attempt-id path must roll the streak back \
+             exactly like restore_cq_state(), not just pause it"
+        );
+    }
+
+    #[test]
+    fn restore_cq_state_for_attempt_does_not_resurrect_an_offset_a_later_generation_bump_invalidated(
+    ) {
+        // PAN-38 round 2 (Codex): a downstream dispatch-failure report for an
+        // attempt that is STILL the latest snapshot (no newer self-CQ has
+        // superseded it) used to unconditionally restore the snapshot's
+        // sticky offset via restore_cq_state's full restore. But an
+        // intervening decide_at cycle's own Hold/Auto-transition generation
+        // check (PAN-39) can have already (correctly) cleared
+        // current_cq_offset_hz to None in between the snapshot and the
+        // restore -- the old unconditional restore would silently
+        // resurrect the stale pre-transition value, undoing that correct
+        // invalidation.
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        ));
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 2;
+        config.listen_cycle.initial_interval = 100;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(mode.clone());
+        op.set_tx_freq_mode_generation_source(generation.clone());
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle 1, establishes the operator's baseline generation
+        op.decide_at(even_ts); // idle 2 -> CQ #1 fires, streak -> 1, snapshot taken
+        let attempt_id = op
+            .last_cq_attempt_id()
+            .expect("a self-CQ ran this cycle and took a snapshot");
+        assert!(
+            op.current_cq_offset_hz.is_some(),
+            "CQ #1 must have picked a sticky offset"
+        );
+
+        // A Hold entry+exit happens entirely between polls -- invisible to a
+        // direct mode-atomic read, same as PAN-39's scenario.
+        generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        op.decide_at(even_ts); // idle cycle: observes the bump, clears the sticky offset
+        assert!(
+            op.current_cq_offset_hz.is_none(),
+            "the generation bump must have invalidated the sticky offset already"
+        );
+        // No new self-CQ has fired (idle cycle only) -- attempt_id is still
+        // the latest unresolved snapshot.
+        assert_eq!(op.last_cq_attempt_id(), Some(attempt_id));
+
+        // A late downstream dispatch-failure report for CQ #1 arrives now.
+        op.restore_cq_state_for_attempt(attempt_id);
+
+        assert!(
+            op.current_cq_offset_hz.is_none(),
+            "restoring a stale attempt must not resurrect an offset a later \
+             generation bump already (correctly) invalidated"
+        );
+    }
+
+    #[test]
+    fn restore_cq_state_still_undoes_the_streak_when_only_the_offset_was_invalidated() {
+        // PAN-38 round 4 (Codex): round 3's fix gated the ENTIRE restore
+        // (streak AND offset) on one shared generation, which over-blocked
+        // a safe streak restore whenever ONLY the offset had been
+        // invalidated since the snapshot (a Hold/Auto transition or band
+        // hop, neither of which touches the streak) -- silently
+        // under-counting a suppressed attempt's speculative "+1"
+        // permanently. The streak and offset generations are now tracked
+        // independently, so an offset-only invalidation must still let the
+        // streak roll back correctly.
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        ));
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 2;
+        config.listen_cycle.initial_interval = 100;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(mode.clone());
+        op.set_tx_freq_mode_generation_source(generation.clone());
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle 1, establishes the baseline generation
+        op.decide_at(even_ts); // idle 2 -> CQ #1 fires, streak -> 1, snapshot taken
+        let attempt_id = op
+            .last_cq_attempt_id()
+            .expect("a self-CQ ran this cycle and took a snapshot");
+
+        // A Hold entry+exit happens entirely between polls -- invalidates
+        // the offset (PAN-39) but has no bearing on the streak.
+        generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        op.decide_at(even_ts); // idle cycle: observes the bump, clears the sticky offset
+        assert!(
+            op.current_cq_offset_hz.is_none(),
+            "the generation bump must have invalidated the sticky offset"
+        );
+        assert_eq!(
+            op.last_cq_attempt_id(),
+            Some(attempt_id),
+            "no new self-CQ fired (idle cycle only) -- CQ #1's snapshot is still live"
+        );
+
+        // The coordinator determines CQ #1 was suppressed before reaching
+        // the radio and calls the restore path.
+        op.restore_cq_state_for_attempt(attempt_id);
+
+        assert_eq!(
+            op.cq_no_response_streak, 0,
+            "the streak must still roll back to its pre-attempt value -- an offset-only \
+             invalidation has no bearing on whether the streak restore is safe"
+        );
+        assert!(
+            op.current_cq_offset_hz.is_none(),
+            "the offset must remain uninvolved -- restoring it would resurrect the stale \
+             pre-transition value the generation bump already (correctly) cleared"
+        );
+    }
+
+    #[test]
+    fn restore_cq_state_for_attempt_bounded_compensates_a_stale_non_switching_attempt_id() {
+        // PAN-38 round 1 (Codex): a failure report for an attempt a LATER
+        // self-CQ has since superseded used to be a complete no-op — this
+        // can happen because the failure signal round-trips through the
+        // message bus and the QSO component's own task, so it isn't
+        // guaranteed to arrive before the next decide_at cycle takes a fresh
+        // snapshot. That silently baked the failed attempt's speculative
+        // "+1 streak" into the newer attempt's baseline forever. Since
+        // neither CQ #1 nor CQ #2 triggered a frequency switch, the bounded
+        // compensation path applies: decrementing the CURRENT streak by
+        // exactly 1 undoes CQ #1's contribution without touching CQ #2's own
+        // (still fully live) state — NOT a full restore to CQ #1's
+        // pre-attempt values, which would incorrectly discard CQ #2's own
+        // legitimate increment too.
+        let mut op = primed_operator(2, 5, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #1, streak -> 1
+        let stale_attempt_id = op
+            .last_cq_attempt_id()
+            .expect("a self-CQ ran this cycle and took a snapshot");
+
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #2, streak -> 2 (a NEW attempt/snapshot)
+        let current_offset = op.current_cq_offset_hz;
+        let current_streak = op.cq_no_response_streak;
+
+        // A late failure report for the OLD (CQ #1) attempt arrives now.
+        op.restore_cq_state_for_attempt(stale_attempt_id);
+
+        assert_eq!(
+            op.cq_no_response_streak,
+            current_streak - 1,
+            "a stale, non-switching attempt_id must decrement the streak by exactly the one \
+             increment it contributed, not leave it uncorrected"
+        );
+        assert_eq!(
+            op.current_cq_offset_hz, current_offset,
+            "a non-switching attempt never touched the offset, so compensating it needs no \
+             offset correction"
+        );
+    }
+
+    #[test]
+    fn restore_cq_state_for_attempt_does_not_bounded_compensate_across_a_directed_reply_reset() {
+        // PAN-38 round 3 (Codex): the bounded-compensation "-1" above assumes
+        // the streak is purely additive across the gap between the stale
+        // attempt's snapshot and the newer one that superseded it. A genuine
+        // directed reply arriving in between breaks that assumption -- it
+        // resets the streak to 0 independent of either attempt, so CQ #2's
+        // "streak -> 1" reflects its OWN single increment off a fresh
+        // baseline, not "CQ #1's contribution + CQ #2's contribution". A
+        // blind `-1` would wrongly eat into CQ #2's own genuine increment
+        // instead of the (already irrelevant) stale CQ #1 contribution the
+        // reply already wiped out.
+        let mut op = primed_operator(2, 5, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #1, streak -> 1
+        let stale_attempt_id = op
+            .last_cq_attempt_id()
+            .expect("a self-CQ ran this cycle and took a snapshot");
+
+        // A genuine directed reply arrives before CQ #2 -- resets the streak
+        // to 0 independent of either self-CQ attempt.
+        op.feed_decoded_messages(
+            &[DecodedMessageInfo {
+                callsign: Some("K9ZZ".into()),
+                frequency_hz: 1500.0,
+                snr: -5,
+                message_text: "W1ABC K9ZZ -05".into(),
+                slot_parity: None,
+                confidence: None,
+                time_offset_s: None,
+                decode_origin: None,
+            }],
+            &NullDxEvaluator,
+        );
+
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #2 (post-reset), streak -> 1 again
+        let current_streak = op.cq_no_response_streak;
+        assert_eq!(
+            current_streak, 1,
+            "CQ #2 fired off the reply-reset baseline, so the streak is exactly its own \
+             one increment"
+        );
+
+        // A late failure report for the OLD (CQ #1) attempt arrives now --
+        // its speculative "+1" was already erased by the directed reply, so
+        // there is nothing left to compensate.
+        op.restore_cq_state_for_attempt(stale_attempt_id);
+
+        assert_eq!(
+            op.cq_no_response_streak, current_streak,
+            "a directed-reply reset in between must block the bounded-compensation -1 -- \
+             applying it anyway would wrongly eat into CQ #2's own genuine increment"
+        );
+    }
+
+    #[test]
+    fn restore_cq_state_for_attempt_does_not_auto_correct_a_stale_switching_attempt_id() {
+        // PAN-38 round 1: the flip side of the test above — when the STALE
+        // attempt is the one that performed a frequency switch, undoing it
+        // would mean restoring an absolute pre-attempt baseline, unsafe once
+        // superseded (risks discarding a legitimate later switch). This case
+        // stays a no-op (with a warning logged, not asserted here), same as
+        // before this round — just now for a narrower, honestly-documented
+        // reason instead of blanket "always a no-op."
+        //
+        // `switch_after: 0` so the very FIRST self-CQ already satisfies
+        // `streak (0) >= switch_after` and triggers a switch immediately —
+        // simplest way to get a switching CQ #1 without needing several
+        // cycles to build up a real streak first.
+        let mut op = primed_operator(2, 0, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #1: streak (0) >= switch_after (0) -> switches, streak -> 1
+        let stale_attempt_id = op
+            .last_cq_attempt_id()
+            .expect("a self-CQ ran this cycle and took a snapshot");
+        assert!(
+            op.last_cq_snapshot.is_some_and(|s| s.did_switch),
+            "precondition: CQ #1 must have performed the switch this test exercises"
+        );
+
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #2, streak -> 2 (a NEW attempt/snapshot, no switch)
+        let current_offset = op.current_cq_offset_hz;
+        let current_streak = op.cq_no_response_streak;
+
+        op.restore_cq_state_for_attempt(stale_attempt_id);
+
+        assert_eq!(
+            op.cq_no_response_streak, current_streak,
+            "a stale SWITCHING attempt_id must not be auto-corrected — risks discarding a \
+             legitimate later switch"
+        );
+        assert_eq!(
+            op.current_cq_offset_hz, current_offset,
+            "a stale SWITCHING attempt_id must not be auto-corrected — risks discarding a \
+             legitimate later switch"
+        );
+    }
+
+    #[test]
     fn hold_mode_invalidates_sticky_offset_even_without_a_cq_firing() {
         // Codex review (PR #276, round 6): the round-5 fix only invalidated
         // current_cq_offset_hz when a Hold-mode self-CQ actually ran. If the
@@ -3556,6 +4299,99 @@ mod tests {
             op.current_cq_offset_hz.is_none(),
             "current_cq_offset_hz must be invalidated on observing Hold mode, \
              even when no self-CQ ran this cycle"
+        );
+    }
+
+    #[test]
+    fn generation_bump_invalidates_sticky_offset_even_when_mode_reads_auto_both_times() {
+        // PAN-39: an Auto -> Hold -> Auto round trip that completes entirely
+        // between two `decide_at` polling cycles is invisible to a direct
+        // read of the mode atomic — by the time the next cycle polls, the
+        // mode already reads Auto again, same as before the round trip.
+        // Simulate that "invisible" transition by bumping the generation
+        // counter without ever setting the mode atomic to Hold — decide_at
+        // must still discard the stale sticky offset.
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        ));
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 1000; // no self-CQ fires during this test
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(mode.clone());
+        op.set_tx_freq_mode_generation_source(generation.clone());
+
+        let stale_auto_offset = 1500.0;
+        op.current_cq_offset_hz = Some(stale_auto_offset);
+
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // establishes the operator's baseline generation
+        assert_eq!(
+            op.current_cq_offset_hz,
+            Some(stale_auto_offset),
+            "no transition observed yet -- sticky offset must survive"
+        );
+
+        // Simulate a Hold entry+exit that happened entirely between polls:
+        // the mode atomic is back to Auto, but the generation moved.
+        generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        assert_eq!(
+            mode.load(std::sync::atomic::Ordering::Relaxed),
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            "mode reads Auto at poll time, exactly like the invisible-Hold scenario"
+        );
+
+        op.decide_at(even_ts);
+
+        assert!(
+            op.current_cq_offset_hz.is_none(),
+            "a generation bump the mode-atomic read can't see must still \
+             invalidate the sticky offset"
+        );
+    }
+
+    #[test]
+    fn refresh_tx_freq_offset_invalidation_catches_a_bump_between_two_calls_in_one_cycle() {
+        // PAN-38 round 4 (Codex): `decide_at` calls
+        // `refresh_tx_freq_offset_invalidation` once at the top AND again
+        // immediately before the routine self-CQ path actually consumes
+        // `current_cq_offset_hz`, several hundred lines later in the same
+        // call -- a concurrent Hold->Auto round trip landing in that
+        // in-between window would otherwise go unnoticed by the top-level
+        // check alone, letting a self-CQ reuse a stale offset. Directly
+        // exercise the two-calls-with-a-bump-in-between pattern (the
+        // narrowest reproduction of the actual intra-cycle race, since a
+        // synchronous unit test can't literally pause mid-`decide_at`).
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        ));
+        let generation = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(mode);
+        op.set_tx_freq_mode_generation_source(generation.clone());
+
+        let sticky_offset = 1700.0;
+        op.current_cq_offset_hz = Some(sticky_offset);
+        op.refresh_tx_freq_offset_invalidation(); // establishes the baseline generation
+        assert_eq!(
+            op.current_cq_offset_hz,
+            Some(sticky_offset),
+            "no transition observed yet -- sticky offset must survive the first call"
+        );
+
+        // A Hold entry+exit happens entirely between the two calls -- the
+        // exact window the top-of-decide_at check alone can't see.
+        generation.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+        op.refresh_tx_freq_offset_invalidation(); // the pre-consumption revalidation
+        assert!(
+            op.current_cq_offset_hz.is_none(),
+            "a generation bump landing between the two calls in one decide_at cycle must \
+             still be caught before the offset is actually consumed"
         );
     }
 
