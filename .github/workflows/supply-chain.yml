@@ -323,23 +323,19 @@ jobs:
               alike), and every other real semantic by construction, since
               this IS the same code npm/pnpm itself uses.
 
-              raw_patterns is None for pnpm when pnpm-workspace.yaml omits
-              `packages` entirely: pnpm's own documented default is then
-              "root + every subdirectory" (@pnpm/find-workspace-packages
-              re-reads the manifest itself and falls through to
-              @pnpm/fs.find-packages' ['.', '**'] default -- verified against
-              the pinned tarballs' installed source, not guessed), so that
-              case is passed straight through to let pnpm apply its own
-              default rather than being shortcut here to zero (which
-              previously made this gate refuse every default-configured pnpm
-              workspace member, Codex round, CAT-318 follow-up). raw_patterns
-              is an explicit empty list for npm's missing/absent `workspaces`
-              field (npm has no implicit default -- absent means none) and
-              for pnpm's `packages: []` (an explicit, real zero); either
-              short-circuits below without invoking node."""
-              if raw_patterns == []:
-                  return set()
-              if raw_patterns is None and kind == "npm":
+              Empty/absent raw_patterns means ZERO non-root members for
+              BOTH npm and pnpm -- not "pass through so the tool applies
+              its own default". A prior version of this function passed
+              `None` straight through for pnpm on the theory that pnpm's
+              own default is "root + every subdirectory"; that was wrong
+              (round-3 fix, reversed by round 4 -- see the caller's own
+              comment below for the pinned-binary verification). npm has
+              no implicit `workspaces` default at all (absent means none)
+              -- same zero-coverage conclusion, different reason. Only an
+              explicit non-empty glob list ever reaches the resolver
+              below -- the caller is responsible for never passing `None`
+              here in the first place."""
+              if not raw_patterns:
                   return set()
               prefix = os.environ["WS_RESOLVERS_PREFIX"]
               abs_root = os.path.abspath(root)
