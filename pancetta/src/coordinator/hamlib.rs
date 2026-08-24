@@ -618,11 +618,26 @@ mod hamlib_command_in_flight_guard_tests {
 /// only at that point -- as close in time to the observed exit as
 /// possible -- the second read is far more likely to already reflect a
 /// flip that caused it.
+///
+/// PAN-28 (Codex round-1 on PR #303): generic over the two reads, rather
+/// than a concrete `&AtomicBool`/`&[JoinHandle]` wrapper delegating to a
+/// separately-tested ordering helper, so the check-order regression test
+/// (`child_task_crashed_tests::fixed_order_survives_a_shutdown_flip_the_old_order_misses`)
+/// drives THIS EXACT function with scripted reads instead of a real race
+/// -- a prior version split the ordering into an extracted
+/// `crashed_by_check_order` helper that the test drove directly, which
+/// left the WIRING at each real call site (which closure is passed as
+/// `is_finished` vs `shutdown_is_set`, or whether a future edit bypasses
+/// the helper and inlines the check differently) completely untested: the
+/// helper's own test would keep passing even if a call site's wiring, or
+/// the body here, regressed to the old (broken) order. Collapsing them
+/// into one generic function closes that gap — there is no other place
+/// the ordering logic could live.
 pub(crate) fn child_task_crashed(
-    shutdown: &std::sync::atomic::AtomicBool,
-    spawned_handles: &[tokio::task::JoinHandle<()>],
+    mut is_finished: impl FnMut() -> bool,
+    mut shutdown_is_set: impl FnMut() -> bool,
 ) -> bool {
-    spawned_handles.iter().any(|handle| handle.is_finished()) && !shutdown.load(Ordering::Acquire)
+    is_finished() && !shutdown_is_set()
 }
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageBus, MessageType};
@@ -1969,7 +1984,10 @@ impl super::ApplicationCoordinator {
                 // for the ABA race this closes.
                 let _hamlib_loop_ready_guard =
                     if publish_loop_readiness_if_children_alive(&hamlib_command_loop_ready, || {
-                        child_task_crashed(&shutdown, &spawned_handles)
+                        child_task_crashed(
+                            || spawned_handles.iter().any(|handle| handle.is_finished()),
+                            || shutdown.load(Ordering::Acquire),
+                        )
                     }) {
                         let _ = loop_ready_tx.send(());
                         Some(HamlibLoopReadyGuard::new(
@@ -1989,7 +2007,10 @@ impl super::ApplicationCoordinator {
 
                 // Process messages
                 while !shutdown.load(Ordering::Acquire) {
-                    if child_task_crashed(&shutdown, &spawned_handles) {
+                    if child_task_crashed(
+                        || spawned_handles.iter().any(|handle| handle.is_finished()),
+                        || shutdown.load(Ordering::Acquire),
+                    ) {
                         anyhow::bail!("Hamlib polling or PTT-watchdog child terminated");
                     }
                     match hamlib_rx.try_recv() {
@@ -3318,7 +3339,12 @@ mod child_task_crashed_tests {
         );
 
         assert!(
-            !child_task_crashed(&shutdown, std::slice::from_ref(&handle)),
+            !child_task_crashed(
+                || std::slice::from_ref(&handle)
+                    .iter()
+                    .any(|h| h.is_finished()),
+                || shutdown.load(Ordering::Acquire),
+            ),
             "a child observed exiting during shutdown must not be treated as a crash"
         );
     }
@@ -3341,7 +3367,12 @@ mod child_task_crashed_tests {
         );
 
         assert!(
-            child_task_crashed(&shutdown, std::slice::from_ref(&handle)),
+            child_task_crashed(
+                || std::slice::from_ref(&handle)
+                    .iter()
+                    .any(|h| h.is_finished()),
+                || shutdown.load(Ordering::Acquire),
+            ),
             "a child that exits outside of shutdown must still be flagged as a crash"
         );
     }
@@ -3355,8 +3386,10 @@ mod child_task_crashed_tests {
         assert!(!handle.is_finished());
 
         assert!(!child_task_crashed(
-            &shutdown,
-            std::slice::from_ref(&handle)
+            || std::slice::from_ref(&handle)
+                .iter()
+                .any(|h| h.is_finished()),
+            || shutdown.load(Ordering::Acquire),
         ));
         handle.abort();
     }
@@ -3378,69 +3411,54 @@ mod child_task_crashed_tests {
     /// (`shutdown`, checked only once a finished child is already known)
     /// reliably sees the fresh value.
     ///
-    /// This races a real background task -- which stores `shutdown = true`
-    /// and then returns -- against a tight polling loop, for many
-    /// independent trials, comparing the ACTUAL (fixed) `child_task_crashed`
-    /// against a locally reimplemented OLD-ordered formula under identical
-    /// conditions. The fixed function must never misfire; the old-ordered
-    /// formula is expected to misfire at least once across enough trials,
-    /// demonstrating the race is real and that check order is what closes
-    /// it (not just re-checking `shutdown` at all, which the MEDIUM #1 fix
-    /// already did in either order).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn check_order_closes_the_shutdown_flip_race_that_the_old_order_missed() {
-        const TRIALS: usize = 20_000;
-        let mut old_order_misfired = false;
-
-        for _ in 0..TRIALS {
-            let shutdown = Arc::new(AtomicBool::new(false));
-            let shutdown_for_task = shutdown.clone();
-            let handle = tokio::spawn(async move {
-                // Simulates the real shutdown sequence: flip the flag, THEN
-                // exit -- exactly the "child observes shutdown and returns"
-                // path both orderings are trying to classify correctly.
-                shutdown_for_task.store(true, Ordering::Release);
-            });
-
-            // Race a tight, non-yielding poll against the task above on a
-            // different worker thread (multi_thread runtime, no `.await`
-            // in this loop body so this thread doesn't voluntarily give up
-            // its slot) -- maximizing the chance of observing the handles
-            // in whatever intermediate states are actually reachable.
-            let handles = [handle];
-            loop {
-                let old_order_result =
-                    !shutdown.load(Ordering::Acquire) && handles.iter().any(|h| h.is_finished());
-                let new_order_result = child_task_crashed(&shutdown, &handles);
-
-                // The fixed function's core invariant: NEVER misclassify a
-                // shutdown-caused exit as a crash. Checked every iteration,
-                // not just at the end -- this must hold at every observed
-                // instant, not merely once settled.
-                assert!(
-                    !new_order_result,
-                    "child_task_crashed (fixed order) misclassified a shutdown-caused exit \
-                     as a crash"
-                );
-
-                if old_order_result {
-                    old_order_misfired = true;
-                }
-
-                if handles[0].is_finished() {
-                    break;
-                }
+    /// PAN-28 (Codex round-2 on PR #254): this used to race a real
+    /// background task against 20,000 timing trials, which was
+    /// scheduler-dependent -- on a runtime where the two reads always
+    /// landed both-pre-flip or both-post-flip, `old_order_misfired` could
+    /// stay false forever even though `child_task_crashed` was correct,
+    /// and the test's own failure message admitted as much. There's no
+    /// timer to pause and no yield point inside `child_task_crashed`'s
+    /// synchronous body to synchronize a real thread race on, so instead
+    /// this scripts the two reads directly: `FlipTrace::read()` returns
+    /// `false` on its first call and `true` on every call after --
+    /// modelling "the shutdown flip (and the child exit it causes) lands
+    /// in the single gap between whichever two reads the checked ordering
+    /// performs" -- with zero dependence on real scheduling.
+    ///
+    /// PAN-28 round 1 (Codex): drives `child_task_crashed` ITSELF, not a
+    /// separately-tested ordering helper it merely delegates to -- see
+    /// that function's doc comment for why the two used to be split (and
+    /// why splitting them left the wiring at each real call site
+    /// untested). Reverting the production order flips this test's first
+    /// assertion from pass to fail, no matter where in `child_task_crashed`
+    /// that reversion happens.
+    #[test]
+    fn fixed_order_survives_a_shutdown_flip_the_old_order_misses() {
+        struct FlipTrace(std::cell::Cell<u32>);
+        impl FlipTrace {
+            fn new() -> Self {
+                Self(std::cell::Cell::new(0))
+            }
+            fn read(&self) -> bool {
+                self.0.set(self.0.get() + 1);
+                self.0.get() >= 2
             }
         }
 
+        let trace = FlipTrace::new();
         assert!(
-            old_order_misfired,
+            !child_task_crashed(|| trace.read(), || trace.read()),
+            "fixed order (is_finished first) misclassified a shutdown flip landing \
+             between the two reads as a crash"
+        );
+
+        let trace = FlipTrace::new();
+        let old_order_shutdown_first = !trace.read() && trace.read();
+        assert!(
+            old_order_shutdown_first,
             "expected the OLD check order (shutdown read before is_finished()) to \
-             misclassify at least one shutdown-caused exit as a crash across {TRIALS} trials \
-             -- if this never triggers, either the race genuinely isn't reachable on this \
-             platform/scheduler or TRIALS needs to be higher; the fixed order's own \
-             never-misfires assertion above already ran unconditionally every iteration \
-             regardless of whether this one fires"
+             misclassify a shutdown flip landing between the two reads as a crash -- \
+             if this doesn't fire, the trace no longer models the race"
         );
     }
 }
@@ -3656,7 +3674,10 @@ mod children_publish_race_tests {
 
         // Mirrors the real (fixed) call site exactly: check liveness
         // BEFORE reporting readiness.
-        if child_task_crashed(&shutdown, &spawned_handles) {
+        if child_task_crashed(
+            || spawned_handles.iter().any(|handle| handle.is_finished()),
+            || shutdown.load(Ordering::Acquire),
+        ) {
             // Withhold: neither the atomic flag nor the oneshot send.
             // Explicitly drop `loop_ready_tx` without sending, mirroring
             // the real task going on to bail and end.
