@@ -1032,6 +1032,105 @@ impl Ft8Message {
     }
 }
 
+/// "Is this token shaped like a real (possibly compound) callsign" check.
+///
+/// Originally lived in `encoder.rs` (guarding the i3=4 nonstandard-callsign
+/// TX path against being triggered by arbitrary free text) but was moved
+/// here — PAN-27 round 5 (Codex round-2 review of PR #305, finding 2) needs
+/// the DECODER's type-4 hash-seeding loop (`Ft8Decoder`'s
+/// `all_learned`/`add_callsign` step in decoder.rs) to apply this exact
+/// same strict shape check before learning a type-4 exact field into the
+/// callsign hash table — `looks_like_nonstandard_callsign` above is
+/// deliberately looser (any alphanumeric run with a digit and a letter) and
+/// was letting free-text-shaped CRC-valid garbage (e.g. `"ABC1D"`) get
+/// learned as a "real" callsign, so a LATER frame sharing its 12-bit hash
+/// rendered as that bogus identity instead of resolving correctly.
+/// `encoder.rs` is feature-gated behind `transmit`, but `decoder.rs` is not
+/// — living here (always compiled) lets both call the identical function
+/// instead of the decoder duplicating a second, possibly-diverging check.
+///
+/// PAN-17 round 2 (Codex review): the original version of this check (≥3
+/// chars, has a digit AND a letter, in any position) was too loose —
+/// `"HELLO1 WORLD2"` is valid 13-char free text, but both tokens pass that
+/// check and fit the 58-bit hash-callsign field, so `encode_message` would
+/// silently transmit a WRONG type-4 frame instead of the requested free
+/// text. Real callsigns (including compound forms) always have their digit
+/// "block" with letters on BOTH sides — a prefix before it and a suffix
+/// after it (`K1ABC`, `WE9G`, `8G81PA`, `3E40CDW`) — never a bare trailing
+/// digit with no suffix letters (`HELLO1`, `WORLD2`). This mirrors this
+/// module's own `looks_like_callsign` (the Standard-type shape rule), so
+/// the two paths agree on what a plausible callsign looks like.
+///
+/// PAN-22 (round 3+ finding): a trailing `/<digits>` is the call-area
+/// reassignment convention (`K1ABC/4`, `W1AW/8`) — `pack28` only special-
+/// cases `/P`/`/R`, so this genuinely needs the i3=4 fallback, and
+/// `pancetta-qso::exchange::validate_callsign` already treats it as a valid
+/// compound form. Strip it and validate the base call underneath.
+///
+/// PAN-27 (round 4 finding): the suffix-after-digit rule alone still
+/// misclassifies ordinary words like `"ABC1D"`/`"EFG2H"` as callsign-shaped
+/// (they satisfy it too). Real callsign/DXCC prefixes are at most 2 letters
+/// before the first digit (`K1`, `W1`, `AB1`), or a digit-led international
+/// form with none at all (`8G8...`, `3E4...`) — a longer all-letter run
+/// before the first digit is an ordinary word, not a prefix.
+pub(crate) fn looks_like_compound_callsign(s: &str) -> bool {
+    if s.len() < 3 {
+        return false;
+    }
+    if let Some(slash_pos) = s.rfind('/') {
+        let base = &s[..slash_pos];
+        let suffix = &s[slash_pos + 1..];
+        if base.is_empty() {
+            return false;
+        }
+        if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) {
+            return looks_like_compound_callsign(base);
+        }
+        // Compound prefix/homecall form (e.g. "YS/WE9G", "PJ4/KA1ABC"):
+        // validate the shape of the final component; earlier components
+        // (the DXCC prefix) just need to be present.
+        return looks_like_compound_callsign_shape(suffix.as_bytes());
+    }
+    looks_like_compound_callsign_shape(s.as_bytes())
+}
+
+/// Digit/letter shape check shared by `looks_like_compound_callsign`'s
+/// branches — see that function's doc for the rationale of each rule.
+fn looks_like_compound_callsign_shape(bytes: &[u8]) -> bool {
+    if bytes.len() < 2 {
+        return false;
+    }
+    let Some(last_digit_pos) = bytes.iter().rposition(u8::is_ascii_digit) else {
+        return false; // no digit at all
+    };
+    // At least one suffix letter after the last digit.
+    if last_digit_pos + 1 >= bytes.len()
+        || !bytes[last_digit_pos + 1..]
+            .iter()
+            .all(u8::is_ascii_alphabetic)
+    {
+        return false;
+    }
+    // The prefix before the FIRST digit must be a plausible callsign/DXCC
+    // prefix: at most 2 letters (or none, for a digit-led form).
+    let first_digit_pos = bytes.iter().position(u8::is_ascii_digit).unwrap();
+    let prefix = &bytes[..first_digit_pos];
+    if prefix.is_empty() {
+        // Digit-led form (e.g. "8G81PA", "3E40CDW"): a genuine digit-led
+        // DXCC prefix always has a letter immediately after that leading
+        // digit ("8G...", "3E..."). Free text that merely starts with a
+        // digit run — "1234A" — has another digit right after the first
+        // one, not a letter, so it must NOT satisfy this shape check
+        // (PAN-27 round 5 / Codex round-2 finding 1: an empty prefix
+        // previously passed unconditionally, misclassifying free text like
+        // "1234A 5678B" as a compound-callsign exchange and transmitting a
+        // bogus i3=4 frame instead of the requested free text).
+        return first_digit_pos + 1 < bytes.len()
+            && bytes[first_digit_pos + 1].is_ascii_alphabetic();
+    }
+    prefix.len() <= 2 && prefix.iter().all(u8::is_ascii_alphabetic)
+}
+
 /// Decoded FT8 message with metadata
 #[derive(Debug, Clone)]
 pub struct DecodedMessage {
