@@ -164,7 +164,7 @@ jobs:
       # next, letting the reporter treat a PR-fabricated "no advisories"
       # baseline as the real pre-PR scan (Codex round, widdershins #219).
       - name: "Run scanner on existing code"
-        uses: google/osv-scanner-action/osv-scanner-action@baa4139e56d6312335d899e6ba045fa16d1d3d0b # v2.5.1
+        uses: google/osv-scanner-action/osv-scanner-action@ffa0a5f39214d80778c9b494822d94d0d9668458 # v2.5.1
         env:
           GOTOOLCHAIN: auto
         continue-on-error: true
@@ -177,7 +177,7 @@ jobs:
       - name: "Checkout head of the merge group"
         run: git checkout -f "$GITHUB_SHA"
       - name: "Run scanner on new code"
-        uses: google/osv-scanner-action/osv-scanner-action@baa4139e56d6312335d899e6ba045fa16d1d3d0b # v2.5.1
+        uses: google/osv-scanner-action/osv-scanner-action@ffa0a5f39214d80778c9b494822d94d0d9668458 # v2.5.1
         env:
           GOTOOLCHAIN: auto
         continue-on-error: true
@@ -188,7 +188,7 @@ jobs:
             -r
             ./
       - name: "Run osv-scanner-reporter"
-        uses: google/osv-scanner-action/osv-reporter-action@baa4139e56d6312335d899e6ba045fa16d1d3d0b # v2.5.1
+        uses: google/osv-scanner-action/osv-reporter-action@ffa0a5f39214d80778c9b494822d94d0d9668458 # v2.5.1
         with:
           scan-args: |-
             --output=${{ env.OSV_SCAN_DIR }}/results.sarif
@@ -985,3 +985,4 @@ jobs:
             fi
           done
           echo "All supply-chain scans passed."
+
