@@ -1398,6 +1398,116 @@ async fn test_loopback_compound_callsign_qso_advances_state_machine() {
     );
 }
 
+/// PAN-49: real encode -> modulate -> decode -> classify -> advance loopback
+/// for the state-QSO-party "R"+grid ack shape (`ExchangeShape::GridWithRAck`)
+/// that stalled a live QSO the night of 2026-08-29/30 -- the partner acked
+/// with "K5ARH K5TD R EM40" instead of a numeric report, which today's
+/// classifier has no pattern for (it falls through to `NonStandard`).
+/// Task 1 fixed the encode side (packgrid/parse_standard_message); this test
+/// proves the decode side: with the QSO contest-engaged
+/// (`QsoManager::engage_contest_profile`), PAN-49's reclassification step
+/// recognizes the `NonStandard` decode and advances the state machine to
+/// `WaitingForConfirmation` with the grid captured, exactly as the fix
+/// intends.
+///
+/// Only K5ARH's own `QsoManager` runs here -- PAN-49 is entirely about how
+/// OUR engine handles the decode, not how K5TD's software produced the ack,
+/// so `dx_codec` is used purely to encode K5TD's real over-the-air text.
+#[tokio::test]
+async fn test_loopback_pan_49_contest_r_grid_ack_advances_qso() {
+    use pancetta_qso::QsoManager;
+
+    let freq = 1203.0;
+
+    // dx_codec encodes K5TD's real over-the-air "R"+grid ack (Task 1's
+    // packgrid/parse_standard_message fix). It runs no QSO engine of its
+    // own -- PAN-49 is entirely about how OUR (K5ARH's) engine handles the
+    // decode, not how K5TD's software produced it.
+    let mut dx_codec = Station::new("K5TD", "EM40");
+    let mut us_codec = Station::new("K5ARH", "EM10");
+
+    let config = QsoManagerConfig {
+        our_callsign: "K5ARH".to_string(),
+        our_grid: Some("EM10".to_string()),
+        timeouts: TimeoutConfig {
+            cq_timeout: 120,
+            report_timeout: 120,
+            confirmation_timeout: 120,
+            max_qso_duration: 600,
+            cleanup_interval: 600,
+            manual_call_watchdog_minutes: 5,
+            manual_call_max_calls: 10,
+            repetitive_tx_timeout_secs: 100_000,
+        },
+        contest_mode: None,
+        auto_sequence: AutoSequenceConfig {
+            enabled: false,
+            auto_respond_cq: false,
+            auto_send_reports: false,
+            auto_send_confirmations: false,
+            action_delay_ms: 0,
+        },
+        duplicate_checking: DuplicateCheckConfig {
+            enabled: false,
+            ..DuplicateCheckConfig::default()
+        },
+        ..Default::default()
+    };
+    let manager = QsoManager::new(config);
+    manager.start().await.unwrap();
+
+    // We manually respond to K5TD's CQ and engage the state-QSO-party
+    // profile for this QSO (no UI yet -- a later plan wires this to the
+    // "enter this contest?" modal).
+    let qso_id = manager
+        .respond_to_cq_manual("K5TD".to_string(), freq, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        manager.get_qso(qso_id).await.unwrap().state,
+        QsoState::RespondingToCq { .. }
+    ));
+    let profile = pancetta_qso::contest::catalog::builtin_catalog()
+        .into_iter()
+        .find(|p| p.id == "us-state-qso-party")
+        .unwrap();
+    manager
+        .engage_contest_profile(qso_id, profile)
+        .await
+        .unwrap();
+
+    // Real encode -> modulate -> decode of K5TD's "R"+grid ack. Before
+    // Task 1's fix this silently encoded as an empty exchange.
+    let audio = dx_codec.encode_and_modulate("K5ARH K5TD R EM40", freq);
+    let decoded = us_codec.decode(&audio);
+    assert!(!decoded.is_empty(), "must decode the R+grid contest ack");
+    let decoded_text = &decoded[0].text;
+    assert_eq!(decoded_text, "K5ARH K5TD R EM40");
+
+    // Today's classifier has no pattern for this shape -- it parses as
+    // NonStandard, exactly like the real 2026-08-29/30 PAN-49 decode did.
+    let parsed = pancetta_qso::utils::parse_ft8_message(decoded_text, "K5ARH").unwrap();
+    assert!(matches!(parsed, MessageType::NonStandard { .. }));
+
+    // Feed it through the real QSO engine, exactly as the coordinator
+    // does. PAN-49's fix reclassifies and advances it because this QSO is
+    // contest-engaged.
+    manager
+        .process_message(parsed, decoded_text.clone(), freq, Some(-11.0))
+        .await
+        .unwrap();
+
+    let progress = manager.get_qso(qso_id).await.unwrap();
+    assert!(
+        matches!(
+            progress.state,
+            QsoState::WaitingForConfirmation { grid_square: Some(ref g), .. } if g == "EM40"
+        ),
+        "expected WaitingForConfirmation with grid EM40, got: {:?}",
+        progress.state
+    );
+}
+
 /// PAN-17 round 4 (Codex re-review of #248): "resolve first-time callers
 /// before filtering type-4 replies."
 ///
