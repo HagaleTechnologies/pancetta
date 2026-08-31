@@ -284,6 +284,15 @@ pub enum MessageType {
         serial: SerialNumber,
     },
 
+    /// Contest ack via grid instead of a numeric report:
+    /// "K1ABC W9XYZ R EN37" (PAN-49 — state QSO parties, ARRL Intl Digital).
+    ContestReply {
+        to_station: String,
+        from_station: String,
+        grid: String,
+        is_ack: bool,
+    },
+
     /// Non-standard message
     NonStandard { text: String },
 }
@@ -386,8 +395,30 @@ pub struct QsoMetadata {
     /// Their callsign (if known)
     pub their_callsign: Option<String>,
 
-    /// Operating frequency in Hz
+    /// Operating frequency in Hz — always the AUDIO OFFSET within the slot
+    /// (e.g. ~200-3000 Hz), even after the QSO completes. Every TX-path
+    /// consumer (the modulator's ~3100 Hz limit, `resend_last_tx`, QSY,
+    /// Hound offset logic, duplicate-checking) depends on this invariant
+    /// holding for the QSO's ENTIRE lifetime, not just while active — do not
+    /// overwrite it with a dial-adjusted RF value after completion (PAN-25
+    /// round 2 regression: doing so made a close-step retry/73-recovery try
+    /// to transmit at the ~14 MHz RF frequency, which the TX worker
+    /// correctly rejected as exceeding its modulation limit, so the 73 never
+    /// keyed). See `completed_rf_frequency_hz` for the true RF frequency.
     pub frequency: f64,
+
+    /// The true RF frequency (dial + `frequency`) at the moment this QSO
+    /// completed, stamped once by the completion-transition sites in
+    /// `qso_manager.rs` (PAN-25 round 2) — separate from `frequency` so the
+    /// audio-offset invariant above stays intact for every other consumer.
+    /// `None` for an active QSO, or a completed QSO stamped before this
+    /// field existed / with no dial source configured. Used only for
+    /// band-scoping the recently-completed-QSO suppression checks
+    /// (`find_qsos_for_message`, `find_recently_completed_manual_qso_for_at`)
+    /// — falls back to `frequency` itself (audio-offset comparison, matching
+    /// pre-PAN-25 behavior) when unset.
+    #[serde(default)]
+    pub completed_rf_frequency_hz: Option<f64>,
 
     /// Operating mode (should be "FT8")
     pub mode: String,
@@ -854,7 +885,8 @@ impl MessageType {
             | MessageType::ReportAck { to_station, .. }
             | MessageType::FinalConfirmation { to_station, .. }
             | MessageType::SeventyThree { to_station, .. }
-            | MessageType::ContestExchange { to_station, .. } => to_station == callsign,
+            | MessageType::ContestExchange { to_station, .. }
+            | MessageType::ContestReply { to_station, .. } => to_station == callsign,
             _ => false,
         }
     }
@@ -876,7 +908,8 @@ impl MessageType {
             | MessageType::ReportAck { from_station, .. }
             | MessageType::FinalConfirmation { from_station, .. }
             | MessageType::SeventyThree { from_station, .. }
-            | MessageType::ContestExchange { from_station, .. } => Some(from_station),
+            | MessageType::ContestExchange { from_station, .. }
+            | MessageType::ContestReply { from_station, .. } => Some(from_station),
             MessageType::NonStandard { .. } => None,
         }
     }
@@ -891,7 +924,8 @@ impl MessageType {
             | MessageType::ReportAck { to_station, .. }
             | MessageType::FinalConfirmation { to_station, .. }
             | MessageType::SeventyThree { to_station, .. }
-            | MessageType::ContestExchange { to_station, .. } => Some(to_station),
+            | MessageType::ContestExchange { to_station, .. }
+            | MessageType::ContestReply { to_station, .. } => Some(to_station),
             MessageType::Cq { .. } | MessageType::NonStandard { .. } => None,
         }
     }
@@ -907,7 +941,8 @@ impl MessageType {
             | MessageType::ReportAck { from_station, .. }
             | MessageType::FinalConfirmation { from_station, .. }
             | MessageType::SeventyThree { from_station, .. }
-            | MessageType::ContestExchange { from_station, .. } => from_station == callsign,
+            | MessageType::ContestExchange { from_station, .. }
+            | MessageType::ContestReply { from_station, .. } => from_station == callsign,
             _ => false,
         }
     }
@@ -1198,5 +1233,31 @@ mod tests {
             } if failed_reason == &reason && **last_state == QsoState::Idle
         ));
         assert!(failed.ladder_view(QsoRole::Caller).is_none());
+    }
+
+    #[test]
+    fn contest_reply_is_addressed_to_the_to_station() {
+        let msg = MessageType::ContestReply {
+            to_station: "K5ARH".to_string(),
+            from_station: "K5TD".to_string(),
+            grid: "EM40".to_string(),
+            is_ack: true,
+        };
+        assert!(msg.is_addressed_to("K5ARH"));
+        assert!(!msg.is_addressed_to("K5TD"));
+    }
+
+    #[test]
+    fn contest_reply_sender_and_addressee_callsigns() {
+        let msg = MessageType::ContestReply {
+            to_station: "K5ARH".to_string(),
+            from_station: "K5TD".to_string(),
+            grid: "EM40".to_string(),
+            is_ack: true,
+        };
+        assert_eq!(msg.sender_callsign(), Some("K5TD"));
+        assert_eq!(msg.addressee_callsign(), Some("K5ARH"));
+        assert!(msg.is_from("K5TD"));
+        assert!(!msg.is_from("K5ARH"));
     }
 }

@@ -639,8 +639,17 @@ pub struct ApplicationCoordinator {
     /// thread-safely-mutable state both that task and
     /// `start_hamlib_component`/`replay_or_fallback` can reach without
     /// `&mut self` -- same shape as `last_freq_command` below.
+    ///
+    /// PAN-35 (round-16 review, Codex P2): keyed by `pancetta_hamlib::Vfo`
+    /// (A vs B), not a single shared slot. The remote QSY path
+    /// (`station_agent`) can send `SetFrequency` for either VFO; a single
+    /// shared slot/supersession domain let a newer VFO-A command wrongly
+    /// discard (as "superseded") an older still-pending VFO-B command, or
+    /// let one VFO's retry silently overwrite the other's tracking --
+    /// changing A must never affect B's pending state or vice versa.
     #[cfg(feature = "pancetta-hamlib")]
-    pub(crate) hamlib_pending_frequency: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
+    pub(crate) hamlib_pending_frequency:
+        Arc<std::sync::Mutex<HashMap<pancetta_hamlib::Vfo, ComponentMessage>>>,
     #[cfg(feature = "pancetta-hamlib")]
     pub(crate) hamlib_pending_split: Arc<std::sync::Mutex<Option<ComponentMessage>>>,
     /// Authorization refresh child owned by the current StationAgent generation.
@@ -690,6 +699,17 @@ pub struct ApplicationCoordinator {
     /// Number of active supervisor-owned hard mutes. Non-zero while Hamlib is
     /// being torn down and reacquired; separate from operator TX policy.
     pub(crate) tx_restart_inhibit: Arc<AtomicU32>,
+    /// PAN-33: count of `tx_restart_inhibit` increments `handle_finished_task`
+    /// has `mem::forget`'d (permanently leaked) for a Hamlib crash it believed
+    /// was terminal. A later successful restart of Hamlib -- reached via the
+    /// early-return guard's budget-aware fallthrough when that same crash is
+    /// rediscovered on a subsequent health pass -- pays every one of these
+    /// back (see `handle_finished_task`'s `Ok(())` restart-dispatch arm), so
+    /// `tx_restart_inhibit` doesn't get stuck above zero once Hamlib actually
+    /// recovers. Only ever touched from the single-threaded supervisor path
+    /// (`run_main_loop` -> `check_task_handles` -> `handle_finished_task`), so
+    /// a plain counter is enough -- no atomic/lock needed.
+    pub(crate) hamlib_leaked_tx_inhibits: u32,
     /// PAN-19 round-7 review (Codex P1): whether the CURRENT Hamlib
     /// generation's message loop has confirmed it's actually consuming
     /// commands. Independent of, and orthogonal to, `tx_restart_inhibit`
@@ -789,6 +809,16 @@ pub struct ApplicationCoordinator {
     /// (`f`). Orthogonal to [`Self::tx_policy`].
     tx_freq_mode: Arc<std::sync::atomic::AtomicU8>,
 
+    /// PAN-39: generation counter bumped alongside every `tx_freq_mode`
+    /// store (see `tui_relay.rs`'s `ToggleTxFreqMode`/`SetTxOffset`
+    /// handlers). Lets the autonomous operator detect a Hold/Auto
+    /// transition it didn't directly observe — e.g. an Auto -> Hold -> Auto
+    /// round trip that completed entirely between two `decide_at` polling
+    /// cycles — without needing a direct handle from `tui_relay.rs`'s
+    /// command handlers into the operator (which lives behind its own
+    /// `Arc<Mutex<..>>` elsewhere in this struct).
+    tx_freq_mode_generation: Arc<std::sync::atomic::AtomicU32>,
+
     /// Unix-epoch milliseconds of the operator's last console keypress (0 =
     /// never / headless). Stamped by the TUI key handler, read by the autonomous
     /// engine's FCC §97.221 presence gate (see [`operator_present_now`]).
@@ -814,6 +844,18 @@ pub struct ApplicationCoordinator {
     /// by `start_audio_pipeline` (`audio.rs`) ahead of the stub/real-device
     /// branches.
     pub(crate) replay_path: Option<PathBuf>,
+
+    /// PAN-41 round 3: test-only override for the `~/.pancetta` directory
+    /// `start_qso_component` otherwise always derives from `dirs::home_dir()`
+    /// -- including under `--replay`, whose own documented contract is to
+    /// still *read* the real ADIF/index for duplicate/DX-Hunter history
+    /// seeding (only writes are suppressed). Without this, an in-process
+    /// test that merely sets `replay_path` to a dummy value (to satisfy
+    /// `replay_mode()`) still reads whatever real `~/.pancetta/qsos.adi`
+    /// happens to exist on the machine running the test. Always `None` in
+    /// production (nothing outside `#[cfg(test)]` code ever sets it); test
+    /// helpers set this to an isolated temp dir.
+    pub(crate) pancetta_home_override: Option<PathBuf>,
 
     /// One-shot test transmission. If Some, after startup the coordinator
     /// injects a single TransmitRequest with this message text and shuts
@@ -1632,6 +1674,7 @@ impl ApplicationCoordinator {
                 pancetta_core::TxPolicy::default().as_u8(),
             )),
             tx_restart_inhibit: Arc::new(AtomicU32::new(0)),
+            hamlib_leaked_tx_inhibits: 0,
             hamlib_command_loop_ready: Arc::new(AtomicBool::new(true)),
             hamlib_generation: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             hamlib_command_in_flight: Arc::new(std::sync::atomic::AtomicU32::new(0)),
@@ -1641,6 +1684,11 @@ impl ApplicationCoordinator {
             tx_freq_mode: Arc::new(std::sync::atomic::AtomicU8::new(
                 pancetta_core::TxFreqMode::default().as_u8(),
             )),
+            // PAN-39: bumped once per `tx_freq_mode` store (see the
+            // `ToggleTxFreqMode`/`SetTxOffset` handlers in `tui_relay.rs`) so
+            // the autonomous operator's `decide_at` can detect a Hold/Auto
+            // transition it didn't directly observe.
+            tx_freq_mode_generation: Arc::new(std::sync::atomic::AtomicU32::new(0)),
             // 0 = no console input seen yet → not present → respond-only
             // initiation until the operator touches the keyboard.
             last_operator_input_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1653,6 +1701,7 @@ impl ApplicationCoordinator {
             metrics_port,
             wav_path,
             replay_path,
+            pancetta_home_override: None,
             test_tx,
             test_tx_offset,
             cached_lookup: std::sync::Arc::new(
@@ -1718,7 +1767,7 @@ impl ApplicationCoordinator {
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_orphans: Vec::new(),
             #[cfg(feature = "pancetta-hamlib")]
-            hamlib_pending_frequency: Arc::new(std::sync::Mutex::new(None)),
+            hamlib_pending_frequency: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_pending_split: Arc::new(std::sync::Mutex::new(None)),
             station_agent_poll: None,

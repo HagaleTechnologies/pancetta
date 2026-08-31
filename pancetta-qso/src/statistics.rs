@@ -2281,6 +2281,7 @@ mod tests {
                 our_callsign: "W1ABC".to_string(),
                 their_callsign: Some(format!("K1DE{}", i)),
                 frequency: 14074000.0 + (i as f64 * 1000.0),
+                completed_rf_frequency_hz: None,
                 mode: "FT8".to_string(),
                 start_time,
                 end_time: Some(start_time + Duration::minutes(2)),

@@ -2640,6 +2640,13 @@ impl Ft8Decoder {
         self.message_parser.add_callsign(callsign);
     }
 
+    /// All callsigns this decoder's i3=4 hash table has learned so far
+    /// (PAN-27 finding 2) — used to carry accumulated learning into a
+    /// freshly-rebuilt decoder rather than discarding it.
+    pub fn learned_callsigns(&self) -> Vec<String> {
+        self.message_parser.learned_callsigns()
+    }
+
     /// Create a new decoder with custom message handler
     pub fn with_message_handler(
         config: Ft8Config,
@@ -3320,8 +3327,49 @@ impl Ft8Decoder {
             } else {
                 auto_passband_range.as_ref()
             };
-            let mut sync_candidates =
-                self.costas_sync_search_partner(&spectrogram, effective_scope, partner_freq_hz)?;
+            // Codex round-1 finding on PR #306 (PAN-31 follow-up): defer
+            // this call's own native-only NMS pass exactly when the
+            // pass-0 seed-union block below is ALSO about to run — that
+            // block's `finalize_native_and_seed_candidate_union` call is
+            // then the ONE NMS pass, over the complete native+seed
+            // union, instead of an early native-only pass that could
+            // permanently discard a candidate a later seed would have
+            // spared. When the flag is off (production today),
+            // `should_run_seed_union` is always `false` and behavior is
+            // byte-identical to before this fix.
+            //
+            // Codex round-2 finding on PR #306 (PAN-31 follow-up): this
+            // decision used to be computed TWICE — once here (to decide
+            // `defer_nms`) and again, independently, at the seed-union
+            // `if` guard below, each with its OWN
+            // `self.current_budget.has_time()` call. A finite
+            // `DecodeBudget` that still had time at THIS check could
+            // expire during the native Costas search just below or the
+            // optional three-method spectral sweep (hb-228) that runs
+            // between the two checks, so the later, independently
+            // re-evaluated `has_time()` could come back `false` even
+            // though this one came back `true`. That left `defer_nms`
+            // `true` (native NMS skipped here) while the seed-union
+            // block that was supposed to supply the deferred NMS pass
+            // got skipped too — NO NMS pass ran at all, and the
+            // candidate list reached the unconditional floor-candidate
+            // decode completely unsuppressed. Freezing the decision
+            // into `should_run_seed_union` ONCE, before the native
+            // search and spectral sweep even run, and reusing that same
+            // value both here and at the later guard, means the two
+            // sites can never diverge: if it's `true`, the seed-union
+            // block (and its NMS pass) is now guaranteed to run later in
+            // this same pass-0 iteration, regardless of how much of the
+            // budget the intervening work consumes.
+            let should_run_seed_union = self.should_run_ft8lib_seed_union(pass);
+            let defer_nms = should_run_seed_union;
+            let mut sync_candidates = self.costas_sync_search_with_threshold_and_partner(
+                &spectrogram,
+                self.config.min_sync_score,
+                effective_scope,
+                partner_freq_hz,
+                defer_nms,
+            )?;
 
             // hb-228: 3-method spectral sweep. On the initial pass, also run the
             // Costas sync search over sqrt- and linear-compressed spectrograms
@@ -3331,6 +3379,19 @@ impl Ft8Decoder {
             // population; the union widens recall before the (unchanged)
             // downstream decode/CRC/LDPC gating. Pass-0-only — multipass already
             // re-searches the subtracted residual.
+            // Codex round-2 finding on PR #306 (PAN-31 follow-up): the
+            // primary sweep just above receives `defer_nms`, but until
+            // this fix these alternate-transform sweeps did not — the
+            // thin `costas_sync_search_partner` wrapper hardcoded
+            // `defer_nms = false`, so an alternate-sweep candidate could
+            // still suppress a neighbor during an early, non-deferred
+            // NMS pass, before the seed union (which might later
+            // suppress the suppressor instead) ever got a chance to
+            // reconsider. All three sweeps (primary + these two
+            // alternates) participate in the SAME pass-0 candidate list
+            // that the seed-union block below reconsiders as a whole, so
+            // all three must share the SAME `defer_nms` /
+            // `should_run_seed_union` decision.
             if self.config.three_method_spectral_sweep_enabled && pass == 0 {
                 for transform in [MagnitudeTransform::Sqrt, MagnitudeTransform::Linear] {
                     if let Ok(alt_spec) = self.compute_spectrogram_with(&audio, transform) {
@@ -3338,6 +3399,7 @@ impl Ft8Decoder {
                             &alt_spec,
                             effective_scope,
                             partner_freq_hz,
+                            defer_nms,
                         ) {
                             sync_candidates.extend(extra);
                         }
@@ -3385,8 +3447,23 @@ impl Ft8Decoder {
             // shared tail would change behavior whenever that flag is on.
             let mut ft8lib_seed_keys: std::collections::HashSet<(usize, usize, usize)> =
                 std::collections::HashSet::new();
-            if self.config.ft8lib_sync_seeds_enabled && pass == 0 && self.current_budget.has_time()
-            {
+            // PAN-32: FT2 has no ft8_lib counterpart, so every seed is rejected
+            // downstream by the translator's block_size guard anyway — skip the
+            // FFI search entirely rather than pay its wall-clock cost for zero
+            // surviving seeds (and, under a finite `DecodeBudget`, at the expense
+            // of legitimate candidate decoding).
+            //
+            // Codex round-2 finding on PR #306 (PAN-31 follow-up): this
+            // guard used to re-derive the same condition independently
+            // (including its own fresh `self.current_budget.has_time()`
+            // call) instead of reusing `should_run_seed_union`, computed
+            // once above before the native Costas search and the
+            // optional three-method spectral sweep ran. Reusing that
+            // frozen value here is the actual fix — see the comment at
+            // its definition for why a second, independent `has_time()`
+            // check here could disagree with the first and leave the
+            // candidate list with NO NMS pass at all.
+            if should_run_seed_union {
                 let seed_start = std::time::Instant::now();
 
                 // Reproduce the native sweep's envelope EXACTLY (see
@@ -3409,9 +3486,7 @@ impl Ft8Decoder {
 
                 let protocol = match self.protocol_params.protocol {
                     Protocol::Ft4 => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT4,
-                    // FT2 has no ft8_lib counterpart. The translator's
-                    // block_size guard then rejects every seed, so this is
-                    // inert rather than wrong.
+                    // Ft2 is excluded by the `is_ft2()` guard above.
                     _ => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT8,
                 };
 
@@ -3491,29 +3566,11 @@ impl Ft8Decoder {
                     }
                 }
 
-                // Dedup exact (time,freq,sub) collisions keeping the highest
-                // score, then re-sort best-first and restore the configured
-                // cap. The two-level sort is a HARD PRECONDITION, not style:
-                // `dedup_by_key` removes only CONSECUTIVE equal keys, and the
-                // descending secondary sort is what makes the retained member
-                // of each group the highest-scoring one. Do not reorder it.
-                sync_candidates.sort_by(|a, b| {
-                    (a.time_step, a.freq_bin, a.freq_sub)
-                        .cmp(&(b.time_step, b.freq_bin, b.freq_sub))
-                        .then(
-                            b.sync_score
-                                .partial_cmp(&a.sync_score)
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                        )
-                });
-                sync_candidates.dedup_by_key(|c| (c.time_step, c.freq_bin, c.freq_sub));
-                sync_candidates.sort_by(|a, b| {
-                    b.sync_score
-                        .partial_cmp(&a.sync_score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                let after_dedup = sync_candidates.len();
-                sync_candidates.truncate(self.config.max_sync_candidates);
+                // Dedup exact-key collisions, cap, and (PAN-31) re-run NMS
+                // over the native+seed union. See
+                // `finalize_native_and_seed_candidate_union` for the mechanics.
+                let after_dedup =
+                    self.finalize_native_and_seed_candidate_union(&mut sync_candidates);
 
                 // Seeds that were BOTH novel AND survived the cap. These
                 // counters are LOAD-BEARING, not diagnostics: at the default
@@ -4423,6 +4480,49 @@ impl Ft8Decoder {
             .flatten()
             {
                 if call != "CQ" && call != "DE" && call != "QRZ" && !call.starts_with("CQ ") {
+                    self.message_parser.add_callsign(call);
+                }
+            }
+        }
+
+        // PAN-27 finding 4: a type-4 (NonStdCall) frame's exact 58-bit
+        // field is already trustworthy plaintext (e.g. decoding
+        // "CQ YS/WE9G" reveals the full compound callsign) — learn it too,
+        // not just `MessageType::Standard` decodes, so a LATER exchange
+        // that hashes the same callsign into the lossy 12-bit slot still
+        // resolves. Skip the hash-rendered slot itself (`"<K5ARH>"`
+        // resolved or `"<...>"` unresolved) — that's not a real callsign,
+        // just this same table's own prior render of one — and the bare
+        // `"CQ"` addressee token.
+        //
+        // PAN-27 round 5 (Codex round-2 review of PR #305, finding 2): a
+        // CRC-valid noise decode can still produce a `NonStdCall` exact
+        // field that passed `is_plausible` (which only requires
+        // alphanumeric-plus-digit-plus-letter — much looser than a real
+        // callsign shape) but is actually free-text-shaped garbage (e.g.
+        // `"ABC1D"` — the same shape `looks_like_compound_callsign` in
+        // message.rs rejects on the encode side, finding 1's fix). Without
+        // this extra check, seeding it into `all_learned`/the hash table
+        // means a LATER real type-4 frame that happens to share its 12-bit
+        // hash renders as this bogus identity instead of resolving
+        // correctly. Apply the encoder's own (stricter) callsign-shape
+        // classifier here too, rather than trusting `is_plausible`'s looser
+        // gate a second time.
+        for msg in &all_decoded_messages {
+            if msg.message.message_type != MessageType::NonStdCall {
+                continue;
+            }
+            for call in [
+                msg.message.to_callsign.as_deref(),
+                msg.message.from_callsign.as_deref(),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if call != "CQ"
+                    && !call.starts_with('<')
+                    && crate::message::looks_like_compound_callsign(call)
+                {
                     self.message_parser.add_callsign(call);
                 }
             }
@@ -5965,6 +6065,7 @@ impl Ft8Decoder {
             self.config.min_sync_score,
             freq_bin_scope,
             None,
+            false,
         )
     }
 
@@ -5972,18 +6073,32 @@ impl Ft8Decoder {
     /// to the threshold helper. Used by the top-level scoped-with-partner
     /// decode entry point so the near-partner relaxed-threshold branch
     /// fires on pass 1 (as well as the residual pass via
-    /// `coherent_subtract_and_repass`).
+    /// `coherent_subtract_and_repass`), and by the pass-0 three-method
+    /// spectral sweep (hb-228) alternate transforms.
+    ///
+    /// `defer_nms`: forwarded verbatim to
+    /// `costas_sync_search_with_threshold_and_partner` — see that fn's
+    /// doc comment. Codex round-2 finding on PR #306 (PAN-31
+    /// follow-up): this wrapper used to hardcode `false` unconditionally,
+    /// so the hb-228 alternate-sweep candidates always got an early,
+    /// non-deferred native-only NMS pass even on pass-0 windows where the
+    /// primary sweep's candidates were correctly deferring to the
+    /// seed-union NMS pass — the same "candidate discarded before the
+    /// seed union could reconsider it" failure shape as round-1's
+    /// original finding, just for the alternate sweeps.
     fn costas_sync_search_partner(
         &self,
         spectrogram: &Spectrogram,
         freq_bin_scope: Option<&RangeInclusive<usize>>,
         partner_freq_hz: Option<f64>,
+        defer_nms: bool,
     ) -> Ft8Result<Vec<CostasCandidate>> {
         self.costas_sync_search_with_threshold_and_partner(
             spectrogram,
             self.config.min_sync_score,
             freq_bin_scope,
             partner_freq_hz,
+            defer_nms,
         )
     }
 
@@ -6006,6 +6121,7 @@ impl Ft8Decoder {
             min_score,
             freq_bin_scope,
             None,
+            false,
         )
     }
 
@@ -6026,12 +6142,36 @@ impl Ft8Decoder {
     /// When `partner_freq_hz = None` OR the config radius is `None` the
     /// relaxed branch never fires and behaviour is byte-identical to
     /// `costas_sync_search_with_threshold`.
+    ///
+    /// `defer_nms`: when `true`, this call's own (native-only) NMS pass
+    /// below is skipped — the caller is responsible for running NMS
+    /// itself once a fuller candidate set (e.g. the native+ft8_lib-seed
+    /// union) is available. `costas_sync_search`, `costas_sync_search_\
+    /// with_threshold`, and every other existing caller pass `false`, so
+    /// they remain byte-identical; only the pass-0 seed-union call sites
+    /// in `decode_window_with_ap_scoped_partner_impl` — the primary
+    /// sweep directly, and the hb-228 alternate transforms via
+    /// `costas_sync_search_partner` — pass the same frozen
+    /// `should_run_seed_union` decision, and only when it has already
+    /// verified `finalize_native_and_seed_candidate_union` will run
+    /// afterward (see those call sites for the exact guard). See the
+    /// Codex round-1 finding on PR #306 (PAN-31 follow-up): running NMS
+    /// here AND again in `finalize_native_and_seed_candidate_union`
+    /// cannot produce true union-wide suppression, because a native
+    /// candidate already discarded here (by a nearby native dominator)
+    /// can never be reconsidered even if a stronger seed later
+    /// suppresses that dominator instead. Round-2 extended this to the
+    /// alternate sweeps (same failure shape) and fixed a second bug: the
+    /// two call sites re-evaluating this guard independently could
+    /// disagree if the budget expired between them, leaving NO NMS pass
+    /// at all — see `should_run_seed_union`'s definition.
     fn costas_sync_search_with_threshold_and_partner(
         &self,
         spectrogram: &Spectrogram,
         min_score: f64,
         freq_bin_scope: Option<&RangeInclusive<usize>>,
         partner_freq_hz: Option<f64>,
+        defer_nms: bool,
     ) -> Ft8Result<Vec<CostasCandidate>> {
         let mut candidates = Vec::new();
         let pp = &self.protocol_params;
@@ -6296,8 +6436,11 @@ impl Ft8Decoder {
         candidates.truncate(self.config.max_sync_candidates);
 
         // Non-maximum suppression: remove weaker candidates near stronger ones.
-        // Gated by config so hb-019-style audits can disable it.
-        if self.config.nms_enabled {
+        // Gated by config so hb-019-style audits can disable it. Also
+        // skipped when `defer_nms` is set — see this fn's doc comment and
+        // the pass-0 seed-union call site, which runs the ONE correct
+        // union-wide NMS pass itself afterward instead.
+        if self.config.nms_enabled && !defer_nms {
             self.nms_candidates(&mut candidates);
         }
 
@@ -6548,6 +6691,86 @@ impl Ft8Decoder {
         }
 
         best_score
+    }
+
+    /// Whether the pass-0 ft8_lib seed-union block should run for this
+    /// decode window: `ft8lib_sync_seeds_enabled`, on pass 0, with budget
+    /// remaining, and not FT2 (which has no `ftx_protocol_t` counterpart,
+    /// see PAN-32).
+    ///
+    /// Codex round-2 finding on PR #306 (PAN-31 follow-up): extracted so
+    /// the decision is computed from exactly ONE call, at ONE point in
+    /// the pass-0 pipeline (before the native Costas search and the
+    /// optional three-method spectral sweep run), and that single result
+    /// is reused for both the early `defer_nms` decision and the later
+    /// seed-union `if` guard — see `should_run_seed_union` at its call
+    /// site in `decode_window_with_ap_scoped_partner_impl`. Before this
+    /// fix, both sites called `self.current_budget.has_time()`
+    /// independently, so a finite `DecodeBudget` that still had time at
+    /// the first call could expire (consumed by the native search /
+    /// spectral sweep) by the second, leaving `defer_nms == true` with
+    /// no union pass ever running to supply the NMS pass it deferred.
+    /// Also independently unit-testable, matching this fn's own doc
+    /// comment about `finalize_native_and_seed_candidate_union` below.
+    fn should_run_ft8lib_seed_union(&self, pass: usize) -> bool {
+        self.config.ft8lib_sync_seeds_enabled
+            && pass == 0
+            && self.current_budget.has_time()
+            && !self.protocol_params.protocol.is_ft2()
+    }
+
+    /// Dedup exact `(time_step, freq_bin, freq_sub)` collisions in a
+    /// native+ft8_lib-seed candidate union (keeping the highest score),
+    /// re-sort best-first, restore the configured cap, then (PAN-31)
+    /// re-run non-max suppression over the resulting union.
+    ///
+    /// Extracted so the PAN-31 fix — NMS applying to seeded candidates, not
+    /// just native ones — is independently unit-testable without going
+    /// through a full audio decode + the ft8_lib FFI seed search (which,
+    /// per PAN-7's own measurement, almost never produces a seed at a
+    /// distinct-but-nearby key on real audio: the native sweep is exhaustive
+    /// on the same representable lattice, so seeds usually land exactly on
+    /// an existing native key and get removed by the exact-key dedup below
+    /// rather than surviving to exercise NMS).
+    ///
+    /// The two-level sort before `dedup_by_key` is a HARD PRECONDITION, not
+    /// style: `dedup_by_key` removes only CONSECUTIVE equal keys, and the
+    /// descending secondary sort is what makes the retained member of each
+    /// group the highest-scoring one. Do not reorder it. Returns the
+    /// candidate count after dedup but before the cap/NMS, for diagnostics.
+    fn finalize_native_and_seed_candidate_union(
+        &self,
+        candidates: &mut Vec<CostasCandidate>,
+    ) -> usize {
+        candidates.sort_by(|a, b| {
+            (a.time_step, a.freq_bin, a.freq_sub)
+                .cmp(&(b.time_step, b.freq_bin, b.freq_sub))
+                .then(
+                    b.sync_score
+                        .partial_cmp(&a.sync_score)
+                        .unwrap_or(std::cmp::Ordering::Equal),
+                )
+        });
+        candidates.dedup_by_key(|c| (c.time_step, c.freq_bin, c.freq_sub));
+        candidates.sort_by(|a, b| {
+            b.sync_score
+                .partial_cmp(&a.sync_score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        let after_dedup = candidates.len();
+        candidates.truncate(self.config.max_sync_candidates);
+
+        // PAN-31: NMS runs inside `costas_sync_search_with_threshold_and_partner`
+        // on the native-only set, before ft8_lib seeds are appended by the
+        // caller — so a seed landing near a stronger native candidate would
+        // otherwise bypass suppression entirely (only exact-key dedup above
+        // applies to it). Re-run NMS now over the union, sorted-descending
+        // per `nms_candidates`'s precondition (already true post-truncate).
+        if self.config.nms_enabled {
+            self.nms_candidates(candidates);
+        }
+
+        after_dedup
     }
 
     /// Non-maximum suppression: remove weaker candidates near stronger ones.
@@ -7375,6 +7598,7 @@ impl Ft8Decoder {
             residual_min,
             freq_bin_scope,
             partner_freq_hz,
+            false,
         ) else {
             return Vec::new();
         };
@@ -15237,6 +15461,146 @@ mod tests {
         );
     }
 
+    /// PAN-27 finding 4 (round 4 review): the seeding loop was restricted
+    /// to `MessageType::Standard` decodes, discarding trustworthy plaintext
+    /// already carried in a type-4 (`NonStdCall`) frame's exact 58-bit
+    /// field. Decoding "CQ YS/WE9G" reveals the full compound callsign in
+    /// plaintext; a LATER type-4 exchange between two DIFFERENT compound
+    /// stations that places "YS/WE9G" in the hashed slot must resolve it,
+    /// not render the unrecoverable `<...>` placeholder.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn decoder_seeds_hash_table_from_nonstdcall_exact_field_too() {
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let cfg = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(cfg).expect("decoder");
+        // Deliberately do NOT call seed_hash_callsign at all -- the fix
+        // must work purely from decoding YS/WE9G's own type-4 CQ.
+
+        // Step 1: decode a type-4 CQ from the compound-callsign operator
+        // YS/WE9G. Their full callsign lands in the exact 58-bit field.
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("CQ YS/WE9G", None)
+            .expect("encode compound CQ");
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        let decoded = decoder.decode_window(&tx).expect("decode compound CQ");
+        assert!(
+            decoded
+                .iter()
+                .any(|d| d.message.from_callsign.as_deref() == Some("YS/WE9G")),
+            "must decode YS/WE9G's type-4 CQ"
+        );
+
+        // Step 2: two OTHER compound stations work each other; the message
+        // exchange puts PJ4/KA1ABC in the exact slot (it wins the
+        // deterministic tiebreak) and hashes YS/WE9G into the 12-bit slot.
+        let symbols2 = encoder
+            .encode_message("PJ4/KA1ABC YS/WE9G RR73", None)
+            .expect("encode second compound exchange");
+        let mut tx2 = modulator
+            .modulate_symbols(&symbols2, 900.0)
+            .expect("modulate");
+        tx2.resize(WINDOW_SAMPLES, 0.0);
+        let decoded2 = decoder
+            .decode_window(&tx2)
+            .expect("decode second compound exchange");
+
+        let hit = decoded2
+            .iter()
+            .find(|d| d.message.to_callsign.as_deref() == Some("PJ4/KA1ABC"))
+            .expect("must decode the second compound exchange");
+        assert_eq!(
+            hit.message.from_callsign.as_deref(),
+            Some("<YS/WE9G>"),
+            "YS/WE9G must resolve via the hash table seeded from step 1's \
+             type-4 CQ exact field, not render as <...>"
+        );
+    }
+
+    /// Codex round-2 review of PR #305, finding 2: a CRC-valid noise decode
+    /// can produce a `NonStdCall` exact field that passes `is_plausible`
+    /// (`looks_like_nonstandard_callsign` only requires alphanumeric plus
+    /// at least one digit and one letter -- much looser than a real
+    /// callsign shape) but is actually free-text-shaped garbage, e.g.
+    /// "ABC1D" (the same shape the encoder's `looks_like_compound_callsign`
+    /// rejects -- finding 1's fix, and PAN-27 round 4's original finding).
+    /// The hash-seeding loop added for PAN-27 finding 4 (see the test
+    /// above) must NOT unconditionally learn such a field into the hash
+    /// table, or a LATER, unrelated frame that happens to share its 12-bit
+    /// hash renders as this bogus identity instead of staying correctly
+    /// unresolved.
+    #[cfg(feature = "transmit")]
+    #[test]
+    fn decoder_hash_seeding_rejects_free_text_shaped_nonstdcall_exact_field() {
+        use crate::message::{hash12, pack58};
+        use crate::{Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES};
+
+        let cfg = Ft8Config::default();
+        let mut decoder = Ft8Decoder::new(cfg).expect("decoder");
+        let encoder = Ft8Encoder::new();
+        let mut modulator = Ft8Modulator::new_default().expect("modulator");
+
+        // Step 1: decode a bogus type-4 CQ whose exact 58-bit field is
+        // "ABC1D" -- not a real callsign, just free-text-shaped garbage
+        // that a CRC-14 false positive could land on. Built directly with
+        // `pack_nonstandard` + `pack58` (bypassing `try_encode_nonstandard`,
+        // which would refuse to encode "CQ ABC1D" at all thanks to PAN-27
+        // round 4's `looks_like_callsign` fix) to simulate exactly that
+        // noise-decode scenario.
+        let n58 = pack58("ABC1D").expect("fits the 58-bit hash-callsign field");
+        let payload = crate::encoder::pack_nonstandard(0, n58, 0, 0, 1); // icq CQ shape
+        let symbols = encoder
+            .payload_to_symbols(&payload)
+            .expect("payload to symbols");
+        let mut tx = modulator
+            .modulate_symbols(&symbols, 500.0)
+            .expect("modulate");
+        tx.resize(WINDOW_SAMPLES, 0.0);
+        let decoded = decoder.decode_window(&tx).expect("decode bogus type-4 CQ");
+        assert!(
+            decoded
+                .iter()
+                .any(|d| d.message.from_callsign.as_deref() == Some("ABC1D")),
+            "must decode the bogus type-4 CQ's exact field as plain text 'ABC1D'"
+        );
+
+        // Step 2: a later type-4 exchange hashes "ABC1D" into the 12-bit
+        // slot (constructed directly with the same n12 = hash12("ABC1D"),
+        // reproducing the collision deterministically rather than needing
+        // a real second callsign that happens to share the bucket). If
+        // step 1 wrongly seeded "ABC1D" into the hash table, this resolves
+        // as "<ABC1D>"; with the fix it must stay unresolved ("<...>").
+        let n12 = hash12("ABC1D") & 0xFFF;
+        let n58_2 = pack58("PJ4/KA1ABC").expect("fits");
+        let payload2 = crate::encoder::pack_nonstandard(n12, n58_2, 1, 2, 0); // RR73
+        let symbols2 = encoder
+            .payload_to_symbols(&payload2)
+            .expect("payload to symbols");
+        let mut tx2 = modulator
+            .modulate_symbols(&symbols2, 900.0)
+            .expect("modulate");
+        tx2.resize(WINDOW_SAMPLES, 0.0);
+        let decoded2 = decoder.decode_window(&tx2).expect("decode second exchange");
+
+        let hit = decoded2
+            .iter()
+            .find(|d| d.message.to_callsign.as_deref() == Some("PJ4/KA1ABC"))
+            .expect("must decode the second exchange");
+        assert_eq!(
+            hit.message.from_callsign.as_deref(),
+            Some("<...>"),
+            "the free-text-shaped exact field 'ABC1D' must NOT have been \
+             seeded into the hash table -- it must remain unresolved, not \
+             wrongly render as <ABC1D>"
+        );
+    }
+
     #[test]
     fn test_invalid_sample_rate() {
         let mut config = Ft8Config::default();
@@ -16702,14 +17066,14 @@ mod tests {
         assert!(!config_off.per_bin_candidate_selection);
         let decoder_off = Ft8Decoder::new(config_off.clone()).unwrap();
         let baseline = decoder_off
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("baseline sync search");
 
         let mut config_explicit_off = config_off.clone();
         config_explicit_off.per_bin_candidate_selection = false;
         let decoder_explicit_off = Ft8Decoder::new(config_explicit_off).unwrap();
         let explicit_off = decoder_explicit_off
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("explicit-off sync search");
 
         assert_eq!(
@@ -16728,7 +17092,7 @@ mod tests {
         config_on.per_bin_candidate_selection = true;
         let decoder_on = Ft8Decoder::new(config_on).unwrap();
         let with_selection = decoder_on
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("flag-on sync search");
 
         assert!(
@@ -18007,7 +18371,7 @@ mod hb230_relaxed_sync_tests {
         let spec = build_synthetic_costas(&[0, 1, 2], -10.0, -40.0, f0);
 
         let without_partner = decoder
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("sync search no partner");
         let with_partner_default_off = decoder
             .costas_sync_search_with_threshold_and_partner(
@@ -18015,6 +18379,7 @@ mod hb230_relaxed_sync_tests {
                 MIN_SYNC_SCORE,
                 None,
                 Some(1500.0),
+                false,
             )
             .expect("sync search partner provided but feature off");
 
@@ -18053,7 +18418,7 @@ mod hb230_relaxed_sync_tests {
         let decoder = Ft8Decoder::new(config).unwrap();
 
         let baseline = decoder
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("baseline");
         let with_partner = decoder
             .costas_sync_search_with_threshold_and_partner(
@@ -18061,6 +18426,7 @@ mod hb230_relaxed_sync_tests {
                 MIN_SYNC_SCORE,
                 None,
                 Some(partner_hz),
+                false,
             )
             .expect("partner");
 
@@ -18121,6 +18487,7 @@ mod hb230_relaxed_sync_tests {
                 MIN_SYNC_SCORE,
                 None,
                 Some(partner_hz),
+                false,
             )
             .expect("partner");
 
@@ -18148,10 +18515,10 @@ mod hb230_relaxed_sync_tests {
         let decoder = Ft8Decoder::new(config).unwrap();
 
         let baseline = decoder
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("baseline");
         let same_baseline = decoder
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("repeat");
         assert_eq!(baseline.len(), same_baseline.len());
     }
@@ -21500,10 +21867,10 @@ mod auto_passband_tests {
         let decoder_off = Ft8Decoder::new(cfg_off).unwrap();
 
         let r_default = decoder_default
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("default sync search");
         let r_off = decoder_off
-            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None)
+            .costas_sync_search_with_threshold_and_partner(&spec, MIN_SYNC_SCORE, None, None, false)
             .expect("explicit-off sync search");
 
         assert_eq!(
@@ -24463,6 +24830,547 @@ mod pan7_ft8lib_sync_seed_tests {
             key(&a),
             key(&b),
             "on a stub build the seed helper returns nothing, so the flag must be inert"
+        );
+    }
+
+    /// PAN-31: NMS ran only over the native set (inside
+    /// `costas_sync_search_with_threshold_and_partner`) before ft8_lib seeds
+    /// were appended, so a seed within another candidate's suppression
+    /// radius survived — only exact-key duplicates were removed. Fixed by
+    /// re-running `nms_candidates` over the native+seed union, via the
+    /// extracted `finalize_native_and_seed_candidate_union` helper.
+    ///
+    /// Exercises that helper directly with a synthetic native+seed pair
+    /// rather than through a full audio decode. An end-to-end repro was
+    /// tried first and found to be effectively unreproducible on real
+    /// audio: PAN-7's own measurement (`docs/superpowers/specs/\
+    /// 2026-08-03-ft8lib-sync-seed-union-design.md` §4.1) already
+    /// establishes the native sweep is exhaustive on the same representable
+    /// lattice ft8_lib searches, so on real signals an ft8_lib seed almost
+    /// always lands on an EXACT existing native key (and is removed by the
+    /// exact-key dedup, never reaching NMS) rather than at a distinct key
+    /// merely within radius of one — empirically confirmed here: a densely
+    /// populated native sweep (`min_sync_score: 0.0`, cap 60) over a noisy
+    /// synthetic window produced zero novel (distinct-key) seeds at all.
+    /// The synthetic pair below reproduces the exact geometry the bug
+    /// requires deterministically: same `(time_step, freq_bin)` as a
+    /// stronger "native" candidate (trivially within any configured NMS
+    /// radius), one sub-bin over — a distinct `freq_sub`, so the earlier
+    /// exact-key dedup pass does not remove it — and a strictly lower score.
+    #[test]
+    fn pan31_seed_within_nms_radius_of_stronger_candidate_is_suppressed() {
+        let native = CostasCandidate {
+            time_step: 100,
+            freq_bin: 50,
+            freq_sub: 0,
+            sync_score: 5.0,
+            time_refinement: 0.0,
+        };
+        let seed = CostasCandidate {
+            time_step: 100,
+            freq_bin: 50,
+            freq_sub: 1,
+            sync_score: 3.0,
+            time_refinement: 0.0,
+        };
+
+        // Sanity: with NMS off, exact-key dedup alone must not remove the
+        // seed — proves the two-candidate setup is not vacuously already
+        // suppressed before NMS ever runs.
+        let dec_off = Ft8Decoder::new(Ft8Config {
+            nms_enabled: false,
+            max_sync_candidates: 10,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let mut candidates_off = vec![native, seed];
+        let after_dedup_off = dec_off.finalize_native_and_seed_candidate_union(&mut candidates_off);
+        assert_eq!(
+            after_dedup_off, 2,
+            "distinct exact keys must both survive the exact-key dedup pass"
+        );
+        assert_eq!(
+            candidates_off.len(),
+            2,
+            "with NMS off, both the native and seeded candidate must survive"
+        );
+
+        // Fixed behavior: with NMS on, the weaker seed must be suppressed
+        // by the stronger native candidate within radius.
+        let dec_on = Ft8Decoder::new(Ft8Config {
+            nms_enabled: true,
+            max_sync_candidates: 10,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let mut candidates_on = vec![native, seed];
+        let after_dedup_on = dec_on.finalize_native_and_seed_candidate_union(&mut candidates_on);
+        assert_eq!(
+            after_dedup_on, 2,
+            "distinct exact keys must both survive the exact-key dedup pass"
+        );
+        assert_eq!(
+            candidates_on.len(),
+            1,
+            "PAN-31: seed within NMS radius of a stronger candidate must be \
+             suppressed by NMS, not merely left alone by exact-key dedup"
+        );
+        assert_eq!(
+            candidates_on[0].time_step, native.time_step,
+            "the surviving candidate must be the stronger native one"
+        );
+        assert_eq!(candidates_on[0].sync_score, native.sync_score);
+    }
+
+    /// Codex round-1 finding on PR #306 (PAN-31 follow-up): PAN-31's fix
+    /// (above) re-runs NMS over the native+seed union in
+    /// `finalize_native_and_seed_candidate_union`, but
+    /// `costas_sync_search_with_threshold_and_partner` had ALREADY run its
+    /// own native-only NMS pass earlier, before any seed was known. That
+    /// earlier pass can permanently discard a native candidate that a
+    /// TRUE union-wide NMS pass would have kept.
+    ///
+    /// Concrete failure geometry (mirrors the finding): a strong native
+    /// candidate A suppresses a weaker native neighbor B during the EARLY
+    /// native-only pass. A stronger seed S later suppresses A during the
+    /// union pass — but S's own suppression radius does not reach B, so
+    /// the correct union-wide answer keeps B as a distinct signal. The
+    /// old two-pass approach (early native-only NMS, then a second NMS
+    /// over survivors+seeds) loses B forever: once discarded early, B
+    /// never gets a second chance.
+    ///
+    /// Exercised the same way as `pan31_seed_within_nms_radius_of_stronger_\
+    /// candidate_is_suppressed` above — directly driving `nms_candidates`
+    /// (standing in for the early native-only pass) and
+    /// `finalize_native_and_seed_candidate_union` (the union pass) with a
+    /// synthetic native+seed set, rather than a full audio decode (per
+    /// that test's own comment, real audio essentially never produces a
+    /// seed at a distinct-but-nearby key, so this geometry is not
+    /// reproducible end-to-end).
+    ///
+    /// Default NMS radii (`nms_time_radius = 8`, `nms_freq_radius = 2`,
+    /// `nms_score_delta_db = 0.0`) apply throughout, all at the same
+    /// `time_step` so only frequency-bin distance matters:
+    ///   - A: freq_bin 50, score 5.0 (native, strong)
+    ///   - B: freq_bin 52, score 4.0 (native, weak — |52-50|=2, within A's
+    ///     radius, so the early native-only pass suppresses it)
+    ///   - S: freq_bin 48, score 6.0 (seed — |48-50|=2, within A's radius,
+    ///     so it suppresses A; |48-52|=4, OUTSIDE B's radius, so it does
+    ///     NOT reach B even if B were still present)
+    #[test]
+    fn codex_round1_deferred_union_nms_saves_neighbor_that_early_native_only_nms_would_lose() {
+        let a = CostasCandidate {
+            time_step: 100,
+            freq_bin: 50,
+            freq_sub: 0,
+            sync_score: 5.0,
+            time_refinement: 0.0,
+        };
+        let b = CostasCandidate {
+            time_step: 100,
+            freq_bin: 52,
+            freq_sub: 0,
+            sync_score: 4.0,
+            time_refinement: 0.0,
+        };
+        let s = CostasCandidate {
+            time_step: 100,
+            freq_bin: 48,
+            freq_sub: 0,
+            sync_score: 6.0,
+            time_refinement: 0.0,
+        };
+
+        let dec = Ft8Decoder::new(Ft8Config {
+            nms_enabled: true,
+            max_sync_candidates: 10,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+
+        // Old (buggy) two-pass behavior: run NMS early over the
+        // native-only set [A, B] — exactly what
+        // `costas_sync_search_with_threshold_and_partner` did
+        // unconditionally before this fix — THEN append the seed and run
+        // the union pass. B is lost during the early pass and can never
+        // come back, even though S (which suppresses A) doesn't reach it.
+        let mut native_only = vec![a, b];
+        dec.nms_candidates(&mut native_only);
+        assert_eq!(
+            native_only.len(),
+            1,
+            "sanity: the early native-only pass must suppress B (within A's radius)"
+        );
+        assert_eq!(native_only[0].freq_bin, a.freq_bin);
+
+        let mut old_pipeline_union = native_only;
+        old_pipeline_union.push(s);
+        dec.finalize_native_and_seed_candidate_union(&mut old_pipeline_union);
+        let old_bins: std::collections::HashSet<usize> =
+            old_pipeline_union.iter().map(|c| c.freq_bin).collect();
+        assert_eq!(
+            old_bins,
+            std::collections::HashSet::from([s.freq_bin]),
+            "bug reproduction: the old two-pass approach loses B permanently — \
+             only the seed survives, even though a true union-wide NMS pass \
+             would have kept B"
+        );
+
+        // Fixed (deferred) behavior: the early native-only NMS pass is
+        // skipped entirely (this fix's `defer_nms` gate) — natives reach
+        // the union un-suppressed — and `finalize_native_and_seed_candidate_\
+        // union` runs the ONE correct NMS pass over the complete
+        // native+seed union [A, B, S].
+        let mut deferred_union = vec![a, b, s];
+        dec.finalize_native_and_seed_candidate_union(&mut deferred_union);
+        let new_bins: std::collections::HashSet<usize> =
+            deferred_union.iter().map(|c| c.freq_bin).collect();
+        assert_eq!(
+            new_bins,
+            std::collections::HashSet::from([s.freq_bin, b.freq_bin]),
+            "fix: with a single deferred union-wide NMS pass, S suppresses A \
+             (within radius) but B survives — it is outside S's own \
+             suppression radius and A was never given the chance to \
+             suppress it early"
+        );
+        assert!(
+            !new_bins.contains(&a.freq_bin),
+            "A must still be suppressed by the stronger seed S"
+        );
+    }
+
+    /// Codex round-2 finding-1 on PR #306 (PAN-31 follow-up): unit-tests
+    /// `should_run_ft8lib_seed_union` (the extracted, single-evaluation
+    /// decision this fix introduced) directly, pinning that it reflects
+    /// the flag, the pass number, and the live budget exactly as the
+    /// production call site relies on.
+    #[test]
+    fn codex_round2_finding1_seed_union_decision_helper() {
+        use crate::DecodeBudget;
+
+        let mut dec_on = Ft8Decoder::new(Ft8Config {
+            ft8lib_sync_seeds_enabled: true,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        dec_on.current_budget = DecodeBudget::unlimited();
+        assert!(
+            dec_on.should_run_ft8lib_seed_union(0),
+            "flag on, pass 0, unlimited budget => must run"
+        );
+        assert!(
+            !dec_on.should_run_ft8lib_seed_union(1),
+            "the seed union is pass-0-only, mirroring hb-228"
+        );
+
+        dec_on.current_budget =
+            DecodeBudget::until(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        assert!(
+            !dec_on.should_run_ft8lib_seed_union(0),
+            "an already-expired budget must not run the seed union"
+        );
+
+        let dec_off = Ft8Decoder::new(Ft8Config::default()).unwrap();
+        assert!(
+            !dec_off.should_run_ft8lib_seed_union(0),
+            "flag off (production default) must never run the seed union, \
+             regardless of pass or budget"
+        );
+    }
+
+    /// Codex round-2 finding-1 on PR #306 (PAN-31 follow-up): before this
+    /// fix, `defer_nms` (computed BEFORE the native Costas search) and
+    /// the seed-union block's `if` guard (evaluated AFTER the native
+    /// search and the optional three-method spectral sweep) each called
+    /// `self.current_budget.has_time()` independently. Real work runs
+    /// between those two points in production, so a finite `DecodeBudget`
+    /// that still had time at the first call could expire by the second —
+    /// leaving `defer_nms == true` (native NMS skipped) while the
+    /// seed-union block that was supposed to supply the deferred NMS pass
+    /// got skipped too, because IT saw an expired budget by the time it
+    /// ran. The result: NO NMS pass runs at all, and the (still
+    /// unconditionally-decoded) floor candidates are left completely
+    /// unsuppressed.
+    ///
+    /// This test proves the PRECONDITION the bug relied on:
+    /// `DecodeBudget::has_time()` genuinely CAN return different answers
+    /// across two evaluations separated by real elapsed time — exactly
+    /// what two independently-evaluated call sites would observe. The
+    /// fix (`should_run_ft8lib_seed_union`, called once and stored in the
+    /// `should_run_seed_union` local in
+    /// `decode_window_with_ap_scoped_partner_impl`) computes this
+    /// decision ONCE, before the native search and spectral sweep even
+    /// run, and reuses that single value at both the `defer_nms` site and
+    /// the later seed-union guard — so, unlike the two independent calls
+    /// modeled below, the two sites in the actual pipeline can never
+    /// disagree, no matter how much of the budget the intervening work
+    /// consumes.
+    #[test]
+    fn codex_round2_finding1_has_time_can_diverge_across_two_evaluations() {
+        use crate::DecodeBudget;
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(15);
+        let budget = DecodeBudget::until(deadline);
+
+        assert!(
+            budget.has_time(),
+            "T1 (models the early `defer_nms` call site): the budget must \
+             still have time immediately after construction"
+        );
+
+        // Models the real work that runs between the two call sites in
+        // production: the native Costas full sweep, plus the optional
+        // hb-228 alternate-transform spectral sweeps.
+        std::thread::sleep(std::time::Duration::from_millis(30));
+
+        assert!(
+            !budget.has_time(),
+            "T2 (models the OLD seed-union guard's own independent \
+             `has_time()` re-check): the SAME budget object now reports \
+             expired — proving the two checkpoints CAN see different \
+             answers when each evaluates `has_time()` for itself, which \
+             is the exact TOCTOU precondition the fix eliminates by \
+             freezing a single `should_run_seed_union` decision"
+        );
+    }
+
+    /// Boundary-consistency companion to the two tests above: exercises
+    /// the REAL pass-0 pipeline (not a synthetic budget) at the two
+    /// deterministic extremes where `has_time()` cannot itself be
+    /// time-sensitive across a real decode — `DecodeBudget::unlimited()`
+    /// (always has time) and a budget whose deadline is already in the
+    /// past before decode even starts (never has time). In both cases
+    /// `defer_nms` and the seed-union guard's outcome must agree (the
+    /// `S0-ft8lib-seed` budget stage is pushed only from inside the
+    /// guarded block, so its presence/absence is direct proof of whether
+    /// the block ran): under `unlimited()` the stage must appear; under
+    /// an already-expired budget it must not. This does not exercise the
+    /// exact mid-decode race (real audio's decode time is too variable
+    /// across machines/CI load to straddle deterministically — see
+    /// `pan31_seed_within_nms_radius_of_stronger_candidate_is_suppressed`'s
+    /// own comment above for the same limitation on a related scenario),
+    /// but it does pin that the fix did not simply remove the FFI seed
+    /// search's budget gate: an already-expired budget still skips it
+    /// entirely.
+    #[test]
+    fn codex_round2_finding1_seed_union_stage_matches_budget_at_the_extremes() {
+        use crate::DecodeBudget;
+
+        let tx = noisy_window();
+
+        let mut dec_unlimited = Ft8Decoder::new(Ft8Config {
+            ft8lib_sync_seeds_enabled: true,
+            max_decode_passes: 1,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let (_msgs, report_unlimited) = dec_unlimited
+            .decode_window_budgeted(&tx, DecodeBudget::unlimited())
+            .expect("decode unlimited");
+        assert!(
+            report_unlimited
+                .stages
+                .iter()
+                .any(|(name, ..)| *name == "S0-ft8lib-seed"),
+            "under an unlimited budget the seed-union block must run every \
+             time"
+        );
+
+        let mut dec_expired = Ft8Decoder::new(Ft8Config {
+            ft8lib_sync_seeds_enabled: true,
+            max_decode_passes: 1,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let expired =
+            DecodeBudget::until(std::time::Instant::now() - std::time::Duration::from_millis(1));
+        let (_msgs, report_expired) = dec_expired
+            .decode_window_budgeted(&tx, expired)
+            .expect("decode expired");
+        assert!(
+            report_expired
+                .stages
+                .iter()
+                .all(|(name, ..)| *name != "S0-ft8lib-seed"),
+            "an already-expired budget must still skip the seed-union \
+             block entirely — the fix freezes WHEN the decision is made, \
+             it does not remove the has_time() gate itself"
+        );
+    }
+
+    /// Codex round-2 finding-2 on PR #306 (PAN-31 follow-up): the pass-0
+    /// hb-228 three-method spectral sweep's alternate (sqrt/linear)
+    /// transforms call `costas_sync_search_partner`, a thin wrapper that
+    /// used to hardcode `defer_nms = false` regardless of what the
+    /// primary sweep's call decided — so those alternate-sweep candidates
+    /// always got an early, non-deferred native-only NMS pass even on
+    /// pass-0 windows where the primary sweep (and the pending seed-union
+    /// block) had decided to defer NMS to the union pass. Fixed by adding
+    /// a `defer_nms` parameter to `costas_sync_search_partner` and
+    /// threading the SAME value through from the pass-0 call site as the
+    /// primary sweep uses.
+    ///
+    /// Proven directly against the underlying
+    /// `costas_sync_search_with_threshold_and_partner`, mirroring this
+    /// file's established pattern of driving the sync-search functions
+    /// with a small controlled synthetic `Spectrogram` rather than a full
+    /// audio decode. The spectrogram here is intentionally UNIFORM (every
+    /// bin at the same power) so every swept `(t0, f0, freq_sub)` scores
+    /// IDENTICALLY under the neighbor-comparison metric — with
+    /// `min_sync_score` set far below that score, all of them clear the
+    /// threshold and become candidates, and because they are all mutually
+    /// within the default NMS TF radius, `nms_candidates` demonstrably
+    /// collapses them when it runs and leaves them all present when it is
+    /// deferred. That gives a deterministic way to observe whether
+    /// `defer_nms` reached the NMS gate through
+    /// `costas_sync_search_partner`, without needing the (per PAN-31's
+    /// own test comments above) hard-to-reproduce near-duplicate-key
+    /// geometry a real signal would require.
+    #[test]
+    fn codex_round2_finding2_costas_sync_search_partner_threads_defer_nms() {
+        let min_score = -100.0_f64;
+        let mut config = Ft8Config::default();
+        config.nms_enabled = true;
+        config.min_sync_score = min_score;
+        let decoder = Ft8Decoder::new(config).unwrap();
+
+        // Minimal uniform spectrogram covering exactly 2 time positions
+        // (t0 = 0, 1 — `num_steps = msg_span(158) + 1 + 1`) and, with the
+        // freq scope below, 7 freq-bin positions.
+        let num_steps = 160;
+        let num_bins = 20;
+        let freq_osr = 2;
+        let spec = Spectrogram {
+            power: vec![0.0 as SpecScalar; num_steps * freq_osr * num_bins],
+            complex: None,
+            num_steps,
+            num_bins,
+            freq_osr,
+            time_padding: 0,
+        };
+        let scope = 0..=6;
+
+        let underlying_deferred = decoder
+            .costas_sync_search_with_threshold_and_partner(
+                &spec,
+                min_score,
+                Some(&scope),
+                None,
+                true,
+            )
+            .expect("underlying deferred");
+        let underlying_immediate = decoder
+            .costas_sync_search_with_threshold_and_partner(
+                &spec,
+                min_score,
+                Some(&scope),
+                None,
+                false,
+            )
+            .expect("underlying immediate");
+
+        let via_partner_deferred = decoder
+            .costas_sync_search_partner(&spec, Some(&scope), None, true)
+            .expect("partner deferred");
+        let via_partner_immediate = decoder
+            .costas_sync_search_partner(&spec, Some(&scope), None, false)
+            .expect("partner immediate");
+
+        let key_set = |v: &[CostasCandidate]| -> std::collections::HashSet<(usize, usize, usize)> {
+            v.iter()
+                .map(|c| (c.time_step, c.freq_bin, c.freq_sub))
+                .collect()
+        };
+
+        // Sanity: every swept cell (7 freq bins * 2 freq_sub * 2 time
+        // steps) clears the deeply negative threshold and NMS actually
+        // suppresses some of them — otherwise this spectrogram would not
+        // be exercising the mechanism this test is about.
+        assert_eq!(
+            underlying_deferred.len(),
+            28,
+            "sanity: every swept cell must be a raw candidate on this \
+             uniform-power spectrogram"
+        );
+        assert!(
+            underlying_immediate.len() < underlying_deferred.len(),
+            "sanity: NMS must actually suppress something in this \
+             densely-tied spectrogram, or this test proves nothing"
+        );
+
+        assert_eq!(
+            key_set(&via_partner_deferred),
+            key_set(&underlying_deferred),
+            "costas_sync_search_partner(defer_nms=true) must match the \
+             underlying defer_nms=true call exactly — the fix threads the \
+             SAME value through, not a hardcoded `false`"
+        );
+        assert_eq!(
+            key_set(&via_partner_immediate),
+            key_set(&underlying_immediate),
+            "costas_sync_search_partner(defer_nms=false) must still match \
+             the underlying defer_nms=false call (no regression on the \
+             non-deferred path)"
+        );
+        assert!(
+            via_partner_deferred.len() > via_partner_immediate.len(),
+            "bug reproduction check: before this fix, \
+             costas_sync_search_partner hardcoded defer_nms=false \
+             unconditionally, so passing `true` would have made no \
+             difference — via_partner_deferred yielding MORE surviving \
+             candidates than via_partner_immediate proves the parameter \
+             genuinely reaches the NMS gate instead of being silently \
+             ignored"
+        );
+    }
+
+    /// PAN-32: FT2 has no `ftx_protocol_t` counterpart, so every seed the
+    /// FFI search would produce is rejected downstream by the translator's
+    /// block_size guard — the search is skipped entirely rather than run
+    /// and discarded. The `S0-ft8lib-seed` budget stage is pushed only from
+    /// inside the guarded block, so its absence in the report is direct
+    /// proof the FFI call never happened, not merely that it found nothing.
+    #[cfg(feature = "ft2")]
+    #[test]
+    fn pan32_ft8lib_seed_search_is_skipped_entirely_for_ft2() {
+        use crate::{DecodeBudget, Protocol};
+
+        let params = ProtocolParams::ft2();
+        let mut encoder = crate::Ft8Encoder::with_protocol(params.clone());
+        let symbols = encoder
+            .encode_message_protocol("CQ W1ABC FN42", None)
+            .expect("encode");
+        let mut modulator = crate::Ft8Modulator::with_pulse_shape(
+            SAMPLE_RATE,
+            1500.0,
+            0.5,
+            crate::PulseShape::Rectangular,
+        )
+        .expect("modulator");
+        let mut audio = modulator
+            .modulate_symbols_protocol(&symbols, 0.0, &params)
+            .expect("modulate");
+        audio.resize(params.window_samples(SAMPLE_RATE), 0.0);
+
+        let mut dec = Ft8Decoder::new(Ft8Config {
+            protocol: Protocol::Ft2,
+            ft8lib_sync_seeds_enabled: true,
+            max_decode_passes: 1,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+
+        let (_msgs, report) = dec
+            .decode_window_budgeted(&audio, DecodeBudget::unlimited())
+            .expect("decode");
+
+        assert!(
+            report
+                .stages
+                .iter()
+                .all(|(name, ..)| *name != "S0-ft8lib-seed"),
+            "S0-ft8lib-seed stage was pushed for Protocol::Ft2 — the ft8_lib \
+             FFI search ran despite every seed being unusable for this protocol"
         );
     }
 }

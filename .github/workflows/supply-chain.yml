@@ -1,0 +1,988 @@
+name: Supply Chain
+
+# (CAT-299) Supply-chain gate for dependency changes. Governance: dispensa ADR-0014.
+#
+# WHY THIS RUNS ON EVERY PR: the job named "Supply Chain" below is a
+# ruleset-required status check on main. A required check that only ran on
+# some PRs would leave every other PR stuck at "Expected -- waiting for
+# status" forever, so this workflow runs on every PR and passes trivially
+# when no dependency manifest, lockfile, or workflow changed. When one DID
+# change, the scanners run and GitHub's native auto-merge (armed by
+# auto-merge.yml / dependabot-auto-merge.yml via `gh pr merge --auto`)
+# cannot fire until they pass -- that is the "dependency bumps are excluded
+# from blanket standing auto-merge until a scan passes" carve-out, enforced
+# by the ruleset rather than by convention.
+#
+# What runs when dependencies changed:
+#   * osv            -- google/osv-scanner PR diff against OSV.dev. Fails only
+#                       on advisories NEW in this PR (pre-existing ones don't
+#                       block the fix). OSV.dev carries the OpenSSF
+#                       malicious-packages feed (MAL-* ids), e.g. the Aug 2026
+#                       keyv@6.0.0 compromise is MAL-2026-11524 -- so this is a
+#                       malware gate, not just a CVE gate.
+#   * install-policy -- every Cargo.toml covered by its workspace's Cargo.lock; crate sources
+#                       registry-only (cargo metadata --locked); .cargo/config may not
+#                       override sources/registries/transport; cargo fetch --locked.
+#   * actions-pins   -- on EVERY PR: every NEWLY
+#                       ADDED executable reference (parsed from the YAML at the
+#                       merge-base and head, per file and per occurrence: step
+#                       and reusable-workflow `uses:`, job container / service
+#                       images, local ./actions expanded, docker-action images)
+#                       must be pinned: a floating branch ref, no version, or an
+#                       image without an @sha256 digest fails; a tag pin warns --
+#                       SHA pinning of the whole fleet's workflows is a separate
+#                       decision, ADR-0014 open questions.
+#
+# THREAT MODEL / KNOWN LIMIT: this gate defends against malicious DEPENDENCY
+# CONTENT. It does not defend against a PR author who rewrites this file --
+# on a same-repo PR a `pull_request` workflow runs the PR's own definition.
+# The fleet's PR authors are a single trusted identity that can already edit
+# any workflow (CI included); a compromised author identity is the
+# credential-rotation runbook's domain (dispensa docs/runbooks). GitHub's
+# "require workflows to pass" ruleset rule (base-controlled definition) is
+# Enterprise-only; `pull_request_target` would run untrusted PR content under
+# the base definition AND break the OSV base/head diff (GITHUB_SHA is the base
+# there). Every action below is pinned to a full commit SHA so the verifier
+# itself cannot change underneath the check.
+on:
+  pull_request:
+    branches: [main]
+  # A merge queue requests the same required context for its temporary
+  # merge-group SHA; the scans then run against merge_group.base_sha/head_sha.
+  merge_group:
+    types: [checks_requested]
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Detect dependency changes
+    runs-on: ubuntu-latest
+    # paths-filter lists the PR's files through the API on pull_request events;
+    # without pull-requests:read it fails "Resource not accessible by
+    # integration" (seen live on the first run of this workflow).
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      deps: ${{ steps.filter.outputs.deps }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4
+        id: filter
+        with:
+          base: ${{ github.event.pull_request.base.ref || github.event.merge_group.base_ref }}
+          ref: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+          filters: |
+            deps:
+              - '**/package.json'
+              - '**/package-lock.json'
+              - '**/npm-shrinkwrap.json'
+              - '**/pnpm-lock.yaml'
+              - '**/pnpm-workspace.yaml'
+              - '**/.npmrc'
+              - '**/.pnpmfile.cjs'
+              - '**/yarn.lock'
+              - '**/bun.lock'
+              - '**/bun.lockb'
+              - '**/Cargo.toml'
+              - '**/Cargo.lock'
+              - '**/.cargo/config'
+              - '**/.cargo/config.toml'
+              - '.github/workflows/**'
+              - '**/action.yml'
+              - '**/action.yaml'
+              - '**/Dockerfile*'
+              - '**/dockerfile*'
+              - '**/*.Dockerfile'
+              - '**/*.dockerfile'
+  # The differential PR scan (osv-scanner-reusable-pr.yml) relies on
+  # GITHUB_BASE_REF to check out the base ref -- that variable is only
+  # populated for pull_request(_target) events and is EMPTY for merge_group,
+  # so calling it there checks out nothing and silently fails to compute a
+  # base scan (Codex round 1, pancetta #291). merge_group gets its own job
+  # running a full (non-diff) scan of the merge commit instead: every
+  # constituent PR was already diff-scanned before entering the queue, so a
+  # full scan here is a correct, simpler final gate, not a downgrade.
+  osv-pr:
+    name: OSV advisories (incl. malicious-package MAL-*)
+    needs: changes
+    if: needs.changes.outputs.deps == 'true' && github.event_name == 'pull_request'
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    uses: google/osv-scanner-action/.github/workflows/osv-scanner-reusable-pr.yml@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
+    with:
+      # The job conclusion is the gate; code-scanning upload needs GitHub
+      # Advanced Security on private repos and is not what we're relying on.
+      upload-sarif: false
+      fail-on-vuln: true
+
+  # A full (non-diff) scan here would ALSO fail on any advisory already
+  # present on main before this merge group -- exactly what the PR-diff scan
+  # is designed to tolerate -- rejecting every dependency-changing merge-queue
+  # entry forever once one exists on main (Codex round 2, pancetta #291).
+  # GITHUB_SHA (used below) IS correctly the merge group's own SHA for this
+  # event; only GITHUB_BASE_REF is empty (pull_request(_target)-only), so
+  # this mirrors osv-scanner-reusable-pr.yml's own steps -- same pinned
+  # action SHAs -- substituting merge_group.base_sha for the base checkout.
+  osv-merge-group:
+    name: OSV advisories (incl. malicious-package MAL-*) -- merge group
+    needs: changes
+    if: needs.changes.outputs.deps == 'true' && github.event_name == 'merge_group'
+    runs-on: ubuntu-latest
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      # google/osv-scanner-action's scanner/reporter run as Docker container
+      # actions, which only see $GITHUB_WORKSPACE (not $RUNNER_TEMP -- a host
+      # path the container can't reach), so scan outputs must live INSIDE the
+      # checkout. An unpredictable, per-run directory name means a PR cannot
+      # pre-commit a colliding tracked path, so the later `git checkout -f`
+      # (which only overwrites paths the target commit itself tracks) leaves it
+      # alone -- closing the tamperable-results-file gap without breaking the
+      # scan under a Docker action (Codex round, widdershins #219).
+      - name: "Prepare an unpredictable scan-output directory"
+        run: |
+          dir=".osv-scan-${GITHUB_RUN_ID}-${RANDOM}${RANDOM}"
+          mkdir -p "$dir"
+          echo "OSV_SCAN_DIR=$dir" >> "$GITHUB_ENV"
+      - name: "Checkout base of the merge group"
+        run: git checkout ${{ github.event.merge_group.base_sha }}
+      # Written under $RUNNER_TEMP, outside the checkout -- a PR that commits a
+      # tracked file literally named old-results.json would otherwise have it
+      # replace this step's genuine output the moment `git checkout -f` runs
+      # next, letting the reporter treat a PR-fabricated "no advisories"
+      # baseline as the real pre-PR scan (Codex round, widdershins #219).
+      - name: "Run scanner on existing code"
+        uses: google/osv-scanner-action/osv-scanner-action@8e5cf47b818121e8b405931c82126c2630b0b20d # v2.5.1
+        env:
+          GOTOOLCHAIN: auto
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=json
+            --output=${{ env.OSV_SCAN_DIR }}/old-results.json
+            -r
+            ./
+      - name: "Checkout head of the merge group"
+        run: git checkout -f "$GITHUB_SHA"
+      - name: "Run scanner on new code"
+        uses: google/osv-scanner-action/osv-scanner-action@8e5cf47b818121e8b405931c82126c2630b0b20d # v2.5.1
+        env:
+          GOTOOLCHAIN: auto
+        continue-on-error: true
+        with:
+          scan-args: |-
+            --format=json
+            --output=${{ env.OSV_SCAN_DIR }}/new-results.json
+            -r
+            ./
+      - name: "Run osv-scanner-reporter"
+        uses: google/osv-scanner-action/osv-reporter-action@8e5cf47b818121e8b405931c82126c2630b0b20d # v2.5.1
+        with:
+          scan-args: |-
+            --output=${{ env.OSV_SCAN_DIR }}/results.sarif
+            --old=${{ env.OSV_SCAN_DIR }}/old-results.json
+            --new=${{ env.OSV_SCAN_DIR }}/new-results.json
+            --gh-annotations=true
+            --fail-on-vuln=true
+
+  install-policy:
+    name: Lockfile integrity (cargo fetch --locked) + source policy
+    # Runs only after OSV has PASSED (see the pnpm repos' gate for the rationale).
+    needs: [changes, osv-pr, osv-merge-group]
+    # always(): without an explicit status-check function, GH Actions implicitly
+    # ANDs "&& success()" onto a custom `if:` -- since exactly one of osv-pr/
+    # osv-merge-group is ALWAYS 'skipped' by design, that implicit check would
+    # fail on every run and this job would never execute at all (Codex round 8,
+    # cqdx #349) -- ci.yml's analogous gate already uses always() for the same
+    # reason. Event-specific success, not "either succeeded or skipped": the
+    # earlier form tolerated BOTH osv-pr and osv-merge-group being 'skipped'
+    # simultaneously, so an unexpected event where neither OSV job actually ran
+    # still let this job proceed. Require the ACTIVE event's own OSV job to
+    # have succeeded; the inactive counterpart's result is never even checked,
+    # since it's expected to be 'skipped' by its own if: gate (Codex round,
+    # vanity #153 / CAT-315).
+    if: |
+      always() &&
+      needs.changes.outputs.deps == 'true' &&
+      ((github.event_name == 'pull_request' && needs.osv-pr.result == 'success') ||
+       (github.event_name == 'merge_group' && needs.osv-merge-group.result == 'success'))
+    runs-on: ubuntu-latest
+    env:
+      # Single source of truth for which lockfile kinds this repo's gate
+      # actually validates -- read by both the bootstrap step's `if:` below
+      # and the coverage-check step (which passes it straight through as
+      # argv[1] instead of a second hardcoded literal). This repo has no
+      # JS/pnpm manifest today (Rust/cargo only), so "cargo" is the only
+      # kind accepted and the npm/pnpm resolver bootstrap is skipped
+      # entirely (Codex, CAT-318): the two upstream tools it verifies are
+      # otherwise fetched from the npm registry on every dependency-changing
+      # PR for zero benefit, and an npm outage/rate-limit could then block
+      # an otherwise-valid Cargo-only PR for tooling this gate never calls.
+      WORKSPACE_ACCEPT: cargo
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+      - uses: dtolnay/rust-toolchain@4360b52568e2003a75bf9bc1d59f33a8e3fc893c # stable
+      # The npm/pnpm workspace-glob matchers below are themselves a dependency
+      # of this gate's own trust chain, same reasoning as the pnpm bootstrap
+      # above: each installed from a pinned version + byte-verified tarball
+      # digest, into an ISOLATED prefix (never the repo's own node_modules or
+      # lockfile), with --ignore-scripts, so neither becomes the unverified
+      # root of a gate that claims pre-install trust. Delegates real
+      # npm/pnpm workspace-glob resolution to npm's and pnpm's own published
+      # tools instead of a hand-maintained reimplementation, after an
+      # extended chase of hand-rolled-parser edge cases (CAT-314/315/316)
+      # made clear that reproducing minimatch/pnpm's real (sometimes
+      # pathological) semantics by hand doesn't converge. Also closes a real
+      # gap this repo's pnpm-side coverage check had (see below): it trusted
+      # every pnpm-lock.yaml importer as covered with no cross-check against
+      # pnpm-workspace.yaml's globs at all -- cqdx#349 already fixed this
+      # class of issue for cqdx specifically; it never propagated here
+      # (CAT-318). Only runs when WORKSPACE_ACCEPT actually names npm/pnpm
+      # (see the job env above) -- this repo's gate never accepts either
+      # today, so the step is a no-op skip here (Codex round, CAT-318).
+      - name: Bootstrap real npm/pnpm workspace resolvers from a pinned, integrity-verified lockfile
+        if: contains(env.WORKSPACE_ACCEPT, 'npm') || contains(env.WORKSPACE_ACCEPT, 'pnpm')
+        run: |
+          # Byte-verifying just the two top-level tarballs isn't enough: a plain
+          # `npm install` also resolves and installs each tool's own transitive
+          # dependencies fresh on every run, unpinned -- a dependency range could
+          # resolve to a different, validly-signed-but-compromised release on a
+          # later run and execute its require()'d code with no check catching it
+          # (Codex round, CAT-318 follow-up). Instead, install from a checked-in
+          # package-lock.json (.github/workflows/vendor/workspace-resolvers/) that
+          # pins an exact resolved version + integrity hash for the FULL
+          # transitive closure (210 packages) -- `npm ci` refuses to proceed if
+          # anything it downloads doesn't match the lockfile's pinned integrity
+          # hash, byte-for-byte, deterministically every run. This is npm's own
+          # standard mechanism for exactly this problem, not a hand-rolled one --
+          # the same "delegate to the real tool" reasoning CAT-318 itself is
+          # built on. `npm audit signatures` on top additionally verifies registry
+          # provenance (the lockfile pins integrity, not who published it).
+          set -euo pipefail
+          prefix=$(mktemp -d)
+          cp .github/workflows/vendor/workspace-resolvers/package.json \
+             .github/workflows/vendor/workspace-resolvers/package-lock.json \
+             "$prefix/"
+          (cd "$prefix" && npm ci --ignore-scripts --no-audit --no-fund --loglevel=error)
+          if ! npm audit signatures --prefix "$prefix" >/dev/null; then
+            echo "::error::one or more packages in the workspace-resolver dependency closure failed registry signature verification -- refusing to use them"; exit 1
+          fi
+          echo "WS_RESOLVERS_PREFIX=$prefix" >> "$GITHUB_ENV"
+          echo "Bootstrapped @npmcli/map-workspaces and @pnpm/find-workspace-packages from a pinned, integrity-verified lockfile into $prefix"
+      # 0. Every manifest must be covered by a lockfile this gate validates
+      #    (pnpm importer / sibling package-lock.json / a package of the Cargo
+      #    workspace its Cargo.lock actually locks); yarn/bun/shrinkwrap are
+      #    refused rather than silently passed. Every manifest and lockfile
+      #    kind named here is also in the detector above, so a PR that adds
+      #    only a refused kind still reaches this step.
+      - name: Every manifest is covered by a validated lockfile
+        run: |
+          python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
+          python3 - "$WORKSPACE_ACCEPT" <<'PY'
+          import os, sys, yaml
+          # Every npm/pnpm manifest must be covered by a lockfile this gate validates
+          # (CAT-299 / ADR-0014, local review gate round 5): a package.json is covered if
+          # it is an importer of a pnpm-lock.yaml (workspace member) or has a sibling
+          # package-lock.json / pnpm-lock.yaml. yarn.lock / bun.lock are NOT validated by
+          # this gate and are refused outright rather than silently passed.
+          # argv[1]: comma-separated lockfile kinds this repo's gate actually validates
+          # (pnpm,npm[,cargo] for pnpm workspaces; npm only for an npm repo; cargo for Rust),
+          # passed through from the job-level WORKSPACE_ACCEPT env var (single source of
+          # truth shared with the resolver-bootstrap step's `if:` above -- CAT-318). A
+          # lockfile of any other kind is refused, never counted as coverage (local gate round 6).
+          ACCEPT = set((sys.argv[1] if len(sys.argv) > 1 else "pnpm,npm").split(","))
+          PRUNE = {"node_modules", "target", ".git", ".worktrees"}
+          manifests, covered, refused = [], set(), []
+          # a symlinked manifest / lockfile / package-manager config is refused: the tools
+          # follow the link, but a change to its differently-named target would not be
+          # detected as a dependency change
+          SYMLINK_NAMES = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", ".pnpmfile.cjs", "Cargo.toml", "Cargo.lock", "yarn.lock", "bun.lock", "bun.lockb"}
+
+          import json, subprocess
+
+          def _resolve_workspace_dirs(root, raw_patterns, kind):
+              """Delegates workspace-glob resolution to the REAL npm/pnpm tool
+              (bootstrapped from a pinned, integrity-verified lockfile -- see the
+              'Bootstrap real npm/pnpm workspace resolvers' step) instead of a
+              hand-maintained reimplementation (CAT-318). Returns the set of
+              real, existing directories (relative to root, normalized) the
+              tool actually selects -- extglobs, negation (npm's resurrection
+              model and pnpm's distinct order-independent-absolute model
+              alike), and every other real semantic by construction, since
+              this IS the same code npm/pnpm itself uses.
+
+              Empty/absent raw_patterns means ZERO non-root members for
+              BOTH npm and pnpm -- not "pass through so the tool applies
+              its own default". A prior version of this function passed
+              `None` straight through for pnpm on the theory that pnpm's
+              own default is "root + every subdirectory"; that was wrong
+              (round-3 fix, reversed by round 4 -- see the caller's own
+              comment below for the pinned-binary verification). npm has
+              no implicit `workspaces` default at all (absent means none)
+              -- same zero-coverage conclusion, different reason. Only an
+              explicit non-empty glob list ever reaches the resolver
+              below -- the caller is responsible for never passing `None`
+              here in the first place."""
+              if not raw_patterns:
+                  return set()
+              prefix = os.environ["WS_RESOLVERS_PREFIX"]
+              abs_root = os.path.abspath(root)
+              if kind == "npm":
+                  script = (
+                      "const path = require('path');"
+                      "const mapWorkspaces = require(process.env.WS_RESOLVERS_PREFIX + '/node_modules/@npmcli/map-workspaces');"
+                      "(async () => {"
+                      "  const cwd = process.argv[1];"
+                      "  const workspaces = JSON.parse(process.argv[2]);"
+                      "  const m = await mapWorkspaces({ cwd, pkg: { workspaces } });"
+                      "  process.stdout.write(JSON.stringify([...m.values()].map(p => path.relative(cwd, p) || '.')));"
+                      "})().catch(e => { console.error(e); process.exit(1); });"
+                  )
+              else:
+                  script = (
+                      "const path = require('path');"
+                      "const { findWorkspacePackagesNoCheck } = require(process.env.WS_RESOLVERS_PREFIX + '/node_modules/@pnpm/find-workspace-packages');"
+                      "(async () => {"
+                      "  const cwd = process.argv[1];"
+                      "  const patterns = JSON.parse(process.argv[2]);"
+                      "  const pkgs = await findWorkspacePackagesNoCheck(cwd, { patterns });"
+                      "  process.stdout.write(JSON.stringify(pkgs.map(p => path.relative(cwd, p.dir) || '.')));"
+                      "})().catch(e => { console.error(e); process.exit(1); });"
+                  )
+              result = subprocess.run(["node", "-e", script, "--", abs_root, json.dumps(raw_patterns)], capture_output=True, text=True, timeout=60)
+              if result.returncode != 0:
+                  raise RuntimeError(f"workspace resolution ({kind}) failed for {root}: {result.stderr}")
+              return {os.path.normpath(p) for p in json.loads(result.stdout)}
+
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in PRUNE]
+              for f in files:
+                  if f in SYMLINK_NAMES and os.path.islink(os.path.join(root, f)):
+                      refused.append(os.path.normpath(os.path.join(root, f)) + " (symlink)")
+              for d in list(dirs):
+                  if d == ".cargo" and os.path.islink(os.path.join(root, d)): refused.append(os.path.normpath(os.path.join(root, d)) + " (symlinked .cargo dir)")
+              if os.path.basename(root) == ".cargo":
+                  for f in ("config", "config.toml"):
+                      if f in files and os.path.islink(os.path.join(root, f)): refused.append(os.path.normpath(os.path.join(root, f)) + " (symlink)")
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in PRUNE]
+              rel = os.path.normpath(root)
+              # The npm/pnpm workspace-resolver bootstrap (CAT-318) is CI's own
+              # tooling, not an application dependency: it is pinned and
+              # signature-verified by its own dedicated install-policy step
+              # (ignore-scripts enforcement, per-entry registry-signature check,
+              # `npm ci`, `npm audit signatures` -- strictly more than this
+              # generic coverage check provides) whenever WORKSPACE_ACCEPT
+              # actually names npm/pnpm, and is unused dead weight otherwise
+              # (e.g. this Cargo-only gate) -- either way it should not be
+              # double-counted or refused here.
+              if rel == os.path.normpath(".github/workflows/vendor/workspace-resolvers"):
+                  continue
+              if "package.json" in files:
+                  manifests.append(rel)
+              if "package-lock.json" in files:
+                  if "npm" in ACCEPT:
+                      covered.add(rel)
+                      try:
+                          import json
+                          lock = json.load(open(os.path.join(root, "package-lock.json")))
+                          pkgs = lock.get("packages") or {}
+                          ws = (json.load(open(os.path.join(root, "package.json"))) if os.path.exists(os.path.join(root, "package.json")) else {}).get("workspaces") or []
+                          if isinstance(ws, dict): ws = ws.get("packages") or []
+                          ws = [g for g in ws if isinstance(g, str)]
+                          real_dirs = _resolve_workspace_dirs(root, ws, "npm")
+                          link_targets = {os.path.normpath(m["resolved"]) for m in pkgs.values() if isinstance(m, dict) and m.get("link") and isinstance(m.get("resolved"), str)}
+                          for key in pkgs:
+                              # an npm workspace member is covered only when the ROOT manifest
+                              # declares it (workspaces globs) AND the lock links to it -- a
+                              # handcrafted lock key alone grants nothing
+                              nk = os.path.normpath(key)
+                              if key and "node_modules/" not in key and not nk.startswith("..") and nk in link_targets \
+                                      and nk in real_dirs:
+                                  covered.add(os.path.normpath(os.path.join(rel, nk)))
+                      except (ValueError, OSError):
+                          pass                                                 # the verifier step rejects an unparseable lock
+                  else:
+                      refused.append(os.path.join(rel, "package-lock.json"))
+              if "pnpm-lock.yaml" in files:
+                  if "pnpm" in ACCEPT:
+                      covered.add(rel)
+                      lock = yaml.safe_load(open(os.path.join(root, "pnpm-lock.yaml"))) or {}
+                      # an importer other than the root (".") is covered only when
+                      # pnpm-workspace.yaml's `packages` globs actually select it -- a
+                      # hand-added lock-only importer key with no matching workspace
+                      # declaration is ignored by `pnpm install --frozen-lockfile` (it
+                      # only installs importers pnpm itself resolves from the workspace
+                      # globs), so trusting the raw importers map alone previously granted
+                      # coverage to a manifest pnpm never actually installs or verifies
+                      # (cqdx#349's class of finding, closed here too via CAT-318).
+                      pwy_path = os.path.join(root, "pnpm-workspace.yaml")
+                      pwy = (yaml.safe_load(open(pwy_path)) or {}) if os.path.exists(pwy_path) else {}
+                      # The pinned pnpm CLI normalizes a missing/omitted `packages` key --
+                      # whether pnpm-workspace.yaml is absent entirely, present but omits
+                      # the key, or sets it to an explicit `[]` -- to root-only before any
+                      # install; it does NOT fall through to @pnpm/fs.find-packages' own
+                      # library-level recursive ['.', '**'] default the way calling
+                      # findWorkspacePackagesNoCheck directly (with patterns=None) does.
+                      # Verified against the pinned pnpm 11.22.0 binary itself, not just
+                      # its source: `pnpm install --lockfile-only` and `pnpm -r list`
+                      # against a workspace file with no `packages` key both show only the
+                      # "." importer -- identical to no workspace file at all. This
+                      # reverses the earlier round-3 "let pnpm apply its own default" fix,
+                      # which relied on the library's coded fallback rather than the CLI's
+                      # actual behaviour (Codex round, CAT-318 follow-up). A stale or
+                      # hand-added subdirectory importer must not be granted coverage a
+                      # real `pnpm install --frozen-lockfile` would never check.
+                      pnpm_ws = [g for g in (pwy.get("packages") or []) if isinstance(g, str)]
+                      real_dirs = _resolve_workspace_dirs(root, pnpm_ws, "pnpm")
+                      for imp in (lock.get("importers") or {}):
+                          nimp = os.path.normpath(imp)
+                          if nimp == "." or nimp in real_dirs:
+                              covered.add(os.path.normpath(os.path.join(rel, imp)))
+                  else:
+                      refused.append(os.path.join(rel, "pnpm-lock.yaml"))
+              for f in ("yarn.lock", "bun.lock", "bun.lockb"):
+                  if f in files:
+                      refused.append(os.path.join(rel, f))
+          # Cargo manifests: a Cargo.toml is covered only if it is a package of the
+          # workspace that some Cargo.lock actually locks (cargo metadata --locked from
+          # that lock's directory; an ancestor lock does NOT cover a nested standalone
+          # project -- Codex round 2). Refused outright if this gate does not validate Cargo.
+          import json, subprocess
+          cargo_manifests, cargo_locks = [], []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in PRUNE]
+              rel = os.path.normpath(root)
+              if "Cargo.toml" in files: cargo_manifests.append(os.path.normpath(os.path.join(rel, "Cargo.toml")))
+              if "Cargo.lock" in files: cargo_locks.append(rel)
+          cargo_covered = set()
+          if "cargo" in ACCEPT:
+              for d in cargo_locks:
+                  r = subprocess.run(["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"], cwd=d, capture_output=True, text=True)
+                  if r.returncode != 0:
+                      print(f"::error::{d}/Cargo.lock: cargo metadata --locked failed (manifest/lockfile drift?)\n{r.stderr.strip()[:400]}"); sys.exit(1)
+                  cargo_covered.add(os.path.normpath(os.path.join(d, "Cargo.toml")))   # the workspace root manifest itself
+                  for pkg in json.loads(r.stdout)["packages"]:
+                      cargo_covered.add(os.path.normpath(os.path.relpath(pkg["manifest_path"], ".")))
+          if cargo_manifests and "cargo" not in ACCEPT:
+              refused += cargo_manifests
+          bad = [m for m in manifests if m not in covered]
+          bad += [m for m in cargo_manifests if "cargo" in ACCEPT and m not in cargo_covered]
+          manifests = manifests + (cargo_manifests if "cargo" in ACCEPT else [])
+          if refused:
+              print("::error::lockfile format(s) this gate does not validate -- add validation or remove them:")
+              print("\n".join("  " + r for r in refused))
+          if bad:
+              print("::error::manifest(s) with no covering validated lockfile (not installed, not signature-audited, not source-checked):")
+              print("\n".join("  " + b for b in bad))
+          if refused or bad:
+              sys.exit(1)
+          print(f"all {len(manifests)} manifest(s) are covered by a validated lockfile")
+          PY
+      # Per Cargo project: the parsed source policy (registry crates or
+      # (name, version) workspace members only; cargo metadata --no-deps --locked,
+      # no download) runs BEFORE cargo fetch --locked resolves and
+      # checksum-verifies the crates of THAT project.
+      - name: Crate source policy + cargo fetch --locked (every Cargo.lock)
+        run: |
+          # .cargo/config(.toml) is parsed as TOML and may not override crate
+          # sources, registries, or network transport (dotted keys included).
+          python3 - <<'CCP'
+          import os, sys, tomllib
+          # .cargo/config(.toml) can redirect crate fetching (source replacement,
+          # registries, registry.default, net.git-fetch-with-cli...) without touching
+          # Cargo.toml/Cargo.lock. Parsed as TOML (dotted keys included), any of those
+          # top-level tables is refused; benign tables (env, build, test, alias...) pass.
+          FORBIDDEN = {"source", "registries", "registry", "net", "http"}
+          bad = []
+          for root, dirs, files in os.walk("."):
+              dirs[:] = [d for d in dirs if d not in ("node_modules", "target", ".git")]
+              if os.path.basename(root) != ".cargo": continue
+              for f in ("config", "config.toml"):
+                  if f in files:
+                      p = os.path.join(root, f)
+                      try: cfg = tomllib.load(open(p, "rb"))
+                      except tomllib.TOMLDecodeError as e: bad.append(f"{p}: unparseable TOML ({e})"); continue
+                      hit = sorted(FORBIDDEN & set(cfg))
+                      if hit: bad.append(f"{p}: overrides {', '.join(hit)} -- crate sources/registries/network may only come from Cargo.toml + Cargo.lock")
+          if bad:
+              print("::error::Cargo configuration overrides are not allowed:"); print("\n".join("  " + b for b in bad)); sys.exit(1)
+          print("no Cargo source/registry/network overrides in any .cargo/config")
+          CCP
+          cat > /tmp/cargo-sources.py <<'PY'
+          import json, subprocess, sys, tomllib
+          # Registry-only source policy for Cargo.lock (CAT-299 / ADR-0014). A path
+          # dependency has NO `source` field in Cargo.lock, so "no git source" is not
+          # enough: every package must either be a workspace member or come from a
+          # registry.
+          # --locked: a manifest that drifted from Cargo.lock must FAIL here instead of
+          # cargo silently regenerating the lockfile we are about to judge (local gate
+          # round 10).
+          meta = json.loads(subprocess.check_output(["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"]))
+          # workspace_members are package IDs; identify members by (name, version) so a
+          # path crate that merely reuses a member's NAME cannot pass as that member.
+          ids = set(meta["workspace_members"])
+          members = {(p["name"], p["version"]) for p in meta["packages"] if p["id"] in ids}
+          lock = tomllib.load(open("Cargo.lock", "rb"))
+          # The only trusted registry sources -- crates.io's classic git index and its
+          # current sparse-protocol index. A manifest dependency can set the stable
+          # `registry-index` key directly (bypassing the separate .cargo/config.toml
+          # guard entirely, since this is a Cargo.toml-level override, not a config
+          # file one) to point Cargo at an arbitrary registry, including a plaintext
+          # http:// one; `src.startswith("registry+")` alone accepts that unchanged
+          # (Codex round 8, cqdx #349). Anything else -- a different host, a different
+          # protocol, plaintext http -- is refused, matching the pnpm/npm registry
+          # pin's "one trusted source, not any source that merely looks like one"
+          # posture used elsewhere in this gate.
+          CRATES_IO = {
+              "registry+https://github.com/rust-lang/crates.io-index",
+              "registry+sparse+https://index.crates.io/",
+          }
+          bad = []
+          for p in lock.get("package", []):
+              src = p.get("source")
+              if src is None:
+                  if (p["name"], p["version"]) not in members:
+                      bad.append(f"{p['name']} {p['version']}: path dependency (not a workspace member)")
+              elif src not in CRATES_IO:
+                  bad.append(f"{p['name']} {p['version']}: source={src}")
+          if bad:
+              print("::error::non-registry crate sources in Cargo.lock:"); print("\n".join("  " + b for b in bad)); sys.exit(1)
+          print(f"all {len(lock.get('package', []))} locked crates are registry crates or workspace members ({len(members)} members)")
+          PY
+          n=0
+          while IFS= read -r lock; do
+            n=$((n+1)); echo "== $lock"; ( cd "$(dirname "$lock")" && python3 /tmp/cargo-sources.py && cargo fetch --locked )
+          done < <(find . \( -name node_modules -o -name target -o -name .git \) -prune -o -name 'Cargo.lock' -print | sort)
+          echo "checked $n Cargo lockfile(s)"
+  # Runs on EVERY PR (~10s): no path filter can know the custom filenames a
+  # Docker action's runs.image may point at, so the script classifies every
+  # changed file itself (local review gate, round 3).
+  actions-pins:
+    name: Newly added actions are pinned
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
+        with:
+          fetch-depth: 0
+      - name: Newly added actions must be pinned (structural YAML check)
+        env:
+          BASE: ${{ github.event.pull_request.base.sha || github.event.merge_group.base_sha }}
+          HEAD: ${{ github.event.pull_request.head.sha || github.event.merge_group.head_sha }}
+        run: |
+          python3 -c 'import yaml' || { echo '::error::PyYAML is not on this runner -- refusing to install anything inside the verifier'; exit 1; }
+          cat > /tmp/action-pins.py <<'PY'
+          import json, os, re, shlex, subprocess, sys, yaml
+          from collections import Counter
+          # Built from two concatenated halves, never spelled as one contiguous token
+          # anywhere in this file (comments included): GitHub evaluates any
+          # dollar-brace-brace ... brace-brace expression sequence appearing anywhere
+          # in a run: block's raw text -- even inside a Python string literal or a
+          # comment -- before bash/python ever sees it. Spelling that sequence out
+          # literally here previously broke this entire workflow file (every trigger
+          # failed with zero jobs, "workflow file issue") because GitHub tried to
+          # evaluate it as a real expression (Codex round, cqdx #349).
+          EXPR_MARK = "$" + "{{"
+          # Newly-added-action pin policy (CAT-299 / ADR-0014). Structural, not textual:
+          # every workflow (.github/workflows/*.yml) and every action manifest
+          # (**/action.yml|yaml) changed in the PR is parsed at the PR's MERGE-BASE and at
+          # HEAD; the executable references of each file -- step `uses`, job-level
+          # reusable-workflow `uses`, job `container`/`services.*.image`, composite/docker
+          # action `runs.image` (a Dockerfile-backed action's FROM images; any changed
+          # Dockerfile, or any file an action manifest names as its runs.image, whatever its
+          # filename; COPY/ADD/RUN --from images too), with local `./path` actions expanded
+          # recursively -- are
+          # counted PER FILE, and only occurrences new in that file are judged: floating
+          # branch ref or no version -> fail; docker:// or container image without an
+          # immutable @sha256 digest -> fail; tag pin -> warning; SHA -> ok. Local
+          # references are expanded per invocation (cycle-safe, fail-closed on depth) and
+          # a file renamed INTO an executable location is judged as new.
+          # HagaleTechnologies/ refs are the fleet's own code.
+          base_arg, head = sys.argv[1], sys.argv[2]
+          def sh(*a):
+              r = subprocess.run(a, capture_output=True, text=True); return r.returncode, r.stdout
+          rc, mb = sh("git", "merge-base", base_arg, head)
+          base = mb.strip() if rc == 0 and mb.strip() else base_arg   # judge only the PR's own additions
+          def dockerfile_images(text, hard_fail=None, label="Dockerfile"):
+              """container:<image> for every FROM that is not `scratch`, an earlier build
+              stage (alias OR numeric index), honouring a leading `# escape=` directive for
+              line continuations; heredoc-bearing instructions fail closed; `ARG NAME=default` declared before a FROM is substituted
+              ($NAME / ${NAME} / ${NAME:-fallback}); an unresolved variable stays in the
+              ref and fails the digest check (fail closed)."""
+              text = text.lstrip("\ufeff")   # Docker strips a leading BOM before parsing
+              # directives; a raw \ufeff before "#" would otherwise stop the directive
+              # regexes from matching a legitimate `# syntax=` on line 1 (Codex round 1,
+              # pancetta #291).
+              esc, out, seen = "\\", [], set()
+              # Parser directives (Docker reference): only at the very top, one per line, no
+              # continuation; the block ENDS at the first empty line, ordinary comment,
+              # UNKNOWN directive (treated as a comment) or instruction -- a later
+              # `# syntax=` is then an inert comment. A directive given twice is invalid;
+              # refused rather than guessed (Codex local round, sync PRs).
+              for raw in text.splitlines():
+                  m = re.match(r"\s*#\s*([A-Za-z]+)\s*=\s*(\S+)\s*$", raw)
+                  if not m or m.group(1).lower() not in ("syntax", "escape", "check"): break
+                  key, val = m.group(1).lower(), m.group(2)
+                  if key in seen:
+                      if hard_fail is not None: hard_fail.add(f"{label}: parser directive `{key}` appears twice -- invalid Dockerfile, refused")
+                      break
+                  seen.add(key)
+                  if key == "escape": esc = val[0]
+                  elif key == "syntax": out.append("container:" + val)              # BuildKit frontend image: pulled and executed first
+              logical, buf = [], ""
+              for raw in text.splitlines():
+                  if raw.lstrip().startswith("#"): continue
+                  if raw.rstrip().endswith(esc):
+                      buf += raw.rstrip()[:-1] + " "; continue
+                  logical.append(buf + raw); buf = ""
+              if buf: logical.append(buf)
+              # Docker heredocs (`RUN <<EOF ... EOF`, `COPY <<X ...`) are NOT parsed by this
+              # gate: getting shell heredoc grammar exactly right (quoting, grouped
+              # operators, escapes, dash delimiters) is a bypass surface in itself, and a
+              # body line can forge a stage alias. Any unquoted `<<` token in a RUN/COPY/ADD
+              # instruction therefore fails closed with an explicit message. ACCEPTED
+              # OVER-APPROXIMATION (policy, not a bug): this also refuses rare non-heredoc
+              # uses such as `$((1 << 2))` or an escaped `\<<`: the instruction must be
+              # rewritten without a `<<` operator (e.g. multiply instead of shift, or
+              # move the script into a file ADDed from the context). The fleet has no
+              # Dockerfile-backed action today, so the cost is zero and the bypass
+              # surface is closed.
+              for line in logical:                                   # HEAD: refuse heredocs; BASE: a heredoc-bearing base is
+
+                  m = re.match(r"\s*(?:ONBUILD\s+)?(?:RUN|COPY|ADD)\s+((?:--\S+\s+)*)(.*)$", line, re.I | re.S)
+                  if m:
+                      if m.group(2).lstrip().startswith("["):
+                          try:
+                              if isinstance(json.loads(m.group(2).strip()), list): continue   # JSON (exec) form: no shell, no heredoc
+                          except ValueError:
+                              pass                                                          # `RUN [ -e x ] || …` is shell form
+                      try:
+                          lex = shlex.shlex(line, posix=False, punctuation_chars=True); lex.whitespace_split = True; lex.commenters = ""; toks = list(lex)
+                      except ValueError:
+                          toks = line.split()
+                      if any("<<" in t and "<<<" not in t and not t.startswith(("'", '"')) for t in toks):   # `<<<` is a here-string, not a heredoc
+                          # an UNCONDITIONAL failure at HEAD (never a subtractable reference):
+                          # a heredoc that already existed at the base must still fail the PR
+                          if hard_fail is not None:
+                              hard_fail.add(f"{label}: a RUN/COPY/ADD instruction uses a heredoc (`<<`) -- this gate refuses to parse heredocs; rewrite the instruction without one")
+                          # UNAVAILABLE for subtraction (fail closed): body text could otherwise
+                          # cancel a genuinely new reference, and such a base can only predate
+                          # this gate -- a cleanup PR must pin everything it keeps.
+                          return []
+              global_args, stage_args, stages, index = {}, {}, set(), 0
+              in_stage = False
+              def expand(v, scope):
+                  v = re.sub(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::-([^}]*))?\}",
+                             lambda m: (scope.get(m.group(1)) or (m.group(2) if m.group(2) is not None else scope.get(m.group(1), m.group(0)))) if m.group(2) is not None or m.group(1) in scope else m.group(0), v)
+                  return re.sub(r"\$([A-Za-z_][A-Za-z0-9_]*)", lambda m: scope.get(m.group(1), m.group(0)), v)
+              for line in logical:
+                  m = re.match(r"\s*ARG\s+([A-Za-z_][A-Za-z0-9_]*)(?:=(.*))?\s*$", line, re.I)
+                  if m:
+                      name, val = m.group(1), m.group(2)
+                      val = None if val is None else val.strip().strip("\"'")
+                      if not in_stage:
+                          global_args[name] = val or ""                              # pre-FROM: global default
+                      elif val is not None:
+                          stage_args[name] = val                                     # stage-local value
+                      else:
+                          stage_args[name] = global_args.get(name, "")               # valueless: inherits the GLOBAL default only
+                      continue
+                  # COPY/ADD --from=X (instruction FLAGS only) and RUN --mount=...,from=X
+                  # (inside the --mount option value only) pull X when it is not a stage;
+                  # ordinary command text such as `RUN echo from=x` is never an image.
+                  srcs = []
+                  am = re.match(r"\s*(?:ONBUILD\s+)?ADD\s+((?:--\S+\s+)*)(.*)$", line, re.I | re.S)
+                  if am:
+                      flags, rest = am.group(1), am.group(2).strip()
+                      try: parts = json.loads(rest) if rest.startswith("[") else shlex.split(rest, posix=True)
+                      except ValueError: parts = rest.split()
+                      for src in parts[:-1]:                                             # last word is the destination
+                          src = str(src)
+                          # NOT expanded: inside a stage, ENV overrides a same-named ARG (Docker
+                          # reference), and a base image's own ENV is invisible here, so an ARG
+                          # value is never proof of what Docker will use. A variable in an ADD
+                          # source fails closed; write it literally (Codex panino round 8).
+                          if "$" in src:
+                              if hard_fail is not None: hard_fail.add(f"{label}: ADD source `{src}` uses a variable -- ENV can override any ARG (including from the base image), so the gate cannot know what is fetched; write the source literally")
+                              continue
+                          # a bare local path/dirname ending in ".git" (e.g. a fixture named
+                          # "repo.git") is NOT a remote source -- Docker's own docs show git
+                          # sources ONLY via an explicit transport (git@host:, ssh://, git://)
+                          # or an http(s):// URL; there is no documented bare-hostname
+                          # shorthand for ADD, so `.endswith(".git")` alone over-matched local
+                          # paths (Codex round 1, pancetta #291).
+                          if re.match(r"(?i)^(https?://|git@[\w.-]+:|ssh://|git://)", src):
+                              # remote content baked into the action image: a URL needs an
+                              # immutable --checksum=sha256:…, a git source is never pinned enough
+                              # unanchored re.search over the whole flags string let a single
+                              # token like --exclude=nomatch--checksum=sha256:<64hex> (no space
+                              # before --checksum, so still ONE --\S+ token) satisfy the check
+                              # via substring match even though it names --exclude, not
+                              # --checksum -- require a COMPLETE token to equal the checksum
+                              # flag exactly (Codex round, pancetta #291).
+                              if re.match(r"(?i)^https://", src) and any(re.fullmatch(r"--checksum=sha256:[0-9a-f]{64}", f) for f in flags.split()): continue   # plaintext http is never acceptable
+                              out.append("container:ADD-REMOTE-UNPINNED(" + src + ")")
+                  fm = re.match(r"\s*(?:ONBUILD\s+)?(COPY|ADD)\s+((?:--\S+\s+)*)", line, re.I)
+                  if fm: srcs += [v.strip("'\"") for v in re.findall(r"--from=(\S+)", fm.group(2))]   # Docker removes quotes: --from="build"
+                  rm = re.match(r"\s*(?:ONBUILD\s+)?RUN\s+((?:--\S+\s+)*)", line, re.I)
+                  if rm:
+                      for mnt in re.findall(r"--mount=(\S+)", rm.group(1)):
+                          mnt = mnt.strip("'\"")                         # --mount="from=img,target=/x" is valid BuildKit syntax
+                          srcs += [v.strip("'\"") for v in re.findall(r"(?:^|,)from=([^,]+)", mnt)]
+                  for src in srcs:
+                      if "$" in src:                                                 # same ENV-over-ARG argument: a variable stage/image ref is refused
+                          if hard_fail is not None: hard_fail.add(f"{label}: `{line.strip()[:60]}` references image/stage `{src}` through a variable -- ENV can override any ARG, so the gate cannot know what is pulled; write it literally")
+                          continue
+                      onbuild = bool(re.match(r"\s*ONBUILD\b", line, re.I))   # a deferred trigger runs DOWNSTREAM: a stage name is an external image there
+                      if onbuild or (src.lower() not in stages and not (src.isdigit() and int(src) < index)):
+                          out.append("container:" + src)
+                  m = re.match(r"\s*FROM\s+((?:--\S+\s+)*)(\S+)(?:\s+AS\s+(\S+))?", line, re.I)
+                  if not m: continue
+                  img, alias = expand(m.group(2), global_args), m.group(3)            # FROM sees only global ARGs
+                  in_stage, stage_args = True, {}                                    # a new stage starts with an empty ARG scope
+                  is_stage_index = img.isdigit() and int(img) < index
+                  if img.lower() != "scratch" and img.lower() not in stages and not is_stage_index:
+                      out.append("container:" + img)
+                  if alias: stages.add(alias.lower())
+                  index += 1
+              return out
+          def manifests_at(rev):
+              _, out = sh("git", "ls-tree", "-r", "--name-only", "-z", rev)
+              return [p for p in out.split("\0") if os.path.basename(p) in ("action.yml", "action.yaml")]
+          def image_files_at(rev):
+              """Every file an action manifest at `rev` builds from (runs.image as a relative
+              path, any filename) -- a change to such a file changes what executes."""
+              refs = set()
+              for m in manifests_at(rev):
+                  doc = load(rev, m)
+                  runs = doc.get("runs") if isinstance(doc, dict) else None
+                  img = runs.get("image") if isinstance(runs, dict) else None
+                  if isinstance(img, str) and img.strip() and not img.startswith("docker://"):
+                      refs.add(os.path.normpath(os.path.join(os.path.dirname(m), img.strip())))
+              return refs
+          REF_CACHE = {}
+          def referenced_at(rev):
+              if rev not in REF_CACHE: REF_CACHE[rev] = image_files_at(rev)
+              return REF_CACHE[rev]
+          REFERENCED = None
+          def is_target(p):
+              global REFERENCED
+              if REFERENCED is None: REFERENCED = referenced_at(head) | referenced_at(base)   # union: classify the CHANGE
+              b = os.path.basename(p); bl = b.lower()
+              return ((p.startswith(".github/workflows/") and p.endswith((".yml", ".yaml"))) or b in ("action.yml", "action.yaml")
+                      or bl.startswith("dockerfile") or bl.endswith(".dockerfile") or p in REFERENCED)
+          def changed_pairs():
+              """[(base_path|None, head_path|None)] rename-aware, NUL-safe."""
+              _, raw = sh("git", "diff", "-z", "--name-status", "-M", base, head, "--", ".")
+              raw = raw.split("\0"); pairs, i = [], 0
+              while i < len(raw) and raw[i]:
+                  st = raw[i]; i += 1
+                  if st[0] in "RC":
+                      old, new = raw[i], raw[i + 1]; i += 2
+                      pairs.append((old if st[0] == "R" else None, new))
+                  else:
+                      p = raw[i]; i += 1
+                      pairs.append((None if st[0] == "A" else p, None if st[0] == "D" else p))
+              out = []
+              for b, h in pairs:
+                  if h is not None and not is_target(h): continue
+                  if h is None and not is_target(b): continue
+                  # a file renamed INTO an executable location was not executable before:
+                  # judge it as new rather than subtracting its old, inert contents
+                  if b is not None and not is_target(b): b = None
+                  out.append((b, h))
+              return out
+          def is_symlink(rev, path):
+              _, out = sh("git", "ls-tree", rev, "--", path)
+              return out.startswith("120000 ")
+          def show(rev, path):
+              if is_symlink(rev, path):
+                  # the runner follows the link to some other checked-in file; refuse to
+                  # judge a manifest/Dockerfile we cannot attribute (fail closed)
+                  if rev == head and path not in SYMLINKED:          # a base-only symlink is just "unavailable" for subtraction
+                      print(f"::error::{path} is a symlink -- executable manifests must be real files"); SYMLINKED.add(path)
+                  return None
+              rc, out = sh("git", "show", f"{rev}:{path}"); return out if rc == 0 else None
+          SYMLINKED = set()
+          HARD_FAIL = set()   # unconditional HEAD failures (never subtracted against the base)
+          DEP_SYMLINK_NAMES = {"package.json", "package-lock.json", "npm-shrinkwrap.json", "pnpm-lock.yaml", "pnpm-workspace.yaml", ".npmrc", ".pnpmfile.cjs", "Cargo.toml", "Cargo.lock", "yarn.lock", "bun.lock", "bun.lockb"}
+          def check_dependency_symlinks(rev):
+              # `changes`'s paths-filter only fires install-policy when one of these exact
+              # PATHS shows a changed git blob -- a symlinked lockfile whose TARGET file is
+              # what the PR actually edits (the symlink itself untouched) never matches that
+              # filter, so install-policy (and its own, narrower symlink refusal) is skipped
+              # entirely; pnpm/npm/cargo transparently follow the symlink and read the new
+              # content regardless. This runs unconditionally, on every PR, like the rest of
+              # this script (Codex round, panino #101).
+              rc, out = sh("git", "ls-tree", "-r", rev)
+              if rc != 0: return
+              for line in out.splitlines():
+                  meta, _, path = line.partition("\t")
+                  if not path or not meta.split(): continue
+                  if meta.split()[0] == "120000" and os.path.basename(path) in DEP_SYMLINK_NAMES:
+                      HARD_FAIL.add(f"{path}: a dependency manifest/lockfile must not be a symlink -- its target could change without the path-filter that gates install-policy ever noticing")
+          def load(rev, path):
+              txt = show(rev, path)
+              if txt is None: return None
+              try: return yaml.safe_load(txt)
+              except yaml.YAMLError as e:
+                  print(f"::error::{path}@{rev[:8]}: unparseable YAML ({e}) -- refusing to judge it"); sys.exit(1)
+          def image_ref(v):
+              if isinstance(v, dict): v = v.get("image")
+              return f"container:{v.strip()}" if isinstance(v, str) and v.strip() else None
+          MAX_DEPTH = 12
+          def refs_of(rev, doc, acc, stack, depth=0, manifest_path=""):
+              if not isinstance(doc, dict): return
+              def expand(path, label):
+                  # every invocation is expanded (per-occurrence policy); `stack` is the
+                  # current recursion path only, so a cycle is cut but a repeated
+                  # invocation is still counted; too-deep chains FAIL rather than vanish.
+                  if path in stack:
+                      return
+                  if depth >= MAX_DEPTH:
+                      print(f"::error::local reference chain deeper than {MAX_DEPTH} at {label} -- refusing to skip it"); acc["MISSING:" + label] += 1; return
+                  sub = load(rev, path)
+                  if sub is None:
+                      print(f"::error::local reference {label} has no {path} at {rev[:8]}"); acc["MISSING:" + label] += 1; return
+                  refs_of(rev, sub, acc, stack | {path}, depth + 1, path)
+              def add(ref, job_level=False):
+                  ref = ref.strip()
+                  if ref.startswith("./"):
+                      local = ref[2:].rstrip("/")
+                      if job_level and local.endswith((".yml", ".yaml")):      # local reusable workflow
+                          expand(local, ref)
+                      else:                                                    # local action directory
+                          cand = [f"{local}/action.yml", f"{local}/action.yaml"]
+                          hit = next((c for c in cand if show(rev, c) is not None), None)
+                          expand(hit if hit else cand[0], ref)
+                  else: acc[ref] += 1
+              def steps(lst):
+                  for st in lst or []:
+                      if isinstance(st, dict) and isinstance(st.get("uses"), str): add(st["uses"])
+              jobs = doc.get("jobs")
+              if isinstance(jobs, dict):
+                  for job in jobs.values():
+                      if not isinstance(job, dict): continue
+                      if isinstance(job.get("uses"), str): add(job["uses"], job_level=True)
+                      if isinstance(job.get("steps"), list): steps(job["steps"])
+                      # an expression-valued image (a matrix/input/vars-templated ref --
+                      # literal dollar-brace-brace syntax deliberately not spelled out here:
+                      # GitHub evaluates ANY such sequence appearing anywhere in this run:
+                      # block's raw text, even inside a comment, which is exactly what broke
+                      # this workflow file until this line was reworded) is unchanged text
+                      # whose VALUE a PR can change elsewhere, so base/head would cancel: it
+                      # cannot be verified and fails closed at HEAD (Codex round 8). Write the
+                      # digest-pinned image literally.
+                      def image(v, what):
+                          c = image_ref(v)
+                          if c and EXPR_MARK in c:
+                              if rev == head: HARD_FAIL.add(f"{manifest_path or 'workflow'}: {what} image is an expression ({c[len('container:'):]}) -- the gate cannot verify what it resolves to; write the @sha256-pinned image literally")
+                              return
+                          if c: acc[c] += 1
+                      image(job.get("container"), "job container")
+                      svcs = job.get("services")
+                      if isinstance(svcs, dict):
+                          for name, sv in svcs.items(): image(sv, f"service `{name}`")
+              runs = doc.get("runs")
+              if isinstance(runs, dict):
+                  if isinstance(runs.get("steps"), list): steps(runs["steps"])
+                  img = runs.get("image")
+                  if isinstance(img, str) and img.startswith("docker://"):
+                      if EXPR_MARK in img:
+                          if rev == head: HARD_FAIL.add(f"{manifest_path or 'action'}: runs.image is an expression ({img.strip()}) -- write the @sha256-pinned image literally")
+                      else: acc[img.strip()] += 1
+                  elif isinstance(img, str) and img.strip():
+                      # Dockerfile-backed action: GitHub builds it, so its FROM images run (round 3)
+                      df = os.path.normpath(os.path.join(os.path.dirname(manifest_path), img.strip()))
+                      txt = show(rev, df)
+                      if txt is None: print(f"::error::action {manifest_path} references missing {df}"); acc["MISSING:" + df] += 1
+                      else:
+                          for c in dockerfile_images(txt, HARD_FAIL if rev == head else None, df): acc[c] += 1
+          def refs_at(rev, path):
+              acc = Counter()
+              b = os.path.basename(path).lower()
+              if b.startswith("dockerfile") or b.endswith(".dockerfile") or path in referenced_at(rev):   # per revision: what EXECUTES there
+                  txt = show(rev, path)
+                  if txt is not None:
+                      for c in dockerfile_images(txt, HARD_FAIL if rev == head else None, path): acc[c] += 1
+                  return acc
+              doc = load(rev, path)
+              if doc is not None: refs_of(rev, doc, acc, frozenset({path}), 0, path)
+              return acc
+          fail = 0; new = Counter()
+          for mpath in sorted(set(manifests_at(head)) | referenced_at(head)):
+              if is_symlink(head, mpath) and mpath not in SYMLINKED:
+                  print(f"::error::{mpath} is a symlink -- executable manifests and action image files must be real files (a change to the target would otherwise escape review)"); SYMLINKED.add(mpath)
+          for b, h in changed_pairs():
+              if h is None: continue                               # deleted file: nothing new runs
+              new += refs_at(head, h) - (refs_at(base, b) if b else Counter())   # per file, per occurrence
+          if SYMLINKED: fail = 1
+          check_dependency_symlinks(head)
+          for msg in sorted(HARD_FAIL): print(f"::error::{msg}"); fail = 1
+          for ref in sorted(new):            # one verdict per distinct ref (a ref reached via a local action AND its own changed manifest is reported once)
+              if ref.startswith("MISSING:"): fail = 1; continue
+              if ref.startswith("HagaleTechnologies/"): continue
+              if ref.startswith(("docker://", "container:")):
+                  if re.search(r"@sha256:[0-9a-f]{64}$", ref): print(f"pinned by digest: {ref}")
+                  else: print(f"::error::image without an immutable @sha256 digest: {ref}"); fail = 1
+                  continue
+              if "@" not in ref: print(f"::error::unpinned action (no @version): {ref}"); fail = 1; continue
+              ver = ref.rsplit("@", 1)[1]
+              if re.fullmatch(r"[0-9a-f]{40}", ver): print(f"pinned by SHA: {ref}")
+              elif re.fullmatch(r"v?[0-9]+(\.[0-9]+)*", ver): print(f"::warning::tag-pinned (mutable) action added: {ref} -- prefer a full commit SHA")
+              else: print(f"::error::floating ref (branch) action added: {ref}"); fail = 1
+          print("added-action pin check " + ("FAILED" if fail else "passed")); sys.exit(fail)
+          PY
+          python3 /tmp/action-pins.py "$BASE" "$HEAD"
+
+  # Fan-in gate. Its check context is "Supply Chain" -- the branch ruleset's
+  # required status check. NEVER rename this job. Runs with if: always() so a
+  # failed/cancelled upstream job FAILS this check instead of skipping it (a
+  # skipped required check does NOT block merge).
+  supply-chain:
+    name: Supply Chain
+    if: always()
+    needs: [changes, osv-pr, osv-merge-group, install-policy, actions-pins]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Gate
+        env:
+          CHANGES: ${{ needs.changes.result }}
+          DEPS: ${{ needs.changes.outputs.deps }}
+          OSV_PR: ${{ needs.osv-pr.result }}
+          OSV_MG: ${{ needs.osv-merge-group.result }}
+          POLICY: ${{ needs.install-policy.result }}
+          PINS: ${{ needs.actions-pins.result }}
+        run: |
+          # exactly one of osv-pr/osv-merge-group runs per event (each is
+          # if-gated on github.event_name); the other reports 'skipped'.
+          OSV="$OSV_PR"; [ "$OSV" != skipped ] || OSV="$OSV_MG"
+          echo "changes=$CHANGES deps=$DEPS osv=$OSV (pr=$OSV_PR mg=$OSV_MG) install-policy=$POLICY actions-pins=$PINS"
+          if [ "$CHANGES" != success ]; then
+            echo "::error::dependency change detection did not succeed ($CHANGES)"; exit 1
+          fi
+          if [ "$PINS" != success ]; then
+            echo "::error::newly added actions/images are not acceptably pinned ($PINS)"; exit 1
+          fi
+          if [ "$DEPS" != true ]; then
+            echo "No dependency manifest, lockfile, or workflow changed -- nothing more to scan."; exit 0
+          fi
+          for r in "$OSV" "$POLICY"; do
+            if [ "$r" != success ]; then
+              echo "::error::a supply-chain scan did not succeed -- this PR must not merge until it does"; exit 1
+            fi
+          done
+          echo "All supply-chain scans passed."
+

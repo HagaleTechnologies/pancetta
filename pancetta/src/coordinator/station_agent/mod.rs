@@ -284,29 +284,73 @@ fn now_ms() -> i64 {
 /// from any panic in the session loop. Drop must remain synchronous and
 /// panic-free: it can itself run while another panic is already unwinding.
 ///
-/// `shutdown` lets `Drop` tell an ordinary, requested shutdown apart from an
-/// actual crash/unwind (PAN-19 MEDIUM #4): `run_session_loop` already calls
-/// `disarm_on_loss` (reason `OperatorDisarm`) on every ordinary exit path,
-/// including its own "final safety" call right before it returns -- so on a
-/// clean shutdown this guard's `Drop` is normally a no-op (the arm is
+/// `normal_exit` lets `Drop` tell an ordinary, requested shutdown apart from
+/// an actual crash/unwind (PAN-19 MEDIUM #4): `run_session_loop` already
+/// calls `disarm_on_loss` (reason `OperatorDisarm`) on every ordinary exit
+/// path, including its own "final safety" call right before it returns -- so
+/// on a clean shutdown this guard's `Drop` is normally a no-op (the arm is
 /// already disarmed, and `disarm_with_reason` no-ops when nothing is armed).
 /// But if that prior disarm silently gave up (e.g. a poisoned `arm` mutex),
 /// the session could still be armed when this `Drop` runs even though
 /// nothing crashed -- attributing that disarm to `ComponentCrash`
 /// unconditionally would misattribute a routine shutdown as a crash in the
 /// audit log, exactly the failure mode `DisarmReason` exists to prevent (see
-/// its doc comment), just in the opposite direction. Attribute to
-/// `OperatorDisarm` ("the operator (or coordinator) explicitly disarmed")
-/// whenever `shutdown` is set, and only to `ComponentCrash` otherwise.
+/// its doc comment), just in the opposite direction.
+///
+/// `normal_exit` is set by [`RemoteTxDisarmGuard::mark_normal_exit`], called
+/// only from `run_session_loop`'s own clean-return path, immediately before
+/// it returns. PAN-36: an earlier version of this guard instead read the
+/// process-wide `shutdown` `AtomicBool` here in `Drop` -- but that flag can
+/// be set true by an unrelated task at any moment, including the exact
+/// instant this task is unwinding from a genuine panic, which misattributed
+/// the crash as `OperatorDisarm`. `normal_exit` is owned exclusively by this
+/// task and flipped only on its own verified clean-return path, so it can't
+/// be raced by anything outside this task.
+///
+/// PAN-36 round 2: `normal_exit` alone under-covers a second ordinary exit
+/// path -- `run_one_session` never checks `cfg.shutdown` itself, so a
+/// session with an established peer can still be mid-flight when shutdown is
+/// requested. `shutdown.rs` gives every named task a 1s grace period, then
+/// force-`abort()`s it. That abort drops this guard immediately, well before
+/// `mark_normal_exit`, via ordinary (non-unwinding) `Drop` cleanup -- so a
+/// genuine panic always leaves this thread `std::thread::panicking()`, while
+/// an abort-triggered cancellation never does.
+///
+/// PAN-36 round 3 (Codex on the round-2 fix): treating every non-panicking
+/// drop as automatically operator-initiated is itself too broad -- some
+/// future cancellation unrelated to shutdown (a different `AbortHandle`
+/// call, a runtime-level drop) would also read as "not panicking" and get
+/// misattributed as `OperatorDisarm`, hiding a real unexpected termination.
+/// `Drop` now ALSO re-checks the shared `shutdown` flag for that fallback
+/// case, so a non-panicking, non-`normal_exit` drop is `OperatorDisarm` only
+/// when shutdown was actually requested. This does not reopen the round-1
+/// race (an unrelated task's shutdown flag flipping during a real panic on
+/// THIS task): `!std::thread::panicking()` is checked FIRST and short-
+/// circuits to `ComponentCrash` on any genuine panic regardless of the
+/// flag's state, exactly as round 2 established -- the flag is now only
+/// consulted to narrow the *non-panicking* fallback, never to override a
+/// real panic.
 struct RemoteTxDisarmGuard {
     arm: Arc<Mutex<ArmState>>,
     audit: AuditLog,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
+    normal_exit: bool,
+}
+
+impl RemoteTxDisarmGuard {
+    /// Call only right before `run_session_loop` returns on its own
+    /// requested-shutdown path -- never from anywhere a panic could still
+    /// unwind through afterward.
+    fn mark_normal_exit(&mut self) {
+        self.normal_exit = true;
+    }
 }
 
 impl Drop for RemoteTxDisarmGuard {
     fn drop(&mut self) {
-        let reason = if self.shutdown.load(Ordering::Acquire) {
+        let non_panicking_shutdown_cancellation =
+            !std::thread::panicking() && self.shutdown.load(Ordering::Acquire);
+        let reason = if self.normal_exit || non_panicking_shutdown_cancellation {
             DisarmReason::OperatorDisarm
         } else {
             DisarmReason::ComponentCrash
@@ -1637,10 +1681,11 @@ struct RunConfig {
 /// On any session teardown the arm is disarmed (fail TX-off on control-channel
 /// loss, Part-97), then the loop reconnects with capped backoff until shutdown.
 async fn run_session_loop(mut cfg: RunConfig) {
-    let _disarm_guard = RemoteTxDisarmGuard {
+    let mut disarm_guard = RemoteTxDisarmGuard {
         arm: cfg.arm.clone(),
         audit: cfg.audit.clone(),
         shutdown: cfg.shutdown.clone(),
+        normal_exit: false,
     };
     let mut backoff = RECONNECT_BACKOFF_MIN;
     let mut ctx = ArmContext {
@@ -1686,6 +1731,7 @@ async fn run_session_loop(mut cfg: RunConfig) {
     }
     // Final safety: disarm on component shutdown.
     disarm_on_loss(&mut ctx);
+    disarm_guard.mark_normal_exit();
 }
 
 /// Disarm the shared arm on any control-channel loss and audit it. Also clears
@@ -1791,6 +1837,12 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
                     Ok(a) => a,
                     Err(e) => {
                         debug!(target: "agent.control", "malformed control frame: {e}");
+                        // PAN-34: this `continue` must not skip the
+                        // end-of-loop revocation broadcast below, or a
+                        // client that keeps resending bad frames can
+                        // suppress it for every OTHER connected peer
+                        // indefinitely.
+                        broadcast_pending_revocation(ctx, &mut sess);
                         continue;
                     }
                 };
@@ -1857,22 +1909,27 @@ async fn run_one_session<W: pancetta_agent::relay::WsConn>(
             }
         }
 
-        // Round-1 review fix (PR #261): a concurrent `poll_authorizations_loop`
-        // cycle may have just disarmed the live controller
-        // (`DisarmReason::AuthorizationRevoked`) — it flags this here via
-        // `ctx.revocation_pending` because it runs in a separate tokio task
-        // and cannot call `deliver_sends` itself. Check (and clear) the flag
-        // once per tick, same granularity as every other per-tick concern in
-        // this loop, and broadcast the CURRENT (already-disarmed) control
-        // state to every established peer — matching this module's existing
-        // rule that every arm transition fans `control_state_sends` out
-        // immediately, so an already-connected peer's `transmitArmed` never
-        // goes stale until its next heartbeat/TX request happens to refresh
-        // it.
-        if ctx.revocation_pending.swap(false, Ordering::AcqRel) {
-            let sends = control_state_sends(ctx, now_ms(), None);
-            deliver_sends(&mut sess, &sends);
-        }
+        // Round-1 review fix (PR #261), broadcast now factored into
+        // `broadcast_pending_revocation` (PAN-34) so the malformed-frame
+        // `continue` above can't bypass it — see that fn's doc comment.
+        broadcast_pending_revocation(ctx, &mut sess);
+    }
+}
+
+/// Broadcast the current (already-disarmed) control state to every
+/// established peer if a concurrent `poll_authorizations_loop` cycle flagged
+/// `ctx.revocation_pending` since the last check. Factored out of
+/// `run_one_session` so both the normal end-of-tick path AND the
+/// malformed-control-frame `continue` (PAN-34) run it — a persistently
+/// misbehaving client must not be able to suppress the broadcast to other
+/// connected peers by never reaching the bottom of the loop.
+fn broadcast_pending_revocation<W: pancetta_agent::relay::WsConn>(
+    ctx: &ArmContext,
+    sess: &mut MultiPeerSession<'_, W>,
+) {
+    if ctx.revocation_pending.swap(false, Ordering::AcqRel) {
+        let sends = control_state_sends(ctx, now_ms(), None);
+        deliver_sends(sess, &sends);
     }
 }
 
@@ -2083,21 +2140,21 @@ mod tests {
     /// EVERY disarm to `DisarmReason::ComponentCrash`, unconditionally --
     /// including on an ordinary, requested shutdown (`run_session_loop`
     /// returning normally, not via panic/unwind). Simulate that: construct
-    /// the guard with `shutdown` already set and the arm still armed (as it
-    /// could be if `disarm_on_loss`'s own prior disarm silently gave up on
-    /// a poisoned mutex), drop it, and confirm the audit log attributes the
-    /// disarm to the shutdown path, not a crash.
+    /// the guard with `normal_exit` already set and the arm still armed (as
+    /// it could be if `disarm_on_loss`'s own prior disarm silently gave up
+    /// on a poisoned mutex), drop it, and confirm the audit log attributes
+    /// the disarm to the shutdown path, not a crash.
     #[test]
     fn drop_during_ordinary_shutdown_does_not_audit_a_component_crash() {
         let arm = Arc::new(Mutex::new(armed_state()));
         let audit = AuditLog::new(audit_tmp());
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         {
             let _guard = RemoteTxDisarmGuard {
                 arm: arm.clone(),
                 audit: audit.clone(),
-                shutdown: shutdown.clone(),
+                shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                normal_exit: true,
             };
         }
 
@@ -2112,29 +2169,252 @@ mod tests {
         );
     }
 
-    /// The flip side of the test above: outside of shutdown (a real
-    /// panic/unwind), the guard must still correctly attribute the disarm
-    /// to `ComponentCrash` -- this is the scenario `RemoteTxDisarmGuard`
-    /// exists for in the first place.
+    /// The flip side of the test above, updated for PAN-36 round 2: a drop
+    /// with `normal_exit` unset is not on its own proof of a crash --
+    /// `shutdown.rs` force-`abort()`s a task that overran its 1s grace
+    /// period, which drops this guard via ordinary (non-unwinding) cleanup,
+    /// same as a ordinary drop. When shutdown was actually requested (round
+    /// 3: the guard's own `shutdown` flag is true), that must still audit as
+    /// `OperatorDisarm`, not `ComponentCrash` -- a genuine panic is covered
+    /// separately below (`drop_during_genuine_panic_...`), which actually
+    /// unwinds; a non-panicking drop with shutdown NOT requested is covered
+    /// by `drop_without_shutdown_requested_and_not_panicking_audits_a_crash`.
     #[test]
-    fn drop_outside_shutdown_still_audits_a_component_crash() {
+    fn drop_without_normal_exit_but_not_panicking_still_audits_operator_disarm() {
         let arm = Arc::new(Mutex::new(armed_state()));
         let audit = AuditLog::new(audit_tmp());
-        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
         {
             let _guard = RemoteTxDisarmGuard {
                 arm: arm.clone(),
                 audit: audit.clone(),
-                shutdown: shutdown.clone(),
+                shutdown: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+                normal_exit: false,
             };
+            // Guard drops here via ordinary scope exit -- simulating a
+            // shutdown.rs `abort()`-triggered cancellation, not a panic,
+            // with shutdown actually having been requested.
+        }
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            !log.contains("component-crash"),
+            "a non-panicking drop during requested shutdown (e.g. shutdown.rs's \
+             abort-on-timeout) must never be misattributed as a component crash: {log:?}"
+        );
+        assert!(
+            log.contains("operator-disarm"),
+            "expected a non-panicking, non-normal-exit drop during requested shutdown to still \
+             audit as operator-disarm: {log:?}"
+        );
+    }
+
+    /// PAN-36 round 3 (Codex finding on the round-2 fix): treating every
+    /// non-panicking drop as automatically operator-initiated is too broad
+    /// -- a cancellation unrelated to shutdown (a hypothetical future
+    /// `AbortHandle` call, a runtime-level drop) would also read as "not
+    /// panicking" and get misattributed as `OperatorDisarm`, hiding a real
+    /// unexpected termination. With `normal_exit` unset AND the shutdown
+    /// flag never having been set, a non-panicking drop must fall back to
+    /// `ComponentCrash`, not be assumed benign.
+    #[test]
+    fn drop_without_shutdown_requested_and_not_panicking_audits_a_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+
+        {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm.clone(),
+                audit: audit.clone(),
+                shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                normal_exit: false,
+            };
+            // Guard drops here via ordinary scope exit -- not a panic, but
+            // shutdown was never requested either (e.g. a hypothetical
+            // future non-shutdown cancellation of this task).
         }
 
         let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
         assert!(
             log.contains("component-crash"),
-            "a disarm outside of shutdown (panic/unwind) must still be attributed to a \
-             component crash: {log:?}"
+            "a non-panicking drop with shutdown never requested must not be assumed to be an \
+             ordinary operator action: {log:?}"
+        );
+        assert!(
+            !log.contains("operator-disarm"),
+            "a non-panicking, non-shutdown-requested drop must not be misattributed to \
+             operator-disarm: {log:?}"
+        );
+    }
+
+    /// The scenario `RemoteTxDisarmGuard` exists for in the first place: a
+    /// real panic/unwind, with `normal_exit` never reached. Drives an actual
+    /// panic through `catch_unwind` so `std::thread::panicking()` is
+    /// genuinely true while the guard drops, unlike the ordinary-drop test
+    /// above.
+    #[test]
+    fn drop_during_genuine_panic_audits_a_component_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+        let arm_for_panic = arm.clone();
+        let audit_for_panic = audit.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm_for_panic,
+                audit: audit_for_panic,
+                shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                normal_exit: false,
+            };
+            panic!("simulated genuine task panic");
+        }));
+        assert!(result.is_err(), "the closure must have actually panicked");
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            log.contains("component-crash"),
+            "a disarm during a genuine panic/unwind must still be attributed to a component \
+             crash: {log:?}"
+        );
+    }
+
+    /// PAN-36 (round-18 finding on PR #254, still relevant after round 3
+    /// reintroduced a `shutdown` field to the guard): the shared `shutdown`
+    /// flag can be set true by a completely unrelated task at any moment --
+    /// including the exact instant this task's session loop panics for a
+    /// real, unrelated reason. That coincidence used to misattribute a
+    /// genuine crash as `OperatorDisarm`. Simulate the race directly: the
+    /// guard's own `shutdown` flag is already true (as if shutdown was
+    /// requested around the same time), but this guard's own `normal_exit`
+    /// was never set because the panic happened before `run_session_loop`
+    /// reached its own clean-return path. Because `Drop` checks
+    /// `!std::thread::panicking()` FIRST, a real panic must still win over
+    /// the shutdown flag and be attributed to `ComponentCrash`.
+    #[test]
+    fn drop_during_genuine_panic_with_concurrent_shutdown_flag_still_audits_a_component_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+        // Shutdown requested at (or just before) the exact moment this
+        // task's own, unrelated panic unwinds -- must not mask the panic.
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let arm_for_panic = arm.clone();
+        let audit_for_panic = audit.clone();
+        let shutdown_for_panic = shutdown_flag.clone();
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm_for_panic,
+                audit: audit_for_panic,
+                shutdown: shutdown_for_panic,
+                normal_exit: false,
+            };
+            // A real panic, so the guard drops while genuinely unwinding --
+            // the shutdown flag being true must have no bearing.
+            panic!("simulated genuine task panic racing a concurrent shutdown flag");
+        }));
+        assert!(result.is_err(), "the closure must have actually panicked");
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            log.contains("component-crash"),
+            "a genuine panic must be attributed to a component crash even when the shutdown \
+             flag happens to be set at the same instant: {log:?}"
+        );
+        assert!(
+            !log.contains("operator-disarm"),
+            "a genuine panic must never be misattributed to operator-disarm just because a \
+             concurrent shutdown flag happens to be true: {log:?}"
+        );
+    }
+
+    /// PAN-36 round 2 (Codex finding on this PR): reproduces the actual
+    /// shutdown.rs mechanism end-to-end rather than just the `Drop` logic in
+    /// isolation. `run_one_session` never checks `cfg.shutdown` itself, so a
+    /// session with an established peer can still be mid-flight when
+    /// shutdown is requested; `shutdown.rs` gives the task a 1s grace
+    /// period, then force-`abort()`s it -- dropping this guard before
+    /// `mark_normal_exit` is ever reached. With shutdown actually requested
+    /// (round 3: the guard's own `shutdown` flag set beforehand, matching
+    /// how `shutdown.rs` sets it before its abort loop runs), that must
+    /// audit as `OperatorDisarm`, not `ComponentCrash`.
+    #[tokio::test]
+    async fn task_abort_mid_session_drops_the_guard_as_operator_disarm_not_a_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+        let arm_for_task = arm.clone();
+        let audit_for_task = audit.clone();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let shutdown_for_task = shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm_for_task,
+                audit: audit_for_task,
+                shutdown: shutdown_for_task,
+                normal_exit: false,
+            };
+            // Stand-in for `run_one_session` still mid-flight (e.g. awaiting
+            // a peer message) when shutdown.rs's grace period elapses.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+
+        // Let the task actually start and construct the guard before
+        // aborting it, mirroring shutdown.rs's abort-after-timeout shape.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            !log.contains("component-crash"),
+            "a shutdown.rs-style task abort with shutdown requested must never be misattributed \
+             as a component crash: {log:?}"
+        );
+        assert!(
+            log.contains("operator-disarm"),
+            "expected the abort-triggered drop during requested shutdown to audit as \
+             operator-disarm: {log:?}"
+        );
+    }
+
+    /// PAN-36 round 3 companion to the test above: an abort that happens
+    /// WITHOUT shutdown ever having been requested (a hypothetical future
+    /// non-shutdown cancellation of this task) must NOT be assumed to be an
+    /// ordinary operator action -- it should still audit as `ComponentCrash`
+    /// so an unexpected termination isn't hidden from the audit log.
+    #[tokio::test]
+    async fn task_abort_without_shutdown_requested_still_audits_a_component_crash() {
+        let arm = Arc::new(Mutex::new(armed_state()));
+        let audit = AuditLog::new(audit_tmp());
+        let arm_for_task = arm.clone();
+        let audit_for_task = audit.clone();
+        let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_for_task = shutdown.clone();
+
+        let handle = tokio::spawn(async move {
+            let _guard = RemoteTxDisarmGuard {
+                arm: arm_for_task,
+                audit: audit_for_task,
+                shutdown: shutdown_for_task,
+                normal_exit: false,
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        handle.abort();
+        let _ = handle.await;
+
+        let log = std::fs::read_to_string(audit.path()).unwrap_or_default();
+        assert!(
+            log.contains("component-crash"),
+            "an abort-triggered drop with shutdown never requested must not be assumed to be an \
+             ordinary operator action: {log:?}"
+        );
+        assert!(
+            !log.contains("operator-disarm"),
+            "an abort-triggered drop without requested shutdown must not be misattributed to \
+             operator-disarm: {log:?}"
         );
     }
 
@@ -4159,7 +4439,7 @@ mod tests {
 
     #[test]
     fn authorizations_filter_matches_only_this_agents_edges() {
-        let edges = vec![
+        let edges = [
             pancetta_cqdx::AuthorizationEdge {
                 id: "1".to_string(),
                 agent_key_id: "agent_this".to_string(),
@@ -4196,7 +4476,7 @@ mod tests {
     /// connection-admission filter (`agentKeyId` only) keeps ALL THREE.
     #[test]
     fn tx_arm_filter_excludes_delegated_edges_but_admission_filter_keeps_them() {
-        let edges = vec![
+        let edges = [
             // Owner edge, delegatedBy field entirely absent from the wire —
             // deserializes to `None` (mirrors `pancetta-cqdx`'s absent-field
             // fixture).
@@ -4694,6 +4974,204 @@ mod tests {
             "the poll-driven disarm must broadcast an updated controlState with \
              transmitArmed: false to the already-connected peer — not just mutate \
              ArmState/the audit log"
+        );
+    }
+
+    /// PAN-34: a persistently misbehaving established client (one that keeps
+    /// sending frames that decrypt fine but fail `map_client_frame`) must not
+    /// be able to suppress the poll-driven revocation broadcast to OTHER,
+    /// well-behaved connected peers. Before the fix, the malformed-frame arm
+    /// of `run_one_session`'s match `continue`d straight back to the top of
+    /// the loop, skipping the trailing `revocation_pending` check entirely —
+    /// so PEER_B here would still see its stale pre-revocation `controlState`
+    /// with no way to learn the station was disarmed until its own traffic
+    /// happened to touch the loop's tail.
+    ///
+    /// Drives a REAL two-peer `run_one_session` (real Noise handshakes for
+    /// both peers) so the malformed frame from PEER_A genuinely decrypts
+    /// under ITS OWN completed transport (a Noise-level decrypt failure would
+    /// instead hit `Poll::PeerDown`, a different code path this test is not
+    /// about) and only fails at the `map_client_frame` (non-JSON plaintext)
+    /// step — exactly the "malformed encrypted control frame" the ticket
+    /// describes.
+    #[tokio::test]
+    async fn malformed_frame_does_not_suppress_revocation_broadcast_to_other_peers() {
+        let identity = AgentIdentity::generate();
+        let agent_kid = identity.key_id();
+        let agent_pub = identity.agreement_public_raw();
+
+        let mut allow = HashSet::new();
+        allow.insert(CLIENT_KEY_ID.to_string());
+        allow.insert(PEER_B.to_string());
+        let mut ctx = fresh_ctx(&agent_kid, allow);
+
+        // Pre-arm as CLIENT_KEY_ID (PEER_A) so its establishment greeting
+        // shows `transmitArmed: true`, giving the later broadcast a real
+        // true→false transition to prove for PEER_B.
+        let real_now = now_ms();
+        ctx.arm.lock().unwrap().set_local_consent(true, real_now);
+        ctx.arm.lock().unwrap().arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: OPERATOR.to_string(),
+                ttl_ms: 3_600_000,
+                scope_tx: true,
+                jti: "malformed-frame-test-jti".to_string(),
+                client_key_id: CLIENT_KEY_ID.to_string(),
+            },
+            real_now,
+        );
+
+        let poll_arm = ctx.arm.clone();
+        let poll_revocation_pending = ctx.revocation_pending.clone();
+        let revocation_pending_after = ctx.revocation_pending.clone();
+
+        let bus = MessageBus::new(64).unwrap();
+        let mut init_a = fresh_initiator(&agent_pub);
+        let mut init_b = fresh_initiator(&agent_pub);
+        let msg1_a = init_a.write_msg1(b"");
+        let msg1_b = init_b.write_msg1(b"");
+
+        let hello = RelayFrame::Hello {
+            challenge: b64url(&[13u8; 32]),
+        }
+        .to_json()
+        .unwrap();
+        let env_a = RelayFrame::Env {
+            dst: agent_kid.clone(),
+            payload: b64url(&msg1_a),
+            src: Some(CLIENT_KEY_ID.to_string()),
+        }
+        .to_json()
+        .unwrap();
+        let env_b = RelayFrame::Env {
+            dst: agent_kid.clone(),
+            payload: b64url(&msg1_b),
+            src: Some(PEER_B.to_string()),
+        }
+        .to_json()
+        .unwrap();
+
+        let outbound = Arc::new(Mutex::new(Vec::new()));
+        // Only the handshake frames are scripted up front — the malformed
+        // follow-up from PEER_A can't be pre-built because it must be
+        // encrypted under PEER_A's real completed transport, which only
+        // exists after the agent's msg2 (emitted mid-session) is observed.
+        let mock = MockWs::new(vec![hello, env_a, env_b], outbound.clone());
+        let ws_handle = mock.clone();
+        let trigger_outbound = outbound.clone();
+        let trigger_agent_kid = agent_kid.clone();
+        let ws = TriggerAfterWs::new(mock, 4, move || {
+            // Simulate the concurrent poll disarming the live controller
+            // between ticks, exactly like the single-peer broadcast test.
+            let effects = poll_arm
+                .lock()
+                .unwrap()
+                .disarm_with_reason(DisarmReason::AuthorizationRevoked, now_ms());
+            assert!(
+                !effects.is_empty(),
+                "setup sanity: the simulated poll disarm must actually find a live arm"
+            );
+            poll_revocation_pending.store(true, Ordering::Release);
+
+            // Recover PEER_A's msg2 (the first env addressed to CLIENT_KEY_ID
+            // so far — sent during env_a's handshake bootstrap, before env_b
+            // was processed) to complete a REAL client-side transport for it.
+            let out = trigger_outbound.lock().unwrap().clone();
+            let msg2_a = out
+                .iter()
+                .find_map(|s| match parse_frame(s).unwrap() {
+                    RelayFrame::Env { dst, payload, .. } if dst == CLIENT_KEY_ID => Some(
+                        base64::engine::general_purpose::URL_SAFE_NO_PAD
+                            .decode(&payload)
+                            .unwrap(),
+                    ),
+                    _ => None,
+                })
+                .expect("PEER_A's msg2 must already be on the wire by the 4th tick");
+            init_a.read_msg2(&msg2_a);
+            let mut client_transport_a = init_a.into_transport();
+
+            // Genuinely non-JSON plaintext — decrypts fine under PEER_A's
+            // real transport, but fails `map_client_frame`'s
+            // `serde_json::from_slice`, taking the malformed-frame `continue`
+            // arm this test targets (not a Noise-level decrypt failure).
+            let plaintext = b"not valid json{{{";
+            let mut ct = vec![0u8; plaintext.len() + 16];
+            let n = client_transport_a
+                .write_message(plaintext, &mut ct)
+                .unwrap();
+            ct.truncate(n);
+            let malformed_env = RelayFrame::Env {
+                dst: trigger_agent_kid.clone(),
+                payload: b64url(&ct),
+                src: Some(CLIENT_KEY_ID.to_string()),
+            }
+            .to_json()
+            .unwrap();
+            ws_handle.push_inbound(malformed_env);
+        });
+
+        run_one_session(ws, &identity, &mut ctx, &bus, &mut None).await;
+
+        assert!(
+            ctx.peers.contains_key(CLIENT_KEY_ID),
+            "a malformed control frame must not disconnect the established peer \
+             that sent it (only a Noise-level decrypt failure would)"
+        );
+        assert!(
+            ctx.peers.contains_key(PEER_B),
+            "PEER_B must remain established throughout"
+        );
+        assert!(
+            !revocation_pending_after.load(Ordering::Acquire),
+            "revocation_pending must have been cleared by the broadcast"
+        );
+
+        // PEER_B never sent anything malformed — its wire traffic must show
+        // msg2, the establishment greeting (armed=true), and the poll-driven
+        // broadcast (armed=false), proving PEER_A's malformed frame did not
+        // suppress the broadcast to PEER_B.
+        let out = outbound.lock().unwrap().clone();
+        let envs_b: Vec<Vec<u8>> = out
+            .iter()
+            .filter_map(|s| match parse_frame(s).unwrap() {
+                RelayFrame::Env { dst, payload, .. } if dst == PEER_B => Some(
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .decode(&payload)
+                        .unwrap(),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            envs_b.len(),
+            3,
+            "PEER_B: msg2 + establishment greeting + the poll-driven broadcast \
+             (PAN-34 regression: PEER_A's malformed frame must not swallow this)"
+        );
+
+        init_b.read_msg2(&envs_b[0]);
+        let mut transport_b = init_b.into_transport();
+        let mut decrypt = |ct: &[u8]| -> serde_json::Value {
+            let mut buf = vec![0u8; ct.len().max(1)];
+            let n = transport_b.read_message(ct, &mut buf).unwrap();
+            buf.truncate(n);
+            serde_json::from_slice(&buf).unwrap()
+        };
+
+        let greeting = decrypt(&envs_b[1]);
+        assert_eq!(greeting["event"]["event"], "controlState");
+        assert_eq!(
+            greeting["event"]["transmitArmed"], true,
+            "the establishment greeting must reflect the pre-armed state"
+        );
+
+        let broadcast = decrypt(&envs_b[2]);
+        assert_eq!(broadcast["event"]["event"], "controlState");
+        assert_eq!(
+            broadcast["event"]["transmitArmed"], false,
+            "the poll-driven disarm must still broadcast to PEER_B even while \
+             PEER_A is stuck resending a malformed frame"
         );
     }
 

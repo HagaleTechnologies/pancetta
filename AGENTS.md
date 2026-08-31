@@ -104,9 +104,10 @@ You are never alone in this repo — other agents may work concurrently in other
 
 ## Code review convergence
 
-Rounds 1-5 (per reviewer) fix everything reasonable. Rounds 6-15 fix P1
-inline, ticket new P2-or-lower. Rounds 16-25 ticket P1 too unless
-critical/blocking. Round 25 is a hard stop — escalate to a human. Run a
-local review pass before each push; check for a concurrent session
-working the same PR before starting a round. Full policy:
-docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md.
+PR review convergence policy (round-based, per-reviewer): see the
+`resolve-review-feedback` and `land-pr` Claude Code skills (credenza,
+symlinked into `~/.claude/skills/`). Canonical bot-reviewer-facing text:
+docs/DECISIONS/2026-08-07-pr-review-convergence-policy.md — synced from
+credenza; edit
+`credenza/claude/skills/resolve-review-feedback/references/convergence-policy.md`
+instead of hand-editing this copy.

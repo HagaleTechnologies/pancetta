@@ -3123,6 +3123,17 @@ impl App {
             if call.is_empty() {
                 continue;
             }
+            // PAN-23: never surface `"<...>"`, FT8's literal placeholder for
+            // an i3=4 nonstandard-callsign hash the local hash table
+            // couldn't resolve (see PAN-16, app.rs's dx_stations insert
+            // filter, applied to the exact same string). It's a legitimate,
+            // correctly decoded frame — left in `decoded_messages` for
+            // logs/QSO context — but it isn't a callsign at all and can
+            // never actually be called, so it must not become a selectable
+            // Callers-panel row (`selected_caller` reads this same list).
+            if call.as_str() == "<...>" {
+                continue;
+            }
             let key = call.to_uppercase();
             if seen.insert(key) {
                 out.push(msg);
@@ -3888,7 +3899,12 @@ pub fn classify_caller_reply(msg_text: &str, _our_call: &str) -> pancetta_core::
 /// Count the unique callsigns that are calling US (directed-at-us decodes) in a
 /// decoded-message snapshot — i.e. the number of rows the Callers panel would
 /// show. Used to phrase the "restored N callers from Nm ago" status on a
-/// band-return. Mirrors the de-dup in [`App::displayed_callers`].
+/// band-return. Mirrors the de-dup (AND, PAN-23 round-4, the unresolved-hash
+/// placeholder exclusion) in [`App::displayed_callers`], so this count always
+/// matches what the Callers panel actually displays once the cached snapshot
+/// is restored — otherwise a cached band snapshot containing a directed
+/// `"<...>"` decode could report "restored 1 caller" while the Callers panel
+/// renders empty (or overcount a mixed list of real callers + placeholders).
 fn directed_caller_count(messages: &VecDeque<DecodedMessageView>) -> usize {
     let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
     for msg in messages.iter() {
@@ -3896,7 +3912,7 @@ fn directed_caller_count(messages: &VecDeque<DecodedMessageView>) -> usize {
             continue;
         }
         if let Some(call) = msg.call_sign.as_ref() {
-            if !call.is_empty() {
+            if !call.is_empty() && call.as_str() != "<...>" {
                 seen.insert(call.to_uppercase());
             }
         }
@@ -6055,6 +6071,54 @@ mod tests {
         assert_eq!(callers[0].message, "K5ARH K9ZZ R-10");
     }
 
+    /// PAN-23: the unresolved-hash placeholder `"<...>"` must never surface
+    /// as a selectable Caller. PAN-16 (#249) filtered it out of the
+    /// DX-Hunter list's underlying `dx_stations` store, but a Codex round-2
+    /// review of that PR flagged that `displayed_callers`/`selected_caller`
+    /// were NOT covered by the same filter — they read directly from
+    /// `decoded_messages`, which deliberately still retains the placeholder
+    /// decode for logs/QSO context. Production logs (2026-08-20..22) show
+    /// the gap firing for real: an operator selected `"<...>"` from the
+    /// Callers panel and pancetta tried (and failed) to transmit to it.
+    #[tokio::test]
+    async fn displayed_callers_excludes_unresolved_hash_placeholder() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+
+        let placeholder = fixture_view_directed("<...>", -10);
+        let real = fixture_view_directed("K9ZZ", -8);
+        app.add_decoded_message(placeholder).await.unwrap();
+        app.add_decoded_message(real).await.unwrap();
+
+        let callers = app.displayed_callers();
+        assert!(
+            !callers
+                .iter()
+                .any(|m| m.call_sign.as_deref() == Some("<...>")),
+            "unresolved hash placeholder must never appear in displayed_callers"
+        );
+        assert_eq!(callers.len(), 1);
+        assert_eq!(callers[0].call_sign.as_deref(), Some("K9ZZ"));
+
+        // selected_caller() derives from displayed_callers(), so with the
+        // placeholder filtered, the cursor at index 0 resolves to the real
+        // caller, never the placeholder.
+        app.callers_scroll = 0;
+        assert_eq!(
+            app.selected_caller().and_then(|m| m.call_sign.as_deref()),
+            Some("K9ZZ")
+        );
+
+        // The decode itself must still be retained in decoded_messages for
+        // logs/QSO context (mirrors PAN-16's dx_stations behavior).
+        assert!(
+            app.decoded_messages
+                .iter()
+                .any(|m| m.call_sign.as_deref() == Some("<...>")),
+            "the decode itself must still be retained for logs/QSO context"
+        );
+    }
+
     #[tokio::test]
     async fn is_caller_busy_detects_third_party_exchange() {
         let mut app = fixture_app().await;
@@ -6462,6 +6526,52 @@ mod tests {
         assert!(
             app.status_message.contains("restored") && app.status_message.contains("2 caller"),
             "restore should be visible in status: {:?}",
+            app.status_message
+        );
+    }
+
+    /// PAN-23 round-4 (Codex review of #283): the "restored N caller(s)"
+    /// status must count only what the Callers panel will actually show on
+    /// return — the unresolved-hash placeholder `"<...>"` is excluded from
+    /// `displayed_callers()` (PAN-23 round 1), so `directed_caller_count`
+    /// (which phrases this status) must apply the identical exclusion.
+    /// Without it, a cached snapshot containing a directed `"<...>"` decode
+    /// among real callers could report "restored 3 callers" while only 2
+    /// rows actually render.
+    #[tokio::test]
+    async fn band_return_restored_caller_count_excludes_unresolved_hash_placeholder() {
+        let mut app = fixture_app().await;
+        app.add_decoded_message(fixture_view_directed("AA1AA", -5))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view_directed("CC3CC", -7))
+            .await
+            .unwrap();
+        app.add_decoded_message(fixture_view_directed("<...>", -9))
+            .await
+            .unwrap();
+        // Precondition: the placeholder decode is retained (for logs/QSO
+        // context) but never rendered as a Caller.
+        assert_eq!(app.displayed_callers().len(), 2);
+
+        app.band_up(); // leave 20M (snapshot stashed, including the placeholder)
+        app.band_down(); // back to 20M within TTL → restore
+
+        assert_eq!(
+            app.displayed_callers().len(),
+            2,
+            "the placeholder must still be excluded from the restored Callers panel"
+        );
+        assert!(
+            app.status_message.contains("restored") && app.status_message.contains("2 caller"),
+            "restored-count status must match the displayed rows (2), not the raw \
+             directed-decode count (3, which would wrongly include the placeholder): {:?}",
+            app.status_message
+        );
+        assert!(
+            !app.status_message.contains("3 caller"),
+            "restored-count status must never count the unresolved hash \
+             placeholder as a caller: {:?}",
             app.status_message
         );
     }

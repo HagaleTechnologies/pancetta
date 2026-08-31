@@ -28,6 +28,17 @@ impl Protocol {
             Protocol::Ft2 => ProtocolParams::ft2().slot_ns(),
         }
     }
+
+    /// True for `Protocol::Ft2`. Exists so callers can gate on FT2 without
+    /// referencing the variant directly, which would fail to compile when
+    /// the `ft2` feature is off (PAN-32).
+    pub fn is_ft2(self) -> bool {
+        match self {
+            Protocol::Ft8 | Protocol::Ft4 => false,
+            #[cfg(feature = "ft2")]
+            Protocol::Ft2 => true,
+        }
+    }
 }
 
 impl std::fmt::Display for Protocol {

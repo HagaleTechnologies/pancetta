@@ -1398,8 +1398,10 @@ mod gate_tests {
 
     #[test]
     fn unicast_stranger_is_refused_even_with_master_on() {
-        let mut cfg = WsjtxUdpConfig::default();
-        cfg.accept_udp_requests = true;
+        let cfg = WsjtxUdpConfig {
+            accept_udp_requests: true,
+            ..Default::default()
+        };
         let dest: SocketAddr = "192.168.1.20:2237".parse().unwrap();
         let stranger: IpAddr = "10.0.0.1".parse().unwrap();
         assert!(!request_allowed(&cfg, stranger, &dest));
@@ -1873,6 +1875,7 @@ mod qso_logged_tests {
             our_callsign: "K5ARH".to_string(),
             their_callsign: Some("K1ABC".to_string()),
             frequency: 14_074_200.4,
+            completed_rf_frequency_hz: None,
             mode: "FT8".to_string(),
             start_time: start,
             end_time: Some(end),

@@ -237,6 +237,16 @@ pub enum MessageType {
         success: bool,
         message_text: String,
         duration_ms: u64,
+        /// PAN-38 round 1 (Codex): the QSO this transmission belongs to, when
+        /// known at the emission site — `None` for a multi-item bundle (each
+        /// item's own `qso_id` isn't threaded through the shared
+        /// `item_texts` completion loop; not needed for PAN-38's own use
+        /// case, since a self-CQ's opening transmission is always a single
+        /// item, never a bundle) or a manual/tune TX with no QSO. Lets the
+        /// autonomous coordinator correlate a downstream transmit failure
+        /// back to the self-CQ attempt that dispatched it (see
+        /// [`QsoMessage::AutonomousCqOpened`]).
+        qso_id: Option<String>,
     },
 
     /// TX-active indicator for the TUI title-bar badge (Batch 93).
@@ -775,7 +785,41 @@ pub enum QsoMessage {
         /// For a pounce: the DX's slot parity (we reply on the opposite). For
         /// a CQ: our chosen TX parity (`None` → self-parity fallback).
         parity: Option<pancetta_core::slot::SlotParity>,
+        /// PAN-38: for a self-CQ (`callsign: None`) only, the
+        /// `AutonomousOperator`'s `CqStateSnapshot::attempt_id` this
+        /// dispatch corresponds to — echoed back on
+        /// [`QsoMessage::AutonomousCqDispatchFailed`] if `start_cq` fails, so
+        /// the operator can roll back exactly this attempt's speculative
+        /// streak/offset mutations. Always `None` for a pounce (no CQ-streak
+        /// state to roll back).
+        cq_attempt_id: Option<u64>,
     },
+    /// PAN-38: `QsoManager::start_cq` failed for a dispatched self-CQ
+    /// (`StartAutonomousQso { callsign: None, .. }`) — a downstream
+    /// radio/CAT error or subsystem race — after the coordinator's own gates
+    /// (Shift+Q, TX policy, operator-presence, dry_run) had all already
+    /// permitted the transmission. No QSO was actually opened and nothing
+    /// was actually transmitted, so the CQ-no-response streak and any
+    /// frequency-switch offset `decide_at` mutated speculatively for this
+    /// attempt must be rolled back — same mechanism as a suppressed-before-
+    /// dispatch CQ ([`AutonomousOperator::restore_cq_state`]), routed back
+    /// through the message bus since the `QsoManager`/`start_cq` call lives
+    /// in the QSO component's task, not the autonomous operator's.
+    AutonomousCqDispatchFailed {
+        /// The `cq_attempt_id` from the `StartAutonomousQso` that failed.
+        attempt_id: u64,
+    },
+    /// PAN-38 round 1 (Codex): `QsoManager::start_cq` SUCCEEDED for a
+    /// dispatched self-CQ (a QSO was opened, `qso_id` assigned, and its
+    /// opening `MessageToSend` handed to the TX worker) -- but the actual
+    /// radio/CAT transmission can still fail downstream, reported later as
+    /// `MessageType::TransmitComplete { success: false, .. }`, which carries
+    /// no `cq_attempt_id` (it isn't self-CQ-specific machinery). This lets
+    /// the autonomous coordinator task record the `qso_id` <-> `attempt_id`
+    /// association up front, so it can correlate a later matching
+    /// `TransmitComplete` failure back to this attempt and roll it back the
+    /// same way a synchronous `start_cq` failure already does.
+    AutonomousCqOpened { qso_id: String, attempt_id: u64 },
     /// Enable or disable Fox (DXpedition operator) mode.
     ///
     /// `on: true` — sets the `fox_mode` flag, starts a repeating CQ
@@ -1135,7 +1179,30 @@ impl MessageBus {
     }
 
     /// Send a message to a specific component
-    pub async fn send_message(&self, mut message: ComponentMessage) -> Result<()> {
+    pub async fn send_message(&self, message: ComponentMessage) -> Result<()> {
+        self.send_message_checked(message).await?;
+        Ok(())
+    }
+
+    /// Same delivery attempt as [`Self::send_message`], but the `bool`
+    /// distinguishes an actually-enqueued message (`true`) from every drop
+    /// reason `send_message` only logs and swallows into `Ok(())`
+    /// (`false`: expired, a full channel, a disconnected receiver, or no
+    /// registered channel for the destination).
+    ///
+    /// PAN-38 round 5 (Codex): `send_message`'s `Result<()>` is NEVER
+    /// actually `Err` for a delivery failure — `TrySendError::Full` (the
+    /// bounded-queue-drop case) is caught, logged, and mapped to `Ok(())`
+    /// just like every other drop reason. A caller checking `if let
+    /// Err(e) = ...` for "did this reach the destination" (e.g. the
+    /// autonomous self-CQ dispatch, which needs to roll back its
+    /// speculative streak/offset mutation if `StartAutonomousQso` never
+    /// reaches the QSO task) can never observe a drop through that API —
+    /// it always sees success. Callers that only want best-effort,
+    /// fire-and-forget delivery (the overwhelming majority of call sites)
+    /// should keep using `send_message`; this method is for the rarer
+    /// caller that needs to know.
+    pub async fn send_message_checked(&self, mut message: ComponentMessage) -> Result<bool> {
         // Check message expiration
         if message.is_expired(self.config.message_timeout_us) {
             self.expired_messages.fetch_add(1, Ordering::Relaxed);
@@ -1145,7 +1212,7 @@ impl MessageBus {
                 message.destination,
                 message.age_us()
             );
-            return Ok(());
+            return Ok(false);
         }
 
         // Mark message as sent
@@ -1178,16 +1245,19 @@ impl MessageBus {
                             transit
                         );
                     }
+                    Ok(true)
                 }
                 Err(crossbeam_channel::TrySendError::Full(_)) => {
                     channel.error_count.fetch_add(1, Ordering::Relaxed);
                     self.dropped_messages.fetch_add(1, Ordering::Relaxed);
                     warn!("Channel full, dropping message from {} to {}", src, dst);
+                    Ok(false)
                 }
                 Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
                     channel.error_count.fetch_add(1, Ordering::Relaxed);
                     self.dropped_messages.fetch_add(1, Ordering::Relaxed);
                     error!("Channel disconnected for component: {}", dst);
+                    Ok(false)
                 }
             }
         } else {
@@ -1196,9 +1266,8 @@ impl MessageBus {
                 message.destination
             );
             self.dropped_messages.fetch_add(1, Ordering::Relaxed);
+            Ok(false)
         }
-
-        Ok(())
     }
 
     /// Get health status for all components
