@@ -1366,7 +1366,8 @@ impl AutonomousOperator {
             | Ok(MessageType::ReportAck { to_station, .. })
             | Ok(MessageType::FinalConfirmation { to_station, .. })
             | Ok(MessageType::SeventyThree { to_station, .. })
-            | Ok(MessageType::ContestExchange { to_station, .. }) => {
+            | Ok(MessageType::ContestExchange { to_station, .. })
+            | Ok(MessageType::ContestReply { to_station, .. }) => {
                 callsigns_match(&to_station, &self.our_callsign)
             }
             // A CQ (not a reply), non-standard text, or a parse/validation

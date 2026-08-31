@@ -154,6 +154,8 @@ pub use callsign_continuity::{build_filter, CallsignContinuityFilter};
 pub mod content_score;
 pub use content_score::{content_score_from_features, ContentFeatures, MessageContentScore};
 
+pub mod contest;
+
 pub mod cross_time_state;
 // Note: `QsoState`/`QsoPhase` live inside the `cross_time_state` module
 // rather than being re-exported, to avoid clashing with the existing

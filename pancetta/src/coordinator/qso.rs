@@ -319,6 +319,14 @@ fn dx_activity_summary(
             from_station.clone(),
             format!("→ {} (contest)", tgt(to_station)),
         ),
+        Mt::ContestReply {
+            to_station,
+            from_station,
+            ..
+        } => (
+            from_station.clone(),
+            format!("→ {} (contest reply)", tgt(to_station)),
+        ),
         Mt::NonStandard { .. } => return None,
     })
 }

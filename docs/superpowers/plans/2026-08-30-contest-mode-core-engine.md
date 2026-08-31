@@ -12,9 +12,9 @@
 
 ## Global Constraints
 
-- FT8 mode paths must remain byte-identical for every QSO that is not contest-engaged (AGENTS.md invariant) — every new code path in this plan is additive and only activates once `engage_contest_profile` has been called for a specific QSO.
+- FT8 mode paths must remain byte-identical for every QSO that is not contest-engaged (AGENTS.md invariant) — every new code path in this plan is additive and only activates once `engage_contest_profile` has been called for a specific QSO. This guarantee was not literally true until the final-review fix wave (2026-08-30) tightened the reclassification gate in `qso_manager.rs` from "any QSO anywhere is engaged" to "the incoming frame's sender matches a specific engaged QSO's partner" — see that fix wave's report for detail.
 - `cargo test --workspace --features transmit` must stay green throughout; run it after every task.
-- No new supervised coordinator component (per the approved design) — nothing in this plan touches `pancetta/src/coordinator`.
+- No new supervised coordinator component (per the approved design), and no behavioral coordinator change — Task 6's `ContestReply` addition did require one narrow, display-only, compile-necessity match arm in `pancetta/src/coordinator/qso.rs` (an exhaustive match needed a variant, no new logic; landed in the Task 6 commit though not called out in that task's Files list above).
 - Follow existing repo conventions exactly: `SignalReport = i8`, `GridSquare = String` (pancetta-qso/src/states.rs:15,18), the `-15` sentinel for "no real numeric report" (used throughout qso_manager.rs, e.g. lines 3238, 3544, 10260), and `MAXGRID4 = 32400` (pancetta-ft8/src/encoder.rs:37, pancetta-ft8/src/message.rs:2213).
 
 ---
