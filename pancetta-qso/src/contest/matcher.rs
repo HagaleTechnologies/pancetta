@@ -15,11 +15,17 @@ pub struct ContestMatch {
 /// International Digital Contest ack, standing in for a numeric report.
 /// Grid must be 4 characters: first two `A`-`R`, last two digits — the
 /// same shape pancetta-ft8's decoder already accepts (message.rs's
-/// `unpackgrid`).
+/// `unpackgrid`). Special case: `"RR73"` is shape-valid but reserved as
+/// an FT8 QSO-completion token (see ft8/src/message.rs:1844-1852), so it
+/// is explicitly rejected despite passing the grid shape check.
 pub fn match_grid_with_r_ack(text: &str) -> Option<ContestMatch> {
     let msg = tokenize_directed_message(text)?;
     let grid_candidate = msg.trailing.strip_prefix("R ")?;
     if !is_valid_grid(grid_candidate) {
+        return None;
+    }
+    // RR73 collision: shape-valid Maidenhead grid but reserved as FT8 token.
+    if grid_candidate == "RR73" {
         return None;
     }
     Some(ContestMatch {
@@ -33,7 +39,7 @@ fn is_valid_grid(s: &str) -> bool {
     let b = s.as_bytes();
     b.len() == 4
         && (b'A'..=b'R').contains(&b[0])
-        && (b'A'..=b'Q').contains(&b[1])
+        && (b'A'..=b'R').contains(&b[1])
         && b[2].is_ascii_digit()
         && b[3].is_ascii_digit()
 }
