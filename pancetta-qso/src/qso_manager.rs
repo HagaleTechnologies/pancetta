@@ -2787,6 +2787,17 @@ impl QsoManager {
             }
         }
 
+        // PAN-49: latch the grid the moment a contest "R"+grid ack arrives,
+        // mirroring the CqResponse grid-latch above — the transition arm's
+        // WaitingForConfirmation.grid_square only feeds the Completed-state
+        // latch (see the block below), not metadata directly, and ADIF
+        // logging (adif.rs) reads metadata.grids.theirs, not QsoState.
+        if let MessageType::ContestReply { grid, .. } = &message.message_type {
+            if !grid.is_empty() {
+                progress.metadata.grids.theirs = Some(grid.clone());
+            }
+        }
+
         if new_state != old_state {
             // CQer flow: the QSO was created by start_cq with their_callsign
             // None (we didn't know who would answer). The moment a state
@@ -3555,6 +3566,56 @@ impl QsoManager {
                     our_report,
                     frequency: *frequency,
                     grid_square: None,
+                    started_at: Utc::now(),
+                })
+            }
+
+            // PAN-49 skip-rung: a state-QSO-party / ARRL Intl Digital
+            // partner acks our grid with "R"+grid instead of a numeric
+            // report — same close-shape as the ReportAck skip-rung arm
+            // above (RespondingToCq -> WaitingForConfirmation), but with no
+            // real dB value to carry. `-15` is the established "no real
+            // report" sentinel used throughout this file (e.g. lines 3238,
+            // 3544, 10260) for exactly this situation. `is_ack: false`
+            // (the plain first-exchange grid, already handled by the
+            // ordinary CqResponse path) never reaches this arm because
+            // process_message_with_parity's reclassification step
+            // (PAN-49) only ever produces `is_ack: true`.
+            (
+                QsoState::RespondingToCq {
+                    target_callsign,
+                    frequency,
+                    ..
+                },
+                MessageType::ContestReply {
+                    from_station,
+                    to_station,
+                    grid,
+                    is_ack: true,
+                },
+            ) => {
+                if self
+                    .reject_sender(qso_id, from_station, target_callsign, to_station)
+                    .await
+                {
+                    warn!(
+                        target: "qso.security",
+                        expected_from = %target_callsign,
+                        got_from = %from_station,
+                        got_to = %to_station,
+                        "spurious ContestReply in RespondingToCq ignored — sender does not match QSO target"
+                    );
+                    return Ok(current_state.clone());
+                }
+                let our_report = signal_strength
+                    .map(|snr| (snr.round() as i8).clamp(-30, 50))
+                    .unwrap_or(-15);
+                Ok(QsoState::WaitingForConfirmation {
+                    their_callsign: target_callsign.clone(),
+                    their_report: -15,
+                    our_report,
+                    frequency: *frequency,
+                    grid_square: Some(grid.clone()),
                     started_at: Utc::now(),
                 })
             }
@@ -7158,7 +7219,15 @@ mod tests {
 
     #[tokio::test]
     async fn r_grid_ack_reclassifies_only_when_a_qso_is_contest_engaged() {
-        let config = test_config();
+        // `test_config()`'s default `our_callsign` is "W1ABC", but this test's
+        // decode text replays the real PAN-49 incident verbatim ("K5ARH K5TD
+        // R EM40" — K5ARH is the operator's real callsign). Override so the
+        // message is actually addressed to "us"; otherwise
+        // `MessageType::is_addressed_to`'s routing check silently drops the
+        // frame before it ever reaches a QSO, independent of the transition
+        // arm under test.
+        let mut config = test_config();
+        config.our_callsign = "K5ARH".to_string();
         let manager = QsoManager::new(config);
         let mut rx = manager.subscribe();
 
@@ -7211,6 +7280,64 @@ mod tests {
             matches!(progress.state, QsoState::WaitingForConfirmation { .. }),
             "engaged QSO must advance on the R+grid ack, got {:?}",
             progress.state
+        );
+    }
+
+    /// PAN-49 regression: replays the real decode from
+    /// ~/.pancetta/logs/pancetta.log.2026-08-30 (K5TD acking our grid during
+    /// the 2026-08-29/30 Kansas QSO Party session) that stalled a live manual
+    /// QSO before this fix. Must now advance to WaitingForConfirmation with
+    /// the grid latched, instead of silently landing in NonStandard forever.
+    ///
+    /// `our_callsign` is overridden to the operator's real callsign (K5ARH,
+    /// not `test_config()`'s default "W1ABC") so the replayed text is
+    /// genuinely addressed to "us" — see the comment on
+    /// `r_grid_ack_reclassifies_only_when_a_qso_is_contest_engaged` above for
+    /// why that matters.
+    #[tokio::test]
+    async fn pan_49_k5td_r_grid_ack_advances_the_qso() {
+        let mut config = test_config();
+        config.our_callsign = "K5ARH".to_string();
+        let manager = QsoManager::new(config);
+        let qso_id = manager
+            .respond_to_cq_manual("K5TD".to_string(), 1203.0, None)
+            .await
+            .unwrap();
+        let profile = crate::contest::catalog::builtin_catalog()
+            .into_iter()
+            .find(|p| p.id == "us-state-qso-party")
+            .unwrap();
+        manager
+            .engage_contest_profile(qso_id, profile)
+            .await
+            .unwrap();
+
+        manager
+            .process_message(
+                MessageType::NonStandard {
+                    text: "K5ARH K5TD R EM40".to_string(),
+                },
+                "K5ARH K5TD R EM40".to_string(),
+                1203.1,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::WaitingForConfirmation { grid_square: Some(ref g), .. } if g == "EM40"),
+            "expected WaitingForConfirmation with grid EM40, got {:?}",
+            progress.state
+        );
+        assert_eq!(progress.metadata.grids.theirs, Some("EM40".to_string()));
+        assert_eq!(
+            progress
+                .metadata
+                .contest_info
+                .as_ref()
+                .map(|c| c.contest_name.as_str()),
+            Some("us-state-qso-party")
         );
     }
 
