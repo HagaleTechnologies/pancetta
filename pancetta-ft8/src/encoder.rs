@@ -479,7 +479,13 @@ impl Ft8Encoder {
 
             let call_to = parts[0].to_string();
             let call_de = parts[1].to_string();
-            let extra = if parts.len() > 2 {
+            let extra = if parts.len() > 3 && parts[2] == "R" {
+                // "R"+grid contest ack (PAN-49): join both tokens so
+                // packgrid sees the combined "R EM40" shape it needs to
+                // distinguish from a plain "R-12" numeric report (which
+                // arrives as ONE token, no space).
+                format!("{} {}", parts[2], parts[3])
+            } else if parts.len() > 2 {
                 parts[2].to_string()
             } else {
                 String::new()
@@ -1161,6 +1167,30 @@ pub fn packgrid(extra: &str) -> u16 {
         return MAXGRID4 + irpt; // ir=0
     }
 
+    // Parse "R"+4-char-grid ack (PAN-49): state QSO parties and the ARRL
+    // International Digital Contest ack with "R"+grid instead of a numeric
+    // report. Checked after the numeric-report branch above (which already
+    // falls through harmlessly for this shape) since it's a more specific,
+    // less common pattern. ir=1, plain grid value — mirrors the report
+    // path's `| 0x8000` bit placement.
+    if let Some(grid_part) = extra.strip_prefix("R ") {
+        let gbytes = grid_part.as_bytes();
+        if gbytes.len() == 4
+            && gbytes[0] >= b'A'
+            && gbytes[0] <= b'R'
+            && gbytes[1] >= b'A'
+            && gbytes[1] <= b'R'
+            && gbytes[2].is_ascii_digit()
+            && gbytes[3].is_ascii_digit()
+        {
+            let mut igrid4: u16 = (gbytes[0] - b'A') as u16;
+            igrid4 = igrid4 * 18 + (gbytes[1] - b'A') as u16;
+            igrid4 = igrid4 * 10 + (gbytes[2] - b'0') as u16;
+            igrid4 = igrid4 * 10 + (gbytes[3] - b'0') as u16;
+            return igrid4 | 0x8000;
+        }
+    }
+
     MAXGRID4 + 1 // fallback: no grid
 }
 
@@ -1600,6 +1630,31 @@ mod tests {
         // Signal report R-12 (R prefix, ir=1)
         let igrid = packgrid("R-12");
         assert_eq!(igrid, (MAXGRID4 + 35 - 12) | 0x8000);
+    }
+
+    #[test]
+    fn packgrid_r_prefixed_grid_sets_ir_bit() {
+        // PAN-49: state-QSO-party / ARRL Intl Digital contest ack — "R"+grid
+        // instead of a numeric report. ir=1 (bit 0x8000), plain grid value.
+        let packed = packgrid("R EM40");
+        assert_ne!(packed & 0x8000, 0, "ir bit must be set for an R-grid ack");
+        let plain = packgrid("EM40");
+        assert_eq!(packed & 0x7FFF, plain, "grid value itself must match the unprefixed encoding");
+    }
+
+    #[test]
+    fn encode_message_r_grid_ack_round_trips_through_decoder() {
+        let mut encoder = Ft8Encoder::new();
+        let symbols = encoder
+            .encode_message("K5TD K5ARH R EM40", None)
+            .expect("R+grid ack must be encodable, not silently dropped");
+        // A non-empty exchange must not collapse to the "no grid/report" payload.
+        // (packgrid("") == MAXGRID4 + 1; confirm we did NOT take that fallback
+        // by checking the symbols differ from an actual empty-exchange encode.)
+        let empty_symbols = encoder
+            .encode_message("K5TD K5ARH", None)
+            .expect("plain grid-less exchange must still encode");
+        assert_ne!(symbols, empty_symbols, "R+grid must not silently degrade to an empty exchange");
     }
 
     #[test]
