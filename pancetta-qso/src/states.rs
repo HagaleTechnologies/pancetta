@@ -885,7 +885,8 @@ impl MessageType {
             | MessageType::ReportAck { to_station, .. }
             | MessageType::FinalConfirmation { to_station, .. }
             | MessageType::SeventyThree { to_station, .. }
-            | MessageType::ContestExchange { to_station, .. } => to_station == callsign,
+            | MessageType::ContestExchange { to_station, .. }
+            | MessageType::ContestReply { to_station, .. } => to_station == callsign,
             _ => false,
         }
     }
@@ -907,7 +908,8 @@ impl MessageType {
             | MessageType::ReportAck { from_station, .. }
             | MessageType::FinalConfirmation { from_station, .. }
             | MessageType::SeventyThree { from_station, .. }
-            | MessageType::ContestExchange { from_station, .. } => Some(from_station),
+            | MessageType::ContestExchange { from_station, .. }
+            | MessageType::ContestReply { from_station, .. } => Some(from_station),
             MessageType::NonStandard { .. } => None,
         }
     }
@@ -922,7 +924,8 @@ impl MessageType {
             | MessageType::ReportAck { to_station, .. }
             | MessageType::FinalConfirmation { to_station, .. }
             | MessageType::SeventyThree { to_station, .. }
-            | MessageType::ContestExchange { to_station, .. } => Some(to_station),
+            | MessageType::ContestExchange { to_station, .. }
+            | MessageType::ContestReply { to_station, .. } => Some(to_station),
             MessageType::Cq { .. } | MessageType::NonStandard { .. } => None,
         }
     }
@@ -938,7 +941,8 @@ impl MessageType {
             | MessageType::ReportAck { from_station, .. }
             | MessageType::FinalConfirmation { from_station, .. }
             | MessageType::SeventyThree { from_station, .. }
-            | MessageType::ContestExchange { from_station, .. } => from_station == callsign,
+            | MessageType::ContestExchange { from_station, .. }
+            | MessageType::ContestReply { from_station, .. } => from_station == callsign,
             _ => false,
         }
     }
@@ -1229,5 +1233,31 @@ mod tests {
             } if failed_reason == &reason && **last_state == QsoState::Idle
         ));
         assert!(failed.ladder_view(QsoRole::Caller).is_none());
+    }
+
+    #[test]
+    fn contest_reply_is_addressed_to_the_to_station() {
+        let msg = MessageType::ContestReply {
+            to_station: "K5ARH".to_string(),
+            from_station: "K5TD".to_string(),
+            grid: "EM40".to_string(),
+            is_ack: true,
+        };
+        assert!(msg.is_addressed_to("K5ARH"));
+        assert!(!msg.is_addressed_to("K5TD"));
+    }
+
+    #[test]
+    fn contest_reply_sender_and_addressee_callsigns() {
+        let msg = MessageType::ContestReply {
+            to_station: "K5ARH".to_string(),
+            from_station: "K5TD".to_string(),
+            grid: "EM40".to_string(),
+            is_ack: true,
+        };
+        assert_eq!(msg.sender_callsign(), Some("K5TD"));
+        assert_eq!(msg.addressee_callsign(), Some("K5ARH"));
+        assert!(msg.is_from("K5TD"));
+        assert!(!msg.is_from("K5ARH"));
     }
 }
