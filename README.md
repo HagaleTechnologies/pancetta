@@ -162,13 +162,19 @@ current status.
 
 ## Quick start
 
-**Prebuilt binaries.** No Rust toolchain needed. Every
+**Prebuilt binaries.** No Rust toolchain needed. Starting with the first
+tagged release after this note was added, every
 [release](https://github.com/HagaleTechnologies/pancetta/releases/latest)
 ships CI-verified binaries for macOS (Apple Silicon), Linux x86_64, Linux
-aarch64 (Raspberry Pi 4/5 and other 64-bit ARM boards), and Windows x86_64.
-Download the archive for your platform, extract it, and run `./pancetta`
-(`pancetta.exe` on Windows) — skip straight to step 3 below. Hamlib is still
-needed at runtime if you want to key a radio (see the table below).
+aarch64 (Raspberry Pi 4/5 and other 64-bit ARM boards), and Windows x86_64 —
+if `/releases/latest` doesn't list an archive for your platform yet, either
+build from source below or wait for the next tag. Download the archive for
+your platform, extract it, and run `./pancetta` (`pancetta.exe` on Windows)
+— it walks you through the same setup wizard as step 3 below, then run it
+again the same way to start the station (step 4's `cargo run --release -p
+pancetta` is the source-build equivalent of that second run — a prebuilt
+binary doesn't need it or a source checkout). Hamlib is still needed at
+runtime if you want to key a radio (see the table below).
 
 To build from source instead:
 
