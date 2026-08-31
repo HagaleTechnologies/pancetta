@@ -1262,6 +1262,37 @@ impl QsoManager {
         .await
     }
 
+    /// Engage a contest profile on an existing QSO. Stamps
+    /// `metadata.contest_info` so `process_message_with_parity`'s
+    /// reclassification step (PAN-49) knows to try this QSO's engaged
+    /// profile's exchange-shape matcher against otherwise-`NonStandard`
+    /// decodes, and so ADIF logging picks up `CONTEST_ID` (adif.rs).
+    ///
+    /// No operator UI calls this yet — a later plan wires the "enter this
+    /// contest?" modal to it (docs/superpowers/specs/
+    /// 2026-08-30-contest-mode-design.md §4).
+    pub async fn engage_contest_profile(
+        &self,
+        qso_id: QsoId,
+        profile: crate::contest::profile::ContestProfile,
+    ) -> Result<(), QsoManagerError> {
+        let mut qsos = self.qsos.write().await;
+        let progress = qsos
+            .get_mut(&qso_id)
+            .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
+        progress.metadata.contest_info = Some(ContestInfo {
+            contest_name: profile.id,
+            category: String::new(),
+            serials: ContestSerials {
+                sent: None,
+                received: None,
+            },
+            points: 0,
+            multiplier: None,
+        });
+        Ok(())
+    }
+
     /// Open a manual **Hound** QSO to work a Fox (DXpedition) station.
     ///
     /// Thin wrapper over [`respond_to_cq_with`](Self::respond_to_cq_with) that
@@ -7041,6 +7072,48 @@ mod tests {
             "WaitingForConfirmation against a compound partner has RR73 (not a \
              numeric report) queued and must NOT retire early"
         );
+    }
+
+    #[tokio::test]
+    async fn engage_contest_profile_stamps_contest_info() {
+        let config = test_config();
+        let manager = QsoManager::new(config);
+        let qso_id = manager
+            .respond_to_cq_manual("K5TD".to_string(), 1203.0, None)
+            .await
+            .unwrap();
+
+        let profile = crate::contest::catalog::builtin_catalog()
+            .into_iter()
+            .find(|p| p.id == "us-state-qso-party")
+            .unwrap();
+        manager
+            .engage_contest_profile(qso_id, profile)
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        let contest_info = progress
+            .metadata
+            .contest_info
+            .expect("contest_info must be set after engaging a profile");
+        assert_eq!(contest_info.contest_name, "us-state-qso-party");
+    }
+
+    #[tokio::test]
+    async fn engage_contest_profile_errors_for_unknown_qso() {
+        let config = test_config();
+        let manager = QsoManager::new(config);
+        let profile = crate::contest::catalog::builtin_catalog()
+            .into_iter()
+            .next()
+            .unwrap();
+        let bogus_id = QsoId::new_v4();
+        let result = manager.engage_contest_profile(bogus_id, profile).await;
+        assert!(matches!(
+            result,
+            Err(QsoManagerError::QsoNotFound { qso_id }) if qso_id == bogus_id
+        ));
     }
 
     /// Repetitive-TX watchdog: a QSO stuck in the same active TX state (we keep
