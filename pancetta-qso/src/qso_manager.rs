@@ -2316,17 +2316,29 @@ impl QsoManager {
 
         // PAN-49: an otherwise-unclassifiable decode may be a contest ack
         // (e.g. "R"+grid) that `MessageExchange::parse_message` has no
-        // pattern for. Only reinterpret it when at least one active QSO is
-        // contest-engaged (`engage_contest_profile`) — this keeps every
-        // non-contest QSO's classification byte-identical to today.
+        // pattern for. Only reinterpret it when the incoming frame's sender
+        // matches the PARTNER of a QSO that is itself contest-engaged
+        // (`engage_contest_profile`) — scoped per-QSO, not "any QSO
+        // anywhere is engaged" (final review Finding 2: that global gate let
+        // a frame from an unrelated third party get reclassified and routed
+        // to someone else's engaged QSO). This keeps every QSO whose partner
+        // did not send this frame — including every non-contest QSO —
+        // byte-identical to today; Finding 1's sender-gated grid latch is
+        // the remaining defense-in-depth layer once a frame does reach the
+        // transition arm.
         let message_type = match &message_type {
             MessageType::NonStandard { .. } => {
                 match crate::contest::matcher::match_grid_with_r_ack(&raw_text) {
                     Some(m) => {
                         let any_engaged = {
                             let qsos = self.qsos.read().await;
-                            qsos.values()
-                                .any(|p| p.state.is_active() && p.metadata.contest_info.is_some())
+                            qsos.values().any(|p| {
+                                p.state.is_active()
+                                    && p.metadata.contest_info.is_some()
+                                    && p.state.their_callsign().is_some_and(|c| {
+                                        crate::exchange::callsigns_match(c, &m.from_station)
+                                    })
+                            })
                         };
                         if any_engaged {
                             MessageType::ContestReply {
@@ -2792,8 +2804,24 @@ impl QsoManager {
         // WaitingForConfirmation.grid_square only feeds the Completed-state
         // latch (see the block below), not metadata directly, and ADIF
         // logging (adif.rs) reads metadata.grids.theirs, not QsoState.
-        if let MessageType::ContestReply { grid, .. } = &message.message_type {
-            if !grid.is_empty() {
+        //
+        // Guarded by sender verification against `old_state`'s ORIGINAL
+        // partner (final review Finding 1): the transition arm's own
+        // `reject_sender` check may have rejected this frame (spoofed or
+        // third-party sender) and left `new_state == old_state`, but this
+        // latch used to run unconditionally regardless of that outcome —
+        // writing an unrelated station's grid into the QSO's ADIF-bound
+        // metadata. The CqResponse latch above is protected the equivalent
+        // way structurally: `(RespondingToCq, CqResponse)` has a dedicated
+        // relevance arm requiring `is_partner` before it is ever reached.
+        if let MessageType::ContestReply {
+            grid, from_station, ..
+        } = &message.message_type
+        {
+            let from_partner = old_state
+                .their_callsign()
+                .is_some_and(|partner| Self::is_partner(from_station, partner));
+            if from_partner && !grid.is_empty() {
                 progress.metadata.grids.theirs = Some(grid.clone());
             }
         }
@@ -7338,6 +7366,75 @@ mod tests {
                 .as_ref()
                 .map(|c| c.contest_name.as_str()),
             Some("us-state-qso-party")
+        );
+    }
+
+    /// Final-review Finding 1/3 regression: a `ContestReply` frame that
+    /// legitimately reclassifies (because ITS sender — W0D — has its own
+    /// contest-engaged QSO, satisfying Finding 2's per-QSO gate) is still
+    /// broadcast-routed to every active QSO addressed to us, including an
+    /// UNRELATED engaged QSO (K5TD) whose partner is not W0D. That QSO's
+    /// transition arm must `reject_sender` (state does not advance), and —
+    /// this is the assertion that would have caught Finding 1 before this
+    /// fix — the grid-latch block must NOT write W0D's grid into K5TD's
+    /// `metadata.grids.theirs` just because the frame reached
+    /// `process_message_for_qso` for that QSO.
+    #[tokio::test]
+    async fn spurious_contest_reply_from_unrelated_station_does_not_advance_or_leak_grid() {
+        let mut config = test_config();
+        config.our_callsign = "K5ARH".to_string();
+        let manager = QsoManager::new(config);
+        let profile = crate::contest::catalog::builtin_catalog()
+            .into_iter()
+            .find(|p| p.id == "us-state-qso-party")
+            .unwrap();
+
+        // QSO under test: engaged with K5TD, RespondingToCq.
+        let k5td_qso_id = manager
+            .respond_to_cq_manual("K5TD".to_string(), 1203.0, None)
+            .await
+            .unwrap();
+        manager
+            .engage_contest_profile(k5td_qso_id, profile.clone())
+            .await
+            .unwrap();
+
+        // A second, unrelated engaged QSO with W0D at the same frequency —
+        // its presence is what legitimately unlocks reclassification (per
+        // Finding 2's tightened per-QSO gate) for a frame FROM W0D, even
+        // though that frame has nothing to do with the K5TD QSO.
+        let w0d_qso_id = manager
+            .respond_to_cq_manual("W0D".to_string(), 1203.0, None)
+            .await
+            .unwrap();
+        manager
+            .engage_contest_profile(w0d_qso_id, profile)
+            .await
+            .unwrap();
+
+        // W0D acks OUR grid — legitimate traffic for the W0D QSO, but must
+        // not be able to advance or contaminate the unrelated K5TD QSO.
+        manager
+            .process_message(
+                MessageType::NonStandard {
+                    text: "K5ARH W0D R EM28".to_string(),
+                },
+                "K5ARH W0D R EM28".to_string(),
+                1203.0,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+
+        let k5td_progress = manager.get_qso(k5td_qso_id).await.unwrap();
+        assert!(
+            matches!(k5td_progress.state, QsoState::RespondingToCq { .. }),
+            "K5TD QSO must not advance on a ContestReply from an unrelated sender, got {:?}",
+            k5td_progress.state
+        );
+        assert_eq!(
+            k5td_progress.metadata.grids.theirs, None,
+            "W0D's grid must not leak into the unrelated K5TD QSO's metadata"
         );
     }
 
