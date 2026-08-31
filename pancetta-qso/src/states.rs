@@ -284,6 +284,15 @@ pub enum MessageType {
         serial: SerialNumber,
     },
 
+    /// Contest ack via grid instead of a numeric report:
+    /// "K1ABC W9XYZ R EN37" (PAN-49 — state QSO parties, ARRL Intl Digital).
+    ContestReply {
+        to_station: String,
+        from_station: String,
+        grid: String,
+        is_ack: bool,
+    },
+
     /// Non-standard message
     NonStandard { text: String },
 }

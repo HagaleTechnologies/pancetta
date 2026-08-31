@@ -366,6 +366,19 @@ impl MessageExchange {
                 serial
             )),
 
+            MessageType::ContestReply {
+                to_station,
+                from_station,
+                grid,
+                is_ack,
+            } => {
+                if *is_ack {
+                    Ok(format!("{} {} R {}", to_station, from_station, grid))
+                } else {
+                    Ok(format!("{} {} {}", to_station, from_station, grid))
+                }
+            }
+
             MessageType::NonStandard { text } => Ok(text.clone()),
         }
     }
@@ -1308,6 +1321,19 @@ mod tests {
             grid: Some(String::new()),
         };
         assert_eq!(exchange.generate_message(&empty).unwrap(), "PY2GIG K5ARH");
+    }
+
+    #[test]
+    fn generate_message_renders_contest_reply_as_r_grid() {
+        let exchange = MessageExchange::new("K5ARH".to_string());
+        let msg = MessageType::ContestReply {
+            to_station: "K5ARH".to_string(),
+            from_station: "K5TD".to_string(),
+            grid: "EM40".to_string(),
+            is_ack: true,
+        };
+        let text = exchange.generate_message(&msg).unwrap();
+        assert_eq!(text, "K5ARH K5TD R EM40");
     }
 
     // ========================================================================
