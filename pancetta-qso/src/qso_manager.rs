@@ -2314,6 +2314,37 @@ impl QsoManager {
     ) -> Result<(), QsoManagerError> {
         let timestamp = Utc::now();
 
+        // PAN-49: an otherwise-unclassifiable decode may be a contest ack
+        // (e.g. "R"+grid) that `MessageExchange::parse_message` has no
+        // pattern for. Only reinterpret it when at least one active QSO is
+        // contest-engaged (`engage_contest_profile`) — this keeps every
+        // non-contest QSO's classification byte-identical to today.
+        let message_type = match &message_type {
+            MessageType::NonStandard { .. } => {
+                match crate::contest::matcher::match_grid_with_r_ack(&raw_text) {
+                    Some(m) => {
+                        let any_engaged = {
+                            let qsos = self.qsos.read().await;
+                            qsos.values()
+                                .any(|p| p.state.is_active() && p.metadata.contest_info.is_some())
+                        };
+                        if any_engaged {
+                            MessageType::ContestReply {
+                                to_station: m.to_station,
+                                from_station: m.from_station,
+                                grid: m.grid,
+                                is_ack: true,
+                            }
+                        } else {
+                            message_type
+                        }
+                    }
+                    None => message_type,
+                }
+            }
+            _ => message_type,
+        };
+
         self.maybe_confirm_frequency_drift(&message_type, frequency)
             .await;
 
@@ -5508,6 +5539,15 @@ mod tests {
         }
     }
 
+    /// Drain currently-buffered events into a Vec.
+    fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
     #[test]
     fn admit_idle_admits_any_desire() {
         use pancetta_core::slot::SlotParity::*;
@@ -7114,6 +7154,64 @@ mod tests {
             result,
             Err(QsoManagerError::QsoNotFound { qso_id }) if qso_id == bogus_id
         ));
+    }
+
+    #[tokio::test]
+    async fn r_grid_ack_reclassifies_only_when_a_qso_is_contest_engaged() {
+        let config = test_config();
+        let manager = QsoManager::new(config);
+        let mut rx = manager.subscribe();
+
+        // No QSO engaged yet — an R+grid ack for an unrelated station must stay
+        // NonStandard (today's behavior, unchanged) and route nowhere.
+        manager
+            .process_message(
+                MessageType::NonStandard {
+                    text: "K5ARH K5TD R EM40".to_string(),
+                },
+                "K5ARH K5TD R EM40".to_string(),
+                1203.0,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        assert!(
+            drain(&mut rx).is_empty(),
+            "an unengaged QSO must not react to an R+grid ack"
+        );
+
+        // Engage a QSO with K5TD, then the same text must reclassify and route.
+        let qso_id = manager
+            .respond_to_cq_manual("K5TD".to_string(), 1203.0, None)
+            .await
+            .unwrap();
+        drain(&mut rx); // discard the initial call's MessageToSend
+        let profile = crate::contest::catalog::builtin_catalog()
+            .into_iter()
+            .find(|p| p.id == "us-state-qso-party")
+            .unwrap();
+        manager
+            .engage_contest_profile(qso_id, profile)
+            .await
+            .unwrap();
+
+        manager
+            .process_message(
+                MessageType::NonStandard {
+                    text: "K5ARH K5TD R EM40".to_string(),
+                },
+                "K5ARH K5TD R EM40".to_string(),
+                1203.0,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::WaitingForConfirmation { .. }),
+            "engaged QSO must advance on the R+grid ack, got {:?}",
+            progress.state
+        );
     }
 
     /// Repetitive-TX watchdog: a QSO stuck in the same active TX state (we keep
