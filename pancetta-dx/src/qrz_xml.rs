@@ -319,11 +319,8 @@ fn extract_tag_text(xml: &str, tag: &str) -> Result<Option<String>> {
                 }
             }
             Ok(Event::Text(e)) if in_target => {
-                // quick-xml 0.41: BytesText::unescape() → xml10_content()
-                // (decode + XML-1.0 entity unescape; same Result<Cow<str>> shape).
-                let unescaped = e
-                    .xml10_content()
-                    .map_err(|err| DxError::Parse(format!("QRZ XML decode error: {err}")))?;
+                // quick-xml 0.42: xml10_content() returns Cow<str> directly (no Result).
+                let unescaped = e.xml10_content();
                 collected.push_str(&unescaped);
             }
             Ok(Event::End(e)) => {
@@ -342,13 +339,13 @@ fn extract_tag_text(xml: &str, tag: &str) -> Result<Option<String>> {
 
 /// Compare an XML element's (possibly namespace-prefixed) raw name to a target
 /// local name, case-insensitively on the local part.
-fn local_name_eq(raw: &[u8], target: &str) -> bool {
+fn local_name_eq(raw: &str, target: &str) -> bool {
     // Strip an optional `prefix:` namespace qualifier.
-    let local = match raw.iter().rposition(|&b| b == b':') {
+    let local = match raw.rfind(':') {
         Some(pos) => &raw[pos + 1..],
         None => raw,
     };
-    local.eq_ignore_ascii_case(target.as_bytes())
+    local.eq_ignore_ascii_case(target)
 }
 
 /// Minimal percent-encoder for query-parameter values.
@@ -496,10 +493,10 @@ mod tests {
 
     #[test]
     fn local_name_eq_handles_namespace_prefix() {
-        assert!(local_name_eq(b"call", "call"));
-        assert!(local_name_eq(b"qrz:call", "call"));
-        assert!(local_name_eq(b"Call", "call"));
-        assert!(!local_name_eq(b"callsign", "call"));
+        assert!(local_name_eq("call", "call"));
+        assert!(local_name_eq("qrz:call", "call"));
+        assert!(local_name_eq("Call", "call"));
+        assert!(!local_name_eq("callsign", "call"));
     }
 
     #[test]
