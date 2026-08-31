@@ -1639,7 +1639,11 @@ mod tests {
         let packed = packgrid("R EM40");
         assert_ne!(packed & 0x8000, 0, "ir bit must be set for an R-grid ack");
         let plain = packgrid("EM40");
-        assert_eq!(packed & 0x7FFF, plain, "grid value itself must match the unprefixed encoding");
+        assert_eq!(
+            packed & 0x7FFF,
+            plain,
+            "grid value itself must match the unprefixed encoding"
+        );
     }
 
     #[test]
@@ -1654,7 +1658,10 @@ mod tests {
         let empty_symbols = encoder
             .encode_message("K5TD K5ARH", None)
             .expect("plain grid-less exchange must still encode");
-        assert_ne!(symbols, empty_symbols, "R+grid must not silently degrade to an empty exchange");
+        assert_ne!(
+            symbols, empty_symbols,
+            "R+grid must not silently degrade to an empty exchange"
+        );
     }
 
     #[test]
