@@ -58,7 +58,14 @@ def soft_rank_loss_tensor(scores, labels, tau=0.1):
     positives = labels.sum(dim=1)
     valid = positives > 0
     if not valid.any():
-        raise ValueError("soft-rank minibatch has no positive labels")
+        # A minibatch that's entirely zero-label rows (parity-only
+        # recoveries, retained for BCE calibration — see load_corpus) has
+        # no positive to rank against, but that's a legitimate corpus
+        # composition, not a caller error: raising would abort the whole
+        # training run over one unlucky shuffle. `combined_loss`'s BCE
+        # term can still optimize these rows; contribute a differentiable
+        # zero here so it does, instead of failing the batch outright.
+        return scores.sum() * 0.0
     return ((soft_ranks * labels).sum(dim=1)[valid] / positives[valid]).mean()
 
 

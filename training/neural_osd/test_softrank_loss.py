@@ -48,6 +48,21 @@ class SoftRankLossTests(unittest.TestCase):
         ).item()
         self.assertAlmostEqual(actual, expected, places=6)
 
+    def test_tensor_loss_all_zero_batch_is_differentiable_zero(self):
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("PyTorch is not installed")
+        # A minibatch of nothing but zero-label (parity-only recovery) rows
+        # must not raise — those rows are retained specifically so BCE can
+        # train on them; the rank term should just contribute nothing.
+        scores = torch.tensor([[3.0, 1.0, 2.0], [0.5, -1.0, 2.5]], requires_grad=True)
+        labels = torch.zeros(2, 3)
+        loss = soft_rank_loss_tensor(scores, labels, tau=0.25)
+        self.assertEqual(loss.item(), 0.0)
+        loss.backward()
+        self.assertTrue(torch.all(scores.grad == 0.0))
+
     def test_loader_preserves_natural_systematic_output_indices(self):
         try:
             import numpy  # noqa: F401
