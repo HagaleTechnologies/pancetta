@@ -54,7 +54,15 @@ fn main() -> Result<()> {
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let mut writer = BufWriter::new(File::create(&output)?);
+    // Write to a sibling temp file and rename into place only after the
+    // full scan, flush, and label checks succeed. A late-file read error,
+    // a serialization failure, or the empty-corpus/zero-label checks below
+    // would otherwise leave a valid-looking but truncated (prefix-biased)
+    // JSONL at `output` — `load_corpus` has no completion marker, so a
+    // later training run can't tell a failed mining pass from a real,
+    // complete corpus.
+    let tmp_output = output.with_extension("jsonl.tmp");
+    let mut writer = BufWriter::new(File::create(&tmp_output)?);
     let mut records = 0usize;
     let mut labels = 0usize;
     for wav in &wavs {
@@ -66,23 +74,23 @@ fn main() -> Result<()> {
         }
     }
     writer.flush()?;
-    anyhow::ensure!(
-        records > 0,
-        "tier {tier} wrote zero records from {} WAVs",
-        wavs.len()
-    );
+    if records == 0 {
+        let _ = std::fs::remove_file(&tmp_output);
+        anyhow::bail!("tier {tier} wrote zero records from {} WAVs", wavs.len());
+    }
     // A record count alone does not make a trainable corpus: `load_corpus` keeps
     // only OSD-recovered rows, so a long T1 run with zero recoveries would exit
     // successfully and publish a corpus that later filters to an empty split.
     // T0 is a pipeline proof, not a training tier, so it only warns.
-    if tier == "t1" {
-        anyhow::ensure!(
-            labels > 0,
+    if tier == "t1" && labels == 0 {
+        let _ = std::fs::remove_file(&tmp_output);
+        anyhow::bail!(
             "tier t1 captured {records} records from {} WAVs but zero OSD-recovered \
              labels; the corpus has no trainable positives",
             wavs.len()
         );
     }
+    std::fs::rename(&tmp_output, &output)?;
     println!(
         "tier={tier} wavs={} records={records} labeled={labels} output={}",
         wavs.len(),

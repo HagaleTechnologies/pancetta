@@ -365,7 +365,13 @@ def main():
             print(f"epoch={epoch + 1} tier1_expected_soft_rank={rank_metric:.6f} selection_metric={selection_metric:.6f} [MODEL SELECTION ONLY — NOT A SHIP SIGNAL]")
             if selection_metric < best:
                 best = selection_metric
-                torch.save(model.state_dict(), args.output)
+                # Persist the seed alongside the weights, not just applied
+                # to the in-process RNGs — once the command transcript that
+                # launched this run is gone, a bare state_dict can't be
+                # traced back to (or reproduced with) the RNG seed that
+                # produced it. export_weights.py propagates this into the
+                # exported provenance.json.
+                torch.save({"state_dict": model.state_dict(), "seed": args.seed}, args.output)
     finally:
         # Close every memmap's underlying OS mapping before removing its
         # backing files. On Windows, an open memory-mapped file cannot be

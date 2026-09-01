@@ -64,7 +64,8 @@ def main():
             self.linear = nn.Linear(N_CODEWORD, K_INFO)
 
     model = DIAModel()
-    model.load_state_dict(torch.load(args.model, map_location="cpu", weights_only=True))
+    checkpoint = torch.load(args.model, map_location="cpu", weights_only=True)
+    model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
     weights = {}
@@ -103,6 +104,7 @@ def main():
         "input_channels": 26,
         "syndrome_normalization_divisor": 3,
         "derivation": f"exported from {args.model}",
+        "training_seed": checkpoint["seed"],
         "tensors": [{"name": name, "length": length} for name, length in TENSOR_ORDER],
     }
     with open(args.provenance, "w") as f:

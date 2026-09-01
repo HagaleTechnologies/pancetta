@@ -415,6 +415,27 @@ fn elapsed_regression_gate(a: &Scorecard, b: &Scorecard, max_pct: f64) -> Elapse
             a.harness.cores_used, b.harness.cores_used
         ));
     }
+    // Host/cores alone don't prove the two runs did the same WORK — a
+    // candidate that accidentally omits a tier (or a WAV within a shared
+    // tier) can clear the 20% budget simply by doing less of it. Require
+    // the same tier set and, for every shared tier, the same
+    // wavs_processed count before trusting the elapsed comparison.
+    if a.config.tiers_run != b.config.tiers_run {
+        return ElapsedGate::Skipped(format!(
+            "  (skipped: tiers_run differs — {:?} vs {:?})",
+            a.config.tiers_run, b.config.tiers_run
+        ));
+    }
+    for (tier_name, a_result) in &a.tiers {
+        if let Some(b_result) = b.tiers.get(tier_name) {
+            if a_result.wavs_processed != b_result.wavs_processed {
+                return ElapsedGate::Skipped(format!(
+                    "  (skipped: tier '{tier_name}' wavs_processed differs — {} vs {})",
+                    a_result.wavs_processed, b_result.wavs_processed
+                ));
+            }
+        }
+    }
     if !base.is_finite() || !cand.is_finite() || base <= 0.0 {
         return ElapsedGate::Skipped(format!(
             "  (skipped: baseline elapsed_seconds is {base}; nothing to compare against)"
@@ -789,6 +810,46 @@ mod tests {
         // A zero baseline has no meaningful percentage.
         assert!(matches!(
             elapsed_regression_gate(&card("host-a", 8, 0.0), &card("host-a", 8, 5.0), 20.0),
+            ElapsedGate::Skipped(_)
+        ));
+    }
+
+    #[test]
+    fn elapsed_gate_skips_when_tiers_run_differs() {
+        let mut a = card("host-a", 8, 100.0);
+        let mut b = card("host-a", 8, 105.0);
+        a.config.tiers_run = vec!["hard-200".into(), "hard-1000".into()];
+        b.config.tiers_run = vec!["hard-200".into()];
+        assert!(matches!(
+            elapsed_regression_gate(&a, &b, 20.0),
+            ElapsedGate::Skipped(_)
+        ));
+    }
+
+    #[test]
+    fn elapsed_gate_skips_when_a_shared_tier_processed_different_wav_counts() {
+        let mut a = card("host-a", 8, 100.0);
+        let mut b = card("host-a", 8, 105.0);
+        a.config.tiers_run = vec!["hard-1000".into()];
+        b.config.tiers_run = vec!["hard-1000".into()];
+        a.tiers.insert(
+            "hard-1000".into(),
+            TierResult {
+                wavs_processed: 1000,
+                ..Default::default()
+            },
+        );
+        // Candidate accidentally processed fewer WAVs in the same tier —
+        // doing less work must not let it clear the gate on that basis.
+        b.tiers.insert(
+            "hard-1000".into(),
+            TierResult {
+                wavs_processed: 400,
+                ..Default::default()
+            },
+        );
+        assert!(matches!(
+            elapsed_regression_gate(&a, &b, 20.0),
             ElapsedGate::Skipped(_)
         ));
     }
