@@ -539,7 +539,7 @@ git push origin --delete feature/your-feature
 
 ### Maintainers
 
-Maintained by Hagale Technologies (K5ARH).
+Maintained by Hagale Technologies (W5AU).
 
 ## Recognition
 
