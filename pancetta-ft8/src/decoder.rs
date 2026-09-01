@@ -3708,6 +3708,7 @@ impl Ft8Decoder {
                 ldpc_iterations: self.config.ldpc_iterations,
                 osd_depth: self.config.osd_depth,
                 osd_npre2_preprocessing_enabled: self.config.osd_npre2_preprocessing_enabled,
+                neural_osd_enabled: self.config.neural_osd_enabled,
                 llr_target_variance: self.config.llr_target_variance,
                 adaptive_ldpc_iters: self.config.adaptive_ldpc_iters,
                 max_parity_errors_for_osd: self.config.max_parity_errors_for_osd,
@@ -3834,6 +3835,7 @@ impl Ft8Decoder {
                 let build = |iters: usize| {
                     LdpcDecoder::new_with_osd(iters, osd_cfg)
                         .expect("LDPC decoder init failed")
+                        .with_neural_osd(ctx.neural_osd_enabled)
                         .with_max_parity_errors_for_osd(ctx.max_parity_errors_for_osd)
                         .with_bp_offset_subtract(ctx.bp_offset_subtract)
                         .with_osd_input(ctx.osd_input)
@@ -9044,6 +9046,12 @@ struct DecodeContext<'a> {
     /// `OsdConfig::npre2_preprocessing_enabled`). Active only when
     /// `osd_depth >= 3`.
     osd_npre2_preprocessing_enabled: bool,
+    /// Neural-OSD reprocessing-order toggle (matches Ft8Config field). Must
+    /// be threaded into every per-thread `LdpcDecoder` `ldpc_init` builds —
+    /// `LdpcDecoder`'s own constructor defaults this to `true`, so a
+    /// decoder built without an explicit `.with_neural_osd(..)` call
+    /// silently ignores `--neural-osd off`.
+    neural_osd_enabled: bool,
     /// LLR normalization target variance (matches Ft8Config field).
     llr_target_variance: f32,
     /// When true, per-thread LDPC decoders are created in 3 buckets
@@ -16043,6 +16051,26 @@ mod tests {
         assert!(matches!(ldpc.algorithm, LdpcAlgorithm::SumProduct));
         // Early termination is always on (syndrome checked every iteration)
         assert!(!ldpc.var_positions.is_empty());
+    }
+
+    /// `LdpcDecoder::new_with_osd` defaults `neural_osd_enabled` to `true`
+    /// (see its `impl Default`), so every construction path that wants
+    /// `--neural-osd off` to actually take effect — including the parallel
+    /// `ldpc_init`/`build` closure `decode_window` uses per-candidate — must
+    /// explicitly call `.with_neural_osd(false)`. A construction site that
+    /// forgets this call is invisible at the type level (both compile
+    /// fine); this test locks in that the builder call itself does what it
+    /// claims, so any future path built the same way is at least backed by
+    /// a working setter.
+    #[test]
+    fn with_neural_osd_false_overrides_the_constructor_default() {
+        let default_on = LdpcDecoder::new_with_osd(50, None).unwrap();
+        assert!(default_on.neural_osd_enabled, "constructor default must stay true — production paths rely on with_neural_osd to opt out, not a false default");
+
+        let explicitly_off = LdpcDecoder::new_with_osd(50, None)
+            .unwrap()
+            .with_neural_osd(false);
+        assert!(!explicitly_off.neural_osd_enabled);
     }
 
     /// Perf (decoder-analysis A2): every `LdpcDecoder::new` call shares the
@@ -23100,6 +23128,7 @@ mod w2_5_acceptance_gating_tests {
             ldpc_iterations: decoder.config.ldpc_iterations,
             osd_depth: decoder.config.osd_depth,
             osd_npre2_preprocessing_enabled: decoder.config.osd_npre2_preprocessing_enabled,
+            neural_osd_enabled: decoder.config.neural_osd_enabled,
             llr_target_variance: decoder.config.llr_target_variance,
             adaptive_ldpc_iters: decoder.config.adaptive_ldpc_iters,
             max_parity_errors_for_osd: decoder.config.max_parity_errors_for_osd,
@@ -23387,6 +23416,7 @@ mod w26_ap_coverage_tests {
             ldpc_iterations: decoder.config.ldpc_iterations,
             osd_depth: decoder.config.osd_depth,
             osd_npre2_preprocessing_enabled: decoder.config.osd_npre2_preprocessing_enabled,
+            neural_osd_enabled: decoder.config.neural_osd_enabled,
             llr_target_variance: decoder.config.llr_target_variance,
             adaptive_ldpc_iters: decoder.config.adaptive_ldpc_iters,
             max_parity_errors_for_osd: decoder.config.max_parity_errors_for_osd,
@@ -23804,6 +23834,7 @@ mod ap5_hot_path_rescue_tests {
             ldpc_iterations: decoder.config.ldpc_iterations,
             osd_depth: decoder.config.osd_depth,
             osd_npre2_preprocessing_enabled: decoder.config.osd_npre2_preprocessing_enabled,
+            neural_osd_enabled: decoder.config.neural_osd_enabled,
             llr_target_variance: decoder.config.llr_target_variance,
             adaptive_ldpc_iters: decoder.config.adaptive_ldpc_iters,
             max_parity_errors_for_osd: decoder.config.max_parity_errors_for_osd,

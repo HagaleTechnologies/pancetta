@@ -190,16 +190,24 @@ fn decode(wav: &Path, root: &Path) -> Result<Vec<CorpusRecord>> {
     let mut decoder = pancetta_ft8::Ft8Decoder::new(config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     capture::enable_global();
-    // `decode_window` requires exactly WINDOW_SAMPLES (12.64s @ 12kHz); a raw
-    // recording is typically 15s+ and not slot-aligned. Chunk it into
-    // consecutive WINDOW_SAMPLES-sized slots (matching how the live pipeline
-    // feeds one window per slot to a persistent decoder), padding the final
-    // partial chunk with zeros. Passing an oversized buffer directly costs
-    // 4-5x more per the decoder's own documented single-window contract.
+    // `decode_window` requires exactly WINDOW_SAMPLES (12.64s @ 12kHz), but
+    // FT8's actual cycle is a 15s slot — the message occupies the first
+    // ~12.64s of each slot, the remaining ~2.36s is dead air/guard time, not
+    // more signal. Stepping by WINDOW_SAMPLES (rather than the 15s slot
+    // period) drifts the window earlier into each successive slot by that
+    // same ~2.36s, so only the first slot of a multi-slot recording is ever
+    // presented at its real boundary, and a plain 15s single-slot file gets
+    // a second, meaningless decode of its silent tail. Stride by
+    // SAMPLES_PER_SLOT (matches `Jt9Decoder`'s own file-chunking in
+    // `decoder.rs`) and truncate/pad only the in-slot window to
+    // WINDOW_SAMPLES for the actual decode call.
+    const SLOT_SECONDS: usize = 15;
+    let samples_per_slot = SLOT_SECONDS * pancetta_ft8::SAMPLE_RATE as usize;
     let mut decode_error = None;
-    for chunk in samples.chunks(pancetta_ft8::WINDOW_SAMPLES) {
+    for slot in samples.chunks(samples_per_slot) {
         let mut window = vec![0.0f32; pancetta_ft8::WINDOW_SAMPLES];
-        window[..chunk.len()].copy_from_slice(chunk);
+        let n = slot.len().min(pancetta_ft8::WINDOW_SAMPLES);
+        window[..n].copy_from_slice(&slot[..n]);
         if let Err(error) = decoder.decode_window(&window) {
             decode_error = Some(anyhow::anyhow!(error.to_string()));
             break;

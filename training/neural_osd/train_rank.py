@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import shutil
 import tempfile
 from pathlib import Path
 
@@ -59,6 +60,41 @@ def soft_rank_loss_tensor(scores, labels, tau=0.1):
     if not valid.any():
         raise ValueError("soft-rank minibatch has no positive labels")
     return ((soft_ranks * labels).sum(dim=1)[valid] / positives[valid]).mean()
+
+
+def validation_soft_rank_metric(model, val_x, val_y, tau, batch_size=256):
+    """Batched validation soft-rank metric, equivalent to a single full-split
+    call but bounded to O(batch_size) peak activation memory.
+
+    At T1 scale (~100k validation samples) a single forward pass over the
+    whole split materializes roughly 1.8 GB of input alone plus several GB
+    of conv1 activations, which can OOM checkpoint selection even though
+    training itself is batched. Aggregates the same per-sample quantity
+    `soft_rank_loss_tensor` averages (`(soft_ranks * labels).sum(dim=1) /
+    positives`, restricted to samples with at least one positive label) as
+    a running sum/count across batches instead of a mean-of-batch-means, so
+    the result is numerically equivalent regardless of batch size or how
+    valid samples are distributed across batches.
+    """
+    import torch
+    from torch.utils.data import DataLoader, TensorDataset
+
+    loader = DataLoader(TensorDataset(torch.from_numpy(val_x), torch.from_numpy(val_y)), batch_size=batch_size)
+    total = 0.0
+    count = 0
+    for batch_x, batch_y in loader:
+        scores = model(batch_x)
+        pairwise = (scores.unsqueeze(1) - scores.unsqueeze(2)) / tau
+        soft_ranks = torch.sigmoid(pairwise).sum(dim=2)
+        positives = batch_y.sum(dim=1)
+        valid = positives > 0
+        if valid.any():
+            per_sample = (soft_ranks * batch_y).sum(dim=1)[valid] / positives[valid]
+            total += per_sample.sum().item()
+            count += int(valid.sum().item())
+    if count == 0:
+        raise ValueError("soft-rank validation split has no positive labels")
+    return total / count
 
 
 def combined_loss(scores, labels, tau=0.1, bce_weight=0.1):
@@ -151,6 +187,11 @@ def load_corpus(path):
     retaining them; pass 2 writes directly into pre-sized `np.memmap` arrays,
     so peak RSS stays O(1) regardless of corpus size and training reads pull
     pages from disk on demand instead of holding the whole split in RAM.
+
+    Returns `(arrays, cache_dir)` — the caller owns `cache_dir`'s lifetime
+    (roughly 18.5 GB on disk at 1M samples) and is responsible for removing
+    it once training is done with the arrays; a few reruns left behind
+    would otherwise exhaust the temp filesystem.
     """
     import numpy as np
 
@@ -159,9 +200,7 @@ def load_corpus(path):
         counts[split] += 1
 
     # A fresh temp dir per call avoids collisions between concurrent training
-    # runs; it's not cleaned up automatically (a training run may want to
-    # inspect it after the fact), so it accumulates under the OS temp dir
-    # like other run-scoped artifacts elsewhere in this tree.
+    # runs.
     cache_dir = Path(tempfile.mkdtemp(prefix="pan9_rank_corpus_"))
     feature_dim = BP_ITERS + 1
     arrays = {}
@@ -188,7 +227,7 @@ def load_corpus(path):
         if isinstance(y, np.memmap):
             y.flush()
 
-    return arrays
+    return arrays, cache_dir
 
 
 def main():
@@ -223,29 +262,37 @@ def main():
             x = torch.relu(self.conv2(x))
             return self.linear(self.conv3(x).squeeze(1))
 
-    splits = load_corpus(args.corpus)
-    train_x, train_y = splits["train"]
-    val_x, val_y = splits["val"]
-    if not len(train_x) or not len(val_x):
-        raise SystemExit("schema-v2 corpus produced an empty train or validation split")
-    model = RankModel()
-    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
-    loader = DataLoader(TensorDataset(torch.from_numpy(train_x), torch.from_numpy(train_y)), batch_size=64, shuffle=True)
-    best = float("inf")
-    for epoch in range(args.epochs):
-        model.train()
-        for batch_x, batch_y in loader:
-            optimizer.zero_grad()
-            loss = combined_loss(model(batch_x), batch_y, args.tau, args.bce_weight)
-            loss.backward()
-            optimizer.step()
-        model.eval()
-        with torch.no_grad():
-            metric = soft_rank_loss_tensor(model(torch.from_numpy(val_x)), torch.from_numpy(val_y), args.tau).item()
-        print(f"epoch={epoch + 1} tier1_expected_soft_rank={metric:.6f} [MODEL SELECTION ONLY — NOT A SHIP SIGNAL]")
-        if metric < best:
-            best = metric
-            torch.save(model.state_dict(), args.output)
+    splits, cache_dir = load_corpus(args.corpus)
+    try:
+        train_x, train_y = splits["train"]
+        val_x, val_y = splits["val"]
+        if not len(train_x) or not len(val_x):
+            raise SystemExit("schema-v2 corpus produced an empty train or validation split")
+        model = RankModel()
+        optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        loader = DataLoader(TensorDataset(torch.from_numpy(train_x), torch.from_numpy(train_y)), batch_size=64, shuffle=True)
+        best = float("inf")
+        for epoch in range(args.epochs):
+            model.train()
+            for batch_x, batch_y in loader:
+                optimizer.zero_grad()
+                loss = combined_loss(model(batch_x), batch_y, args.tau, args.bce_weight)
+                loss.backward()
+                optimizer.step()
+            model.eval()
+            with torch.no_grad():
+                metric = validation_soft_rank_metric(model, val_x, val_y, args.tau)
+            print(f"epoch={epoch + 1} tier1_expected_soft_rank={metric:.6f} [MODEL SELECTION ONLY — NOT A SHIP SIGNAL]")
+            if metric < best:
+                best = metric
+                torch.save(model.state_dict(), args.output)
+    finally:
+        # The memmap corpus cache is a training-run-scoped intermediate
+        # (~18.5 GB on disk at 1M samples), not an artifact worth keeping —
+        # `args.output`'s checkpoint is the actual deliverable and lives
+        # outside cache_dir. Remove it regardless of how training exited so
+        # a few reruns or a failed run can't exhaust the temp filesystem.
+        shutil.rmtree(cache_dir, ignore_errors=True)
 
 
 if __name__ == "__main__":

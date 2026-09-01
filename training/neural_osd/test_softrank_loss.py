@@ -1,4 +1,5 @@
 import json
+import shutil
 import tempfile
 import unittest
 from pathlib import Path
@@ -67,10 +68,13 @@ class SoftRankLossTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             corpus = Path(directory) / "capture.jsonl"
             corpus.write_text(json.dumps(row) + "\n")
-            splits = load_corpus(corpus)
-        labels = next(values[1] for values in splits.values() if len(values[1]))
-        self.assertEqual(labels[0, 0], 1.0)
-        self.assertEqual(labels[0].sum(), 1.0)
+            splits, cache_dir = load_corpus(corpus)
+        try:
+            labels = next(values[1] for values in splits.values() if len(values[1]))
+            self.assertEqual(labels[0, 0], 1.0)
+            self.assertEqual(labels[0].sum(), 1.0)
+        finally:
+            shutil.rmtree(cache_dir, ignore_errors=True)
 
     def test_loader_rejects_unsupported_schema_versions(self):
         try:
@@ -116,8 +120,11 @@ class SoftRankLossTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             corpus = Path(directory) / "capture.jsonl"
             corpus.write_text(json.dumps(row) + "\n\n")
-            splits = load_corpus(corpus)
-        self.assertTrue(any(len(values[1]) for values in splits.values()))
+            splits, cache_dir = load_corpus(corpus)
+        try:
+            self.assertTrue(any(len(values[1]) for values in splits.values()))
+        finally:
+            shutil.rmtree(cache_dir, ignore_errors=True)
 
     def test_permutation_then_inverse_is_identity(self):
         values = list(range(174))
