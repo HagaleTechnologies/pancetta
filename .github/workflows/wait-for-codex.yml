@@ -62,7 +62,12 @@ on:
 permissions:
   contents: read
   pull-requests: write
-  issues: read
+  # write, not read: creating the codex-clean label needs Issues:write on
+  # GitHub's Create-a-label endpoint -- read is insufficient, and the
+  # label-create/attach calls below are written fail-open (retry-then-warn,
+  # never abort the step), so this would otherwise fail completely
+  # silently rather than loudly.
+  issues: write
 
 # A newer push must supersede an older run outright rather than let the old
 # run finish and mutate review threads based on a review of a commit that's
@@ -418,6 +423,29 @@ jobs:
           IS_GENUINE_SYNC: ${{ github.event.action == 'synchronize' && github.run_attempt == 1 }}
         run: |
           set -o pipefail
+          # apply_clean_label(): SHA-scoped label name (never a bare toggle
+          # -- a bare toggle needs cross-run add/remove coordination that
+          # is itself a race), 3-attempt retry with 5s backoff, `gh label
+          # create` (idempotent, `|| true`) before the attach POST. Never
+          # deletes a stale/older label -- that's a separate, real race
+          # (an older run's own cleanup step could delete a newer
+          # revision's already-valid label); labels accumulating one per
+          # round is cosmetic clutter, not a bug.
+          apply_clean_label() {
+            local label="codex-clean:${HEAD_SHA:0:12}"
+            for _ in 1 2 3; do
+              gh label create "$label" --color 0e8a16 \
+                --description "This revision's Codex round raised nothing new -- safe to run the expensive gated jobs" \
+                --repo "$REPO" >/dev/null 2>&1 || true
+              if gh api -X POST "repos/$REPO/issues/$PR/labels" -f "labels[]=$label" >/dev/null 2>&1; then
+                echo "Applied $label -- codex-clean can now unblock ci.yml's gated jobs for this revision."
+                return 0
+              fi
+              sleep 5
+            done
+            echo "::warning::Could not apply $label after 3 attempts -- codex-clean will wait out its own timeout instead."
+            return 1
+          }
           # Only count signals created at/after this run started, and reviews
           # submitted against the CURRENT head commit AND after this round
           # started (a small buffer absorbs clock skew between this runner
@@ -655,6 +683,7 @@ jobs:
               echo "::error::Codex's initial review left $unresolved unresolved concern(s) open — resolve them, then push a remediation commit to trigger a fresh re-review."
               exit 1
             fi
+            apply_clean_label
             exit 0
           fi
 
@@ -668,7 +697,8 @@ jobs:
           fi
 
           if [ "$IS_GENUINE_SYNC" != "true" ]; then
-            echo "This round is a reopened/rerun, not a genuine synchronize — the code hasn't changed, so not auto-resolving baseline threads that may still describe it."
+            echo "This round is a reopened/rerun, not a genuine synchronize — the code hasn't changed, so not auto-resolving baseline threads that may still describe it (the label below still applies regardless: this revision IS clean, just not safe to silently clear old findings against)."
+            apply_clean_label
             exit 0
           fi
 
@@ -759,6 +789,13 @@ jobs:
             echo "Codex raised $new_count new concern(s) on this revision — leaving all threads as-is for human review."
             exit 0
           fi
+
+          # This exact revision is genuinely clean (zero new Codex-raised
+          # concerns this round) — apply the label now, before deciding
+          # below whether auto-resolving stale baseline threads is safe.
+          # That decision is a DIFFERENT question from "is this SHA clean"
+          # and must not gate the label itself.
+          apply_clean_label
 
           echo "$result" | jq -r '.resolvable[]' | while read -r thread_id; do
             [ -z "$thread_id" ] && continue

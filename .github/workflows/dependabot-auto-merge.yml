@@ -5,9 +5,6 @@ on: pull_request_target
 permissions:
   contents: write
   pull-requests: write
-  # See auto-merge.yml: without issues: write, a squash-merge done by this
-  # token silently fails to auto-close any "Closes #N" issue the PR links.
-  issues: write
 
 jobs:
   auto-merge:
@@ -63,14 +60,6 @@ jobs:
           DEP_NAMES: ${{ steps.metadata.outputs.dependency-names }}
         run: |
           gh pr review "$PR_URL" --approve --body "Auto-approved: ${UPDATE_TYPE} update for ${DEP_NAMES}"
-
-      - name: Enable auto-merge for minor/patch updates
-        if: steps.classify.outputs.is-breaking == 'false'
-        env:
-          PR_URL: ${{ github.event.pull_request.html_url }}
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          gh pr merge "$PR_URL" --auto --squash
 
       - name: Label breaking updates for review
         if: steps.classify.outputs.is-breaking == 'true'

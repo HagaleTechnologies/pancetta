@@ -1,0 +1,42 @@
+# Self-contained (no `extends: credenza`) -- pancetta is a public repo, and
+# a `uses:`-called reusable workflow's real step content renders into the
+# calling repo's own public Action logs, which would leak private-repo
+# incident history embedded in a shared config's own comments. This file's
+# own comments stay generic for the same reason.
+#
+# Mergify's rule-action only re-fires when a condition transitions from
+# unmatched to matched -- a static condition list (base=main, -draft,
+# -closed alone) is already true the instant a PR opens, fires once
+# immediately, and never gets a second chance once checks later go green.
+# check-success/#review-threads-unresolved conditions give the rule
+# something stateful to re-trigger on. The check-skipped OR-clause for
+# "Wait for Codex Review" is needed because wait-for-codex.yml excludes
+# dependabot[bot] and draft PRs, so that check reports `skipped`, not
+# `success`, for those. "Supply Chain" needs no such OR-clause -- it runs
+# unconditionally on every PR. The needs-review label exclusion matters
+# because dependabot-auto-merge.yml labels breaking updates
+# "major-update,needs-review" and deliberately never auto-approves them --
+# a queue tool with no concept of that label would silently defeat that
+# policy.
+queue_rules:
+  - name: default
+    merge_method: squash
+    batch_size: 1
+    update_method: rebase
+
+pull_request_rules:
+  - name: queue on green + threads resolved
+    conditions:
+      - base = main
+      - -draft
+      - -closed
+      - -label = needs-review
+      - "#review-threads-unresolved = 0"
+      - check-success = CI
+      - check-success = Supply Chain
+      - or:
+          - check-success = Wait for Codex Review
+          - check-skipped = Wait for Codex Review
+    actions:
+      queue:
+        name: default

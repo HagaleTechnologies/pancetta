@@ -7,11 +7,11 @@ name: Supply Chain
 # some PRs would leave every other PR stuck at "Expected -- waiting for
 # status" forever, so this workflow runs on every PR and passes trivially
 # when no dependency manifest, lockfile, or workflow changed. When one DID
-# change, the scanners run and GitHub's native auto-merge (armed by
-# auto-merge.yml / dependabot-auto-merge.yml via `gh pr merge --auto`)
-# cannot fire until they pass -- that is the "dependency bumps are excluded
-# from blanket standing auto-merge until a scan passes" carve-out, enforced
-# by the ruleset rather than by convention.
+# change, the scanners run and Mergify's merge queue (.mergify.yml) cannot
+# queue the PR until they pass -- that is the "dependency bumps are
+# excluded from blanket standing auto-merge until a scan passes"
+# carve-out, enforced by the ruleset/queue conditions rather than by
+# convention.
 #
 # What runs when dependencies changed:
 #   * osv            -- google/osv-scanner PR diff against OSV.dev. Fails only
