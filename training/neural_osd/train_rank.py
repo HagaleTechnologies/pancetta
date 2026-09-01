@@ -243,13 +243,22 @@ def load_corpus(path):
     # populated multi-gigabyte cache_dir is left behind with nothing left
     # holding a reference to remove it.
     cache_dir = Path(tempfile.mkdtemp(prefix="pan9_rank_corpus_"))
+    # Tracked independently of `arrays` below: if allocating a split's `y`
+    # memmap fails right after its `x` succeeded, `x` never makes it into
+    # `arrays` (the pair is only inserted once both exist) — the except
+    # handler needs its own reference to close that orphaned mapping too,
+    # or an open mapping blocks rmtree from deleting its backing file on
+    # Windows while ignore_errors=True hides the failure.
+    created_memmaps = []
     try:
         feature_dim = BP_ITERS + 1
         arrays = {}
         for name, count in counts.items():
             if count:
                 x = np.memmap(cache_dir / f"{name}_x.dat", dtype=np.float32, mode="w+", shape=(count, feature_dim, N_CODEWORD))
+                created_memmaps.append(x)
                 y = np.memmap(cache_dir / f"{name}_y.dat", dtype=np.float32, mode="w+", shape=(count, K_INFO))
+                created_memmaps.append(y)
             else:
                 x = np.zeros((0, feature_dim, N_CODEWORD), dtype=np.float32)
                 y = np.zeros((0, K_INFO), dtype=np.float32)
@@ -269,11 +278,9 @@ def load_corpus(path):
             if isinstance(y, np.memmap):
                 y.flush()
     except BaseException:
-        for x, y in arrays.values() if "arrays" in locals() else ():
-            if hasattr(x, "_mmap"):
-                x._mmap.close()
-            if hasattr(y, "_mmap"):
-                y._mmap.close()
+        for mapped in created_memmaps:
+            if hasattr(mapped, "_mmap"):
+                mapped._mmap.close()
         shutil.rmtree(cache_dir, ignore_errors=True)
         raise
 
