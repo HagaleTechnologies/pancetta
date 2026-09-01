@@ -236,32 +236,46 @@ def load_corpus(path):
         counts[split] += 1
 
     # A fresh temp dir per call avoids collisions between concurrent training
-    # runs.
+    # runs. Once created, its cleanup is main()'s job (see load_corpus's own
+    # docstring) — but ONLY once this function has actually returned it. Any
+    # failure below (most plausibly memmap allocation exhausting temp
+    # storage at T1 scale) must clean up here instead, or a partially
+    # populated multi-gigabyte cache_dir is left behind with nothing left
+    # holding a reference to remove it.
     cache_dir = Path(tempfile.mkdtemp(prefix="pan9_rank_corpus_"))
-    feature_dim = BP_ITERS + 1
-    arrays = {}
-    for name, count in counts.items():
-        if count:
-            x = np.memmap(cache_dir / f"{name}_x.dat", dtype=np.float32, mode="w+", shape=(count, feature_dim, N_CODEWORD))
-            y = np.memmap(cache_dir / f"{name}_y.dat", dtype=np.float32, mode="w+", shape=(count, K_INFO))
-        else:
-            x = np.zeros((0, feature_dim, N_CODEWORD), dtype=np.float32)
-            y = np.zeros((0, K_INFO), dtype=np.float32)
-        arrays[name] = (x, y)
+    try:
+        feature_dim = BP_ITERS + 1
+        arrays = {}
+        for name, count in counts.items():
+            if count:
+                x = np.memmap(cache_dir / f"{name}_x.dat", dtype=np.float32, mode="w+", shape=(count, feature_dim, N_CODEWORD))
+                y = np.memmap(cache_dir / f"{name}_y.dat", dtype=np.float32, mode="w+", shape=(count, K_INFO))
+            else:
+                x = np.zeros((0, feature_dim, N_CODEWORD), dtype=np.float32)
+                y = np.zeros((0, K_INFO), dtype=np.float32)
+            arrays[name] = (x, y)
 
-    cursors = {"train": 0, "val": 0, "test": 0}
-    for split, model_input, labels in _iter_samples(path):
-        idx = cursors[split]
-        x, y = arrays[split]
-        x[idx] = model_input
-        y[idx] = labels
-        cursors[split] += 1
+        cursors = {"train": 0, "val": 0, "test": 0}
+        for split, model_input, labels in _iter_samples(path):
+            idx = cursors[split]
+            x, y = arrays[split]
+            x[idx] = model_input
+            y[idx] = labels
+            cursors[split] += 1
 
-    for x, y in arrays.values():
-        if isinstance(x, np.memmap):
-            x.flush()
-        if isinstance(y, np.memmap):
-            y.flush()
+        for x, y in arrays.values():
+            if isinstance(x, np.memmap):
+                x.flush()
+            if isinstance(y, np.memmap):
+                y.flush()
+    except BaseException:
+        for x, y in arrays.values() if "arrays" in locals() else ():
+            if hasattr(x, "_mmap"):
+                x._mmap.close()
+            if hasattr(y, "_mmap"):
+                y._mmap.close()
+        shutil.rmtree(cache_dir, ignore_errors=True)
+        raise
 
     return arrays, cache_dir
 

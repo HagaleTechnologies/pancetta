@@ -237,7 +237,15 @@ fn decode(wav: &Path, root: &Path) -> Result<Vec<CorpusRecord>> {
         return Ok(Vec::new());
     }
     let mut config = pancetta_ft8::Ft8Config::default();
-    config.osd_depth = Some(1);
+    // Capture truth at the deepest supported OSD order (3), not the depth-1
+    // the production A/B arms actually run at. A depth-1-only capture never
+    // produces osd_codeword for a BP failure that needs 2+ flips, so
+    // _iter_samples silently drops it — conditioning the training set on
+    // exactly the easy cases the depth-only baseline (arm B) already
+    // solves, and excluding the hard multi-flip cases the candidate most
+    // needs to learn. This only affects label mining here; eval.rs's A/B
+    // arms configure their own osd_depth independently and are unaffected.
+    config.osd_depth = Some(3);
     config.neural_osd_enabled = false;
     let mut decoder = pancetta_ft8::Ft8Decoder::new(config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
