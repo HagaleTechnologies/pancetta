@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "sha256": "28ad6537cb4e0ad695d97b66fcbc294310c7dcb31eb5e5d9f3a346096d2f0967",
+  "byte_length": 80088,
+  "total_len": 20022,
+  "input_channels": 26,
+  "syndrome_normalization_divisor": 3,
+  "derivation": "25-channel production blob with a zero-initialized syndrome channel inserted per conv1 output channel",
+  "tensors": [
+    {
+      "name": "conv1.weight",
+      "length": 2496
+    },
+    {
+      "name": "conv1.bias",
+      "length": 32
+    },
+    {
+      "name": "conv2.weight",
+      "length": 1536
+    },
+    {
+      "name": "conv2.bias",
+      "length": 16
+    },
+    {
+      "name": "conv3.weight",
+      "length": 16
+    },
+    {
+      "name": "conv3.bias",
+      "length": 1
+    },
+    {
+      "name": "linear.weight",
+      "length": 15834
+    },
+    {
+      "name": "linear.bias",
+      "length": 91
+    }
+  ]
+}

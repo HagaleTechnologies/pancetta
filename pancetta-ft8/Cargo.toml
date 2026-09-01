@@ -43,6 +43,9 @@ parking_lot = { version = "0.12", optional = true }
 # Configuration handling (optional: required by benchmark and transmit features)
 serde = { version = "1.0", features = ["derive"], optional = true }
 serde_json = { version = "1.0", optional = true }
+# Verifying the compiled neural-OSD weight blob's identity at runtime
+# (optional: required by benchmark and transmit features)
+sha2 = { version = "0.10", optional = true }
 # Async runtime for transmission control
 tokio = { version = "1.50", features = ["full"], optional = true }
 # WAV file reading for benchmark (optional)
@@ -64,6 +67,8 @@ rand = "0.10"
 tokio-test = "0.4"
 # WAV file reading for integration tests
 hound = "3.5"
+sha2 = "0.10"
+serde_json = "1.0"
 
 [[example]]
 name = "transmission_demo"
@@ -85,9 +90,9 @@ ffi = []
 # Enable GPIO support for Raspberry Pi
 gpio = ["rppal"]
 # Enable transmission capabilities
-transmit = ["serialport", "cpal", "chrono", "parking_lot", "tokio", "dep:serde", "dep:serde_json"]
+transmit = ["serialport", "cpal", "chrono", "parking_lot", "tokio", "dep:serde", "dep:serde_json", "dep:sha2"]
 # Enable benchmark harness for decoder comparison
-benchmark = ["dep:hound", "dep:serde", "dep:serde_json"]
+benchmark = ["dep:hound", "dep:serde", "dep:serde_json", "dep:sha2"]
 # Enable serde Serialize/Deserialize for config types (used by research harness)
 serde = ["dep:serde"]
 # Enable decoder debug output (temporary)

@@ -18,7 +18,7 @@
 
 use std::sync::OnceLock;
 
-const CONV1_WEIGHT_LEN: usize = 32 * 25 * 3; // 2400
+const CONV1_WEIGHT_LEN: usize = 32 * 26 * 3; // 2496
 const CONV1_BIAS_LEN: usize = 32;
 const CONV2_WEIGHT_LEN: usize = 16 * 32 * 3; // 1536
 const CONV2_BIAS_LEN: usize = 16;
@@ -33,7 +33,7 @@ const TOTAL_LEN: usize = CONV1_WEIGHT_LEN
     + CONV3_WEIGHT_LEN
     + CONV3_BIAS_LEN
     + LINEAR_WEIGHT_LEN
-    + LINEAR_BIAS_LEN; // 19926
+    + LINEAR_BIAS_LEN; // 20022
 
 const RAW_BYTES: &[u8] = include_bytes!("../assets/neural_osd_weights.bin");
 
@@ -132,9 +132,48 @@ pub fn linear_bias() -> &'static [f32] {
     )
 }
 
+/// SHA-256 of the compiled-in weight blob, computed from `RAW_BYTES` itself
+/// (not read from `assets/neural_osd_weights.provenance.json`'s declared
+/// field — an operator who swaps the blob but leaves or copies a mismatched
+/// provenance file would otherwise get a scorecard identifying a model the
+/// binary never actually ran). Cross-checked against the JSON's declared
+/// value here at runtime, not only by this module's own test below (a
+/// plain `cargo build` never runs tests), so a stale/mismatched provenance
+/// file fails loudly instead of silently mislabeling an A/B arm.
+///
+/// `neural_osd_enabled` alone can't distinguish which model produced a
+/// given A/B arm's decodes — the blob is `include_bytes!`-compiled, not
+/// runtime-selectable, so two arms both showing `neural_osd_enabled: true`
+/// may still be running different weights (or, absent a rebuild between
+/// them, the same weights twice). Exists for research/eval tooling (PAN-9
+/// Phases 6-7) to stamp into each scorecard.
+#[cfg(any(feature = "transmit", feature = "benchmark"))]
+pub fn provenance_sha256() -> &'static str {
+    use sha2::{Digest, Sha256};
+
+    static SHA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SHA.get_or_init(|| {
+        let computed = format!("{:x}", Sha256::digest(RAW_BYTES));
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/neural_osd_weights.provenance.json"))
+                .expect("neural_osd_weights.provenance.json must be valid JSON");
+        let declared = json["sha256"]
+            .as_str()
+            .expect("neural_osd_weights.provenance.json missing sha256 field");
+        assert_eq!(
+            computed, declared,
+            "neural_osd_weights.bin does not match its provenance.json sha256 — \
+             the weight blob was swapped without regenerating provenance.json \
+             (or vice versa); A/B scorecards would misattribute the model"
+        );
+        computed
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
 
     #[test]
     fn weights_load_with_expected_dimensions() {
@@ -149,11 +188,37 @@ mod tests {
     }
 
     #[test]
-    fn checksum_matches_dumper() {
-        // Sentinel values printed by examples/dump_neural_weights.rs.
-        // If the binary blob is regenerated, these may shift; update both.
-        assert!((conv1_weight()[0] - -7.682037e-3).abs() < 1e-9);
-        assert!((conv1_bias()[0] - -3.2619007e-2).abs() < 1e-9);
-        assert!((linear_bias()[0] - 1.7349027e-2).abs() < 1e-9);
+    fn provenance_matches_compiled_blob_schema_and_hash() {
+        let provenance: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/neural_osd_weights.provenance.json"))
+                .expect("valid neural OSD provenance JSON");
+        assert_eq!(provenance["total_len"], TOTAL_LEN);
+        assert_eq!(provenance["byte_length"], RAW_BYTES.len());
+        assert_eq!(provenance["input_channels"], crate::neural_osd::IN_CHANNELS);
+        assert_eq!(
+            provenance["syndrome_normalization_divisor"],
+            crate::syndrome::MAX_INCIDENT_CHECKS
+        );
+        let digest = format!("{:x}", Sha256::digest(RAW_BYTES));
+        assert_eq!(provenance["sha256"], digest);
+        let lengths: Vec<usize> = provenance["tensors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["length"].as_u64().unwrap() as usize)
+            .collect();
+        assert_eq!(
+            lengths,
+            vec![
+                CONV1_WEIGHT_LEN,
+                CONV1_BIAS_LEN,
+                CONV2_WEIGHT_LEN,
+                CONV2_BIAS_LEN,
+                CONV3_WEIGHT_LEN,
+                CONV3_BIAS_LEN,
+                LINEAR_WEIGHT_LEN,
+                LINEAR_BIAS_LEN,
+            ]
+        );
     }
 }

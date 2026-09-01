@@ -30,6 +30,9 @@ pub mod noise;
 
 pub mod gen_noise;
 
+pub mod baseline_cache;
+pub use baseline_cache::{BaselineCache, BaselineDecode};
+
 pub mod curated;
 
 pub mod chrono_replay;

@@ -256,6 +256,12 @@ impl Ft8Decoder {
         self
     }
 
+    /// Toggle learned ordering independently of OSD depth for attribution.
+    pub fn with_neural_osd(mut self, enabled: bool) -> Self {
+        self.config.neural_osd_enabled = enabled;
+        self
+    }
+
     /// Override `osd_input` on the wrapped config — Task W2.3 [A/B]:
     /// which LLR array drives OSD's search (BP-posterior vs. channel vs.
     /// offset-subtracted).
@@ -1117,12 +1123,26 @@ impl DecoderUnderTest for Ft8Decoder {
     fn config_snapshot(&self) -> serde_json::Value {
         // Prefer JSON-serialize; fall back to Debug-print if Ft8Config doesn't
         // (yet) derive Serialize.
-        match serde_json::to_value(&self.config) {
+        let mut snapshot = match serde_json::to_value(&self.config) {
             Ok(v) => v,
             Err(_) => serde_json::json!({
                 "debug_repr": format!("{:?}", self.config),
             }),
+        };
+        // `neural_osd_enabled` alone can't distinguish which weight blob is
+        // compiled in (see `pancetta_ft8::neural_osd_weights::provenance_sha256`
+        // doc comment) — record it so A/B scorecards comparing two
+        // `neural_osd_enabled: true` arms can prove they actually ran
+        // different (or the same) model.
+        if let serde_json::Value::Object(ref mut map) = snapshot {
+            map.insert(
+                "neural_osd_weights_sha256".to_string(),
+                serde_json::Value::String(
+                    pancetta_ft8::neural_osd_weights::provenance_sha256().to_string(),
+                ),
+            );
         }
+        snapshot
     }
 
     fn chrono_replay_snapshot_len(&self) -> Option<usize> {
@@ -1325,5 +1345,13 @@ mod jt9_tests {
     fn jt9_decoder_with_custom_path() {
         let d = Jt9Decoder::default().with_executable_path(PathBuf::from("/usr/local/bin/jt9"));
         assert!(d.identity().contains("/usr/local/bin/jt9"));
+    }
+
+    #[test]
+    fn neural_osd_attribution_toggle_reaches_production_config() {
+        let enabled = Ft8Decoder::with_default_config().with_neural_osd(true);
+        let disabled = Ft8Decoder::with_default_config().with_neural_osd(false);
+        assert!(enabled.config.neural_osd_enabled);
+        assert!(!disabled.config.neural_osd_enabled);
     }
 }

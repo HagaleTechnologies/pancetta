@@ -6,7 +6,7 @@
 use anyhow::Context;
 use chrono::Utc;
 use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus, load_synth_pair_corpus};
-use pancetta_research::curated::{load_curated_corpus, CuratedEntry};
+use pancetta_research::curated::{load_curated_corpus, preflight_curated_corpus, CuratedEntry};
 use pancetta_research::decoder::{DecoderUnderTest, Ft8Decoder};
 use pancetta_research::metrics::{
     compute_regression_flags, default_weights, populate_composite, saturation_aware_composite,
@@ -35,6 +35,7 @@ struct Args {
     /// "set depth to d". `None` means "no override; use the production
     /// default."
     osd_depth: Option<Option<u8>>,
+    neural_osd: Option<bool>,
     ldpc_iterations: Option<usize>,
     llr_target_variance: Option<f32>,
     nms_enabled: Option<bool>,
@@ -285,6 +286,7 @@ impl Args {
         let mut max_sync_candidates: Option<usize> = None;
         let mut max_candidates: Option<usize> = None;
         let mut osd_depth: Option<Option<u8>> = None;
+        let mut neural_osd: Option<bool> = None;
         let mut ldpc_iterations: Option<usize> = None;
         let mut llr_target_variance: Option<f32> = None;
         let mut nms_enabled: Option<bool> = None;
@@ -411,6 +413,19 @@ impl Args {
                     } else {
                         Some(s.parse()?)
                     });
+                }
+                "--neural-osd" => {
+                    neural_osd = Some(
+                        match iter
+                            .next()
+                            .context("--neural-osd needs on or off")?
+                            .as_str()
+                        {
+                            "on" => true,
+                            "off" => false,
+                            value => anyhow::bail!("--neural-osd must be on or off, got {value}"),
+                        },
+                    );
                 }
                 "--ldpc-iters" => {
                     ldpc_iterations =
@@ -962,6 +977,7 @@ impl Args {
             max_sync_candidates,
             max_candidates,
             osd_depth,
+            neural_osd,
             ldpc_iterations,
             llr_target_variance,
             nms_enabled,
@@ -1540,7 +1556,9 @@ fn run_chrono_replay_tier(
         wsjtx_total += baseline_decodes.len() as u32;
         truth_decodes_total += baseline_decodes.len() as u32;
 
-        let mut our_decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        let mut our_decodes = decoder
+            .decode_wav(&entry.wav_path)
+            .with_context(|| format!("decode {}", entry.wav_path.display()))?;
         apply_fp_filter(fp_filter, &mut our_decodes);
 
         if let Some(min_ttfd) = our_decodes
@@ -1693,10 +1711,14 @@ fn run_curated_tier(
     novel_classifier: Option<&pancetta_research::FpFilter>,
 ) -> anyhow::Result<TierResult> {
     let entries: Vec<CuratedEntry> = load_curated_corpus(manifest_path)?;
+    let preflight_started = Instant::now();
+    preflight_curated_corpus(&entries, &workspace.join("research/baselines/ft8"))?;
+    let preflight_seconds = preflight_started.elapsed().as_secs_f64();
     let total = entries.len() as u32;
     if total == 0 {
         return Ok(TierResult {
             wavs_processed: 0,
+            preflight_seconds,
             ..Default::default()
         });
     }
@@ -1742,7 +1764,9 @@ fn run_curated_tier(
         wsjtx_total += baseline_decodes.len() as u32;
         truth_decodes_total += baseline_decodes.len() as u32;
 
-        let mut our_decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        let mut our_decodes = decoder
+            .decode_wav(&entry.wav_path)
+            .with_context(|| format!("decode {}", entry.wav_path.display()))?;
         apply_fp_filter(fp_filter, &mut our_decodes);
         // hb-129: per-WAV TTFD — min decode_time_into_window_s over decodes.
         // WAVs with zero stamped decodes don't contribute to the distribution.
@@ -1850,6 +1874,7 @@ fn run_curated_tier(
         per_wav_top_failures: per_wav_failures,
         per_wav_records,
         ttfd_distribution,
+        preflight_seconds,
         ..Default::default()
     })
 }
@@ -1864,18 +1889,56 @@ fn run_noise_tier(
     decoder: &dyn DecoderUnderTest,
     manifest_path: &std::path::Path,
 ) -> anyhow::Result<TierResult> {
+    use sha2::{Digest, Sha256};
+
     let entries = pancetta_research::gen_noise::load_noise_corpus(manifest_path)?;
-    let total = entries.len() as u32;
-    if total == 0 {
-        return Ok(TierResult {
-            wavs_processed: 0,
-            ..Default::default()
-        });
+    // `compare`'s false-positive hard gate only evaluates tiers present in
+    // both scorecards, and treats an absent/unset noise tier as a pass — an
+    // empty manifest previously produced exactly that (zero WAVs, unset
+    // counters), letting an arm clear the gate without ever evaluating a
+    // noise-only WAV. Reject rather than silently no-op.
+    anyhow::ensure!(
+        !entries.is_empty(),
+        "noise manifest {} has zero entries — the false-positive hard gate \
+         cannot be evaluated against an empty corpus",
+        manifest_path.display()
+    );
+    let preflight_started = Instant::now();
+    for entry in &entries {
+        anyhow::ensure!(
+            entry.wav_path.is_file(),
+            "noise manifest {} references a missing WAV: {}",
+            manifest_path.display(),
+            entry.wav_path.display()
+        );
+        let actual = format!("{:x}", Sha256::digest(std::fs::read(&entry.wav_path)?));
+        anyhow::ensure!(
+            actual.eq_ignore_ascii_case(&entry.wav_sha256),
+            "noise WAV SHA-256 mismatch: {} expected {} got {}",
+            entry.wav_path.display(),
+            entry.wav_sha256,
+            actual
+        );
     }
+    // Same category of pure I/O as preflight_curated_corpus (WAV existence
+    // + hash) — excluded from harness.elapsed_seconds for the same reason
+    // (see TierResult::preflight_seconds): the required noise_1000 tier
+    // reads and hashes every WAV after the harness timer starts, so
+    // cold-vs-warm filesystem cache variance shouldn't be attributable to
+    // the candidate under the elapsed hard gate.
+    let preflight_seconds = preflight_started.elapsed().as_secs_f64();
+    let total = entries.len() as u32;
     let mut false_positives_total: u32 = 0;
     let mut noise_files_decoded: u32 = 0;
     for entry in &entries {
-        let decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        // A decode ERROR (missing/corrupt WAV, decoder panic-equivalent) is
+        // not the same signal as "genuinely decoded nothing" — collapsing
+        // both into an empty list via unwrap_or_default() let a broken run
+        // report a clean "0 false positives" without ever evaluating the
+        // advertised corpus. Propagate it instead of swallowing it.
+        let decodes = decoder
+            .decode_wav(&entry.wav_path)
+            .with_context(|| format!("decoding noise WAV {}", entry.wav_path.display()))?;
         if !decodes.is_empty() {
             noise_files_decoded += 1;
             false_positives_total += decodes.len() as u32;
@@ -1893,6 +1956,7 @@ fn run_noise_tier(
         wavs_processed: total,
         false_positives_total: Some(false_positives_total),
         noise_files_decoded: Some(noise_files_decoded),
+        preflight_seconds,
         ..Default::default()
     })
 }
@@ -1968,6 +2032,23 @@ fn rustc_version() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
+/// `compare`'s elapsed-time hard gate is documented to skip cross-machine
+/// comparisons (wall-clock isn't comparable across hosts), and gates on
+/// `Scorecard.harness.host` equality to decide that. `OS/ARCH` alone (the
+/// prior value here) is identical for any two machines with the same OS and
+/// CPU architecture, so it silently enforced the gate across genuinely
+/// different hosts — a real machine identity is required for that skip to
+/// mean what it claims.
+fn hostname_string() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-host".to_string())
+}
+
 /// Task W0.4 (2026-07-07): build the `Ft8Decoder` wrapper from CLI args for
 /// a given protocol. Factored out of `main`'s old `match args.mode { Mode::Ft8
 /// => { .. } }` arm so adding `Mode::Ft4` (FT4 evaluation tier) didn't
@@ -1987,6 +2068,9 @@ fn build_decoder_from_args(args: &Args, protocol: pancetta_ft8::Protocol) -> Ft8
     }
     if let Some(depth) = args.osd_depth {
         d = d.with_osd_depth(depth);
+    }
+    if let Some(enabled) = args.neural_osd {
+        d = d.with_neural_osd(enabled);
     }
     if let Some(n) = args.ldpc_iterations {
         d = d.with_ldpc_iterations(n);
@@ -2334,6 +2418,13 @@ fn main() -> anyhow::Result<()> {
                 | "chrono-replay"
         )
     });
+    // Reads and parses every jt9 baseline JSON under research/baselines/ft8
+    // (thousands of files) — setup I/O, not decoder work. Timed and
+    // excluded from harness.elapsed_seconds below for the same reason as
+    // TierResult::preflight_seconds: run sequentially, arm A pays cold-disk
+    // I/O that later arms read from warm page cache, which the elapsed
+    // hard gate would otherwise attribute to the candidate.
+    let classifier_setup_started = Instant::now();
     let novel_classifier: Option<pancetta_research::FpFilter> = if novel_classifier_needed {
         let dir = workspace.join("research/baselines/ft8");
         if dir.exists() {
@@ -2359,6 +2450,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let classifier_setup_seconds = classifier_setup_started.elapsed().as_secs_f64();
     let novel_classifier_ref = novel_classifier.as_ref();
 
     // Batch 19 (2026-06-02): build a tier-slot pool when --max-concurrent-tiers
@@ -2653,6 +2745,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Excluded from `harness.elapsed_seconds` below — see TierResult::preflight_seconds.
+    let preflight_seconds_total: f64;
     let mut card = Scorecard {
         schema_version: Scorecard::CURRENT_SCHEMA_VERSION,
         generated_at: Utc::now(),
@@ -2665,10 +2759,18 @@ fn main() -> anyhow::Result<()> {
         },
         harness: HarnessInfo {
             harness_version: env!("CARGO_PKG_VERSION").to_string(),
-            host: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
-            cores_used: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
+            host: format!(
+                "{}/{}/{}",
+                hostname_string(),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
+            // rayon's actual worker-pool size, not hardware availability —
+            // the repo explicitly supports RAYON_NUM_THREADS overrides for
+            // timing runs, and available_parallelism() can't see that, so
+            // the elapsed hard gate could attribute a thread-count change
+            // to the candidate under test instead of skipping as expected.
+            cores_used: rayon::current_num_threads(),
             elapsed_seconds: 0.0,
         },
         config: ConfigInfo {
@@ -2677,7 +2779,10 @@ fn main() -> anyhow::Result<()> {
             tiers_run: args.tiers.clone(),
             fp_filter_active: fp_filter.is_some(),
         },
-        tiers,
+        tiers: {
+            preflight_seconds_total = tiers.values().map(|t| t.preflight_seconds).sum();
+            tiers
+        },
         composite: pancetta_research::scorecard::CompositeInfo {
             weights: default_weights(),
             score: 0.0,
@@ -2688,7 +2793,14 @@ fn main() -> anyhow::Result<()> {
         notes: format!("Decoder under test: {}", decoder.identity()),
     };
     populate_composite(&mut card, default_weights());
-    card.harness.elapsed_seconds = started.elapsed().as_secs_f64();
+    // Preflight (WAV hashing + baseline-cache validation) and novel-
+    // classifier setup (parsing every jt9 baseline JSON) are pure I/O, not
+    // decoder work — subtract both so cold-vs-warm filesystem-cache
+    // variance between two sequentially-run arms doesn't get attributed to
+    // the candidate under the A/B elapsed hard gate.
+    card.harness.elapsed_seconds =
+        (started.elapsed().as_secs_f64() - preflight_seconds_total - classifier_setup_seconds)
+            .max(0.0);
 
     // Task W0.3 (2026-07-06): compute real `RegressionFlags` by
     // self-diffing this run against the checked-in
@@ -2951,13 +3063,17 @@ mod novel_classification_tests {
     fn curated_tier_classification_is_report_only_and_correct() {
         let dir = tempfile::tempdir().unwrap();
         let workspace = dir.path();
-        let sha = "aaaa1111";
+        // SHA-256 of setup_curated's exact `b"not real audio"` fixture.
+        let sha = "963b1b883c546e5e0a383c7152e64f11439ebe42b9fa3f0fd14e444aab955f57";
         // jt9 found K1ABC's CQ; pancetta finds it too PLUS two novels.
         let manifest_path = setup_curated(
             workspace,
             sha,
             &["CQ K1ABC FN42"],
-            Some(("bbbb2222", &["W1AW K5ARH FN20"])), // seeds K5ARH into the reference set
+            Some((
+                "bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222bbbb2222",
+                &["W1AW K5ARH FN20"],
+            )), // seeds K5ARH into the reference set
         );
 
         let mut responses = HashMap::new();

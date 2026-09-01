@@ -13,6 +13,8 @@ worked but was a 12 MB blob in source form that bloated every workspace
 build. The packed binary takes ~80 KB.
 """
 import argparse
+import hashlib
+import json
 import os
 import struct
 
@@ -21,7 +23,7 @@ import struct
 # pancetta-ft8/src/neural_osd_weights.rs::TOTAL_LEN and the per-tensor
 # `*_LEN` constants there.
 TENSOR_ORDER = [
-    ("conv1.weight", 32 * 25 * 3),
+    ("conv1.weight", 32 * 26 * 3),
     ("conv1.bias", 32),
     ("conv2.weight", 16 * 32 * 3),
     ("conv2.bias", 16),
@@ -34,19 +36,36 @@ TENSOR_ORDER = [
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", type=str, default="model.pt")
+    # Must match train_rank.py's --output default: a mismatch either fails the
+    # export outright in a clean directory or silently packages a stale legacy
+    # model.pt from a reused one, invalidating the A/B.
+    parser.add_argument("--model", type=str, default="rank_model.pt")
     parser.add_argument(
         "--output",
         type=str,
         default="../../pancetta-ft8/assets/neural_osd_weights.bin",
     )
+    parser.add_argument(
+        "--provenance",
+        default="../../pancetta-ft8/assets/neural_osd_weights.provenance.json",
+    )
     args = parser.parse_args()
 
     import torch
-    from train import DIAModel
+    from train_rank import N_CODEWORD, K_INFO
+    import torch.nn as nn
+
+    class DIAModel(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.conv1 = nn.Conv1d(26, 32, 3, padding=1)
+            self.conv2 = nn.Conv1d(32, 16, 3, padding=1)
+            self.conv3 = nn.Conv1d(16, 1, 1)
+            self.linear = nn.Linear(N_CODEWORD, K_INFO)
 
     model = DIAModel()
-    model.load_state_dict(torch.load(args.model, map_location="cpu", weights_only=True))
+    checkpoint = torch.load(args.model, map_location="cpu", weights_only=True)
+    model.load_state_dict(checkpoint["state_dict"])
     model.eval()
 
     weights = {}
@@ -76,14 +95,24 @@ def main():
                 total_floats += 1
 
     file_size = os.path.getsize(args.output)
+    output_bytes = open(args.output, "rb").read()
+    provenance = {
+        "schema_version": 1,
+        "sha256": hashlib.sha256(output_bytes).hexdigest(),
+        "byte_length": file_size,
+        "total_len": total_floats,
+        "input_channels": 26,
+        "syndrome_normalization_divisor": 3,
+        "derivation": f"exported from {args.model}",
+        "training_seed": checkpoint["seed"],
+        "tensors": [{"name": name, "length": length} for name, length in TENSOR_ORDER],
+    }
+    with open(args.provenance, "w") as f:
+        json.dump(provenance, f, indent=2)
+        f.write("\n")
     print(f"Exported {total_floats:,} f32 parameters to {args.output}")
     print(f"File size: {file_size:,} bytes ({file_size/1024:.1f} KB)")
-    print(
-        "Sentinel checksum: "
-        f"conv1.weight[0]={weights['conv1.weight'][0]:.8e} "
-        f"conv1.bias[0]={weights['conv1.bias'][0]:.8e} "
-        f"linear.bias[0]={weights['linear.bias'][0]:.8e}"
-    )
+    print(f"Provenance: {args.provenance} ({provenance['sha256']})")
 
 
 if __name__ == "__main__":

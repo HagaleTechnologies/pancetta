@@ -86,8 +86,8 @@ soft decoder state, so the true error pattern is enumerated early.
   bits**, i.e. minimize the rank at which OSD reaches the true error pattern. Two
   concrete, differentiable surrogates, in preference order:
   1. **Expected-reprocessing-order (soft-rank) loss.** Let `y ∈ {0,1}^91` be the
-     true error pattern (info bits wrong in the OSD-0 hard decision, in the permuted
-     MRB basis — see §2). Compute a differentiable **soft rank** of each info
+     true error pattern (natural systematic info-bit indices wrong in the OSD-0
+     hard decision — see §2). Compute a differentiable **soft rank** of each info
      position from the predicted scores (e.g. `softrank_i = Σ_j σ((s_j − s_i)/τ)`,
      the smooth count of positions scored above `i`). The loss is the sum of soft
      ranks of the **true-error** positions:
@@ -107,10 +107,14 @@ soft decoder state, so the true error pattern is enumerated early.
 
 ## 2. Training-data synthesis
 
-The label is **which info bits are wrong in the OSD-0 hard decision**, in the MRB-
-permuted basis — this requires the ground-truth codeword and the *same MRB
-permutation the Rust OSD computes*, or the label won't match what the model must
-rank. Two complementary sources:
+The label is **which natural systematic info bits are wrong in the OSD-0 hard
+decision**. This matches the existing `[91]` inference contract exactly:
+`neural_ordering[i]` is consumed as the score for original info bit `i` before
+the MRB is constructed. Training output slot `i` as MRB slot `i` would be both
+circular (the predicted scores help determine that MRB) and incorrect at the
+Rust call site. Schema-v2 still records the exact Rust MRB permutation as
+diagnostic/provenance data, but it is not an output-index remapping. Two
+complementary sources:
 
 - **A. Synthetic sweep (scale + coverage).** Extend `generate_data.py`:
   - **Fix the SNR bug first:** the README documents `−28…−18 dB` but the code
@@ -120,10 +124,10 @@ rank. Two complementary sources:
     regime.
   - Pipeline stays: random 91 info bits → systematic encode → BPSK → AWGN → 25-iter
     sum-product BP (record trajectory) → **keep only BP failures** (converged frames
-    never reach OSD). Then run the **real MRB permutation** (port or FFI
-    `osd.rs::decode_with_features`'s sort+gaussian-eliminate) to compute `final_perm`,
-    and label `y_i = (osd0_hard[perm[i]] != true_info[perm[i]])`. Labeling in the
-    permuted basis is the fix for the offline↔production mismatch at the data level.
+    never reach OSD). Run the real Rust OSD path and retain its `final_perm` for
+    diagnostics, while labeling the stable output contract as
+    `y_i = (osd0_hard[i] != true_info[i])` for natural systematic indices. Keeping this mapping
+    identical across training and inference is the data-level fix for output-contract skew.
   - Sweep SNR **importance-weighted toward the marginal band** where OSD actually
     fires (BP-fails-but-recoverable), not uniform — most uniform samples are either
     trivially converged or hopeless.
@@ -270,6 +274,6 @@ When built (separately, per the brief — this doc stops here):
   captured trajectories for training-distribution fidelity; keep synth only for
   volume/coverage, and verify the two BP implementations produce comparable
   trajectories (a silent divergence would poison synth labels).
-- `neural_osd_weights_ensemble_si.bin` is a **dormant** S3 artifact next to the live
-  blob; the loader reads only `neural_osd_weights.bin`. Remove or clearly quarantine
-  it to avoid confusion.
+- The former `neural_osd_weights_ensemble_si.bin` dormant S3 artifact was removed by PAN-9;
+  the loader reads only `neural_osd_weights.bin`, so retaining the unused blob only caused
+  confusion.

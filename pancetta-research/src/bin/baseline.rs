@@ -7,33 +7,10 @@
 
 use anyhow::Context;
 use pancetta_research::corpus::{load_ft8_fixtures, load_synth_corpus};
-use pancetta_research::Mode;
-use serde::{Deserialize, Serialize};
+use pancetta_research::{BaselineCache, BaselineDecode, Mode};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BaselineDecode {
-    pub message: String,
-    pub freq_hz: f64,
-    pub dt_s: f64,
-    pub snr_db: f64,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct BaselineCache {
-    pub schema_version: u32,
-    pub wav_path: String,
-    pub wav_sha256: String,
-    pub decoder_identity: String,
-    pub decodes: Vec<BaselineDecode>,
-    pub elapsed_seconds: f64,
-}
-
-impl BaselineCache {
-    pub const CURRENT_SCHEMA_VERSION: u32 = 1;
-}
 
 #[derive(Debug)]
 struct Args {
