@@ -99,6 +99,11 @@ __pycache__/
 training/neural_osd/data/
 training/neural_osd/data_test/
 training/neural_osd/model.pt
+# PAN-9 soft-rank trainer (train_rank.py's own --output default) and its T1
+# corpus generator output — both regenerable, both large (a T1-scale corpus
+# JSONL is tens of GB; well past research/'s 500 MB in-git cap).
+training/neural_osd/rank_model.pt
+research/corpus/neural_osd/
 training/neural_osd/session2_best.pt
 training/neural_osd/session2_best.metrics.json
 training/neural_osd/session2_train.log

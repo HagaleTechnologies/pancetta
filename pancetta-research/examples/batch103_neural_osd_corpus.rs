@@ -29,6 +29,7 @@ struct CorpusRecord {
 fn main() -> Result<()> {
     let mut tier = "t0";
     let mut output = PathBuf::from("research/corpus/neural_osd/schema_v2.jsonl");
+    let mut max_wavs: Option<usize> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut index = 0;
     while index < args.len() {
@@ -41,6 +42,15 @@ fn main() -> Result<()> {
                 index += 1;
                 output = PathBuf::from(args.get(index).context("--output requires a path")?);
             }
+            "--max-wavs" => {
+                index += 1;
+                max_wavs = Some(
+                    args.get(index)
+                        .context("--max-wavs requires a count")?
+                        .parse()
+                        .context("--max-wavs must be a positive integer")?,
+                );
+            }
             other => anyhow::bail!("unknown argument {other}"),
         }
         index += 1;
@@ -50,7 +60,24 @@ fn main() -> Result<()> {
         .parent()
         .unwrap()
         .to_path_buf();
-    let wavs = wav_pool(&root, tier)?;
+    let mut wavs = wav_pool(&root, tier)?;
+    // T1 now recursively covers the NAS offload share in addition to local
+    // recordings — potentially the full multi-month recording history, an
+    // unbounded, very-slow-over-SMB scan. `--max-wavs` caps it explicitly
+    // instead of relying on an operator killing the process partway
+    // through. Files are sorted (wav_pool), so the cap takes the
+    // chronologically-earliest N — logged so a capped run is never
+    // mistaken for full coverage.
+    if let Some(cap) = max_wavs {
+        if wavs.len() > cap {
+            eprintln!(
+                "--max-wavs {cap}: capping {} available WAVs to the earliest {cap} (dropping {})",
+                wavs.len(),
+                wavs.len() - cap
+            );
+            wavs.truncate(cap);
+        }
+    }
     if let Some(parent) = output.parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -115,6 +142,18 @@ fn scan_and_write(wavs: &[PathBuf], root: &Path, tmp_path: &Path) -> Result<(usi
     let mut labels = 0usize;
     for wav in wavs {
         for record in decode(wav, root)? {
+            // train_rank.py's _iter_samples only ever consumes a row when
+            // osd_recovered is true and both mrb_perm/osd_codeword are
+            // present — every other row (BP resolved without OSD, OSD
+            // never invoked, OSD failed) is unconditionally skipped there.
+            // Writing those anyway is why 588 WAVs produced 442k records
+            // for 194 usable labels: at NAS corpus scale that ratio
+            // exhausts local disk before the run can finish. Skip at
+            // write time instead — _iter_samples's actual predicate is
+            // unaffected, this only drops rows it would drop anyway.
+            if !record.osd_recovered || record.mrb_perm.is_none() || record.osd_codeword.is_none() {
+                continue;
+            }
             labels += usize::from(is_trainable_label(&record));
             serde_json::to_writer(&mut writer, &record)?;
             writer.write_all(b"\n")?;
@@ -167,6 +206,21 @@ fn wav_pool(root: &Path, tier: &str) -> Result<Vec<PathBuf>> {
         // Unix environment variable.
         let home = dirs::home_dir().context("could not resolve the home directory")?;
         collect_wavs(&home.join(".pancetta/recordings"), &mut files)?;
+        // The local recordings dir is a rotating 10 GB buffer (see
+        // pancetta/src/coordinator/dsp.rs's WavRecorder) — a regular NAS
+        // offload job moves files out of it before they'd be evicted, so
+        // most of the historical corpus lives on the NAS, not locally, by
+        // the time T1 mining runs. Scan the offload share too when it's
+        // mounted; skip silently (not an error) when it isn't, since T1 is
+        // still meaningful — just smaller — from local recordings alone.
+        for nas_offload_dir in [
+            PathBuf::from("/Users/Shared/maersk/offload/pancetta-wav-corpus"), // macOS
+            PathBuf::from("/mnt/maersk/offload/pancetta-wav-corpus"),          // Linux
+        ] {
+            if nas_offload_dir.is_dir() {
+                collect_wavs(&nas_offload_dir, &mut files)?;
+            }
+        }
         // `~/.pancetta/recordings` also holds curated fixture subdirectories
         // that are signal-free or synthetic by construction (e.g. noise_1000,
         // the noise-corpus dir the ship-gate's noise manifest points at). Any
