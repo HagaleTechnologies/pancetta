@@ -150,9 +150,28 @@ jobs:
           # (transient network error, 403, 5xx) fails the gate closed
           # rather than silently treating a real API problem as "not
           # live yet, skip."
+          #
+          # CORRECTED 2026-09-01: existence alone is NOT sufficient. It
+          # conflates a genuinely migrated wait-for-codex.yml (has
+          # apply_clean_label()) with a base branch whose wait-for-codex.yml
+          # PRE-DATES this migration -- pancetta's own file existed before
+          # this label mechanism was added, so an existence-only check here
+          # always resolves "ready," making the bootstrap escape hatch a
+          # structural no-op on the very first synchronize push, deadlocking
+          # codex-clean for its full ~95min timeout waiting for a label that
+          # can never arrive. Fetch the file's actual content and grep for
+          # apply_clean_label -- present means genuinely migrated (ready);
+          # absent means either the file doesn't exist yet, or it exists but
+          # predates the label mechanism -- both cases pass through the same
+          # way a true 404 does.
           err_file="$(mktemp)"
-          if gh api "repos/$REPO/contents/.github/workflows/wait-for-codex.yml?ref=$BASE_SHA" --jq '.sha' >/dev/null 2>"$err_file"; then
-            echo "bootstrap_status=ready" >> "$GITHUB_OUTPUT"
+          if content="$(gh api "repos/$REPO/contents/.github/workflows/wait-for-codex.yml?ref=$BASE_SHA" -H "Accept: application/vnd.github.raw" 2>"$err_file")"; then
+            if echo "$content" | grep -q "apply_clean_label"; then
+              echo "bootstrap_status=ready" >> "$GITHUB_OUTPUT"
+            else
+              echo "::warning::Base branch's wait-for-codex.yml at $BASE_SHA exists but has no apply_clean_label() yet -- this repo hasn't finished migrating (or this IS the migrating PR itself). Passing through unconditionally."
+              echo "bootstrap_status=absent" >> "$GITHUB_OUTPUT"
+            fi
           else
             err="$(cat "$err_file")"
             if echo "$err" | grep -qiE "HTTP 404|not found"; then
@@ -249,14 +268,32 @@ jobs:
   ft8-tests:
     name: FT8 Tests
     needs: [changes, codex-clean]
-    # codex-clean can legitimately report `skipped` (a draft PR,
-    # dependabot[bot] PR, or non-pull_request event -- see codex-clean's
-    # own eligibility `if:` above), which is different from "ran and
-    # found the round not clean yet" (that produces `failure`). Both
-    # `success` and `skipped` mean "proceed."
-    if: (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
+    # always() is load-bearing, not decorative: GitHub Actions auto-skips a
+    # job whenever any of its `needs` was itself skipped, REGARDLESS of a
+    # custom `if:`, unless that `if:` includes always() -- without it, this
+    # job would silently skip (not run) whenever codex-clean legitimately
+    # reports `skipped` (draft PR, dependabot[bot], non-pull_request event),
+    # even though the `changes` condition below explicitly allows it. The
+    # `changes`-gate itself is untouched -- that's a real, intentional skip
+    # unrelated to codex-clean.
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
+      # Explicit first step, not a richer `if:`: a bare
+      # `if: ... && (needs.codex-clean.result == 'success' || == 'skipped')`
+      # still reports this job's own conclusion as `skipped` when
+      # codex-clean genuinely FAILS -- indistinguishable, to Mergify's
+      # `check-skipped = <job>` OR-clause, from a legitimate skip, letting a
+      # real gate failure auto-merge with this job's real work never having
+      # run. Fail explicitly instead, so a genuine failure produces `failure`.
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -282,7 +319,8 @@ jobs:
   workspace-check:
     name: Workspace Check
     needs: [changes, codex-clean]
-    if: (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
+    # See ft8-tests's own comment above for why always() is load-bearing.
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     env:
       # This lane links the whole workspace THREE times (check, examples,
@@ -296,6 +334,16 @@ jobs:
       CARGO_PROFILE_DEV_DEBUG: line-tables-only
       CARGO_PROFILE_TEST_DEBUG: line-tables-only
     steps:
+      # See ft8-tests's own comment above for why this explicit step exists
+      # instead of a richer `if:`.
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -338,7 +386,8 @@ jobs:
   cross-platform-check:
     name: Cross-Platform Check (${{ matrix.os }})
     needs: [changes, codex-clean]
-    if: ((github.event_name == 'pull_request' && needs.changes.outputs.code == 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
+    # See ft8-tests's own comment above for why always() is load-bearing.
+    if: always() && ((github.event_name == 'pull_request' && needs.changes.outputs.code == 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     strategy:
       fail-fast: false
       matrix:
@@ -354,6 +403,16 @@ jobs:
         os: [macos-latest]
     runs-on: ${{ matrix.os }}
     steps:
+      # See ft8-tests's own comment above for why this explicit step exists
+      # instead of a richer `if:`.
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
         with:
           submodules: recursive
@@ -378,9 +437,20 @@ jobs:
   deny:
     name: Cargo Deny
     needs: [changes, codex-clean]
-    if: (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
+    # See ft8-tests's own comment above for why always() is load-bearing.
+    if: always() && (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch')
     runs-on: ubuntu-latest
     steps:
+      # See ft8-tests's own comment above for why this explicit step exists
+      # instead of a richer `if:`.
+      - name: Fail explicitly (not silently skip) if codex-clean did not pass
+        run: |
+          result="${{ needs.codex-clean.result }}"
+          if [ "$result" != "success" ] && [ "$result" != "skipped" ]; then
+            echo "::error::codex-clean gate result was '$result', not success or skipped -- failing explicitly so Mergify's check-skipped tolerance can't mistake this for a legitimate skip."
+            exit 1
+          fi
+
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
         with:
