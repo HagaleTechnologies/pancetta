@@ -43,6 +43,16 @@ jobs:
             os: macos-latest
           - target: x86_64-unknown-linux-gnu
             os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            # 22.04, not 24.04: the oldest glibc baseline GitHub's hosted
+            # arm64 runners offer (glibc 2.35 vs. 24.04's 2.39). A binary
+            # linked against 24.04's newer glibc symbol versions can fail in
+            # the dynamic loader on an older Pi OS image before it ever runs
+            # (PR #278 review). This doesn't cover Bullseye-era Pi OS (glibc
+            # 2.31) — no GitHub-hosted arm64 runner goes that old — hence the
+            # "unvalidated on real hardware" caveat in README.md staying in
+            # place rather than being removed by this change.
+            os: ubuntu-22.04-arm
           - target: x86_64-pc-windows-gnu
             os: windows-latest
     runs-on: ${{ matrix.os }}
@@ -96,11 +106,30 @@ jobs:
           "$BIN" info | grep -q "ft8_lib C decoder: native-C" \
             || { echo "::error::binary was built with ft8lib_stub — degraded decoder must not ship"; exit 1; }
 
+      - name: Decode fixture verification (ARM only) — proves decoding, not just linkage
+        # The smoke test above only proves the native C decoder is linked in;
+        # it never decodes anything, so it can't catch an ARM-specific
+        # decoder/FFI/DSP regression (PR #278 review). This runs the same
+        # off-air-fixture cross-validation ci.yml's "FT8 Tests" job runs on
+        # x86_64, natively on the arm64 runner (not cross-compiled), and
+        # asserts our decoder finds >=100% of what the real ft8_lib decoder
+        # finds across 9 real recordings. Scoped to one non-timing-sensitive
+        # test (not the full pancetta-ft8 suite, which includes real-time
+        # budget assertions unproven on this runner class) to keep the
+        # release gate itself robust.
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: cargo test -p pancetta-ft8 --test wav_decode_tests test_cross_validate_against_ft8lib -- --exact
+
       - name: Package
         shell: bash
         run: |
           set -euo pipefail
-          NAME="pancetta-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # Sanitize: GITHUB_REF_NAME is a bare tag ("v0.9.5") on a real
+          # release, but on a workflow_dispatch dry run it's the branch name,
+          # which contains "/" per this repo's feat/fix/docs/... convention
+          # and would otherwise break `mkdir` by being read as a path.
+          REF_SLUG="${GITHUB_REF_NAME//\//-}"
+          NAME="pancetta-${REF_SLUG}-${{ matrix.target }}"
           mkdir "$NAME"
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/${{ matrix.target }}/release/pancetta.exe" "$NAME/"
@@ -156,8 +185,12 @@ jobs:
             echo ""
             echo "---"
             echo "Tagged at \`${GITHUB_SHA}\`. Prebuilt binaries: macOS (Apple Silicon),"
-            echo "Linux x86_64 (gnu), Windows x86_64 (MinGW). Every binary is CI-verified"
-            echo "to embed the real \`ft8_lib\` C decoder (\`pancetta info\`)."
+            echo "Linux x86_64 (gnu), Linux aarch64/Raspberry Pi (gnu — needs glibc >= 2.35,"
+            echo "i.e. Raspberry Pi OS Bookworm/2023-10 or newer; Bullseye-era images can't"
+            echo "load it), Windows x86_64 (MinGW). Every binary is CI-verified to embed the"
+            echo "real \`ft8_lib\` C decoder (\`pancetta info\`); the Linux aarch64 build is"
+            echo "additionally verified against a real off-air decode fixture, not just"
+            echo "linkage."
           } >> notes.md
 
       - name: Create draft release (operator publishes)

@@ -162,6 +162,43 @@ current status.
 
 ## Quick start
 
+**Prebuilt binaries.** No Rust toolchain needed. Starting with the first
+tagged release after this note was added, every
+[release](https://github.com/HagaleTechnologies/pancetta/releases/latest)
+ships CI-verified binaries for macOS (Apple Silicon), Linux x86_64, Linux
+aarch64 (Raspberry Pi 4/5 and other 64-bit ARM boards — needs glibc >= 2.35,
+i.e. Raspberry Pi OS **Bookworm** (2023-10) or newer; Bullseye-era images
+can't load it), and Windows x86_64 — if `/releases/latest` doesn't list an
+archive for your platform yet, either build from source below or wait for
+the next tag.
+
+```bash
+# Linux/macOS: the archive extracts into a version-named directory — the
+# binary isn't at the archive root.
+tar xzf pancetta-*.tar.gz && cd pancetta-*/
+
+# Linux only: the runtime ALSA library (not the `-dev` headers the
+# from-source table below lists) — install if `./pancetta` fails to start
+# with a missing libasound.so.2 error.
+sudo apt install -y libasound2   # libasound2t64 on Debian 13/Ubuntu 24.04+
+
+# macOS only: this binary isn't notarized yet, so a browser download is
+# quarantined and Gatekeeper blocks it until you clear that bit once.
+xattr -d com.apple.quarantine ./pancetta 2>/dev/null || true
+
+./pancetta        # first-run wizard — same as step 3 below
+```
+
+(Windows: extract the `.zip`, open the extracted folder, and run
+`pancetta.exe`.)
+
+Run it again the same way to start the station — step 4's `cargo run
+--release -p pancetta` is the source-build equivalent of that second run; a
+prebuilt binary doesn't need it or a source checkout. Hamlib is still needed
+at runtime if you want to key a radio (see the table below).
+
+To build from source instead:
+
 **1. Dependencies.**
 
 ```bash
@@ -242,9 +279,11 @@ Honest gaps, so you can judge whether it fits your station:
   crate an integration stub; `pancetta-cqdx` awaits live API validation;
   LoTW/eQSL upload is scaffolded where ClubLog/QRZ/cqdx paths are live.
 - **Platform coverage is narrow.** Developed on macOS (Apple Silicon), CI on
-  Linux, deployed on a Windows 11 MiniPC. Pi-class ARM is a design target of
-  the effort-budget work but unvalidated on real hardware, and there are no
-  prebuilt binaries yet — you build from source.
+  Linux, deployed on a Windows 11 MiniPC. Prebuilt Linux aarch64 binaries are
+  published for Pi-class ARM, but real-hardware validation (the
+  effort-budget work's actual target) hasn't happened yet — CI only proves
+  the binary builds and decodes correctly on an ARM64 cloud runner, not on a
+  Raspberry Pi.
 - **One radio, well tested.** CAT/PTT is exercised against a Yaesu FTdx10.
   Other hamlib-supported rigs should work; nobody has proven it.
 - **`pancetta-research`** is a local-only decoder harness, excluded from CI

@@ -246,6 +246,22 @@ fn test_cross_validate_against_ft8lib() {
         false_positive_candidates, unique_to_ours
     );
 
+    // Guard the ratio check below from passing vacuously: these 9 fixtures
+    // are known-decodable real recordings (unlike the "off-air" section's
+    // best-effort files), so ft8_lib decoding zero messages across all of
+    // them means the reference decoder itself is broken — e.g. an FFI/link
+    // regression that silently swapped in ft8lib_stub — not a legitimate
+    // "nothing to compare" case. Without this, the ratio assertion below is
+    // skipped entirely in that scenario and the test reports green (PR #278
+    // review, round 3: this release-gate reuse of the test surfaced the gap).
+    assert!(
+        total_ft8lib > 0,
+        "ft8_lib (the reference decoder) decoded zero messages across all {} fixtures — \
+         the reference decoder itself is broken (stub swapped in? FFI regression?), \
+         not a legitimate zero-signal case",
+        files.len()
+    );
+
     // Overall assertion: we should decode at least as many messages as ft8_lib.
     // Pancetta decoder achieves 129%+ of ft8_lib via:
     // spectrogram extraction, sum-product LDPC, TIME_OSR=2, OSD-3,
@@ -255,19 +271,17 @@ fn test_cross_validate_against_ft8lib() {
     // Previously 120%, but that counted CRC-14 false positives as "better".
     // After tightening confidence gates, we may decode fewer noise artifacts
     // which is correct behavior, not a regression.
-    if total_ft8lib > 0 {
-        let overall_ratio = total_ours as f64 / total_ft8lib as f64;
-        println!("Overall ratio: {:.1}%", overall_ratio * 100.0);
+    let overall_ratio = total_ours as f64 / total_ft8lib as f64;
+    println!("Overall ratio: {:.1}%", overall_ratio * 100.0);
 
-        assert!(
-            overall_ratio >= 1.00,
-            "REGRESSION: decode ratio {:.1}% dropped below 100% floor. Ours={}, ft8_lib={}.\nPer-file failures:\n{}",
-            overall_ratio * 100.0,
-            total_ours,
-            total_ft8lib,
-            files_below_threshold.join("\n")
-        );
-    }
+    assert!(
+        overall_ratio >= 1.00,
+        "REGRESSION: decode ratio {:.1}% dropped below 100% floor. Ours={}, ft8_lib={}.\nPer-file failures:\n{}",
+        overall_ratio * 100.0,
+        total_ours,
+        total_ft8lib,
+        files_below_threshold.join("\n")
+    );
 }
 
 // =============================================================
