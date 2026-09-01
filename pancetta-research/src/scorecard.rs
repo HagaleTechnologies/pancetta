@@ -167,6 +167,17 @@ pub struct TierResult {
     /// `snr_at_50pct_recovery_db`. `None` when `jt9_snr_curve` is empty.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jt9_snr_at_50pct_recovery_db: Option<f64>,
+    /// Wall-clock time `preflight_curated_corpus` spent hashing WAVs and
+    /// validating baseline caches for this tier — pure I/O, not decoder
+    /// work. `main`'s harness timer wraps the whole run including
+    /// preflight, so this is subtracted back out of `harness.elapsed_seconds`
+    /// before the elapsed hard gate compares two runs; otherwise an arm
+    /// that pays cold-disk I/O while an earlier arm reads warm page cache
+    /// (or vice versa) confounds unrelated storage variance with the
+    /// candidate's actual decode-time regression. `0.0` for tiers that
+    /// don't preflight a curated manifest.
+    #[serde(default)]
+    pub preflight_seconds: f64,
 }
 
 /// hb-129: aggregate Time-To-First-Decode distribution across WAVs in a tier.

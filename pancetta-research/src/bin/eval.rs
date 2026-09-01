@@ -1711,11 +1711,14 @@ fn run_curated_tier(
     novel_classifier: Option<&pancetta_research::FpFilter>,
 ) -> anyhow::Result<TierResult> {
     let entries: Vec<CuratedEntry> = load_curated_corpus(manifest_path)?;
+    let preflight_started = Instant::now();
     preflight_curated_corpus(&entries, &workspace.join("research/baselines/ft8"))?;
+    let preflight_seconds = preflight_started.elapsed().as_secs_f64();
     let total = entries.len() as u32;
     if total == 0 {
         return Ok(TierResult {
             wavs_processed: 0,
+            preflight_seconds,
             ..Default::default()
         });
     }
@@ -1871,6 +1874,7 @@ fn run_curated_tier(
         per_wav_top_failures: per_wav_failures,
         per_wav_records,
         ttfd_distribution,
+        preflight_seconds,
         ..Default::default()
     })
 }
@@ -2724,6 +2728,8 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
+    // Excluded from `harness.elapsed_seconds` below — see TierResult::preflight_seconds.
+    let preflight_seconds_total: f64;
     let mut card = Scorecard {
         schema_version: Scorecard::CURRENT_SCHEMA_VERSION,
         generated_at: Utc::now(),
@@ -2742,9 +2748,12 @@ fn main() -> anyhow::Result<()> {
                 std::env::consts::OS,
                 std::env::consts::ARCH
             ),
-            cores_used: std::thread::available_parallelism()
-                .map(|n| n.get())
-                .unwrap_or(1),
+            // rayon's actual worker-pool size, not hardware availability —
+            // the repo explicitly supports RAYON_NUM_THREADS overrides for
+            // timing runs, and available_parallelism() can't see that, so
+            // the elapsed hard gate could attribute a thread-count change
+            // to the candidate under test instead of skipping as expected.
+            cores_used: rayon::current_num_threads(),
             elapsed_seconds: 0.0,
         },
         config: ConfigInfo {
@@ -2753,7 +2762,10 @@ fn main() -> anyhow::Result<()> {
             tiers_run: args.tiers.clone(),
             fp_filter_active: fp_filter.is_some(),
         },
-        tiers,
+        tiers: {
+            preflight_seconds_total = tiers.values().map(|t| t.preflight_seconds).sum();
+            tiers
+        },
         composite: pancetta_research::scorecard::CompositeInfo {
             weights: default_weights(),
             score: 0.0,
@@ -2764,7 +2776,12 @@ fn main() -> anyhow::Result<()> {
         notes: format!("Decoder under test: {}", decoder.identity()),
     };
     populate_composite(&mut card, default_weights());
-    card.harness.elapsed_seconds = started.elapsed().as_secs_f64();
+    // Preflight (WAV hashing + baseline-cache validation) is pure I/O, not
+    // decoder work — subtract it so cold-vs-warm filesystem-cache variance
+    // between two sequentially-run arms doesn't get attributed to the
+    // candidate under the A/B elapsed hard gate.
+    card.harness.elapsed_seconds =
+        (started.elapsed().as_secs_f64() - preflight_seconds_total).max(0.0);
 
     // Task W0.3 (2026-07-06): compute real `RegressionFlags` by
     // self-diffing this run against the checked-in

@@ -62,7 +62,7 @@ def soft_rank_loss_tensor(scores, labels, tau=0.1):
     return ((soft_ranks * labels).sum(dim=1)[valid] / positives[valid]).mean()
 
 
-def validation_metrics(model, val_x, val_y, tau, bce_weight, batch_size=256):
+def validation_metrics(model, val_x, val_y, tau, bce_weight, batch_size=256, device=None):
     """Batched validation metrics, equivalent to a single full-split call
     but bounded to O(batch_size) peak activation memory.
 
@@ -95,6 +95,9 @@ def validation_metrics(model, val_x, val_y, tau, bce_weight, batch_size=256):
     bce_total = 0.0
     bce_count = 0
     for batch_x, batch_y in loader:
+        if device is not None:
+            batch_x = batch_x.to(device)
+            batch_y = batch_y.to(device)
         scores = model(batch_x)
         pairwise = (scores.unsqueeze(1) - scores.unsqueeze(2)) / tau
         soft_ranks = torch.sigmoid(pairwise).sum(dim=2)
@@ -182,9 +185,18 @@ def _iter_samples(path):
             if sorted(perm) != list(range(N_CODEWORD)):
                 raise ValueError("mrb_perm is not a permutation of 0..173")
             # Rust consumes output slot i as natural systematic bit i.
+            #
+            # An all-zero label vector (recovery confined to parity
+            # positions — no info-bit error) is still a valid, useful
+            # sample: the rank loss can't use it (no positive to rank), but
+            # BCE can — it's exactly the kind of "confidently no error"
+            # example the calibration term needs to learn the unconditional
+            # absolute error probability production compares directly
+            # against parity-bit |LLR|. soft_rank_loss_tensor's own `valid
+            # = positives > 0` mask already excludes zero-label samples
+            # from the rank component per-batch, so retaining them here
+            # only feeds the BCE term, not the rank term.
             labels = errors[:K_INFO]
-            if not any(labels):
-                continue
             trajectory = np.asarray(row["trajectory_flat"], dtype=np.float32).reshape(BP_ITERS, N_CODEWORD)
             syndrome = np.asarray(row["syndrome_counts"], dtype=np.float32) / divisor
             model_input = np.concatenate([trajectory, syndrome[None, :]], axis=0)
@@ -255,6 +267,7 @@ def main():
     parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument("--bce-weight", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--device", type=str, default="auto", choices=["auto", "cpu", "mps", "cuda"])
     args = parser.parse_args()
     if not math.isfinite(args.tau) or args.tau <= 0.0:
         # tau=0 divides by zero in the pairwise term (NaN loss, val never
@@ -282,6 +295,17 @@ def main():
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
+    if args.device == "auto":
+        if torch.backends.mps.is_available():
+            device = torch.device("mps")
+        elif torch.cuda.is_available():
+            device = torch.device("cuda")
+        else:
+            device = torch.device("cpu")
+    else:
+        device = torch.device(args.device)
+    print(f"device: {device}")
+
     class RankModel(nn.Module):
         def __init__(self):
             super().__init__()
@@ -301,20 +325,22 @@ def main():
         val_x, val_y = splits["val"]
         if not len(train_x) or not len(val_x):
             raise SystemExit("schema-v2 corpus produced an empty train or validation split")
-        model = RankModel()
+        model = RankModel().to(device)
         optimizer = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=1e-4)
         loader = DataLoader(TensorDataset(torch.from_numpy(train_x), torch.from_numpy(train_y)), batch_size=64, shuffle=True)
         best = float("inf")
         for epoch in range(args.epochs):
             model.train()
             for batch_x, batch_y in loader:
+                batch_x = batch_x.to(device)
+                batch_y = batch_y.to(device)
                 optimizer.zero_grad()
                 loss = combined_loss(model(batch_x), batch_y, args.tau, args.bce_weight)
                 loss.backward()
                 optimizer.step()
             model.eval()
             with torch.no_grad():
-                rank_metric, selection_metric = validation_metrics(model, val_x, val_y, args.tau, args.bce_weight)
+                rank_metric, selection_metric = validation_metrics(model, val_x, val_y, args.tau, args.bce_weight, device=device)
             print(f"epoch={epoch + 1} tier1_expected_soft_rank={rank_metric:.6f} selection_metric={selection_metric:.6f} [MODEL SELECTION ONLY — NOT A SHIP SIGNAL]")
             if selection_metric < best:
                 best = selection_metric

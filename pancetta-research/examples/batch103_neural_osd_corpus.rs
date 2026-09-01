@@ -133,11 +133,12 @@ fn wav_pool(root: &Path, tier: &str) -> Result<Vec<PathBuf>> {
         )?;
         collect_wavs(&root.join("research/corpus/synth/wavs"), &mut files)?;
     } else {
-        let home = std::env::var_os("HOME").context("HOME is unset")?;
-        collect_wavs(
-            &PathBuf::from(home).join(".pancetta/recordings"),
-            &mut files,
-        )?;
+        // `$HOME` is commonly unset on the native Windows 11 operator
+        // target even though a real home directory exists (USERPROFILE);
+        // `dirs::home_dir()` resolves it portably instead of requiring the
+        // Unix environment variable.
+        let home = dirs::home_dir().context("could not resolve the home directory")?;
+        collect_wavs(&home.join(".pancetta/recordings"), &mut files)?;
         // `~/.pancetta/recordings` also holds curated fixture subdirectories
         // that are signal-free or synthetic by construction (e.g. noise_1000,
         // the noise-corpus dir the ship-gate's noise manifest points at). Any

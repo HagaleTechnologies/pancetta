@@ -32,7 +32,9 @@ rand_distr = "0.6"
 # spectrogram + Costas score + LLR pipeline inline.
 rustfft = "6.4"
 num-complex = "0.4"
+rayon = "1.12"                           # actual worker-pool size for the elapsed-gate cores_used field
 sha2 = "0.10"                            # SHA-256 for WAV cache keying in baseline binary
+dirs = { workspace = true }              # portable home-dir resolution (Windows: USERPROFILE, not $HOME)
 tempfile = "3"                           # slot-cutting helper for Jt9Decoder; not in workspace.dependencies
 # Raw flock(2) for cross-process tier-slot semaphore (see tier_slots.rs).
 # Already transitively present in the workspace via other crates; we pin
