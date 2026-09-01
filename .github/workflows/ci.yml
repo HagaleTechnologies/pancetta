@@ -19,6 +19,16 @@ on:
     - cron: '0 12 * * 1'
   workflow_dispatch:
 
+permissions:
+  contents: read
+  # pull-requests: read is narrowed further at the job level below
+  # (codex-clean) -- a job's own permissions: block can only be a SUBSET
+  # of what's granted here, never wider. Without this scope present at
+  # this top level, GitHub rejects the whole workflow file at parse time
+  # (zero jobs created, no per-job error) the moment that job requests a
+  # scope this block doesn't grant.
+  pull-requests: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -69,6 +79,97 @@ jobs:
               - '**/Cargo.lock'
               - '.github/workflows/ci.yml'
 
+  # codex-clean gate: defers the heavier lanes below (ft8-tests,
+  # workspace-check, cross-platform-check, deny) until wait-for-codex.yml
+  # signals this exact revision's Codex round raised nothing new. clippy
+  # and fmt stay ungated (fast, ~2min, immediate feedback regardless of
+  # review-round status). Self-contained (no external `uses:` call) since
+  # this repo is public. gate_timeout_minutes is fixed at 95, derived from
+  # this repo's OWN wait-for-codex job (75min timeout / 70min in-script
+  # poll bound, see wait-for-codex.yml).
+  codex-clean:
+    name: Codex review clean (gate before expensive downstream jobs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 95
+    permissions:
+      contents: read
+      pull-requests: read
+    # exclude_dependabot + draft-PR skip, mirroring wait-for-codex.yml's own
+    # eligibility check -- belt-and-suspenders against that producer-side
+    # skip logic ever drifting from this consumer-side one.
+    if: github.event_name == 'pull_request' && github.actor != 'dependabot[bot]' && github.event.pull_request.draft == false
+    steps:
+      - name: "Bootstrap check: does the base branch have wait-for-codex.yml's label mechanism yet?"
+        id: bootstrap-check
+        if: github.event.action == 'synchronize'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          # wait-for-codex.yml is pull_request_target, which ALWAYS
+          # executes the BASE branch's copy, never the PR's own -- so the
+          # PR that first wires this mechanism up can never produce a
+          # label for its own pushes until it merges. Pinned to base.sha
+          # (the event-fixed commit), not base.ref (a moving branch tip).
+          #
+          # A clean HTTP 404 (the file genuinely doesn't exist at this
+          # SHA -- this IS the bootstrap PR) is the ONLY fetch-side
+          # outcome allowed to pass through; every OTHER fetch failure
+          # (transient network error, 403, 5xx) fails the gate closed
+          # rather than silently treating a real API problem as "not
+          # live yet, skip."
+          err_file="$(mktemp)"
+          if gh api "repos/$REPO/contents/.github/workflows/wait-for-codex.yml?ref=$BASE_SHA" --jq '.sha' >/dev/null 2>"$err_file"; then
+            echo "bootstrap_status=ready" >> "$GITHUB_OUTPUT"
+          else
+            err="$(cat "$err_file")"
+            if echo "$err" | grep -qiE "HTTP 404|not found"; then
+              echo "::warning::Base branch has no wait-for-codex.yml at $BASE_SHA (clean 404) -- this is the bootstrap PR itself. Passing through unconditionally."
+              echo "bootstrap_status=absent" >> "$GITHUB_OUTPUT"
+            else
+              echo "bootstrap_status=fetch-failed" >> "$GITHUB_OUTPUT"
+              echo "::error::Could not determine whether base branch has wait-for-codex.yml (non-404 failure fetching $BASE_SHA, failing closed): $err"
+              exit 1
+            fi
+          fi
+
+      - name: Pass through -- not a synchronize event, or bootstrap not yet live on the base branch
+        if: github.event.action != 'synchronize' || steps.bootstrap-check.outputs.bootstrap_status == 'absent'
+        run: echo "Passing through (event action=${{ github.event.action }}, bootstrap_status=${{ steps.bootstrap-check.outputs.bootstrap_status }}) -- no prior round to converge on, or this is the bootstrap PR itself."
+
+      - name: Poll for the codex-clean label on this exact revision
+        if: github.event.action == 'synchronize' && steps.bootstrap-check.outputs.bootstrap_status == 'ready'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          target="codex-clean:${HEAD_SHA:0:12}"
+          # In-script deadline runs a fixed 7-minute margin under this
+          # job's own 95-minute timeout-minutes, leaving slack for the
+          # loop to notice and error out cleanly before GitHub kills the
+          # job outright.
+          END=$((SECONDS + 95 * 60 - 420))
+          while [ $SECONDS -lt $END ]; do
+            # per_page=100: labels accumulate one per round with no
+            # cleanup (deleting a stale label is itself a race that can
+            # delete a newer revision's already-valid one), so a long
+            # review loop can push the current label past the REST
+            # default page size of 30.
+            if labels=$(gh api "repos/$REPO/issues/$PR/labels?per_page=100" --jq '[.[].name]' 2>/dev/null); then
+              if echo "$labels" | jq -e --arg l "$target" 'index($l) != null' >/dev/null 2>&1; then
+                echo "Found $target -- this round raised nothing new, safe to run the jobs gated behind this one."
+                exit 0
+              fi
+            fi
+            echo "Still waiting for $target..."
+            sleep 20
+          done
+          echo "::error::$target never appeared within the gate's timeout budget -- this revision's Codex round either hasn't converged or the label failed to apply. See wait-for-codex.yml's own run for this SHA."
+          exit 1
+
   # Fast checks — run on every push and PR (~2 min)
   clippy:
     name: Clippy
@@ -116,8 +217,13 @@ jobs:
   # (plus weekly schedule + manual dispatch). Part of the authoritative gate.
   ft8-tests:
     name: FT8 Tests
-    needs: changes
-    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [changes, codex-clean]
+    # codex-clean can legitimately report `skipped` (a draft PR,
+    # dependabot[bot] PR, or non-pull_request event -- see codex-clean's
+    # own eligibility `if:` above), which is different from "ran and
+    # found the round not clean yet" (that produces `failure`). Both
+    # `success` and `skipped` mean "proceed."
+    if: (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -144,8 +250,8 @@ jobs:
 
   workspace-check:
     name: Workspace Check
-    needs: changes
-    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [changes, codex-clean]
+    if: (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
     runs-on: ubuntu-latest
     env:
       # This lane links the whole workspace THREE times (check, examples,
@@ -200,8 +306,8 @@ jobs:
   # (skipped on direct human push to main; macos minutes are 10x cost).
   cross-platform-check:
     name: Cross-Platform Check (${{ matrix.os }})
-    needs: changes
-    if: (github.event_name == 'pull_request' && needs.changes.outputs.code == 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [changes, codex-clean]
+    if: ((github.event_name == 'pull_request' && needs.changes.outputs.code == 'true') || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
     strategy:
       fail-fast: false
       matrix:
@@ -240,8 +346,8 @@ jobs:
   # every push to main (part of the authoritative gate).
   deny:
     name: Cargo Deny
-    needs: changes
-    if: needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    needs: [changes, codex-clean]
+    if: (needs.changes.outputs.code == 'true' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && (needs.codex-clean.result == 'success' || needs.codex-clean.result == 'skipped')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -253,7 +359,12 @@ jobs:
   # lanes so branch-protection only needs to require one check name.
   ci:
     name: CI
-    needs: [clippy, fmt, ft8-tests, workspace-check, deny]
+    # codex-clean added: if it genuinely fails (round not converged), the
+    # jobs it gates report `skipped` (not `failure`), which the
+    # failure|cancelled grep below wouldn't otherwise catch on its own --
+    # codex-clean's own result flows into the SAME toJSON(needs.*.result)
+    # string via this needs: entry, so a real gate failure still fails CI.
+    needs: [clippy, fmt, ft8-tests, workspace-check, deny, codex-clean]
     runs-on: ubuntu-latest
     if: always()
     steps:
