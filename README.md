@@ -348,3 +348,5 @@ Dual-licensed under your choice of:
 
 Contributions are accepted under the same dual-license terms unless
 explicitly stated otherwise in the PR.
+
+<!-- codex-clean gate verification: throwaway, will be reverted before merge or PR closed without merging -->
