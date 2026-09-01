@@ -59,7 +59,7 @@ fn main() -> Result<()> {
     let mut labels = 0usize;
     for wav in &wavs {
         for record in decode(wav, &root)? {
-            labels += usize::from(record.osd_recovered && record.osd_codeword.is_some());
+            labels += usize::from(is_trainable_label(&record));
             serde_json::to_writer(&mut writer, &record)?;
             writer.write_all(b"\n")?;
             records += 1;
@@ -95,6 +95,29 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Mirrors `train_rank.py::_iter_samples`'s trainable-row predicate: a
+/// record is only kept for training when the OSD-recovered codeword
+/// disagrees with the BP hard decision in at least one of the first
+/// `K_INFO` (91, the FT8 payload's info-bit count) systematic positions —
+/// `osd_recovered && osd_codeword.is_some()` alone (the prior check here)
+/// also counts recoveries that only correct parity bits, which
+/// `_iter_samples` then discards, so this label-yield count could report a
+/// usable T1 corpus that trains on an empty split.
+fn is_trainable_label(record: &CorpusRecord) -> bool {
+    const K_INFO: usize = 91;
+    let Some(codeword) = &record.osd_codeword else {
+        return false;
+    };
+    if !record.osd_recovered || codeword.len() != record.final_llrs.len() {
+        return false;
+    }
+    codeword
+        .iter()
+        .zip(&record.final_llrs)
+        .take(K_INFO)
+        .any(|(&bit, &llr)| bit != u8::from(llr < 0.0))
 }
 
 fn wav_pool(root: &Path, tier: &str) -> Result<Vec<PathBuf>> {
@@ -184,6 +207,24 @@ fn decode(wav: &Path, root: &Path) -> Result<Vec<CorpusRecord>> {
             .samples::<f32>()
             .collect::<std::result::Result<_, _>>()?,
     };
+    // The live recorder (pancetta/src/coordinator/dsp.rs) writes every
+    // active mode's windows into the same ~/.pancetta/recordings directory
+    // under the same `ft8_*.wav` naming — there's no mode marker in the
+    // filename to filter on. But each mode's window length differs (FT8's
+    // WINDOW_SAMPLES; FT4's slot is half that, FT2 shorter still), so a
+    // recording physically too short to contain a full FT8 window can only
+    // be a non-FT8 capture; padding and decoding it as FT8 anyway lets any
+    // CRC-valid collision get accepted as a training label. Skip it rather
+    // than abort the whole T1 scan over one wrong-mode file.
+    if samples.len() < pancetta_ft8::WINDOW_SAMPLES {
+        eprintln!(
+            "skip {} — {} samples, shorter than one FT8 window ({}); likely a non-FT8 recording",
+            wav.display(),
+            samples.len(),
+            pancetta_ft8::WINDOW_SAMPLES
+        );
+        return Ok(Vec::new());
+    }
     let mut config = pancetta_ft8::Ft8Config::default();
     config.osd_depth = Some(1);
     config.neural_osd_enabled = false;

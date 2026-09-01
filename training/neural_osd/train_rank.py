@@ -245,6 +245,12 @@ def main():
         raise SystemExit(f"--tau must be finite and positive, got {args.tau}")
     if not math.isfinite(args.bce_weight) or args.bce_weight < 0.0:
         raise SystemExit(f"--bce-weight must be finite and non-negative, got {args.bce_weight}")
+    if args.epochs <= 0:
+        # epochs<=0 skips the training loop entirely and exits 0 without
+        # writing a checkpoint — if --output already exists from a prior
+        # run, it's left untouched and a later export step can silently
+        # package that stale model as the new candidate.
+        raise SystemExit(f"--epochs must be positive, got {args.epochs}")
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, TensorDataset
@@ -287,6 +293,18 @@ def main():
                 best = metric
                 torch.save(model.state_dict(), args.output)
     finally:
+        # Close every memmap's underlying OS mapping before removing its
+        # backing files. On Windows, an open memory-mapped file cannot be
+        # unlinked at all (rmtree would silently leave the ~18.5 GB cache
+        # behind via ignore_errors); closing first makes cleanup work
+        # regardless of platform. Safe here specifically because nothing
+        # reads train_x/val_x/loader again after this point, whether the
+        # epoch loop ran to completion or the `try` block raised.
+        for x, y in splits.values():
+            if hasattr(x, "_mmap"):
+                x._mmap.close()
+            if hasattr(y, "_mmap"):
+                y._mmap.close()
         # The memmap corpus cache is a training-run-scoped intermediate
         # (~18.5 GB on disk at 1M samples), not an artifact worth keeping —
         # `args.output`'s checkpoint is the actual deliverable and lives
