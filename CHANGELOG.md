@@ -14,9 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   in the Shift+D Diagnostics overlay, while preserving existing rejection,
   logging, and status-line behavior.
 - GitHub release workflow: pushing a `v*` tag builds prebuilt binaries for
-  macOS (Apple Silicon), Linux x86_64, and Windows x86_64 (MinGW) and attaches
-  them to a draft release. CI refuses to ship any binary built without the
-  real `ft8_lib` C decoder.
+  macOS (Apple Silicon), Linux x86_64, Linux aarch64 (Raspberry Pi 4/5 and
+  other 64-bit ARM boards), and Windows x86_64 (MinGW) and attaches them to a
+  draft release. CI refuses to ship any binary built without the real
+  `ft8_lib` C decoder, and the aarch64 build is additionally gated on an
+  actual fixture decode (not just linkage).
 - `pancetta info` now reports the decode engine: `ft8_lib C decoder: native-C`
   or a loud `STUB` line with the fix command.
 - Station agent: concurrent multi-client relay sessions (up to 8, the relay's

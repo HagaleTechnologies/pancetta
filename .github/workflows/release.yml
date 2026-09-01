@@ -185,9 +185,12 @@ jobs:
             echo ""
             echo "---"
             echo "Tagged at \`${GITHUB_SHA}\`. Prebuilt binaries: macOS (Apple Silicon),"
-            echo "Linux x86_64 (gnu), Linux aarch64/Raspberry Pi (gnu), Windows x86_64"
-            echo "(MinGW). Every binary is CI-verified to embed the real \`ft8_lib\` C"
-            echo "decoder (\`pancetta info\`)."
+            echo "Linux x86_64 (gnu), Linux aarch64/Raspberry Pi (gnu — needs glibc >= 2.35,"
+            echo "i.e. Raspberry Pi OS Bookworm/2023-10 or newer; Bullseye-era images can't"
+            echo "load it), Windows x86_64 (MinGW). Every binary is CI-verified to embed the"
+            echo "real \`ft8_lib\` C decoder (\`pancetta info\`); the Linux aarch64 build is"
+            echo "additionally verified against a real off-air decode fixture, not just"
+            echo "linkage."
           } >> notes.md
 
       - name: Create draft release (operator publishes)

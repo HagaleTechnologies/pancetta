@@ -166,15 +166,36 @@ current status.
 tagged release after this note was added, every
 [release](https://github.com/HagaleTechnologies/pancetta/releases/latest)
 ships CI-verified binaries for macOS (Apple Silicon), Linux x86_64, Linux
-aarch64 (Raspberry Pi 4/5 and other 64-bit ARM boards), and Windows x86_64 —
-if `/releases/latest` doesn't list an archive for your platform yet, either
-build from source below or wait for the next tag. Download the archive for
-your platform, extract it, and run `./pancetta` (`pancetta.exe` on Windows)
-— it walks you through the same setup wizard as step 3 below, then run it
-again the same way to start the station (step 4's `cargo run --release -p
-pancetta` is the source-build equivalent of that second run — a prebuilt
-binary doesn't need it or a source checkout). Hamlib is still needed at
-runtime if you want to key a radio (see the table below).
+aarch64 (Raspberry Pi 4/5 and other 64-bit ARM boards — needs glibc >= 2.35,
+i.e. Raspberry Pi OS **Bookworm** (2023-10) or newer; Bullseye-era images
+can't load it), and Windows x86_64 — if `/releases/latest` doesn't list an
+archive for your platform yet, either build from source below or wait for
+the next tag.
+
+```bash
+# Linux/macOS: the archive extracts into a version-named directory — the
+# binary isn't at the archive root.
+tar xzf pancetta-*.tar.gz && cd pancetta-*/
+
+# Linux only: the runtime ALSA library (not the `-dev` headers the
+# from-source table below lists) — install if `./pancetta` fails to start
+# with a missing libasound.so.2 error.
+sudo apt install -y libasound2   # libasound2t64 on Debian 13/Ubuntu 24.04+
+
+# macOS only: this binary isn't notarized yet, so a browser download is
+# quarantined and Gatekeeper blocks it until you clear that bit once.
+xattr -d com.apple.quarantine ./pancetta 2>/dev/null || true
+
+./pancetta        # first-run wizard — same as step 3 below
+```
+
+(Windows: extract the `.zip`, open the extracted folder, and run
+`pancetta.exe`.)
+
+Run it again the same way to start the station — step 4's `cargo run
+--release -p pancetta` is the source-build equivalent of that second run; a
+prebuilt binary doesn't need it or a source checkout. Hamlib is still needed
+at runtime if you want to key a radio (see the table below).
 
 To build from source instead:
 
