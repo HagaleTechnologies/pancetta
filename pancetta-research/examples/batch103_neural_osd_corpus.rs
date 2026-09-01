@@ -115,6 +115,18 @@ fn wav_pool(root: &Path, tier: &str) -> Result<Vec<PathBuf>> {
             &PathBuf::from(home).join(".pancetta/recordings"),
             &mut files,
         )?;
+        // `~/.pancetta/recordings` also holds curated fixture subdirectories
+        // that are signal-free or synthetic by construction (e.g. noise_1000,
+        // the noise-corpus dir the ship-gate's noise manifest points at). Any
+        // CRC-valid OSD decode from those is a false positive being fed back
+        // in as a training-corpus ground-truth label, poisoning T1's
+        // positives even though the production decoder would reject the
+        // message. Drop anything under a known non-signal directory.
+        files.retain(|path| {
+            !path
+                .components()
+                .any(|component| component.as_os_str() == "noise_1000")
+        });
     }
     files.sort();
     files.dedup();
@@ -178,11 +190,25 @@ fn decode(wav: &Path, root: &Path) -> Result<Vec<CorpusRecord>> {
     let mut decoder = pancetta_ft8::Ft8Decoder::new(config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     capture::enable_global();
-    let decode_result = decoder
-        .decode_window(&samples)
-        .map_err(|error| anyhow::anyhow!(error.to_string()));
+    // `decode_window` requires exactly WINDOW_SAMPLES (12.64s @ 12kHz); a raw
+    // recording is typically 15s+ and not slot-aligned. Chunk it into
+    // consecutive WINDOW_SAMPLES-sized slots (matching how the live pipeline
+    // feeds one window per slot to a persistent decoder), padding the final
+    // partial chunk with zeros. Passing an oversized buffer directly costs
+    // 4-5x more per the decoder's own documented single-window contract.
+    let mut decode_error = None;
+    for chunk in samples.chunks(pancetta_ft8::WINDOW_SAMPLES) {
+        let mut window = vec![0.0f32; pancetta_ft8::WINDOW_SAMPLES];
+        window[..chunk.len()].copy_from_slice(chunk);
+        if let Err(error) = decoder.decode_window(&window) {
+            decode_error = Some(anyhow::anyhow!(error.to_string()));
+            break;
+        }
+    }
     capture::disable_global();
-    decode_result?;
+    if let Some(error) = decode_error {
+        return Err(error);
+    }
     let relative = wav
         .strip_prefix(root)
         .unwrap_or(wav)

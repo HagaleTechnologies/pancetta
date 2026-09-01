@@ -1123,12 +1123,26 @@ impl DecoderUnderTest for Ft8Decoder {
     fn config_snapshot(&self) -> serde_json::Value {
         // Prefer JSON-serialize; fall back to Debug-print if Ft8Config doesn't
         // (yet) derive Serialize.
-        match serde_json::to_value(&self.config) {
+        let mut snapshot = match serde_json::to_value(&self.config) {
             Ok(v) => v,
             Err(_) => serde_json::json!({
                 "debug_repr": format!("{:?}", self.config),
             }),
+        };
+        // `neural_osd_enabled` alone can't distinguish which weight blob is
+        // compiled in (see `pancetta_ft8::neural_osd_weights::provenance_sha256`
+        // doc comment) — record it so A/B scorecards comparing two
+        // `neural_osd_enabled: true` arms can prove they actually ran
+        // different (or the same) model.
+        if let serde_json::Value::Object(ref mut map) = snapshot {
+            map.insert(
+                "neural_osd_weights_sha256".to_string(),
+                serde_json::Value::String(
+                    pancetta_ft8::neural_osd_weights::provenance_sha256().to_string(),
+                ),
+            );
         }
+        snapshot
     }
 
     fn chrono_replay_snapshot_len(&self) -> Option<usize> {

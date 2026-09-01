@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import tempfile
 from pathlib import Path
 
 N_CODEWORD = 174
@@ -60,20 +61,45 @@ def soft_rank_loss_tensor(scores, labels, tau=0.1):
     return ((soft_ranks * labels).sum(dim=1)[valid] / positives[valid]).mean()
 
 
+def combined_loss(scores, labels, tau=0.1, bce_weight=0.1):
+    """Soft-rank loss plus a small BCE term to anchor the absolute score scale.
+
+    Soft-rank depends only on pairwise score differences within a sample, so
+    adding the same constant to every logit in a sample leaves it (and
+    checkpoint selection, which uses it) completely unchanged. Production
+    inference doesn't have that invariance: `reliability_sorted_indices`
+    converts each score to `ln((1-p)/p)` and compares it directly against
+    parity-bit |LLR| magnitudes, so a common offset shifts every information
+    bit relative to every parity bit and can change the MRB/OSD enumeration.
+    The BCE term is a low-weight regularizer (design doc: lambda ~= 0.1) that
+    trains the scores to also be calibrated probabilities on the absolute
+    scale production reads them on, without dominating the ranking objective.
+    """
+    import torch
+
+    rank = soft_rank_loss_tensor(scores, labels, tau)
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(scores, labels)
+    return rank + bce_weight * bce
+
+
 def load_contract():
     path = Path(__file__).resolve().parents[2] / "pancetta-ft8/assets/neural_osd_weights.provenance.json"
     return json.loads(path.read_text())
 
 
-def load_corpus(path):
+def _iter_samples(path):
+    """Stream qualifying (split, model_input, labels) triples from the JSONL corpus.
+
+    Each row's transient JSON/array construction is O(1) per row and discarded
+    immediately after yielding, so a caller that only counts (rather than
+    retaining) keeps this generator's memory bound at O(1) regardless of
+    corpus size — that's what lets `load_corpus` below do a cheap counting
+    pass before allocating fixed-size backing storage.
+    """
     import numpy as np
 
     contract = load_contract()
     divisor = float(contract["syndrome_normalization_divisor"])
-    groups = {"train": ([], []), "val": ([], []), "test": ([], [])}
-    # Stream the JSONL: a T1 corpus is 100k-1M records and multi-gigabyte, so
-    # materializing every line up front costs several times the corpus size in
-    # peak RSS before a single sample is decoded.
     with open(path, "r", encoding="utf-8") as handle:
         for line_number, line in enumerate(handle, start=1):
             line = line.strip()
@@ -112,12 +138,57 @@ def load_corpus(path):
             split_key = row["split_key"]
             bucket = int(hashlib.sha256(split_key.encode()).hexdigest()[:8], 16) % 10
             split = "train" if bucket < 8 else "val" if bucket == 8 else "test"
-            groups[split][0].append(model_input)
-            groups[split][1].append(labels)
-    return {
-        name: (np.asarray(values[0], dtype=np.float32), np.asarray(values[1], dtype=np.float32))
-        for name, values in groups.items()
-    }
+            yield split, model_input, np.asarray(labels, dtype=np.float32)
+
+
+def load_corpus(path):
+    """Two-pass load into memory-mapped backing arrays.
+
+    A T1 corpus is 100k-1M qualifying samples; retaining every decoded
+    26x174 sample in a Python list before a final `np.asarray` copy costs
+    several times the corpus size in peak RSS (~18 GB at 1M samples) and can
+    prevent the run from starting. Pass 1 counts samples per split without
+    retaining them; pass 2 writes directly into pre-sized `np.memmap` arrays,
+    so peak RSS stays O(1) regardless of corpus size and training reads pull
+    pages from disk on demand instead of holding the whole split in RAM.
+    """
+    import numpy as np
+
+    counts = {"train": 0, "val": 0, "test": 0}
+    for split, _model_input, _labels in _iter_samples(path):
+        counts[split] += 1
+
+    # A fresh temp dir per call avoids collisions between concurrent training
+    # runs; it's not cleaned up automatically (a training run may want to
+    # inspect it after the fact), so it accumulates under the OS temp dir
+    # like other run-scoped artifacts elsewhere in this tree.
+    cache_dir = Path(tempfile.mkdtemp(prefix="pan9_rank_corpus_"))
+    feature_dim = BP_ITERS + 1
+    arrays = {}
+    for name, count in counts.items():
+        if count:
+            x = np.memmap(cache_dir / f"{name}_x.dat", dtype=np.float32, mode="w+", shape=(count, feature_dim, N_CODEWORD))
+            y = np.memmap(cache_dir / f"{name}_y.dat", dtype=np.float32, mode="w+", shape=(count, K_INFO))
+        else:
+            x = np.zeros((0, feature_dim, N_CODEWORD), dtype=np.float32)
+            y = np.zeros((0, K_INFO), dtype=np.float32)
+        arrays[name] = (x, y)
+
+    cursors = {"train": 0, "val": 0, "test": 0}
+    for split, model_input, labels in _iter_samples(path):
+        idx = cursors[split]
+        x, y = arrays[split]
+        x[idx] = model_input
+        y[idx] = labels
+        cursors[split] += 1
+
+    for x, y in arrays.values():
+        if isinstance(x, np.memmap):
+            x.flush()
+        if isinstance(y, np.memmap):
+            y.flush()
+
+    return arrays
 
 
 def main():
@@ -126,7 +197,15 @@ def main():
     parser.add_argument("--output", type=Path, default=Path("rank_model.pt"))
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--tau", type=float, default=0.1)
+    parser.add_argument("--bce-weight", type=float, default=0.1)
     args = parser.parse_args()
+    if not math.isfinite(args.tau) or args.tau <= 0.0:
+        # tau=0 divides by zero in the pairwise term (NaN loss, val never
+        # improves, a reused --output silently keeps a stale checkpoint);
+        # tau<0 reverses the ranking objective and trains errors the wrong way.
+        raise SystemExit(f"--tau must be finite and positive, got {args.tau}")
+    if not math.isfinite(args.bce_weight) or args.bce_weight < 0.0:
+        raise SystemExit(f"--bce-weight must be finite and non-negative, got {args.bce_weight}")
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, TensorDataset
@@ -157,7 +236,7 @@ def main():
         model.train()
         for batch_x, batch_y in loader:
             optimizer.zero_grad()
-            loss = soft_rank_loss_tensor(model(batch_x), batch_y, args.tau)
+            loss = combined_loss(model(batch_x), batch_y, args.tau, args.bce_weight)
             loss.backward()
             optimizer.step()
         model.eval()

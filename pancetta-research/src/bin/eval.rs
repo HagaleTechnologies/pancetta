@@ -1885,18 +1885,48 @@ fn run_noise_tier(
     decoder: &dyn DecoderUnderTest,
     manifest_path: &std::path::Path,
 ) -> anyhow::Result<TierResult> {
+    use sha2::{Digest, Sha256};
+
     let entries = pancetta_research::gen_noise::load_noise_corpus(manifest_path)?;
-    let total = entries.len() as u32;
-    if total == 0 {
-        return Ok(TierResult {
-            wavs_processed: 0,
-            ..Default::default()
-        });
+    // `compare`'s false-positive hard gate only evaluates tiers present in
+    // both scorecards, and treats an absent/unset noise tier as a pass — an
+    // empty manifest previously produced exactly that (zero WAVs, unset
+    // counters), letting an arm clear the gate without ever evaluating a
+    // noise-only WAV. Reject rather than silently no-op.
+    anyhow::ensure!(
+        !entries.is_empty(),
+        "noise manifest {} has zero entries — the false-positive hard gate \
+         cannot be evaluated against an empty corpus",
+        manifest_path.display()
+    );
+    for entry in &entries {
+        anyhow::ensure!(
+            entry.wav_path.is_file(),
+            "noise manifest {} references a missing WAV: {}",
+            manifest_path.display(),
+            entry.wav_path.display()
+        );
+        let actual = format!("{:x}", Sha256::digest(std::fs::read(&entry.wav_path)?));
+        anyhow::ensure!(
+            actual.eq_ignore_ascii_case(&entry.wav_sha256),
+            "noise WAV SHA-256 mismatch: {} expected {} got {}",
+            entry.wav_path.display(),
+            entry.wav_sha256,
+            actual
+        );
     }
+    let total = entries.len() as u32;
     let mut false_positives_total: u32 = 0;
     let mut noise_files_decoded: u32 = 0;
     for entry in &entries {
-        let decodes = decoder.decode_wav(&entry.wav_path).unwrap_or_default();
+        // A decode ERROR (missing/corrupt WAV, decoder panic-equivalent) is
+        // not the same signal as "genuinely decoded nothing" — collapsing
+        // both into an empty list via unwrap_or_default() let a broken run
+        // report a clean "0 false positives" without ever evaluating the
+        // advertised corpus. Propagate it instead of swallowing it.
+        let decodes = decoder
+            .decode_wav(&entry.wav_path)
+            .with_context(|| format!("decoding noise WAV {}", entry.wav_path.display()))?;
         if !decodes.is_empty() {
             noise_files_decoded += 1;
             false_positives_total += decodes.len() as u32;
@@ -1987,6 +2017,23 @@ fn rustc_version() -> String {
         .and_then(|o| String::from_utf8(o.stdout).ok())
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// `compare`'s elapsed-time hard gate is documented to skip cross-machine
+/// comparisons (wall-clock isn't comparable across hosts), and gates on
+/// `Scorecard.harness.host` equality to decide that. `OS/ARCH` alone (the
+/// prior value here) is identical for any two machines with the same OS and
+/// CPU architecture, so it silently enforced the gate across genuinely
+/// different hosts — a real machine identity is required for that skip to
+/// mean what it claims.
+fn hostname_string() -> String {
+    std::process::Command::new("hostname")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "unknown-host".to_string())
 }
 
 /// Task W0.4 (2026-07-07): build the `Ft8Decoder` wrapper from CLI args for
@@ -2689,7 +2736,12 @@ fn main() -> anyhow::Result<()> {
         },
         harness: HarnessInfo {
             harness_version: env!("CARGO_PKG_VERSION").to_string(),
-            host: format!("{}/{}", std::env::consts::OS, std::env::consts::ARCH),
+            host: format!(
+                "{}/{}/{}",
+                hostname_string(),
+                std::env::consts::OS,
+                std::env::consts::ARCH
+            ),
             cores_used: std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(1),

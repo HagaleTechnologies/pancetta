@@ -132,6 +132,27 @@ pub fn linear_bias() -> &'static [f32] {
     )
 }
 
+/// SHA-256 of the compiled-in weight blob, from `assets/neural_osd_weights.provenance.json`
+/// (kept equal to `RAW_BYTES`'s own hash by this module's `provenance_matches_compiled_blob_schema_and_hash`
+/// test below). `neural_osd_enabled` alone can't distinguish which model produced a given
+/// A/B arm's decodes — the blob is `include_bytes!`-compiled, not runtime-selectable, so two
+/// arms both showing `neural_osd_enabled: true` may still be running different weights (or,
+/// absent a rebuild between them, the same weights twice). Exists for research/eval tooling
+/// (PAN-9 Phases 6-7) to stamp into each scorecard.
+#[cfg(any(feature = "transmit", feature = "benchmark"))]
+pub fn provenance_sha256() -> &'static str {
+    static SHA: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SHA.get_or_init(|| {
+        let json: serde_json::Value =
+            serde_json::from_str(include_str!("../assets/neural_osd_weights.provenance.json"))
+                .expect("neural_osd_weights.provenance.json must be valid JSON");
+        json["sha256"]
+            .as_str()
+            .expect("neural_osd_weights.provenance.json missing sha256 field")
+            .to_string()
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

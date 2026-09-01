@@ -10,6 +10,28 @@ Run four paired arms on hard-200, hard-1000, **and noise_1000**:
 3. C: `--osd-depth 1 --neural-osd on` with shipped migrated weights
 4. D: `--osd-depth 1 --neural-osd on` with soft-rank candidate weights
 
+**Arms C and D require a rebuild in between, not just a config flag.** The
+weight blob is `include_bytes!`-compiled into the binary
+(`pancetta-ft8/assets/neural_osd_weights.bin`), so `--neural-osd on` alone
+cannot select between the shipped and candidate weights — running C then D
+without swapping the blob and rebuilding just runs the same model twice.
+Between C and D:
+
+```bash
+cp path/to/shipped_weights.bin pancetta-ft8/assets/neural_osd_weights.bin      # before arm C
+cp path/to/shipped_weights.provenance.json pancetta-ft8/assets/neural_osd_weights.provenance.json
+cargo build --release -p pancetta-research --bin eval                          # rebuild picks up the shipped blob
+
+cd training/neural_osd && python export_weights.py --model rank_model.pt       # before arm D — regenerates
+cd ../.. && cargo build --release -p pancetta-research --bin eval              # both the .bin and provenance.json
+```
+
+Every scorecard's `config.decoder.neural_osd_weights_sha256` field (stamped
+automatically from `pancetta-ft8/assets/neural_osd_weights.provenance.json`)
+records which blob actually ran. Before trusting a D-vs-C comparison, diff
+that field across the two scorecards — if it's identical, C and D ran the
+same model and the comparison proves nothing.
+
 `noise_1000` is not optional. `compare`'s false-positive hard gate only
 evaluates tiers present in **both** scorecards, so an arm run without the noise
 tier makes that gate vacuous — a candidate that newly decodes noise would pass
