@@ -351,3 +351,13 @@ Two changes, so "auto-merge when checks pass" is actually true, not just intende
    2-parent merge commit) and the repo's `allow_auto_merge`/`allow_squash_merge` settings were
    already `true` before this change, so no repo-settings change was needed beyond branch
    protection.
+
+**Superseded (2026-09-01):** `auto-merge.yml` is deleted and `dependabot-auto-merge.yml` no longer
+calls `gh pr merge --auto` — both native auto-merge paths are retired in favor of Mergify's merge
+queue (`.mergify.yml`, new this same change). The trusted-author/breaking-update gating logic this
+entry describes is preserved (dependabot's classify/auto-approve/label-breaking steps are
+unchanged; the general trusted-author case is now covered by Mergify's own conditions —
+`base = main`, `-draft`, `-closed`, thread-resolution, and all three required checks — rather than
+a bespoke `author_association` check, since Mergify has no per-author-association primitive and
+this repo's ruleset `bypass_actors` already covers the equivalent trust boundary for admin/owner
+pushes). Branch protection (`required_status_checks`) is unchanged by this addendum.
