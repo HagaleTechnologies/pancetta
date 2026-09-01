@@ -683,7 +683,15 @@ jobs:
               echo "::error::Codex's initial review left $unresolved unresolved concern(s) open — resolve them, then push a remediation commit to trigger a fresh re-review."
               exit 1
             fi
-            apply_clean_label
+            # `|| true` is load-bearing, not decorative: this step runs under
+            # bash -e (GitHub Actions' default for run: blocks), so a bare
+            # call to a function whose own final-failure path returns
+            # non-zero aborts the whole step under errexit -- turning
+            # apply_clean_label()'s deliberately fail-open design (warn,
+            # don't block) into fail-closed. A transient GitHub API blip
+            # during the label POST would fail the REQUIRED "Wait for Codex
+            # Review" check red on an otherwise genuinely clean round.
+            apply_clean_label || true
             exit 0
           fi
 
@@ -698,7 +706,7 @@ jobs:
 
           if [ "$IS_GENUINE_SYNC" != "true" ]; then
             echo "This round is a reopened/rerun, not a genuine synchronize — the code hasn't changed, so not auto-resolving baseline threads that may still describe it (the label below still applies regardless: this revision IS clean, just not safe to silently clear old findings against)."
-            apply_clean_label
+            apply_clean_label || true
             exit 0
           fi
 
@@ -795,7 +803,9 @@ jobs:
           # below whether auto-resolving stale baseline threads is safe.
           # That decision is a DIFFERENT question from "is this SHA clean"
           # and must not gate the label itself.
-          apply_clean_label
+          # `|| true`: same errexit fail-open guard as the other call sites
+          # above -- see the first one for the full rationale.
+          apply_clean_label || true
 
           echo "$result" | jq -r '.resolvable[]' | while read -r thread_id; do
             [ -z "$thread_id" ] && continue
