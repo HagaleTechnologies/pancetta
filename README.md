@@ -6,7 +6,7 @@
 
 <p align="center">
   A full FT8 station in one Rust binary — decode, score, work, log.<br>
-  Built and operated by <strong>Tony Hagale, K5ARH</strong>.
+  Built and operated by <strong>Tony Hagale, W5AU</strong>.
 </p>
 
 <p align="center">
