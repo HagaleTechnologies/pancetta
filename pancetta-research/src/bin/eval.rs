@@ -1903,6 +1903,7 @@ fn run_noise_tier(
          cannot be evaluated against an empty corpus",
         manifest_path.display()
     );
+    let preflight_started = Instant::now();
     for entry in &entries {
         anyhow::ensure!(
             entry.wav_path.is_file(),
@@ -1919,6 +1920,13 @@ fn run_noise_tier(
             actual
         );
     }
+    // Same category of pure I/O as preflight_curated_corpus (WAV existence
+    // + hash) — excluded from harness.elapsed_seconds for the same reason
+    // (see TierResult::preflight_seconds): the required noise_1000 tier
+    // reads and hashes every WAV after the harness timer starts, so
+    // cold-vs-warm filesystem cache variance shouldn't be attributable to
+    // the candidate under the elapsed hard gate.
+    let preflight_seconds = preflight_started.elapsed().as_secs_f64();
     let total = entries.len() as u32;
     let mut false_positives_total: u32 = 0;
     let mut noise_files_decoded: u32 = 0;
@@ -1948,6 +1956,7 @@ fn run_noise_tier(
         wavs_processed: total,
         false_positives_total: Some(false_positives_total),
         noise_files_decoded: Some(noise_files_decoded),
+        preflight_seconds,
         ..Default::default()
     })
 }

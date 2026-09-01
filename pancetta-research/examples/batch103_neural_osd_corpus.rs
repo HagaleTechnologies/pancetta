@@ -245,15 +245,27 @@ fn decode(wav: &Path, root: &Path) -> Result<Vec<CorpusRecord>> {
         return Ok(Vec::new());
     }
     let mut config = pancetta_ft8::Ft8Config::default();
-    // Capture truth at the deepest supported OSD order (3), not the depth-1
-    // the production A/B arms actually run at. A depth-1-only capture never
-    // produces osd_codeword for a BP failure that needs 2+ flips, so
-    // _iter_samples silently drops it — conditioning the training set on
-    // exactly the easy cases the depth-only baseline (arm B) already
-    // solves, and excluding the hard multi-flip cases the candidate most
-    // needs to learn. This only affects label mining here; eval.rs's A/B
-    // arms configure their own osd_depth independently and are unaffected.
-    config.osd_depth = Some(3);
+    // Capture truth at OSD depth 2, not the depth-1 the production A/B arms
+    // actually run at. A depth-1-only capture never produces osd_codeword
+    // for a BP failure that needs 2+ flips, so _iter_samples silently drops
+    // it — conditioning the training set on exactly the easy cases the
+    // depth-only baseline (arm B) already solves. This only affects label
+    // mining here; eval.rs's A/B arms configure their own osd_depth
+    // independently and are unaffected.
+    //
+    // Deliberately NOT depth 3: `research/experiments/2026-05-24-osd3-followup.md`
+    // measured OSD-2 -> OSD-3 adding ~284 novel decodes on hard-200 with
+    // ZERO recall gain (~275 estimated CRC-14 collisions, not real
+    // recoveries) — OSD-3 is the LDPC codeword-neighborhood width where
+    // spurious CRC-14-valid collisions become common enough to matter, and
+    // capture has no independent oracle to catch one and reject it before
+    // it's recorded as a training label. OSD-2 carries the same class of
+    // risk at a much lower, already production-precedented rate. Mining
+    // depth-3 truth safely needs validating recovered codewords against an
+    // external oracle (synthetic ground truth, or per-WAV jt9 cross-check)
+    // — real work, out of scope here; left for a follow-up, not attempted
+    // as a quick depth bump.
+    config.osd_depth = Some(2);
     config.neural_osd_enabled = false;
     let mut decoder = pancetta_ft8::Ft8Decoder::new(config)
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
