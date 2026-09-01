@@ -1,8 +1,10 @@
-# Self-contained (no `extends: credenza`) -- pancetta is a public repo, and
-# a `uses:`-called reusable workflow's real step content renders into the
-# calling repo's own public Action logs, which would leak private-repo
-# incident history embedded in a shared config's own comments. This file's
-# own comments stay generic for the same reason.
+# Self-contained (no `extends:` pulling in a shared/reusable config) --
+# pancetta is a public repo, and an externally-sourced config's real content
+# renders into THIS repo's own public Action logs when it's pulled in, which
+# would leak incident history or other detail embedded in a shared config's
+# own comments (some of which may live in a private repo) straight onto a
+# public log. This file's own comments stay generic for the same reason --
+# no references to other repos, named or otherwise.
 #
 # Mergify's rule-action only re-fires when a condition transitions from
 # unmatched to matched -- a static condition list (base=main, -draft,
@@ -18,6 +20,37 @@
 # "major-update,needs-review" and deliberately never auto-approves them --
 # a queue tool with no concept of that label would silently defeat that
 # policy.
+#
+# Trusted-author gate (`author = thagale` OR `author = dependabot[bot]`):
+# this repo is public, and the ruleset this queue rule reports through has
+# `required_approving_review_count: 0` -- with no author condition here, ANY
+# outside contributor's PR that goes green on all three required checks
+# above would auto-queue and merge with zero human in the loop, exactly the
+# gap the now-deleted auto-merge.yml's own `author_association in (OWNER,
+# MEMBER, COLLABORATOR)` check existed to close. Mergify has no direct
+# equivalent of GitHub's `author_association` (no built-in "is this login a
+# collaborator" check), so `author = thagale` is the closest available
+# primitive: an exact-login match rather than a role lookup. Practical
+# effect is the same today -- `gh api
+# repos/HagaleTechnologies/pancetta/collaborators` lists exactly one
+# collaborator (thagale, admin) -- but the mechanism diverges once a second
+# trusted collaborator is ever added: their PRs will NOT auto-queue under
+# this condition and need either a manual `@Mergifyio queue` comment or this
+# line updated to an `or:` of logins (there is no Mergify list-of-values
+# shorthand for "any current repo collaborator" to fall back on instead).
+#
+# `author = dependabot[bot]` is included alongside the human-author case,
+# not a loophole in it: dependabot-auto-merge.yml's own classify step
+# already vets every Dependabot PR before it can reach this rule at all --
+# breaking/major bumps get labeled "major-update,needs-review" and are
+# excluded outright by the `-label = needs-review` condition above, so only
+# already-reviewed-as-safe minor/patch bumps ever reach this author check.
+# Restricting to `author = thagale` alone would have silently revoked that
+# pre-existing, still-desired auto-queue path for Dependabot (caught in
+# review of an earlier version of this file) -- Dependabot was always meant
+# to auto-queue non-breaking bumps; the risky/breaking case is excluded via
+# the label regardless of author, so allowing it here doesn't reopen the gap
+# this whole condition exists to close.
 queue_rules:
   - name: default
     merge_method: squash
@@ -31,6 +64,9 @@ pull_request_rules:
       - -draft
       - -closed
       - -label = needs-review
+      - or:
+          - author = thagale
+          - author = dependabot[bot]
       - "#review-threads-unresolved = 0"
       - check-success = CI
       - check-success = Supply Chain

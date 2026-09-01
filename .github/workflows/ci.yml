@@ -19,6 +19,26 @@ on:
     - cron: '0 12 * * 1'
   workflow_dispatch:
 
+# wait-for-codex.yml's own concurrency group (keyed on PR number,
+# cancel-in-progress: true) cancels push A's "Wait for Codex Review" run the
+# instant push B supersedes it -- meaning A's codex-clean:<sha12> label can
+# never be produced. Without a concurrency block here too, A's `ci.yml` run
+# (including the codex-clean job above, which polls for exactly that label)
+# would keep running for its FULL 95-minute timeout as a zombie even though
+# its only possible label producer was just cancelled.
+#
+# Unlike wait-for-codex.yml, this workflow also runs on push/schedule/
+# workflow_dispatch (see the `on:` block above), which have no PR number to
+# key on and must never cancel each other -- a push to main superseding
+# another push to main mid-run, or two independent schedule/dispatch runs
+# overlapping, should each run to completion, not race each other's
+# cancellation. github.run_id is unique per run, so falling back to it for
+# any non-pull_request event makes cancellation a no-op there: each such run
+# gets its own group and nothing else in it can ever match.
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   # pull-requests: read and issues: read are narrowed further at the job

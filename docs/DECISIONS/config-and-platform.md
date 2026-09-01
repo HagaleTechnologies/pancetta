@@ -357,7 +357,23 @@ calls `gh pr merge --auto` — both native auto-merge paths are retired in favor
 queue (`.mergify.yml`, new this same change). The trusted-author/breaking-update gating logic this
 entry describes is preserved (dependabot's classify/auto-approve/label-breaking steps are
 unchanged; the general trusted-author case is now covered by Mergify's own conditions —
-`base = main`, `-draft`, `-closed`, thread-resolution, and all three required checks — rather than
-a bespoke `author_association` check, since Mergify has no per-author-association primitive and
-this repo's ruleset `bypass_actors` already covers the equivalent trust boundary for admin/owner
-pushes). Branch protection (`required_status_checks`) is unchanged by this addendum.
+`base = main`, `-draft`, `-closed`, thread-resolution, and all three required checks — plus a new
+`or: [author = thagale, author = dependabot[bot]]` condition in `.mergify.yml`, added as a
+2026-09-01 follow-up fix after this addendum's initial version shipped with no author condition at
+all (a live gap: with this repo's ruleset at `required_approving_review_count: 0`, any outside
+contributor's green-CI PR would have auto-queued with zero human review). `author = thagale` is
+Mergify's closest available primitive to the deleted workflow's `author_association in (OWNER,
+MEMBER, COLLABORATOR)` check — Mergify has no direct equivalent of that GitHub-native field (no
+built-in role/collaborator lookup), only an exact-login match — and `bypass_actors` is not a
+substitute for it: `bypass_actors` governs who may bypass the ruleset entirely, not whether a normal
+(non-bypass) PR gets auto-queued by Mergify, so it does nothing to gate this path. Today the human
+side of that condition matches the deleted check's practical effect (`gh api
+repos/HagaleTechnologies/pancetta/collaborators` lists exactly one collaborator, thagale, admin), but
+the mechanism will need revisiting the moment a second trusted collaborator is added — their PRs
+won't auto-queue under a single-login condition. `author = dependabot[bot]` is included alongside it
+deliberately, not a loophole: a bare `author = thagale` condition (this fix's own first-pass version)
+would have silently revoked Dependabot's pre-existing, still-desired auto-queue path for non-breaking
+bumps, which `dependabot-auto-merge.yml`'s own classify step already vets (breaking/major bumps are
+labeled `needs-review` and excluded regardless of author via the existing `-label = needs-review`
+condition) — caught in review before landing. Branch protection (`required_status_checks`) is
+unchanged by this addendum.
