@@ -21,13 +21,20 @@ on:
 
 permissions:
   contents: read
-  # pull-requests: read is narrowed further at the job level below
-  # (codex-clean) -- a job's own permissions: block can only be a SUBSET
-  # of what's granted here, never wider. Without this scope present at
-  # this top level, GitHub rejects the whole workflow file at parse time
-  # (zero jobs created, no per-job error) the moment that job requests a
-  # scope this block doesn't grant.
+  # pull-requests: read and issues: read are narrowed further at the job
+  # level below (codex-clean) -- a job's own permissions: block can only
+  # be a SUBSET of what's granted here, never wider. Without these scopes
+  # present at this top level, GitHub rejects the whole workflow file at
+  # parse time (zero jobs created, no per-job error) the moment that job
+  # requests a scope this block doesn't grant.
   pull-requests: read
+  # codex-clean's poll step calls `gh api repos/$REPO/issues/$PR/labels`
+  # (GET) -- that endpoint family is scoped under Issues in GitHub's
+  # token model, not Pull Requests, regardless of the fact that the
+  # target is a PR (PRs are issues for labeling purposes). Read-only:
+  # the poll only lists labels, it never attaches one (compare
+  # wait-for-codex.yml, which needs issues: write for its POST/attach).
+  issues: read
 
 env:
   CARGO_TERM_COLOR: always
@@ -94,6 +101,10 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      # See the top-level permissions: block's comment -- the poll
+      # step's `gh api .../issues/$PR/labels` GET requires issues: read,
+      # not pull-requests: read, even though the target is a PR.
+      issues: read
     # exclude_dependabot + draft-PR skip, mirroring wait-for-codex.yml's own
     # eligibility check -- belt-and-suspenders against that producer-side
     # skip logic ever drifting from this consumer-side one.
