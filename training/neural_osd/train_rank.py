@@ -62,26 +62,38 @@ def soft_rank_loss_tensor(scores, labels, tau=0.1):
     return ((soft_ranks * labels).sum(dim=1)[valid] / positives[valid]).mean()
 
 
-def validation_soft_rank_metric(model, val_x, val_y, tau, batch_size=256):
-    """Batched validation soft-rank metric, equivalent to a single full-split
-    call but bounded to O(batch_size) peak activation memory.
+def validation_metrics(model, val_x, val_y, tau, bce_weight, batch_size=256):
+    """Batched validation metrics, equivalent to a single full-split call
+    but bounded to O(batch_size) peak activation memory.
 
     At T1 scale (~100k validation samples) a single forward pass over the
     whole split materializes roughly 1.8 GB of input alone plus several GB
     of conv1 activations, which can OOM checkpoint selection even though
-    training itself is batched. Aggregates the same per-sample quantity
-    `soft_rank_loss_tensor` averages (`(soft_ranks * labels).sum(dim=1) /
-    positives`, restricted to samples with at least one positive label) as
-    a running sum/count across batches instead of a mean-of-batch-means, so
-    the result is numerically equivalent regardless of batch size or how
-    valid samples are distributed across batches.
+    training itself is batched. Aggregates the same per-sample quantities
+    `soft_rank_loss_tensor`/BCE average — `(soft_ranks * labels).sum(dim=1)
+    / positives` restricted to samples with a positive label, and
+    per-element BCE over every score — as running sums/counts across
+    batches instead of a mean-of-batch-means, so both results are
+    numerically equivalent to a single full-split call regardless of batch
+    size or how samples are distributed across batches.
+
+    Returns `(rank_metric, combined_metric)`: `rank_metric` alone is
+    shift-invariant (adding the same constant to every score in a sample
+    leaves it unchanged) and is the interpretable "expected reprocessing
+    order" figure. `combined_metric` folds in the BCE term at the same
+    weight `combined_loss` trains with, so checkpoint selection is
+    sensitive to the absolute score scale production actually reads
+    (`reliability_sorted_indices` compares scores directly against
+    parity-bit |LLR|) instead of only the rank-preserving component.
     """
     import torch
     from torch.utils.data import DataLoader, TensorDataset
 
     loader = DataLoader(TensorDataset(torch.from_numpy(val_x), torch.from_numpy(val_y)), batch_size=batch_size)
-    total = 0.0
-    count = 0
+    rank_total = 0.0
+    rank_count = 0
+    bce_total = 0.0
+    bce_count = 0
     for batch_x, batch_y in loader:
         scores = model(batch_x)
         pairwise = (scores.unsqueeze(1) - scores.unsqueeze(2)) / tau
@@ -90,11 +102,16 @@ def validation_soft_rank_metric(model, val_x, val_y, tau, batch_size=256):
         valid = positives > 0
         if valid.any():
             per_sample = (soft_ranks * batch_y).sum(dim=1)[valid] / positives[valid]
-            total += per_sample.sum().item()
-            count += int(valid.sum().item())
-    if count == 0:
+            rank_total += per_sample.sum().item()
+            rank_count += int(valid.sum().item())
+        bce = torch.nn.functional.binary_cross_entropy_with_logits(scores, batch_y, reduction="sum")
+        bce_total += bce.item()
+        bce_count += batch_y.numel()
+    if rank_count == 0:
         raise ValueError("soft-rank validation split has no positive labels")
-    return total / count
+    rank_metric = rank_total / rank_count
+    bce_metric = bce_total / bce_count
+    return rank_metric, rank_metric + bce_weight * bce_metric
 
 
 def combined_loss(scores, labels, tau=0.1, bce_weight=0.1):
@@ -237,6 +254,7 @@ def main():
     parser.add_argument("--epochs", type=int, default=60)
     parser.add_argument("--tau", type=float, default=0.1)
     parser.add_argument("--bce-weight", type=float, default=0.1)
+    parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
     if not math.isfinite(args.tau) or args.tau <= 0.0:
         # tau=0 divides by zero in the pairwise term (NaN loss, val never
@@ -251,9 +269,18 @@ def main():
         # run, it's left untouched and a later export step can silently
         # package that stale model as the new candidate.
         raise SystemExit(f"--epochs must be positive, got {args.epochs}")
+    import numpy as np
     import torch
     import torch.nn as nn
     from torch.utils.data import DataLoader, TensorDataset
+
+    # Seed before RankModel's weight init and the shuffled DataLoader
+    # construction below — identical corpus + CLI inputs must produce
+    # identical initial weights, minibatch order, checkpoints, and exported
+    # blob hashes, or a PAN-9 result can't be reproduced and algorithm
+    # changes get confounded with seed variance.
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
 
     class RankModel(nn.Module):
         def __init__(self):
@@ -287,10 +314,10 @@ def main():
                 optimizer.step()
             model.eval()
             with torch.no_grad():
-                metric = validation_soft_rank_metric(model, val_x, val_y, args.tau)
-            print(f"epoch={epoch + 1} tier1_expected_soft_rank={metric:.6f} [MODEL SELECTION ONLY — NOT A SHIP SIGNAL]")
-            if metric < best:
-                best = metric
+                rank_metric, selection_metric = validation_metrics(model, val_x, val_y, args.tau, args.bce_weight)
+            print(f"epoch={epoch + 1} tier1_expected_soft_rank={rank_metric:.6f} selection_metric={selection_metric:.6f} [MODEL SELECTION ONLY — NOT A SHIP SIGNAL]")
+            if selection_metric < best:
+                best = selection_metric
                 torch.save(model.state_dict(), args.output)
     finally:
         # Close every memmap's underlying OS mapping before removing its

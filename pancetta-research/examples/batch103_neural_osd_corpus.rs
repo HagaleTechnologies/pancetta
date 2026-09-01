@@ -180,11 +180,21 @@ fn decode(wav: &Path, root: &Path) -> Result<Vec<CorpusRecord>> {
     let mut reader =
         hound::WavReader::open(wav).with_context(|| format!("open {}", wav.display()))?;
     let spec = reader.spec();
-    anyhow::ensure!(
-        spec.channels == 1 && spec.sample_rate == 12_000,
-        "{} is not 12 kHz mono",
-        wav.display()
-    );
+    // The live recorder also writes non-decoder-window WAVs into the same
+    // directory tree — e.g. `raw_48khz_diagnostic.wav`
+    // (pancetta/src/coordinator/audio.rs), 48 kHz stereo, written once
+    // after ~90s of operation. Aborting the whole T1 scan over one such
+    // file (potentially after already processing every alphabetically
+    // earlier ft8_* recording) is worse than just skipping it.
+    if spec.channels != 1 || spec.sample_rate != 12_000 {
+        eprintln!(
+            "skip {} — {} ch @ {} Hz, not 12 kHz mono; not a decoder-window recording",
+            wav.display(),
+            spec.channels,
+            spec.sample_rate
+        );
+        return Ok(Vec::new());
+    }
     let samples: Vec<f32> = match spec.sample_format {
         // Decode integer PCM at its declared width. The recursive T1 scan over
         // ~/.pancetta/recordings routinely meets 24- and 32-bit captures, which
