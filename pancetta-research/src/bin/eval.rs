@@ -2418,6 +2418,13 @@ fn main() -> anyhow::Result<()> {
                 | "chrono-replay"
         )
     });
+    // Reads and parses every jt9 baseline JSON under research/baselines/ft8
+    // (thousands of files) — setup I/O, not decoder work. Timed and
+    // excluded from harness.elapsed_seconds below for the same reason as
+    // TierResult::preflight_seconds: run sequentially, arm A pays cold-disk
+    // I/O that later arms read from warm page cache, which the elapsed
+    // hard gate would otherwise attribute to the candidate.
+    let classifier_setup_started = Instant::now();
     let novel_classifier: Option<pancetta_research::FpFilter> = if novel_classifier_needed {
         let dir = workspace.join("research/baselines/ft8");
         if dir.exists() {
@@ -2443,6 +2450,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
+    let classifier_setup_seconds = classifier_setup_started.elapsed().as_secs_f64();
     let novel_classifier_ref = novel_classifier.as_ref();
 
     // Batch 19 (2026-06-02): build a tier-slot pool when --max-concurrent-tiers
@@ -2785,12 +2793,14 @@ fn main() -> anyhow::Result<()> {
         notes: format!("Decoder under test: {}", decoder.identity()),
     };
     populate_composite(&mut card, default_weights());
-    // Preflight (WAV hashing + baseline-cache validation) is pure I/O, not
-    // decoder work — subtract it so cold-vs-warm filesystem-cache variance
-    // between two sequentially-run arms doesn't get attributed to the
-    // candidate under the A/B elapsed hard gate.
+    // Preflight (WAV hashing + baseline-cache validation) and novel-
+    // classifier setup (parsing every jt9 baseline JSON) are pure I/O, not
+    // decoder work — subtract both so cold-vs-warm filesystem-cache
+    // variance between two sequentially-run arms doesn't get attributed to
+    // the candidate under the A/B elapsed hard gate.
     card.harness.elapsed_seconds =
-        (started.elapsed().as_secs_f64() - preflight_seconds_total).max(0.0);
+        (started.elapsed().as_secs_f64() - preflight_seconds_total - classifier_setup_seconds)
+            .max(0.0);
 
     // Task W0.3 (2026-07-06): compute real `RegressionFlags` by
     // self-diffing this run against the checked-in

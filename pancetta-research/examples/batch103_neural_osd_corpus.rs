@@ -62,18 +62,17 @@ fn main() -> Result<()> {
     // later training run can't tell a failed mining pass from a real,
     // complete corpus.
     let tmp_output = output.with_extension("jsonl.tmp");
-    let mut writer = BufWriter::new(File::create(&tmp_output)?);
-    let mut records = 0usize;
-    let mut labels = 0usize;
-    for wav in &wavs {
-        for record in decode(wav, &root)? {
-            labels += usize::from(is_trainable_label(&record));
-            serde_json::to_writer(&mut writer, &record)?;
-            writer.write_all(b"\n")?;
-            records += 1;
+    let (records, labels) = match scan_and_write(&wavs, &root, &tmp_output) {
+        Ok(counts) => counts,
+        Err(error) => {
+            // A late corrupt/unreadable WAV, a serialization failure, or a
+            // write error must not leave a partial (potentially many-GB at
+            // T1 scale) tmp file behind just because it wasn't one of the
+            // deliberate validation failures below.
+            let _ = std::fs::remove_file(&tmp_output);
+            return Err(error);
         }
-    }
-    writer.flush()?;
+    };
     if records == 0 {
         let _ = std::fs::remove_file(&tmp_output);
         anyhow::bail!("tier {tier} wrote zero records from {} WAVs", wavs.len());
@@ -103,6 +102,27 @@ fn main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Decode every WAV and write its records to `tmp_path`, returning
+/// `(records, labels)`. Factored out of `main` so a single call site can
+/// clean up the temp file on ANY error from this scan (decode failure,
+/// serialization failure, write failure) rather than only the two
+/// deliberate post-scan validation failures.
+fn scan_and_write(wavs: &[PathBuf], root: &Path, tmp_path: &Path) -> Result<(usize, usize)> {
+    let mut writer = BufWriter::new(File::create(tmp_path)?);
+    let mut records = 0usize;
+    let mut labels = 0usize;
+    for wav in wavs {
+        for record in decode(wav, root)? {
+            labels += usize::from(is_trainable_label(&record));
+            serde_json::to_writer(&mut writer, &record)?;
+            writer.write_all(b"\n")?;
+            records += 1;
+        }
+    }
+    writer.flush()?;
+    Ok((records, labels))
 }
 
 /// Mirrors `train_rank.py::_iter_samples`'s trainable-row predicate: a
