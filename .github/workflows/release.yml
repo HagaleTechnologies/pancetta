@@ -95,6 +95,18 @@ jobs:
         # CI) and every helper binary. Default features (metrics + hamlib
         # rigctld-TCP client) are the production build; no system hamlib is
         # needed at build time (runtime-only, via rigctld over TCP).
+        #
+        # CLUBLOG_API_KEY: ClubLog issues its API key per-application, not
+        # per-operator, so official release binaries bake in Pancetta's own
+        # key (pancetta-config/src/network.rs, `option_env!`) — operators
+        # then only need their own ClubLog email/password, not a personal
+        # key. pancetta-config/build.rs pins a rebuild to this var so
+        # rust-cache below can't silently serve a build compiled before the
+        # secret existed. Empty/unset (e.g. a fork without the repo secret)
+        # degrades to no default key — ClubLog upload still works if the
+        # operator sets their own `network.clublog.api_key`.
+        env:
+          CLUBLOG_API_KEY: ${{ secrets.CLUBLOG_API_KEY }}
         run: cargo build --release -p pancetta --target ${{ matrix.target }}
 
       - name: Smoke test — binary must embed the real C decoder

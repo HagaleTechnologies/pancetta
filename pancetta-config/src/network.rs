@@ -102,9 +102,26 @@ pub struct ClubLogConfig {
     #[serde(default)]
     pub callsign: String,
 
-    /// ClubLog application API key (per-application, from the ClubLog API page).
-    #[serde(default)]
+    /// ClubLog application API key (per-application, from the ClubLog API
+    /// page). ClubLog issues this per *application*, not per operator, so
+    /// most operators shouldn't need to register one: an official release
+    /// binary has Pancetta's own key baked in at build time (`build.rs`
+    /// pins a rebuild to `CLUBLOG_API_KEY`; local `cargo build` never has it
+    /// set, so a source build falls back to empty here). Leaving this field
+    /// absent from your config file uses that baked-in default; set it
+    /// explicitly to override with your own registered key instead.
+    #[serde(default = "default_clublog_api_key")]
     pub api_key: String,
+}
+
+/// Pancetta's own ClubLog application key, embedded only in official release
+/// builds via a `CLUBLOG_API_KEY` build-time env var (release.yml). Absent
+/// (empty) in every local/source build and in `Config::default()` (the
+/// `#[derive(Default)]` above uses `String::default()`, not this function) —
+/// this fires only when TOML deserialization hits a config file that omits
+/// `api_key`, so the real value, if any, never lands in a checked-in file.
+fn default_clublog_api_key() -> String {
+    option_env!("CLUBLOG_API_KEY").unwrap_or("").to_string()
 }
 
 /// QRZ Logbook QSO upload configuration.
@@ -2311,5 +2328,24 @@ tx_allow_list = ["client-key-1", "client-key-2"]
             reparsed.station_agent.relay_url.as_deref(),
             Some("wss://relay.example/ws")
         );
+    }
+
+    #[test]
+    fn clublog_api_key_bakein_defaults_empty_and_toml_absence_falls_back() {
+        // Config::default() must NEVER carry the compiled key (it would leak
+        // into pancetta-config/defaults.toml via defaults_drift's
+        // render_defaults_toml()) — the derive(Default) path bypasses the
+        // serde `default = "fn"` attribute entirely.
+        assert_eq!(ClubLogConfig::default().api_key, "");
+
+        // A TOML fragment that omits api_key picks up the compiled default
+        // (empty in this local/source build, since CLUBLOG_API_KEY isn't set).
+        let cfg: ClubLogConfig =
+            toml::from_str("enabled = true\nemail = \"a@b.com\"\npassword = \"x\"\n").unwrap();
+        assert_eq!(cfg.api_key, default_clublog_api_key());
+
+        // An explicit empty value in the file still wins (no override).
+        let cfg: ClubLogConfig = toml::from_str("enabled = true\napi_key = \"\"\n").unwrap();
+        assert_eq!(cfg.api_key, "");
     }
 }

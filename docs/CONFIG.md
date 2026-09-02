@@ -318,7 +318,8 @@ enabled  = false
 email    = ""        # your ClubLog account email (NOT a callsign), plaintext on disk
 password = ""        # ClubLog password (an Application Password is recommended), plaintext
 callsign = ""        # station call the log uploads into; empty = use the QSO's own call
-api_key  = ""        # ClubLog application API key
+api_key  = ""        # ClubLog application API key — OMIT this line on an official release
+                      # binary to use Pancetta's own baked-in key; see notes below
 
 [network.qrz_logbook]
 enabled = false
@@ -344,7 +345,7 @@ poll_interval_secs = 30      # how often to poll for new priority spots
 | `clublog.email` | ClubLog | The email registered with your ClubLog account. |
 | `clublog.password` | ClubLog | Account password. Plaintext on disk. |
 | `clublog.callsign` | ClubLog | The station callsign the log is filed under. Leave empty to use each QSO's own callsign. |
-| `clublog.api_key` | ClubLog | Application API key. |
+| `clublog.api_key` | ClubLog | Application API key. **Omit this key entirely** (don't set it to `""`) on an official release binary — it falls back to Pancetta's own application key, baked in at build time. Only set it if you registered your own ClubLog application, or you're building from source (which never has the baked-in key, see below). |
 | `qrz_logbook.enabled` | QRZ | Master switch. When `true`, `api_key` is required. |
 | `qrz_logbook.api_key` | QRZ | Per-logbook API access key. |
 | `eqsl.enabled` | eQSL.cc | Master switch. When `true`, `username` and `password` are required. |
@@ -358,9 +359,18 @@ poll_interval_secs = 30      # how often to poll for new priority spots
 
 **Getting the keys:**
 
-- **ClubLog:** create a free account at <https://clublog.org>, then
-  request an application API key on the ClubLog API page
-  (<https://clublog.org/need_api.php>). The realtime upload POSTs to
+- **ClubLog:** create a free account at <https://clublog.org> and set
+  `email`/`password` (an Application Password is recommended) —
+  that's it for an official release binary. ClubLog issues its API key
+  per *application*, not per operator, so Pancetta's own key is baked
+  into official release binaries at build time
+  (`pancetta-config/src/network.rs`'s `option_env!("CLUBLOG_API_KEY")`,
+  set only by `release.yml`'s `CLUBLOG_API_KEY` repo secret) — leave
+  `api_key` out of your config file entirely to use it. Only request
+  your own key on the ClubLog API page
+  (<https://clublog.org/need_api.php>) if you're building from source
+  (source builds never have the baked-in key) or want your own
+  application identity. The realtime upload POSTs to
   `https://clublog.org/realtime.php` with your email + password +
   callsign + API key. A duplicate QSO is accepted (HTTP 200) and is
   harmless.
