@@ -1128,6 +1128,22 @@ pub struct ApplicationCoordinator {
     audio_reopen_tx:
         Option<crossbeam_channel::Sender<crate::coordinator::audio::AudioReopenRequest>>,
 
+    /// PAN-59 live rig-config-switch request channel. The TUI
+    /// command-relay task (`tui_relay.rs`) only holds cloned `Arc`/channel
+    /// handles, never `&mut ApplicationCoordinator` — Hamlib's reconnect
+    /// (`teardown_hamlib`/`start_hamlib_component`) needs `&mut self`, so
+    /// the request routes through here into `run_main_loop`, the only place
+    /// already holding `&mut self` in a loop. Not feature-gated (unlike the
+    /// Hamlib-only fields above): the sender must always exist so
+    /// `tui_relay.rs`'s unconditionally-compiled command-relay task can
+    /// clone it; `handle_hamlib_reconnect_request`'s
+    /// `#[cfg(not(feature = "pancetta-hamlib"))]` arm handles the
+    /// feature-disabled case at the receiving end.
+    pub(crate) hamlib_reconnect_tx:
+        tokio::sync::mpsc::Sender<crate::coordinator::hamlib::HamlibReconnectRequest>,
+    hamlib_reconnect_rx:
+        Option<tokio::sync::mpsc::Receiver<crate::coordinator::hamlib::HamlibReconnectRequest>>,
+
     /// Rig connection state for the TUI badge. Encodes
     /// [`crate::coordinator::hamlib::RigConnState`] via `as_u8`/`from_u8`.
     /// Written by the hamlib connect/poll loop, read by the TUI relay.
@@ -1652,6 +1668,21 @@ impl ApplicationCoordinator {
         let (waterfall_to_auto_tx, waterfall_to_auto_rx) =
             crossbeam_channel::bounded::<Vec<Vec<f32>>>(2);
 
+        // PAN-59: live rig-config-switch request channel. The TUI
+        // command-relay task (`tui_relay.rs`) only holds cloned `Arc`/channel
+        // handles, never `&mut ApplicationCoordinator` — Hamlib's reconnect
+        // needs `&mut self`, so the request routes through here into
+        // `run_main_loop`, the only place already holding `&mut self` in a
+        // loop. Capacity 1: at most one reconnect is ever in flight. I4 fix
+        // (PAN-59 review): the relay's `SelectRig` handler uses `try_send`
+        // (never blocks) and hands the response wait off to a spawned task,
+        // so it does NOT wait for a previous response before this channel
+        // can accept the next request's send attempt -- a `try_send` while a
+        // reconnect is still in flight simply fails `Full` and the relay
+        // reports "already in progress" instead of queuing or blocking.
+        let (hamlib_reconnect_tx, hamlib_reconnect_rx) =
+            tokio::sync::mpsc::channel::<crate::coordinator::hamlib::HamlibReconnectRequest>(1);
+
         let coordinator = Self {
             id,
             config,
@@ -1777,6 +1808,8 @@ impl ApplicationCoordinator {
             audio_output_default: Arc::new(AtomicBool::new(false)),
             audio_input_fallback: Arc::new(AtomicBool::new(false)),
             audio_reopen_tx: None,
+            hamlib_reconnect_tx,
+            hamlib_reconnect_rx: Some(hamlib_reconnect_rx),
             rig_conn_state: Arc::new(std::sync::atomic::AtomicU8::new(
                 crate::coordinator::hamlib::RigConnState::default().as_u8(),
             )),

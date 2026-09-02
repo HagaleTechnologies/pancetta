@@ -723,6 +723,195 @@ impl DeviceSelectionState {
     }
 }
 
+/// Which field of the rig-config picker (`i` key, PAN-59) currently has
+/// keyboard focus.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RigField {
+    Model,
+    Port,
+    Baud,
+    Ptt,
+}
+
+/// Fixed baud-rate choices, identical to `setup_rig`'s wizard list
+/// (`pancetta/src/main.rs:1385`).
+pub const RIG_BAUD_RATES: [u32; 6] = [4800, 9600, 19200, 38400, 57600, 115200];
+
+/// The 4 PTT methods the wizard offers (`setup_ptt`, `pancetta/src/main.rs:1409-1414`).
+/// Deliberately a function, not a `const` array: `PttMethod` doesn't derive
+/// `Copy` (nor `PartialEq` — comparisons below use `Debug` formatting,
+/// mirroring `setup_ptt`'s own `format!("{:?}", ...)` comparison at
+/// `pancetta/src/main.rs:1420`).
+pub fn rig_ptt_methods() -> [pancetta_config::rig::PttMethod; 4] {
+    use pancetta_config::rig::PttMethod;
+    [
+        PttMethod::None,
+        PttMethod::Cat,
+        PttMethod::Serial,
+        PttMethod::Vox,
+    ]
+}
+
+/// State for the live rig-config picker modal (`i` key, PAN-59). Mirrors
+/// `DeviceSelectionState` above but as a 4-field form (model/port/baud/PTT)
+/// rather than a 2-panel list.
+#[derive(Debug, Clone)]
+pub struct RigSelectionState {
+    pub visible: bool,
+    pub available_ports: Vec<String>,
+    pub model: String,
+    pub selected_port_idx: usize,
+    pub selected_baud_idx: usize,
+    pub selected_ptt_idx: usize,
+    pub active_field: RigField,
+    /// I-3 fix (PAN-59 final review): a snapshot of the four live fields
+    /// taken when the modal opens (and refreshed on a successful apply).
+    /// Esc restores the live fields FROM this snapshot rather than just
+    /// hiding the modal -- without it, an abandoned edit (garbage typed
+    /// into Model, then Esc) left the garbage sitting in the live fields,
+    /// silently ready to be applied by a LATER, unrelated Enter press the
+    /// next time the modal opened.
+    pub committed_model: String,
+    pub committed_port_idx: usize,
+    pub committed_baud_idx: usize,
+    pub committed_ptt_idx: usize,
+}
+
+impl Default for RigSelectionState {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            available_ports: Vec::new(),
+            model: String::new(),
+            selected_port_idx: 0,
+            selected_baud_idx: 1, // 9600, RigConfig's own default (rig.rs:807)
+            selected_ptt_idx: 0,  // PttMethod::None
+            active_field: RigField::Model,
+            committed_model: String::new(),
+            committed_port_idx: 0,
+            committed_baud_idx: 1,
+            committed_ptt_idx: 0,
+        }
+    }
+}
+
+impl RigSelectionState {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cycle focus forward through the 4 fields (Tab).
+    pub fn next_field(&mut self) {
+        self.active_field = match self.active_field {
+            RigField::Model => RigField::Port,
+            RigField::Port => RigField::Baud,
+            RigField::Baud => RigField::Ptt,
+            RigField::Ptt => RigField::Model,
+        };
+    }
+
+    /// Move the active list-field's selection up (Up arrow). No-op on the
+    /// `Model` field (text entry, not a list) and clamps at 0 — mirrors
+    /// `DeviceSelectionState::move_up`'s clamp-at-bounds style, not wrap.
+    pub fn move_up(&mut self) {
+        match self.active_field {
+            RigField::Model => {}
+            RigField::Port => {
+                if self.selected_port_idx > 0 {
+                    self.selected_port_idx -= 1;
+                }
+            }
+            RigField::Baud => {
+                if self.selected_baud_idx > 0 {
+                    self.selected_baud_idx -= 1;
+                }
+            }
+            RigField::Ptt => {
+                if self.selected_ptt_idx > 0 {
+                    self.selected_ptt_idx -= 1;
+                }
+            }
+        }
+    }
+
+    /// Move the active list-field's selection down (Down arrow). Clamps at
+    /// each list's last index.
+    pub fn move_down(&mut self) {
+        match self.active_field {
+            RigField::Model => {}
+            RigField::Port => {
+                if !self.available_ports.is_empty()
+                    && self.selected_port_idx + 1 < self.available_ports.len()
+                {
+                    self.selected_port_idx += 1;
+                }
+            }
+            RigField::Baud => {
+                if self.selected_baud_idx + 1 < RIG_BAUD_RATES.len() {
+                    self.selected_baud_idx += 1;
+                }
+            }
+            RigField::Ptt => {
+                if self.selected_ptt_idx + 1 < rig_ptt_methods().len() {
+                    self.selected_ptt_idx += 1;
+                }
+            }
+        }
+    }
+
+    /// Append a character to the model text field (only meaningful while
+    /// `active_field == RigField::Model`; callers gate on that).
+    pub fn push_model_char(&mut self, c: char) {
+        self.model.push(c);
+    }
+
+    /// Backspace the model text field.
+    pub fn pop_model_char(&mut self) {
+        self.model.pop();
+    }
+
+    /// The port value to submit — empty string if no ports were enumerated.
+    pub fn selected_port(&self) -> String {
+        self.available_ports
+            .get(self.selected_port_idx)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    pub fn selected_baud(&self) -> u32 {
+        RIG_BAUD_RATES[self.selected_baud_idx.min(RIG_BAUD_RATES.len() - 1)]
+    }
+
+    pub fn selected_ptt(&self) -> pancetta_config::rig::PttMethod {
+        let methods = rig_ptt_methods();
+        methods[self.selected_ptt_idx.min(methods.len() - 1)].clone()
+    }
+
+    /// I-3 fix (PAN-59 final review): snapshot the four live field values
+    /// into the "committed" baseline. Called when the modal opens (so Esc
+    /// has something correct to restore to) and again right after a
+    /// successful Enter/apply (so the snapshot stays in sync for the NEXT
+    /// open/cancel cycle, rather than reverting past values the operator
+    /// just successfully applied).
+    pub fn snapshot_committed(&mut self) {
+        self.committed_model = self.model.clone();
+        self.committed_port_idx = self.selected_port_idx;
+        self.committed_baud_idx = self.selected_baud_idx;
+        self.committed_ptt_idx = self.selected_ptt_idx;
+    }
+
+    /// I-3 fix (PAN-59 final review): restore the four live field values
+    /// from the last committed snapshot. Called on Esc so an abandoned
+    /// edit doesn't linger in the live fields to be picked up by a LATER,
+    /// unrelated Enter press the next time the modal opens.
+    pub fn restore_committed(&mut self) {
+        self.model = self.committed_model.clone();
+        self.selected_port_idx = self.committed_port_idx;
+        self.selected_baud_idx = self.committed_baud_idx;
+        self.selected_ptt_idx = self.committed_ptt_idx;
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ActivePanel {
     BandActivity,
@@ -1023,6 +1212,9 @@ pub struct App {
     // Device selection modal
     pub device_selection: DeviceSelectionState,
 
+    // Rig config picker modal (PAN-59)
+    pub rig_selection: RigSelectionState,
+
     // Help overlay
     pub help_visible: bool,
 
@@ -1274,6 +1466,7 @@ impl App {
             waterfall_data: Vec::new(),
             autonomous_status: None,
             device_selection: DeviceSelectionState::new(),
+            rig_selection: RigSelectionState::new(),
             help_visible: false,
             quit_confirm_visible: false,
             freq_modal: FreqModalState::default(),
@@ -3484,6 +3677,55 @@ impl App {
             .position(|(_, is_default)| *is_default)
             .unwrap_or(0);
         self.device_selection.selected_input_idx = in_idx;
+    }
+
+    /// Seed `rig_selection` from a `TuiMessage::RigConfigUpdate` (PAN-59).
+    /// Pre-populates the modal with live values so it opens editable, not
+    /// blank — mirrors `set_audio_devices`'s seeding of `device_selection`.
+    pub fn apply_rig_config_update(
+        &mut self,
+        mut available_ports: Vec<String>,
+        current_model: String,
+        current_port: String,
+        current_baud_rate: u32,
+        current_ptt_method: pancetta_config::rig::PttMethod,
+    ) {
+        // I-2a fix (PAN-59 final review): if the configured port isn't
+        // among the enumerated ones (the rig is unplugged, or it's a
+        // `host:port` network-rig spec -- `serialport::available_ports()`
+        // never enumerates those), falling back to index 0 of an unrelated
+        // list would preselect some OTHER device. Combined with I-2b (the
+        // Enter-key handler refusing an empty `selected_port()`), that
+        // preselection is exactly what silently rewrites the operator's
+        // real port the moment they press Enter without ever touching the
+        // Port field. Prepend the current value instead so "leave the
+        // port alone" is always a selectable, default-selected option.
+        let selected_port_idx = match available_ports.iter().position(|p| *p == current_port) {
+            Some(idx) => idx,
+            None => {
+                if !current_port.is_empty() {
+                    available_ports.insert(0, current_port.clone());
+                }
+                0
+            }
+        };
+        let selected_baud_idx = RIG_BAUD_RATES
+            .iter()
+            .position(|b| *b == current_baud_rate)
+            .unwrap_or(1);
+        let selected_ptt_idx = rig_ptt_methods()
+            .iter()
+            .position(|m| format!("{:?}", m) == format!("{:?}", current_ptt_method))
+            .unwrap_or(0);
+
+        self.rig_selection.available_ports = available_ports;
+        self.rig_selection.model = current_model;
+        self.rig_selection.selected_port_idx = selected_port_idx;
+        self.rig_selection.selected_baud_idx = selected_baud_idx;
+        self.rig_selection.selected_ptt_idx = selected_ptt_idx;
+        // Keep the committed snapshot (I-3) in sync with this freshly-
+        // authoritative baseline.
+        self.rig_selection.snapshot_committed();
     }
 
     pub fn toggle_autonomous(&mut self) {
@@ -6073,6 +6315,142 @@ mod tests {
         assert_eq!(st.selected_output_name().as_deref(), Some("Out2"));
         // Input selection was untouched by output navigation.
         assert_eq!(st.selected_input_name().as_deref(), Some("In0"));
+    }
+
+    // === Rig config picker (PAN-59) =======================================
+
+    #[test]
+    fn rig_selection_state_defaults_to_9600_baud_and_none_ptt() {
+        let state = RigSelectionState::default();
+        assert_eq!(state.selected_baud(), 9600);
+        assert!(matches!(
+            state.selected_ptt(),
+            pancetta_config::rig::PttMethod::None
+        ));
+        assert!(!state.visible);
+    }
+
+    #[test]
+    fn rig_selection_state_next_field_cycles_through_all_four() {
+        let mut state = RigSelectionState::default();
+        assert_eq!(state.active_field, RigField::Model);
+        state.next_field();
+        assert_eq!(state.active_field, RigField::Port);
+        state.next_field();
+        assert_eq!(state.active_field, RigField::Baud);
+        state.next_field();
+        assert_eq!(state.active_field, RigField::Ptt);
+        state.next_field();
+        assert_eq!(state.active_field, RigField::Model);
+    }
+
+    #[test]
+    fn rig_selection_state_move_up_down_clamp_on_baud_field() {
+        let mut state = RigSelectionState::default();
+        state.active_field = RigField::Baud;
+        state.selected_baud_idx = 0;
+        state.move_up();
+        assert_eq!(state.selected_baud_idx, 0, "must clamp at 0, not wrap");
+
+        state.selected_baud_idx = RIG_BAUD_RATES.len() - 1;
+        state.move_down();
+        assert_eq!(
+            state.selected_baud_idx,
+            RIG_BAUD_RATES.len() - 1,
+            "must clamp at the last index, not wrap"
+        );
+    }
+
+    #[test]
+    fn rig_selection_state_model_field_text_editing() {
+        let mut state = RigSelectionState::default();
+        state.push_model_char('I');
+        state.push_model_char('C');
+        assert_eq!(state.model, "IC");
+        state.pop_model_char();
+        assert_eq!(state.model, "I");
+    }
+
+    #[tokio::test]
+    async fn apply_rig_config_update_preselects_current_values() {
+        let mut app = fixture_app().await;
+        app.apply_rig_config_update(
+            vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
+            "FTdx10".to_string(),
+            "/dev/ttyUSB1".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::Serial,
+        );
+        assert_eq!(app.rig_selection.model, "FTdx10");
+        assert_eq!(app.rig_selection.selected_port_idx, 1);
+        assert_eq!(app.rig_selection.selected_port(), "/dev/ttyUSB1");
+        assert_eq!(app.rig_selection.selected_baud(), 38400);
+        assert!(matches!(
+            app.rig_selection.selected_ptt(),
+            pancetta_config::rig::PttMethod::Serial
+        ));
+    }
+
+    /// I-2a fix (PAN-59 final review): when the configured port isn't
+    /// enumerated at all (rig unplugged, or a `host:port` network-rig spec
+    /// `serialport::available_ports()` never lists), the picker must NOT
+    /// silently fall back to index 0 of an unrelated enumerated list --
+    /// that would preselect some OTHER device, ready to be persisted over
+    /// the operator's real port by a bare Enter press. It must prepend the
+    /// current value and select it instead.
+    #[tokio::test]
+    async fn apply_rig_config_update_preserves_unenumerated_current_port() {
+        let mut app = fixture_app().await;
+        app.apply_rig_config_update(
+            vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
+            "FTdx10".to_string(),
+            "remote-rig.example:4532".to_string(), // network rig -- never enumerated
+            38400,
+            pancetta_config::rig::PttMethod::Cat,
+        );
+        assert_eq!(
+            app.rig_selection.selected_port(),
+            "remote-rig.example:4532",
+            "the configured (unenumerated) port must stay selected, not fall back to an \
+             unrelated enumerated device"
+        );
+        assert_eq!(app.rig_selection.selected_port_idx, 0);
+        assert!(
+            app.rig_selection
+                .available_ports
+                .contains(&"remote-rig.example:4532".to_string()),
+            "the current port must be prepended so it's a selectable option in the list"
+        );
+    }
+
+    /// I-3 fix (PAN-59 final review): pressing Esc after an abandoned edit
+    /// must restore the modal's live fields from the committed snapshot,
+    /// not merely hide the modal -- otherwise a LATER, unrelated Enter
+    /// press picks up the abandoned edit. Exercised here at the
+    /// `RigSelectionState` level (the `i`/Esc/Enter key wiring is covered
+    /// separately in `pancetta-tui/src/tui_runner.rs`).
+    #[test]
+    fn rig_selection_restore_committed_undoes_an_abandoned_edit() {
+        let mut state = RigSelectionState {
+            model: "FTdx10".to_string(),
+            selected_port_idx: 1,
+            selected_baud_idx: 2,
+            selected_ptt_idx: 1,
+            ..Default::default()
+        };
+        state.snapshot_committed(); // modal "opens" here
+
+        // Operator types garbage into the model field, then abandons the
+        // edit.
+        state.model = "garbage".to_string();
+        state.selected_port_idx = 0;
+
+        state.restore_committed(); // Esc
+
+        assert_eq!(state.model, "FTdx10");
+        assert_eq!(state.selected_port_idx, 1);
+        assert_eq!(state.selected_baud_idx, 2);
+        assert_eq!(state.selected_ptt_idx, 1);
     }
 
     // === Callers panel ===================================================

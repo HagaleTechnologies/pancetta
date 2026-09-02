@@ -25,6 +25,21 @@ Several hand-written `ConfigSection::merge_with` impls silently dropped fields a
 
 `pancetta-research/`, `research/`, `scripts/research-env.sh`: a local-only iteration harness for improving the decoder. Excluded from `default-members` and CI by construction. Spec: `docs/superpowers/specs/2026-05-18-decoder-research-harness-design.md`. Plans 1-3 complete; the loop is operational. Run `./scripts/research-env.sh --status` to see active experiments; read `research/hypothesis_bank.md` for the current backlog.
 
+## Live rig-config switch, and why the hot-reload scaffolding stays dead (2026-09-02)
+
+PAN-59 (user report: switching rig config today requires re-running `pancetta setup` and
+restarting, unlike audio's live device picker). Considered wiring up the existing
+`classify_config_reload` (`pancetta/src/coordinator/health.rs:112`, already classifies `rig` as
+`SafeLive`) + `pancetta_config::ConfigHotReload` file-watcher (`pancetta-config/src/hot_reload.rs`)
+— both confirmed to have **zero production call sites** (only direct unit tests). Rejected: it's a
+*file-watch* reload, not an in-TUI operator action, so wiring it would be a bigger, differently-
+shaped change than reusing the already-proven `TuiCommand::SelectDevice` pattern. Built a dedicated
+`TuiCommand::SelectRig` + ratatui modal instead, reusing the existing crash-restart reconnect pair
+(`teardown_hamlib()` → `start_hamlib_component()`, `pancetta/src/coordinator/hamlib.rs`) routed
+through a new channel `run_main_loop` consumes (Hamlib's reconnect needs `&mut
+ApplicationCoordinator`, unlike audio's independent cpal-stream-reopen). No named rig-profile
+concept added — out of scope. Full design: `docs/superpowers/specs/2026-09-02-pan-59-live-rig-switch-design.md`.
+
 ## Decoder speed overhaul — budget-governed anytime decoder
 
 PAN-7 added the default-off `Ft8Config::ft8lib_sync_seeds_enabled` research path, which runs the vendored MIT ft8_lib candidate finder on pass-0 audio, translates and re-scores its positions on pancetta's Costas lattice, and unions them before truncation. The design is in `docs/superpowers/specs/2026-08-03-ft8lib-sync-seed-union-design.md`; the sixteen cap-200/cap-400 scorecards are under `research/scorecards/pan7/`; and the verdict is recorded in `research/experiments/2026-08-03-ft8lib-sync-seed-union-declined.md`. Both caps produced exact seeded/control nulls: hard-jt9-rich and curated-hard ΔTP=0 with 95% CI `[0,0]`, Δunverified=0, synth recovery unchanged, and noise stayed at the same 1/1000 baseline (incremental ΔFP=0). Seed-survival counters confirmed that representable ft8_lib positions were already present on the exhaustive native lattice and did not survive as novel candidates. The standing TP gate therefore failed and the flag remains `false`; only a separate negative-dt/slot-edge design warrants reopening.
