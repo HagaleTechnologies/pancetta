@@ -432,6 +432,10 @@ impl super::ApplicationCoordinator {
 
         let mut stats_interval = interval(Duration::from_secs(30));
         let mut health_check_interval = interval(Duration::from_secs(5));
+        let mut hamlib_reconnect_rx = self
+            .hamlib_reconnect_rx
+            .take()
+            .expect("run_main_loop must only be called once per coordinator lifetime");
 
         while !self.shutdown_signal.load(Ordering::Acquire) {
             tokio::select! {
@@ -440,6 +444,9 @@ impl super::ApplicationCoordinator {
                 }
                 _ = health_check_interval.tick() => {
                     self.check_task_handles().await;
+                }
+                Some(req) = hamlib_reconnect_rx.recv() => {
+                    self.handle_hamlib_reconnect_request(req).await;
                 }
                 _ = sleep(Duration::from_secs(1)) => {
                     // Perf (Pass 1 / infra-A4): this arm only bounds how quickly
@@ -1297,6 +1304,42 @@ mod supervisor_tests {
             PttState::Off
         );
         assert!(!coordinator.ptt_active.load(Ordering::Acquire));
+    }
+
+    /// PAN-59: `run_main_loop` must actually process a `HamlibReconnectRequest`
+    /// sent on `hamlib_reconnect_tx` -- this is the integration point that
+    /// closes the loop between `tui_relay.rs` (Task 7, which only holds a
+    /// cloned sender, never `&mut ApplicationCoordinator`) and
+    /// `handle_hamlib_reconnect_request` (Task 5, which needs `&mut self`).
+    #[cfg(feature = "pancetta-hamlib")]
+    #[tokio::test]
+    async fn run_main_loop_processes_a_hamlib_reconnect_request() {
+        let mut coordinator = test_coordinator().await;
+        let reconnect_tx = coordinator.hamlib_reconnect_tx.clone();
+        let shutdown = coordinator.shutdown_signal.clone();
+
+        let loop_handle = tokio::spawn(async move {
+            coordinator.run_main_loop().await.unwrap();
+        });
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        reconnect_tx
+            .send(super::super::hamlib::HamlibReconnectRequest { respond: tx })
+            .await
+            .expect("reconnect channel must accept the request");
+
+        let result = tokio::time::timeout(std::time::Duration::from_secs(5), rx)
+            .await
+            .expect("run_main_loop must process the reconnect request within 5s")
+            .expect("handler must always respond");
+        assert!(
+            result.is_ok(),
+            "reconnect should succeed via the mock rig path: {:?}",
+            result.err()
+        );
+
+        shutdown.store(true, Ordering::Release);
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), loop_handle).await;
     }
 
     #[tokio::test]
