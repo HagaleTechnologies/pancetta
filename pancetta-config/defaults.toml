@@ -296,7 +296,7 @@ great_circle = true
 
 [network.psk_reporter.reporter_info]
 software_name = "Pancetta"
-software_version = "0.9.5"
+software_version = "0.9.6"
 
 [network.qrz_logbook]
 api_key = ""

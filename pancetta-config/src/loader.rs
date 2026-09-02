@@ -1059,7 +1059,7 @@ frequency_accuracy_hz    = 1
 
 [network.psk_reporter.reporter_info]
 software_name    = "Pancetta"
-software_version = "0.9.5"
+software_version = "0.9.6"
 
 [network.psk_reporter.filters]
 enabled_modes = ["PSK31", "PSK63", "FT8", "FT4", "JS8"]
@@ -1077,11 +1077,11 @@ exclude_cq_zones = []
 great_circle = true
 "#;
         let parsed = loader.parse_toml(toml_content).unwrap();
-        // software_version is hardcoded "0.9.5" in the doc (informational
+        // software_version is hardcoded "0.9.6" in the doc (informational
         // only, per the doc's own comment); everything else must match
         // Default::default() exactly, so compare with that field zeroed.
         let mut expected = crate::network::PskReporterConfig::default();
-        expected.reporter_info.software_version = "0.9.5".to_string();
+        expected.reporter_info.software_version = "0.9.6".to_string();
         assert_eq!(
             toml::to_string(&parsed.network.psk_reporter).unwrap(),
             toml::to_string(&expected).unwrap(),
