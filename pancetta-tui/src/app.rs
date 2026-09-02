@@ -2560,38 +2560,25 @@ impl App {
 
     /// Returns `true` when `call` resolves to our own station.
     ///
-    /// Uses case-insensitive ASCII equality (matching the existing #42
-    /// self-filter) because `pancetta_qso` is not a dependency of
-    /// pancetta-tui. Guards against an empty/unconfigured callsign — if our
-    /// call is blank we cannot tell what "our" station is, so we return
-    /// `false` to avoid filtering every entry.
+    /// Delegates to the shared `pancetta_core::callsign::callsigns_match`
+    /// (PAN-55), which handles both compound-callsign equivalence
+    /// (`K5ARH/P`, `EA8/K5ARH`) AND i3=4 hash-render resolution
+    /// (`"<K5ARH>"` — a *resolved* hash-render is a real, identifiable
+    /// callsign, see PAN-16). An earlier hand-rolled reimplementation here
+    /// only handled the compound case, so a resolved hash-render
+    /// self-decode (e.g. our own call heard back as `"<K5ARH>"`) slipped
+    /// past this filter and appeared as a bogus DX entry.
+    ///
+    /// Guards against an empty/unconfigured callsign — if our call is blank
+    /// we cannot tell what "our" station is, so we return `false` to avoid
+    /// filtering every entry (`callsigns_match` would otherwise treat two
+    /// blank calls as equal).
     fn is_our_call(&self, call: &str) -> bool {
         let ours = self.station_info.call_sign.trim();
         if ours.is_empty() {
             return false;
         }
-        // Compound-callsign equivalence: K5ARH/P or EA8/K5ARH must also be
-        // treated as "us". Replicate the base-call extraction that
-        // pancetta_qso::exchange::callsigns_match uses without pulling in
-        // that crate — split on '/', pick the longest token that contains
-        // both a digit and an ASCII letter, compare case-insensitively.
-        fn base_call(s: &str) -> &str {
-            s.split('/')
-                .max_by(|a, b| {
-                    let shaped = |t: &str| {
-                        t.len() >= 3
-                            && t.bytes().any(|c| c.is_ascii_digit())
-                            && t.bytes().any(|c| c.is_ascii_alphabetic())
-                    };
-                    match (shaped(a), shaped(b)) {
-                        (true, false) => std::cmp::Ordering::Greater,
-                        (false, true) => std::cmp::Ordering::Less,
-                        _ => a.len().cmp(&b.len()),
-                    }
-                })
-                .unwrap_or(s)
-        }
-        call.eq_ignore_ascii_case(ours) || base_call(call).eq_ignore_ascii_case(base_call(ours))
+        pancetta_core::callsign::callsigns_match(call, ours)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -5337,6 +5324,25 @@ mod tests {
             .await
             .unwrap();
         assert!(app.dx_stations.contains_key("JA1ABC"));
+    }
+
+    /// PAN-55: a *resolved* i3=4 hash-render of our own callsign
+    /// (`"<K5ARH>"` — the hash table found a match, unlike the unresolved
+    /// `"<...>"` placeholder covered by `unresolved_hash_placeholder_not_added_to_dx_hunter`)
+    /// is a legitimate, identifiable self-decode and must be caught by the
+    /// same #42 self-filter as the bare form.
+    #[tokio::test]
+    async fn resolved_hash_render_self_decode_not_added_to_dx_hunter() {
+        let mut app = fixture_app().await;
+        app.station_info.call_sign = "K5ARH".to_string();
+
+        app.add_decoded_message(fixture_view("<K5ARH>", -10))
+            .await
+            .unwrap();
+        assert!(
+            !app.dx_stations.contains_key("<K5ARH>") && !app.dx_stations.contains_key("K5ARH"),
+            "a resolved hash-render of our own call must never be listed in the DX Hunter"
+        );
     }
 
     /// PAN-16: `"<...>"` is FT8's literal placeholder for an i3=4
