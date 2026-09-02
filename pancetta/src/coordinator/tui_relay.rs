@@ -165,7 +165,7 @@ impl super::ApplicationCoordinator {
             // Build the display priority scorer once per relay thread.
             // Uses the same weights and lookup (via Arc-shared internals)
             // as the autonomous scorer, but the DX Hunter's "Pri" column now
-            // reflects the #164 tiered score (0-4999, strict tier dominance
+            // reflects the #164 tiered score (0-5999, strict tier dominance
             // — see TieredScore::as_display_u32) rather than the old
             // continuous [0,1] mapped to [0,1000].
             let relay_scorer = pancetta_qso::PriorityScorer::new(
