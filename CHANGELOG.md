@@ -15,14 +15,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and self-call refusals now appear as retained yellow `qso.security` Warn rows
   in the Shift+D Diagnostics overlay, while preserving existing rejection,
   logging, and status-line behavior.
-- GitHub release workflow: pushing a `v*` tag builds prebuilt binaries for
-  macOS (Apple Silicon), Linux x86_64, Linux aarch64 (Raspberry Pi 4/5 and
-  other 64-bit ARM boards), and Windows x86_64 (MinGW) and attaches them to a
-  draft release. CI refuses to ship any binary built without the real
-  `ft8_lib` C decoder, and the aarch64 build is additionally gated on an
-  actual fixture decode (not just linkage).
-- `pancetta info` now reports the decode engine: `ft8_lib C decoder: native-C`
-  or a loud `STUB` line with the fix command.
+- Release workflow: the `v*`-tag-triggered binary build now also ships a
+  Linux aarch64 (Raspberry Pi 4/5 and other 64-bit ARM boards) target,
+  gated on an actual fixture decode (not just linkage) in addition to the
+  existing non-stub-decoder check — v0.9.6 is the first tagged release to
+  include it. (The macOS/Linux-x86_64/Windows release workflow itself,
+  and `pancetta info`'s decoder-engine line, shipped in v0.9.5.)
 - Station agent: concurrent multi-client relay sessions (up to 8, the relay's
   own client cap), each with an independent Noise session over the one relay
   websocket. One-controller-at-a-time semantics — `takeControl` free-grabs
@@ -33,14 +31,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Connected clients also now get a live read stream (decodes/QSO
   progress/status) over the relay, sharing the same translation pump the
   localhost remote gateway uses.
-- DX watchlist: a short-lived (~2.5 min TTL) per-callsign memory of needed
-  CQs (per-band-DXCC-new or ATNO) that were heard but not pounced on —
-  busy, at TX capacity, or lost that cycle's single-pounce-slot
-  competition — so the same station gets a fair shot the next time it's
-  actively CQing and the operator has room. Never transmits on its own;
+- DX watchlist: a short-lived (~2.5 min TTL) per-callsign memory of
+  recently heard high-tier CQs (per-band-DXCC-new or ATNO), intended to
+  give a station missed while busy, at TX capacity, or having lost that
+  cycle's single-pounce-slot competition a fair shot the next time it's
+  actively CQing. The `◇` marker it puts on DX Hunter rows isn't cleared
+  when a station is pounced on or worked, so it can persist through and
+  after a completed QSO until the TTL lapses. Never transmits on its own;
   a watchlisted station is only ever worked the ordinary way, by being
-  freshly re-decoded as a CQ. Watchlist membership shows as a `◇` marker
-  on DX Hunter rows.
+  freshly re-decoded as a CQ.
 - Recent-QSOs panel (`Shift+R`): a scrollable, color-coded outcome log
   ("KJ5NJF — Failed: Timeout ...") for the last 50 completed/failed QSOs,
   mirroring the existing Diagnostics panel's conventions. A new
@@ -81,10 +80,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   entity next to the grid square in the title bar (resolved once at
   startup). Omitted entirely, not shown as a placeholder, when
   unresolvable.
-- Band Activity now logs the station's own TX (not just received
-  decodes) — every keyed frame, including bare CQ calls — interleaved
-  chronologically with the RX side of the exchange, marked with a `» TX`
-  Call-column marker and `TX` in the SNR column.
+- Band Activity now logs the station's own TX attempts (not just received
+  decodes) — every frame the TX pipeline sends to PTT, including bare CQ
+  calls — interleaved chronologically with the RX side of the exchange,
+  marked with a `» TX` Call-column marker and `TX` in the SNR column. The
+  row is logged when the frame is queued for transmission, not gated on
+  the PTT bus send actually succeeding, so a failed PTT dispatch (e.g.
+  Hamlib unreachable) can still show as a `» TX` row despite the radio
+  never keying.
 
 ### Changed
 
@@ -254,11 +257,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection attempt) is now handled like the other 11 relay.v1 terminal
   codes instead of being silently unrecognized.
 
-- `LICENSE-APACHE` restored to the canonical Apache-2.0 text — the previous
-  file paraphrased §6 and §9 and carried a corrupted appendix, which is both
-  a legal-hygiene problem and the reason GitHub reported the repo license as
-  `NOASSERTION`.
-- `CHANGELOG.md` link footer (the `[Unreleased]` compare URL was malformed).
 - Bogus/unworkable decodes (the FT8 AP-hash placeholder `<...>`, a grid
   square mistaken for a callsign, and the operator's own callsign in
   compound/hash-render form) no longer surface at high priority in the DX
@@ -271,11 +269,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `callsigns_match` the rest of the file already had, instead of plain
   string equality, so a self-decode rendered as `<CALL>` or `CALL/P` no
   longer gets treated as workable third-party DX (PAN-54).
-
-### Removed
-
-- `.env.example`, which described a Docker/Grafana deployment that has never
-  existed in this repository (`git ls-files | grep -i docker` is empty).
 
 ## [0.9.5] - 2026-06-24
 
