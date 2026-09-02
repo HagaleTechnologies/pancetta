@@ -2881,11 +2881,18 @@ impl App {
     /// highlighted.
     ///
     /// Comparator is a stable total order:
-    ///   1. needed first (`worked_before == false` before `== true`)
-    ///   2. `priority_score` descending
-    ///   3. `snr` descending
-    ///   4. `frequency` ascending
-    ///   5. `call_sign` ascending (final tiebreak → deterministic)
+    ///   1. Suspect tier last (PAN-54 round 2, Codex #3910544298:
+    ///      `priority_score` in the `Suspect` band — see
+    ///      `pancetta_qso::priority::TIER_BAND_WIDTH` — always sorts after
+    ///      every real tier, regardless of `worked_before`; without this
+    ///      key, an unworked-but-implausible row could outrank an
+    ///      already-worked real station since `worked_before` was compared
+    ///      first)
+    ///   2. needed first (`worked_before == false` before `== true`)
+    ///   3. `priority_score` descending
+    ///   4. `snr` descending
+    ///   5. `frequency` ascending
+    ///   6. `call_sign` ascending (final tiebreak → deterministic)
     pub fn displayed_dx_stations(&self) -> Vec<&DxStation> {
         // Drop spots not heard within the staleness window — a station last
         // heard minutes ago is no longer "current" DX to chase.
@@ -2904,8 +2911,11 @@ impl App {
             })
             .collect();
         list.sort_by(|a, b| {
-            a.worked_before
-                .cmp(&b.worked_before)
+            let a_suspect = a.priority_score < pancetta_qso::priority::TIER_BAND_WIDTH;
+            let b_suspect = b.priority_score < pancetta_qso::priority::TIER_BAND_WIDTH;
+            a_suspect
+                .cmp(&b_suspect)
+                .then(a.worked_before.cmp(&b.worked_before))
                 .then(b.priority_score.cmp(&a.priority_score))
                 .then(b.snr.cmp(&a.snr))
                 .then(
@@ -5685,6 +5695,33 @@ mod tests {
             .map(|s| s.call_sign.as_str())
             .collect();
         assert_eq!(order, vec!["HIGHPRI", "LOWPRI", "WORKED"]);
+    }
+
+    /// PAN-54 round 2 (Codex #3910544298): a Suspect-tier row (priority_score
+    /// in 0-999, worked_before == false — the default for an invalid/new
+    /// spot) must sort BELOW an already-worked real station, even though
+    /// `worked_before` alone would otherwise put the unworked Suspect row
+    /// first.
+    #[tokio::test]
+    async fn displayed_dx_stations_sorts_suspect_tier_below_worked_real_station() {
+        let mut app = fixture_app().await;
+        app.dx_stations.insert(
+            "SUSPECT".into(),
+            dx_fixture("SUSPECT", 500, 20, 14.074, false),
+        );
+        app.dx_stations
+            .insert("WORKED".into(), dx_fixture("WORKED", 1500, 5, 14.074, true));
+
+        let order: Vec<&str> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["WORKED", "SUSPECT"],
+            "a Suspect-tier (priority_score < TIER_BAND_WIDTH) row must never outrank a real, already-worked station"
+        );
     }
 
     /// A spot last heard beyond the staleness window drops off the displayed

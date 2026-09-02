@@ -156,8 +156,20 @@ pub fn is_grid_shape(t: &str) -> bool {
 /// anything without at least one digit AND one letter, any character
 /// outside the FT8 callsign charset (ASCII alphanumeric plus `/` — PAN-54
 /// round 1, Codex #3910471929: `"W1!"`/`"W1---"` previously passed since
-/// only digit+letter *presence* was checked, not every character), and a
-/// bare 4-char Maidenhead grid square mistaken for a callsign.
+/// only digit+letter *presence* was checked, not every character), a bare
+/// 4-char Maidenhead grid square mistaken for a callsign, and — for a
+/// single (non-compound) token — free-text-shaped garbage like `"ABC1D"`
+/// (PAN-54 round 2, Codex #3910544291): a real callsign's digit run always
+/// has a plausible prefix (at most 2 letters, or none for a digit-led form)
+/// before it and at least one suffix letter after it. This positional check
+/// is intentionally NOT applied to compound (`/`-containing) forms, to
+/// avoid re-deriving `pancetta-ft8::message::looks_like_compound_callsign`'s
+/// multi-component recursion (prefix/homecall vs. homecall/call-area-digit
+/// vs. triple-compound shapes) — `pancetta-ft8` depends on `pancetta-core`,
+/// not the reverse, so that function can't be called from here, and porting
+/// its exact branching under review-round time pressure risked diverging
+/// from its own PAN-17/22/27-hardened behavior for a case Codex's finding
+/// didn't demonstrate (their example, `"ABC1D"`, has no `/`).
 pub fn is_plausible_callsign(callsign: &str) -> bool {
     let upper = callsign.trim().to_uppercase();
     let Some(resolved) = resolve_hash_render(&upper) else {
@@ -178,7 +190,42 @@ pub fn is_plausible_callsign(callsign: &str) -> bool {
     }
     let has_digit = resolved.bytes().any(|b| b.is_ascii_digit());
     let has_alpha = resolved.bytes().any(|b| b.is_ascii_alphabetic());
-    has_digit && has_alpha
+    if !(has_digit && has_alpha) {
+        return false;
+    }
+    if !resolved.contains('/') && !has_plausible_callsign_shape(resolved.as_bytes()) {
+        return false;
+    }
+    true
+}
+
+/// Digit-run positional shape check for a single (non-compound) token: the
+/// digit run must be flanked by a plausible prefix (at most 2 letters, or
+/// none for a digit-led form) and at least one suffix letter after the last
+/// digit. Ported from `pancetta_ft8::message::looks_like_compound_callsign_shape`
+/// (see `is_plausible_callsign`'s doc for why this is a deliberate,
+/// documented duplication rather than a shared call).
+fn has_plausible_callsign_shape(bytes: &[u8]) -> bool {
+    if bytes.len() < 2 {
+        return false;
+    }
+    let Some(last_digit_pos) = bytes.iter().rposition(u8::is_ascii_digit) else {
+        return false;
+    };
+    if last_digit_pos + 1 >= bytes.len()
+        || !bytes[last_digit_pos + 1..]
+            .iter()
+            .all(u8::is_ascii_alphabetic)
+    {
+        return false;
+    }
+    let first_digit_pos = bytes.iter().position(u8::is_ascii_digit).unwrap();
+    let prefix = &bytes[..first_digit_pos];
+    if prefix.is_empty() {
+        return first_digit_pos + 1 < bytes.len()
+            && bytes[first_digit_pos + 1].is_ascii_alphabetic();
+    }
+    prefix.len() <= 2 && prefix.iter().all(u8::is_ascii_alphabetic)
 }
 
 #[cfg(test)]
@@ -270,6 +317,24 @@ mod tests {
         assert!(!is_plausible_callsign("W1---"));
         assert!(!is_plausible_callsign("W1 ABC"));
         assert!(!is_plausible_callsign("W1@ABC"));
+    }
+
+    #[test]
+    fn is_plausible_callsign_rejects_free_text_shaped_single_tokens() {
+        // PAN-54 round 2 (Codex #3910544291): digit+letter presence alone
+        // isn't enough for a single (non-compound) token either — the
+        // digit run needs a plausible prefix/suffix shape.
+        assert!(!is_plausible_callsign("ABC1D"));
+        assert!(!is_plausible_callsign("EFG2H"));
+    }
+
+    #[test]
+    fn is_plausible_callsign_accepts_real_single_token_shapes() {
+        // Real callsigns of various prefix shapes must still pass the new
+        // positional check.
+        assert!(is_plausible_callsign("W5AU")); // 1-letter prefix
+        assert!(is_plausible_callsign("PA3ABC")); // 2-letter prefix
+        assert!(is_plausible_callsign("8G81PA")); // digit-led prefix
     }
 
     #[test]
