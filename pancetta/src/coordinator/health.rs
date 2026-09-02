@@ -12,12 +12,17 @@ use super::{
 };
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 
-struct TxInhibitGuard {
+// PAN-59 (I3 fix): `pub(super)` (not private) so `hamlib.rs`'s
+// `handle_hamlib_reconnect_request` -- a sibling submodule of `coordinator`,
+// reached via `super::health::TxInhibitGuard` -- can raise the same
+// TX-restart inhibit for its own teardown/restart window that the
+// crash-restart path (`handle_finished_task` below) raises for its window.
+pub(super) struct TxInhibitGuard {
     counter: Option<Arc<AtomicU32>>,
 }
 
 impl TxInhibitGuard {
-    fn for_component(component: ComponentId, counter: Arc<AtomicU32>) -> Self {
+    pub(super) fn for_component(component: ComponentId, counter: Arc<AtomicU32>) -> Self {
         if component == ComponentId::Hamlib {
             counter.fetch_add(1, Ordering::AcqRel);
             Self {

@@ -2568,8 +2568,101 @@ impl super::ApplicationCoordinator {
             )));
             return;
         }
+
+        // I3 fix (PAN-59 review): the crash-restart path
+        // (`health.rs::handle_finished_task`) raises `tx_restart_inhibit`
+        // via this same guard BEFORE tearing down, so TX stays hard-muted
+        // (through `tx_hard_mute_reason`) for the whole teardown/restart
+        // window. The `ptt_active` check above is only a one-time
+        // check-then-act load -- without this guard, a `TogglePtt` or the
+        // TX worker could still key the rig between that load and
+        // `teardown_hamlib`'s first `.await`. Construct it here, before
+        // anything else, so the reconnect window is inhibited exactly like
+        // a crash-restart window is.
+        let tx_inhibit = super::health::TxInhibitGuard::for_component(
+            ComponentId::Hamlib,
+            self.tx_restart_inhibit.clone(),
+        );
+
+        // C2 fix (PAN-59 review): unlike the crash-restart path (which only
+        // ever runs after `check_task_handles` has already removed the
+        // finished task's entry from `named_task_handles`), this reconnect
+        // runs against a Hamlib task that is still ALIVE. If we don't
+        // remove+abort its entry here, `teardown_hamlib` aborting its
+        // poll/watchdog children causes the OLD message loop to notice and
+        // bail within ~10ms -- but its now-finished handle stays in
+        // `named_task_handles` (with `start_hamlib_component` below having
+        // ALSO pushed a fresh entry for the new generation), so the next
+        // `check_task_handles` pass rediscovers the stale OLD handle and
+        // processes it as a fresh "crash", dispatching another
+        // teardown+restart against the brand-new generation -- which bails
+        // the same way, repeating, burning `RestartBudget` slots until TX
+        // is permanently inhibited. Removing (and aborting, so it stops
+        // racing `teardown_hamlib`'s channel-drain for messages still on
+        // the Hamlib bus) the current live entry here, before teardown even
+        // starts, means only ONE Hamlib entry -- the new generation's --
+        // ever exists once this call returns.
+        if let Some(index) = self
+            .named_task_handles
+            .iter()
+            .position(|(id, _)| *id == ComponentId::Hamlib)
+        {
+            let (_, old_handle) = self.named_task_handles.remove(index);
+            old_handle.abort();
+        }
+
         self.teardown_hamlib().await;
+
+        // C1 fix (PAN-59 review): `start_hamlib_component`'s rigctld-spawn
+        // logic only spawns a fresh `rigctld` when nothing is already
+        // listening on the configured host:port -- an `already_running`
+        // TCP-connect probe. The OLD managed `rigctld` (spawned with the
+        // OLD `-m model -r port -s baud`) is still bound to that port at
+        // this point (nothing else kills it), so without this the probe
+        // finds it, skips spawning a new one, and the fresh
+        // `RigctldClient` just reconnects to the SAME old daemon --
+        // meaning none of the operator's model/port/baud changes ever take
+        // effect, even though the call reports success. Kill it now, AFTER
+        // `teardown_hamlib` (not before): `teardown_hamlib`'s PTT-off retry
+        // loop is a real safety backstop that talks to the rig through
+        // `self.rig_handle`, which for this (about-to-be-replaced)
+        // generation is still a connection to THIS OLD rigctld -- killing
+        // it first would sever that connection and defeat the very retry
+        // loop that guarantees the rig gets unkeyed before we tear down.
+        if let Some(mut child) = self.rigctld_process.take() {
+            info!(
+                "PAN-59 rig switch: stopping managed rigctld (PID {}) so a fresh one spawns \
+                 with the new model/port/baud",
+                child.id()
+            );
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+
         let result = self.start_hamlib_component().await;
+
+        match &result {
+            Ok(()) => {
+                // Normal recovery: let `tx_inhibit` drop here, releasing
+                // the inhibit exactly as the crash-restart path's `Ok(())`
+                // arm does.
+            }
+            Err(_) => {
+                // Terminal for this attempt: `start_hamlib_component`
+                // failed, so (per its own early-return semantics) either no
+                // fresh Hamlib task is running at all, or the one it did
+                // push already aborted itself -- nothing is left consuming
+                // the Hamlib bus channel right now. Leak the guard (mirror
+                // `handle_finished_task`'s `leak_tx_inhibit` semantics
+                // exactly) so TX stays inhibited rather than un-muting with
+                // no confirmed PTT control, and track the leaked increment
+                // so a later successful crash-restart recovery pays it back
+                // (see `handle_finished_task`'s `Ok(())` arm).
+                self.hamlib_leaked_tx_inhibits += 1;
+                std::mem::forget(tx_inhibit);
+            }
+        }
+
         let _ = req.respond.send(result);
     }
 
@@ -6371,6 +6464,111 @@ mod pan_59_reconnect_tests {
             result.is_ok(),
             "must succeed reconnecting via the mock rig path when PTT is idle: {:?}",
             result.err()
+        );
+    }
+
+    /// I5 fix (PAN-59 review): the two tests above call
+    /// `handle_hamlib_reconnect_request` against a brand-new coordinator
+    /// that has never started Hamlib, so `named_task_handles` has no PRIOR
+    /// live entry and `rigctld_process` has no prior managed child --
+    /// neither the C2 (stale task-handle) nor the C1 (stale managed
+    /// rigctld) bug can manifest without a real, still-alive PRIOR
+    /// generation. This test creates one for real (a genuine first
+    /// `start_hamlib_component()` call, still via the mock-rig path so it
+    /// stays fast/hermetic -- exercising the real rigctld *spawn* path
+    /// would need the `rigctld` binary installed and a real serial device,
+    /// neither available/hermetic here), seeds a real stand-in OS process
+    /// into `rigctld_process` (the field is only ever `Some` when pancetta
+    /// itself spawned a managed rigctld -- this stands in for that spawn
+    /// without needing the real binary, exercising exactly the code this
+    /// fix added: killing whatever is currently tracked there), then
+    /// reconnects and asserts both fixes actually fired.
+    #[tokio::test]
+    async fn reconnect_replaces_stale_task_handle_and_kills_managed_rigctld() {
+        fn live_hamlib_entries(c: &super::super::ApplicationCoordinator) -> usize {
+            c.named_task_handles
+                .iter()
+                .filter(|(id, h)| *id == ComponentId::Hamlib && !h.is_finished())
+                .count()
+        }
+        fn total_hamlib_entries(c: &super::super::ApplicationCoordinator) -> usize {
+            c.named_task_handles
+                .iter()
+                .filter(|(id, _)| *id == ComponentId::Hamlib)
+                .count()
+        }
+
+        let mut coordinator = test_coordinator().await;
+        coordinator
+            .start_hamlib_component()
+            .await
+            .expect("initial Hamlib start should succeed via the mock rig path");
+        assert_eq!(
+            live_hamlib_entries(&coordinator),
+            1,
+            "setup: exactly one live Hamlib task handle expected after the first start"
+        );
+
+        // Seed a stand-in "previously spawned managed rigctld": a real,
+        // long-lived OS process, exactly the shape `rigctld_process` holds
+        // when `start_hamlib_component`'s real spawn path populated it.
+        let stand_in = std::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("failed to spawn stand-in process for the test");
+        let stand_in_pid = stand_in.id();
+        coordinator.rigctld_process = Some(stand_in);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        coordinator
+            .handle_hamlib_reconnect_request(HamlibReconnectRequest { respond: tx })
+            .await;
+        let result = rx.await.expect("handler must always respond");
+        assert!(
+            result.is_ok(),
+            "reconnect should succeed: {:?}",
+            result.err()
+        );
+
+        // C2: exactly ONE live Hamlib entry after reconnect, and no stale
+        // finished entry left alongside it either -- two entries (one
+        // stale-finished, one live) is exactly the state that fed the
+        // PAN-59 restart cascade (check_task_handles rediscovers the stale
+        // one as a fresh "crash" and tears down/restarts the brand-new
+        // generation too).
+        assert_eq!(
+            live_hamlib_entries(&coordinator),
+            1,
+            "reconnect must leave exactly one live Hamlib task handle"
+        );
+        assert_eq!(
+            total_hamlib_entries(&coordinator),
+            1,
+            "reconnect must remove the old generation's handle entirely, not merely leave it \
+             alongside the new one"
+        );
+
+        // C1: the stand-in must actually have been killed -- proving the
+        // reconnect path terminates whatever was tracked in
+        // `rigctld_process` rather than leaking it (an un-killed OLD
+        // rigctld is exactly what let `already_running` find it and skip
+        // spawning a fresh one with the operator's new model/port/baud).
+        let still_alive = std::process::Command::new("kill")
+            .args(["-0", &stand_in_pid.to_string()])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .expect("failed to run `kill -0` to check stand-in liveness")
+            .success();
+        assert!(
+            !still_alive,
+            "the old managed rigctld stand-in (PID {stand_in_pid}) must be killed during \
+             reconnect, not left running for a fresh RigctldClient to (re)find"
+        );
+        assert!(
+            coordinator.rigctld_process.is_none(),
+            "rigctld_process must not still reference the killed stand-in after reconnect \
+             (the mock-rig path on the new generation doesn't spawn a replacement)"
         );
     }
 }

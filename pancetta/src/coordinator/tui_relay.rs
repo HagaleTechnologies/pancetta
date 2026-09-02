@@ -2203,59 +2203,118 @@ impl super::ApplicationCoordinator {
                             if let Err(e) = persist_result {
                                 warn!("Failed to persist rig config selection: {}", e);
                             } else {
-                                info!("Persisted rig config selection to {}", config_path.display());
+                                info!(
+                                    "Persisted rig config selection to {}",
+                                    config_path.display()
+                                );
                             }
 
+                            // I4 fix (PAN-59 review): this relay task's loop
+                            // also services OperatorEmergencyStop/StopTx/
+                            // TogglePtt/AbortQso -- an unbounded
+                            // `.send().await` on the capacity-1
+                            // `hamlib_reconnect_tx` channel (blocking until
+                            // run_main_loop drains it) and then awaiting the
+                            // full reconnect response INLINE would
+                            // head-of-line-block every one of those safety
+                            // commands behind an in-flight rig switch. Use
+                            // `try_send` (bounded: fails immediately, never
+                            // blocks) so a reconnect already in flight is
+                            // reported instantly instead of stalling this
+                            // loop, and hand the response wait off to a
+                            // short-lived spawned task so the loop itself
+                            // returns to `try_recv` immediately after handing
+                            // off the request.
                             let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
-                            let status = if cmd_hamlib_reconnect_tx
-                                .send(crate::coordinator::hamlib::HamlibReconnectRequest {
+                            match cmd_hamlib_reconnect_tx.try_send(
+                                crate::coordinator::hamlib::HamlibReconnectRequest {
                                     respond: resp_tx,
-                                })
-                                .await
-                                .is_err()
-                            {
-                                warn!(
-                                    "Hamlib reconnect channel closed; rig config saved but not applied live"
-                                );
-                                format!(
-                                    "Rig config saved ({}) — live switch unavailable; restart to apply",
-                                    model
-                                )
-                            } else {
-                                match tokio::time::timeout(Duration::from_secs(5), resp_rx).await {
-                                    Ok(Ok(Ok(()))) => {
-                                        info!("Live rig reconnect succeeded: {}", model);
-                                        format!("Rig → {} (live)", model)
-                                    }
-                                    Ok(Ok(Err(err))) => {
-                                        warn!("Live rig reconnect failed: {}", err);
-                                        format!(
-                                            "Rig config saved ({}) but reconnect failed: {} — kept previous connection",
-                                            model, err
-                                        )
-                                    }
-                                    Ok(Err(_)) => {
-                                        warn!("run_main_loop dropped the reconnect response");
-                                        format!(
-                                            "Rig config saved ({}) — no response from main loop; restart to apply",
-                                            model
-                                        )
-                                    }
-                                    Err(_) => {
-                                        warn!("Timed out waiting for rig reconnect");
-                                        format!(
-                                            "Rig config saved ({}) — reconnect timed out; check rig connection",
-                                            model
-                                        )
-                                    }
-                                }
-                            };
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                    component: "rig".to_string(),
-                                    status,
                                 },
-                            );
+                            ) {
+                                Ok(()) => {
+                                    let report_model = model.clone();
+                                    let report_tui_msg_tx = cmd_tui_msg_tx.clone();
+                                    tokio::spawn(async move {
+                                        // Bound the wait comfortably beyond
+                                        // `teardown_hamlib`'s documented
+                                        // worst case (~10s of PTT-off
+                                        // retries) plus margin, so a slow-
+                                        // but-genuinely-in-progress reconnect
+                                        // isn't misreported as timed out.
+                                        let status = match tokio::time::timeout(
+                                            Duration::from_secs(20),
+                                            resp_rx,
+                                        )
+                                        .await
+                                        {
+                                            Ok(Ok(Ok(()))) => {
+                                                info!(
+                                                    "Live rig reconnect succeeded: {}",
+                                                    report_model
+                                                );
+                                                format!("Rig → {} (live)", report_model)
+                                            }
+                                            Ok(Ok(Err(err))) => {
+                                                warn!("Live rig reconnect failed: {}", err);
+                                                format!(
+                                                    "Rig config saved ({}) but reconnect failed: {} — kept previous connection",
+                                                    report_model, err
+                                                )
+                                            }
+                                            Ok(Err(_)) => {
+                                                warn!(
+                                                    "run_main_loop dropped the reconnect response"
+                                                );
+                                                format!(
+                                                    "Rig config saved ({}) — no response from main loop; restart to apply",
+                                                    report_model
+                                                )
+                                            }
+                                            Err(_) => {
+                                                warn!("Timed out waiting for rig reconnect");
+                                                format!(
+                                                    "Rig config saved ({}) — reconnect timed out; check rig connection",
+                                                    report_model
+                                                )
+                                            }
+                                        };
+                                        let _ = report_tui_msg_tx.send(
+                                            pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                                component: "rig".to_string(),
+                                                status,
+                                            },
+                                        );
+                                    });
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    warn!(
+                                        "Rig switch already in progress; ignoring new SelectRig request"
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "rig".to_string(),
+                                            status: format!(
+                                                "Rig config saved ({}) — a rig switch is already in progress; try again shortly",
+                                                model
+                                            ),
+                                        },
+                                    );
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                    warn!(
+                                        "Hamlib reconnect channel closed; rig config saved but not applied live"
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "rig".to_string(),
+                                            status: format!(
+                                                "Rig config saved ({}) — live switch unavailable; restart to apply",
+                                                model
+                                            ),
+                                        },
+                                    );
+                                }
+                            }
                         }
                         pancetta_tui::tui_runner::TuiCommand::ToggleFoxMode => {
                             // Operator pressed `Shift+X`: toggle Fox mode.
