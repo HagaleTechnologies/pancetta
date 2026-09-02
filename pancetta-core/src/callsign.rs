@@ -150,7 +150,9 @@ pub fn is_grid_shape(t: &str) -> bool {
 /// coincidental DXCC-prefix/rarity lookup says about it (PAN-54).
 ///
 /// Rejects: empty/whitespace-only input, the unresolved AP-hash placeholder
-/// `"<...>"`, anything under 3 or over 10 characters (once hash-resolved),
+/// `"<...>"`, anything under 3 or over 11 characters (once hash-resolved —
+/// 11 matches `pancetta-ft8`'s i3=4 nonstandard-callsign field limit, see
+/// `looks_like_nonstandard_callsign` in `pancetta-ft8/src/message.rs`),
 /// anything without at least one digit AND one letter, and a bare 4-char
 /// Maidenhead grid square mistaken for a callsign.
 pub fn is_plausible_callsign(callsign: &str) -> bool {
@@ -159,7 +161,7 @@ pub fn is_plausible_callsign(callsign: &str) -> bool {
         return false;
     };
     let len = resolved.len();
-    if !(3..=10).contains(&len) {
+    if !(3..=11).contains(&len) {
         return false;
     }
     if is_grid_shape(resolved) {
@@ -234,6 +236,11 @@ mod tests {
         assert!(is_plausible_callsign("g8bcg")); // case-insensitive
         assert!(is_plausible_callsign("  K1ABC/P  ")); // trimmed, portable suffix
         assert!(is_plausible_callsign("<W5AU>")); // resolved AP-hash render
+    }
+
+    #[test]
+    fn is_plausible_callsign_accepts_max_length_nonstandard_compound() {
+        assert!(is_plausible_callsign("VP2E/W5AU/P")); // 11 chars, matches pancetta-ft8's 3..=11 nonstandard-callsign limit
     }
 
     #[test]
