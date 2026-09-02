@@ -33,6 +33,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Connected clients also now get a live read stream (decodes/QSO
   progress/status) over the relay, sharing the same translation pump the
   localhost remote gateway uses.
+- DX watchlist: a short-lived (~2.5 min TTL) per-callsign memory of needed
+  CQs (per-band-DXCC-new or ATNO) that were heard but not pounced on —
+  busy, at TX capacity, or lost that cycle's single-pounce-slot
+  competition — so the same station gets a fair shot the next time it's
+  actively CQing and the operator has room. Never transmits on its own;
+  a watchlisted station is only ever worked the ordinary way, by being
+  freshly re-decoded as a CQ. Watchlist membership shows as a `◇` marker
+  on DX Hunter rows.
+- Recent-QSOs panel (`Shift+R`): a scrollable, color-coded outcome log
+  ("KJ5NJF — Failed: Timeout ...") for the last 50 completed/failed QSOs,
+  mirroring the existing Diagnostics panel's conventions. A new
+  `[database].persist_qso_timeline` config flag (default off) additionally
+  persists full per-QSO state-history timelines to the database — data
+  capture only, no in-app viewer yet.
+- IARU-region-aware band-plan TX warning: the soft, once-per-session
+  out-of-band TX warning now checks against the operator's actual IARU
+  region (Region 1/2/3) instead of a US-shaped global table for the 5
+  bands with real documented divergence (40m/60m/80m/2m/70cm) — e.g.
+  Region 1's 40m stops at 7.2 MHz where the old table extended to
+  7.3 MHz. Configurable via the pre-existing but previously-unwired
+  `[band_plan]` region/custom_bands/edge_warnings settings. Still never a
+  hard TX block.
+- Autonomous Auto-mode TX-frequency switching: after `cq_no_response_switch_after`
+  (default 5) consecutive self-CQs with zero decoded responses, the
+  autonomous operator switches to a different TX frequency instead of
+  retransmitting into a possibly-dead spot indefinitely, choosing a new
+  frequency that explicitly avoids the abandoned one via
+  `SmartFrequencyAllocator`. If occupancy data isn't fresh enough to pick
+  a good alternative, it skips a TX window and listens instead of
+  guessing blind. `TxFreqMode::Hold` is unaffected.
 
 ### Changed
 
