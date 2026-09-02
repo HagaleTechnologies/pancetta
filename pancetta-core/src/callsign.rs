@@ -126,6 +126,50 @@ fn resolve_hash_render(call: &str) -> Option<&str> {
     }
 }
 
+/// Is `t` shaped like a bare 4-character Maidenhead grid square (two field
+/// letters, two square digits — e.g. `FN42`)? Promoted from
+/// `pancetta_qso::callsign_continuity`'s identical private check so both
+/// crates share one definition (PAN-54).
+pub fn is_grid_shape(t: &str) -> bool {
+    let chars: Vec<char> = t.chars().collect();
+    chars.len() == 4
+        && chars[0].is_ascii_alphabetic()
+        && chars[1].is_ascii_alphabetic()
+        && chars[2].is_ascii_digit()
+        && chars[3].is_ascii_digit()
+}
+
+/// Is `callsign` structurally plausible as a real amateur-radio callsign,
+/// as opposed to decoder noise or a placeholder token?
+///
+/// This is a SHAPE check, not a semantic one — it cannot and does not
+/// detect a well-formed decode that happens to be a false positive (that
+/// discrimination is `pancetta_qso::content_score`'s job). It exists so a
+/// decode that cannot possibly BE a real callsign never outranks a genuine
+/// station in `pancetta_qso::priority`'s scoring, regardless of what a
+/// coincidental DXCC-prefix/rarity lookup says about it (PAN-54).
+///
+/// Rejects: empty/whitespace-only input, the unresolved AP-hash placeholder
+/// `"<...>"`, anything under 3 or over 10 characters (once hash-resolved),
+/// anything without at least one digit AND one letter, and a bare 4-char
+/// Maidenhead grid square mistaken for a callsign.
+pub fn is_plausible_callsign(callsign: &str) -> bool {
+    let upper = callsign.trim().to_uppercase();
+    let Some(resolved) = resolve_hash_render(&upper) else {
+        return false;
+    };
+    let len = resolved.len();
+    if !(3..=10).contains(&len) {
+        return false;
+    }
+    if is_grid_shape(resolved) {
+        return false;
+    }
+    let has_digit = resolved.bytes().any(|b| b.is_ascii_digit());
+    let has_alpha = resolved.bytes().any(|b| b.is_ascii_alphabetic());
+    has_digit && has_alpha
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +214,35 @@ mod tests {
             );
             assert!(callsigns_match(b, a), "callsigns_match must be symmetric");
         }
+    }
+
+    // --- is_grid_shape / is_plausible_callsign ------------------------------
+
+    #[test]
+    fn is_grid_shape_matches_maidenhead_field_square() {
+        assert!(is_grid_shape("FN42"));
+        assert!(is_grid_shape("PM95"));
+        assert!(!is_grid_shape("FN4")); // too short
+        assert!(!is_grid_shape("FN42A")); // too long (6-char grid, not 4)
+        assert!(!is_grid_shape("W1ABC")); // not grid-shaped at all
+        assert!(!is_grid_shape("44NN")); // digits/letters swapped
+    }
+
+    #[test]
+    fn is_plausible_callsign_accepts_real_shapes() {
+        assert!(is_plausible_callsign("W5AU"));
+        assert!(is_plausible_callsign("g8bcg")); // case-insensitive
+        assert!(is_plausible_callsign("  K1ABC/P  ")); // trimmed, portable suffix
+        assert!(is_plausible_callsign("<W5AU>")); // resolved AP-hash render
+    }
+
+    #[test]
+    fn is_plausible_callsign_rejects_placeholder_and_noise() {
+        assert!(!is_plausible_callsign("")); // empty
+        assert!(!is_plausible_callsign("<...>")); // unresolved AP-hash placeholder
+        assert!(!is_plausible_callsign("FN42")); // grid square, not a callsign
+        assert!(!is_plausible_callsign("K")); // too short / no digit
+        assert!(!is_plausible_callsign("12345")); // no letters
     }
 
     #[test]
