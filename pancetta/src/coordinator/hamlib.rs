@@ -2544,6 +2544,43 @@ impl super::ApplicationCoordinator {
     }
 }
 
+/// A live rig-config-switch request (PAN-59), routed from the TUI
+/// command-relay task (which only holds cloned `Arc`/channel handles, never
+/// `&mut ApplicationCoordinator`) into `run_main_loop` (the only place that
+/// already holds `&mut self` in a loop). See
+/// `docs/superpowers/specs/2026-09-02-pan-59-live-rig-switch-design.md`.
+pub struct HamlibReconnectRequest {
+    pub respond: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
+}
+
+impl super::ApplicationCoordinator {
+    /// Handle a PAN-59 live rig-config-switch request: refuse while PTT is
+    /// active (tearing down Hamlib mid-key-down would yank CAT/PTT control
+    /// out from under an active transmission -- the same safety instinct as
+    /// `TxInhibitGuard`), otherwise reconnect via the same
+    /// teardown/restart pair the crash-restart path already uses so the
+    /// freshly-persisted `self.config.rig` takes effect.
+    #[cfg(feature = "pancetta-hamlib")]
+    pub(crate) async fn handle_hamlib_reconnect_request(&mut self, req: HamlibReconnectRequest) {
+        if self.ptt_active.load(Ordering::Acquire) {
+            let _ = req.respond.send(Err(anyhow::anyhow!(
+                "cannot switch rig while PTT is active -- release PTT and retry"
+            )));
+            return;
+        }
+        self.teardown_hamlib().await;
+        let result = self.start_hamlib_component().await;
+        let _ = req.respond.send(result);
+    }
+
+    #[cfg(not(feature = "pancetta-hamlib"))]
+    pub(crate) async fn handle_hamlib_reconnect_request(&mut self, req: HamlibReconnectRequest) {
+        let _ = req.respond.send(Err(anyhow::anyhow!(
+            "rig control not compiled in (pancetta-hamlib feature disabled)"
+        )));
+    }
+}
+
 /// PAN-35 (round-16 review, Codex P2): maps a `SetFrequency` message's raw
 /// `vfo: u8` wire field to the physical VFO it targets. Single source for
 /// the `0 => A, else => B` convention every SetFrequency call site already
@@ -6265,5 +6302,75 @@ mod device_path_tests {
                 "expected {p:?} to be rejected"
             );
         }
+    }
+}
+
+#[cfg(all(test, feature = "pancetta-hamlib"))]
+mod pan_59_reconnect_tests {
+    //! PAN-59: `handle_hamlib_reconnect_request` is the coordinator-side
+    //! handler for a live rig-config switch. Two things must hold: it must
+    //! refuse to tear down Hamlib while PTT is active (that would yank
+    //! CAT/PTT control out from under an active transmission), and it must
+    //! otherwise reconnect successfully via the same teardown/restart pair
+    //! the crash-restart path already uses.
+    use super::*;
+    use pancetta_config::Config;
+    use std::sync::atomic::AtomicBool;
+
+    async fn test_coordinator() -> super::super::ApplicationCoordinator {
+        let config = Config::default();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        super::super::ApplicationCoordinator::new(
+            config,
+            None,
+            true,  // no_audio
+            true,  // headless
+            false, // metrics
+            9090,
+            None, // no WAV
+            None, // no replay
+            None, // no test-tx
+            1500.0,
+            shutdown,
+            Vec::new(), // no config warnings
+        )
+        .await
+        .expect("coordinator creation should succeed")
+    }
+
+    #[tokio::test]
+    async fn refuses_reconnect_while_ptt_is_active() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.ptt_active.store(true, Ordering::Release);
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        coordinator
+            .handle_hamlib_reconnect_request(HamlibReconnectRequest { respond: tx })
+            .await;
+
+        let result = rx.await.expect("handler must always respond");
+        assert!(
+            result.is_err(),
+            "must refuse a live rig reconnect while PTT is active -- tearing down Hamlib \
+             mid-key-down would yank CAT/PTT control out from under an active transmission"
+        );
+    }
+
+    #[tokio::test]
+    async fn reconnects_successfully_when_ptt_is_idle() {
+        let mut coordinator = test_coordinator().await;
+        assert!(!coordinator.ptt_active.load(Ordering::Acquire));
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        coordinator
+            .handle_hamlib_reconnect_request(HamlibReconnectRequest { respond: tx })
+            .await;
+
+        let result = rx.await.expect("handler must always respond");
+        assert!(
+            result.is_ok(),
+            "must succeed reconnecting via the mock rig path when PTT is idle: {:?}",
+            result.err()
+        );
     }
 }
