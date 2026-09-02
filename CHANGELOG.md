@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-09-02
+
 ### Added
 
 - Operator-visible QSO security diagnostics: sender-mismatch/impostor rejections
@@ -205,6 +207,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a legal-hygiene problem and the reason GitHub reported the repo license as
   `NOASSERTION`.
 - `CHANGELOG.md` link footer (the `[Unreleased]` compare URL was malformed).
+- Bogus/unworkable decodes (the FT8 AP-hash placeholder `<...>`, a grid
+  square mistaken for a callsign, and the operator's own callsign in
+  compound/hash-render form) no longer surface at high priority in the DX
+  Hunter list. `pancetta-core` gained shape-only `is_grid_shape`/
+  `is_plausible_callsign` checks; a new bottom `PriorityTier::Suspect`
+  clamps any decode failing that check to the floor regardless of
+  `WorkedStationLookup` state; a `callsign_continuity.rs` leak that let a
+  bare grid square earn false "observed" trust is closed; and the
+  autonomous CQ-candidate loop now uses the same compound/hash-render-aware
+  `callsigns_match` the rest of the file already had, instead of plain
+  string equality, so a self-decode rendered as `<CALL>` or `CALL/P` no
+  longer gets treated as workable third-party DX (PAN-54).
 
 ### Removed
 
@@ -299,5 +313,6 @@ The ongoing `End-to-End QSO` initiative (`docs/superpowers/specs/`) is
 moving toward Phase 5: a full autonomous CQ → grid → report → RR73
 exchange on real hardware.
 
-[Unreleased]: https://github.com/HagaleTechnologies/pancetta/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/HagaleTechnologies/pancetta/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/HagaleTechnologies/pancetta/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/HagaleTechnologies/pancetta/releases/tag/v0.9.5

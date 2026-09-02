@@ -3123,7 +3123,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -3181,7 +3181,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-agent"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "base64 0.23.1",
  "dirs 5.0.1",
@@ -3200,7 +3200,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-audio"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "atomic",
  "cpal",
@@ -3214,7 +3214,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-config"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3235,7 +3235,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-core"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "approx",
  "chrono",
@@ -3246,7 +3246,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-cqdx"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "chrono",
  "pancetta-core",
@@ -3262,7 +3262,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-dsp"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "async-trait",
  "biquad",
@@ -3282,7 +3282,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-dx"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "approx",
  "chrono",
@@ -3305,7 +3305,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-ft8"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "approx",
@@ -3338,7 +3338,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-hamlib"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -3363,7 +3363,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-protocol"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "chrono",
  "pancetta-core",
@@ -3373,7 +3373,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-qso"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "chrono",
@@ -3397,7 +3397,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-research"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "bitvec",
@@ -3420,7 +3420,7 @@ dependencies = [
 
 [[package]]
 name = "pancetta-tui"
-version = "0.9.5"
+version = "0.9.6"
 dependencies = [
  "anyhow",
  "chrono",
