@@ -273,12 +273,24 @@ fn create_dx_row<'a>(station: &'a DxStation, app: &App) -> Row<'a> {
     let snr_style = Style::default().fg(get_snr_color(station.snr, &app.theme));
 
     let priority_style = match station.priority_score {
-        score if score >= 2000 => Style::default()
-            .fg(app.theme.error_color())
-            .add_modifier(Modifier::BOLD),
-        score if score >= 1000 => Style::default()
-            .fg(app.theme.warning_color())
-            .add_modifier(Modifier::BOLD),
+        score
+            if score
+                >= pancetta_qso::priority::PriorityTier::SpecialStation as u32
+                    * pancetta_qso::priority::TIER_BAND_WIDTH =>
+        {
+            Style::default()
+                .fg(app.theme.error_color())
+                .add_modifier(Modifier::BOLD)
+        }
+        score
+            if score
+                >= pancetta_qso::priority::PriorityTier::PerBandGridNew as u32
+                    * pancetta_qso::priority::TIER_BAND_WIDTH =>
+        {
+            Style::default()
+                .fg(app.theme.warning_color())
+                .add_modifier(Modifier::BOLD)
+        }
         _ => dim,
     };
 
@@ -414,6 +426,20 @@ fn extract_base_prefix(call_sign: &str) -> String {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn priority_style_thresholds_track_tier_band_width() {
+        assert_eq!(
+            pancetta_qso::priority::PriorityTier::SpecialStation as u32
+                * pancetta_qso::priority::TIER_BAND_WIDTH,
+            3000
+        );
+        assert_eq!(
+            pancetta_qso::priority::PriorityTier::PerBandGridNew as u32
+                * pancetta_qso::priority::TIER_BAND_WIDTH,
+            2000
+        );
+    }
 
     #[test]
     fn test_is_rare_dx_fallback() {

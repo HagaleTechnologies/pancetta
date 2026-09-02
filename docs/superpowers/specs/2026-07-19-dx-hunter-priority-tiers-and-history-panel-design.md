@@ -1,12 +1,13 @@
-# DX Hunter: 5-tier priority scoring (#164) + last-10-QSOs panel (#165)
+# DX Hunter: 6-tier priority scoring (#164, PAN-54) + last-10-QSOs panel (#165)
 
 ## Context
 
 Builds on the #163 fix (`docs/DECISIONS/priority-scoring.md`, PR #169): the per-band-DXCC-needed
 signal now actually reaches the score, and rarity has real entity-keyed coverage instead of
 collapsing to a flat 0.5 default. That fix stayed inside the existing flat weighted-sum
-architecture. This spec is the actual redesign the operator proposed: a strict 5-tier ordering
-where a higher tier always outranks every station in a lower tier, regardless of any other
+architecture. This spec is the actual redesign the operator proposed: a strict tier ordering
+(6-tier since PAN-54 added `Suspect`) where a higher tier always outranks every station in a
+lower tier, regardless of any other
 factor — something a flat weighted sum cannot guarantee (a big rarity number can currently
 outweigh a smaller "needed" bonus in ways that don't reflect what the operator actually wants).
 
@@ -17,19 +18,25 @@ Tiers, descending priority:
 3. Special stations (event/gov/research/UN — detection scoped below)
 4. Per-band grid-square new-one
 5. Everything else, varying only by rarity/signal quality
+6. **Suspect** (added PAN-54, 2026-09-01): the callsign failed
+   `pancetta_core::callsign::is_plausible_callsign` — decoder noise, the
+   unresolved AP-hash placeholder `<...>`, or a token that isn't
+   callsign-shaped at all. Always ranks below every other tier, including
+   Standard, regardless of what `WorkedStationLookup` reports for it.
 
 Two independent features are bundled in this one design doc because #164 forces changes to a
 shared type (`WorkedStationLookup`/`CachedStationLookup`) that #165 doesn't touch — the two are
 otherwise unrelated and will land as separate PRs.
 
-## Part A — #164: 5-tier priority scoring
+## Part A — #164: 6-tier priority scoring (PAN-54 added `Suspect`)
 
 ### Core types (`pancetta-qso/src/priority.rs`)
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PriorityTier {
-    Standard,        // tier 5 (lowest)
+    Suspect,          // tier 6 (lowest, added PAN-54)
+    Standard,         // tier 5
     PerBandGridNew,   // tier 4
     SpecialStation,   // tier 3
     PerBandDxccNew,   // tier 2
@@ -38,8 +45,8 @@ pub enum PriorityTier {
 ```
 
 Declaration order is ascending priority — Rust's derived `Ord` on a fieldless enum ranks by
-declaration order, so `Atno > PerBandDxccNew > SpecialStation > PerBandGridNew > Standard` falls
-out of `#[derive(Ord)]` with no hand-written comparator to get wrong.
+declaration order, so `Atno > PerBandDxccNew > SpecialStation > PerBandGridNew > Standard >
+Suspect` falls out of `#[derive(Ord)]` with no hand-written comparator to get wrong.
 
 ```rust
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -212,18 +219,24 @@ input it needs already exists on `DxStation` today.
 ```rust
 let display_score = (tier as u32) * 1000 + (secondary.clamp(0.0, 1.0) * 999.0) as u32;
 ```
-Ranges: Standard 0–999, PerBandGridNew 1000–1999, SpecialStation 2000–2999, PerBandDxccNew
-3000–3999, Atno 4000–4999 — one sortable integer, strict tier dominance guaranteed by the 1000-gap.
-`dx_hunter.rs`'s `priority_style` thresholds (`score > 100` / `score > 50`) get re-tuned to the
-new range (e.g. `> 2000` bold/error, `> 1000` warning, else dim) since the old thresholds assumed
-the additive scheme's much smaller numbers.
+Ranges (updated PAN-54, 2026-09-01, for the added `Suspect` tier): Suspect 0–999, Standard
+1000–1999, PerBandGridNew 2000–2999, SpecialStation 3000–3999, PerBandDxccNew 4000–4999, Atno
+5000–5999 — one sortable integer, strict tier dominance guaranteed by the 1000-gap. The band
+width is exported as `pancetta_qso::priority::TIER_BAND_WIDTH` so a downstream consumer derives
+a threshold from `PriorityTier::X as u32 * TIER_BAND_WIDTH` instead of a bare literal — PAN-54
+found `dx_hunter.rs`'s hardcoded thresholds silently break when `Suspect` was inserted and every
+band shifted by one width. `dx_hunter.rs`'s `priority_style` thresholds now derive from
+`PriorityTier::SpecialStation`/`PriorityTier::PerBandGridNew` this way (bold/error at the
+SpecialStation boundary, warning at the PerBandGridNew boundary, else dim).
 
 ### Testing
 
-- `PriorityTier` ordering: derived `Ord` produces the exact 5-way ranking (one test enumerating
-  all pairs).
+- `PriorityTier` ordering: derived `Ord` produces the exact 6-way ranking (one test enumerating
+  all pairs, including `Suspect` sorting below `Standard` — added PAN-54).
 - `classify_tier`: one test per tier boundary (ATNO beats needed even with weak signal; needed
-  beats special-station; special-station beats grid-new; grid-new beats standard) — mirrors the
+  beats special-station; special-station beats grid-new; grid-new beats standard; standard beats
+  suspect even when `WorkedStationLookup` reports needed/ATNO for the implausible callsign —
+  PAN-54) — mirrors the
   existing `dx_priority_hierarchy_atno_over_needed_over_rare_over_plain` shape already in
   `dx_hunter.rs`, now against the real scorer instead of the coarse one being deleted.
   - Regression pin: `test_atno_bonus_lifts_score_over_plain_needed` and the #163 regression tests

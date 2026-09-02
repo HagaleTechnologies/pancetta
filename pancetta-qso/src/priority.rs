@@ -5,6 +5,7 @@
 //! is provided via the `WorkedStationLookup` trait.
 
 use crate::autonomous::DxEvaluator;
+use pancetta_core::callsign::is_plausible_callsign;
 use serde::{Deserialize, Serialize};
 
 /// Weights for each scoring factor.
@@ -38,13 +39,18 @@ impl Default for PriorityWeights {
     }
 }
 
-/// Lexicographic priority tier (#164 redesign). Declaration order below is
-/// ascending priority — Rust's derived `Ord` on a fieldless enum ranks by
-/// declaration order, so `Atno > PerBandDxccNew > SpecialStation >
-/// PerBandGridNew > Standard` falls out for free.
+/// Lexicographic priority tier (#164 redesign, `Suspect` added PAN-54).
+/// Declaration order below is ascending priority — Rust's derived `Ord` on
+/// a fieldless enum ranks by declaration order, so `Atno > PerBandDxccNew >
+/// SpecialStation > PerBandGridNew > Standard > Suspect` falls out for free.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum PriorityTier {
-    /// Tier 5 (lowest): everything else, varying only by rarity/signal quality.
+    /// Tier 6 (lowest): callsign failed `is_plausible_callsign` — decoder
+    /// noise, an unresolved AP-hash placeholder (`<...>`), or a token that
+    /// isn't callsign-shaped at all. Never outranks a real station
+    /// regardless of what `WorkedStationLookup` says about it (PAN-54).
+    Suspect,
+    /// Tier 5: everything else, varying only by rarity/signal quality.
     Standard,
     /// Tier 4: per-band grid-square new-one.
     PerBandGridNew,
@@ -66,13 +72,23 @@ pub struct TieredScore {
     pub secondary: f64,
 }
 
+/// Width of each tier's band in `TieredScore::as_display_u32`'s encoding.
+/// A consumer deriving a display threshold from a `PriorityTier` MUST use
+/// this constant (`PriorityTier::X as u32 * TIER_BAND_WIDTH`) rather than a
+/// bare numeric literal — PAN-54 found a hardcoded threshold in
+/// `pancetta-tui/src/ui/dx_hunter.rs` silently break when `Suspect` was
+/// inserted and every band shifted by one width.
+pub const TIER_BAND_WIDTH: u32 = 1000;
+
 impl TieredScore {
     /// Encode as a single sortable u32 for display: tier dominates via a
     /// 1000-wide band per tier, secondary breaks ties within a tier.
-    /// Ranges: Standard 0-999, PerBandGridNew 1000-1999, SpecialStation
-    /// 2000-2999, PerBandDxccNew 3000-3999, Atno 4000-4999.
+    /// Ranges (PAN-54 shifted every band +1000 to make room for Suspect):
+    /// Suspect 0-999, Standard 1000-1999, PerBandGridNew 2000-2999,
+    /// SpecialStation 3000-3999, PerBandDxccNew 4000-4999, Atno 5000-5999.
     pub fn as_display_u32(&self) -> u32 {
-        (self.tier as u32) * 1000 + (self.secondary.clamp(0.0, 1.0) * 999.0).round() as u32
+        (self.tier as u32) * TIER_BAND_WIDTH
+            + (self.secondary.clamp(0.0, 1.0) * 999.0).round() as u32
     }
 }
 
@@ -366,7 +382,11 @@ impl PriorityScorer {
             + snr_bonus)
             * staleness;
 
-        let total = raw_score.clamp(0.0, 1.0);
+        let total = if is_plausible_callsign(callsign) {
+            raw_score.clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
 
         ScoreBreakdown {
             callsign: callsign.to_string(),
@@ -382,12 +402,16 @@ impl PriorityScorer {
         }
     }
 
-    /// Classify into one of the 5 lexicographic tiers (#164). ATNO always
-    /// wins when the entity is also needed (mirrors `score_cq_detailed`'s
-    /// existing "ATNO premium only meaningful when needed" rule); needed
+    /// Classify into one of the 6 lexicographic tiers (#164, `Suspect`
+    /// added PAN-54). ATNO always wins when the entity is also needed
+    /// (mirrors `score_cq_detailed`'s existing "ATNO premium only
+    /// meaningful when needed" rule); needed
     /// alone (not ATNO) is tier 2; special-station patterns/cqdx-notable is
     /// tier 3; per-band grid-new is tier 4; everything else is Standard.
     fn classify_tier(&self, callsign: &str, grid: Option<&str>, freq_hz: f64) -> PriorityTier {
+        if !is_plausible_callsign(callsign) {
+            return PriorityTier::Suspect;
+        }
         let needed = self.lookup.is_needed_dxcc(callsign)
             || self.lookup.is_dxcc_needed_on_band(callsign, freq_hz);
         if needed && self.lookup.is_atno(callsign) {
@@ -1034,6 +1058,50 @@ mod tests {
         let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
         let score = scorer.score_tiered("W1XYZ", Some("FN42"), -10, 14_074_000.0);
         assert_eq!(score.tier, PriorityTier::Standard);
+    }
+
+    #[test]
+    fn classify_tier_implausible_callsign_is_suspect_even_when_needed_and_atno() {
+        // A garbage decode that happens to resolve to an "unworked" DXCC via
+        // WorkedStationLookup must NOT escape the bottom tier.
+        let mut lookup = TestLookup::new();
+        lookup.needed_dxcc.insert("<...>".to_string());
+        lookup.atno.insert("<...>".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("<...>", Some("FN42"), 0, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::Suspect);
+    }
+
+    #[test]
+    fn classify_tier_grid_shaped_callsign_is_suspect() {
+        let lookup = TestLookup::new();
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let score = scorer.score_tiered("FN42", None, 0, 14_074_000.0);
+        assert_eq!(score.tier, PriorityTier::Suspect);
+    }
+
+    #[test]
+    fn score_cq_detailed_implausible_callsign_totals_zero_even_when_needed_and_atno() {
+        let mut lookup = TestLookup::new();
+        lookup.needed_dxcc.insert("<...>".to_string());
+        lookup.atno.insert("<...>".to_string());
+        let scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(lookup));
+        let breakdown = scorer.score_cq_detailed("<...>", Some("FN42"), 0, 14_074_000.0);
+        assert_eq!(breakdown.total, 0.0);
+    }
+
+    #[test]
+    fn suspect_tier_sorts_below_standard() {
+        let suspect = TieredScore {
+            tier: PriorityTier::Suspect,
+            secondary: 1.0, // even at its own max, must stay below Standard's min
+        };
+        let weak_standard = TieredScore {
+            tier: PriorityTier::Standard,
+            secondary: 0.0,
+        };
+        assert!(suspect < weak_standard);
+        assert!(suspect.as_display_u32() < weak_standard.as_display_u32());
     }
 
     #[test]
