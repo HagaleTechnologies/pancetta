@@ -53,8 +53,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bands with real documented divergence (40m/60m/80m/2m/70cm) — e.g.
   Region 1's 40m stops at 7.2 MHz where the old table extended to
   7.3 MHz. Configurable via the pre-existing but previously-unwired
-  `[band_plan]` region/custom_bands/edge_warnings settings. Still never a
-  hard TX block.
+  `[rig.frequency.band_plan]` region/custom_bands/edge_warnings settings.
+  Still never a hard TX block.
 - Autonomous Auto-mode TX-frequency switching: after `cq_no_response_switch_after`
   (default 5) consecutive self-CQs with zero decoded responses, the
   autonomous operator switches to a different TX frequency instead of
@@ -63,6 +63,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SmartFrequencyAllocator`. If occupancy data isn't fresh enough to pick
   a good alternative, it skips a TX window and listens instead of
   guessing blind. `TxFreqMode::Hold` is unaffected.
+- DX Hunter 5-tier priority scoring: replaces the flat weighted-sum
+  formula with a strict lexicographic ranking (ATNO > per-band-DXCC-new >
+  special-station > per-band-grid-new > everything else), so a needed
+  entity always outranks ordinary rarity variation instead of the two
+  blending into one continuous score. Special-station detection covers
+  US 1x1, UK GB-prefix, and a curated international list. The two
+  previously-divergent DX Hunter scorers (live decodes vs. network spots)
+  are now unified onto one formula.
+- `pancetta pair <CODE>`: a CLI to enroll the station agent against a
+  live cqdx pairing endpoint (enroll → sign challenge → complete),
+  persisting `paired.json` so `station_agent` picks it up on next start.
+  `--force` to overwrite an existing pairing; `--pairing-api-url`/`--name`/
+  `--platform` overrides.
+- QSO Status panel and the title bar now show DXCC entity — the partner's
+  entity next to the Call line in QSO Status, and the station's own
+  entity next to the grid square in the title bar (resolved once at
+  startup). Omitted entirely, not shown as a placeholder, when
+  unresolvable.
+- Band Activity now logs the station's own TX (not just received
+  decodes) — every keyed frame, including bare CQ calls — interleaved
+  chronologically with the RX side of the exchange, marked with a `» TX`
+  Call-column marker and `TX` in the SNR column.
 
 ### Changed
 
