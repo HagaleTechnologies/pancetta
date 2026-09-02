@@ -1516,7 +1516,7 @@ impl AutonomousOperator {
             if is_cq_message(&msg.message_text) {
                 if let Some(ref call) = msg.callsign {
                     // Don't respond to our own CQ.
-                    if call.eq_ignore_ascii_case(&self.our_callsign) {
+                    if callsigns_match(call, &self.our_callsign) {
                         continue;
                     }
 
@@ -5245,6 +5245,30 @@ mod tests {
         );
 
         assert!(op.watchlist_callsigns().is_empty());
+    }
+
+    #[test]
+    fn feed_decoded_messages_excludes_own_callsign_in_compound_form() {
+        let config = AutonomousConfig::default();
+        let mut op = AutonomousOperator::new(config, "W5AU".to_string(), Some("EM10".to_string()));
+        let evaluator = NullDxEvaluator;
+        op.feed_decoded_messages_at(&[cq_message("W5AU/P", "EM10")], &evaluator, Utc::now());
+        assert!(
+            op.pending_cqs.is_empty(),
+            "a compound form of our own callsign must not become a CQ candidate"
+        );
+    }
+
+    #[test]
+    fn feed_decoded_messages_excludes_own_callsign_as_resolved_hash_render() {
+        let config = AutonomousConfig::default();
+        let mut op = AutonomousOperator::new(config, "W5AU".to_string(), Some("EM10".to_string()));
+        let evaluator = NullDxEvaluator;
+        op.feed_decoded_messages_at(&[cq_message("<W5AU>", "EM10")], &evaluator, Utc::now());
+        assert!(
+            op.pending_cqs.is_empty(),
+            "a resolved AP-hash render of our own callsign must not become a CQ candidate"
+        );
     }
 
     #[test]
