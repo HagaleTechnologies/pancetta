@@ -406,7 +406,7 @@ frequency_accuracy_hz    = 1
 
 [network.psk_reporter.reporter_info]
 software_name    = "Pancetta"
-software_version = "0.9.5"   # informational only; not validated against the running binary
+software_version = "0.9.6"   # informational only; not validated against the running binary
 
 [network.psk_reporter.filters]
 enabled_modes = ["PSK31", "PSK63", "FT8", "FT4", "JS8"]

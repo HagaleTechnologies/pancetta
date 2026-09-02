@@ -7,20 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.9.6] - 2026-09-02
+
 ### Added
 
 - Operator-visible QSO security diagnostics: sender-mismatch/impostor rejections
   and self-call refusals now appear as retained yellow `qso.security` Warn rows
   in the Shift+D Diagnostics overlay, while preserving existing rejection,
   logging, and status-line behavior.
-- GitHub release workflow: pushing a `v*` tag builds prebuilt binaries for
-  macOS (Apple Silicon), Linux x86_64, Linux aarch64 (Raspberry Pi 4/5 and
-  other 64-bit ARM boards), and Windows x86_64 (MinGW) and attaches them to a
-  draft release. CI refuses to ship any binary built without the real
-  `ft8_lib` C decoder, and the aarch64 build is additionally gated on an
-  actual fixture decode (not just linkage).
-- `pancetta info` now reports the decode engine: `ft8_lib C decoder: native-C`
-  or a loud `STUB` line with the fix command.
+- Release workflow: the `v*`-tag-triggered binary build now also ships a
+  Linux aarch64 (Raspberry Pi 4/5 and other 64-bit ARM boards) target,
+  gated on an actual fixture decode (not just linkage) in addition to the
+  existing non-stub-decoder check — v0.9.6 is the first tagged release to
+  include it. (The macOS/Linux-x86_64/Windows release workflow itself,
+  and `pancetta info`'s decoder-engine line, shipped in v0.9.5.)
 - Station agent: concurrent multi-client relay sessions (up to 8, the relay's
   own client cap), each with an independent Noise session over the one relay
   websocket. One-controller-at-a-time semantics — `takeControl` free-grabs
@@ -31,6 +31,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Connected clients also now get a live read stream (decodes/QSO
   progress/status) over the relay, sharing the same translation pump the
   localhost remote gateway uses.
+- DX watchlist: a short-lived (~2.5 min TTL) per-callsign memory of
+  recently heard high-tier CQs (per-band-DXCC-new or ATNO), intended to
+  give a station missed while busy, at TX capacity, or having lost that
+  cycle's single-pounce-slot competition a fair shot the next time it's
+  actively CQing. The `◇` marker it puts on DX Hunter rows isn't cleared
+  when a station is pounced on or worked, so it can persist through and
+  after a completed QSO until the TTL lapses. Never transmits on its own;
+  a watchlisted station is only ever worked the ordinary way, by being
+  freshly re-decoded as a CQ.
+- Recent-QSOs panel (`Shift+R`): a scrollable, color-coded outcome log
+  ("KJ5NJF — Failed: Timeout ...") for the last 50 completed/failed QSOs,
+  mirroring the existing Diagnostics panel's conventions. A new
+  `[database].persist_qso_timeline` config flag (default off) additionally
+  persists full per-QSO state-history timelines to the database — data
+  capture only, no in-app viewer yet.
+- IARU-region-aware band-plan TX warning: the soft, once-per-session
+  out-of-band TX warning now checks against the operator's actual IARU
+  region (Region 1/2/3) instead of a US-shaped global table for the 5
+  bands with real documented divergence (40m/60m/80m/2m/70cm) — e.g.
+  Region 1's 40m stops at 7.2 MHz where the old table extended to
+  7.3 MHz. Configurable via the pre-existing but previously-unwired
+  `[rig.frequency.band_plan]` region/custom_bands/edge_warnings settings.
+  Still never a hard TX block.
+- Autonomous Auto-mode TX-frequency switching: after `cq_no_response_switch_after`
+  (default 5) consecutive self-CQs with zero decoded responses, the
+  autonomous operator switches to a different TX frequency instead of
+  retransmitting into a possibly-dead spot indefinitely, choosing a new
+  frequency that explicitly avoids the abandoned one via
+  `SmartFrequencyAllocator`. If occupancy data isn't fresh enough to pick
+  a good alternative, it skips a TX window and listens instead of
+  guessing blind. `TxFreqMode::Hold` is unaffected.
+- DX Hunter 5-tier priority scoring: replaces the flat weighted-sum
+  formula with a strict lexicographic ranking (ATNO > per-band-DXCC-new >
+  special-station > per-band-grid-new > everything else), so a needed
+  entity always outranks ordinary rarity variation instead of the two
+  blending into one continuous score. Special-station detection covers
+  US 1x1, UK GB-prefix, and a curated international list. The two
+  previously-divergent DX Hunter scorers (live decodes vs. network spots)
+  are now unified onto one formula.
+- `pancetta pair <CODE>`: a CLI to enroll the station agent against a
+  live cqdx pairing endpoint (enroll → sign challenge → complete),
+  persisting `paired.json` so `station_agent` picks it up on next start.
+  `--force` to overwrite an existing pairing; `--pairing-api-url`/`--name`/
+  `--platform` overrides.
+- QSO Status panel and the title bar now show DXCC entity — the partner's
+  entity next to the Call line in QSO Status, and the station's own
+  entity next to the grid square in the title bar (resolved once at
+  startup). Omitted entirely, not shown as a placeholder, when
+  unresolvable.
+- Band Activity now logs the station's own TX attempts (not just received
+  decodes) — every frame the TX pipeline sends to PTT, including bare CQ
+  calls — interleaved chronologically with the RX side of the exchange,
+  marked with a `» TX` Call-column marker and `TX` in the SNR column. The
+  row is logged when the frame is queued for transmission, not gated on
+  the PTT bus send actually succeeding, so a failed PTT dispatch (e.g.
+  Hamlib unreachable) can still show as a `» TX` row despite the radio
+  never keying.
 
 ### Changed
 
@@ -200,16 +257,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   connection attempt) is now handled like the other 11 relay.v1 terminal
   codes instead of being silently unrecognized.
 
-- `LICENSE-APACHE` restored to the canonical Apache-2.0 text — the previous
-  file paraphrased §6 and §9 and carried a corrupted appendix, which is both
-  a legal-hygiene problem and the reason GitHub reported the repo license as
-  `NOASSERTION`.
-- `CHANGELOG.md` link footer (the `[Unreleased]` compare URL was malformed).
-
-### Removed
-
-- `.env.example`, which described a Docker/Grafana deployment that has never
-  existed in this repository (`git ls-files | grep -i docker` is empty).
+- Bogus/unworkable decodes (the FT8 AP-hash placeholder `<...>`, a grid
+  square mistaken for a callsign, and the operator's own callsign in
+  compound/hash-render form) no longer surface at high priority in the DX
+  Hunter list. `pancetta-core` gained shape-only `is_grid_shape`/
+  `is_plausible_callsign` checks; a new bottom `PriorityTier::Suspect`
+  clamps any decode failing that check to the floor regardless of
+  `WorkedStationLookup` state; a `callsign_continuity.rs` leak that let a
+  bare grid square earn false "observed" trust is closed; and the
+  autonomous CQ-candidate loop now uses the same compound/hash-render-aware
+  `callsigns_match` the rest of the file already had, instead of plain
+  string equality, so a self-decode rendered as `<CALL>` or `CALL/P` no
+  longer gets treated as workable third-party DX (PAN-54).
 
 ## [0.9.5] - 2026-06-24
 
@@ -299,5 +358,6 @@ The ongoing `End-to-End QSO` initiative (`docs/superpowers/specs/`) is
 moving toward Phase 5: a full autonomous CQ → grid → report → RR73
 exchange on real hardware.
 
-[Unreleased]: https://github.com/HagaleTechnologies/pancetta/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/HagaleTechnologies/pancetta/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/HagaleTechnologies/pancetta/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/HagaleTechnologies/pancetta/releases/tag/v0.9.5
