@@ -269,6 +269,17 @@ pub enum TuiMessage {
         output: Vec<(String, bool)>,
         current_output: Option<String>,
     },
+    /// Current rig config + enumerated serial ports, pushed once at startup
+    /// (PAN-59) so the `i` rig-picker modal can pre-populate with live
+    /// values. The TUI is a passive renderer — it never enumerates serial
+    /// ports itself, mirroring `DeviceListUpdate` above.
+    RigConfigUpdate {
+        available_ports: Vec<String>,
+        current_model: String,
+        current_port: String,
+        current_baud_rate: u32,
+        current_ptt_method: pancetta_config::rig::PttMethod,
+    },
     /// Rig connection state for the station-panel badge. Pushed by the
     /// coordinator relay from the hamlib connect/poll loop.
     RigStatusUpdate {
@@ -378,6 +389,17 @@ pub enum TuiCommand {
     SelectDevice {
         input_device: Option<String>,
         output_device: Option<String>,
+    },
+    /// Switch the live rig config (PAN-59): model, serial port, baud rate,
+    /// and PTT method, mirroring `SelectDevice` for audio. Unlike
+    /// `SelectDevice`'s independent input/output axes, this modal is a
+    /// single form — all four fields always carry a definite value (no
+    /// `Option`/"leave unchanged" semantics).
+    SelectRig {
+        model: String,
+        port: String,
+        baud_rate: u32,
+        ptt_method: pancetta_config::rig::PttMethod,
     },
     /// User requested quit
     Quit,
@@ -846,6 +868,21 @@ impl TuiRunner {
             } => {
                 app.set_audio_devices(input, output, current_output);
             }
+            TuiMessage::RigConfigUpdate {
+                available_ports,
+                current_model,
+                current_port,
+                current_baud_rate,
+                current_ptt_method,
+            } => {
+                app.apply_rig_config_update(
+                    available_ports,
+                    current_model,
+                    current_port,
+                    current_baud_rate,
+                    current_ptt_method,
+                );
+            }
             TuiMessage::RigStatusUpdate { state } => {
                 app.rig_connected = state;
             }
@@ -1022,6 +1059,48 @@ impl TuiRunner {
                         input_device: input,
                         output_device: output,
                     })?;
+                }
+                _ => {}
+            }
+            return Ok(true);
+        }
+
+        // If rig config picker modal is visible, route keys there (PAN-59)
+        if app.rig_selection.visible {
+            match key.code {
+                KeyCode::Esc => {
+                    app.rig_selection.visible = false;
+                    app.status_message = "Rig config picker cancelled".to_string();
+                }
+                KeyCode::Tab => {
+                    app.rig_selection.next_field();
+                }
+                KeyCode::Up => {
+                    app.rig_selection.move_up();
+                }
+                KeyCode::Down => {
+                    app.rig_selection.move_down();
+                }
+                KeyCode::Backspace
+                    if app.rig_selection.active_field == crate::app::RigField::Model =>
+                {
+                    app.rig_selection.pop_model_char();
+                }
+                KeyCode::Char(c)
+                    if app.rig_selection.active_field == crate::app::RigField::Model
+                        && !c.is_control() =>
+                {
+                    app.rig_selection.push_model_char(c);
+                }
+                KeyCode::Enter => {
+                    app.rig_selection.visible = false;
+                    self.message_tx.send(TuiCommand::SelectRig {
+                        model: app.rig_selection.model.clone(),
+                        port: app.rig_selection.selected_port(),
+                        baud_rate: app.rig_selection.selected_baud(),
+                        ptt_method: app.rig_selection.selected_ptt(),
+                    })?;
+                    app.status_message = "Applying rig config…".to_string();
                 }
                 _ => {}
             }
@@ -1495,6 +1574,12 @@ impl TuiRunner {
                         "Select audio devices (Tab to switch, Enter to confirm, Esc to cancel)"
                             .to_string();
                 }
+            }
+            KeyCode::Char('i') => {
+                app.rig_selection.visible = true;
+                app.status_message =
+                    "Edit rig config (Tab: next field, Up/Down: change, type: edit model, Enter: apply, Esc: cancel)"
+                        .to_string();
             }
             KeyCode::Char('?') => {
                 app.toggle_help();
@@ -1971,6 +2056,11 @@ impl TuiRunner {
                 TuiRunner::render_device_selection_modal(f, f.area(), &app.device_selection);
             }
 
+            // Render rig config picker modal overlay if visible (PAN-59)
+            if app.rig_selection.visible {
+                TuiRunner::render_rig_selection_modal(f, f.area(), &app.rig_selection);
+            }
+
             // Render help overlay if visible
             if app.help_visible {
                 TuiRunner::render_help_overlay(f, f.area());
@@ -2145,6 +2235,92 @@ impl TuiRunner {
             Paragraph::new(" Tab: switch panel | Up/Down: select | Enter: confirm | Esc: cancel")
                 .style(Style::default().fg(Color::DarkGray));
         f.render_widget(footer, vert_chunks[1]);
+    }
+
+    /// Render the rig-config picker as a centered modal (PAN-59). Mirrors
+    /// `render_device_selection_modal`'s sizing/centering/clear idiom, but as
+    /// a 4-field single form (model/port/baud/PTT) instead of a 2-panel list.
+    fn render_rig_selection_modal(
+        f: &mut Frame,
+        area: Rect,
+        state: &crate::app::RigSelectionState,
+    ) {
+        use crate::app::RigField;
+        use ratatui::text::{Line, Span};
+
+        // Defensive: see the identical guard in `render_device_selection_modal`.
+        if area.width < 10 || area.height < 4 {
+            return;
+        }
+        let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
+        // title(1) + border(2) + 4 fields + blank + footer + border
+        let modal_height = 9u16.min(area.height);
+
+        let modal_area = Rect {
+            x: (area.width.saturating_sub(modal_width)) / 2,
+            y: (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        };
+
+        // Clear background behind modal
+        f.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let outer_block = Block::default()
+            .title(" Rig Config ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+
+        let inner = outer_block.inner(modal_area);
+        f.render_widget(outer_block, modal_area);
+
+        let fields: [(&str, String, bool); 4] = [
+            (
+                "Model",
+                state.model.clone(),
+                state.active_field == RigField::Model,
+            ),
+            (
+                "Port",
+                state.selected_port(),
+                state.active_field == RigField::Port,
+            ),
+            (
+                "Baud",
+                state.selected_baud().to_string(),
+                state.active_field == RigField::Baud,
+            ),
+            (
+                "PTT",
+                format!("{:?}", state.selected_ptt()),
+                state.active_field == RigField::Ptt,
+            ),
+        ];
+
+        let mut lines: Vec<Line> = Vec::with_capacity(fields.len() + 2);
+        for (label, value, active) in &fields {
+            let value_style = if *active {
+                Style::default()
+                    .bg(Color::Cyan)
+                    .fg(Color::Black)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default()
+            };
+            lines.push(Line::from(vec![
+                Span::raw(format!("{:>6}: ", label)),
+                Span::styled(value.clone(), value_style),
+            ]));
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Tab: next field | Up/Down: change | type: edit model | Enter: apply | Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, inner);
     }
 
     /// Render help overlay as a centered modal.
@@ -4834,6 +5010,57 @@ mod key_tests {
                 assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Even));
             }
             other => panic!("Expected RespondToCaller targeting G8KHF, got {:?}", other),
+        }
+    }
+}
+
+#[cfg(test)]
+mod pan_59_command_tests {
+    use super::*;
+
+    #[test]
+    fn select_rig_command_round_trips_all_four_fields() {
+        let cmd = TuiCommand::SelectRig {
+            model: "IC-7300".to_string(),
+            port: "/dev/ttyUSB1".to_string(),
+            baud_rate: 38400,
+            ptt_method: pancetta_config::rig::PttMethod::Cat,
+        };
+        match cmd {
+            TuiCommand::SelectRig {
+                model,
+                port,
+                baud_rate,
+                ptt_method,
+            } => {
+                assert_eq!(model, "IC-7300");
+                assert_eq!(port, "/dev/ttyUSB1");
+                assert_eq!(baud_rate, 38400);
+                assert!(matches!(ptt_method, pancetta_config::rig::PttMethod::Cat));
+            }
+            _ => panic!("expected SelectRig"),
+        }
+    }
+
+    #[test]
+    fn rig_config_update_message_carries_ports_and_current_values() {
+        let msg = TuiMessage::RigConfigUpdate {
+            available_ports: vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
+            current_model: "FTdx10".to_string(),
+            current_port: "/dev/ttyUSB0".to_string(),
+            current_baud_rate: 38400,
+            current_ptt_method: pancetta_config::rig::PttMethod::Serial,
+        };
+        match msg {
+            TuiMessage::RigConfigUpdate {
+                available_ports,
+                current_model,
+                ..
+            } => {
+                assert_eq!(available_ports.len(), 2);
+                assert_eq!(current_model, "FTdx10");
+            }
+            _ => panic!("expected RigConfigUpdate"),
         }
     }
 }

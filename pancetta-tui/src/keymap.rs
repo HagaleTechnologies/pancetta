@@ -244,6 +244,12 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
     ),
     kb("d", "Device picker", Category::AudioDevices, true),
     kb(
+        "i",
+        "Rig config picker (model/port/baud/PTT)",
+        Category::AudioDevices,
+        false,
+    ),
+    kb(
         "x",
         "Clear decoded messages (press twice within 3s)",
         Category::Diagnostics,
