@@ -445,6 +445,66 @@ impl Config {
         Ok(())
     }
 
+    /// Persist a live rig-config switch (model / serial port / baud rate /
+    /// PTT method) into the config file at `path`, preserving every other
+    /// key. Mirrors [`Config::set_audio_devices_in_file`]'s targeted-write
+    /// pattern (PAN-59: the operator picks a new rig from the running TUI
+    /// the same way they already pick a new audio device).
+    pub fn set_rig_in_file<P: AsRef<std::path::Path>>(
+        &self,
+        path: P,
+        model: &str,
+        port: &str,
+        baud_rate: u32,
+        ptt_method: crate::rig::PttMethod,
+    ) -> ConfigResult<()> {
+        let path = path.as_ref();
+
+        let mut root: toml::Table = match std::fs::read_to_string(path) {
+            Ok(contents) => contents
+                .parse::<toml::Table>()
+                .map_err(|e| ConfigError::Validation(format!("Failed to parse config: {}", e)))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => return Err(e.into()),
+        };
+
+        let rig = root
+            .entry("rig".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let rig_table = rig
+            .as_table_mut()
+            .ok_or_else(|| ConfigError::Validation("[rig] in config is not a table".to_string()))?;
+        rig_table.insert("model".to_string(), toml::Value::String(model.to_string()));
+
+        let interface = rig_table
+            .entry("interface".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let interface_table = interface.as_table_mut().ok_or_else(|| {
+            ConfigError::Validation("[rig.interface] in config is not a table".to_string())
+        })?;
+        interface_table.insert("port".to_string(), toml::Value::String(port.to_string()));
+        interface_table.insert(
+            "baud_rate".to_string(),
+            toml::Value::Integer(baud_rate as i64),
+        );
+
+        let ptt = rig_table
+            .entry("ptt".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let ptt_table = ptt.as_table_mut().ok_or_else(|| {
+            ConfigError::Validation("[rig.ptt] in config is not a table".to_string())
+        })?;
+        let ptt_value = toml::Value::try_from(&ptt_method)
+            .map_err(|e| ConfigError::Validation(format!("Failed to serialize PTT method: {}", e)))?;
+        ptt_table.insert("method".to_string(), ptt_value);
+
+        let serialized = toml::to_string_pretty(&root)
+            .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?;
+        Self::write_secure_atomic(path, &serialized)?;
+        info!("Rig configuration persisted to: {}", path.display());
+        Ok(())
+    }
+
     /// Get a summary of the current configuration
     pub fn summary(&self) -> String {
         format!(
@@ -683,6 +743,72 @@ mod tests {
         let audio = parsed["audio"].as_table().unwrap();
         assert_eq!(audio["output_device"].as_str(), Some("Spk Y"));
         assert_eq!(audio["input_device"].as_str(), Some("Mic X"));
+    }
+
+    #[test]
+    fn set_rig_in_file_writes_all_four_fields_and_preserves_other_keys() {
+        let temp = NamedTempFile::new().unwrap();
+        std::fs::write(
+            temp.path(),
+            "[station]\ncallsign = \"K5ARH\"\n\n[rig]\nmodel = \"OldRig\"\n\n[rig.interface]\nport = \"/dev/ttyUSB0\"\nbaud_rate = 9600\nenabled = true\n\n[rig.ptt]\nmethod = \"none\"\n",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        config
+            .set_rig_in_file(
+                temp.path(),
+                "IC-7300",
+                "/dev/ttyUSB1",
+                38400,
+                crate::rig::PttMethod::Cat,
+            )
+            .unwrap();
+
+        let written = std::fs::read_to_string(temp.path()).unwrap();
+        let parsed: toml::Table = written.parse().unwrap();
+
+        let rig = parsed["rig"].as_table().unwrap();
+        assert_eq!(rig["model"].as_str(), Some("IC-7300"));
+
+        let interface = rig["interface"].as_table().unwrap();
+        assert_eq!(interface["port"].as_str(), Some("/dev/ttyUSB1"));
+        assert_eq!(interface["baud_rate"].as_integer(), Some(38400));
+
+        let ptt = rig["ptt"].as_table().unwrap();
+        assert_eq!(ptt["method"].as_str(), Some("cat"));
+
+        // Unrelated keys preserved.
+        assert_eq!(
+            parsed["station"].as_table().unwrap()["callsign"].as_str(),
+            Some("K5ARH")
+        );
+    }
+
+    #[test]
+    fn set_rig_in_file_creates_minimal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("pancetta.toml");
+        let config = Config::default();
+        config
+            .set_rig_in_file(
+                &path,
+                "FTdx10",
+                "/dev/cu.usbserial-01A6218A1",
+                38400,
+                crate::rig::PttMethod::Serial,
+            )
+            .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Table = written.parse().unwrap();
+        let rig = parsed["rig"].as_table().unwrap();
+        assert_eq!(rig["model"].as_str(), Some("FTdx10"));
+        assert_eq!(
+            rig["interface"].as_table().unwrap()["port"].as_str(),
+            Some("/dev/cu.usbserial-01A6218A1")
+        );
+        assert_eq!(rig["ptt"].as_table().unwrap()["method"].as_str(), Some("serial"));
     }
 }
 
