@@ -326,7 +326,11 @@ impl CachedStationLookup {
     }
 
     pub fn rarity(&self, callsign: &str) -> f64 {
-        let upper = callsign.to_uppercase();
+        // PAN-58 round 1 (Codex P2): resolve before the exact-key lookup so
+        // a resolved hash-render scores identically to its plain form.
+        let Some(upper) = resolved_identity(callsign) else {
+            return 0.5;
+        };
         if let Some(r) = self.rarity_scores.read().get(&upper).copied() {
             return r;
         }
@@ -334,7 +338,7 @@ impl CachedStationLookup {
         // itself seen in a cqdx live-spot poll, but another callsign from the
         // same DXCC entity may have been — reuse that rarity rather than the
         // flat neutral default.
-        if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(callsign) {
+        if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(&upper) {
             if let Some(r) = self.rarity_by_entity.read().get(entity).copied() {
                 return r;
             }
@@ -343,19 +347,35 @@ impl CachedStationLookup {
     }
 
     pub fn record_failure(&self, callsign: &str) {
-        self.recent_failures.write().insert(callsign.to_uppercase());
+        // PAN-58 round 1: canonicalize on write so a later resolved-form
+        // lookup (`is_recent_failure`) actually finds it — see
+        // `resolved_identity`'s doc comment. Never record the unresolved
+        // hash-miss placeholder; it isn't a real station identity.
+        let Some(upper) = resolved_identity(callsign) else {
+            return;
+        };
+        self.recent_failures.write().insert(upper);
     }
 
     pub fn record_worked(&self, callsign: &str, band: &str) {
+        // PAN-58 round 1 (Codex P1): canonicalize on write, matching
+        // `is_duplicate`'s resolved-form read — otherwise a QSO completed
+        // with a hash-rendered identity is stored under a key later lookups
+        // (already resolved to plain form) never match, silently losing the
+        // duplicate penalty. Never record the unresolved hash-miss
+        // placeholder; it isn't a real station identity.
+        let Some(upper) = resolved_identity(callsign) else {
+            return;
+        };
         self.worked_on_band
             .write()
             .entry(band.to_uppercase())
             .or_default()
-            .insert(callsign.to_uppercase());
+            .insert(upper.clone());
         // Keep worked_dxcc_on_band live-updated as QSOs complete during the
         // session, not just at startup seeding — same resolver, same
         // skip-if-unresolvable behavior as seed_worked_dxcc_from_list.
-        if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(callsign) {
+        if let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(&upper) {
             self.worked_dxcc_on_band
                 .write()
                 .entry(band.to_uppercase())
@@ -394,9 +414,12 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_recent_failure(&self, callsign: &str) -> bool {
-        self.recent_failures
-            .read()
-            .contains(&callsign.to_uppercase())
+        // PAN-58 round 1 (Codex P2): resolve before the exact-key lookup —
+        // see `resolved_identity`'s doc comment.
+        let Some(upper) = resolved_identity(callsign) else {
+            return false;
+        };
+        self.recent_failures.read().contains(&upper)
     }
 
     fn is_needed_dxcc(&self, callsign: &str) -> bool {
@@ -494,7 +517,15 @@ impl WorkedStationLookup for CachedStationLookup {
             return false;
         }
 
-        let upper = callsign.to_uppercase();
+        // PAN-58 round 1 (Codex P1): this exclusion check used the raw
+        // callsign, so a resolved hash-render ("<N7RLK>") never matched the
+        // excluded "N" prefix and fell through to `entity_for_callsign`
+        // below (which DOES resolve) — still returning `needed=true` for an
+        // already-excluded home station via the ORed `is_needed_dxcc` path.
+        // Use the same resolved identity for both checks.
+        let Some(upper) = resolved_identity(callsign) else {
+            return false;
+        };
         let excluded = self.excluded_dxcc_prefixes.read();
         if excluded
             .iter()
@@ -506,7 +537,7 @@ impl WorkedStationLookup for CachedStationLookup {
 
         // Unresolvable callsign (no matching prefix in the offline table):
         // never claim "needed" for an entity we can't even identify.
-        let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(callsign) else {
+        let Some(entity) = pancetta_tui::dxcc::entity_for_callsign(&upper) else {
             return false;
         };
         let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
@@ -562,17 +593,17 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn network_snr(&self, callsign: &str) -> Option<(u32, i32)> {
-        self.network_snr
-            .read()
-            .get(&callsign.to_uppercase())
-            .copied()
+        // PAN-58 round 1 (Codex P2): resolve before the exact-key lookup —
+        // see `resolved_identity`'s doc comment. cqdx's network data is
+        // always keyed by a plain callsign; only the query side (a local
+        // decode) can be hash-rendered.
+        let upper = resolved_identity(callsign)?;
+        self.network_snr.read().get(&upper).copied()
     }
 
     fn network_last_seen(&self, callsign: &str) -> Option<i64> {
-        self.network_last_seen
-            .read()
-            .get(&callsign.to_uppercase())
-            .copied()
+        let upper = resolved_identity(callsign)?;
+        self.network_last_seen.read().get(&upper).copied()
     }
 }
 
@@ -1231,6 +1262,46 @@ mod tests {
             "an already-worked station heard again via a resolved hash-render \
              must still count as a duplicate (worked-before)"
         );
+    }
+
+    /// PAN-58 round 1 (Codex P1): the write side must canonicalize too — a
+    /// QSO completed while the partner's identity was still a resolved
+    /// hash-render must be findable by a later PLAIN-form lookup (and vice
+    /// versa), not just the reverse direction the first test above covers.
+    #[test]
+    fn record_worked_canonicalizes_hash_render_key_for_later_plain_lookup() {
+        let lookup = CachedStationLookup::new();
+        lookup.record_worked("<N7RLK>", "20m");
+
+        assert!(
+            lookup.is_duplicate("N7RLK", 14_074_000.0),
+            "a QSO logged under a resolved hash-render identity must still \
+             be found by a later plain-callsign duplicate check"
+        );
+        assert!(lookup.is_duplicate("<N7RLK>", 14_074_000.0));
+    }
+
+    #[test]
+    fn record_worked_never_stores_unresolved_hash_placeholder() {
+        let lookup = CachedStationLookup::new();
+        lookup.record_worked("<...>", "20m");
+        assert!(!lookup.is_duplicate("<...>", 14_074_000.0));
+    }
+
+    #[test]
+    fn record_failure_and_rarity_resolve_hash_render_symmetrically() {
+        let lookup = CachedStationLookup::new();
+        lookup.record_failure("<N7RLK>");
+        assert!(
+            lookup.is_recent_failure("N7RLK"),
+            "a recorded failure under a resolved hash-render identity must \
+             still be found by a later plain-callsign lookup"
+        );
+
+        let mut scores = HashMap::new();
+        scores.insert("N7RLK".to_string(), 0.9);
+        lookup.update_rarity_scores(scores);
+        assert_eq!(CachedStationLookup::rarity(&lookup, "<N7RLK>"), 0.9);
     }
 
     #[test]
