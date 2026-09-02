@@ -1949,20 +1949,32 @@ mod tests {
 
     #[test]
     fn test_clublog_validation_enabled_without_creds_fails() {
+        // Whether a bare "email + password, no api_key" config is valid
+        // depends on whether this binary has a compiled-in fallback key —
+        // conditional so `CLUBLOG_API_KEY=... cargo test` (the official
+        // release build mode) exercises real assertions instead of failing
+        // on a hardcoded no-compiled-key assumption (Codex review, PR #325).
+        let has_compiled_key = !default_clublog_api_key().is_empty();
+
         let mut config = NetworkConfig::default();
         config.clublog.enabled = true;
-        // No creds at all.
+        // No creds at all — always invalid regardless of compiled key
+        // (email/password are never supplied by the compiled fallback).
         assert!(config.validate_section().is_err());
 
-        // Email only — still missing password + api_key.
+        // Email only — still missing password.
         config.clublog.email = "op@example.com".to_string();
         assert!(config.validate_section().is_err());
 
-        // Email + password — still missing api_key.
+        // Email + password, no api_key — valid iff a compiled key exists.
         config.clublog.password = "secret".to_string();
-        assert!(config.validate_section().is_err());
+        if has_compiled_key {
+            assert!(config.validate_section().is_ok());
+        } else {
+            assert!(config.validate_section().is_err());
+        }
 
-        // All required creds present (callsign may stay empty).
+        // All required creds present explicitly — always valid.
         config.clublog.api_key = "appkey123".to_string();
         assert!(config.validate_section().is_ok());
     }
@@ -2378,22 +2390,28 @@ tx_allow_list = ["client-key-1", "client-key-2"]
     }
 
     #[test]
-    fn clublog_validate_accepts_empty_api_key_when_compiled_default_present() {
-        // With no compiled key (this test binary), enabling ClubLog with an
-        // empty api_key must still fail validation -- neither the file nor
-        // the binary can supply one.
+    fn clublog_validate_resolves_empty_api_key_against_compiled_default() {
+        // An empty api_key is valid iff a compiled fallback key exists —
+        // exercised in whichever mode this binary was actually built in
+        // (`CLUBLOG_API_KEY=... cargo test` for the official release build
+        // mode, unset for a normal source build), rather than assuming one
+        // mode and failing the other (Codex review, PR #325).
         let mut net = NetworkConfig::default();
         net.clublog.enabled = true;
         net.clublog.email = "a@b.com".to_string();
         net.clublog.password = "x".to_string();
         net.clublog.api_key = String::new();
-        assert!(
-            default_clublog_api_key().is_empty(),
-            "this test assumes CLUBLOG_API_KEY is unset in the test build"
-        );
-        assert!(
-            net.validate_section().is_err(),
-            "empty api_key with no compiled fallback must fail validation"
-        );
+
+        if default_clublog_api_key().is_empty() {
+            assert!(
+                net.validate_section().is_err(),
+                "empty api_key with no compiled fallback must fail validation"
+            );
+        } else {
+            assert!(
+                net.validate_section().is_ok(),
+                "empty api_key must validate OK when a compiled fallback key exists"
+            );
+        }
     }
 }
