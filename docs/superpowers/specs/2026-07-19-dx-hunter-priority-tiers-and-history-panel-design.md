@@ -1,12 +1,13 @@
-# DX Hunter: 5-tier priority scoring (#164) + last-10-QSOs panel (#165)
+# DX Hunter: 6-tier priority scoring (#164, PAN-54) + last-10-QSOs panel (#165)
 
 ## Context
 
 Builds on the #163 fix (`docs/DECISIONS/priority-scoring.md`, PR #169): the per-band-DXCC-needed
 signal now actually reaches the score, and rarity has real entity-keyed coverage instead of
 collapsing to a flat 0.5 default. That fix stayed inside the existing flat weighted-sum
-architecture. This spec is the actual redesign the operator proposed: a strict 5-tier ordering
-where a higher tier always outranks every station in a lower tier, regardless of any other
+architecture. This spec is the actual redesign the operator proposed: a strict tier ordering
+(6-tier since PAN-54 added `Suspect`) where a higher tier always outranks every station in a
+lower tier, regardless of any other
 factor — something a flat weighted sum cannot guarantee (a big rarity number can currently
 outweigh a smaller "needed" bonus in ways that don't reflect what the operator actually wants).
 
@@ -27,7 +28,7 @@ Two independent features are bundled in this one design doc because #164 forces 
 shared type (`WorkedStationLookup`/`CachedStationLookup`) that #165 doesn't touch — the two are
 otherwise unrelated and will land as separate PRs.
 
-## Part A — #164: 5-tier priority scoring
+## Part A — #164: 6-tier priority scoring (PAN-54 added `Suspect`)
 
 ### Core types (`pancetta-qso/src/priority.rs`)
 
@@ -230,10 +231,12 @@ SpecialStation boundary, warning at the PerBandGridNew boundary, else dim).
 
 ### Testing
 
-- `PriorityTier` ordering: derived `Ord` produces the exact 5-way ranking (one test enumerating
-  all pairs).
+- `PriorityTier` ordering: derived `Ord` produces the exact 6-way ranking (one test enumerating
+  all pairs, including `Suspect` sorting below `Standard` — added PAN-54).
 - `classify_tier`: one test per tier boundary (ATNO beats needed even with weak signal; needed
-  beats special-station; special-station beats grid-new; grid-new beats standard) — mirrors the
+  beats special-station; special-station beats grid-new; grid-new beats standard; standard beats
+  suspect even when `WorkedStationLookup` reports needed/ATNO for the implausible callsign —
+  PAN-54) — mirrors the
   existing `dx_priority_hierarchy_atno_over_needed_over_rare_over_plain` shape already in
   `dx_hunter.rs`, now against the real scorer instead of the coarse one being deleted.
   - Regression pin: `test_atno_bonus_lifts_score_over_plain_needed` and the #163 regression tests
