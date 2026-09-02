@@ -157,19 +157,17 @@ pub fn is_grid_shape(t: &str) -> bool {
 /// outside the FT8 callsign charset (ASCII alphanumeric plus `/` — PAN-54
 /// round 1, Codex #3910471929: `"W1!"`/`"W1---"` previously passed since
 /// only digit+letter *presence* was checked, not every character), a bare
-/// 4-char Maidenhead grid square mistaken for a callsign, and — for a
-/// single (non-compound) token — free-text-shaped garbage like `"ABC1D"`
-/// (PAN-54 round 2, Codex #3910544291): a real callsign's digit run always
-/// has a plausible prefix (at most 2 letters, or none for a digit-led form)
-/// before it and at least one suffix letter after it. This positional check
-/// is intentionally NOT applied to compound (`/`-containing) forms, to
-/// avoid re-deriving `pancetta-ft8::message::looks_like_compound_callsign`'s
-/// multi-component recursion (prefix/homecall vs. homecall/call-area-digit
-/// vs. triple-compound shapes) — `pancetta-ft8` depends on `pancetta-core`,
-/// not the reverse, so that function can't be called from here, and porting
-/// its exact branching under review-round time pressure risked diverging
-/// from its own PAN-17/22/27-hardened behavior for a case Codex's finding
-/// didn't demonstrate (their example, `"ABC1D"`, has no `/`).
+/// 4-char Maidenhead grid square mistaken for a callsign, and free-text-
+/// shaped garbage like `"ABC1D"` (PAN-54 round 2, Codex #3910544291): a
+/// real callsign's digit run always has a plausible prefix (at most 2
+/// letters, or none for a digit-led form) before it and at least one
+/// suffix letter after it. Applied to [`base_callsign`]'s extraction
+/// rather than the raw input, so a compound form (`"K1ABC/P"`,
+/// `"VP2E/W5AU/P"`) is validated on its actual home-call component instead
+/// of being exempted wholesale — PAN-54 round 3 (Codex #3910624281) found
+/// the first cut of this check skipped compound tokens entirely, so
+/// appending any portable suffix to implausible garbage (`"ABC1D/P"`)
+/// bypassed it outright.
 pub fn is_plausible_callsign(callsign: &str) -> bool {
     let upper = callsign.trim().to_uppercase();
     let Some(resolved) = resolve_hash_render(&upper) else {
@@ -193,18 +191,20 @@ pub fn is_plausible_callsign(callsign: &str) -> bool {
     if !(has_digit && has_alpha) {
         return false;
     }
-    if !resolved.contains('/') && !has_plausible_callsign_shape(resolved.as_bytes()) {
+    if !has_plausible_callsign_shape(base_callsign(resolved).as_bytes()) {
         return false;
     }
     true
 }
 
-/// Digit-run positional shape check for a single (non-compound) token: the
-/// digit run must be flanked by a plausible prefix (at most 2 letters, or
-/// none for a digit-led form) and at least one suffix letter after the last
-/// digit. Ported from `pancetta_ft8::message::looks_like_compound_callsign_shape`
-/// (see `is_plausible_callsign`'s doc for why this is a deliberate,
-/// documented duplication rather than a shared call).
+/// Digit-run positional shape check for a bare token (called on
+/// [`base_callsign`]'s output, so `is_plausible_callsign` gets this for
+/// compound forms too): the digit run must be flanked by a plausible
+/// prefix (at most 2 letters, or none for a digit-led form) and at least
+/// one suffix letter after the last digit. Ported from
+/// `pancetta_ft8::message::looks_like_compound_callsign_shape` (see
+/// `is_plausible_callsign`'s doc for why this is a deliberate, documented
+/// duplication rather than a shared call).
 fn has_plausible_callsign_shape(bytes: &[u8]) -> bool {
     if bytes.len() < 2 {
         return false;
@@ -326,6 +326,15 @@ mod tests {
         // digit run needs a plausible prefix/suffix shape.
         assert!(!is_plausible_callsign("ABC1D"));
         assert!(!is_plausible_callsign("EFG2H"));
+    }
+
+    #[test]
+    fn is_plausible_callsign_rejects_free_text_shaped_compound_tokens() {
+        // PAN-54 round 3 (Codex #3910624281): appending a portable suffix
+        // must not bypass the positional shape check — it must apply to
+        // the extracted home-call component, not be skipped wholesale for
+        // any '/'-containing token.
+        assert!(!is_plausible_callsign("ABC1D/P"));
     }
 
     #[test]

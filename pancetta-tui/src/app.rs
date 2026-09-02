@@ -2881,13 +2881,17 @@ impl App {
     /// highlighted.
     ///
     /// Comparator is a stable total order:
-    ///   1. Suspect tier last (PAN-54 round 2, Codex #3910544298:
-    ///      `priority_score` in the `Suspect` band — see
-    ///      `pancetta_qso::priority::TIER_BAND_WIDTH` — always sorts after
-    ///      every real tier, regardless of `worked_before`; without this
-    ///      key, an unworked-but-implausible row could outrank an
-    ///      already-worked real station since `worked_before` was compared
-    ///      first)
+    ///   1. implausible callsign last (PAN-54 round 2, Codex #3910544298:
+    ///      always sorts after every plausible-callsign row, regardless of
+    ///      `worked_before`; without this key, an unworked-but-implausible
+    ///      row could outrank an already-worked real station since
+    ///      `worked_before` was compared first. Keyed on
+    ///      `is_plausible_callsign(&call_sign)` directly rather than
+    ///      `priority_score` — round 3, Codex #3910624274: `add_dx_spot`
+    ///      stamps every DX-cluster row with a `priority_score: 0`
+    ///      "not yet scored" sentinel before its real score arrives on a
+    ///      later feed, which a `priority_score`-based check couldn't
+    ///      distinguish from a genuinely Suspect-tier row)
     ///   2. needed first (`worked_before == false` before `== true`)
     ///   3. `priority_score` descending
     ///   4. `snr` descending
@@ -2911,8 +2915,16 @@ impl App {
             })
             .collect();
         list.sort_by(|a, b| {
-            let a_suspect = a.priority_score < pancetta_qso::priority::TIER_BAND_WIDTH;
-            let b_suspect = b.priority_score < pancetta_qso::priority::TIER_BAND_WIDTH;
+            // PAN-54 round 3 (Codex #3910624274): `add_dx_spot` stamps
+            // every DX-cluster row with the SENTINEL `priority_score: 0`
+            // ("not yet scored by the tui_relay layer") before its real
+            // score arrives on a later feed — comparing against
+            // `TIER_BAND_WIDTH` treated that placeholder as genuinely
+            // Suspect-tier and sorted a legitimate unworked/needed/ATNO
+            // cluster spot to the bottom. Checking the callsign's own
+            // plausibility directly sidesteps the placeholder entirely.
+            let a_suspect = !pancetta_core::callsign::is_plausible_callsign(&a.call_sign);
+            let b_suspect = !pancetta_core::callsign::is_plausible_callsign(&b.call_sign);
             a_suspect
                 .cmp(&b_suspect)
                 .then(a.worked_before.cmp(&b.worked_before))
@@ -5705,12 +5717,12 @@ mod tests {
     #[tokio::test]
     async fn displayed_dx_stations_sorts_suspect_tier_below_worked_real_station() {
         let mut app = fixture_app().await;
-        app.dx_stations.insert(
-            "SUSPECT".into(),
-            dx_fixture("SUSPECT", 500, 20, 14.074, false),
-        );
+        // "FN42" is a bare grid square, not a real callsign — implausible
+        // regardless of its (deliberately high) priority_score.
         app.dx_stations
-            .insert("WORKED".into(), dx_fixture("WORKED", 1500, 5, 14.074, true));
+            .insert("FN42".into(), dx_fixture("FN42", 500, 20, 14.074, false));
+        app.dx_stations
+            .insert("JA1ABC".into(), dx_fixture("JA1ABC", 1500, 5, 14.074, true));
 
         let order: Vec<&str> = app
             .displayed_dx_stations()
@@ -5719,8 +5731,38 @@ mod tests {
             .collect();
         assert_eq!(
             order,
-            vec!["WORKED", "SUSPECT"],
-            "a Suspect-tier (priority_score < TIER_BAND_WIDTH) row must never outrank a real, already-worked station"
+            vec!["JA1ABC", "FN42"],
+            "an implausible-callsign row must never outrank a real, already-worked station"
+        );
+    }
+
+    /// PAN-54 round 3 (Codex #3910624274): a DX-cluster spot's
+    /// `priority_score: 0` "not yet scored" sentinel (`add_dx_spot`, before
+    /// the tui_relay layer's real score arrives on a later feed) must NOT
+    /// be misread as genuinely Suspect-tier — a real, unworked, plausible
+    /// callsign with that placeholder score must still rank above an
+    /// already-worked real station.
+    #[tokio::test]
+    async fn displayed_dx_stations_does_not_treat_unscored_placeholder_as_suspect() {
+        let mut app = fixture_app().await;
+        app.dx_stations.insert(
+            "JA1ABC".into(),
+            dx_fixture("JA1ABC", 0, 20, 14.074, false), // real call, not yet scored
+        );
+        app.dx_stations.insert(
+            "W1XYZ".into(),
+            dx_fixture("W1XYZ", 1500, 5, 14.074, true), // already worked, real score
+        );
+
+        let order: Vec<&str> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["JA1ABC", "W1XYZ"],
+            "an unworked real station with the unscored priority_score:0 placeholder must still outrank an already-worked real station"
         );
     }
 
