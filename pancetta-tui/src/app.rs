@@ -4122,14 +4122,15 @@ mod tests {
             is_own_tx: false,
         };
         let score = app.calculate_dx_priority(&message);
-        // ATNO + needed -> PriorityTier::Atno -> display range 4000-4999.
+        // ATNO + needed -> PriorityTier::Atno -> display range 5000-5999
+        // (PAN-54 shifted every band +1000 to make room for the Suspect tier).
         // The old coarse dx_priority_score function would have scored this
         // input (atno=true, distance=None, snr=-10, non-rare-prefix call)
         // at only 1014 (1000 ATNO + 0 rarity + 0 distance + 14 SNR
-        // tiebreak), so `>= 4000` alone already distinguishes new from old
-        // behavior; `< 5000` further pins it to the Atno band specifically.
-        assert!(score >= 4000, "expected ATNO tier range, got {score}");
-        assert!(score < 5000, "expected ATNO tier range, got {score}");
+        // tiebreak), so `>= 5000` alone already distinguishes new from old
+        // behavior; `< 6000` further pins it to the Atno band specifically.
+        assert!(score >= 5000, "expected ATNO tier range, got {score}");
+        assert!(score < 6000, "expected ATNO tier range, got {score}");
     }
 
     #[test]
@@ -5468,7 +5469,7 @@ mod tests {
         app.merge_spot_groups(&[spot]);
         let entry = app.dx_stations.get("JA1ABC").expect("spot merged");
         assert!(
-            entry.priority_score >= 4000,
+            entry.priority_score >= 5000,
             "expected ATNO tier range, got {}",
             entry.priority_score
         );
