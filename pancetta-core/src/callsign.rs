@@ -112,13 +112,23 @@ pub fn callsigns_match(a: &str, b: &str) -> bool {
     base_callsign(au) == base_callsign(bu)
 }
 
-/// Resolve an i3=4 hash-render token to the plain callsign it represents,
-/// for [`callsigns_match`]. Returns the input unchanged for a normal
-/// (non-bracketed) callsign, `Some(inner)` for a resolved render
-/// (`"<K5ARH>"` -> `"K5ARH"`), and `None` for the unresolved hash-miss
-/// placeholder `"<...>"` (or any other bracketed form that isn't a real
-/// resolved callsign) — callers must treat `None` as "cannot match".
-fn resolve_hash_render(call: &str) -> Option<&str> {
+/// Resolve an i3=4 hash-render token to the plain callsign it represents.
+/// Returns the input unchanged for a normal (non-bracketed) callsign,
+/// `Some(inner)` for a resolved render (`"<K5ARH>"` -> `"K5ARH"`), and
+/// `None` for the unresolved hash-miss placeholder `"<...>"` (or any other
+/// bracketed form that isn't a real resolved callsign) — callers must treat
+/// `None` as "cannot match" / "not a real callsign".
+///
+/// Used by [`callsigns_match`] for QSO-partner/self-call identity, and
+/// (PAN-58) by every DXCC/entity/needed/atno/duplicate/notable lookup that
+/// must reason about *which station* a decode is — a resolved hash-render
+/// is a real, identifiable callsign and must score identically to its
+/// plain form, not silently fail every prefix/exact match on its leading
+/// `'<'`. `pub` so pancetta-tui and pancetta (coordinator/priority_evaluator)
+/// can share this instead of each growing their own bracket-stripping copy.
+/// Input should already be trimmed/uppercased (matching [`base_callsign`]'s
+/// contract) — callers normalize before calling.
+pub fn resolve_hash_render(call: &str) -> Option<&str> {
     match call.strip_prefix('<').and_then(|s| s.strip_suffix('>')) {
         Some(inner) if inner.is_empty() || inner.bytes().all(|b| b == b'.') => None,
         Some(inner) => Some(inner),

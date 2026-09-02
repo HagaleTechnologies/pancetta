@@ -9,6 +9,22 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 
+/// PAN-58: resolve a possibly hash-rendered callsign (`"<N7RLK>"`, FT8's
+/// i3=4 nonstandard-callsign hash-render — see
+/// `pancetta_core::callsign::resolve_hash_render`) to the plain, uppercase
+/// identity it represents, before any DXCC/needed/atno/duplicate/notable
+/// lookup below. Without this, a leading `'<'` defeats every prefix/exact
+/// match those lookups do, so a hash-rendered decode of an already-worked
+/// or home-country station silently fails every check and reads as
+/// "unknown, never excluded, never worked" — ranking it artificially high.
+/// Returns `None` for the unresolved hash-miss placeholder `"<...>"`, which
+/// carries no station identity at all and must never be treated as
+/// needed/worked/notable.
+fn resolved_identity(callsign: &str) -> Option<String> {
+    let upper = callsign.trim().to_uppercase();
+    pancetta_core::callsign::resolve_hash_render(&upper).map(|s| s.to_string())
+}
+
 /// Derive the operator's home DXCC prefix from a callsign by stripping
 /// at the first digit. Examples:
 ///   K5ARH  -> "K"
@@ -366,11 +382,15 @@ impl CachedStationLookup {
 
 impl WorkedStationLookup for CachedStationLookup {
     fn is_duplicate(&self, callsign: &str, freq_hz: f64) -> bool {
+        // PAN-58: an already-worked station heard again via a resolved
+        // hash-render must still count as a duplicate — see
+        // `resolved_identity`'s doc comment.
+        let Some(upper) = resolved_identity(callsign) else {
+            return false;
+        };
         let band = pancetta_qso::utils::frequency_to_band(freq_hz).to_uppercase();
         let worked = self.worked_on_band.read();
-        worked
-            .get(&band)
-            .is_some_and(|set| set.contains(&callsign.to_uppercase()))
+        worked.get(&band).is_some_and(|set| set.contains(&upper))
     }
 
     fn is_recent_failure(&self, callsign: &str) -> bool {
@@ -380,36 +400,36 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_needed_dxcc(&self, callsign: &str) -> bool {
-        // PAN-16: FT8's `"<...>"` placeholder for an unresolved i3=4
-        // nonstandard-callsign hash (message.rs's `parse_nonstd_call`, used
-        // when the local hash table has no entry for the 12-bit hash) is
-        // not a callsign at all — it can never be scored as "needed".
+        // PAN-16 / PAN-58: FT8's `"<...>"` placeholder for an unresolved
+        // i3=4 nonstandard-callsign hash (message.rs's `parse_nonstd_call`,
+        // used when the local hash table has no entry for the 12-bit hash)
+        // is not a callsign at all — it can never be scored as "needed".
         // Without this guard it fell through every branch below into
         // "needed" (the historical-default branch treats anything
         // non-excluded as needed; the exclusion-set branch treats anything
         // that doesn't match a *real* prefix as automatically outside the
         // excluded set too) and picked up `needed_dxcc`'s weight — the
         // scorer's single largest term — ranking an uncallable placeholder
-        // above real, workable stations.
+        // above real, workable stations. `resolved_identity` rejects this
+        // exact literal, not "any callsign whose prefix doesn't resolve in
+        // the bundled offline DXCC table" (unlike `is_dxcc_needed_on_band`'s
+        // broader `entity_for_callsign` guard) — cqdx's `needed_dxcc` set
+        // can name a prefix that's newer than, or otherwise absent from,
+        // the bundled static BigCTY table, and a real, valid,
+        // cqdx-confirmed-needed callsign with that prefix must still win
+        // via the branches below, not be silently zeroed here just because
+        // the local table has a gap.
         //
-        // Deliberately narrow: reject only this exact literal, not "any
-        // callsign whose prefix doesn't resolve in the bundled offline DXCC
-        // table" (unlike `is_dxcc_needed_on_band`'s broader
-        // `entity_for_callsign` guard). cqdx's `needed_dxcc` set can name a
-        // prefix that's newer than, or otherwise absent from, the bundled
-        // static BigCTY table — a real, valid, cqdx-confirmed-needed
-        // callsign with that prefix must still win via the branches below,
-        // not be silently zeroed here just because the local table has a
-        // gap. The resolved hash form `<CALLSIGN>` (a real, identifiable
+        // PAN-58: a *resolved* hash form `<CALLSIGN>` (a real, identifiable
         // callsign the local hash table did map) is also a real callsign
-        // and must keep resolving/scoring normally — it never equals this
-        // literal.
-        if callsign == "<...>" {
+        // and must keep resolving/scoring normally against the branches
+        // below — `resolved_identity` strips its brackets first so the
+        // leading `'<'` doesn't defeat every prefix match that follows.
+        let Some(upper) = resolved_identity(callsign) else {
             return false;
-        }
+        };
 
         let needed = self.needed_dxcc.read();
-        let upper = callsign.to_uppercase();
         if needed.is_empty() {
             // Phase-5 hardening #2: when cqdx hasn't supplied a needed
             // set, fall back to the "all-except-excluded" default.
@@ -441,7 +461,11 @@ impl WorkedStationLookup for CachedStationLookup {
         if atno.is_empty() {
             return false;
         }
-        let upper = callsign.to_uppercase();
+        // PAN-58: resolve a hash-render before prefix-matching — see
+        // `resolved_identity`'s doc comment.
+        let Some(upper) = resolved_identity(callsign) else {
+            return false;
+        };
         atno.iter().any(|prefix| upper.starts_with(prefix.as_str()))
     }
 
@@ -529,9 +553,12 @@ impl WorkedStationLookup for CachedStationLookup {
     }
 
     fn is_notable(&self, callsign: &str) -> bool {
-        self.notable_callsigns
-            .read()
-            .contains(&callsign.to_uppercase())
+        // PAN-58: resolve a hash-render before the exact-match lookup —
+        // see `resolved_identity`'s doc comment.
+        let Some(upper) = resolved_identity(callsign) else {
+            return false;
+        };
+        self.notable_callsigns.read().contains(&upper)
     }
 
     fn network_snr(&self, callsign: &str) -> Option<(u32, i32)> {
@@ -1138,5 +1165,82 @@ mod tests {
         assert!(excluded.contains("DL"));
         assert!(!excluded.contains("K"));
         assert!(!excluded.contains("JA"));
+    }
+
+    // --- PAN-58: a resolved i3=4 hash-render ("<N7RLK>") must score
+    // identically to the plain callsign it represents, everywhere a
+    // decode's identity drives DXCC/needed/atno/worked/notable lookups.
+    // Without this, the leading '<' defeats every prefix/exact match below
+    // and each of these signals silently fails toward "unknown station,
+    // never excluded, never worked, never a duplicate" — which happens to
+    // rank an already-worked home-country station artificially HIGH
+    // (needed_dxcc fails open) while also blanking its Entity column
+    // (entity_for_callsign can't parse a DXCC prefix starting with '<').
+
+    #[test]
+    fn is_needed_dxcc_resolves_hash_render_before_prefix_match() {
+        let lookup = CachedStationLookup::new();
+        let mut excluded = HashSet::new();
+        excluded.insert("N".to_string());
+        lookup.set_excluded_dxcc_prefixes(excluded);
+
+        // N7RLK is a home (excluded) US call — must read as "not needed"
+        // whether decoded plain or via a resolved hash-render.
+        assert!(!lookup.is_needed_dxcc("N7RLK"));
+        assert!(
+            !lookup.is_needed_dxcc("<N7RLK>"),
+            "resolved hash-render of an excluded prefix must not read as needed"
+        );
+        // A genuinely-needed DX call must still be needed in both forms.
+        assert!(lookup.is_needed_dxcc("JA1ABC"));
+        assert!(lookup.is_needed_dxcc("<JA1ABC>"));
+    }
+
+    #[test]
+    fn is_needed_dxcc_unresolved_hash_placeholder_is_never_needed() {
+        let lookup = CachedStationLookup::new();
+        // Even with an empty exclusion/needed set (the "everything is
+        // needed" fallback), the unresolved hash-miss placeholder carries
+        // no identity and must never be treated as a callable, needed
+        // station.
+        assert!(!lookup.is_needed_dxcc("<...>"));
+    }
+
+    #[test]
+    fn is_atno_resolves_hash_render_before_prefix_match() {
+        let lookup = CachedStationLookup::new();
+        let mut atno = HashSet::new();
+        atno.insert("JA".to_string());
+        lookup.update_needed_atno(atno);
+
+        assert!(lookup.is_atno("JA1ABC"));
+        assert!(
+            lookup.is_atno("<JA1ABC>"),
+            "resolved hash-render of an ATNO prefix must still read as ATNO"
+        );
+    }
+
+    #[test]
+    fn is_duplicate_resolves_hash_render_before_worked_lookup() {
+        let lookup = CachedStationLookup::new();
+        lookup.record_worked("N7RLK", "20m");
+
+        assert!(lookup.is_duplicate("N7RLK", 14_074_000.0));
+        assert!(
+            lookup.is_duplicate("<N7RLK>", 14_074_000.0),
+            "an already-worked station heard again via a resolved hash-render \
+             must still count as a duplicate (worked-before)"
+        );
+    }
+
+    #[test]
+    fn is_notable_resolves_hash_render_before_exact_match() {
+        let lookup = CachedStationLookup::new();
+        let mut notable = HashSet::new();
+        notable.insert("K1SE".to_string());
+        lookup.update_notable_callsigns(notable);
+
+        assert!(lookup.is_notable("K1SE"));
+        assert!(lookup.is_notable("<K1SE>"));
     }
 }
