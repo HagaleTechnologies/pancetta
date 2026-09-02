@@ -72,6 +72,14 @@ pub struct TieredScore {
     pub secondary: f64,
 }
 
+/// Width of each tier's band in `TieredScore::as_display_u32`'s encoding.
+/// A consumer deriving a display threshold from a `PriorityTier` MUST use
+/// this constant (`PriorityTier::X as u32 * TIER_BAND_WIDTH`) rather than a
+/// bare numeric literal — PAN-54 found a hardcoded threshold in
+/// `pancetta-tui/src/ui/dx_hunter.rs` silently break when `Suspect` was
+/// inserted and every band shifted by one width.
+pub const TIER_BAND_WIDTH: u32 = 1000;
+
 impl TieredScore {
     /// Encode as a single sortable u32 for display: tier dominates via a
     /// 1000-wide band per tier, secondary breaks ties within a tier.
@@ -79,7 +87,8 @@ impl TieredScore {
     /// Suspect 0-999, Standard 1000-1999, PerBandGridNew 2000-2999,
     /// SpecialStation 3000-3999, PerBandDxccNew 4000-4999, Atno 5000-5999.
     pub fn as_display_u32(&self) -> u32 {
-        (self.tier as u32) * 1000 + (self.secondary.clamp(0.0, 1.0) * 999.0).round() as u32
+        (self.tier as u32) * TIER_BAND_WIDTH
+            + (self.secondary.clamp(0.0, 1.0) * 999.0).round() as u32
     }
 }
 
@@ -393,9 +402,10 @@ impl PriorityScorer {
         }
     }
 
-    /// Classify into one of the 5 lexicographic tiers (#164). ATNO always
-    /// wins when the entity is also needed (mirrors `score_cq_detailed`'s
-    /// existing "ATNO premium only meaningful when needed" rule); needed
+    /// Classify into one of the 6 lexicographic tiers (#164, `Suspect`
+    /// added PAN-54). ATNO always wins when the entity is also needed
+    /// (mirrors `score_cq_detailed`'s existing "ATNO premium only
+    /// meaningful when needed" rule); needed
     /// alone (not ATNO) is tier 2; special-station patterns/cqdx-notable is
     /// tier 3; per-band grid-new is tier 4; everything else is Standard.
     fn classify_tier(&self, callsign: &str, grid: Option<&str>, freq_hz: f64) -> PriorityTier {
