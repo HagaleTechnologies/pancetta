@@ -781,7 +781,12 @@ async fn config_command(args: ConfigArgs, cli: &Cli) -> Result<()> {
     }
 
     if let Some(output_path) = args.generate {
-        let default_config = Config::default();
+        let mut default_config = Config::default();
+        // `Config::default()` never carries the compiled-in ClubLog key (see
+        // `default_clublog_api_key`'s doc comment) — apply it explicitly here
+        // so a generated file's `api_key = ""` doesn't permanently shadow the
+        // baked-in default the moment an operator flips `clublog.enabled`.
+        default_config.network.clublog.api_key = pancetta_config::default_clublog_api_key();
         default_config.save_to_file(&output_path)?;
         println!("Generated default configuration: {}", output_path.display());
         info!("Default configuration saved to: {}", output_path.display());

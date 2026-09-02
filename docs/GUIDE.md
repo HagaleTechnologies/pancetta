@@ -175,7 +175,9 @@ enabled  = true
 email    = ""       # your ClubLog account email
 password = ""       # an Application Password is recommended
 callsign = ""       # empty = each QSO's own station call
-api_key  = ""       # ClubLog application API key
+# api_key: OMIT this line on an official release binary — it falls back to
+# Pancetta's own baked-in ClubLog application key. Only set it if you
+# registered your own ClubLog application, or you're building from source.
 ```
 
 **LoTW:** per-QSO upload is wired via TQSL signing (not a raw ADIF POST) —

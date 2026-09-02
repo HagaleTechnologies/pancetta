@@ -120,7 +120,14 @@ pub struct ClubLogConfig {
 /// `#[derive(Default)]` above uses `String::default()`, not this function) —
 /// this fires only when TOML deserialization hits a config file that omits
 /// `api_key`, so the real value, if any, never lands in a checked-in file.
-fn default_clublog_api_key() -> String {
+///
+/// Public so callers that serialize a fresh `Config::default()` straight to
+/// an operator-facing file (`pancetta config --generate`) can apply it
+/// explicitly — an explicit `api_key = ""` written by that serialization
+/// would otherwise permanently shadow the compiled-in default the moment the
+/// operator flips `clublog.enabled = true` (the whole point of this field
+/// being deserialize-default-only, not `Config::default()`-only).
+pub fn default_clublog_api_key() -> String {
     option_env!("CLUBLOG_API_KEY").unwrap_or("").to_string()
 }
 
