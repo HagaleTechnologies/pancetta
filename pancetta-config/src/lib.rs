@@ -494,8 +494,9 @@ impl Config {
         let ptt_table = ptt.as_table_mut().ok_or_else(|| {
             ConfigError::Validation("[rig.ptt] in config is not a table".to_string())
         })?;
-        let ptt_value = toml::Value::try_from(&ptt_method)
-            .map_err(|e| ConfigError::Validation(format!("Failed to serialize PTT method: {}", e)))?;
+        let ptt_value = toml::Value::try_from(&ptt_method).map_err(|e| {
+            ConfigError::Validation(format!("Failed to serialize PTT method: {}", e))
+        })?;
         ptt_table.insert("method".to_string(), ptt_value);
 
         let serialized = toml::to_string_pretty(&root)
@@ -808,7 +809,10 @@ mod tests {
             rig["interface"].as_table().unwrap()["port"].as_str(),
             Some("/dev/cu.usbserial-01A6218A1")
         );
-        assert_eq!(rig["ptt"].as_table().unwrap()["method"].as_str(), Some("serial"));
+        assert_eq!(
+            rig["ptt"].as_table().unwrap()["method"].as_str(),
+            Some("serial")
+        );
     }
 }
 
