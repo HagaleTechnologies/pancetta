@@ -18,7 +18,7 @@ use crate::frequency::{
 use crate::priority::{PriorityTier, TieredScore};
 use crate::states::MessageType;
 use crate::watchlist::DxWatchlist;
-use pancetta_core::callsign::callsigns_match;
+use pancetta_core::callsign::{callsigns_match, is_plausible_callsign};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -1517,6 +1517,20 @@ impl AutonomousOperator {
                 if let Some(ref call) = msg.callsign {
                     // Don't respond to our own CQ.
                     if callsigns_match(call, &self.our_callsign) {
+                        continue;
+                    }
+
+                    // PAN-54 round 1 (Codex #3910471924): a Suspect-tier
+                    // callsign must never become a CQ candidate at all, not
+                    // merely score low. `score_cq_detailed`'s zero clamp is
+                    // an IN-RANGE value — it satisfies `dx_score >=
+                    // min_dx_score` whenever an operator sets `min_dx_score
+                    // = 0.0` (a supported value), and during the continuity
+                    // filter's documented cold-start window. Filtering here,
+                    // at candidate admission, removes the footgun
+                    // structurally instead of relying on every downstream
+                    // threshold comparison staying strictly positive.
+                    if !is_plausible_callsign(call) {
                         continue;
                     }
 
@@ -5268,6 +5282,27 @@ mod tests {
         assert!(
             op.pending_cqs.is_empty(),
             "a resolved AP-hash render of our own callsign must not become a CQ candidate"
+        );
+    }
+
+    #[test]
+    fn feed_decoded_messages_excludes_implausible_callsigns_from_candidates() {
+        // PAN-54 round 1 (Codex #3910471924): a Suspect-tier candidate must
+        // never even reach the evaluator, let alone `pending_cqs` — proven
+        // here with `NullDxEvaluator` (a fixed 0.5 for everything), so the
+        // only thing that can be keeping these out is the admission gate
+        // itself, not a scoring threshold.
+        let config = AutonomousConfig::default();
+        let mut op = AutonomousOperator::new(config, "W5AU".to_string(), Some("EM10".to_string()));
+        let evaluator = NullDxEvaluator;
+        op.feed_decoded_messages_at(
+            &[cq_message("<...>", "FN42"), cq_message("FN42", "FN42")],
+            &evaluator,
+            Utc::now(),
+        );
+        assert!(
+            op.pending_cqs.is_empty(),
+            "an unresolved AP-hash placeholder or a grid-shaped callsign must never become a CQ candidate, regardless of evaluator score"
         );
     }
 

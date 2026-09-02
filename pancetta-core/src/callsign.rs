@@ -153,8 +153,11 @@ pub fn is_grid_shape(t: &str) -> bool {
 /// `"<...>"`, anything under 3 or over 11 characters (once hash-resolved —
 /// 11 matches `pancetta-ft8`'s i3=4 nonstandard-callsign field limit, see
 /// `looks_like_nonstandard_callsign` in `pancetta-ft8/src/message.rs`),
-/// anything without at least one digit AND one letter, and a bare 4-char
-/// Maidenhead grid square mistaken for a callsign.
+/// anything without at least one digit AND one letter, any character
+/// outside the FT8 callsign charset (ASCII alphanumeric plus `/` — PAN-54
+/// round 1, Codex #3910471929: `"W1!"`/`"W1---"` previously passed since
+/// only digit+letter *presence* was checked, not every character), and a
+/// bare 4-char Maidenhead grid square mistaken for a callsign.
 pub fn is_plausible_callsign(callsign: &str) -> bool {
     let upper = callsign.trim().to_uppercase();
     let Some(resolved) = resolve_hash_render(&upper) else {
@@ -165,6 +168,12 @@ pub fn is_plausible_callsign(callsign: &str) -> bool {
         return false;
     }
     if is_grid_shape(resolved) {
+        return false;
+    }
+    if !resolved
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'/')
+    {
         return false;
     }
     let has_digit = resolved.bytes().any(|b| b.is_ascii_digit());
@@ -250,6 +259,17 @@ mod tests {
         assert!(!is_plausible_callsign("FN42")); // grid square, not a callsign
         assert!(!is_plausible_callsign("K")); // too short / no digit
         assert!(!is_plausible_callsign("12345")); // no letters
+    }
+
+    #[test]
+    fn is_plausible_callsign_rejects_non_charset_characters() {
+        // PAN-54 round 1 (Codex #3910471929): digit+letter presence alone
+        // isn't enough — every character must be in the FT8 callsign
+        // charset (ASCII alphanumeric plus '/').
+        assert!(!is_plausible_callsign("W1!"));
+        assert!(!is_plausible_callsign("W1---"));
+        assert!(!is_plausible_callsign("W1 ABC"));
+        assert!(!is_plausible_callsign("W1@ABC"));
     }
 
     #[test]
