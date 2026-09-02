@@ -26,10 +26,18 @@ use crate::dxcc_table::PREFIX_TABLE;
 /// is kept as a safety net for any sparse US callsign patterns not listed in
 /// cty.dat (e.g. rarely-allocated K/W/N blocks).
 pub fn entity_for_callsign(call: &str) -> Option<&'static str> {
-    let c = call.trim().to_uppercase();
-    if c.is_empty() {
+    let trimmed = call.trim().to_uppercase();
+    if trimmed.is_empty() {
         return None;
     }
+    // PAN-58: a decode heard via FT8's i3=4 hash-render comes through as
+    // "<N7RLK>" (see `pancetta_core::callsign::resolve_hash_render`'s doc).
+    // Resolve to the plain callsign it represents before prefix-matching —
+    // otherwise the leading '<' never matches any PREFIX_TABLE entry and
+    // every hash-rendered decode's Entity column reads blank ("---"). The
+    // unresolved hash-miss placeholder "<...>" carries no identity at all
+    // and correctly still resolves to `None`.
+    let c = pancetta_core::callsign::resolve_hash_render(&trimmed)?;
 
     // Longest leading-prefix match over the authoritative table. The leading
     // prefix also correctly handles portable-PREFIX compounds
@@ -133,5 +141,25 @@ mod tests {
     #[test]
     fn d4_cape_verde_resolves() {
         assert_eq!(entity_for_callsign("D4VHF"), Some("Cape Verde"));
+    }
+
+    /// PAN-58: a resolved i3=4 hash-render (`"<N7RLK>"`) is a real,
+    /// identifiable callsign (see `pancetta_core::callsign::resolve_hash_render`)
+    /// and must resolve to the same entity as its plain form — the leading
+    /// `'<'` previously defeated the prefix-table match entirely, leaving
+    /// the DX Hunter's Entity column blank ("---") for any station heard
+    /// via a hash-rendered decode.
+    #[test]
+    fn resolved_hash_render_resolves_same_entity_as_plain_callsign() {
+        assert_eq!(entity_for_callsign("<N7RLK>"), entity_for_callsign("N7RLK"));
+        assert_eq!(entity_for_callsign("<N7RLK>"), Some("United States"));
+        assert_eq!(entity_for_callsign("<JA1XYZ>"), Some("Japan"));
+    }
+
+    /// The unresolved hash-miss placeholder carries no identity at all —
+    /// must never resolve to an entity.
+    #[test]
+    fn unresolved_hash_placeholder_has_no_entity() {
+        assert_eq!(entity_for_callsign("<...>"), None);
     }
 }

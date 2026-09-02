@@ -233,12 +233,19 @@ impl WorkedStationLookup for NullLookup {
 // TODO: thread pota_flag from cqdx spot enrichment through DecodedMessageInfo
 // so genuine activators without a /P or /POTA suffix are detected.
 pub fn is_pota_sota_candidate(callsign: &str) -> bool {
-    let upper = callsign.to_uppercase();
-    upper.ends_with("/P")
-        || upper.ends_with("/POTA")
-        || upper.ends_with("/S")
-        || upper.ends_with("/SOTA")
-        || upper.ends_with("/PORT")
+    let upper = callsign.trim().to_uppercase();
+    // PAN-58 round 1 (Codex P2): resolve a hash-render first, matching
+    // `is_plausible_callsign`'s own pattern — otherwise a resolved compound
+    // form like "<K1ABC/P>" never matches any suffix below (it ends with
+    // '>', not "/P") and silently loses its portable bonus.
+    let Some(resolved) = pancetta_core::callsign::resolve_hash_render(&upper) else {
+        return false;
+    };
+    resolved.ends_with("/P")
+        || resolved.ends_with("/POTA")
+        || resolved.ends_with("/S")
+        || resolved.ends_with("/SOTA")
+        || resolved.ends_with("/PORT")
 }
 
 /// US 1x1 format (letter-digit-letter, e.g. `W1A`, `N4B`, `K9Z`) is FCC's
@@ -249,14 +256,19 @@ pub fn is_pota_sota_candidate(callsign: &str) -> bool {
 /// covers well-known permanent international special-service stations
 /// (UN/ITU HQ stations).
 pub fn is_special_event_callsign(callsign: &str) -> bool {
-    let upper = callsign.to_uppercase();
-    if is_us_1x1_format(&upper) {
+    let upper = callsign.trim().to_uppercase();
+    // PAN-58 round 1 (Codex P2): resolve a hash-render first — see
+    // `is_pota_sota_candidate`'s matching comment.
+    let Some(resolved) = pancetta_core::callsign::resolve_hash_render(&upper) else {
+        return false;
+    };
+    if is_us_1x1_format(resolved) {
         return true;
     }
-    if upper.starts_with("GB") && upper.chars().nth(2).is_some_and(|c| c.is_ascii_digit()) {
+    if resolved.starts_with("GB") && resolved.chars().nth(2).is_some_and(|c| c.is_ascii_digit()) {
         return true;
     }
-    matches!(upper.as_str(), "4U1UN" | "4U1ITU")
+    matches!(resolved, "4U1UN" | "4U1ITU")
 }
 
 fn is_us_1x1_format(upper: &str) -> bool {
@@ -1005,6 +1017,30 @@ mod tests {
         assert!(is_special_event_callsign("4U1UN"));
         assert!(is_special_event_callsign("4U1ITU"));
         assert!(!is_special_event_callsign("4U1XYZ")); // not in the curated list
+    }
+
+    // --- PAN-58 round 1 (Codex P2): a resolved hash-render must score
+    // identically to its plain form for every callsign-scoped predicate,
+    // not just the four DXCC/priority lookups the first pass covered.
+
+    #[test]
+    fn is_pota_sota_candidate_resolves_hash_render_before_suffix_check() {
+        assert!(is_pota_sota_candidate("K1ABC/P"));
+        assert!(
+            is_pota_sota_candidate("<K1ABC/P>"),
+            "a resolved hash-render of a portable-suffix call must still get the POTA/SOTA bonus"
+        );
+        assert!(!is_pota_sota_candidate("<...>"));
+    }
+
+    #[test]
+    fn is_special_event_callsign_resolves_hash_render_before_pattern_check() {
+        assert!(is_special_event_callsign("W1A"));
+        assert!(
+            is_special_event_callsign("<W1A>"),
+            "a resolved hash-render of a special-event callsign must still be detected"
+        );
+        assert!(!is_special_event_callsign("<...>"));
     }
 
     #[test]
