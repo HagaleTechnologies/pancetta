@@ -61,8 +61,9 @@ coarse `dx_priority_score` bucket function for network-only spots) are now unifi
 took on a new `pancetta-qso` dependency (confirmed non-cyclic — `pancetta-qso` has no dependency
 back on `pancetta-tui`) so every DX Hunter row, regardless of source, is scored by the same
 `PriorityScorer::score_tiered`. Display encoding is a single `u32`
-(`TieredScore::as_display_u32`): `tier_rank * 1000 + secondary*999`, giving five clean 1000-wide
-bands (Standard 0-999 through Atno 4000-4999) that can never bleed into each other.
+(`TieredScore::as_display_u32`): `tier_rank * 1000 + secondary*999`, giving six clean 1000-wide
+bands (Suspect 0-999, Standard 1000-1999, PerBandGridNew 2000-2999, SpecialStation 3000-3999,
+PerBandDxccNew 4000-4999, Atno 5000-5999) that can never bleed into each other.
 
 Full design: `docs/superpowers/specs/2026-07-19-dx-hunter-priority-tiers-and-history-panel-design.md`.
 

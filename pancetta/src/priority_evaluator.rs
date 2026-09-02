@@ -1012,6 +1012,12 @@ mod tests {
     fn test_atno_bonus_lifts_score_over_plain_needed() {
         // An ATNO entity should score strictly higher than the same entity
         // when only band-needed (not ATNO), via the atno_bonus weight.
+        // PAN-54 round 5 (Codex #3910841457): the fixture used to be
+        // "3Y/B1234" — a digit-terminal home call with no suffix letter —
+        // which `is_plausible_callsign` (added by this PR) now correctly
+        // rejects as implausible, zeroing both totals and breaking this
+        // assertion. "3Y/B1ABC" still matches the "3Y/B" needed-prefix
+        // lookup below while passing the new shape gate.
         use pancetta_qso::priority::{PriorityScorer, PriorityWeights};
         use pancetta_qso::DxEvaluator;
 
@@ -1022,14 +1028,14 @@ mod tests {
         let plain = CachedStationLookup::new();
         plain.update_needed_dxcc(needed.clone());
         let plain_scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(plain));
-        let plain_score = plain_scorer.evaluate_cq("3Y/B1234", None, -10, 14_074_000.0);
+        let plain_score = plain_scorer.evaluate_cq("3Y/B1ABC", None, -10, 14_074_000.0);
 
         // Lookup B: needed AND atno.
         let atno_lookup = CachedStationLookup::new();
         atno_lookup.update_needed_dxcc(needed.clone());
         atno_lookup.update_needed_atno(needed);
         let atno_scorer = PriorityScorer::new(PriorityWeights::default(), Box::new(atno_lookup));
-        let atno_score = atno_scorer.evaluate_cq("3Y/B1234", None, -10, 14_074_000.0);
+        let atno_score = atno_scorer.evaluate_cq("3Y/B1ABC", None, -10, 14_074_000.0);
 
         assert!(
             atno_score > plain_score,

@@ -2881,11 +2881,22 @@ impl App {
     /// highlighted.
     ///
     /// Comparator is a stable total order:
-    ///   1. needed first (`worked_before == false` before `== true`)
-    ///   2. `priority_score` descending
-    ///   3. `snr` descending
-    ///   4. `frequency` ascending
-    ///   5. `call_sign` ascending (final tiebreak → deterministic)
+    ///   1. implausible callsign last (PAN-54 round 2, Codex #3910544298:
+    ///      always sorts after every plausible-callsign row, regardless of
+    ///      `worked_before`; without this key, an unworked-but-implausible
+    ///      row could outrank an already-worked real station since
+    ///      `worked_before` was compared first. Keyed on
+    ///      `is_plausible_callsign(&call_sign)` directly rather than
+    ///      `priority_score` — round 3, Codex #3910624274: `add_dx_spot`
+    ///      stamps every DX-cluster row with a `priority_score: 0`
+    ///      "not yet scored" sentinel before its real score arrives on a
+    ///      later feed, which a `priority_score`-based check couldn't
+    ///      distinguish from a genuinely Suspect-tier row)
+    ///   2. needed first (`worked_before == false` before `== true`)
+    ///   3. `priority_score` descending
+    ///   4. `snr` descending
+    ///   5. `frequency` ascending
+    ///   6. `call_sign` ascending (final tiebreak → deterministic)
     pub fn displayed_dx_stations(&self) -> Vec<&DxStation> {
         // Drop spots not heard within the staleness window — a station last
         // heard minutes ago is no longer "current" DX to chase.
@@ -2904,8 +2915,19 @@ impl App {
             })
             .collect();
         list.sort_by(|a, b| {
-            a.worked_before
-                .cmp(&b.worked_before)
+            // PAN-54 round 3 (Codex #3910624274): `add_dx_spot` stamps
+            // every DX-cluster row with the SENTINEL `priority_score: 0`
+            // ("not yet scored by the tui_relay layer") before its real
+            // score arrives on a later feed — comparing against
+            // `TIER_BAND_WIDTH` treated that placeholder as genuinely
+            // Suspect-tier and sorted a legitimate unworked/needed/ATNO
+            // cluster spot to the bottom. Checking the callsign's own
+            // plausibility directly sidesteps the placeholder entirely.
+            let a_suspect = !pancetta_core::callsign::is_plausible_callsign(&a.call_sign);
+            let b_suspect = !pancetta_core::callsign::is_plausible_callsign(&b.call_sign);
+            a_suspect
+                .cmp(&b_suspect)
+                .then(a.worked_before.cmp(&b.worked_before))
                 .then(b.priority_score.cmp(&a.priority_score))
                 .then(b.snr.cmp(&a.snr))
                 .then(
@@ -4122,14 +4144,15 @@ mod tests {
             is_own_tx: false,
         };
         let score = app.calculate_dx_priority(&message);
-        // ATNO + needed -> PriorityTier::Atno -> display range 4000-4999.
+        // ATNO + needed -> PriorityTier::Atno -> display range 5000-5999
+        // (PAN-54 shifted every band +1000 to make room for the Suspect tier).
         // The old coarse dx_priority_score function would have scored this
         // input (atno=true, distance=None, snr=-10, non-rare-prefix call)
         // at only 1014 (1000 ATNO + 0 rarity + 0 distance + 14 SNR
-        // tiebreak), so `>= 4000` alone already distinguishes new from old
-        // behavior; `< 5000` further pins it to the Atno band specifically.
-        assert!(score >= 4000, "expected ATNO tier range, got {score}");
-        assert!(score < 5000, "expected ATNO tier range, got {score}");
+        // tiebreak), so `>= 5000` alone already distinguishes new from old
+        // behavior; `< 6000` further pins it to the Atno band specifically.
+        assert!(score >= 5000, "expected ATNO tier range, got {score}");
+        assert!(score < 6000, "expected ATNO tier range, got {score}");
     }
 
     #[test]
@@ -5468,7 +5491,7 @@ mod tests {
         app.merge_spot_groups(&[spot]);
         let entry = app.dx_stations.get("JA1ABC").expect("spot merged");
         assert!(
-            entry.priority_score >= 4000,
+            entry.priority_score >= 5000,
             "expected ATNO tier range, got {}",
             entry.priority_score
         );
@@ -5684,6 +5707,63 @@ mod tests {
             .map(|s| s.call_sign.as_str())
             .collect();
         assert_eq!(order, vec!["HIGHPRI", "LOWPRI", "WORKED"]);
+    }
+
+    /// PAN-54 round 2 (Codex #3910544298): a Suspect-tier row (priority_score
+    /// in 0-999, worked_before == false — the default for an invalid/new
+    /// spot) must sort BELOW an already-worked real station, even though
+    /// `worked_before` alone would otherwise put the unworked Suspect row
+    /// first.
+    #[tokio::test]
+    async fn displayed_dx_stations_sorts_suspect_tier_below_worked_real_station() {
+        let mut app = fixture_app().await;
+        // "FN42" is a bare grid square, not a real callsign — implausible
+        // regardless of its (deliberately high) priority_score.
+        app.dx_stations
+            .insert("FN42".into(), dx_fixture("FN42", 500, 20, 14.074, false));
+        app.dx_stations
+            .insert("JA1ABC".into(), dx_fixture("JA1ABC", 1500, 5, 14.074, true));
+
+        let order: Vec<&str> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["JA1ABC", "FN42"],
+            "an implausible-callsign row must never outrank a real, already-worked station"
+        );
+    }
+
+    /// PAN-54 round 3 (Codex #3910624274): a DX-cluster spot's
+    /// `priority_score: 0` "not yet scored" sentinel (`add_dx_spot`, before
+    /// the tui_relay layer's real score arrives on a later feed) must NOT
+    /// be misread as genuinely Suspect-tier — a real, unworked, plausible
+    /// callsign with that placeholder score must still rank above an
+    /// already-worked real station.
+    #[tokio::test]
+    async fn displayed_dx_stations_does_not_treat_unscored_placeholder_as_suspect() {
+        let mut app = fixture_app().await;
+        app.dx_stations.insert(
+            "JA1ABC".into(),
+            dx_fixture("JA1ABC", 0, 20, 14.074, false), // real call, not yet scored
+        );
+        app.dx_stations.insert(
+            "W1XYZ".into(),
+            dx_fixture("W1XYZ", 1500, 5, 14.074, true), // already worked, real score
+        );
+
+        let order: Vec<&str> = app
+            .displayed_dx_stations()
+            .iter()
+            .map(|s| s.call_sign.as_str())
+            .collect();
+        assert_eq!(
+            order,
+            vec!["JA1ABC", "W1XYZ"],
+            "an unworked real station with the unscored priority_score:0 placeholder must still outrank an already-worked real station"
+        );
     }
 
     /// A spot last heard beyond the staleness window drops off the displayed

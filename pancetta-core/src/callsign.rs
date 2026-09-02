@@ -126,6 +126,119 @@ fn resolve_hash_render(call: &str) -> Option<&str> {
     }
 }
 
+/// Is `t` shaped like a bare 4-character Maidenhead grid square (two field
+/// letters, two square digits — e.g. `FN42`)? Promoted from
+/// `pancetta_qso::callsign_continuity`'s identical private check so both
+/// crates share one definition (PAN-54).
+pub fn is_grid_shape(t: &str) -> bool {
+    let chars: Vec<char> = t.chars().collect();
+    chars.len() == 4
+        && chars[0].is_ascii_alphabetic()
+        && chars[1].is_ascii_alphabetic()
+        && chars[2].is_ascii_digit()
+        && chars[3].is_ascii_digit()
+}
+
+/// Is `callsign` structurally plausible as a real amateur-radio callsign,
+/// as opposed to decoder noise or a placeholder token?
+///
+/// This is a SHAPE check, not a semantic one — it cannot and does not
+/// detect a well-formed decode that happens to be a false positive (that
+/// discrimination is `pancetta_qso::content_score`'s job). It exists so a
+/// decode that cannot possibly BE a real callsign never outranks a genuine
+/// station in `pancetta_qso::priority`'s scoring, regardless of what a
+/// coincidental DXCC-prefix/rarity lookup says about it (PAN-54).
+///
+/// Rejects: empty/whitespace-only input, the unresolved AP-hash placeholder
+/// `"<...>"`, anything under 3 or over 11 characters (once hash-resolved —
+/// 11 matches `pancetta-ft8`'s i3=4 nonstandard-callsign field limit, see
+/// `looks_like_nonstandard_callsign` in `pancetta-ft8/src/message.rs`),
+/// anything without at least one digit AND one letter, any character
+/// outside the FT8 callsign charset (ASCII alphanumeric plus `/` — PAN-54
+/// round 1, Codex #3910471929: `"W1!"`/`"W1---"` previously passed since
+/// only digit+letter *presence* was checked, not every character), a bare
+/// 4-char Maidenhead grid square mistaken for a callsign, and free-text-
+/// shaped garbage like `"ABC1D"` (PAN-54 round 2, Codex #3910544291): a
+/// real callsign's digit run always has a plausible prefix (at most 2
+/// letters, or none for a digit-led form) before it and at least one
+/// suffix letter after it. Applied to [`base_callsign`]'s extraction
+/// rather than the raw input, so a compound form (`"K1ABC/P"`,
+/// `"VP2E/W5AU/P"`) is validated on its actual home-call component instead
+/// of being exempted wholesale — PAN-54 round 3 (Codex #3910624281) found
+/// the first cut of this check skipped compound tokens entirely, so
+/// appending any portable suffix to implausible garbage (`"ABC1D/P"`)
+/// bypassed it outright.
+pub fn is_plausible_callsign(callsign: &str) -> bool {
+    let upper = callsign.trim().to_uppercase();
+    let Some(resolved) = resolve_hash_render(&upper) else {
+        return false;
+    };
+    let len = resolved.len();
+    if !(3..=11).contains(&len) {
+        return false;
+    }
+    if is_grid_shape(resolved) {
+        return false;
+    }
+    if !resolved
+        .bytes()
+        .all(|b| b.is_ascii_alphanumeric() || b == b'/')
+    {
+        return false;
+    }
+    // PAN-54 round 5 (Codex #3910841449): a leading/trailing/repeated slash
+    // ("/K1ABC", "K1ABC/", "K1ABC//P") passes the charset check above, and
+    // `base_callsign` silently drops the resulting empty component(s) — any
+    // empty `/`-separated component (which covers all three malformed
+    // shapes at once: a leading or trailing slash yields an empty first or
+    // last component, a doubled slash yields an empty one in the middle)
+    // means the token is structurally impossible; reject it before it ever
+    // reaches `base_callsign`.
+    if resolved.split('/').any(str::is_empty) {
+        return false;
+    }
+    let has_digit = resolved.bytes().any(|b| b.is_ascii_digit());
+    let has_alpha = resolved.bytes().any(|b| b.is_ascii_alphabetic());
+    if !(has_digit && has_alpha) {
+        return false;
+    }
+    if !has_plausible_callsign_shape(base_callsign(resolved).as_bytes()) {
+        return false;
+    }
+    true
+}
+
+/// Digit-run positional shape check for a bare token (called on
+/// [`base_callsign`]'s output, so `is_plausible_callsign` gets this for
+/// compound forms too): the digit run must be flanked by a plausible
+/// prefix (at most 2 letters, or none for a digit-led form) and at least
+/// one suffix letter after the last digit. Ported from
+/// `pancetta_ft8::message::looks_like_compound_callsign_shape` (see
+/// `is_plausible_callsign`'s doc for why this is a deliberate, documented
+/// duplication rather than a shared call).
+fn has_plausible_callsign_shape(bytes: &[u8]) -> bool {
+    if bytes.len() < 2 {
+        return false;
+    }
+    let Some(last_digit_pos) = bytes.iter().rposition(u8::is_ascii_digit) else {
+        return false;
+    };
+    if last_digit_pos + 1 >= bytes.len()
+        || !bytes[last_digit_pos + 1..]
+            .iter()
+            .all(u8::is_ascii_alphabetic)
+    {
+        return false;
+    }
+    let first_digit_pos = bytes.iter().position(u8::is_ascii_digit).unwrap();
+    let prefix = &bytes[..first_digit_pos];
+    if prefix.is_empty() {
+        return first_digit_pos + 1 < bytes.len()
+            && bytes[first_digit_pos + 1].is_ascii_alphabetic();
+    }
+    prefix.len() <= 2 && prefix.iter().all(u8::is_ascii_alphabetic)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,6 +283,88 @@ mod tests {
             );
             assert!(callsigns_match(b, a), "callsigns_match must be symmetric");
         }
+    }
+
+    // --- is_grid_shape / is_plausible_callsign ------------------------------
+
+    #[test]
+    fn is_grid_shape_matches_maidenhead_field_square() {
+        assert!(is_grid_shape("FN42"));
+        assert!(is_grid_shape("PM95"));
+        assert!(!is_grid_shape("FN4")); // too short
+        assert!(!is_grid_shape("FN42A")); // too long (6-char grid, not 4)
+        assert!(!is_grid_shape("W1ABC")); // not grid-shaped at all
+        assert!(!is_grid_shape("44NN")); // digits/letters swapped
+    }
+
+    #[test]
+    fn is_plausible_callsign_accepts_real_shapes() {
+        assert!(is_plausible_callsign("W5AU"));
+        assert!(is_plausible_callsign("g8bcg")); // case-insensitive
+        assert!(is_plausible_callsign("  K1ABC/P  ")); // trimmed, portable suffix
+        assert!(is_plausible_callsign("<W5AU>")); // resolved AP-hash render
+    }
+
+    #[test]
+    fn is_plausible_callsign_accepts_max_length_nonstandard_compound() {
+        assert!(is_plausible_callsign("VP2E/W5AU/P")); // 11 chars, matches pancetta-ft8's 3..=11 nonstandard-callsign limit
+    }
+
+    #[test]
+    fn is_plausible_callsign_rejects_placeholder_and_noise() {
+        assert!(!is_plausible_callsign("")); // empty
+        assert!(!is_plausible_callsign("<...>")); // unresolved AP-hash placeholder
+        assert!(!is_plausible_callsign("FN42")); // grid square, not a callsign
+        assert!(!is_plausible_callsign("K")); // too short / no digit
+        assert!(!is_plausible_callsign("12345")); // no letters
+    }
+
+    #[test]
+    fn is_plausible_callsign_rejects_non_charset_characters() {
+        // PAN-54 round 1 (Codex #3910471929): digit+letter presence alone
+        // isn't enough — every character must be in the FT8 callsign
+        // charset (ASCII alphanumeric plus '/').
+        assert!(!is_plausible_callsign("W1!"));
+        assert!(!is_plausible_callsign("W1---"));
+        assert!(!is_plausible_callsign("W1 ABC"));
+        assert!(!is_plausible_callsign("W1@ABC"));
+    }
+
+    #[test]
+    fn is_plausible_callsign_rejects_free_text_shaped_single_tokens() {
+        // PAN-54 round 2 (Codex #3910544291): digit+letter presence alone
+        // isn't enough for a single (non-compound) token either — the
+        // digit run needs a plausible prefix/suffix shape.
+        assert!(!is_plausible_callsign("ABC1D"));
+        assert!(!is_plausible_callsign("EFG2H"));
+    }
+
+    #[test]
+    fn is_plausible_callsign_rejects_free_text_shaped_compound_tokens() {
+        // PAN-54 round 3 (Codex #3910624281): appending a portable suffix
+        // must not bypass the positional shape check — it must apply to
+        // the extracted home-call component, not be skipped wholesale for
+        // any '/'-containing token.
+        assert!(!is_plausible_callsign("ABC1D/P"));
+    }
+
+    #[test]
+    fn is_plausible_callsign_rejects_malformed_slash_placement() {
+        // PAN-54 round 5 (Codex #3910841449): a leading, trailing, or
+        // doubled slash must not slip an empty component past
+        // base_callsign's silent empty-component filtering.
+        assert!(!is_plausible_callsign("/K1ABC"));
+        assert!(!is_plausible_callsign("K1ABC/"));
+        assert!(!is_plausible_callsign("K1ABC//P"));
+    }
+
+    #[test]
+    fn is_plausible_callsign_accepts_real_single_token_shapes() {
+        // Real callsigns of various prefix shapes must still pass the new
+        // positional check.
+        assert!(is_plausible_callsign("W5AU")); // 1-letter prefix
+        assert!(is_plausible_callsign("PA3ABC")); // 2-letter prefix
+        assert!(is_plausible_callsign("8G81PA")); // digit-led prefix
     }
 
     #[test]
