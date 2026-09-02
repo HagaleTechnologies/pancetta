@@ -186,6 +186,17 @@ pub fn is_plausible_callsign(callsign: &str) -> bool {
     {
         return false;
     }
+    // PAN-54 round 5 (Codex #3910841449): a leading/trailing/repeated slash
+    // ("/K1ABC", "K1ABC/", "K1ABC//P") passes the charset check above, and
+    // `base_callsign` silently drops the resulting empty component(s) — any
+    // empty `/`-separated component (which covers all three malformed
+    // shapes at once: a leading or trailing slash yields an empty first or
+    // last component, a doubled slash yields an empty one in the middle)
+    // means the token is structurally impossible; reject it before it ever
+    // reaches `base_callsign`.
+    if resolved.split('/').any(str::is_empty) {
+        return false;
+    }
     let has_digit = resolved.bytes().any(|b| b.is_ascii_digit());
     let has_alpha = resolved.bytes().any(|b| b.is_ascii_alphabetic());
     if !(has_digit && has_alpha) {
@@ -335,6 +346,16 @@ mod tests {
         // the extracted home-call component, not be skipped wholesale for
         // any '/'-containing token.
         assert!(!is_plausible_callsign("ABC1D/P"));
+    }
+
+    #[test]
+    fn is_plausible_callsign_rejects_malformed_slash_placement() {
+        // PAN-54 round 5 (Codex #3910841449): a leading, trailing, or
+        // doubled slash must not slip an empty component past
+        // base_callsign's silent empty-component filtering.
+        assert!(!is_plausible_callsign("/K1ABC"));
+        assert!(!is_plausible_callsign("K1ABC/"));
+        assert!(!is_plausible_callsign("K1ABC//P"));
     }
 
     #[test]
