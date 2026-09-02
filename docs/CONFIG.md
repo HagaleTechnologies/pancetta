@@ -318,8 +318,9 @@ enabled  = false
 email    = ""        # your ClubLog account email (NOT a callsign), plaintext on disk
 password = ""        # ClubLog password (an Application Password is recommended), plaintext
 callsign = ""        # station call the log uploads into; empty = use the QSO's own call
-api_key  = ""        # ClubLog application API key — OMIT this line on an official release
-                      # binary to use Pancetta's own baked-in key; see notes below
+# api_key: OMIT this line on an official release binary — it falls back to
+# Pancetta's own baked-in ClubLog application key. Only set it if you
+# registered your own ClubLog application, or you're building from source.
 
 [network.qrz_logbook]
 enabled = false
