@@ -2722,6 +2722,22 @@ impl super::ApplicationCoordinator {
                 // Normal recovery: let `tx_inhibit` drop here, releasing
                 // the inhibit exactly as the crash-restart path's `Ok(())`
                 // arm does.
+                //
+                // Bug fix (PAN-59 post-review): a PRIOR call to this same
+                // handler may have taken the `Err(_)` arm below and leaked
+                // its own `TxInhibitGuard` into `hamlib_leaked_tx_inhibits`
+                // (e.g. operator tried a dead port, then fixed it and
+                // retried). Unlike the crash-restart path
+                // (`health.rs::handle_finished_task`'s `Ok(())` arm), this
+                // handler never checked for that debt on a later success --
+                // so a failed-then-successful live-switch sequence left TX
+                // permanently hard-muted even though CAT is now confirmed
+                // up. Pay back any such debt here, exactly like
+                // `handle_finished_task` does.
+                if self.hamlib_leaked_tx_inhibits > 0 {
+                    let owed = std::mem::take(&mut self.hamlib_leaked_tx_inhibits);
+                    self.tx_restart_inhibit.fetch_sub(owed, Ordering::AcqRel);
+                }
             }
             Err(_) => {
                 // Terminal for this attempt: `start_hamlib_component`
@@ -6542,11 +6558,15 @@ mod pan_59_reconnect_tests {
         let mut coordinator = test_coordinator().await;
         coordinator.ptt_active.store(true, Ordering::Release);
         // M10 (PAN-59 final review): capture the generation counter BEFORE
-        // the call -- both `teardown_hamlib()` and `start_hamlib_component()`
-        // bump it (see `start_hamlib_component`'s `this_generation` fetch_add
-        // near its top), so an unchanged value after a refused call is
-        // direct proof neither ever ran, not just that the call returned an
-        // error for some other reason.
+        // the call -- only `start_hamlib_component()` bumps it (see its
+        // `this_generation` fetch_add near its top); `teardown_hamlib()`
+        // never touches `hamlib_generation` at all. A refused reconnect
+        // calls neither function (both live further down in
+        // `handle_hamlib_reconnect_request`, unconditionally back-to-back,
+        // whenever a reconnect is actually attempted), so an unchanged
+        // value after the refusal is still direct proof that this call
+        // short-circuited before reaching either of them, not just that it
+        // returned an error for some other reason.
         let generation_before = coordinator.hamlib_generation.load(Ordering::Acquire);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
@@ -6794,6 +6814,82 @@ mod pan_59_reconnect_tests {
             coordinator.rigctld_process.is_none(),
             "rigctld_process must not still reference the killed stand-in after reconnect \
              (the mock-rig path on the new generation doesn't spawn a replacement)"
+        );
+    }
+
+    /// Bug fix (PAN-59 post-review): a failed live-switch (e.g. a dead/wrong
+    /// port) leaks a `TxInhibitGuard` increment into
+    /// `hamlib_leaked_tx_inhibits` (mirroring `handle_finished_task`'s
+    /// crash-restart failure path) so TX stays hard-muted rather than
+    /// un-muting with no confirmed CAT/PTT control. The crash-restart path's
+    /// own `Ok(())` arm (`health.rs::handle_finished_task`) pays that debt
+    /// back on a later successful restart -- but before this fix,
+    /// `handle_hamlib_reconnect_request`'s own success arm never checked
+    /// for it. That left an operator who tried a bad port, then fixed it
+    /// and retried, with TX permanently hard-muted even after a genuinely
+    /// successful reconnect (only a full pancetta restart cleared the
+    /// in-memory counter). This proves a failed reconnect followed by a
+    /// successful one fully repays the debt: `tx_restart_inhibit` returns to
+    /// 0 and `hamlib_leaked_tx_inhibits` is cleared.
+    #[tokio::test]
+    async fn successful_reconnect_repays_a_leaked_inhibit_from_an_earlier_failed_one() {
+        let mut coordinator = test_coordinator().await;
+
+        // First: a reconnect that fails the `device_path_looks_safe` gate
+        // (same setup as `refuses_reconnect_when_configured_port_fails_the_
+        // safety_check`), leaking a TxInhibitGuard increment.
+        {
+            let mut config = coordinator.config.write().await;
+            config.rig.interface.enabled = true;
+            config.rig.interface.port = "/dev/not-a-real-serial-device".to_string();
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        coordinator
+            .handle_hamlib_reconnect_request(HamlibReconnectRequest { respond: tx })
+            .await;
+        let result = rx.await.expect("handler must always respond");
+        assert!(
+            result.is_err(),
+            "setup: the bad-port reconnect must fail: {:?}",
+            result
+        );
+        assert_eq!(
+            coordinator.tx_restart_inhibit.load(Ordering::Acquire),
+            1,
+            "setup: the failed reconnect must leak a TxInhibitGuard increment"
+        );
+        assert_eq!(
+            coordinator.hamlib_leaked_tx_inhibits, 1,
+            "setup: the failed reconnect must record the leaked increment for later repayment"
+        );
+
+        // Second: the operator fixes the config (disabling rig control
+        // takes the trivial success path, same as
+        // `reconnects_successfully_when_ptt_is_idle`) and retries.
+        {
+            let mut config = coordinator.config.write().await;
+            config.rig.interface.enabled = false;
+        }
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        coordinator
+            .handle_hamlib_reconnect_request(HamlibReconnectRequest { respond: tx })
+            .await;
+        let result = rx.await.expect("handler must always respond");
+        assert!(
+            result.is_ok(),
+            "the follow-up reconnect must succeed: {:?}",
+            result.err()
+        );
+
+        assert_eq!(
+            coordinator.tx_restart_inhibit.load(Ordering::Acquire),
+            0,
+            "a successful reconnect must repay any inhibit leaked by an earlier failed one -- \
+             otherwise TX stays permanently hard-muted despite a confirmed-good rig connection"
+        );
+        assert_eq!(
+            coordinator.hamlib_leaked_tx_inhibits, 0,
+            "the leaked-inhibit debt must be cleared once repaid"
         );
     }
 }
