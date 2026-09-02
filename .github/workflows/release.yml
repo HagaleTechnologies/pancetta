@@ -70,6 +70,23 @@ jobs:
           test -f pancetta-ft8/vendor/ft8_lib/ft8/constants.c \
             || { echo "::error::ft8_lib submodule not checked out — refusing to build a stub release"; exit 1; }
 
+      - name: Guard — ClubLog app key present (upstream only)
+        if: github.repository == 'HagaleTechnologies/pancetta'
+        shell: bash
+        # Upstream-only: a fork has no access to this repo secret, and that's
+        # the documented, intentional empty-key behavior for forks (see the
+        # CLUBLOG_API_KEY note on the build step below) — this guard exists
+        # so the secret going missing/renamed/expired on the CANONICAL repo
+        # fails loudly instead of silently shipping an official release
+        # where the documented email/password-only ClubLog config is
+        # rejected by validation in every affected binary (Codex review,
+        # PR #325).
+        run: |
+          test -n "${CLUBLOG_API_KEY:-}" \
+            || { echo "::error::CLUBLOG_API_KEY repo secret is empty/missing on the upstream repo — refusing to ship an official release with no ClubLog app key baked in"; exit 1; }
+        env:
+          CLUBLOG_API_KEY: ${{ secrets.CLUBLOG_API_KEY }}
+
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
