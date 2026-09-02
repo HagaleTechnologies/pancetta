@@ -32,6 +32,8 @@ use std::collections::{HashSet, VecDeque};
 use std::path::Path;
 use std::sync::RwLock;
 
+use pancetta_core::callsign::is_grid_shape;
+
 /// True if the message contains a high-risk false-positive pattern.
 ///
 /// Used by `accept()` as a pre-callsign-lookup reject. These patterns
@@ -95,15 +97,6 @@ pub fn has_high_risk_fp_pattern(message: &str) -> bool {
     false
 }
 
-fn is_grid_shape(t: &str) -> bool {
-    let chars: Vec<char> = t.chars().collect();
-    chars.len() == 4
-        && chars[0].is_ascii_alphabetic()
-        && chars[1].is_ascii_alphabetic()
-        && chars[2].is_ascii_digit()
-        && chars[3].is_ascii_digit()
-}
-
 fn has_consecutive_digit_run(s: &str, min_run: usize) -> bool {
     let mut run = 0usize;
     for ch in s.chars() {
@@ -151,6 +144,9 @@ fn is_cq_modifier(t: &str) -> bool {
 fn looks_like_callsign(t: &str) -> bool {
     let len = t.len();
     if !(3..=10).contains(&len) {
+        return false;
+    }
+    if is_grid_shape(t) {
         return false;
     }
     let mut has_digit = false;
@@ -839,5 +835,33 @@ mod tests {
         assert!(f.accept("CQ K1ABC FN42"));
         assert!(f.accept("CQ W9XYZ FN42"));
         assert!(f.accept("DL5XYZ K1ABC -10"));
+    }
+
+    #[test]
+    fn callsigns_in_does_not_treat_a_grid_square_as_a_pseudo_callsign() {
+        // The unresolved AP-hash placeholder plus a trailing grid square must
+        // extract to NO callsigns at all, not "the grid square as a fake one".
+        assert_eq!(callsigns_in("CQ <...> FN42"), Vec::<String>::new());
+    }
+
+    #[test]
+    fn accept_does_not_grant_continuity_via_grid_square_pseudo_callsign() {
+        // Strict mode (cold_start_threshold = 0). Mirrors the real pipeline's
+        // per-window ordering (coordinator/ft8.rs:2168-2170): `accept()` runs
+        // against the trust state built by PRIOR windows, then
+        // `note_window_raw_calls` records this window's raw text for the
+        // NEXT window.
+        let filter = CallsignContinuityFilter::new(500);
+        let msg = "CQ <...> FN42".to_string();
+
+        // Window 1: nothing in any trust set yet — rejected.
+        assert!(!filter.accept(&msg));
+        filter.note_window_raw_calls(std::slice::from_ref(&msg));
+
+        // Window 2: before the fix, "FN42" was wrongly extracted as a
+        // pseudo-callsign in window 1 and recorded into `observed` by
+        // `note_window_raw_calls` above — this second `accept()` call would
+        // incorrectly return `true` via `in_observed`.
+        assert!(!filter.accept(&msg));
     }
 }
