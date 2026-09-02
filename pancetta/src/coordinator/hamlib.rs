@@ -2553,6 +2553,32 @@ pub struct HamlibReconnectRequest {
     pub respond: tokio::sync::oneshot::Sender<anyhow::Result<()>>,
 }
 
+/// PAN-59 final-review fix (I-1a): thin wrapper the TUI command-relay task
+/// (`tui_relay.rs`'s `TuiCommand::SelectRig` arm, which runs regardless of
+/// whether `pancetta-hamlib` is compiled in) can call to validate a rig
+/// model BEFORE persisting anything or requesting a live reconnect.
+/// Without this, an unrecognized `rig.model` string was silently persisted
+/// and `start_hamlib_component` would fall through to build a
+/// `RigctldClient` pointing at a port nothing is listening on, still
+/// reporting success.
+///
+/// When `pancetta-hamlib` IS compiled in, this defers to the same
+/// recognized-model table `start_hamlib_component` itself uses
+/// ([`ApplicationCoordinator::hamlib_model_id`]), so the two can never
+/// silently disagree. When it is NOT compiled in, there's no model table
+/// to check against and the reconnect will already fail with "rig control
+/// not compiled in" regardless of the model string -- persisting a model
+/// name by itself isn't unsafe, so this permissively returns `true`.
+#[cfg(feature = "pancetta-hamlib")]
+pub(crate) fn model_recognized(model: &str) -> bool {
+    super::ApplicationCoordinator::hamlib_model_id(model).is_some()
+}
+
+#[cfg(not(feature = "pancetta-hamlib"))]
+pub(crate) fn model_recognized(_model: &str) -> bool {
+    true
+}
+
 impl super::ApplicationCoordinator {
     /// Handle a PAN-59 live rig-config-switch request: refuse while PTT is
     /// active (tearing down Hamlib mid-key-down would yank CAT/PTT control
@@ -2639,7 +2665,57 @@ impl super::ApplicationCoordinator {
             let _ = child.wait();
         }
 
-        let result = self.start_hamlib_component().await;
+        let mut result = self.start_hamlib_component().await;
+
+        // I-1b fix (PAN-59 final review): `start_hamlib_component` returns
+        // `Ok(())` on essentially every rig-config failure -- an
+        // unrecognized `rig.model` (falls through to build a
+        // `RigctldClient` pointing at a port nothing is listening on) or a
+        // port that fails `device_path_looks_safe` (returns `Ok(())`
+        // *before* ever spawning the message loop, leaving
+        // `hamlib_command_loop_ready` permanently `false`) both report
+        // success today even though no real CAT/PTT control came up. When
+        // rig control is enabled and not mocked, confirm the connection
+        // actually came up before telling the operator the switch
+        // succeeded.
+        //
+        // `start_hamlib_component` has already (on the `rig_enabled` path)
+        // synchronously awaited its own `initial_read_rx` (connect
+        // attempt) and `loop_ready_rx` (message loop confirmation) before
+        // returning, so both `rig_conn_state` and
+        // `hamlib_command_loop_ready` have normally already settled one
+        // way or the other by the time we get here. The short poll below
+        // is just a safety margin for the rare case where those internal
+        // waits timed out right at their boundary.
+        if result.is_ok() {
+            let mock_rig = std::env::var("PANCETTA_MOCK_RIG")
+                .map(|v| v.to_lowercase() == "true" || v == "1")
+                .unwrap_or(false);
+            let rig_enabled = {
+                let config = self.config.read().await;
+                config.rig.interface.enabled
+            } && !mock_rig;
+
+            if rig_enabled {
+                let cat_up = |this: &Self| {
+                    this.rig_conn_state.load(Ordering::Relaxed) == RigConnState::Connected.as_u8()
+                        && this.hamlib_command_loop_ready.load(Ordering::Acquire)
+                };
+                let mut confirmed = cat_up(self);
+                for _ in 0..5 {
+                    if confirmed {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    confirmed = cat_up(self);
+                }
+                if !confirmed {
+                    result = Err(anyhow::anyhow!(
+                        "config saved but CAT did not come up — check rig connection"
+                    ));
+                }
+            }
+        }
 
         match &result {
             Ok(()) => {
@@ -6398,6 +6474,36 @@ mod device_path_tests {
     }
 }
 
+/// I-1a fix (PAN-59 final review): `model_recognized` is the gate
+/// `tui_relay.rs`'s `TuiCommand::SelectRig` handler calls before
+/// persisting/reconnecting anything -- it must agree exactly with
+/// `hamlib_model_id`'s recognized-model table (the one
+/// `start_hamlib_component` itself uses), since the whole point is to
+/// catch a bad model BEFORE the live-switch attempt.
+#[cfg(all(test, feature = "pancetta-hamlib"))]
+mod model_recognized_tests {
+    use super::*;
+
+    #[test]
+    fn recognizes_every_model_in_the_hamlib_id_table() {
+        for model in [
+            "FTdx10", "ftdx10", "FT-DX10", "FTdx101D", "FT991", "ft991a", "FT710", "FT891",
+            "FT857", "FT817", "IC-7300", "ic7610", "IC7851", "IC705", "IC9700", "TS890", "ts590sg",
+        ] {
+            assert!(
+                model_recognized(model),
+                "expected {model:?} to be recognized (it's in hamlib_model_id's table)"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_an_unrecognized_model() {
+        assert!(!model_recognized("totally-bogus-unrecognized-model"));
+        assert!(!model_recognized(""));
+    }
+}
+
 #[cfg(all(test, feature = "pancetta-hamlib"))]
 mod pan_59_reconnect_tests {
     //! PAN-59: `handle_hamlib_reconnect_request` is the coordinator-side
@@ -6435,6 +6541,13 @@ mod pan_59_reconnect_tests {
     async fn refuses_reconnect_while_ptt_is_active() {
         let mut coordinator = test_coordinator().await;
         coordinator.ptt_active.store(true, Ordering::Release);
+        // M10 (PAN-59 final review): capture the generation counter BEFORE
+        // the call -- both `teardown_hamlib()` and `start_hamlib_component()`
+        // bump it (see `start_hamlib_component`'s `this_generation` fetch_add
+        // near its top), so an unchanged value after a refused call is
+        // direct proof neither ever ran, not just that the call returned an
+        // error for some other reason.
+        let generation_before = coordinator.hamlib_generation.load(Ordering::Acquire);
 
         let (tx, rx) = tokio::sync::oneshot::channel();
         coordinator
@@ -6446,6 +6559,13 @@ mod pan_59_reconnect_tests {
             result.is_err(),
             "must refuse a live rig reconnect while PTT is active -- tearing down Hamlib \
              mid-key-down would yank CAT/PTT control out from under an active transmission"
+        );
+        assert_eq!(
+            coordinator.hamlib_generation.load(Ordering::Acquire),
+            generation_before,
+            "a refused reconnect must never bump hamlib_generation -- proving \
+             teardown_hamlib()/start_hamlib_component() genuinely never ran, not just that \
+             the call returned an error"
         );
     }
 
@@ -6464,6 +6584,111 @@ mod pan_59_reconnect_tests {
             result.is_ok(),
             "must succeed reconnecting via the mock rig path when PTT is idle: {:?}",
             result.err()
+        );
+    }
+
+    /// I-1 fix (PAN-59 final review), failure class 2 (the "worse" one
+    /// flagged by the review): before the fix, `start_hamlib_component`'s
+    /// `device_path_looks_safe` gate returned `Ok(())` EARLY -- before ever
+    /// spawning the message loop or restoring `hamlib_command_loop_ready`
+    /// to `true` (it's forced `false` at the very top of every call) --
+    /// so a bad-port config reported success to the operator while leaving
+    /// TX permanently hard-muted with no Hamlib task even registered to
+    /// notice/restart it. `handle_hamlib_reconnect_request` must now
+    /// convert that into a real `Err` instead of relaying the false `Ok`.
+    #[tokio::test]
+    async fn refuses_reconnect_when_configured_port_fails_the_safety_check() {
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut config = coordinator.config.write().await;
+            config.rig.interface.enabled = true;
+            // Fails `device_path_looks_safe`: not a recognized
+            // serial/network device shape.
+            config.rig.interface.port = "/dev/not-a-real-serial-device".to_string();
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        coordinator
+            .handle_hamlib_reconnect_request(HamlibReconnectRequest { respond: tx })
+            .await;
+
+        let result = rx.await.expect("handler must always respond");
+        assert!(
+            result.is_err(),
+            "a rig-enabled reconnect with a port that fails device_path_looks_safe must \
+             report failure, not silently succeed with no real CAT/PTT control: {:?}",
+            result
+        );
+        assert!(
+            !coordinator
+                .hamlib_command_loop_ready
+                .load(Ordering::Acquire),
+            "the early-return path never restores hamlib_command_loop_ready to true -- TX \
+             must stay muted after this refusal"
+        );
+    }
+
+    /// I-1 fix (PAN-59 final review), failure class 1: an unrecognized
+    /// `rig.model` string makes `hamlib_model_id` return `None`.
+    /// `start_hamlib_component` logs a warning and reports a rig error, but
+    /// (before this fix) fell through to build a `RigctldClient` pointing
+    /// at a port nothing is listening on and returned `Ok(())` anyway.
+    /// Uses a genuinely free TCP port (bound then immediately released) for
+    /// `RIGCTLD_PORT`/`RIGCTLD_HOST` so the resulting real connect attempt
+    /// fails fast and deterministically, instead of risking collision with
+    /// the default 4532 (which a developer's own rig session could have
+    /// bound) or a slow connect() against an unrelated live service.
+    #[tokio::test]
+    async fn refuses_reconnect_when_rig_model_is_unrecognized() {
+        // SAFETY: this test mutates process-wide env vars (RIGCTLD_PORT/
+        // RIGCTLD_HOST). No other test in this module reads them (the mock
+        // -rig path used elsewhere never reaches the code that does), and
+        // `cargo test` runs each `#[tokio::test]` on its own task, but env
+        // vars are still process-global -- restore them unconditionally
+        // below so another test elsewhere in the binary is never left
+        // seeing a stale value.
+        let free_port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0")
+                .expect("failed to bind an ephemeral port for the test");
+            listener
+                .local_addr()
+                .expect("local_addr should succeed")
+                .port()
+            // listener drops here, releasing the port back to the OS.
+        };
+        let prev_port = std::env::var("RIGCTLD_PORT").ok();
+        let prev_host = std::env::var("RIGCTLD_HOST").ok();
+        std::env::set_var("RIGCTLD_PORT", free_port.to_string());
+        std::env::set_var("RIGCTLD_HOST", "127.0.0.1");
+
+        let mut coordinator = test_coordinator().await;
+        {
+            let mut config = coordinator.config.write().await;
+            config.rig.interface.enabled = true;
+            config.rig.interface.port = "/dev/ttyUSB0".to_string();
+            config.rig.model = "totally-bogus-unrecognized-model".to_string();
+        }
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        coordinator
+            .handle_hamlib_reconnect_request(HamlibReconnectRequest { respond: tx })
+            .await;
+        let result = rx.await.expect("handler must always respond");
+
+        match prev_port {
+            Some(v) => std::env::set_var("RIGCTLD_PORT", v),
+            None => std::env::remove_var("RIGCTLD_PORT"),
+        }
+        match prev_host {
+            Some(v) => std::env::set_var("RIGCTLD_HOST", v),
+            None => std::env::remove_var("RIGCTLD_HOST"),
+        }
+
+        assert!(
+            result.is_err(),
+            "a rig-enabled reconnect with an unrecognized model must report failure, not \
+             silently succeed while connected to nothing: {:?}",
+            result
         );
     }
 

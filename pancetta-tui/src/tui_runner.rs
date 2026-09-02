@@ -1069,6 +1069,13 @@ impl TuiRunner {
         if app.rig_selection.visible {
             match key.code {
                 KeyCode::Esc => {
+                    // I-3 fix (PAN-59 final review): restore the live
+                    // fields from the committed snapshot BEFORE hiding the
+                    // modal, so an abandoned edit (e.g. garbage typed into
+                    // Model) doesn't linger in `RigSelectionState` to be
+                    // picked up by a LATER, unrelated Enter press the next
+                    // time the modal opens.
+                    app.rig_selection.restore_committed();
                     app.rig_selection.visible = false;
                     app.status_message = "Rig config picker cancelled".to_string();
                 }
@@ -1093,14 +1100,29 @@ impl TuiRunner {
                     app.rig_selection.push_model_char(c);
                 }
                 KeyCode::Enter => {
-                    app.rig_selection.visible = false;
-                    self.message_tx.send(TuiCommand::SelectRig {
-                        model: app.rig_selection.model.clone(),
-                        port: app.rig_selection.selected_port(),
-                        baud_rate: app.rig_selection.selected_baud(),
-                        ptt_method: app.rig_selection.selected_ptt(),
-                    })?;
-                    app.status_message = "Applying rig config…".to_string();
+                    let port = app.rig_selection.selected_port();
+                    if port.is_empty() {
+                        // I-2b fix (PAN-59 final review): no ports were
+                        // enumerated (or none is selected) -- submitting
+                        // now would persist `port = ""` into
+                        // ~/.pancetta/pancetta.toml, destroying whatever
+                        // was previously configured there. Refuse and keep
+                        // the modal open instead.
+                        app.status_message = "No port selected — cannot apply".to_string();
+                    } else {
+                        app.rig_selection.visible = false;
+                        self.message_tx.send(TuiCommand::SelectRig {
+                            model: app.rig_selection.model.clone(),
+                            port,
+                            baud_rate: app.rig_selection.selected_baud(),
+                            ptt_method: app.rig_selection.selected_ptt(),
+                        })?;
+                        // I-3 fix (PAN-59 final review): sync the committed
+                        // snapshot to the just-applied values so a later
+                        // open/cancel cycle doesn't revert past them.
+                        app.rig_selection.snapshot_committed();
+                        app.status_message = "Applying rig config…".to_string();
+                    }
                 }
                 _ => {}
             }
@@ -1576,6 +1598,11 @@ impl TuiRunner {
                 }
             }
             KeyCode::Char('i') => {
+                // I-3 fix (PAN-59 final review): snapshot the current
+                // fields as the committed baseline BEFORE the operator can
+                // edit anything, so an Esc later in this session has
+                // correct values to restore.
+                app.rig_selection.snapshot_committed();
                 app.rig_selection.visible = true;
                 app.status_message =
                     "Edit rig config (Tab: next field, Up/Down: change, type: edit model, Enter: apply, Esc: cancel)"
@@ -5010,6 +5037,87 @@ mod key_tests {
                 assert_eq!(dx_parity, Some(pancetta_core::slot::SlotParity::Even));
             }
             other => panic!("Expected RespondToCaller targeting G8KHF, got {:?}", other),
+        }
+    }
+
+    /// I-2b fix (PAN-59 final review): pressing Enter with no port
+    /// selected (no ports enumerated at all) must refuse to submit --
+    /// otherwise it would persist `port = ""` into
+    /// ~/.pancetta/pancetta.toml, destroying whatever was previously
+    /// configured there.
+    #[tokio::test]
+    async fn rig_modal_enter_with_no_port_refuses_to_submit() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut app = app.write().await;
+            app.rig_selection.visible = true;
+            app.rig_selection.available_ports.clear();
+            app.rig_selection.selected_port_idx = 0;
+            app.rig_selection.model = "FTdx10".to_string();
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "no SelectRig command should be sent when no port is selected"
+        );
+        let app = app.read().await;
+        assert!(
+            app.rig_selection.visible,
+            "the modal must stay open when the submission is refused"
+        );
+        assert!(app.status_message.contains("No port selected"));
+    }
+
+    /// I-3 fix (PAN-59 final review): Esc after an abandoned edit must
+    /// restore the modal's committed values, so a LATER `i`+Enter cycle
+    /// applies the ORIGINAL values, not the abandoned garbage.
+    #[tokio::test]
+    async fn rig_modal_esc_then_reopen_and_enter_applies_original_values_not_abandoned_edit() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut app = app.write().await;
+            app.rig_selection.model = "FTdx10".to_string();
+            app.rig_selection.available_ports = vec!["/dev/ttyUSB0".to_string()];
+            app.rig_selection.selected_port_idx = 0;
+        }
+
+        // Open the modal (snapshots the committed baseline).
+        r.handle_key_event(key('i')).await.unwrap();
+        assert!(app.read().await.rig_selection.visible);
+
+        // Type garbage into the Model field (active_field defaults to
+        // Model on open), then abandon the edit with Esc.
+        r.handle_key_event(key('X')).await.unwrap();
+        r.handle_key_event(key('X')).await.unwrap();
+        assert_eq!(app.read().await.rig_selection.model, "FTdx10XX");
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        assert!(!app.read().await.rig_selection.visible);
+        assert_eq!(
+            app.read().await.rig_selection.model,
+            "FTdx10",
+            "Esc must restore the model field, not leave the abandoned edit sitting in state"
+        );
+
+        // Reopen and submit with no further edits -- must apply the
+        // ORIGINAL value, not the abandoned "FTdx10XX".
+        r.handle_key_event(key('i')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::SelectRig { model, .. }) => {
+                assert_eq!(
+                    model, "FTdx10",
+                    "a later, unrelated Enter must never apply an abandoned edit from a \
+                     prior cancelled session"
+                );
+            }
+            other => panic!("expected SelectRig, got {:?}", other),
         }
     }
 }
