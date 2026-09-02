@@ -781,7 +781,7 @@ async fn config_command(args: ConfigArgs, cli: &Cli) -> Result<()> {
     }
 
     if let Some(output_path) = args.generate {
-        let default_config = fresh_default_config();
+        let default_config = Config::default();
         default_config.save_to_file(&output_path)?;
         println!("Generated default configuration: {}", output_path.display());
         info!("Default configuration saved to: {}", output_path.display());
@@ -951,7 +951,7 @@ async fn load_configuration_with_warnings(cli: &Cli) -> Result<(Config, Vec<Stri
                     "Re-run first-time setup? (overwrites the broken config on save)",
                     false,
                 )? {
-                    let defaults = fresh_default_config();
+                    let defaults = Config::default();
                     match run_first_time_setup(&defaults)? {
                         Some(fixed) => (fixed, Vec::new()),
                         None => {
@@ -1010,22 +1010,6 @@ fn offer_wizard_on_load_failure(
     interactive: bool,
 ) -> bool {
     !headless && !wav && !replay && interactive
-}
-
-/// `Config::default()` deliberately never carries the compiled-in ClubLog
-/// key (see `default_clublog_api_key`'s doc comment — it must stay pure so
-/// the secret can never leak into the checked-in `defaults.toml`). Every
-/// call site that instead serializes a fresh default straight to an
-/// operator-facing file (`--generate`, the first-run wizard's de-brick path,
-/// `pancetta setup` with no existing config) must apply it explicitly here:
-/// an explicit `api_key = ""` written by that serialization would otherwise
-/// permanently shadow the baked-in default the moment ClubLog gets enabled
-/// (the serde per-field default only fires when the field is *absent* from
-/// a parsed file, not when it's present-but-empty).
-fn fresh_default_config() -> Config {
-    let mut config = Config::default();
-    config.network.clublog.api_key = pancetta_config::default_clublog_api_key();
-    config
 }
 
 /// Interactive first-run setup wizard.
@@ -1477,7 +1461,7 @@ async fn setup_command() -> Result<()> {
     let mut config = if config_path.exists() {
         Config::load_from_file(&config_path).unwrap_or_default()
     } else {
-        fresh_default_config()
+        Config::default()
     };
 
     setup_station(&mut config)?;
