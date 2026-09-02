@@ -6303,11 +6303,21 @@ fn start_qso_upload_subscriber(
         } else {
             clublog_cfg.callsign.clone()
         };
+        // An empty configured key falls back to Pancetta's own compiled-in
+        // ClubLog application key (empty on a source build) — resolved here,
+        // at point of use, rather than baked into the config value itself,
+        // so a rotated compiled key takes effect immediately with no config
+        // file changes and a config resave never freezes in a stale one.
+        let api_key = if clublog_cfg.api_key.is_empty() {
+            pancetta_config::default_clublog_api_key()
+        } else {
+            clublog_cfg.api_key.clone()
+        };
         Some(Arc::new(pancetta_dx::ClubLogClient::new(
             clublog_cfg.email.clone(),
             clublog_cfg.password.clone(),
             callsign,
-            clublog_cfg.api_key.clone(),
+            api_key,
         )))
     } else {
         None

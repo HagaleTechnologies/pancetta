@@ -70,6 +70,23 @@ jobs:
           test -f pancetta-ft8/vendor/ft8_lib/ft8/constants.c \
             || { echo "::error::ft8_lib submodule not checked out — refusing to build a stub release"; exit 1; }
 
+      - name: Guard — ClubLog app key present (upstream only)
+        if: github.repository == 'HagaleTechnologies/pancetta'
+        shell: bash
+        # Upstream-only: a fork has no access to this repo secret, and that's
+        # the documented, intentional empty-key behavior for forks (see the
+        # CLUBLOG_API_KEY note on the build step below) — this guard exists
+        # so the secret going missing/renamed/expired on the CANONICAL repo
+        # fails loudly instead of silently shipping an official release
+        # where the documented email/password-only ClubLog config is
+        # rejected by validation in every affected binary (Codex review,
+        # PR #325).
+        run: |
+          test -n "${CLUBLOG_API_KEY:-}" \
+            || { echo "::error::CLUBLOG_API_KEY repo secret is empty/missing on the upstream repo — refusing to ship an official release with no ClubLog app key baked in"; exit 1; }
+        env:
+          CLUBLOG_API_KEY: ${{ secrets.CLUBLOG_API_KEY }}
+
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libudev-dev libssl-dev pkg-config
@@ -95,6 +112,18 @@ jobs:
         # CI) and every helper binary. Default features (metrics + hamlib
         # rigctld-TCP client) are the production build; no system hamlib is
         # needed at build time (runtime-only, via rigctld over TCP).
+        #
+        # CLUBLOG_API_KEY: ClubLog issues its API key per-application, not
+        # per-operator, so official release binaries bake in Pancetta's own
+        # key (pancetta-config/src/network.rs, `option_env!`) — operators
+        # then only need their own ClubLog email/password, not a personal
+        # key. pancetta-config/build.rs pins a rebuild to this var so
+        # rust-cache below can't silently serve a build compiled before the
+        # secret existed. Empty/unset (e.g. a fork without the repo secret)
+        # degrades to no default key — ClubLog upload still works if the
+        # operator sets their own `network.clublog.api_key`.
+        env:
+          CLUBLOG_API_KEY: ${{ secrets.CLUBLOG_API_KEY }}
         run: cargo build --release -p pancetta --target ${{ matrix.target }}
 
       - name: Smoke test — binary must embed the real C decoder

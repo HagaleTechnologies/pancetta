@@ -102,9 +102,42 @@ pub struct ClubLogConfig {
     #[serde(default)]
     pub callsign: String,
 
-    /// ClubLog application API key (per-application, from the ClubLog API page).
+    /// ClubLog application API key (per-application, from the ClubLog API
+    /// page). ClubLog issues this per *application*, not per operator, so
+    /// most operators shouldn't need to register one: an official release
+    /// binary has Pancetta's own key baked in at build time (`build.rs`
+    /// pins a rebuild to `CLUBLOG_API_KEY`; local `cargo build` never has it
+    /// set, so a source build falls back to empty here). Leaving this field
+    /// absent from your config file uses that baked-in default.
+    ///
+    /// Deliberately a PLAIN `#[serde(default)]` (empty), not a per-field
+    /// default resolving to the compiled key: an earlier version of this
+    /// fix applied the compiled key during TOML deserialization, which
+    /// meant loading a config, then saving it back out (every setup-wizard
+    /// path does this) *materialized* the compiled key into the file as an
+    /// explicit value — permanently pinning that operator to whichever
+    /// binary they last ran setup with, and defeating the whole point of
+    /// omitting the field (Codex review, PR #325: "Avoid persisting the
+    /// compiled ClubLog key"). Resolving it only at the point of use
+    /// ([`default_clublog_api_key`], called from `validate` and from the
+    /// coordinator's `ClubLogClient` construction) keeps this field's
+    /// on-disk value exactly what the operator put there, forever — a
+    /// rotated compiled key is picked up immediately with no file changes,
+    /// and a config resave never freezes anything.
     #[serde(default)]
     pub api_key: String,
+}
+
+/// Pancetta's own ClubLog application key, embedded only in official release
+/// builds via a `CLUBLOG_API_KEY` build-time env var (release.yml). Absent
+/// (empty) in every local/source build.
+///
+/// Call this ONLY at the point of use (validation, client construction) —
+/// never during config (de)serialization or from `Config::default()`. See
+/// [`ClubLogConfig::api_key`]'s doc comment for why: resolving it earlier
+/// lets a config resave freeze in a stale key and defeats key rotation.
+pub fn default_clublog_api_key() -> String {
+    option_env!("CLUBLOG_API_KEY").unwrap_or("").to_string()
 }
 
 /// QRZ Logbook QSO upload configuration.
@@ -1480,7 +1513,11 @@ impl ConfigSection for NetworkConfig {
                     "ClubLog upload enabled but no password configured".to_string(),
                 ));
             }
-            if self.clublog.api_key.is_empty() {
+            // An empty api_key is fine IF the running binary has a compiled-in
+            // key to fall back on at point of use (see default_clublog_api_key's
+            // doc comment) — only reject when NEITHER the file nor the binary
+            // can supply one.
+            if self.clublog.api_key.is_empty() && default_clublog_api_key().is_empty() {
                 return Err(ConfigError::Validation(
                     "ClubLog upload enabled but no api_key configured".to_string(),
                 ));
@@ -1912,20 +1949,32 @@ mod tests {
 
     #[test]
     fn test_clublog_validation_enabled_without_creds_fails() {
+        // Whether a bare "email + password, no api_key" config is valid
+        // depends on whether this binary has a compiled-in fallback key —
+        // conditional so `CLUBLOG_API_KEY=... cargo test` (the official
+        // release build mode) exercises real assertions instead of failing
+        // on a hardcoded no-compiled-key assumption (Codex review, PR #325).
+        let has_compiled_key = !default_clublog_api_key().is_empty();
+
         let mut config = NetworkConfig::default();
         config.clublog.enabled = true;
-        // No creds at all.
+        // No creds at all — always invalid regardless of compiled key
+        // (email/password are never supplied by the compiled fallback).
         assert!(config.validate_section().is_err());
 
-        // Email only — still missing password + api_key.
+        // Email only — still missing password.
         config.clublog.email = "op@example.com".to_string();
         assert!(config.validate_section().is_err());
 
-        // Email + password — still missing api_key.
+        // Email + password, no api_key — valid iff a compiled key exists.
         config.clublog.password = "secret".to_string();
-        assert!(config.validate_section().is_err());
+        if has_compiled_key {
+            assert!(config.validate_section().is_ok());
+        } else {
+            assert!(config.validate_section().is_err());
+        }
 
-        // All required creds present (callsign may stay empty).
+        // All required creds present explicitly — always valid.
         config.clublog.api_key = "appkey123".to_string();
         assert!(config.validate_section().is_ok());
     }
@@ -2311,5 +2360,58 @@ tx_allow_list = ["client-key-1", "client-key-2"]
             reparsed.station_agent.relay_url.as_deref(),
             Some("wss://relay.example/ws")
         );
+    }
+
+    #[test]
+    fn clublog_api_key_never_materializes_from_deserialization() {
+        // Config::default() must NEVER carry the compiled key -- it would
+        // leak into pancetta-config/defaults.toml via defaults_drift's
+        // render_defaults_toml().
+        assert_eq!(ClubLogConfig::default().api_key, "");
+
+        // A TOML fragment that omits api_key must deserialize to an empty
+        // field, NOT the compiled default -- an earlier version of this fix
+        // applied the compiled key here, which meant load-then-resave (every
+        // setup-wizard path) permanently froze in whatever key the binary
+        // that last ran setup happened to have compiled in, defeating
+        // "omit to follow the current binary" and key rotation (Codex
+        // review, PR #325). The compiled key is resolved ONLY at point of
+        // use: validate() below, and the coordinator's ClubLogClient
+        // construction (pancetta/src/coordinator/qso.rs) -- never here.
+        let cfg: ClubLogConfig =
+            toml::from_str("enabled = true\nemail = \"a@b.com\"\npassword = \"x\"\n").unwrap();
+        assert_eq!(cfg.api_key, "");
+
+        // Round-tripping (deserialize, then reserialize, as every save does)
+        // must never introduce a value that wasn't there originally.
+        let reserialized = toml::to_string(&cfg).unwrap();
+        let reparsed: ClubLogConfig = toml::from_str(&reserialized).unwrap();
+        assert_eq!(reparsed.api_key, "");
+    }
+
+    #[test]
+    fn clublog_validate_resolves_empty_api_key_against_compiled_default() {
+        // An empty api_key is valid iff a compiled fallback key exists —
+        // exercised in whichever mode this binary was actually built in
+        // (`CLUBLOG_API_KEY=... cargo test` for the official release build
+        // mode, unset for a normal source build), rather than assuming one
+        // mode and failing the other (Codex review, PR #325).
+        let mut net = NetworkConfig::default();
+        net.clublog.enabled = true;
+        net.clublog.email = "a@b.com".to_string();
+        net.clublog.password = "x".to_string();
+        net.clublog.api_key = String::new();
+
+        if default_clublog_api_key().is_empty() {
+            assert!(
+                net.validate_section().is_err(),
+                "empty api_key with no compiled fallback must fail validation"
+            );
+        } else {
+            assert!(
+                net.validate_section().is_ok(),
+                "empty api_key must validate OK when a compiled fallback key exists"
+            );
+        }
     }
 }
