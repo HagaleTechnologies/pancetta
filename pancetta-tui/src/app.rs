@@ -737,6 +737,12 @@ pub enum RigField {
 /// (`pancetta/src/main.rs:1385`).
 pub const RIG_BAUD_RATES: [u32; 6] = [4800, 9600, 19200, 38400, 57600, 115200];
 
+/// Sentinel for `RigSelectionState::selected_baud_idx`/`selected_ptt_idx`
+/// meaning "the live value isn't one of the picker's fixed enumerated
+/// choices" (PAN-64) -- `selected_baud()`/`selected_ptt()` fall back to
+/// `live_baud_rate`/`live_ptt_method` instead of indexing into the array.
+const NOT_ENUMERATED: usize = usize::MAX;
+
 /// The 4 PTT methods the wizard offers (`setup_ptt`, `pancetta/src/main.rs:1409-1414`).
 /// Deliberately a function, not a `const` array: `PttMethod` doesn't derive
 /// `Copy` (nor `PartialEq` — comparisons below use `Debug` formatting,
@@ -763,6 +769,13 @@ pub struct RigSelectionState {
     pub selected_port_idx: usize,
     pub selected_baud_idx: usize,
     pub selected_ptt_idx: usize,
+    /// The live rig's true baud rate/PTT method (PAN-64), always kept in
+    /// sync by `apply_rig_config_update`. Read only as the fallback when
+    /// `selected_baud_idx`/`selected_ptt_idx` is [`NOT_ENUMERATED`] -- the
+    /// live value isn't one of the picker's fixed choices, so there is no
+    /// index that could represent it without losing it.
+    pub live_baud_rate: u32,
+    pub live_ptt_method: pancetta_config::rig::PttMethod,
     pub active_field: RigField,
     /// I-3 fix (PAN-59 final review): a snapshot of the four live fields
     /// taken when the modal opens (and refreshed on a successful apply).
@@ -797,6 +810,8 @@ impl Default for RigSelectionState {
             selected_port_idx: 0,
             selected_baud_idx: 1, // 9600, RigConfig's own default (rig.rs:807)
             selected_ptt_idx: 0,  // PttMethod::None
+            live_baud_rate: 9600,
+            live_ptt_method: pancetta_config::rig::PttMethod::None,
             active_field: RigField::Model,
             committed_model: String::new(),
             committed_port_idx: 0,
@@ -837,13 +852,20 @@ impl RigSelectionState {
                     self.selected_port_idx -= 1;
                 }
             }
+            // PAN-64: from the sentinel (the live value has no
+            // enumerated index), Up enters the list at its first choice
+            // rather than underflowing or staying stuck.
             RigField::Baud => {
-                if self.selected_baud_idx > 0 {
+                if self.selected_baud_idx == NOT_ENUMERATED {
+                    self.selected_baud_idx = 0;
+                } else if self.selected_baud_idx > 0 {
                     self.selected_baud_idx -= 1;
                 }
             }
             RigField::Ptt => {
-                if self.selected_ptt_idx > 0 {
+                if self.selected_ptt_idx == NOT_ENUMERATED {
+                    self.selected_ptt_idx = 0;
+                } else if self.selected_ptt_idx > 0 {
                     self.selected_ptt_idx -= 1;
                 }
             }
@@ -862,13 +884,19 @@ impl RigSelectionState {
                     self.selected_port_idx += 1;
                 }
             }
+            // PAN-64: from the sentinel, Down also enters the list at its
+            // first choice -- see the `move_up` comment above.
             RigField::Baud => {
-                if self.selected_baud_idx + 1 < RIG_BAUD_RATES.len() {
+                if self.selected_baud_idx == NOT_ENUMERATED {
+                    self.selected_baud_idx = 0;
+                } else if self.selected_baud_idx + 1 < RIG_BAUD_RATES.len() {
                     self.selected_baud_idx += 1;
                 }
             }
             RigField::Ptt => {
-                if self.selected_ptt_idx + 1 < rig_ptt_methods().len() {
+                if self.selected_ptt_idx == NOT_ENUMERATED {
+                    self.selected_ptt_idx = 0;
+                } else if self.selected_ptt_idx + 1 < rig_ptt_methods().len() {
                     self.selected_ptt_idx += 1;
                 }
             }
@@ -995,11 +1023,22 @@ impl RigSelectionState {
             .unwrap_or_default()
     }
 
+    /// PAN-64: `NOT_ENUMERATED` means the live baud rate isn't one of
+    /// `RIG_BAUD_RATES` -- return the true live value instead of indexing.
     pub fn selected_baud(&self) -> u32 {
+        if self.selected_baud_idx == NOT_ENUMERATED {
+            return self.live_baud_rate;
+        }
         RIG_BAUD_RATES[self.selected_baud_idx.min(RIG_BAUD_RATES.len() - 1)]
     }
 
+    /// PAN-64: `NOT_ENUMERATED` means the live PTT method isn't one of
+    /// `rig_ptt_methods()` -- return the true live value instead of
+    /// indexing.
     pub fn selected_ptt(&self) -> pancetta_config::rig::PttMethod {
+        if self.selected_ptt_idx == NOT_ENUMERATED {
+            return self.live_ptt_method.clone();
+        }
         let methods = rig_ptt_methods();
         methods[self.selected_ptt_idx.min(methods.len() - 1)].clone()
     }
@@ -3827,20 +3866,31 @@ impl App {
                 0
             }
         };
+        // PAN-64: a schema-valid live baud/PTT outside these fixed
+        // enumerated choices (e.g. a hand-edited `baud_rate = 230400`, or
+        // `PttMethod::Parallel`) previously fell back to `1`/`0` here,
+        // silently substituting 9600/None into the index and permanently
+        // losing the true value -- `selected_baud()`/`selected_ptt()`
+        // (and everything downstream: display, `SelectRig`,
+        // `SaveRigBookmark`) had no way to recover it. `NOT_ENUMERATED`
+        // preserves the true value in `live_baud_rate`/`live_ptt_method`
+        // instead.
         let selected_baud_idx = RIG_BAUD_RATES
             .iter()
             .position(|b| *b == current_baud_rate)
-            .unwrap_or(1);
+            .unwrap_or(NOT_ENUMERATED);
         let selected_ptt_idx = rig_ptt_methods()
             .iter()
             .position(|m| format!("{:?}", m) == format!("{:?}", current_ptt_method))
-            .unwrap_or(0);
+            .unwrap_or(NOT_ENUMERATED);
 
         self.rig_selection.available_ports = available_ports;
         self.rig_selection.model = current_model;
         self.rig_selection.selected_port_idx = selected_port_idx;
         self.rig_selection.selected_baud_idx = selected_baud_idx;
         self.rig_selection.selected_ptt_idx = selected_ptt_idx;
+        self.rig_selection.live_baud_rate = current_baud_rate;
+        self.rig_selection.live_ptt_method = current_ptt_method;
         // Keep the committed snapshot (I-3) in sync with this freshly-
         // authoritative baseline.
         self.rig_selection.snapshot_committed();
@@ -6823,6 +6873,75 @@ mod tests {
                 .contains(&"remote-rig.example:4532".to_string()),
             "the current port must be prepended so it's a selectable option in the list"
         );
+    }
+
+    /// PAN-64: when the live rig config has a baud rate outside the
+    /// picker's fixed enumerated choices (`RIG_BAUD_RATES`) -- e.g. a
+    /// hand-edited `pancetta.toml` with `baud_rate = 230400` -- the
+    /// previous `.unwrap_or(1)` fallback substituted 9600 into the index,
+    /// permanently losing the true value. `selected_baud()` must still
+    /// report the true live value even though it has no representable
+    /// index.
+    #[tokio::test]
+    async fn apply_rig_config_update_preserves_unenumerated_baud_rate() {
+        let mut app = fixture_app().await;
+        app.apply_rig_config_update(
+            vec![],
+            "FTdx10".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            230_400, // not in RIG_BAUD_RATES
+            pancetta_config::rig::PttMethod::None,
+            vec![],
+        );
+        assert_eq!(
+            app.rig_selection.selected_baud(),
+            230_400,
+            "an unenumerated live baud rate must be preserved, not silently \
+             substituted with a default"
+        );
+    }
+
+    /// PAN-64: same bug, PTT side -- e.g. a hand-edited
+    /// `PttMethod::Parallel` (schema-valid, not one of the picker's 4
+    /// choices). Previously substituted with `PttMethod::None`.
+    #[tokio::test]
+    async fn apply_rig_config_update_preserves_unenumerated_ptt_method() {
+        let mut app = fixture_app().await;
+        app.apply_rig_config_update(
+            vec![],
+            "FTdx10".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            9600,
+            pancetta_config::rig::PttMethod::Parallel,
+            vec![],
+        );
+        assert!(
+            matches!(
+                app.rig_selection.selected_ptt(),
+                pancetta_config::rig::PttMethod::Parallel
+            ),
+            "an unenumerated live PTT method must be preserved, not silently \
+             substituted with a default"
+        );
+    }
+
+    /// PAN-64: an operator who sees the true unenumerated value and then
+    /// browses the picker (Down) must land on a real enumerated choice
+    /// (index 0), not stay stuck on the sentinel or panic.
+    #[tokio::test]
+    async fn apply_rig_config_update_unenumerated_baud_then_move_down_selects_first_choice() {
+        let mut app = fixture_app().await;
+        app.apply_rig_config_update(
+            vec![],
+            "FTdx10".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            230_400,
+            pancetta_config::rig::PttMethod::None,
+            vec![],
+        );
+        app.rig_selection.active_field = RigField::Baud;
+        app.rig_selection.move_down();
+        assert_eq!(app.rig_selection.selected_baud(), RIG_BAUD_RATES[0]);
     }
 
     /// I-3 fix (PAN-59 final review): pressing Esc after an abandoned edit
