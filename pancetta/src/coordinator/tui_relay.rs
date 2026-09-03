@@ -2727,6 +2727,29 @@ fn map_recent_qso_outcome(
     }
 }
 
+/// The dial frequency (MHz) to stamp on this decode's `DecodedMessageView`.
+///
+/// PAN-67: this MUST come from the frequency the decode's own audio window
+/// was captured on (`RelayedDecode::dial_hz`), never from a live re-read of
+/// wherever the rig is tuned right now — decoding is real CPU work, and an
+/// in-flight decode's audio can predate a since-happened band switch. The
+/// signature enforces this at the type level: there is no live-state
+/// parameter to read here even by accident.
+///
+/// `dial_hz == 0` means no rig / no CAT read has landed yet (see
+/// `dsp.rs`'s `band_ref_dial_hz`/`cur_dial_hz`) — falls back to the same
+/// 14.074 MHz default the removed live-atomic seed used, so a headless or
+/// pre-first-read decode still enriches against a real band instead of
+/// stamping 0.0 MHz and feeding 0 Hz into the worked/needed lookups
+/// (PAN-67 review round 1 finding 2).
+fn decode_view_dial_mhz(relayed: &super::pipeline::RelayedDecode) -> f64 {
+    if relayed.dial_hz == 0 {
+        14.074
+    } else {
+        relayed.dial_hz as f64 / 1_000_000.0
+    }
+}
+
 /// Worked-before check for TUI enrichment (Batch 95).
 ///
 /// Delegates to `CachedStationLookup::is_duplicate` — the exact method
@@ -2736,18 +2759,6 @@ fn map_recent_qso_outcome(
 /// full callsign as logged (no /P-style suffix stripping, because the
 /// scorer doesn't strip either). `None`/empty callsigns (unparsed
 /// decodes) are never "worked".
-/// The dial frequency (MHz) to stamp on this decode's `DecodedMessageView`.
-///
-/// PAN-67: this MUST come from the frequency the decode's own audio window
-/// was captured on (`RelayedDecode::dial_hz`), never from a live re-read of
-/// wherever the rig is tuned right now — decoding is real CPU work, and an
-/// in-flight decode's audio can predate a since-happened band switch. The
-/// signature enforces this at the type level: there is no live-state
-/// parameter to read here even by accident.
-fn decode_view_dial_mhz(relayed: &super::pipeline::RelayedDecode) -> f64 {
-    relayed.dial_hz as f64 / 1_000_000.0
-}
-
 fn worked_before_for(
     lookup: &crate::priority_evaluator::CachedStationLookup,
     callsign: Option<&str>,
@@ -3130,6 +3141,27 @@ mod tui_relay_tests {
 
         assert_eq!(decode_view_dial_mhz(&old_band), 7.074);
         assert_eq!(decode_view_dial_mhz(&new_band), 14.074);
+    }
+
+    /// PAN-67 review round 1 finding 2: an unestablished dial (no rig, no
+    /// CAT read yet, or a failed read) must fall back to 14.074 MHz — the
+    /// same default the removed live atomic seeded — never stamp 0.0 MHz
+    /// and feed 0 Hz into the worked/needed lookups.
+    #[test]
+    fn decode_view_dial_mhz_falls_back_to_default_when_dial_is_unknown() {
+        let message = pancetta_ft8::DecodedMessage::new(
+            pancetta_ft8::Ft8Message::default(),
+            -10.0,
+            0.5,
+            1500.0,
+            0.1,
+        );
+        let unknown_dial = crate::coordinator::pipeline::RelayedDecode {
+            message,
+            dial_hz: 0,
+        };
+
+        assert_eq!(decode_view_dial_mhz(&unknown_dial), 14.074);
     }
 
     #[test]
