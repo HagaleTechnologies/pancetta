@@ -513,6 +513,7 @@ fn drain_pending_autonomous_cq_dispatch_failures(
     op: &mut pancetta_qso::AutonomousOperator,
     pending_self_cq_qsos: &mut std::collections::HashMap<String, u64>,
     pending_autonomous_cq_dispatch_failures: &std::sync::Mutex<Vec<u64>>,
+    rolled_back_attempt_tombstones: &mut std::collections::VecDeque<u64>,
 ) {
     let failed_attempts: Vec<u64> = std::mem::take(
         &mut *pending_autonomous_cq_dispatch_failures
@@ -522,6 +523,49 @@ fn drain_pending_autonomous_cq_dispatch_failures(
     for attempt_id in failed_attempts {
         op.restore_cq_state_for_attempt(attempt_id);
         pending_self_cq_qsos.retain(|_, id| *id != attempt_id);
+        record_rolled_back_attempt_tombstone(rolled_back_attempt_tombstones, attempt_id);
+    }
+}
+
+/// Bound on `rolled_back_attempt_tombstones` -- self-CQ attempts run at
+/// most one or two at a time in practice, so this is a defensive cap
+/// against pathological growth (a fallback-drained attempt whose
+/// registration was declined outright, PAN-45, never has a matching
+/// `AutonomousCqOpened` to consume its tombstone at all -- it would
+/// otherwise sit forever), not a realistic operating ceiling.
+const MAX_ROLLED_BACK_ATTEMPT_TOMBSTONES: usize = 16;
+
+/// Record that `attempt_id` was just rolled back, so a same-attempt
+/// `AutonomousCqOpened` that's still queued on the message bus (and gets
+/// processed AFTER this rollback, per the race `drain_pending_autonomous_
+/// cq_dispatch_failures`'s doc comment describes) can recognize it's
+/// already-dead and skip inserting into `pending_self_cq_qsos` -- see
+/// [`consume_rolled_back_attempt_tombstone`].
+fn record_rolled_back_attempt_tombstone(
+    tombstones: &mut std::collections::VecDeque<u64>,
+    attempt_id: u64,
+) {
+    if tombstones.contains(&attempt_id) {
+        return;
+    }
+    tombstones.push_back(attempt_id);
+    if tombstones.len() > MAX_ROLLED_BACK_ATTEMPT_TOMBSTONES {
+        tombstones.pop_front();
+    }
+}
+
+/// Check whether `attempt_id` was already rolled back (see
+/// [`record_rolled_back_attempt_tombstone`]), consuming the tombstone if
+/// so -- single-use, since a given `attempt_id` is never reused.
+fn consume_rolled_back_attempt_tombstone(
+    tombstones: &mut std::collections::VecDeque<u64>,
+    attempt_id: u64,
+) -> bool {
+    if let Some(pos) = tombstones.iter().position(|&id| id == attempt_id) {
+        tombstones.remove(pos);
+        true
+    } else {
+        false
     }
 }
 
@@ -1086,6 +1130,30 @@ impl super::ApplicationCoordinator {
                 // two, since a self-CQ only fires when idle).
                 let mut pending_self_cq_qsos: std::collections::HashMap<String, u64> =
                     std::collections::HashMap::new();
+                // PAN-43/45 follow-up (Codex round 3 on PR #342): the
+                // queue-independent fallback drain (below, once per
+                // `slot_interval` tick) can run BEFORE a same-attempt
+                // `AutonomousCqOpened` that's still sitting queued on the
+                // message bus gets processed -- the fallback bypasses the
+                // bus entirely, so it no longer inherits the send-order
+                // guarantee a single channel gives the two normal,
+                // sequentially-sent messages (`AutonomousCqOpened` then
+                // `AutonomousCqDispatchFailed`) relative to each other.
+                // Without this, that late-processed Open would insert a
+                // `pending_self_cq_qsos` entry for a QSO that was already
+                // rolled back and never actually created -- no
+                // `TransmitComplete` will ever arrive to remove it, so
+                // repeated races would grow the map unboundedly. Every
+                // rollback (fallback or message-driven) records its
+                // attempt_id here; the Open handler checks it before
+                // inserting. Bounded FIFO, not a `HashSet` -- self-CQ
+                // attempts run at most one or two at a time in practice, so
+                // this is a defensive cap against pathological growth (a
+                // registration that's declined outright, PAN-45, never has
+                // a matching Open to consume its tombstone at all), not a
+                // realistic operating ceiling.
+                let mut rolled_back_attempt_tombstones: std::collections::VecDeque<u64> =
+                    std::collections::VecDeque::new();
                 // Task 15: coordinator-local edge-trigger baseline for the
                 // persistent tx.placement DiagnosticEvent, scoped to THIS
                 // task's own loop. Deliberately separate from the TUI-side
@@ -1153,6 +1221,7 @@ impl super::ApplicationCoordinator {
                                 &mut op,
                                 &mut pending_self_cq_qsos,
                                 &pending_autonomous_cq_dispatch_failures,
+                                &mut rolled_back_attempt_tombstones,
                             );
 
                             // Update spectral data from waterfall
@@ -2068,6 +2137,20 @@ impl super::ApplicationCoordinator {
                                                 // idle).
                                                 pending_self_cq_qsos
                                                     .retain(|_, id| *id != attempt_id);
+                                                // PAN-43/45 follow-up (Codex
+                                                // round 3 on PR #342): mirrors
+                                                // the queue-independent
+                                                // fallback drain's own
+                                                // tombstone recording (see its
+                                                // doc comment) -- kept in sync
+                                                // for defensiveness even
+                                                // though pure message-bus
+                                                // ordering already protects
+                                                // this specific path today.
+                                                record_rolled_back_attempt_tombstone(
+                                                    &mut rolled_back_attempt_tombstones,
+                                                    attempt_id,
+                                                );
                                             }
                                             // PAN-38 round 1: record the
                                             // qso_id <-> attempt_id link for a
@@ -2082,7 +2165,27 @@ impl super::ApplicationCoordinator {
                                                     attempt_id,
                                                 },
                                             ) => {
-                                                pending_self_cq_qsos.insert(qso_id, attempt_id);
+                                                // PAN-43/45 follow-up (Codex
+                                                // round 3 on PR #342): the
+                                                // queue-independent fallback
+                                                // rollback can process THIS
+                                                // exact attempt_id before this
+                                                // Open message -- still
+                                                // sitting queued at that point
+                                                // -- ever gets processed. That
+                                                // rollback already fully
+                                                // undid the attempt; inserting
+                                                // now would create an entry
+                                                // for a QSO that was never
+                                                // actually kept alive, which
+                                                // no TransmitComplete would
+                                                // ever arrive to remove.
+                                                if !consume_rolled_back_attempt_tombstone(
+                                                    &mut rolled_back_attempt_tombstones,
+                                                    attempt_id,
+                                                ) {
+                                                    pending_self_cq_qsos.insert(qso_id, attempt_id);
+                                                }
                                             }
                                             // PAN-38 round 1 (Codex): `start_cq`
                                             // succeeding only means the QSO
@@ -2808,11 +2911,13 @@ mod drain_pending_autonomous_cq_dispatch_failures_tests {
         let mut pending_self_cq_qsos: std::collections::HashMap<String, u64> =
             std::collections::HashMap::from([("some-qso-id".to_string(), attempt_id)]);
         let pending_failures = std::sync::Mutex::new(vec![attempt_id]);
+        let mut tombstones = std::collections::VecDeque::new();
 
         drain_pending_autonomous_cq_dispatch_failures(
             &mut op,
             &mut pending_self_cq_qsos,
             &pending_failures,
+            &mut tombstones,
         );
 
         assert!(
@@ -2829,6 +2934,12 @@ mod drain_pending_autonomous_cq_dispatch_failures_tests {
             "the matching pending_self_cq_qsos entry must be cleaned up too, mirroring the \
              message-driven AutonomousCqDispatchFailed handler"
         );
+        assert_eq!(
+            tombstones.into_iter().collect::<Vec<_>>(),
+            vec![attempt_id],
+            "a drained rollback must record a tombstone for a same-attempt Open that's still \
+             queued on the bus"
+        );
     }
 
     #[test]
@@ -2837,17 +2948,82 @@ mod drain_pending_autonomous_cq_dispatch_failures_tests {
         let mut pending_self_cq_qsos: std::collections::HashMap<String, u64> =
             std::collections::HashMap::new();
         let pending_failures = std::sync::Mutex::new(Vec::new());
+        let mut tombstones = std::collections::VecDeque::new();
 
         drain_pending_autonomous_cq_dispatch_failures(
             &mut op,
             &mut pending_self_cq_qsos,
             &pending_failures,
+            &mut tombstones,
         );
 
         assert_eq!(
             op.last_cq_attempt_id(),
             Some(attempt_id),
             "nothing pending must mean nothing is touched"
+        );
+        assert!(tombstones.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod rolled_back_attempt_tombstone_tests {
+    use super::*;
+
+    #[test]
+    fn a_consumed_tombstone_is_removed_and_reports_present() {
+        let mut tombstones = std::collections::VecDeque::new();
+        record_rolled_back_attempt_tombstone(&mut tombstones, 7);
+        assert!(consume_rolled_back_attempt_tombstone(&mut tombstones, 7));
+        assert!(
+            tombstones.is_empty(),
+            "a consumed tombstone must not remain and be consumable again"
+        );
+    }
+
+    #[test]
+    fn consuming_an_absent_attempt_id_reports_absent_and_is_a_no_op() {
+        let mut tombstones = std::collections::VecDeque::new();
+        record_rolled_back_attempt_tombstone(&mut tombstones, 1);
+        assert!(!consume_rolled_back_attempt_tombstone(&mut tombstones, 99));
+        assert_eq!(
+            tombstones.into_iter().collect::<Vec<_>>(),
+            vec![1],
+            "consuming a non-matching id must not disturb an unrelated tombstone"
+        );
+    }
+
+    #[test]
+    fn recording_the_same_attempt_id_twice_does_not_duplicate() {
+        let mut tombstones = std::collections::VecDeque::new();
+        record_rolled_back_attempt_tombstone(&mut tombstones, 3);
+        record_rolled_back_attempt_tombstone(&mut tombstones, 3);
+        assert_eq!(tombstones.into_iter().collect::<Vec<_>>(), vec![3]);
+    }
+
+    /// PAN-43/45 follow-up (Codex round 3 on PR #342) regression: without
+    /// a cap, an attempt_id that never gets a matching `AutonomousCqOpened`
+    /// at all (PAN-45's registration-declined path -- no Open was ever
+    /// sent) would sit in the tombstone list forever, growing it
+    /// unboundedly under repeated failures.
+    #[test]
+    fn recording_past_the_cap_evicts_the_oldest_first() {
+        let mut tombstones = std::collections::VecDeque::new();
+        for id in 0..(MAX_ROLLED_BACK_ATTEMPT_TOMBSTONES as u64 + 3) {
+            record_rolled_back_attempt_tombstone(&mut tombstones, id);
+        }
+        assert_eq!(
+            tombstones.len(),
+            MAX_ROLLED_BACK_ATTEMPT_TOMBSTONES,
+            "must never grow past the cap regardless of how many attempts never get consumed"
+        );
+        assert!(
+            !tombstones.contains(&0) && !tombstones.contains(&1) && !tombstones.contains(&2),
+            "the oldest (first-recorded) tombstones must be the ones evicted, got: {tombstones:?}"
+        );
+        assert!(
+            tombstones.contains(&(MAX_ROLLED_BACK_ATTEMPT_TOMBSTONES as u64 + 2)),
+            "the most recently recorded tombstone must survive"
         );
     }
 }
