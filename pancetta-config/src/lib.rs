@@ -506,6 +506,45 @@ impl Config {
         Ok(())
     }
 
+    /// Persist the operator's saved rig-config bookmarks (PAN-61) into the
+    /// config file at `path`, preserving every other key. Writes the WHOLE
+    /// given list every call (replace, not append/diff) — callers always
+    /// pass the full post-mutation list. Mirrors [`Config::set_rig_in_file`]'s
+    /// targeted-write pattern.
+    pub fn set_rig_bookmarks_in_file<P: AsRef<std::path::Path>>(
+        &self,
+        path: P,
+        bookmarks: &[crate::rig::RigBookmark],
+    ) -> ConfigResult<()> {
+        let path = path.as_ref();
+
+        let mut root: toml::Table = match std::fs::read_to_string(path) {
+            Ok(contents) => contents
+                .parse::<toml::Table>()
+                .map_err(|e| ConfigError::Validation(format!("Failed to parse config: {}", e)))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => toml::Table::new(),
+            Err(e) => return Err(e.into()),
+        };
+
+        let rig = root
+            .entry("rig".to_string())
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        let rig_table = rig
+            .as_table_mut()
+            .ok_or_else(|| ConfigError::Validation("[rig] in config is not a table".to_string()))?;
+
+        let bookmarks_value = toml::Value::try_from(bookmarks).map_err(|e| {
+            ConfigError::Validation(format!("Failed to serialize rig bookmarks: {}", e))
+        })?;
+        rig_table.insert("bookmarks".to_string(), bookmarks_value);
+
+        let serialized = toml::to_string_pretty(&root)
+            .map_err(|e| ConfigError::Validation(format!("Failed to serialize config: {}", e)))?;
+        Self::write_secure_atomic(path, &serialized)?;
+        info!("Rig bookmarks persisted to: {}", path.display());
+        Ok(())
+    }
+
     /// Get a summary of the current configuration
     pub fn summary(&self) -> String {
         format!(
@@ -813,6 +852,108 @@ mod tests {
             rig["ptt"].as_table().unwrap()["method"].as_str(),
             Some("serial")
         );
+    }
+
+    #[test]
+    fn set_rig_bookmarks_in_file_writes_array_and_preserves_other_keys() {
+        let temp = NamedTempFile::new().unwrap();
+        std::fs::write(
+            temp.path(),
+            "[station]\ncallsign = \"K5ARH\"\n\n[rig]\nmodel = \"FTdx10\"\n",
+        )
+        .unwrap();
+
+        let config = Config::default();
+        let bookmarks = vec![
+            crate::rig::RigBookmark {
+                name: "Shack".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 38400,
+                ptt_method: crate::rig::PttMethod::Cat,
+            },
+            crate::rig::RigBookmark {
+                name: "Portable".to_string(),
+                model: "IC-7300".to_string(),
+                port: "/dev/ttyUSB1".to_string(),
+                baud_rate: 19200,
+                ptt_method: crate::rig::PttMethod::Vox,
+            },
+        ];
+        config
+            .set_rig_bookmarks_in_file(temp.path(), &bookmarks)
+            .unwrap();
+
+        let written = std::fs::read_to_string(temp.path()).unwrap();
+        let parsed: toml::Table = written.parse().unwrap();
+        let rig = parsed["rig"].as_table().unwrap();
+        // Unrelated rig key preserved.
+        assert_eq!(rig["model"].as_str(), Some("FTdx10"));
+
+        let bookmarks_array = rig["bookmarks"].as_array().unwrap();
+        assert_eq!(bookmarks_array.len(), 2);
+        let shack = bookmarks_array[0].as_table().unwrap();
+        assert_eq!(shack["name"].as_str(), Some("Shack"));
+        assert_eq!(shack["port"].as_str(), Some("/dev/ttyUSB0"));
+        assert_eq!(shack["baud_rate"].as_integer(), Some(38400));
+        assert_eq!(shack["ptt_method"].as_str(), Some("cat"));
+
+        // Unrelated top-level key preserved.
+        assert_eq!(
+            parsed["station"].as_table().unwrap()["callsign"].as_str(),
+            Some("K5ARH")
+        );
+    }
+
+    #[test]
+    fn set_rig_bookmarks_in_file_creates_minimal_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("nested").join("pancetta.toml");
+        let config = Config::default();
+        let bookmarks = vec![crate::rig::RigBookmark {
+            name: "Shack".to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 38400,
+            ptt_method: crate::rig::PttMethod::None,
+        }];
+        config
+            .set_rig_bookmarks_in_file(&path, &bookmarks)
+            .unwrap();
+
+        let written = std::fs::read_to_string(&path).unwrap();
+        let parsed: toml::Table = written.parse().unwrap();
+        let rig = parsed["rig"].as_table().unwrap();
+        let bookmarks_array = rig["bookmarks"].as_array().unwrap();
+        assert_eq!(bookmarks_array.len(), 1);
+        assert_eq!(
+            bookmarks_array[0].as_table().unwrap()["name"].as_str(),
+            Some("Shack")
+        );
+    }
+
+    #[test]
+    fn set_rig_bookmarks_in_file_overwrites_previous_list() {
+        let temp = NamedTempFile::new().unwrap();
+        let config = Config::default();
+        config
+            .set_rig_bookmarks_in_file(
+                temp.path(),
+                &[crate::rig::RigBookmark {
+                    name: "Old".to_string(),
+                    model: "OldRig".to_string(),
+                    port: "/dev/ttyUSB0".to_string(),
+                    baud_rate: 9600,
+                    ptt_method: crate::rig::PttMethod::None,
+                }],
+            )
+            .unwrap();
+        config.set_rig_bookmarks_in_file(temp.path(), &[]).unwrap();
+
+        let written = std::fs::read_to_string(temp.path()).unwrap();
+        let parsed: toml::Table = written.parse().unwrap();
+        let rig = parsed["rig"].as_table().unwrap();
+        assert_eq!(rig["bookmarks"].as_array().unwrap().len(), 0);
     }
 }
 
