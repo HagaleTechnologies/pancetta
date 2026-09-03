@@ -2127,6 +2127,13 @@ impl super::ApplicationCoordinator {
 
                         for decoded_msg in decoded_messages.iter_mut() {
                             decoded_msg.slot_parity = Some(window_parity);
+                            // PAN-67 review round 2: stamp the dial frequency
+                            // THIS window's audio was captured on (same value
+                            // sent to the TUI relay below) onto the message
+                            // itself, so every bus consumer (PSKReporter,
+                            // autonomous, QSO) has it available too, not just
+                            // the TUI channel.
+                            decoded_msg.captured_dial_hz = Some(dial_hz);
                             // I-16: strip control/ANSI chars and cap length on
                             // the human-facing string fields, once, at the bus
                             // boundary before any consumer (cross-slot state,

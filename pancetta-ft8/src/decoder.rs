@@ -17696,6 +17696,7 @@ mod tests {
             tone_symbols: Some(symbols),
             ap_level: 0,
             slot_parity: None,
+            captured_dial_hz: None,
             decode_time_into_window: None,
             via_cross_sequence_a7: false,
             confidence_features: None,
