@@ -2361,18 +2361,28 @@ impl super::ApplicationCoordinator {
                                 baud_rate,
                                 ptt_method,
                             };
-                            let bookmarks = {
-                                let mut cfg = cmd_config.write().await;
-                                upsert_rig_bookmark(&mut cfg.rig.bookmarks, bookmark);
+                            // I-7 fix (PAN-61 review round 2): stage the
+                            // mutated list without touching the shared
+                            // `cfg.rig.bookmarks` yet. Committing the
+                            // mutation into shared state BEFORE persistence
+                            // is confirmed (round-1's approach) meant a
+                            // failed write left the in-memory list silently
+                            // diverged from disk -- an unrelated LATER save
+                            // would then persist this un-persisted change
+                            // as a side effect, and the operator had no way
+                            // to retry the original failed save directly.
+                            let mut staged = {
+                                let cfg = cmd_config.read().await;
                                 cfg.rig.bookmarks.clone()
                             };
+                            upsert_rig_bookmark(&mut staged, bookmark);
                             let config_path = dirs::home_dir()
                                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                                 .join(".pancetta")
                                 .join("pancetta.toml");
                             let persist_result = {
                                 let cfg = cmd_config.read().await;
-                                cfg.set_rig_bookmarks_in_file(&config_path, &bookmarks)
+                                cfg.set_rig_bookmarks_in_file(&config_path, &staged)
                             };
                             let status = if let Err(e) = persist_result {
                                 warn!("Failed to persist rig bookmark: {}", e);
@@ -2383,24 +2393,19 @@ impl super::ApplicationCoordinator {
                                     name,
                                     config_path.display()
                                 );
-                                // I-5 fix (PAN-61 review round 1): only
-                                // resync the TUI's bookmark list on a
-                                // successful persist. Pushing it
-                                // unconditionally would show the operator
-                                // a saved/updated row that doesn't actually
-                                // exist on disk -- the in-memory
-                                // `cfg.rig.bookmarks` stays mutated either
-                                // way (matching this file's existing
-                                // SelectDevice/SelectRig risk tolerance for
-                                // a failed persist), but the TUI's list
-                                // view must not silently diverge from what
-                                // will actually survive a restart.
+                                // Only now, with the write confirmed on
+                                // disk, commit the staged list into shared
+                                // state and resync the TUI.
+                                {
+                                    let mut cfg = cmd_config.write().await;
+                                    cfg.rig.bookmarks = staged.clone();
+                                }
                                 let _ = cmd_tui_msg_tx.send(
                                     pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
-                                        bookmarks: bookmarks.clone(),
+                                        bookmarks: staged.clone(),
                                     },
                                 );
-                                rig_bookmark_saved_status(&name, bookmarks.len())
+                                rig_bookmark_saved_status(&name, staged.len())
                             };
                             let _ = cmd_tui_msg_tx.send(
                                 pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
@@ -2411,13 +2416,18 @@ impl super::ApplicationCoordinator {
                         }
                         pancetta_tui::tui_runner::TuiCommand::DeleteRigBookmark { name } => {
                             info!("TUI DeleteRigBookmark: name={}", name);
-                            let (bookmarks, found) = {
-                                let mut cfg = cmd_config.write().await;
-                                let before = cfg.rig.bookmarks.len();
-                                cfg.rig.bookmarks.retain(|b| b.name != name);
-                                let found = cfg.rig.bookmarks.len() != before;
-                                (cfg.rig.bookmarks.clone(), found)
+                            // I-7 fix (PAN-61 review round 2): same
+                            // stage-then-commit-on-success pattern as
+                            // SaveRigBookmark above -- see its comment for
+                            // why committing the mutation before persist is
+                            // confirmed is unsafe.
+                            let mut staged = {
+                                let cfg = cmd_config.read().await;
+                                cfg.rig.bookmarks.clone()
                             };
+                            let before = staged.len();
+                            staged.retain(|b| b.name != name);
+                            let found = staged.len() != before;
                             if !found {
                                 let _ = cmd_tui_msg_tx.send(
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
@@ -2432,7 +2442,7 @@ impl super::ApplicationCoordinator {
                                     .join("pancetta.toml");
                                 let persist_result = {
                                     let cfg = cmd_config.read().await;
-                                    cfg.set_rig_bookmarks_in_file(&config_path, &bookmarks)
+                                    cfg.set_rig_bookmarks_in_file(&config_path, &staged)
                                 };
                                 let status = if let Err(e) = persist_result {
                                     warn!("Failed to persist rig bookmark deletion: {}", e);
@@ -2443,18 +2453,13 @@ impl super::ApplicationCoordinator {
                                         name,
                                         config_path.display()
                                     );
-                                    // I-5 fix (PAN-61 review round 1): only
-                                    // resync the TUI's bookmark list on a
-                                    // successful persist. Pushing it
-                                    // unconditionally would remove the row
-                                    // from the operator's view even though
-                                    // the delete didn't actually take on
-                                    // disk, leaving them unable to see (and
-                                    // retry) the bookmark they just failed
-                                    // to delete.
+                                    {
+                                        let mut cfg = cmd_config.write().await;
+                                        cfg.rig.bookmarks = staged.clone();
+                                    }
                                     let _ = cmd_tui_msg_tx.send(
                                         pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
-                                            bookmarks: bookmarks.clone(),
+                                            bookmarks: staged.clone(),
                                         },
                                     );
                                     format!("Deleted bookmark '{}'", name)
