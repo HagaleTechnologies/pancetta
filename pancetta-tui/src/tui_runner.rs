@@ -279,6 +279,16 @@ pub enum TuiMessage {
         current_port: String,
         current_baud_rate: u32,
         current_ptt_method: pancetta_config::rig::PttMethod,
+        /// Saved rig-config bookmarks (PAN-61), pushed once at startup
+        /// alongside the live values so the `b` load overlay has data from
+        /// frame 1.
+        bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+    },
+    /// Saved rig-config bookmarks changed (PAN-61: after a `SaveRigBookmark`
+    /// or `DeleteRigBookmark` command). Full resync, mirroring
+    /// `DxWatchlistUpdate`'s bulk-replace style — never a diff.
+    RigBookmarksUpdate {
+        bookmarks: Vec<pancetta_config::rig::RigBookmark>,
     },
     /// Rig connection state for the station-panel badge. Pushed by the
     /// coordinator relay from the hamlib connect/poll loop.
@@ -401,6 +411,20 @@ pub enum TuiCommand {
         baud_rate: u32,
         ptt_method: pancetta_config::rig::PttMethod,
     },
+    /// Save the rig picker's current 4 form values as a named bookmark
+    /// (PAN-61). Save-as-name semantics: overwrites an existing bookmark
+    /// with the same name, else appends. Pure config-list mutation — never
+    /// touches the live rig connection or Hamlib reconnect path.
+    SaveRigBookmark {
+        name: String,
+        model: String,
+        port: String,
+        baud_rate: u32,
+        ptt_method: pancetta_config::rig::PttMethod,
+    },
+    /// Delete a saved rig-config bookmark by name (PAN-61). No-op if the
+    /// name doesn't match any saved bookmark.
+    DeleteRigBookmark { name: String },
     /// User requested quit
     Quit,
     /// Operator pressed the emergency-stop key (`Q` / `q` with Shift).
@@ -874,6 +898,7 @@ impl TuiRunner {
                 current_port,
                 current_baud_rate,
                 current_ptt_method,
+                bookmarks,
             } => {
                 app.apply_rig_config_update(
                     available_ports,
@@ -881,7 +906,14 @@ impl TuiRunner {
                     current_port,
                     current_baud_rate,
                     current_ptt_method,
+                    bookmarks,
                 );
+            }
+            TuiMessage::RigBookmarksUpdate { bookmarks } => {
+                if app.rig_selection.selected_bookmark_idx >= bookmarks.len() {
+                    app.rig_selection.selected_bookmark_idx = 0;
+                }
+                app.rig_selection.bookmarks = bookmarks;
             }
             TuiMessage::RigStatusUpdate { state } => {
                 app.rig_connected = state;
@@ -5158,6 +5190,7 @@ mod pan_59_command_tests {
             current_port: "/dev/ttyUSB0".to_string(),
             current_baud_rate: 38400,
             current_ptt_method: pancetta_config::rig::PttMethod::Serial,
+            bookmarks: vec![],
         };
         match msg {
             TuiMessage::RigConfigUpdate {
@@ -5169,6 +5202,89 @@ mod pan_59_command_tests {
                 assert_eq!(current_model, "FTdx10");
             }
             _ => panic!("expected RigConfigUpdate"),
+        }
+    }
+
+    #[test]
+    fn rig_config_update_message_carries_bookmarks() {
+        let msg = TuiMessage::RigConfigUpdate {
+            available_ports: vec![],
+            current_model: "FTdx10".to_string(),
+            current_port: "/dev/ttyUSB0".to_string(),
+            current_baud_rate: 38400,
+            current_ptt_method: pancetta_config::rig::PttMethod::None,
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "Shack".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }],
+        };
+        match msg {
+            TuiMessage::RigConfigUpdate { bookmarks, .. } => {
+                assert_eq!(bookmarks.len(), 1);
+                assert_eq!(bookmarks[0].name, "Shack");
+            }
+            _ => panic!("expected RigConfigUpdate"),
+        }
+    }
+
+    #[test]
+    fn rig_bookmarks_update_message_carries_bookmarks() {
+        let msg = TuiMessage::RigBookmarksUpdate {
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "Portable".to_string(),
+                model: "IC-7300".to_string(),
+                port: "/dev/ttyUSB1".to_string(),
+                baud_rate: 19200,
+                ptt_method: pancetta_config::rig::PttMethod::Vox,
+            }],
+        };
+        match msg {
+            TuiMessage::RigBookmarksUpdate { bookmarks } => {
+                assert_eq!(bookmarks.len(), 1);
+                assert_eq!(bookmarks[0].name, "Portable");
+            }
+            _ => panic!("expected RigBookmarksUpdate"),
+        }
+    }
+
+    #[test]
+    fn save_rig_bookmark_command_round_trips_all_fields() {
+        let cmd = TuiCommand::SaveRigBookmark {
+            name: "Shack".to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 38400,
+            ptt_method: pancetta_config::rig::PttMethod::Cat,
+        };
+        match cmd {
+            TuiCommand::SaveRigBookmark {
+                name,
+                model,
+                port,
+                baud_rate,
+                ptt_method,
+            } => {
+                assert_eq!(name, "Shack");
+                assert_eq!(model, "FTdx10");
+                assert_eq!(port, "/dev/ttyUSB0");
+                assert_eq!(baud_rate, 38400);
+                assert!(matches!(ptt_method, pancetta_config::rig::PttMethod::Cat));
+            }
+            _ => panic!("expected SaveRigBookmark"),
+        }
+    }
+
+    #[test]
+    fn delete_rig_bookmark_command_carries_name() {
+        let cmd = TuiCommand::DeleteRigBookmark {
+            name: "Shack".to_string(),
+        };
+        match cmd {
+            TuiCommand::DeleteRigBookmark { name } => assert_eq!(name, "Shack"),
+            _ => panic!("expected DeleteRigBookmark"),
         }
     }
 }
