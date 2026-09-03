@@ -1235,6 +1235,28 @@ impl AutonomousOperator {
                          switch); state may be off by one attempt",
                         attempt_id
                     );
+                } else if self.last_cq_snapshot.is_some_and(|s| s.did_switch) {
+                    // PAN-43 (Codex round 6 on PR #301): a NEWER attempt
+                    // (still in `last_cq_snapshot`, i.e. exactly one
+                    // generation ahead of this stale one) reaching the
+                    // switch threshold resets the streak to 0 and
+                    // re-increments it to 1 -- but that same-cycle switch
+                    // reset deliberately does NOT bump `streak_generation`
+                    // (so a SUPPRESSED switch can still be fully undone via
+                    // `restore_cq_state`), so the generation check below
+                    // would wrongly still match. A blind `-1` here would
+                    // then remove the NEWER attempt's own contribution
+                    // instead of the (already-superseded, already-wiped-out
+                    // by the reset) stale attempt's -- there is nothing
+                    // left to compensate.
+                    warn!(
+                        "Autonomous self-CQ attempt {} failed downstream after a newer attempt \
+                         already superseded it, and that newer attempt performed a frequency \
+                         switch (resetting the streak) -- streak NOT auto-corrected (its \
+                         speculative contribution was already erased by the reset; a -1 would \
+                         wrongly eat into the newer attempt's own increment)",
+                        attempt_id
+                    );
                 } else if self.streak_generation == snapshot.streak_generation {
                     // Only the streak generation matters here: a
                     // non-switching attempt never touched the offset, so an
@@ -1266,6 +1288,36 @@ impl AutonomousOperator {
              stale -- state not corrected",
             attempt_id
         );
+    }
+
+    /// Stage a new self-CQ attempt's undo snapshot: bump `cq_attempt_counter`,
+    /// shift any still-unresolved `last_cq_snapshot` down into
+    /// `previous_cq_snapshot` (PAN-38 round 1's one-generation bounded-
+    /// compensation history), and record the pre-mutation baseline this
+    /// attempt can be rolled back to.
+    ///
+    /// PAN-44 (Codex round 6 on PR #301): callers MUST call this only once
+    /// truly committed to dispatching a real CQ this cycle -- i.e. AFTER
+    /// every early-return check that can still bail out to `Listen`
+    /// instead (stale occupancy history, or `allocate_smart_frequency`
+    /// finding no valid candidate honoring the switch exclusion). Calling
+    /// it any earlier let repeated listen-only retries silently consume
+    /// both snapshot slots without ever transmitting, so a delayed
+    /// downstream failure for the LAST attempt that actually transmitted
+    /// could no longer be found in either slot and couldn't be rolled back
+    /// at all.
+    fn stage_cq_attempt_snapshot(&mut self) {
+        self.cq_attempt_counter += 1;
+        self.previous_cq_snapshot = self.last_cq_snapshot.take();
+        self.last_cq_snapshot = Some(CqStateSnapshot {
+            streak: self.cq_no_response_streak,
+            current_cq_offset_hz: self.current_cq_offset_hz,
+            tx_offset_hz: self.config.tx_offset_hz,
+            attempt_id: self.cq_attempt_counter,
+            did_switch: false,
+            offset_generation: self.offset_generation,
+            streak_generation: self.streak_generation,
+        });
     }
 
     fn push_skip(&mut self, record: CqSkipRecord) {
@@ -2321,33 +2373,22 @@ impl AutonomousOperator {
                             // this point `current_cq_offset_hz` is already
                             // correctly `None` whenever we're in Hold mode.)
                             //
-                            // Codex review (PR #276, round 4): captured HERE,
-                            // not by the coordinator before calling decide()
-                            // — this is after Step 0's band-hop/mode-driven
-                            // invalidations already ran this cycle, but
-                            // before this block's own speculative self-CQ
-                            // mutations. A pre-decide() snapshot would
-                            // "restore" a value Step 0 had just correctly
-                            // invalidated (e.g. `current_cq_offset_hz`
-                            // cleared on a same-cycle band hop) if this
-                            // cycle's CQ then got suppressed downstream.
-                            self.cq_attempt_counter += 1;
-                            // PAN-38 round 1: shift the still-unresolved
-                            // previous snapshot (if any) down before
-                            // overwriting `last_cq_snapshot`, so a failure
-                            // report for THAT attempt can still be found by
-                            // `restore_cq_state_for_attempt` one generation
-                            // later instead of being silently dropped.
-                            self.previous_cq_snapshot = self.last_cq_snapshot.take();
-                            self.last_cq_snapshot = Some(CqStateSnapshot {
-                                streak: self.cq_no_response_streak,
-                                current_cq_offset_hz: self.current_cq_offset_hz,
-                                tx_offset_hz: self.config.tx_offset_hz,
-                                attempt_id: self.cq_attempt_counter,
-                                did_switch: false,
-                                offset_generation: self.offset_generation,
-                                streak_generation: self.streak_generation,
-                            });
+                            // PAN-44 (Codex round 6 on PR #301): the attempt
+                            // snapshot itself is staged later in this block
+                            // (via `stage_cq_attempt_snapshot`), only once
+                            // every early-return check below (stale
+                            // occupancy history, no valid switch candidate)
+                            // has passed and a CQ is actually about to be
+                            // dispatched -- see that method's doc comment
+                            // for why. Captured there rather than here
+                            // still means after Step 0's band-hop/mode-
+                            // driven invalidations already ran this cycle
+                            // (Codex review, PR #276 round 4) — a
+                            // pre-decide() snapshot would "restore" a value
+                            // Step 0 had just correctly invalidated (e.g.
+                            // `current_cq_offset_hz` cleared on a
+                            // same-cycle band hop) if this cycle's CQ then
+                            // got suppressed downstream.
 
                             // PAN-38 round 5 (Codex): refresh HERE, before
                             // `should_switch` is decided, not only later
@@ -2454,6 +2495,9 @@ impl AutonomousOperator {
                                     return actions;
                                 }
 
+                                // PAN-44: committed to dispatching now --
+                                // every early-return above has passed.
+                                self.stage_cq_attempt_snapshot();
                                 self.cq_no_response_streak = 0;
                                 // PAN-38 round 1: mark this attempt's own
                                 // snapshot as switch-performing, so a later
@@ -2468,19 +2512,26 @@ impl AutonomousOperator {
                                     new_offset_hz: new_offset,
                                 });
                                 new_offset
-                            } else if self.tx_freq_auto() {
-                                match self.current_cq_offset_hz {
-                                    Some(freq) => freq,
-                                    None => self.allocate_smart_frequency(None, None, None),
-                                }
                             } else {
-                                // Codex review (PR #276, round 2): Hold mode
-                                // never uses a sticky offset — the invalidation
-                                // (so a later Auto -> Hold -> Auto round trip
-                                // re-ranks fresh instead of resuming a stale
-                                // pre-Hold value) now happens above, BEFORE
-                                // the snapshot is taken (round 5), not here.
-                                self.allocate_smart_frequency(None, None, None)
+                                // PAN-44: a routine (non-switching) CQ has
+                                // no early-return path of its own -- once
+                                // `should_switch` reads false, we're
+                                // already committed to dispatching.
+                                self.stage_cq_attempt_snapshot();
+                                if self.tx_freq_auto() {
+                                    match self.current_cq_offset_hz {
+                                        Some(freq) => freq,
+                                        None => self.allocate_smart_frequency(None, None, None),
+                                    }
+                                } else {
+                                    // Codex review (PR #276, round 2): Hold mode
+                                    // never uses a sticky offset — the invalidation
+                                    // (so a later Auto -> Hold -> Auto round trip
+                                    // re-ranks fresh instead of resuming a stale
+                                    // pre-Hold value) now happens above, BEFORE
+                                    // the snapshot is taken (round 5), not here.
+                                    self.allocate_smart_frequency(None, None, None)
+                                }
                             };
 
                             if self.tx_freq_auto() {
@@ -3446,6 +3497,84 @@ mod tests {
     }
 
     #[test]
+    fn decide_at_does_not_consume_an_attempt_snapshot_on_a_listen_only_switch_retry() {
+        // PAN-44 (Codex round 6 on PR #301): `decide_at` used to stage the
+        // attempt snapshot (bump `cq_attempt_counter`, shift
+        // `previous_cq_snapshot`/`last_cq_snapshot`) BEFORE the
+        // history-fresh/no-valid-candidate early-return checks that can
+        // still bail out to a Listen-only round with no CQ ever
+        // dispatched. Repeated listen-only retries therefore silently
+        // consumed the two-entry snapshot history for nothing, so a
+        // delayed downstream failure report for the LAST attempt that
+        // actually transmitted could no longer be found in either slot.
+        //
+        // Same setup as `switch_skips_and_listens_when_no_frequency_
+        // honors_the_exclusion` (min_separation_hz impossible to honor,
+        // switch_after=3): rounds 0-2 dispatch real (routine) CQs #1-#3;
+        // round 3 onward hits the threshold every cycle but the switch
+        // itself always no-ops into a Listen-only retry.
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 2;
+        config.cq_no_response_switch_after = 3;
+        config.listen_cycle.initial_interval = 100;
+        config.frequency.min_separation_hz = 10_000.0; // impossible to honor
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        run_cq_rounds(&mut op, 3); // CQ #1, #2, #3 — real dispatches
+        let last_real_attempt_id = op
+            .last_cq_attempt_id()
+            .expect("CQ #3 ran this cycle and took a snapshot");
+        assert_eq!(last_real_attempt_id, 3);
+        // CQ #3's own dispatch already shifted CQ #2's snapshot down here
+        // (ordinary one-generation history, unrelated to this bug) --
+        // capture it so the listen-only retries below can be checked
+        // against "unchanged", not the wrong expectation of "None".
+        let previous_snapshot_before_retries = op.previous_cq_snapshot;
+        assert!(previous_snapshot_before_retries.is_some());
+
+        // Three more rounds, every one a listen-only switch retry (never a
+        // real dispatch) — must NOT advance the attempt counter or shift
+        // any snapshot.
+        run_cq_rounds(&mut op, 3);
+        assert_eq!(
+            op.last_cq_attempt_id(),
+            Some(last_real_attempt_id),
+            "a listen-only switch retry must not consume a new attempt snapshot -- \
+             `last_cq_attempt_id` must still name the last CQ that actually transmitted"
+        );
+        assert_eq!(
+            op.previous_cq_snapshot.map(|s| s.attempt_id),
+            previous_snapshot_before_retries.map(|s| s.attempt_id),
+            "a listen-only retry must not shift anything into previous_cq_snapshot either"
+        );
+
+        // A delayed failure report for the real CQ #3 must still be found
+        // and fully undone -- not \"more than one generation stale\",
+        // which is what repeated silent consumption used to cause.
+        let streak_before_restore = op.cq_no_response_streak;
+        op.restore_cq_state_for_attempt(last_real_attempt_id);
+        assert_ne!(
+            op.cq_no_response_streak, streak_before_restore,
+            "CQ #3's snapshot must still be reachable and actually restored, not silently \
+             dropped as stale-by-more-than-one-generation"
+        );
+    }
+
+    #[test]
     fn auto_mode_switches_frequency_after_streak_threshold() {
         let mut op = primed_operator(2, 3, true);
         // Pre-fill decode history so freshness never blocks this test.
@@ -4230,6 +4359,63 @@ mod tests {
             op.cq_no_response_streak, current_streak,
             "a directed-reply reset in between must block the bounded-compensation -1 -- \
              applying it anyway would wrongly eat into CQ #2's own genuine increment"
+        );
+    }
+
+    #[test]
+    fn restore_cq_state_for_attempt_does_not_bounded_compensate_when_a_newer_switch_reset_the_streak(
+    ) {
+        // PAN-43 (Codex round 6 on PR #301): the bounded-compensation -1
+        // above assumes the streak is purely additive across the gap
+        // between the stale attempt's snapshot and the newer one that
+        // superseded it. A NEWER CQ hitting the switch threshold breaks
+        // that assumption too, exactly like a directed reply does -- it
+        // resets the streak to 0 and re-increments to 1 -- but (unlike a
+        // directed reply) this same-cycle switch reset deliberately does
+        // NOT bump `streak_generation` (so a suppressed switch can still
+        // be fully undone via `restore_cq_state`), so the generation check
+        // alone can't detect it. Before this fix, a late failure for the
+        // (non-switching) stale CQ #1 applied -1 to CQ #2's freshly-reset
+        // streak of 1, wrongly wiping out CQ #2's own contribution instead
+        // of correctly recognizing CQ #1's speculative "+1" was already
+        // erased by CQ #2's reset.
+        let mut op = primed_operator(2, 1, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #1: streak (0) < switch_after (1), no switch, streak -> 1
+        let stale_attempt_id = op
+            .last_cq_attempt_id()
+            .expect("a self-CQ ran this cycle and took a snapshot");
+        assert!(
+            !op.last_cq_snapshot.is_some_and(|s| s.did_switch),
+            "precondition: CQ #1 must NOT have switched"
+        );
+
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #2: streak (1) >= switch_after (1) -> switches, 0 -> 1
+        assert!(
+            op.last_cq_snapshot.is_some_and(|s| s.did_switch),
+            "precondition: CQ #2 must have performed the switch this test exercises"
+        );
+        let current_streak = op.cq_no_response_streak;
+        assert_eq!(
+            current_streak, 1,
+            "CQ #2 fired off its own switch-reset baseline"
+        );
+
+        // A late failure report for the OLD (CQ #1) attempt arrives now --
+        // its speculative "+1" was already erased by CQ #2's switch-
+        // triggered reset, so there is nothing left to compensate.
+        op.restore_cq_state_for_attempt(stale_attempt_id);
+
+        assert_eq!(
+            op.cq_no_response_streak, current_streak,
+            "a newer attempt's switch-triggered streak reset must block the bounded- \
+             compensation -1 for an older, non-switching stale attempt -- applying it anyway \
+             would wrongly eat into the newer attempt's own genuine increment"
         );
     }
 

@@ -1230,6 +1230,112 @@ async fn notify_autonomous_cq_dispatch_failed_if_self_cq(
     }
 }
 
+/// Register the qso_id<->cq_attempt_id association (`AutonomousCqOpened`)
+/// for a self-CQ dispatch, returning whether it's safe to proceed with
+/// `start_cq_with_id`. A CQ with no `cq_attempt_id` (nothing to register)
+/// always returns `true`.
+///
+/// PAN-45 (Codex round 6 on PR #301): `send_message` swallows a dropped
+/// (bounded-queue-full or disconnected) delivery into `Ok(())`,
+/// indistinguishable from success -- the same class of bug round 5 already
+/// fixed for the sibling `StartAutonomousQso` dispatch via
+/// `send_message_checked`. If this registration is silently dropped and
+/// the caller dispatches anyway, the QSO opens for real but the operator
+/// never learns qso_id<->attempt_id, so a later failed `TransmitComplete`
+/// for it finds no `pending_self_cq_qsos` entry and is silently ignored --
+/// leaving the failed CQ's streak/offset mutation permanently uncorrected.
+/// Returning `false` here lets the caller decline to dispatch at all
+/// instead; the existing generic `Err(e)` handling around the dispatch
+/// call already rolls back the streak via
+/// `notify_autonomous_cq_dispatch_failed_if_self_cq`, exactly like any
+/// other downstream open failure.
+async fn register_autonomous_cq_open_or_decline(
+    message_bus: &MessageBus,
+    pre_generated_qso_id: pancetta_qso::QsoId,
+    cq_attempt_id: Option<u64>,
+) -> bool {
+    let Some(attempt_id) = cq_attempt_id else {
+        return true;
+    };
+    let opened_msg = ComponentMessage::new(
+        ComponentId::Qso,
+        ComponentId::Autonomous,
+        MessageType::QsoMessage(crate::message_bus::QsoMessage::AutonomousCqOpened {
+            qso_id: pre_generated_qso_id.to_string(),
+            attempt_id,
+        }),
+        Instant::now(),
+    );
+    match message_bus.send_message_checked(opened_msg).await {
+        Ok(true) => true,
+        Ok(false) => {
+            warn!(
+                "AutonomousCqOpened dropped (channel full or disconnected) for attempt {} -- \
+                 declining to dispatch the self-CQ",
+                attempt_id
+            );
+            false
+        }
+        Err(e) => {
+            warn!("Failed to send AutonomousCqOpened: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod autonomous_cq_open_registration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn proceeds_when_no_cq_attempt_id_to_register() {
+        let bus = MessageBus::new(1000).expect("bus");
+        assert!(
+            register_autonomous_cq_open_or_decline(&bus, pancetta_qso::QsoId::new_v4(), None).await,
+            "nothing to register (not a self-CQ) must always proceed"
+        );
+    }
+
+    #[tokio::test]
+    async fn proceeds_when_the_registration_is_delivered() {
+        let bus = MessageBus::new(1000).expect("bus");
+        // Register the destination channel so the AutonomousCqOpened send
+        // actually has somewhere to land.
+        bus.create_channel(ComponentId::Autonomous)
+            .await
+            .expect("create channel");
+        assert!(
+            register_autonomous_cq_open_or_decline(&bus, pancetta_qso::QsoId::new_v4(), Some(7))
+                .await,
+            "a successfully delivered registration must proceed to dispatch"
+        );
+    }
+
+    /// PAN-45 (Codex round 6 on PR #301) regression: before this fix, a
+    /// dropped `AutonomousCqOpened` send was swallowed by `send_message`
+    /// into `Ok(())` and the caller dispatched `start_cq_with_id` anyway --
+    /// opening a real QSO the autonomous operator never learned the
+    /// qso_id<->attempt_id association for. A later failed
+    /// `TransmitComplete` for that qso_id would then find no
+    /// `pending_self_cq_qsos` entry and be silently ignored, leaving the
+    /// failed CQ's streak/offset mutation uncorrected forever.
+    #[tokio::test]
+    async fn declines_when_the_registration_is_dropped() {
+        // No channel registered for ComponentId::Autonomous at all --
+        // `send_message_checked` hits its "no channel found for
+        // destination" branch and returns `Ok(false)`, deterministically
+        // simulating a dropped delivery without racing a real bounded
+        // queue.
+        let bus = MessageBus::new(1000).expect("bus");
+        assert!(
+            !register_autonomous_cq_open_or_decline(&bus, pancetta_qso::QsoId::new_v4(), Some(7))
+                .await,
+            "a dropped registration must decline to dispatch, not proceed as if it \
+             succeeded -- the caller's start_cq_with_id must never run in this case"
+        );
+    }
+}
+
 #[cfg(test)]
 mod pan6_diagnostic_tests {
     use super::*;
@@ -3665,36 +3771,37 @@ impl super::ApplicationCoordinator {
                                                     // association did.
                                                     let pre_generated_qso_id =
                                                         pancetta_qso::QsoId::new_v4();
-                                                    if let Some(attempt_id) = cq_attempt_id {
-                                                        let opened_msg = ComponentMessage::new(
-                                                            ComponentId::Qso,
-                                                            ComponentId::Autonomous,
-                                                            MessageType::QsoMessage(
-                                                                crate::message_bus::QsoMessage::AutonomousCqOpened {
-                                                                    qso_id: pre_generated_qso_id.to_string(),
-                                                                    attempt_id,
-                                                                },
-                                                            ),
-                                                            Instant::now(),
-                                                        );
-                                                        if let Err(e) = message_bus
-                                                            .send_message(opened_msg)
+                                                    // PAN-45 (Codex round 6 on PR #301): see
+                                                    // `register_autonomous_cq_open_or_decline`'s
+                                                    // doc comment -- a dropped registration
+                                                    // means we must decline to dispatch
+                                                    // rather than proceed with an
+                                                    // unassociated QSO.
+                                                    if register_autonomous_cq_open_or_decline(
+                                                        &message_bus,
+                                                        pre_generated_qso_id,
+                                                        cq_attempt_id,
+                                                    )
+                                                    .await
+                                                    {
+                                                        qso_manager
+                                                            .start_cq_with_id(
+                                                                pre_generated_qso_id,
+                                                                frequency,
+                                                                parity,
+                                                                false,
+                                                            )
                                                             .await
-                                                        {
-                                                            warn!(
-                                                                "Failed to send AutonomousCqOpened: {}",
-                                                                e
-                                                            );
-                                                        }
+                                                    } else {
+                                                        Err(pancetta_qso::QsoManagerError::Internal {
+                                                            message: format!(
+                                                                "AutonomousCqOpened registration for attempt {:?} \
+                                                                 was not delivered; declining to dispatch the \
+                                                                 self-CQ",
+                                                                cq_attempt_id
+                                                            ),
+                                                        })
                                                     }
-                                                    qso_manager
-                                                        .start_cq_with_id(
-                                                            pre_generated_qso_id,
-                                                            frequency,
-                                                            parity,
-                                                            false,
-                                                        )
-                                                        .await
                                                 }
                                             };
                                             match result {

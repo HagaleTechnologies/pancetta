@@ -290,6 +290,9 @@ pub enum QsoManagerError {
 
     #[error("Database error: {source}")]
     Database { source: anyhow::Error },
+
+    #[error("{message}")]
+    Internal { message: String },
 }
 
 /// QSO manager configuration
