@@ -2380,10 +2380,16 @@ impl super::ApplicationCoordinator {
                                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                                 .join(".pancetta")
                                 .join("pancetta.toml");
-                            let persist_result = {
-                                let cfg = cmd_config.read().await;
-                                cfg.set_rig_bookmarks_in_file(&config_path, &staged)
-                            };
+                            // I-9 fix (PAN-61 review round 4): persist off
+                            // this loop's own task -- see
+                            // `persist_rig_bookmarks_off_thread`'s doc
+                            // comment for why inline blocking I/O here is
+                            // a TX-safety hazard.
+                            let persist_result = persist_rig_bookmarks_off_thread(
+                                config_path.clone(),
+                                staged.clone(),
+                            )
+                            .await;
                             let status = if let Err(e) = persist_result {
                                 warn!("Failed to persist rig bookmark: {}", e);
                                 format!("Failed to save bookmark '{}': {}", name, e)
@@ -2440,10 +2446,15 @@ impl super::ApplicationCoordinator {
                                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                                     .join(".pancetta")
                                     .join("pancetta.toml");
-                                let persist_result = {
-                                    let cfg = cmd_config.read().await;
-                                    cfg.set_rig_bookmarks_in_file(&config_path, &staged)
-                                };
+                                // I-9 fix (PAN-61 review round 4): persist
+                                // off this loop's own task -- see
+                                // `persist_rig_bookmarks_off_thread`'s doc
+                                // comment.
+                                let persist_result = persist_rig_bookmarks_off_thread(
+                                    config_path.clone(),
+                                    staged.clone(),
+                                )
+                                .await;
                                 let status = if let Err(e) = persist_result {
                                     warn!("Failed to persist rig bookmark deletion: {}", e);
                                     format!("Failed to delete bookmark '{}': {}", name, e)
@@ -2825,6 +2836,38 @@ fn rig_bookmark_saved_status(name: &str, count: usize) -> String {
         )
     } else {
         format!("Saved bookmark '{}'", name)
+    }
+}
+
+/// Persist rig bookmarks off the safety-command relay loop's own task
+/// (PAN-61 review round 4, P1): `Config::set_rig_bookmarks_in_file` does
+/// synchronous disk I/O (read, parse, rewrite, atomic write+fsync). Run
+/// inline on the task that also dequeues `OperatorEmergencyStop`/`StopTx`/
+/// `TogglePtt`/`AbortQso`, a slow or stalled filesystem (a network-mounted
+/// home directory, antivirus scanning, a failing disk) could delay every
+/// one of those safety commands until the write returns. `spawn_blocking`
+/// moves the blocking call onto tokio's dedicated blocking-thread pool so
+/// the relay loop's task stays free to keep dequeuing safety commands
+/// while the write is in flight.
+///
+/// `set_rig_bookmarks_in_file` never reads any of `Config`'s own fields --
+/// it's a pure function of `path`/`bookmarks` (see its implementation) --
+/// so a throwaway `Config::default()` is a safe, zero-cost receiver here;
+/// no live config data needs to cross into the blocking task.
+async fn persist_rig_bookmarks_off_thread(
+    path: std::path::PathBuf,
+    bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+) -> pancetta_config::ConfigResult<()> {
+    match tokio::task::spawn_blocking(move || {
+        pancetta_config::Config::default().set_rig_bookmarks_in_file(&path, &bookmarks)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(join_err) => Err(pancetta_config::ConfigError::Validation(format!(
+            "bookmark persist task panicked or was cancelled: {}",
+            join_err
+        ))),
     }
 }
 

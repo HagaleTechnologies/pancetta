@@ -953,14 +953,22 @@ impl RigSelectionState {
                 }
             }
         };
+        // I-10 fix (PAN-61 review round 4): a bookmark can carry a baud
+        // rate or PTT method outside the picker's fixed enumerated choices
+        // (reachable via a hand-edited config, even though the TUI's own
+        // save path only ever offers these enumerated values) -- falling
+        // back to a hardcoded index would silently substitute a DIFFERENT
+        // value than what the bookmark actually stored, the same class of
+        // bug as the empty-port fix above. Leave the field at its current
+        // value instead of guessing.
         self.selected_baud_idx = RIG_BAUD_RATES
             .iter()
             .position(|b| *b == bookmark.baud_rate)
-            .unwrap_or(1);
+            .unwrap_or(self.selected_baud_idx);
         self.selected_ptt_idx = rig_ptt_methods()
             .iter()
             .position(|m| format!("{:?}", m) == format!("{:?}", bookmark.ptt_method))
-            .unwrap_or(0);
+            .unwrap_or(self.selected_ptt_idx);
     }
 
     /// The port value to submit — empty string if no ports were enumerated.
@@ -6636,6 +6644,56 @@ mod tests {
         );
         // The other 3 fields still load normally.
         assert_eq!(state.model, "FTdx10");
+    }
+
+    /// PAN-61 review round 4 (Codex P2): a bookmarked baud rate outside
+    /// `RIG_BAUD_RATES` (reachable via a hand-edited config, even though
+    /// the picker only ever offers the 6 enumerated choices) must not
+    /// silently substitute a hardcoded default -- that would apply a
+    /// DIFFERENT baud rate than the one actually stored.
+    #[test]
+    fn rig_selection_state_load_bookmark_with_unsupported_baud_leaves_baud_field_unchanged() {
+        let mut state = RigSelectionState {
+            selected_baud_idx: 3, // 38400
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "OddBaud".to_string(),
+                model: "FTdx10".to_string(),
+                port: String::new(),
+                baud_rate: 230_400, // not in RIG_BAUD_RATES
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }],
+            ..Default::default()
+        };
+        state.load_bookmark(0);
+
+        assert_eq!(
+            state.selected_baud(),
+            38400,
+            "an unsupported bookmarked baud rate must not silently substitute a different value"
+        );
+    }
+
+    /// Same class of bug as the baud-rate case above, for PTT method.
+    #[test]
+    fn rig_selection_state_load_bookmark_with_unsupported_ptt_leaves_ptt_field_unchanged() {
+        let mut state = RigSelectionState {
+            selected_ptt_idx: 1, // Cat
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "OddPtt".to_string(),
+                model: "FTdx10".to_string(),
+                port: String::new(),
+                baud_rate: 9600,
+                // Not one of the 4 choices `rig_ptt_methods()` offers.
+                ptt_method: pancetta_config::rig::PttMethod::Parallel,
+            }],
+            ..Default::default()
+        };
+        state.load_bookmark(0);
+
+        assert!(
+            matches!(state.selected_ptt(), pancetta_config::rig::PttMethod::Cat),
+            "an unsupported bookmarked PTT method must not silently substitute a different value"
+        );
     }
 
     #[test]
