@@ -929,7 +929,15 @@ impl RigSelectionState {
         {
             Some(pos) => pos,
             None => {
-                if !bookmark.port.is_empty() {
+                if bookmark.port.is_empty() {
+                    // I-8 fix (PAN-61 review round 3): an empty bookmarked
+                    // port (reachable via a hand-edited config file even
+                    // though the TUI's own save path refuses to create
+                    // one) must never fall back to index 0 -- that would
+                    // silently substitute an unrelated enumerated device.
+                    // Leave the port field at its current value instead.
+                    self.selected_port_idx
+                } else {
                     // I-4 fix (PAN-61 review round 1): prepending shifts
                     // every existing index in `available_ports` up by one.
                     // `committed_port_idx` is a snapshot into that same
@@ -941,8 +949,8 @@ impl RigSelectionState {
                     // persist and connect to the wrong port.
                     self.available_ports.insert(0, bookmark.port.clone());
                     self.committed_port_idx += 1;
+                    0
                 }
-                0
             }
         };
         self.selected_baud_idx = RIG_BAUD_RATES
@@ -6593,6 +6601,41 @@ mod tests {
             "/dev/ttyUSB1",
             "restore_committed must land back on the port that was actually committed"
         );
+    }
+
+    /// PAN-61 review round 3 (Codex P2): a bookmark with an empty port
+    /// (reachable via a hand-edited config file even though the TUI's own
+    /// save path refuses to create one) must never fall back to index 0 --
+    /// that would silently substitute an unrelated enumerated device the
+    /// operator never chose.
+    #[test]
+    fn rig_selection_state_load_bookmark_with_empty_port_leaves_port_field_unchanged() {
+        let mut state = RigSelectionState {
+            available_ports: vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
+            selected_port_idx: 1,
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "NoPort".to_string(),
+                model: "FTdx10".to_string(),
+                port: String::new(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }],
+            ..Default::default()
+        };
+        state.load_bookmark(0);
+
+        assert_eq!(
+            state.selected_port(),
+            "/dev/ttyUSB1",
+            "an empty bookmarked port must not silently substitute a different real device"
+        );
+        assert_eq!(
+            state.available_ports,
+            vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
+            "an empty port must not be prepended into the list"
+        );
+        // The other 3 fields still load normally.
+        assert_eq!(state.model, "FTdx10");
     }
 
     #[test]
