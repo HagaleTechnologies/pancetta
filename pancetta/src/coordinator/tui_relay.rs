@@ -893,13 +893,14 @@ impl super::ApplicationCoordinator {
         // sibling for every caller. See `spawn_config_file_write_worker`'s
         // doc comment for why a plain shared lock isn't enough here.
         let (cmd_config_write_tx, cmd_config_write_handle) = spawn_config_file_write_worker();
-        // PAN-61 review round 8 (Codex P1): register the handle so
-        // graceful shutdown (`shutdown.rs`) awaits this worker draining
-        // any writes already queued, with the same bounded per-task
-        // timeout every other task here gets, instead of the runtime
-        // silently cancelling it mid-drain on teardown.
-        self.named_task_handles
-            .push((ComponentId::Tui, cmd_config_write_handle));
+        // PAN-61 review round 8 (Codex P1): registered so graceful
+        // shutdown (`shutdown.rs`) awaits this worker draining any writes
+        // already queued, with the same bounded per-task timeout every
+        // other task here gets, instead of the runtime silently
+        // cancelling it mid-drain on teardown. Registration itself is
+        // deferred -- see the round-9 fix below, right after `cmd_handle`
+        // is pushed.
+        //
         // Serializes the bookmark stage-mutate-commit sequence across the
         // two bookmark commands specifically -- see
         // `spawn_bookmark_mutation_worker`'s doc comment.
@@ -914,8 +915,6 @@ impl super::ApplicationCoordinator {
                 cmd_tui_msg_tx.clone(),
                 cmd_bookmark_config_path,
             );
-        self.named_task_handles
-            .push((ComponentId::Tui, cmd_bookmark_mutation_handle));
         // Live device-switch channel into the audio thread. `None` in
         // stub/`--no-audio` modes — the SelectDevice handler then persists the
         // choice (applies on next restart) and tells the operator it can't apply
@@ -2530,6 +2529,25 @@ impl super::ApplicationCoordinator {
             Ok(())
         });
         self.named_task_handles.push((ComponentId::Tui, cmd_handle));
+        // PAN-61 review round 9 (Codex P1): register the two workers'
+        // handles AFTER cmd_handle (the relay loop above), not before.
+        // `shutdown.rs` drains `named_task_handles` in insertion order
+        // with a bounded 1s-per-task timeout, aborting whatever hasn't
+        // finished. `cmd_handle` is the task holding
+        // `cmd_config_write_tx`/`cmd_bookmark_mutation_tx` -- the two
+        // workers' recv loops only exit once every sender is dropped. If
+        // the workers were drained first (as they were through round 8),
+        // a relay loop still parked in an in-flight await (e.g. the
+        // audio-reopen wait) can't drop its senders in time, so the
+        // workers hit their own timeout and get aborted with queued
+        // saves/deletes still unprocessed. Registering the producer
+        // first lets shutdown close it -- dropping the senders -- before
+        // the consumers are awaited, so the workers see channel closure
+        // and drain cleanly within their own timeout.
+        self.named_task_handles
+            .push((ComponentId::Tui, cmd_config_write_handle));
+        self.named_task_handles
+            .push((ComponentId::Tui, cmd_bookmark_mutation_handle));
 
         // Run the TUI on a blocking task (it takes over the terminal)
         let tui_config_lock = config.read().await;
