@@ -892,7 +892,14 @@ impl super::ApplicationCoordinator {
         // `write_secure_atomic`, which reuses the same `<path>.tmp`
         // sibling for every caller. See `spawn_config_file_write_worker`'s
         // doc comment for why a plain shared lock isn't enough here.
-        let cmd_config_write_tx = spawn_config_file_write_worker();
+        let (cmd_config_write_tx, cmd_config_write_handle) = spawn_config_file_write_worker();
+        // PAN-61 review round 8 (Codex P1): register the handle so
+        // graceful shutdown (`shutdown.rs`) awaits this worker draining
+        // any writes already queued, with the same bounded per-task
+        // timeout every other task here gets, instead of the runtime
+        // silently cancelling it mid-drain on teardown.
+        self.named_task_handles
+            .push((ComponentId::Tui, cmd_config_write_handle));
         // Serializes the bookmark stage-mutate-commit sequence across the
         // two bookmark commands specifically -- see
         // `spawn_bookmark_mutation_worker`'s doc comment.
@@ -900,12 +907,15 @@ impl super::ApplicationCoordinator {
             .unwrap_or_else(|| std::path::PathBuf::from("."))
             .join(".pancetta")
             .join("pancetta.toml");
-        let cmd_bookmark_mutation_tx = spawn_bookmark_mutation_worker(
-            cmd_config.clone(),
-            cmd_config_write_tx.clone(),
-            cmd_tui_msg_tx.clone(),
-            cmd_bookmark_config_path,
-        );
+        let (cmd_bookmark_mutation_tx, cmd_bookmark_mutation_handle) =
+            spawn_bookmark_mutation_worker(
+                cmd_config.clone(),
+                cmd_config_write_tx.clone(),
+                cmd_tui_msg_tx.clone(),
+                cmd_bookmark_config_path,
+            );
+        self.named_task_handles
+            .push((ComponentId::Tui, cmd_bookmark_mutation_handle));
         // Live device-switch channel into the audio thread. `None` in
         // stub/`--no-audio` modes — the SelectDevice handler then persists the
         // choice (applies on next restart) and tells the operator it can't apply
@@ -2858,9 +2868,18 @@ struct ConfigFileWriteRequest {
 /// perspective -- the `send` itself never waits for the write, so NO
 /// caller (relay loop included) is ever suspended by another writer's I/O,
 /// no matter which arm is submitting or how long the queue is.
-fn spawn_config_file_write_worker() -> tokio::sync::mpsc::UnboundedSender<ConfigFileWriteRequest> {
+/// Returns the request sender plus the worker's own `JoinHandle` -- PAN-61
+/// review round 8 (Codex P1): the caller MUST register the handle in
+/// `named_task_handles` so graceful shutdown awaits (with its existing
+/// bounded per-task timeout) this worker draining any mutations already
+/// queued before it exits, instead of the runtime silently cancelling it
+/// mid-drain when the process tears down.
+fn spawn_config_file_write_worker() -> (
+    tokio::sync::mpsc::UnboundedSender<ConfigFileWriteRequest>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ConfigFileWriteRequest>();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         while let Some(req) = rx.recv().await {
             let result = match tokio::task::spawn_blocking(req.work).await {
                 Ok(result) => result,
@@ -2871,8 +2890,9 @@ fn spawn_config_file_write_worker() -> tokio::sync::mpsc::UnboundedSender<Config
             };
             let _ = req.respond.send(result);
         }
+        Ok(())
     });
-    tx
+    (tx, handle)
 }
 
 /// One bookmark mutation, queued for serialized processing by the worker
@@ -2895,18 +2915,26 @@ enum BookmarkMutation {
 
 /// Spawn the single serialized worker that processes every
 /// `SaveRigBookmark`/`DeleteRigBookmark` mutation one at a time, and
-/// return the sender the relay loop submits mutations through. The relay
-/// loop's own arms do nothing but build the request and `send` it --
-/// never awaited, so they return to `try_recv` immediately regardless of
-/// how long this worker's queue takes to drain.
+/// return the sender the relay loop submits mutations through plus the
+/// worker's own `JoinHandle`. The relay loop's own arms do nothing but
+/// build the request and `send` it -- never awaited, so they return to
+/// `try_recv` immediately regardless of how long this worker's queue
+/// takes to drain.
+///
+/// PAN-61 review round 8 (Codex P1): the caller MUST register the
+/// returned handle in `named_task_handles` -- see
+/// `spawn_config_file_write_worker`'s identical note.
 fn spawn_bookmark_mutation_worker(
     config: std::sync::Arc<tokio::sync::RwLock<pancetta_config::Config>>,
     write_tx: tokio::sync::mpsc::UnboundedSender<ConfigFileWriteRequest>,
     tui_msg_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
     config_path: std::path::PathBuf,
-) -> tokio::sync::mpsc::UnboundedSender<BookmarkMutation> {
+) -> (
+    tokio::sync::mpsc::UnboundedSender<BookmarkMutation>,
+    tokio::task::JoinHandle<Result<()>>,
+) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BookmarkMutation>();
-    tokio::spawn(async move {
+    let handle = tokio::spawn(async move {
         while let Some(mutation) = rx.recv().await {
             // Stage fresh at the top of every iteration -- this only runs
             // after the PREVIOUS mutation (if any) fully committed below,
@@ -2996,8 +3024,9 @@ fn spawn_bookmark_mutation_worker(
                 status,
             });
         }
+        Ok(())
     });
-    tx
+    (tx, handle)
 }
 
 #[cfg(test)]
