@@ -7348,7 +7348,8 @@ mod replay_history_seed_tests {
             None,                                                // no test-tx
             1500.0,
             shutdown,
-            Vec::new(), // no config warnings
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
         )
         .await
         .expect("coordinator creation should succeed");
@@ -7656,7 +7657,8 @@ mod respond_to_caller_admission_tests {
             None,                                                // no test-tx
             1500.0,
             shutdown,
-            Vec::new(), // no config warnings
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
         )
         .await
         .expect("coordinator creation should succeed");

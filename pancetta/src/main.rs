@@ -399,6 +399,9 @@ async fn run_application(cli: Cli) -> Result<()> {
         shutdown_for_signals.store(true, Ordering::Release);
     });
 
+    // PAN-62: resolve BEFORE `cli` is partially moved into the fields below.
+    let config_write_path = config_write_path(&cli);
+
     // Create application coordinator
     let coordinator = ApplicationCoordinator::new(
         config,
@@ -413,6 +416,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         cli.test_tx_offset,
         shutdown.clone(),
         config_warnings,
+        config_write_path,
     )
     .await?;
 
@@ -920,6 +924,27 @@ async fn benchmark_decode_command(args: BenchmarkDecodeArgs) -> Result<()> {
 async fn load_configuration(cli: &Cli) -> Result<Config> {
     let (config, _warnings) = load_configuration_with_warnings(cli).await?;
     Ok(config)
+}
+
+/// The default `pancetta.toml` location used when no `--config <path>` is
+/// given -- `~/.pancetta/pancetta.toml`.
+fn default_pancetta_toml_path() -> PathBuf {
+    dirs::home_dir()
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join(".pancetta")
+        .join("pancetta.toml")
+}
+
+/// PAN-62: the config file the rig-picker/bookmark handlers
+/// (`tui_relay.rs`'s SelectDevice/SelectRig/SaveRigBookmark/
+/// DeleteRigBookmark) persist to -- the explicit `--config <path>` if the
+/// operator passed one, matching what `load_configuration_with_warnings`
+/// actually loaded from; otherwise the same default `pancetta.toml`
+/// location that function falls back to.
+fn config_write_path(cli: &Cli) -> PathBuf {
+    cli.config
+        .clone()
+        .unwrap_or_else(default_pancetta_toml_path)
 }
 
 /// Like [`load_configuration`] but also returns non-fatal config-load warnings
@@ -1876,6 +1901,29 @@ mod tests {
             LogFormat::Json
         ));
         assert!("invalid".parse::<LogFormat>().is_err());
+    }
+
+    /// PAN-62: an operator running `--config <custom-path>` must have the
+    /// rig-picker/bookmark handlers persist to that same file, not the
+    /// hardcoded `~/.pancetta/pancetta.toml` `load_configuration_with_warnings`
+    /// only falls back to when NO `--config` flag is given.
+    #[test]
+    fn config_write_path_uses_the_explicit_config_flag_when_given() {
+        let cli = Cli::try_parse_from(["pancetta", "--config", "/tmp/custom-pancetta.toml"])
+            .expect("valid CLI args");
+        assert_eq!(
+            config_write_path(&cli),
+            PathBuf::from("/tmp/custom-pancetta.toml")
+        );
+    }
+
+    /// Without `--config`, the write target must match the same default
+    /// `~/.pancetta/pancetta.toml` location `load_configuration_with_warnings`
+    /// falls back to (unchanged pre-PAN-62 behavior).
+    #[test]
+    fn config_write_path_falls_back_to_the_default_pancetta_toml_location() {
+        let cli = Cli::try_parse_from(["pancetta"]).expect("valid CLI args");
+        assert_eq!(config_write_path(&cli), default_pancetta_toml_path());
     }
 }
 

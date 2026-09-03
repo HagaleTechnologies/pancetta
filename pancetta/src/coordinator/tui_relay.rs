@@ -883,15 +883,23 @@ impl super::ApplicationCoordinator {
         // autonomous slot tick, ≤15s later).
         let cmd_tui_msg_tx = tui_msg_tx.clone();
         // Shared config — the SelectDevice handler persists the operator's
-        // chosen output device into it (and into ~/.pancetta/pancetta.toml).
+        // chosen output device into it (and into `cmd_config_path`).
         let cmd_config = self.config.clone();
+        // PAN-62: the config file `main.rs` actually loaded from --
+        // `--config <path>` if given, else the same default
+        // `~/.pancetta/pancetta.toml`. SelectDevice, SelectRig,
+        // SaveRigBookmark, and DeleteRigBookmark all persist here instead
+        // of a hardcoded `~/.pancetta/pancetta.toml`, so an operator
+        // running under `--config <custom-path>` doesn't have picker/
+        // bookmark saves silently land in the wrong file.
+        let cmd_config_path = self.config_path.clone();
         // PAN-61 review round 7 (Codex P1, superseding round 6's Mutex):
         // serializes every targeted-write persist call to
-        // ~/.pancetta/pancetta.toml -- SelectDevice, SelectRig,
-        // SaveRigBookmark, and DeleteRigBookmark all write into it via
-        // `write_secure_atomic`, which reuses the same `<path>.tmp`
-        // sibling for every caller. See `spawn_config_file_write_worker`'s
-        // doc comment for why a plain shared lock isn't enough here.
+        // `cmd_config_path` -- SelectDevice, SelectRig, SaveRigBookmark,
+        // and DeleteRigBookmark all write into it via `write_secure_atomic`,
+        // which reuses the same `<path>.tmp` sibling for every caller. See
+        // `spawn_config_file_write_worker`'s doc comment for why a plain
+        // shared lock isn't enough here.
         let (cmd_config_write_tx, cmd_config_write_handle) = spawn_config_file_write_worker();
         // PAN-61 review round 8 (Codex P1): registered so graceful
         // shutdown (`shutdown.rs`) awaits this worker draining any writes
@@ -904,16 +912,12 @@ impl super::ApplicationCoordinator {
         // Serializes the bookmark stage-mutate-commit sequence across the
         // two bookmark commands specifically -- see
         // `spawn_bookmark_mutation_worker`'s doc comment.
-        let cmd_bookmark_config_path = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".pancetta")
-            .join("pancetta.toml");
         let (cmd_bookmark_mutation_tx, cmd_bookmark_mutation_handle) =
             spawn_bookmark_mutation_worker(
                 cmd_config.clone(),
                 cmd_config_write_tx.clone(),
                 cmd_tui_msg_tx.clone(),
-                cmd_bookmark_config_path,
+                cmd_config_path.clone(),
             );
         // Live device-switch channel into the audio thread. `None` in
         // stub/`--no-audio` modes — the SelectDevice handler then persists the
@@ -2069,8 +2073,8 @@ impl super::ApplicationCoordinator {
                                 input_device, output_device
                             );
                             // Persist the operator's choice to the in-memory
-                            // config and to ~/.pancetta/pancetta.toml so it
-                            // survives a restart, AND apply it live by asking the
+                            // config and to `cmd_config_path` so it survives
+                            // a restart, AND apply it live by asking the
                             // audio thread to reopen the cpal stream(s) on the new
                             // device(s) — no restart required.
                             {
@@ -2082,10 +2086,10 @@ impl super::ApplicationCoordinator {
                                     cfg.audio.input_device = inp.clone();
                                 }
                             }
-                            let config_path = dirs::home_dir()
-                                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                .join(".pancetta")
-                                .join("pancetta.toml");
+                            // PAN-62: the actually-loaded config path
+                            // (`--config <path>`, or the default), not a
+                            // hardcoded `~/.pancetta/pancetta.toml`.
+                            let config_path = cmd_config_path.clone();
                             // PAN-61 review round 7 (P1): submit to the
                             // serialized write worker and do NOT await the
                             // result inline -- the persist outcome is
@@ -2274,8 +2278,8 @@ impl super::ApplicationCoordinator {
                                 );
                             } else {
                                 // Persist the operator's choice to the in-memory
-                                // config and to ~/.pancetta/pancetta.toml so it
-                                // survives a restart, AND apply it live by asking
+                                // config and to `cmd_config_path` so it survives
+                                // a restart, AND apply it live by asking
                                 // run_main_loop (via hamlib_reconnect_tx) to tear
                                 // down and reconnect Hamlib on the new config --
                                 // same live-switch pattern as SelectDevice above.
@@ -2286,10 +2290,10 @@ impl super::ApplicationCoordinator {
                                     cfg.rig.interface.baud_rate = baud_rate;
                                     cfg.rig.ptt.method = ptt_method.clone();
                                 }
-                                let config_path = dirs::home_dir()
-                                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                    .join(".pancetta")
-                                    .join("pancetta.toml");
+                                // PAN-62: the actually-loaded config path
+                                // (`--config <path>`, or the default), not
+                                // a hardcoded `~/.pancetta/pancetta.toml`.
+                                let config_path = cmd_config_path.clone();
                                 // PAN-61 review round 7 (P1): submit to the
                                 // serialized write worker and do NOT await
                                 // the result inline -- see SelectDevice's
@@ -2902,7 +2906,8 @@ fn rig_bookmark_saved_status(name: &str, count: usize) -> String {
     }
 }
 
-/// One targeted `~/.pancetta/pancetta.toml` write, queued for serialized
+/// One targeted config-file write (PAN-62: the coordinator's `config_path`,
+/// not always `~/.pancetta/pancetta.toml`), queued for serialized
 /// processing by the worker `spawn_config_file_write_worker` spawns
 /// (PAN-61 review round 7, P1). `work` performs the actual blocking
 /// `std::fs` I/O (matching the `set_*_in_file` methods' shape) and is only
