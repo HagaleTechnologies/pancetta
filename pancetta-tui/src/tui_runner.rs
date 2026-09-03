@@ -1097,8 +1097,83 @@ impl TuiRunner {
             return Ok(true);
         }
 
-        // If rig config picker modal is visible, route keys there (PAN-59)
+        // If rig config picker modal is visible, route keys there (PAN-59;
+        // bookmark overlay/name-input sub-states added PAN-61)
         if app.rig_selection.visible {
+            if app.rig_selection.naming_bookmark {
+                match key.code {
+                    KeyCode::Esc => {
+                        app.rig_selection.naming_bookmark = false;
+                        app.rig_selection.bookmark_name_input.clear();
+                        app.status_message = "Save bookmark cancelled".to_string();
+                    }
+                    KeyCode::Backspace => {
+                        app.rig_selection.pop_bookmark_name_char();
+                    }
+                    KeyCode::Char(c) if !c.is_control() => {
+                        app.rig_selection.push_bookmark_name_char(c);
+                    }
+                    KeyCode::Enter => {
+                        let name = app.rig_selection.bookmark_name_input.trim().to_string();
+                        if name.is_empty() {
+                            app.status_message = "Bookmark name cannot be empty".to_string();
+                        } else {
+                            app.rig_selection.naming_bookmark = false;
+                            app.rig_selection.bookmark_name_input.clear();
+                            self.message_tx.send(TuiCommand::SaveRigBookmark {
+                                name,
+                                model: app.rig_selection.model.clone(),
+                                port: app.rig_selection.selected_port(),
+                                baud_rate: app.rig_selection.selected_baud(),
+                                ptt_method: app.rig_selection.selected_ptt(),
+                            })?;
+                            app.status_message = "Saving bookmark…".to_string();
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(true);
+            }
+
+            if app.rig_selection.bookmark_overlay_visible {
+                match key.code {
+                    KeyCode::Esc => {
+                        app.rig_selection.bookmark_overlay_visible = false;
+                        app.status_message = "Load bookmark cancelled".to_string();
+                    }
+                    KeyCode::Up => {
+                        app.rig_selection.move_bookmark_selection_up();
+                    }
+                    KeyCode::Down => {
+                        app.rig_selection.move_bookmark_selection_down();
+                    }
+                    KeyCode::Enter => {
+                        if app.rig_selection.bookmarks.is_empty() {
+                            app.status_message = "No saved bookmarks".to_string();
+                        } else {
+                            let idx = app.rig_selection.selected_bookmark_idx;
+                            app.rig_selection.load_bookmark(idx);
+                            app.rig_selection.bookmark_overlay_visible = false;
+                            app.status_message = "Bookmark loaded — Enter to apply".to_string();
+                        }
+                    }
+                    KeyCode::Char('x') => {
+                        if let Some(bookmark) = app
+                            .rig_selection
+                            .bookmarks
+                            .get(app.rig_selection.selected_bookmark_idx)
+                        {
+                            let name = bookmark.name.clone();
+                            self.message_tx
+                                .send(TuiCommand::DeleteRigBookmark { name })?;
+                            app.status_message = "Deleting bookmark…".to_string();
+                        }
+                    }
+                    _ => {}
+                }
+                return Ok(true);
+            }
+
             match key.code {
                 KeyCode::Esc => {
                     // I-3 fix (PAN-59 final review): restore the live
@@ -1130,6 +1205,19 @@ impl TuiRunner {
                         && !c.is_control() =>
                 {
                     app.rig_selection.push_model_char(c);
+                }
+                KeyCode::Char('b') => {
+                    app.rig_selection.bookmark_overlay_visible = true;
+                    app.rig_selection.selected_bookmark_idx = 0;
+                    app.status_message =
+                        "Load bookmark (Up/Down: select, Enter: load, x: delete, Esc: cancel)"
+                            .to_string();
+                }
+                KeyCode::Char('s') => {
+                    app.rig_selection.naming_bookmark = true;
+                    app.rig_selection.bookmark_name_input.clear();
+                    app.status_message =
+                        "Name this bookmark (Enter: save, Esc: cancel)".to_string();
                 }
                 KeyCode::Enter => {
                     let port = app.rig_selection.selected_port();
@@ -5151,6 +5239,182 @@ mod key_tests {
             }
             other => panic!("expected SelectRig, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn rig_modal_b_opens_bookmark_overlay_and_enter_loads_without_applying() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut app = app.write().await;
+            app.rig_selection.visible = true;
+            // Off the Model field: the Model-field printable-char guard
+            // (added in this task, see the `s`-vs-Model test below) takes
+            // priority over the `b` arm whenever active_field == Model, so
+            // this test — which presses `b` as a modal-level shortcut, not
+            // as Model-field text entry — must not leave active_field at
+            // its RigSelectionState::default() value of Model.
+            app.rig_selection.active_field = crate::app::RigField::Ptt;
+            app.rig_selection.available_ports = vec!["/dev/ttyUSB0".to_string()];
+            app.rig_selection.bookmarks = vec![pancetta_config::rig::RigBookmark {
+                name: "Shack".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::Cat,
+            }];
+        }
+
+        r.handle_key_event(key('b')).await.unwrap();
+        assert!(app.read().await.rig_selection.bookmark_overlay_visible);
+
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let app = app.read().await;
+        assert!(
+            !app.rig_selection.bookmark_overlay_visible,
+            "Enter must close the overlay"
+        );
+        assert_eq!(app.rig_selection.model, "FTdx10", "must load into the form");
+        assert!(
+            cmd_rx.try_recv().is_err(),
+            "loading a bookmark must never send SelectRig itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_modal_b_overlay_esc_cancels_without_loading() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        {
+            let mut app = app.write().await;
+            app.rig_selection.visible = true;
+            // See the comment in rig_modal_b_opens_bookmark_overlay_...
+            // above: `b` is a modal-level shortcut, so keep active_field
+            // off Model.
+            app.rig_selection.active_field = crate::app::RigField::Ptt;
+            app.rig_selection.model = "Original".to_string();
+            app.rig_selection.bookmarks = vec![pancetta_config::rig::RigBookmark {
+                name: "Shack".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }];
+        }
+        r.handle_key_event(key('b')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        let app = app.read().await;
+        assert!(!app.rig_selection.bookmark_overlay_visible);
+        assert!(
+            app.rig_selection.visible,
+            "Esc on the overlay must return to the form, not close the whole modal"
+        );
+        assert_eq!(
+            app.rig_selection.model, "Original",
+            "must not have loaded anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn rig_modal_b_overlay_x_sends_delete_rig_bookmark() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut app = app.write().await;
+            app.rig_selection.visible = true;
+            // See the comment in rig_modal_b_opens_bookmark_overlay_...
+            // above: `b` is a modal-level shortcut, so keep active_field
+            // off Model.
+            app.rig_selection.active_field = crate::app::RigField::Ptt;
+            app.rig_selection.bookmarks = vec![pancetta_config::rig::RigBookmark {
+                name: "Shack".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }];
+        }
+        r.handle_key_event(key('b')).await.unwrap();
+        r.handle_key_event(key('x')).await.unwrap();
+
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::DeleteRigBookmark { name }) => assert_eq!(name, "Shack"),
+            other => panic!("expected DeleteRigBookmark, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn rig_modal_s_opens_name_input_and_enter_sends_save_rig_bookmark() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut app = app.write().await;
+            app.rig_selection.visible = true;
+            app.rig_selection.active_field = crate::app::RigField::Ptt;
+            app.rig_selection.model = "FTdx10".to_string();
+            app.rig_selection.available_ports = vec!["/dev/ttyUSB0".to_string()];
+        }
+
+        r.handle_key_event(key('s')).await.unwrap();
+        assert!(app.read().await.rig_selection.naming_bookmark);
+
+        r.handle_key_event(key('S')).await.unwrap();
+        r.handle_key_event(key('K')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(!app.read().await.rig_selection.naming_bookmark);
+        match cmd_rx.try_recv() {
+            Ok(TuiCommand::SaveRigBookmark { name, model, .. }) => {
+                assert_eq!(name, "SK");
+                assert_eq!(model, "FTdx10");
+            }
+            other => panic!("expected SaveRigBookmark, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn rig_modal_s_while_editing_model_types_the_letter_instead() {
+        let (mut r, _cmd_rx, app) = make_runner().await;
+        {
+            let mut app = app.write().await;
+            app.rig_selection.visible = true;
+            app.rig_selection.active_field = crate::app::RigField::Model;
+            app.rig_selection.model = "FTdx10".to_string();
+        }
+        r.handle_key_event(key('s')).await.unwrap();
+        let app = app.read().await;
+        assert_eq!(
+            app.rig_selection.model, "FTdx10s",
+            "'s' typed into the Model field must edit the model, not open naming"
+        );
+        assert!(!app.rig_selection.naming_bookmark);
+    }
+
+    #[tokio::test]
+    async fn rig_modal_s_name_input_enter_with_empty_name_refuses() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut app = app.write().await;
+            app.rig_selection.visible = true;
+            // See the comment in rig_modal_b_opens_bookmark_overlay_...
+            // above: `s` is a modal-level shortcut, so keep active_field
+            // off Model.
+            app.rig_selection.active_field = crate::app::RigField::Ptt;
+        }
+        r.handle_key_event(key('s')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            app.read().await.rig_selection.naming_bookmark,
+            "must stay open on an empty name"
+        );
+        assert!(cmd_rx.try_recv().is_err());
     }
 }
 
