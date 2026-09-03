@@ -3567,16 +3567,39 @@ impl Ft8Decoder {
                     );
 
                     // Positions the native/sweep search already found (across
-                    // ALL groups). A seed landing on one of these adds
-                    // nothing; recording that distinction is what lets a
-                    // null result be read as "nothing was gained" rather
-                    // than "nothing was admitted".
-                    let native_keys: std::collections::HashSet<(usize, usize, usize)> =
-                        sweep_candidate_groups
-                            .iter()
-                            .flatten()
-                            .map(|c| (c.time_step, c.freq_bin, c.freq_sub))
-                            .collect();
+                    // ALL groups), mapped to the BEST existing score at each
+                    // key. A seed landing on an absent key is unambiguously
+                    // novel. Codex round-3 finding on PR #343: a seed
+                    // landing on a key ALREADY present (e.g. only in an
+                    // hb-228 sqrt/linear group) is not automatically inert
+                    // either — it's re-scored against the PRIMARY
+                    // spectrogram (`spectrogram` below), not whichever
+                    // transform originally found that key, and
+                    // `finalize_native_and_seed_candidate_union`'s exact-key
+                    // dedup keeps the HIGHEST score at each key (the
+                    // design spec's own documented semantics) regardless of
+                    // which pipeline produced it. If the seed's re-scored
+                    // value beats what's already there, it WINS the dedup
+                    // and genuinely alters the result (a different
+                    // score/refinement survives) even though the position
+                    // itself was "already known" — that must count as a
+                    // real alteration too, not just a spatially novel key.
+                    let native_key_scores: std::collections::HashMap<(usize, usize, usize), f64> = {
+                        let mut scores: std::collections::HashMap<(usize, usize, usize), f64> =
+                            std::collections::HashMap::new();
+                        for c in sweep_candidate_groups.iter().flatten() {
+                            let key = (c.time_step, c.freq_bin, c.freq_sub);
+                            scores
+                                .entry(key)
+                                .and_modify(|best| {
+                                    if c.sync_score > *best {
+                                        *best = c.sync_score;
+                                    }
+                                })
+                                .or_insert(c.sync_score);
+                        }
+                        scores
+                    };
 
                     let raw = seed_set.seeds.len();
                     let mut dropped_negative_row = 0usize;
@@ -3619,7 +3642,7 @@ impl Ft8Decoder {
                                 c.sync_score = score;
                                 c.time_refinement = refinement;
                                 let key = (c.time_step, c.freq_bin, c.freq_sub);
-                                if !native_keys.contains(&key) {
+                                if Self::ft8lib_seed_alters_result(&native_key_scores, key, score) {
                                     ft8lib_seed_keys.insert(key);
                                 }
                                 seed_candidates.push(c);
@@ -3635,7 +3658,12 @@ impl Ft8Decoder {
                         translated,
                         dropped_negative_row,
                         dropped_out_of_envelope,
-                        novel = ft8lib_seed_keys.len(),
+                        // Renamed from `novel` (Codex round-3 finding on PR
+                        // #343): this now also counts a seed landing on an
+                        // ALREADY-known key whose re-score still wins the
+                        // dedup tie-break, not just spatially novel keys —
+                        // see `native_key_scores`'s doc comment.
+                        altering = ft8lib_seed_keys.len(),
                         "PAN-7 ft8_lib sync-seed search"
                     );
 
@@ -6883,6 +6911,33 @@ impl Ft8Decoder {
             && pass == 0
             && self.current_budget.has_time()
             && !self.protocol_params.protocol.is_ft2()
+    }
+
+    /// Whether a re-scored ft8_lib seed at `key` counts as a genuine
+    /// alteration of the native/sweep candidate set — either the key is
+    /// entirely absent from `native_key_scores` (spatially novel), or it's
+    /// present but `score` beats the best existing score there.
+    ///
+    /// Codex round-3 finding on PR #343: a seed landing on a key ALREADY
+    /// present (e.g. only in an hb-228 sqrt/linear group) isn't
+    /// automatically inert — it's re-scored against the PRIMARY
+    /// spectrogram, not whichever transform originally found that key,
+    /// and `finalize_native_and_seed_candidate_union`'s exact-key dedup
+    /// keeps the HIGHEST score at each key (the design spec's own
+    /// documented semantics) regardless of which pipeline produced it. A
+    /// higher-scoring seed at an already-known key still WINS the dedup
+    /// and changes the surviving score/refinement, so it must count the
+    /// same as a spatially novel key for the PAN-48 merge decision
+    /// (whether the union path is warranted at all).
+    fn ft8lib_seed_alters_result(
+        native_key_scores: &std::collections::HashMap<(usize, usize, usize), f64>,
+        key: (usize, usize, usize),
+        score: f64,
+    ) -> bool {
+        match native_key_scores.get(&key) {
+            None => true,
+            Some(&existing_best) => score > existing_best,
+        }
     }
 
     /// Dedup exact `(time_step, freq_bin, freq_sub)` collisions in a
@@ -25448,6 +25503,42 @@ mod pan7_ft8lib_sync_seed_tests {
             2,
             "defer_nms=false means each group's own internal NMS already ran (or the group \
              wasn't deferred in the first place) -- this fn must not suppress anything itself"
+        );
+    }
+
+    /// PAN-48 follow-up (Codex round-3 finding on PR #343):
+    /// `ft8lib_seed_alters_result` is the merge decision's actual
+    /// novelty/alteration test — pinned directly since the seed
+    /// translation loop it's called from depends on real FFI output and
+    /// isn't independently exercisable otherwise (same rationale as
+    /// `pan31_seed_within_nms_radius_of_stronger_candidate_is_suppressed`'s
+    /// own comment on why these decisions get pinned at the pure-function
+    /// level rather than via a full audio decode).
+    #[test]
+    fn ft8lib_seed_alters_result_tests() {
+        let mut scores: std::collections::HashMap<(usize, usize, usize), f64> =
+            std::collections::HashMap::new();
+        scores.insert((100, 50, 0), 5.0);
+
+        assert!(
+            Ft8Decoder::ft8lib_seed_alters_result(&scores, (200, 60, 0), 1.0),
+            "an absent key is unambiguously novel regardless of score"
+        );
+        assert!(
+            Ft8Decoder::ft8lib_seed_alters_result(&scores, (100, 50, 0), 6.0),
+            "a higher-scoring seed at an already-known key still wins \
+             finalize_native_and_seed_candidate_union's best-score dedup tie-break -- must \
+             count as an alteration even though the position itself isn't spatially novel"
+        );
+        assert!(
+            !Ft8Decoder::ft8lib_seed_alters_result(&scores, (100, 50, 0), 5.0),
+            "an exactly-tying score never wins the dedup tie-break (`>`, not `>=`) -- the \
+             existing entry survives unchanged, so this is not an alteration"
+        );
+        assert!(
+            !Ft8Decoder::ft8lib_seed_alters_result(&scores, (100, 50, 0), 4.0),
+            "a lower-scoring seed at an already-known key loses the dedup tie-break outright -- \
+             the existing (higher-scoring) entry survives unchanged"
         );
     }
 
