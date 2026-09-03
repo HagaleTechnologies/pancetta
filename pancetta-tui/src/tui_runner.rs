@@ -1725,7 +1725,7 @@ impl TuiRunner {
                 app.rig_selection.snapshot_committed();
                 app.rig_selection.visible = true;
                 app.status_message =
-                    "Edit rig config (Tab: next field, Up/Down: change, type: edit model, Enter: apply, Esc: cancel)"
+                    "Edit rig config (Tab: next, Up/Down: change, b: load bookmark, s: save bookmark, Enter: apply, Esc: cancel)"
                         .to_string();
             }
             KeyCode::Char('?') => {
@@ -2395,6 +2395,15 @@ impl TuiRunner {
         use crate::app::RigField;
         use ratatui::text::{Line, Span};
 
+        if state.naming_bookmark {
+            Self::render_bookmark_name_input(f, area, state);
+            return;
+        }
+        if state.bookmark_overlay_visible {
+            Self::render_bookmark_overlay(f, area, state);
+            return;
+        }
+
         // Defensive: see the identical guard in `render_device_selection_modal`.
         if area.width < 10 || area.height < 4 {
             return;
@@ -2462,7 +2471,128 @@ impl TuiRunner {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Tab: next field | Up/Down: change | type: edit model | Enter: apply | Esc: cancel",
+            "Tab: next | Up/Down: change | b: load | s: save | Enter: apply | Esc: cancel",
+            Style::default().fg(Color::DarkGray),
+        )));
+
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, inner);
+    }
+
+    /// Render the "save as bookmark" name-input overlay (PAN-61), stacked
+    /// on top of the rig-config modal. Mirrors
+    /// `render_rig_selection_modal`'s sizing/centering/clear idiom.
+    fn render_bookmark_name_input(f: &mut Frame, area: Rect, state: &crate::app::RigSelectionState) {
+        use ratatui::text::{Line, Span};
+
+        if area.width < 10 || area.height < 4 {
+            return;
+        }
+        let modal_width = (area.width * 2 / 5).clamp(30, 50).min(area.width);
+        let modal_height = 5u16.min(area.height);
+
+        let modal_area = Rect {
+            x: (area.width.saturating_sub(modal_width)) / 2,
+            y: (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        };
+
+        f.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let outer_block = Block::default()
+            .title(" Save Bookmark ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+
+        let inner = outer_block.inner(modal_area);
+        f.render_widget(outer_block, modal_area);
+
+        let lines = vec![
+            Line::from(vec![
+                Span::raw("Name: "),
+                Span::styled(
+                    state.bookmark_name_input.clone(),
+                    Style::default()
+                        .bg(Color::Cyan)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled(
+                "Enter: save | Esc: cancel",
+                Style::default().fg(Color::DarkGray),
+            )),
+        ];
+
+        let paragraph = Paragraph::new(lines);
+        f.render_widget(paragraph, inner);
+    }
+
+    /// Render the "load bookmark" list overlay (PAN-61), stacked on top of
+    /// the rig-config modal. Mirrors `render_device_selection_modal`'s
+    /// list-select idiom.
+    fn render_bookmark_overlay(f: &mut Frame, area: Rect, state: &crate::app::RigSelectionState) {
+        use ratatui::text::{Line, Span};
+
+        if area.width < 10 || area.height < 4 {
+            return;
+        }
+        let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
+        let modal_height = (state.bookmarks.len() as u16 + 5).clamp(6, area.height);
+
+        let modal_area = Rect {
+            x: (area.width.saturating_sub(modal_width)) / 2,
+            y: (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        };
+
+        f.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let outer_block = Block::default()
+            .title(" Load Bookmark ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+
+        let inner = outer_block.inner(modal_area);
+        f.render_widget(outer_block, modal_area);
+
+        let mut lines: Vec<Line> = Vec::with_capacity(state.bookmarks.len().max(1) + 2);
+        if state.bookmarks.is_empty() {
+            lines.push(Line::from(
+                "(no saved bookmarks — press 's' from the form to save one)",
+            ));
+        } else {
+            for (idx, bookmark) in state.bookmarks.iter().enumerate() {
+                let selected = idx == state.selected_bookmark_idx;
+                let style = if selected {
+                    Style::default()
+                        .bg(Color::Cyan)
+                        .fg(Color::Black)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default()
+                };
+                lines.push(Line::from(Span::styled(
+                    format!(
+                        "{} — {} @ {}, {}, {:?}",
+                        bookmark.name,
+                        bookmark.model,
+                        bookmark.port,
+                        bookmark.baud_rate,
+                        bookmark.ptt_method
+                    ),
+                    style,
+                )));
+            }
+        }
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "Up/Down: select | Enter: load | x: delete | Esc: cancel",
             Style::default().fg(Color::DarkGray),
         )));
 
