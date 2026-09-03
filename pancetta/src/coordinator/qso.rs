@@ -1213,20 +1213,172 @@ async fn notify_autonomous_cq_dispatch_failed_if_self_cq(
     message_bus: &MessageBus,
     callsign: &Option<String>,
     cq_attempt_id: Option<u64>,
+    pending_dispatch_failures: &std::sync::Mutex<Vec<u64>>,
 ) {
     let (None, Some(attempt_id)) = (callsign, cq_attempt_id) else {
         return;
     };
-    let fail_msg = ComponentMessage::new(
+    // PAN-43/45 follow-up (Codex round 1 on PR #342): this notification is
+    // the ONLY way a self-CQ's speculative streak/offset mutation ever
+    // gets rolled back after a failed open -- including when the failure
+    // itself was the Autonomous channel rejecting `AutonomousCqOpened`
+    // for being full (PAN-45). A single unchecked `send_message` attempt
+    // right after that same channel just rejected a delivery is exactly
+    // the condition most likely to drop this one too, silently leaving
+    // the mutation uncorrected forever. Retry with a short backoff
+    // instead of one best-effort attempt -- bounded so a genuinely
+    // wedged/disconnected Autonomous component doesn't stall this task
+    // indefinitely.
+    const RETRY_DELAYS_MS: [u64; 3] = [5, 20, 50];
+    for attempt in 0..=RETRY_DELAYS_MS.len() {
+        let fail_msg = ComponentMessage::new(
+            ComponentId::Qso,
+            ComponentId::Autonomous,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
+                attempt_id,
+            }),
+            Instant::now(),
+        );
+        match message_bus.send_message_checked(fail_msg).await {
+            Ok(true) => return,
+            Ok(false) => match RETRY_DELAYS_MS.get(attempt) {
+                Some(&delay_ms) => tokio::time::sleep(Duration::from_millis(delay_ms)).await,
+                None => {
+                    // PAN-43/45 follow-up (Codex round 2 on PR #342): the
+                    // message-bus retries above are still bounded by a
+                    // ~75ms budget -- sustained congestion past that
+                    // window (the Autonomous task itself stuck/backlogged,
+                    // not just a momentary blip) would otherwise still
+                    // drop this permanently. Fall back to shared state the
+                    // Autonomous task drains directly every
+                    // `slot_interval` tick, independent of its own
+                    // message-bus channel entirely -- same pattern as
+                    // `hamlib_pending_frequency` (PAN-19 round 10) for the
+                    // identical class of problem.
+                    warn!(
+                        "AutonomousCqDispatchFailed dropped for attempt {} after {} \
+                         message-bus attempts -- falling back to the queue-independent \
+                         pending-failures list",
+                        attempt_id,
+                        RETRY_DELAYS_MS.len() + 1
+                    );
+                    pending_dispatch_failures
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(attempt_id);
+                }
+            },
+            Err(e) => {
+                warn!("Failed to send AutonomousCqDispatchFailed: {}", e);
+                return;
+            }
+        }
+    }
+}
+
+/// Register the qso_id<->cq_attempt_id association (`AutonomousCqOpened`)
+/// for a self-CQ dispatch, returning whether it's safe to proceed with
+/// `start_cq_with_id`. A CQ with no `cq_attempt_id` (nothing to register)
+/// always returns `true`.
+///
+/// PAN-45 (Codex round 6 on PR #301): `send_message` swallows a dropped
+/// (bounded-queue-full or disconnected) delivery into `Ok(())`,
+/// indistinguishable from success -- the same class of bug round 5 already
+/// fixed for the sibling `StartAutonomousQso` dispatch via
+/// `send_message_checked`. If this registration is silently dropped and
+/// the caller dispatches anyway, the QSO opens for real but the operator
+/// never learns qso_id<->attempt_id, so a later failed `TransmitComplete`
+/// for it finds no `pending_self_cq_qsos` entry and is silently ignored --
+/// leaving the failed CQ's streak/offset mutation permanently uncorrected.
+/// Returning `false` here lets the caller decline to dispatch at all
+/// instead; the existing generic `Err(e)` handling around the dispatch
+/// call already rolls back the streak via
+/// `notify_autonomous_cq_dispatch_failed_if_self_cq`, exactly like any
+/// other downstream open failure.
+async fn register_autonomous_cq_open_or_decline(
+    message_bus: &MessageBus,
+    pre_generated_qso_id: pancetta_qso::QsoId,
+    cq_attempt_id: Option<u64>,
+) -> bool {
+    let Some(attempt_id) = cq_attempt_id else {
+        return true;
+    };
+    let opened_msg = ComponentMessage::new(
         ComponentId::Qso,
         ComponentId::Autonomous,
-        MessageType::QsoMessage(crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
+        MessageType::QsoMessage(crate::message_bus::QsoMessage::AutonomousCqOpened {
+            qso_id: pre_generated_qso_id.to_string(),
             attempt_id,
         }),
         Instant::now(),
     );
-    if let Err(e) = message_bus.send_message(fail_msg).await {
-        warn!("Failed to send AutonomousCqDispatchFailed: {}", e);
+    match message_bus.send_message_checked(opened_msg).await {
+        Ok(true) => true,
+        Ok(false) => {
+            warn!(
+                "AutonomousCqOpened dropped (channel full or disconnected) for attempt {} -- \
+                 declining to dispatch the self-CQ",
+                attempt_id
+            );
+            false
+        }
+        Err(e) => {
+            warn!("Failed to send AutonomousCqOpened: {}", e);
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod autonomous_cq_open_registration_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn proceeds_when_no_cq_attempt_id_to_register() {
+        let bus = MessageBus::new(1000).expect("bus");
+        assert!(
+            register_autonomous_cq_open_or_decline(&bus, pancetta_qso::QsoId::new_v4(), None).await,
+            "nothing to register (not a self-CQ) must always proceed"
+        );
+    }
+
+    #[tokio::test]
+    async fn proceeds_when_the_registration_is_delivered() {
+        let bus = MessageBus::new(1000).expect("bus");
+        // Register the destination channel so the AutonomousCqOpened send
+        // actually has somewhere to land.
+        bus.create_channel(ComponentId::Autonomous)
+            .await
+            .expect("create channel");
+        assert!(
+            register_autonomous_cq_open_or_decline(&bus, pancetta_qso::QsoId::new_v4(), Some(7))
+                .await,
+            "a successfully delivered registration must proceed to dispatch"
+        );
+    }
+
+    /// PAN-45 (Codex round 6 on PR #301) regression: before this fix, a
+    /// dropped `AutonomousCqOpened` send was swallowed by `send_message`
+    /// into `Ok(())` and the caller dispatched `start_cq_with_id` anyway --
+    /// opening a real QSO the autonomous operator never learned the
+    /// qso_id<->attempt_id association for. A later failed
+    /// `TransmitComplete` for that qso_id would then find no
+    /// `pending_self_cq_qsos` entry and be silently ignored, leaving the
+    /// failed CQ's streak/offset mutation uncorrected forever.
+    #[tokio::test]
+    async fn declines_when_the_registration_is_dropped() {
+        // No channel registered for ComponentId::Autonomous at all --
+        // `send_message_checked` hits its "no channel found for
+        // destination" branch and returns `Ok(false)`, deterministically
+        // simulating a dropped delivery without racing a real bounded
+        // queue.
+        let bus = MessageBus::new(1000).expect("bus");
+        assert!(
+            !register_autonomous_cq_open_or_decline(&bus, pancetta_qso::QsoId::new_v4(), Some(7))
+                .await,
+            "a dropped registration must decline to dispatch, not proceed as if it \
+             succeeded -- the caller's start_cq_with_id must never run in this case"
+        );
     }
 }
 
@@ -1391,6 +1543,128 @@ mod pan6_diagnostic_tests {
             }
             other => panic!("expected DiagnosticEvent, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_failed_notification_sends_exactly_once_when_delivered_immediately() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let pending = std::sync::Mutex::new(Vec::new());
+
+        notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(42), &pending).await;
+
+        let message = receiver
+            .try_recv()
+            .expect("exactly one dispatch-failed message");
+        match message.message_type {
+            MessageType::QsoMessage(
+                crate::message_bus::QsoMessage::AutonomousCqDispatchFailed { attempt_id },
+            ) => assert_eq!(attempt_id, 42),
+            other => panic!("expected AutonomousCqDispatchFailed, got {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "must send exactly once when the first attempt is delivered, not keep retrying"
+        );
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "the queue-independent fallback must NOT be used when the bus delivery succeeded"
+        );
+    }
+
+    /// PAN-43/45 follow-up (Codex round 1 on PR #342): a single unchecked
+    /// `send_message` used to be this notification's only delivery
+    /// attempt. If the Autonomous channel happened to be transiently full
+    /// -- exactly the condition PAN-45's registration-decline path can
+    /// itself trigger -- the notification silently dropped and the
+    /// speculative streak/offset mutation it exists to roll back was
+    /// never corrected. This must now retry past a transient full channel
+    /// instead of giving up on the first attempt.
+    #[tokio::test]
+    async fn dispatch_failed_notification_retries_past_a_transient_full_channel() {
+        let bus = MessageBus::new(1).unwrap(); // capacity 1 -- easy to fill
+        let (sender, receiver) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+
+        // Fill the one slot with an unrelated message so the notification's
+        // FIRST send attempt is guaranteed to see a full channel.
+        sender
+            .try_send(ComponentMessage::new(
+                ComponentId::Qso,
+                ComponentId::Autonomous,
+                MessageType::QsoMessage(
+                    crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
+                        attempt_id: 0, // unrelated filler, distinguishable from attempt_id below
+                    },
+                ),
+                Instant::now(),
+            ))
+            .expect("fill the one slot");
+
+        // Drain that filler shortly after the notification's first (failed)
+        // attempt but well before its bounded retries give up -- simulates
+        // the transient congestion clearing on its own.
+        let receiver_for_drain = receiver.clone();
+        tokio::spawn(async move {
+            loop {
+                if receiver_for_drain.try_recv().is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        let pending = std::sync::Mutex::new(Vec::new());
+        notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(99), &pending).await;
+
+        let message = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(m) = receiver.try_recv() {
+                    return m;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the real AutonomousCqDispatchFailed must eventually arrive");
+        match message.message_type {
+            MessageType::QsoMessage(
+                crate::message_bus::QsoMessage::AutonomousCqDispatchFailed { attempt_id },
+            ) => assert_eq!(
+                attempt_id, 99,
+                "the retried send must be the real notification, not the filler"
+            ),
+            other => panic!("expected AutonomousCqDispatchFailed, got {other:?}"),
+        }
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "the queue-independent fallback must NOT be used when a retry succeeded"
+        );
+    }
+
+    /// PAN-43/45 follow-up (Codex round 2 on PR #342) regression: a
+    /// destination that stays unreachable through every bounded
+    /// message-bus retry (here: no channel registered at all, simulating
+    /// sustained congestion outlasting the ~75ms retry budget) must fall
+    /// back to the queue-independent pending-failures list instead of
+    /// silently losing the rollback forever -- and must still return in
+    /// bounded time, not hang.
+    #[tokio::test]
+    async fn dispatch_failed_notification_falls_back_to_the_pending_list_when_never_delivered_via_the_bus(
+    ) {
+        let bus = MessageBus::new(16).unwrap(); // no Autonomous channel registered
+        let pending = std::sync::Mutex::new(Vec::new());
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(7), &pending),
+        )
+        .await
+        .expect("must give up on the bus after its bounded retries, not hang indefinitely");
+        assert_eq!(
+            *pending.lock().unwrap(),
+            vec![7],
+            "a rollback that never got through the bus must land in the queue-independent \
+             fallback instead of being lost"
+        );
     }
 }
 
@@ -1853,6 +2127,8 @@ impl super::ApplicationCoordinator {
             .await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
+        let pending_autonomous_cq_dispatch_failures =
+            self.pending_autonomous_cq_dispatch_failures.clone();
 
         // Read station config for callsign/grid
         let config = self.config.read().await;
@@ -3605,6 +3881,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     &callsign,
                                                     cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
                                                 )
                                                 .await;
                                                 continue;
@@ -3665,36 +3942,37 @@ impl super::ApplicationCoordinator {
                                                     // association did.
                                                     let pre_generated_qso_id =
                                                         pancetta_qso::QsoId::new_v4();
-                                                    if let Some(attempt_id) = cq_attempt_id {
-                                                        let opened_msg = ComponentMessage::new(
-                                                            ComponentId::Qso,
-                                                            ComponentId::Autonomous,
-                                                            MessageType::QsoMessage(
-                                                                crate::message_bus::QsoMessage::AutonomousCqOpened {
-                                                                    qso_id: pre_generated_qso_id.to_string(),
-                                                                    attempt_id,
-                                                                },
-                                                            ),
-                                                            Instant::now(),
-                                                        );
-                                                        if let Err(e) = message_bus
-                                                            .send_message(opened_msg)
+                                                    // PAN-45 (Codex round 6 on PR #301): see
+                                                    // `register_autonomous_cq_open_or_decline`'s
+                                                    // doc comment -- a dropped registration
+                                                    // means we must decline to dispatch
+                                                    // rather than proceed with an
+                                                    // unassociated QSO.
+                                                    if register_autonomous_cq_open_or_decline(
+                                                        &message_bus,
+                                                        pre_generated_qso_id,
+                                                        cq_attempt_id,
+                                                    )
+                                                    .await
+                                                    {
+                                                        qso_manager
+                                                            .start_cq_with_id(
+                                                                pre_generated_qso_id,
+                                                                frequency,
+                                                                parity,
+                                                                false,
+                                                            )
                                                             .await
-                                                        {
-                                                            warn!(
-                                                                "Failed to send AutonomousCqOpened: {}",
-                                                                e
-                                                            );
-                                                        }
+                                                    } else {
+                                                        Err(pancetta_qso::QsoManagerError::Internal {
+                                                            message: format!(
+                                                                "AutonomousCqOpened registration for attempt {:?} \
+                                                                 was not delivered; declining to dispatch the \
+                                                                 self-CQ",
+                                                                cq_attempt_id
+                                                            ),
+                                                        })
                                                     }
-                                                    qso_manager
-                                                        .start_cq_with_id(
-                                                            pre_generated_qso_id,
-                                                            frequency,
-                                                            parity,
-                                                            false,
-                                                        )
-                                                        .await
                                                 }
                                             };
                                             match result {
@@ -3747,6 +4025,7 @@ impl super::ApplicationCoordinator {
                                                         &message_bus,
                                                         &callsign,
                                                         cq_attempt_id,
+                                                        &pending_autonomous_cq_dispatch_failures,
                                                     )
                                                     .await;
                                                 }

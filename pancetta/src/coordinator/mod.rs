@@ -655,6 +655,20 @@ pub struct ApplicationCoordinator {
     /// Authorization refresh child owned by the current StationAgent generation.
     pub(crate) station_agent_poll: Option<tokio::task::AbortHandle>,
 
+    /// PAN-43/45 follow-up (Codex round 2 on PR #342): self-CQ attempt IDs
+    /// whose dispatch failed but whose `AutonomousCqDispatchFailed`
+    /// rollback notification could not be delivered even after the QSO
+    /// task's own bounded message-bus retries -- same shape/reasoning as
+    /// `hamlib_pending_frequency` above (PAN-19 round 10): a message
+    /// loop's own bounded channel can't be trusted alone for a
+    /// safety-relevant correction under sustained backpressure, so this is
+    /// shared, thread-safely-mutable state both the QSO task (writer, on
+    /// exhausted retries) and the Autonomous task (reader/drainer, once
+    /// per `slot_interval` tick) can reach without `&mut self`. Draining
+    /// this is the queue-independent fallback -- it never goes through
+    /// `message_bus` at all.
+    pending_autonomous_cq_dispatch_failures: Arc<std::sync::Mutex<Vec<u64>>>,
+
     /// Application state
     is_running: Arc<AtomicBool>,
     shutdown_signal: Arc<AtomicBool>,
@@ -1827,6 +1841,7 @@ impl ApplicationCoordinator {
             #[cfg(feature = "pancetta-hamlib")]
             hamlib_pending_split: Arc::new(std::sync::Mutex::new(None)),
             station_agent_poll: None,
+            pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
