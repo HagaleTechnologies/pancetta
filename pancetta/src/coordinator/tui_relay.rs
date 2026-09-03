@@ -2114,18 +2114,16 @@ impl super::ApplicationCoordinator {
                             // would fail every time with a raw parser
                             // error. Reject up front with a clear
                             // operator-facing message instead.
+                            // PAN-62 review round 4 (Codex P2): don't send
+                            // a status here -- the unconditional live-apply
+                            // status below always overwrites it (a single
+                            // `status_message` field, not a queue). The
+                            // persistence outcome is folded into THAT
+                            // final status instead.
                             if !cmd_config_write_is_toml {
                                 warn!(
                                     "Config file {} is not TOML; audio device selection not persisted",
                                     config_path.display()
-                                );
-                                let _ = cmd_tui_msg_tx.send(
-                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                        component: "audio".to_string(),
-                                        status: "Device choice applied live, but not persisted \
-                                                 (config file isn't TOML)"
-                                            .to_string(),
-                                    },
                                 );
                             } else {
                                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -2133,10 +2131,20 @@ impl super::ApplicationCoordinator {
                                 let write_input = input_device.clone();
                                 let write_output = output_device.clone();
                                 let submitted = cmd_config_write_tx.send(ConfigFileWriteRequest {
+                                    // PAN-62 review round 4 (Codex P2):
+                                    // resolve the raw path's real target
+                                    // fresh, right here inside the
+                                    // serialized write worker's blocking
+                                    // thread -- not once at coordinator
+                                    // startup -- so an operator repointing
+                                    // a --config symlink WHILE pancetta
+                                    // runs doesn't have every subsequent
+                                    // write keep landing on the stale
+                                    // target until restart.
                                     work: Box::new(move || {
                                         pancetta_config::Config::default()
                                             .set_audio_devices_in_file(
-                                                &write_path,
+                                                resolve_write_target(&write_path),
                                                 write_input.as_deref(),
                                                 write_output.as_deref(),
                                             )
@@ -2192,7 +2200,7 @@ impl super::ApplicationCoordinator {
                                 .clone()
                                 .or_else(|| input_device.clone())
                                 .unwrap_or_else(|| "(unchanged)".to_string());
-                            match cmd_audio_reopen_tx {
+                            let status = match cmd_audio_reopen_tx {
                                 Some(ref reopen_tx) => {
                                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                                     let req = crate::coordinator::audio::AudioReopenRequest {
@@ -2204,7 +2212,7 @@ impl super::ApplicationCoordinator {
                                         force: true,
                                         respond: resp_tx,
                                     };
-                                    let status = if reopen_tx.send(req).is_err() {
+                                    if reopen_tx.send(req).is_err() {
                                         warn!(
                                             "Audio reopen channel closed; device not switched live"
                                         );
@@ -2247,27 +2255,34 @@ impl super::ApplicationCoordinator {
                                                 )
                                             }
                                         }
-                                    };
-                                    let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "audio".to_string(),
-                                            status,
-                                        },
-                                    );
+                                    }
                                 }
                                 None => {
                                     // Stub / --no-audio: no live stream to reopen.
-                                    let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "audio".to_string(),
-                                            status: format!(
-                                                "Device {} saved — restart to apply (no live audio in this mode)",
-                                                picked
-                                            ),
-                                        },
-                                    );
+                                    format!(
+                                        "Device {} saved — restart to apply (no live audio in this mode)",
+                                        picked
+                                    )
                                 }
-                            }
+                            };
+                            // PAN-62 review round 4 (Codex P2): every
+                            // branch above unconditionally says "saved"
+                            // (it always applies LIVE regardless of
+                            // persist outcome) -- fold the persistence
+                            // result into this FINAL status instead of
+                            // sending an earlier warning the unconditional
+                            // live-apply status below always overwrites.
+                            let status = if cmd_config_write_is_toml {
+                                status
+                            } else {
+                                format!("{status} (not persisted — config isn't TOML)")
+                            };
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "audio".to_string(),
+                                    status,
+                                },
+                            );
                         }
                         pancetta_tui::tui_runner::TuiCommand::SelectRig {
                             model,
@@ -2331,18 +2346,15 @@ impl super::ApplicationCoordinator {
                                 // precomputed at startup per round 2
                                 // (Codex P1): see SelectDevice's identical
                                 // guard above.
+                                // PAN-62 review round 4 (Codex P2): don't
+                                // send a status here -- see SelectDevice's
+                                // identical comment above. The persistence
+                                // outcome is folded into the reconnect
+                                // status below instead.
                                 if !cmd_config_write_is_toml {
                                     warn!(
                                         "Config file {} is not TOML; rig config selection not persisted",
                                         config_path.display()
-                                    );
-                                    let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "rig".to_string(),
-                                            status: "Rig applied live, but not persisted (config \
-                                                     file isn't TOML)"
-                                                .to_string(),
-                                        },
                                     );
                                 } else {
                                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
@@ -2352,9 +2364,12 @@ impl super::ApplicationCoordinator {
                                     let write_ptt = ptt_method.clone();
                                     let submitted =
                                         cmd_config_write_tx.send(ConfigFileWriteRequest {
+                                            // PAN-62 review round 4 (Codex
+                                            // P2): see SelectDevice's
+                                            // identical comment above.
                                             work: Box::new(move || {
                                                 pancetta_config::Config::default().set_rig_in_file(
-                                                    &write_path,
+                                                    resolve_write_target(&write_path),
                                                     &write_model,
                                                     &write_port,
                                                     baud_rate,
@@ -2462,6 +2477,18 @@ impl super::ApplicationCoordinator {
                                                 )
                                                 }
                                             };
+                                            // PAN-62 review round 4 (Codex
+                                            // P2): fold the persistence
+                                            // outcome into this FINAL
+                                            // status -- see SelectDevice's
+                                            // identical comment above.
+                                            let status = if cmd_config_write_is_toml {
+                                                status
+                                            } else {
+                                                format!(
+                                                    "{status} (not persisted — config isn't TOML)"
+                                                )
+                                            };
                                             let _ = report_tui_msg_tx.send(
                                             pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                                 component: "rig".to_string(),
@@ -2474,29 +2501,41 @@ impl super::ApplicationCoordinator {
                                         warn!(
                                         "Rig switch already in progress; ignoring new SelectRig request"
                                     );
+                                        let status = format!(
+                                            "Rig config saved ({}) — a rig switch is already in progress; try again shortly",
+                                            model
+                                        );
+                                        let status = if cmd_config_write_is_toml {
+                                            status
+                                        } else {
+                                            format!("{status} (not persisted — config isn't TOML)")
+                                        };
                                         let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "rig".to_string(),
-                                            status: format!(
-                                                "Rig config saved ({}) — a rig switch is already in progress; try again shortly",
-                                                model
-                                            ),
-                                        },
-                                    );
+                                            pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                                component: "rig".to_string(),
+                                                status,
+                                            },
+                                        );
                                     }
                                     Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                                         warn!(
                                         "Hamlib reconnect channel closed; rig config saved but not applied live"
                                     );
+                                        let status = format!(
+                                            "Rig config saved ({}) — live switch unavailable; restart to apply",
+                                            model
+                                        );
+                                        let status = if cmd_config_write_is_toml {
+                                            status
+                                        } else {
+                                            format!("{status} (not persisted — config isn't TOML)")
+                                        };
                                         let _ = cmd_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "rig".to_string(),
-                                            status: format!(
-                                                "Rig config saved ({}) — live switch unavailable; restart to apply",
-                                                model
-                                            ),
-                                        },
-                                    );
+                                            pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                                component: "rig".to_string(),
+                                                status,
+                                            },
+                                        );
                                     }
                                 }
                             }
@@ -2949,6 +2988,21 @@ fn rig_bookmark_saved_status(name: &str, count: usize) -> String {
     }
 }
 
+/// PAN-62 review round 4 (Codex P2): resolve `raw` (the coordinator's
+/// `config_path` -- NEVER pre-resolved, so a symlinked `--config` is
+/// re-followed here) to its real target, right before a write actually
+/// happens. Callers hold this inside a blocking-thread work closure, not
+/// the relay loop -- consistent with round 2's "no synchronous disk I/O
+/// in the relay loop" fix. Resolving fresh at every write (instead of
+/// once at coordinator startup) means an operator repointing the symlink
+/// WHILE pancetta is running doesn't have every subsequent picker/
+/// bookmark write keep landing on the stale target until restart. Falls
+/// back to `raw` unresolved if it doesn't exist yet (first save through a
+/// not-yet-created default path).
+fn resolve_write_target(raw: &std::path::Path) -> std::path::PathBuf {
+    std::fs::canonicalize(raw).unwrap_or_else(|_| raw.to_path_buf())
+}
+
 /// One targeted config-file write (PAN-62: the coordinator's `config_path`,
 /// not always `~/.pancetta/pancetta.toml`), queued for serialized
 /// processing by the worker `spawn_config_file_write_worker` spawns
@@ -3108,9 +3162,13 @@ fn spawn_bookmark_mutation_worker(
             let write_staged = staged.clone();
             if write_tx
                 .send(ConfigFileWriteRequest {
+                    // PAN-62 review round 4 (Codex P2): see SelectDevice's
+                    // identical comment in start_tui_pipeline.
                     work: Box::new(move || {
-                        pancetta_config::Config::default()
-                            .set_rig_bookmarks_in_file(&write_path, &write_staged)
+                        pancetta_config::Config::default().set_rig_bookmarks_in_file(
+                            resolve_write_target(&write_path),
+                            &write_staged,
+                        )
                     }),
                     respond: resp_tx,
                 })
@@ -3169,6 +3227,37 @@ fn spawn_bookmark_mutation_worker(
 mod tui_relay_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+
+    /// PAN-62 review round 1 (Codex P2), moved here round 4 (Codex P2)
+    /// now that resolution happens per-write instead of once at
+    /// coordinator startup: a symlinked config path must resolve to its
+    /// real target, not the symlink pathname itself -- otherwise a
+    /// picker/bookmark write's atomic rename would replace the symlink
+    /// with a plain file, silently disconnecting the managed target
+    /// startup actually read from.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_write_target_resolves_a_symlink_to_its_real_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-pancetta.toml");
+        std::fs::write(&real, "").unwrap();
+        let link = dir.path().join("pancetta.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        assert_eq!(
+            resolve_write_target(&link),
+            real.canonicalize().unwrap(),
+            "a symlinked config path must resolve to its real target"
+        );
+    }
+
+    /// A config path that doesn't exist yet (nothing to canonicalize)
+    /// must be used as given, not treated as an error.
+    #[test]
+    fn resolve_write_target_uses_a_nonexistent_path_as_given() {
+        let missing = std::path::PathBuf::from("/tmp/does-not-exist-pancetta.toml");
+        assert_eq!(resolve_write_target(&missing), missing);
+    }
 
     /// An empty pending slot -- the common case (nothing carried over from
     /// a prior failed teardown replay).
@@ -3302,6 +3391,93 @@ mod tui_relay_tests {
         assert!(
             config.read().await.rig.bookmarks.is_empty(),
             "in-memory bookmarks must NOT reflect a rejected save"
+        );
+    }
+
+    /// PAN-62 review round 4 (Codex P2): the write TARGET must be
+    /// re-resolved on every write, not pinned once at coordinator
+    /// startup -- otherwise an operator repointing a `--config` symlink
+    /// WHILE pancetta is running has every subsequent picker/bookmark
+    /// write keep landing on the stale target until restart. Repoint the
+    /// symlink between two saves and confirm the SECOND save lands on the
+    /// NEW target, while the first target is left exactly as the first
+    /// save left it.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bookmark_worker_resolves_a_repointed_symlink_on_each_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let target_a = dir.path().join("config-a.toml");
+        let target_b = dir.path().join("config-b.toml");
+        std::fs::write(&target_a, "").unwrap();
+        std::fs::write(&target_b, "").unwrap();
+        let link = dir.path().join("pancetta.toml");
+        std::os::unix::fs::symlink(&target_a, &link).unwrap();
+
+        let config = Arc::new(tokio::sync::RwLock::new(pancetta_config::Config::default()));
+        let (write_tx, _write_handle) = spawn_config_file_write_worker();
+        let (tui_msg_tx, tui_msg_rx) = crossbeam_channel::unbounded();
+        let (bookmark_tx, _bookmark_handle) = spawn_bookmark_mutation_worker(
+            config.clone(),
+            write_tx,
+            tui_msg_tx,
+            link.clone(),
+            true,
+        );
+
+        async fn wait_for_status(
+            rx: &crossbeam_channel::Receiver<pancetta_tui::tui_runner::TuiMessage>,
+        ) -> String {
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                loop {
+                    if let Ok(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                        status, ..
+                    }) = rx.try_recv()
+                    {
+                        return status;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            })
+            .await
+            .expect("worker must report a status within 5s")
+        }
+
+        bookmark_tx
+            .send(BookmarkMutation::Save(pancetta_config::rig::RigBookmark {
+                name: "First".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }))
+            .unwrap();
+        wait_for_status(&tui_msg_rx).await;
+
+        // Repoint the symlink WHILE pancetta is "running" (worker already
+        // spawned, no restart).
+        std::fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(&target_b, &link).unwrap();
+
+        bookmark_tx
+            .send(BookmarkMutation::Save(pancetta_config::rig::RigBookmark {
+                name: "Second".to_string(),
+                model: "IC-7300".to_string(),
+                port: "/dev/ttyUSB1".to_string(),
+                baud_rate: 19200,
+                ptt_method: pancetta_config::rig::PttMethod::Vox,
+            }))
+            .unwrap();
+        wait_for_status(&tui_msg_rx).await;
+
+        let a_content = std::fs::read_to_string(&target_a).unwrap();
+        let b_content = std::fs::read_to_string(&target_b).unwrap();
+        assert!(
+            a_content.contains("First") && !a_content.contains("Second"),
+            "the OLD target must be frozen at the first save's content, got: {a_content}"
+        );
+        assert!(
+            b_content.contains("Second"),
+            "the NEW target (after repoint) must receive the second save, got: {b_content}"
         );
     }
 

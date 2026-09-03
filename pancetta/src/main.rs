@@ -400,7 +400,14 @@ async fn run_application(cli: Cli) -> Result<()> {
     });
 
     // PAN-62: resolve BEFORE `cli` is partially moved into the fields below.
-    let config_write_path = config_write_path(&cli);
+    //
+    // PAN-62 review round 4 (Codex P2): `config_path` is the RAW path
+    // (never canonicalized here) -- a symlink is re-resolved fresh at
+    // EACH write instead, inside `tui_relay.rs`'s `resolve_write_target`,
+    // so an operator repointing it while pancetta is running doesn't have
+    // every subsequent write keep landing on a stale target pinned at
+    // startup.
+    let config_path = config_raw_path(&cli);
     let config_write_is_toml = config_write_is_toml(&cli);
 
     // Create application coordinator
@@ -417,7 +424,7 @@ async fn run_application(cli: Cli) -> Result<()> {
         cli.test_tx_offset,
         shutdown.clone(),
         config_warnings,
-        config_write_path,
+        config_path,
         config_write_is_toml,
     )
     .await?;
@@ -940,34 +947,19 @@ fn default_pancetta_toml_path() -> PathBuf {
 /// The `--config <path>` if the operator passed one, else the default
 /// `pancetta.toml` location -- WITHOUT resolving symlinks. The exact same
 /// raw path `load_configuration_with_warnings` passes to
-/// `Config::load_from_file`. Shared by `config_write_path` (which then
-/// resolves symlinks for the actual write target) and
-/// `config_write_is_toml` (which must NOT resolve symlinks -- see its own
-/// doc comment).
+/// `Config::load_from_file`, and what's threaded into the coordinator as
+/// `config_path`. `config_write_is_toml` must NOT resolve symlinks (see
+/// its own doc comment); the actual write TARGET path is deliberately
+/// resolved much later, per-write, inside `tui_relay.rs`'s
+/// `resolve_write_target` -- PAN-62 review round 4 (Codex P2): resolving
+/// it once here at startup, like an earlier version of this function did,
+/// would pin every write to a symlink's target as of coordinator start,
+/// even after an operator repoints that symlink while pancetta keeps
+/// running.
 fn config_raw_path(cli: &Cli) -> PathBuf {
     cli.config
         .clone()
         .unwrap_or_else(default_pancetta_toml_path)
-}
-
-/// PAN-62: the config file the rig-picker/bookmark handlers
-/// (`tui_relay.rs`'s SelectDevice/SelectRig/SaveRigBookmark/
-/// DeleteRigBookmark) persist to -- the explicit `--config <path>` if the
-/// operator passed one, matching what `load_configuration_with_warnings`
-/// actually loaded from; otherwise the same default `pancetta.toml`
-/// location that function falls back to.
-///
-/// PAN-62 review round 1 (Codex P2): resolved to its real target via
-/// `canonicalize` -- a `--config` path pointing at a symlink (common with
-/// a dotfiles-managed config) would otherwise have its first picker/
-/// bookmark write's atomic rename replace the symlink itself with a plain
-/// file, silently disconnecting the managed target startup actually read
-/// from. `canonicalize` requires the path to exist; a not-yet-created
-/// default config on first run can't be a symlink, so falling back to the
-/// raw path when it fails is correct, not a gap.
-fn config_write_path(cli: &Cli) -> PathBuf {
-    let raw = config_raw_path(cli);
-    std::fs::canonicalize(&raw).unwrap_or(raw)
 }
 
 /// Whether the rig-picker/bookmark handlers may persist at all -- `false`
@@ -976,11 +968,11 @@ fn config_write_path(cli: &Cli) -> PathBuf {
 ///
 /// PAN-62 review round 2 (Codex P1): format MUST be detected from
 /// `config_raw_path` (the same raw path `load_configuration_with_warnings`
-/// actually parsed), never `config_write_path`'s canonicalized target --
-/// a symlink whose own name's extension disagrees with its real target's
-/// extension (e.g. `pancetta.toml` -> `managed-config.json`, containing
-/// genuinely valid TOML) would otherwise be misclassified: the picker
-/// would reject a config that actually loaded fine.
+/// actually parsed), never a symlink-resolved target -- a symlink whose
+/// own name's extension disagrees with its real target's extension (e.g.
+/// `pancetta.toml` -> `managed-config.json`, containing genuinely valid
+/// TOML) would otherwise be misclassified: the picker would reject a
+/// config that actually loaded fine.
 ///
 /// Computed ONCE here at startup, not per-keypress inside `tui_relay.rs`'s
 /// relay loop (round 2's second P1: that loop must never perform
@@ -1950,13 +1942,16 @@ mod tests {
     /// PAN-62: an operator running `--config <custom-path>` must have the
     /// rig-picker/bookmark handlers persist to that same file, not the
     /// hardcoded `~/.pancetta/pancetta.toml` `load_configuration_with_warnings`
-    /// only falls back to when NO `--config` flag is given.
+    /// only falls back to when NO `--config` flag is given. Round 4 (Codex
+    /// P2): `config_raw_path` deliberately does NOT resolve symlinks --
+    /// that happens per-write in `tui_relay.rs`'s `resolve_write_target`
+    /// instead, tested there.
     #[test]
-    fn config_write_path_uses_the_explicit_config_flag_when_given() {
+    fn config_raw_path_uses_the_explicit_config_flag_when_given() {
         let cli = Cli::try_parse_from(["pancetta", "--config", "/tmp/custom-pancetta.toml"])
             .expect("valid CLI args");
         assert_eq!(
-            config_write_path(&cli),
+            config_raw_path(&cli),
             PathBuf::from("/tmp/custom-pancetta.toml")
         );
     }
@@ -1965,46 +1960,9 @@ mod tests {
     /// `~/.pancetta/pancetta.toml` location `load_configuration_with_warnings`
     /// falls back to (unchanged pre-PAN-62 behavior).
     #[test]
-    fn config_write_path_falls_back_to_the_default_pancetta_toml_location() {
+    fn config_raw_path_falls_back_to_the_default_pancetta_toml_location() {
         let cli = Cli::try_parse_from(["pancetta"]).expect("valid CLI args");
-        assert_eq!(config_write_path(&cli), default_pancetta_toml_path());
-    }
-
-    /// PAN-62 review round 1 (Codex P2): when `--config` points to a
-    /// symlink (common with a dotfiles-managed config), the write target
-    /// must be the symlink's real target, not the symlink pathname itself
-    /// -- otherwise the first picker/bookmark write's atomic rename
-    /// replaces the symlink with a plain file, silently disconnecting the
-    /// managed target that startup actually read from.
-    #[cfg(unix)]
-    #[test]
-    fn config_write_path_resolves_a_symlinked_config_flag_to_its_real_target() {
-        let dir = tempfile::tempdir().unwrap();
-        let real = dir.path().join("real-pancetta.toml");
-        std::fs::write(&real, "").unwrap();
-        let link = dir.path().join("pancetta.toml");
-        std::os::unix::fs::symlink(&real, &link).unwrap();
-
-        let cli = Cli::try_parse_from(["pancetta", "--config", link.to_str().unwrap()])
-            .expect("valid CLI args");
-        assert_eq!(
-            config_write_path(&cli),
-            real.canonicalize().unwrap(),
-            "a symlinked --config path must resolve to its real target"
-        );
-    }
-
-    /// A `--config` path that doesn't exist yet (nothing to canonicalize)
-    /// must be used as given, not treated as an error.
-    #[test]
-    fn config_write_path_uses_a_nonexistent_config_flag_path_as_given() {
-        let cli =
-            Cli::try_parse_from(["pancetta", "--config", "/tmp/does-not-exist-pancetta.toml"])
-                .expect("valid CLI args");
-        assert_eq!(
-            config_write_path(&cli),
-            PathBuf::from("/tmp/does-not-exist-pancetta.toml")
-        );
+        assert_eq!(config_raw_path(&cli), default_pancetta_toml_path());
     }
 
     /// PAN-62 review round 2 (Codex P1): `load_configuration_with_warnings`
@@ -2014,7 +1972,7 @@ mod tests {
     /// `managed-config.json` (containing genuinely valid TOML -- a
     /// dotfiles-managed target with a format-agnostic real filename) loads
     /// fine as TOML but the picker would wrongly reject it as JSON because
-    /// `config_write_path`'s canonicalized target ends in `.json`.
+    /// the symlink-resolved target's name ends in `.json`.
     #[cfg(unix)]
     #[test]
     fn config_write_is_toml_uses_the_symlinks_own_name_not_its_real_targets() {
