@@ -2431,28 +2431,8 @@ impl TuiRunner {
         if area.width < 10 || area.height < 4 {
             return;
         }
-        let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
-        // title(1) + border(2) + 4 fields + blank + footer + border
-        let modal_height = 9u16.min(area.height);
-
-        let modal_area = Rect {
-            x: (area.width.saturating_sub(modal_width)) / 2,
-            y: (area.height.saturating_sub(modal_height)) / 2,
-            width: modal_width,
-            height: modal_height,
-        };
-
-        // Clear background behind modal
-        f.render_widget(ratatui::widgets::Clear, modal_area);
-
-        let outer_block = Block::default()
-            .title(" Rig Config ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Double)
-            .style(Style::default().bg(Color::Black).fg(Color::White));
-
-        let inner = outer_block.inner(modal_area);
-        f.render_widget(outer_block, modal_area);
+        const FOOTER: &str =
+            "Tab: next | Up/Down: change | F2: load | F3: save | Enter: apply | Esc: cancel";
 
         let fields: [(&str, String, bool); 4] = [
             (
@@ -2494,11 +2474,48 @@ impl TuiRunner {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Tab: next | Up/Down: change | F2: load | F3: save | Enter: apply | Esc: cancel",
+            FOOTER,
             Style::default().fg(Color::DarkGray),
         )));
 
-        let paragraph = Paragraph::new(lines);
+        let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
+        let inner_width = modal_width.saturating_sub(2);
+        // Every rendered line can wrap, not just the footer — a long edited
+        // value (e.g. a `/dev/serial/by-id/...` port path) wraps exactly
+        // like the footer does, and the modal must reserve its rows too, or
+        // a wrapped field pushes into the footer's space and clips it right
+        // back (round-1 review finding, PAN-66). A hand-rolled column-count
+        // approximation of wrapping undercounts wide (CJK/emoji) graphemes
+        // that don't divide evenly into the line width, since ratatui packs
+        // whole graphemes rather than splitting at arbitrary column offsets
+        // (round-2 AND round-3 review findings) — so ask ratatui itself how
+        // many rows this exact content wraps to, rather than re-deriving it.
+        let content_rows = Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: true })
+            .line_count(inner_width) as u16;
+        // border(2, title rides the top border row) + content rows
+        let modal_height = (2 + content_rows).min(area.height);
+
+        let modal_area = Rect {
+            x: (area.width.saturating_sub(modal_width)) / 2,
+            y: (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        };
+
+        // Clear background behind modal
+        f.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let outer_block = Block::default()
+            .title(" Rig Config ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+
+        let inner = outer_block.inner(modal_area);
+        f.render_widget(outer_block, modal_area);
+
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
         f.render_widget(paragraph, inner);
     }
 
@@ -3175,6 +3192,90 @@ mod key_tests {
                 })
                 .unwrap();
         }
+    }
+
+    /// PAN-66 round-1 review: a wrapped FIELD line (not just the footer)
+    /// must not consume the footer's reserved space. A long edited port
+    /// path (e.g. `/dev/serial/by-id/...`) forces the Port field to wrap at
+    /// the modal's clamped inner width — the full footer, including its
+    /// last word, must still render unclipped.
+    #[test]
+    fn rig_modal_footer_survives_a_wrapped_field_value() {
+        use crate::app::RigSelectionState;
+        use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+        let long_port = "/dev/serial/by-id/usb-Yaesu_Corporation_FTdx10_00000000-if00-port0";
+        let mut state = RigSelectionState::new();
+        state.visible = true;
+        state.available_ports = vec![long_port.to_string()];
+        state.selected_port_idx = 0;
+        state.model = "FTdx10".to_string();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                TuiRunner::render_rig_selection_modal(f, f.area(), &state);
+            })
+            .unwrap();
+
+        let buf: Buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("Esc: cancel")),
+            "footer's last word must render unclipped even with a wrapped field \
+             above it; rendered rows:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// PAN-66 round-3 review: sizing the modal from a column-count
+    /// approximation of wrapping (aggregate display width / line width)
+    /// undercounts when double-width graphemes don't divide the line width
+    /// evenly — ratatui packs whole graphemes per row rather than splitting
+    /// one across a row boundary, so a run of 9 double-width (CJK) glyphs
+    /// at a 9-column inner width needs 3 rows (4 glyphs + 4 glyphs + 1
+    /// glyph), not the 2 a naive `18 / 9` would compute. Reserving too few
+    /// rows clips the footer again. Uses a narrow terminal (11 cols; below
+    /// the modal's 40-col clamp floor so `modal_width == area.width`) to
+    /// force `inner_width == 9`, matching the review comment's example.
+    #[test]
+    fn rig_modal_footer_survives_ungainly_wide_grapheme_packing() {
+        use crate::app::RigSelectionState;
+        use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+        let mut state = RigSelectionState::new();
+        state.visible = true;
+        state.model = "模".repeat(9);
+
+        let backend = TestBackend::new(11, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                TuiRunner::render_rig_selection_modal(f, f.area(), &state);
+            })
+            .unwrap();
+
+        let buf: Buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("cancel")),
+            "footer must render unclipped even when a field's double-width \
+             graphemes don't divide the inner width evenly; rendered rows:\n{}",
+            rows.join("\n")
+        );
     }
 
     /// Task 20f: confirm-on-`x`. A single press must NOT clear (it only

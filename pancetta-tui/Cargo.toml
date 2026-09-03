@@ -16,7 +16,14 @@ publish.workspace = true
 
 [dependencies]
 # TUI Framework
-ratatui = "0.30"
+# "unstable-rendered-line-info" unlocks Paragraph::line_count(width) — used
+# to size the rig-config modal (PAN-66) to however many rows its content
+# actually wraps to, including grapheme-cluster packing for wide (CJK/emoji)
+# characters, rather than a hand-rolled approximation of ratatui's own wrap
+# algorithm. The API is explicitly unstable (ratatui/ratatui#293) but is
+# ratatui's own answer to "how many rows will this wrap to" — safer than
+# reimplementing it.
+ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
 crossterm = "0.29"
 
 # Async runtime and channels
