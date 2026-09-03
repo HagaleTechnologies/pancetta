@@ -139,11 +139,12 @@ impl super::ApplicationCoordinator {
                                         as i64;
 
                                     if let Some(ref callsign) = decoded_msg.message.from_callsign {
-                                        let dial_freq = psk_operating_freq.load(Ordering::Relaxed);
                                         uploader.add_report(ReceptionReport {
                                             tx_callsign: callsign.clone(),
-                                            frequency: dial_freq
-                                                + decoded_msg.frequency_offset as u64,
+                                            frequency: spot_frequency_hz(
+                                                decoded_msg,
+                                                psk_operating_freq.load(Ordering::Relaxed),
+                                            ),
                                             snr: Some(decoded_msg.snr_db as i32),
                                             mode: "FT8".to_string(),
                                             tx_grid: decoded_msg.message.grid_square.clone(),
@@ -196,5 +197,80 @@ impl super::ApplicationCoordinator {
             .push((ComponentId::PskReporter, psk_handle));
         info!("PSKReporter component started");
         Ok(())
+    }
+}
+
+/// The absolute frequency (Hz) to report a reception at: the dial frequency
+/// the decode's own audio window was captured on
+/// (`DecodedMessage::captured_dial_hz`), plus the decode's intra-window
+/// audio tone offset.
+///
+/// PAN-67 review round 2: falls back to `live_dial_hz` only when the
+/// message never got stamped (a path that predates the live decode
+/// pipeline — remote-gateway relay, WSJT-X UDP import, test scaffolding).
+/// For a live decode, using the live atomic directly here would reintroduce
+/// the same race this PR fixed for the TUI: decoding is real CPU work, so
+/// a band switch mid-decode could publish an old-band reception under the
+/// operator's new band.
+///
+/// PAN-67 review round 3: `Some(0)` means "not yet established" (see
+/// `dsp.rs`'s `band_ref_dial_hz`/`cur_dial_hz`, 0 = no rig / pre-first-read),
+/// never a real 0 Hz dial — treated the same as `None`, matching
+/// `tui_relay.rs`'s `decode_view_dial_mhz` zero-sentinel handling.
+fn spot_frequency_hz(decoded_msg: &pancetta_ft8::DecodedMessage, live_dial_hz: u64) -> u64 {
+    let dial_hz = match decoded_msg.captured_dial_hz {
+        Some(hz) if hz != 0 => hz,
+        _ => live_dial_hz,
+    };
+    dial_hz + decoded_msg.frequency_offset as u64
+}
+
+#[cfg(test)]
+mod psk_reporter_tests {
+    use super::spot_frequency_hz;
+
+    fn decoded_at(
+        freq_offset_hz: f64,
+        captured_dial_hz: Option<u64>,
+    ) -> pancetta_ft8::DecodedMessage {
+        let mut d = pancetta_ft8::DecodedMessage::new(
+            pancetta_ft8::Ft8Message::default(),
+            -10.0,
+            0.5,
+            freq_offset_hz,
+            0.1,
+        );
+        d.captured_dial_hz = captured_dial_hz;
+        d
+    }
+
+    /// PAN-67 review round 2: a decode from the old band's audio must
+    /// report under the old band even if the live dial has already moved
+    /// on to a new band by the time this spot gets published.
+    #[test]
+    fn spot_frequency_uses_the_captured_dial_not_the_live_one() {
+        let old_band_decode = decoded_at(1500.0, Some(7_074_000));
+        assert_eq!(spot_frequency_hz(&old_band_decode, 14_074_000), 7_075_500);
+    }
+
+    #[test]
+    fn spot_frequency_falls_back_to_live_dial_when_uncaptured() {
+        let unstamped_decode = decoded_at(1500.0, None);
+        assert_eq!(spot_frequency_hz(&unstamped_decode, 14_074_000), 14_075_500);
+    }
+
+    /// PAN-67 review round 3: a window that closed before the first CAT
+    /// read stamps `captured_dial_hz` as `Some(0)`, not `None` — 0 is a
+    /// real "not yet established" sentinel (see `dsp.rs`'s
+    /// `band_ref_dial_hz`/`cur_dial_hz`), not a legitimate 0 Hz dial.
+    /// `unwrap_or` alone treats `Some(0)` as a real value and would
+    /// publish the reception near the bare audio tone offset.
+    #[test]
+    fn spot_frequency_falls_back_to_live_dial_when_captured_is_zero() {
+        let zero_captured_decode = decoded_at(1500.0, Some(0));
+        assert_eq!(
+            spot_frequency_hz(&zero_captured_decode, 14_074_000),
+            14_075_500
+        );
     }
 }

@@ -54,8 +54,36 @@ pub(crate) async fn forward_or_drop_async<T>(
 
 pub(crate) const DECODE_FORWARD_TIMEOUT: Duration = Duration::from_millis(250);
 
+/// One accumulated FT8/FT4 audio window handed from the DSP stage to the
+/// decoder, tagged with the dial frequency the audio was actually captured
+/// on (`dsp.rs`'s `band_ref_dial_hz`, Hz, 0 = unknown).
+///
+/// PAN-67: decoding is real CPU work (FFT+LDPC) with a genuine wall-clock
+/// gap between window-close and relay. A prior design read the *live*
+/// operating-frequency atomic at relay time instead of carrying this
+/// snapshot, so a decode already in flight when the operator switched
+/// bands got mislabeled with the NEW band's frequency. Carrying `dial_hz`
+/// with the samples themselves removes the race: whichever band the
+/// window's audio came from is fixed the moment the window is built and
+/// never re-derived from state that can change out from under it.
+#[derive(Debug, Clone)]
+pub(crate) struct DecodeWindow {
+    pub(crate) samples: Vec<f32>,
+    pub(crate) dial_hz: u64,
+}
+
+/// A decoded message paired with the dial frequency its SOURCE audio
+/// window was captured on (see [`DecodeWindow`]) — carried unchanged from
+/// decode through to the TUI relay so `DecodedMessageView::frequency` never
+/// has to re-read live rig state at relay time.
+#[derive(Debug, Clone)]
+pub(crate) struct RelayedDecode {
+    pub(crate) message: pancetta_ft8::DecodedMessage,
+    pub(crate) dial_hz: u64,
+}
+
 type TerminalReceivers = (
-    crossbeam_channel::Receiver<pancetta_ft8::DecodedMessage>,
+    crossbeam_channel::Receiver<RelayedDecode>,
     crossbeam_channel::Receiver<Vec<Vec<f32>>>,
     crossbeam_channel::Receiver<f32>,
 );
@@ -63,10 +91,10 @@ type TerminalReceivers = (
 pub(crate) struct DecodePipelineHandles {
     pub(crate) audio_to_dsp_tx: crossbeam_channel::Sender<Vec<f32>>,
     pub(crate) audio_to_dsp_rx: crossbeam_channel::Receiver<Vec<f32>>,
-    pub(crate) dsp_to_ft8_tx: crossbeam_channel::Sender<Vec<f32>>,
-    pub(crate) dsp_to_ft8_rx: crossbeam_channel::Receiver<Vec<f32>>,
-    pub(crate) ft8_to_tui_tx: crossbeam_channel::Sender<pancetta_ft8::DecodedMessage>,
-    ft8_to_tui_rx: Option<crossbeam_channel::Receiver<pancetta_ft8::DecodedMessage>>,
+    pub(crate) dsp_to_ft8_tx: crossbeam_channel::Sender<DecodeWindow>,
+    pub(crate) dsp_to_ft8_rx: crossbeam_channel::Receiver<DecodeWindow>,
+    pub(crate) ft8_to_tui_tx: crossbeam_channel::Sender<RelayedDecode>,
+    ft8_to_tui_rx: Option<crossbeam_channel::Receiver<RelayedDecode>>,
     pub(crate) waterfall_tx: crossbeam_channel::Sender<Vec<Vec<f32>>>,
     waterfall_rx: Option<crossbeam_channel::Receiver<Vec<Vec<f32>>>>,
     pub(crate) audio_level_tx: crossbeam_channel::Sender<f32>,
@@ -268,7 +296,8 @@ impl super::ApplicationCoordinator {
                 while !shutdown.load(Ordering::Acquire) {
                     // Drain decoded messages
                     match ft8_to_tui_rx.try_recv() {
-                        Ok(msg) => {
+                        Ok(relayed) => {
+                            let msg = &relayed.message;
                             info!(
                                 "Decoded: {} (SNR: {:.0}, freq: {:.1} Hz)",
                                 msg.text, msg.snr_db, msg.frequency_offset
@@ -373,7 +402,71 @@ mod tests {
 
         handles.audio_to_dsp_tx.send(vec![2.0; 4]).unwrap();
         assert_eq!(handles.audio_to_dsp_rx.recv().unwrap(), vec![2.0; 4]);
-        handles.dsp_to_ft8_tx.send(vec![0.0; 4]).unwrap();
+        handles
+            .dsp_to_ft8_tx
+            .send(DecodeWindow {
+                samples: vec![0.0; 4],
+                dial_hz: 14_074_000,
+            })
+            .unwrap();
         assert!(handles.dsp_to_ft8_rx.recv().is_ok());
+    }
+
+    /// PAN-67: a window built from OLD-band audio must report the OLD
+    /// band's frequency all the way to the TUI relay, even if a "band
+    /// switch" (modeled here as mutating a shared atomic the way the real
+    /// operating-frequency atomic does) happens between the window closing
+    /// and the decoded message being relayed. `DecodeWindow`/`RelayedDecode`
+    /// carry `dial_hz` by value through the channels, so nothing after
+    /// window-close can overwrite it.
+    #[test]
+    fn decode_window_frequency_survives_a_band_switch_before_relay() {
+        let handles = DecodePipelineHandles::new();
+        let live_dial_hz = Arc::new(std::sync::atomic::AtomicU64::new(7_074_000));
+
+        // Old-band window closes and is forwarded to the decoder stage,
+        // tagged with the band it was actually captured on.
+        handles
+            .dsp_to_ft8_tx
+            .send(DecodeWindow {
+                samples: vec![0.1; 4],
+                dial_hz: live_dial_hz.load(Ordering::Relaxed),
+            })
+            .unwrap();
+
+        let window = handles.dsp_to_ft8_rx.recv().unwrap();
+        assert_eq!(window.dial_hz, 7_074_000);
+
+        // Operator switches bands WHILE that window's decode is still in
+        // flight — the live atomic flips, but the already-dispatched
+        // window's captured `dial_hz` does not.
+        live_dial_hz.store(14_074_000, Ordering::Relaxed);
+
+        // Decode "finishes" after the switch and is relayed carrying the
+        // window's own captured frequency, never the (now stale-for-it)
+        // live atomic.
+        let message = pancetta_ft8::DecodedMessage::new(
+            pancetta_ft8::Ft8Message::default(),
+            -10.0,
+            0.5,
+            1500.0,
+            0.1,
+        );
+        handles
+            .ft8_to_tui_tx
+            .send(RelayedDecode {
+                message,
+                dial_hz: window.dial_hz,
+            })
+            .unwrap();
+
+        let relayed = handles.ft8_to_tui_rx.as_ref().unwrap().recv().unwrap();
+        assert_eq!(
+            relayed.dial_hz, 7_074_000,
+            "a decode from the old band's audio must keep the old band's \
+             frequency even after the operator has already switched to a \
+             new band"
+        );
+        assert_ne!(relayed.dial_hz, live_dial_hz.load(Ordering::Relaxed));
     }
 }

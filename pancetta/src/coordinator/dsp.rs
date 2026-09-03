@@ -691,7 +691,21 @@ impl super::ApplicationCoordinator {
 
                             match super::pipeline::forward_or_drop(
                                 &dsp_to_ft8_tx,
-                                window,
+                                super::pipeline::DecodeWindow {
+                                    samples: window,
+                                    // `cur_dial_hz` (read above for the band-change
+                                    // guard), not `band_ref_dial_hz` — the latter is
+                                    // deliberately frozen across intra-band retuning
+                                    // (see `band_flush_decision`) and would stamp
+                                    // every subsequent window with a stale
+                                    // sub-frequency forever after the operator
+                                    // fine-tunes within the same band (PAN-67 review
+                                    // round 1 finding 1). `cur_dial_hz` is re-read
+                                    // fresh every audio batch, so it tracks the dial
+                                    // right up to window-close regardless of whether
+                                    // the move crossed a band edge.
+                                    dial_hz: cur_dial_hz,
+                                },
                                 super::pipeline::DECODE_FORWARD_TIMEOUT,
                             ) {
                                 super::pipeline::ForwardOutcome::Sent => {}

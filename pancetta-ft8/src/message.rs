@@ -1160,6 +1160,18 @@ pub struct DecodedMessage {
     /// message routed to TUI / QSO / autonomous). Constructors leave it
     /// unset because they don't have access to the slot timing.
     pub slot_parity: Option<pancetta_core::slot::SlotParity>,
+    /// PAN-67: dial frequency (Hz) the audio window that produced this
+    /// decode was captured on. `None` until the coordinator's decoder
+    /// dispatch tags it (same stamping site as `slot_parity`, for every
+    /// message routed to TUI / QSO / autonomous / PSKReporter).
+    /// Constructors leave it unset because they don't have access to the
+    /// DSP pipeline's dial capture. Consumers that need "what band was
+    /// this decode heard on" MUST prefer this field over re-reading a
+    /// live "current dial" value — decoding is real CPU work with a
+    /// wall-clock gap after window-close, so a live re-read at process
+    /// time can race a since-happened band switch and mislabel the
+    /// decode under the wrong band.
+    pub captured_dial_hz: Option<u64>,
     /// hb-129: Time elapsed from window-start until this decode passed CRC
     /// and became available (presentation-time, not arrival-time).
     /// `None` for decodes produced by external paths (ft8_lib FFI) or
@@ -1268,6 +1280,7 @@ impl DecodedMessage {
             tone_symbols: None,
             ap_level: 0,
             slot_parity: None,
+            captured_dial_hz: None,
             decode_time_into_window: None,
             via_cross_sequence_a7: false,
             confidence_features: None,
@@ -1295,6 +1308,7 @@ impl DecodedMessage {
             tone_symbols: None,
             ap_level: 0,
             slot_parity: None,
+            captured_dial_hz: None,
             decode_time_into_window: None,
             via_cross_sequence_a7: false,
             confidence_features: None,
