@@ -1038,7 +1038,20 @@ mod merge_guard {
 
         assert_carries_all::<ui::UiConfig>("UiConfig", &[], |a, b| a.merge_with(b));
 
-        assert_carries_all::<rig::RigConfig>("RigConfig", &[], |a, b| a.merge_with(b));
+        assert_carries_all::<rig::RigConfig>(
+            "RigConfig",
+            &[(
+                "bookmarks",
+                json!([{
+                    "name": "Shack",
+                    "model": "FTdx10",
+                    "port": "/dev/ttyUSB0",
+                    "baud_rate": 38400,
+                    "ptt_method": "cat",
+                }]),
+            )],
+            |a, b| a.merge_with(b),
+        );
 
         // CatInterfaceConfig has an inherent `merge_with` (not a ConfigSection
         // impl) and was one of the audited-inert gaps now closed.
