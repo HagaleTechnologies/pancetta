@@ -212,8 +212,17 @@ impl super::ApplicationCoordinator {
 /// the same race this PR fixed for the TUI: decoding is real CPU work, so
 /// a band switch mid-decode could publish an old-band reception under the
 /// operator's new band.
+///
+/// PAN-67 review round 3: `Some(0)` means "not yet established" (see
+/// `dsp.rs`'s `band_ref_dial_hz`/`cur_dial_hz`, 0 = no rig / pre-first-read),
+/// never a real 0 Hz dial — treated the same as `None`, matching
+/// `tui_relay.rs`'s `decode_view_dial_mhz` zero-sentinel handling.
 fn spot_frequency_hz(decoded_msg: &pancetta_ft8::DecodedMessage, live_dial_hz: u64) -> u64 {
-    decoded_msg.captured_dial_hz.unwrap_or(live_dial_hz) + decoded_msg.frequency_offset as u64
+    let dial_hz = match decoded_msg.captured_dial_hz {
+        Some(hz) if hz != 0 => hz,
+        _ => live_dial_hz,
+    };
+    dial_hz + decoded_msg.frequency_offset as u64
 }
 
 #[cfg(test)]
@@ -248,5 +257,20 @@ mod psk_reporter_tests {
     fn spot_frequency_falls_back_to_live_dial_when_uncaptured() {
         let unstamped_decode = decoded_at(1500.0, None);
         assert_eq!(spot_frequency_hz(&unstamped_decode, 14_074_000), 14_075_500);
+    }
+
+    /// PAN-67 review round 3: a window that closed before the first CAT
+    /// read stamps `captured_dial_hz` as `Some(0)`, not `None` — 0 is a
+    /// real "not yet established" sentinel (see `dsp.rs`'s
+    /// `band_ref_dial_hz`/`cur_dial_hz`), not a legitimate 0 Hz dial.
+    /// `unwrap_or` alone treats `Some(0)` as a real value and would
+    /// publish the reception near the bare audio tone offset.
+    #[test]
+    fn spot_frequency_falls_back_to_live_dial_when_captured_is_zero() {
+        let zero_captured_decode = decoded_at(1500.0, Some(0));
+        assert_eq!(
+            spot_frequency_hz(&zero_captured_decode, 14_074_000),
+            14_075_500
+        );
     }
 }
