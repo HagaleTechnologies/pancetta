@@ -911,7 +911,7 @@ impl TuiRunner {
             }
             TuiMessage::RigBookmarksUpdate { bookmarks } => {
                 if app.rig_selection.selected_bookmark_idx >= bookmarks.len() {
-                    app.rig_selection.selected_bookmark_idx = 0;
+                    app.rig_selection.selected_bookmark_idx = bookmarks.len().saturating_sub(1);
                 }
                 app.rig_selection.bookmarks = bookmarks;
             }
@@ -1115,15 +1115,23 @@ impl TuiRunner {
                     }
                     KeyCode::Enter => {
                         let name = app.rig_selection.bookmark_name_input.trim().to_string();
+                        let port = app.rig_selection.selected_port();
                         if name.is_empty() {
                             app.status_message = "Bookmark name cannot be empty".to_string();
+                        } else if port.is_empty() {
+                            // Mirrors the I-2b fix on the main form's Enter
+                            // key (below): an empty port would silently
+                            // reselect whatever device happens to be first
+                            // in `available_ports` on load. Refuse instead.
+                            app.status_message =
+                                "No port selected — cannot save bookmark".to_string();
                         } else {
                             app.rig_selection.naming_bookmark = false;
                             app.rig_selection.bookmark_name_input.clear();
                             self.message_tx.send(TuiCommand::SaveRigBookmark {
                                 name,
                                 model: app.rig_selection.model.clone(),
-                                port: app.rig_selection.selected_port(),
+                                port,
                                 baud_rate: app.rig_selection.selected_baud(),
                                 ptt_method: app.rig_selection.selected_ptt(),
                             })?;
@@ -1206,14 +1214,14 @@ impl TuiRunner {
                 {
                     app.rig_selection.push_model_char(c);
                 }
-                KeyCode::Char('b') => {
+                KeyCode::F(2) => {
                     app.rig_selection.bookmark_overlay_visible = true;
                     app.rig_selection.selected_bookmark_idx = 0;
                     app.status_message =
                         "Load bookmark (Up/Down: select, Enter: load, x: delete, Esc: cancel)"
                             .to_string();
                 }
-                KeyCode::Char('s') => {
+                KeyCode::F(3) => {
                     app.rig_selection.naming_bookmark = true;
                     app.rig_selection.bookmark_name_input.clear();
                     app.status_message =
@@ -1725,7 +1733,7 @@ impl TuiRunner {
                 app.rig_selection.snapshot_committed();
                 app.rig_selection.visible = true;
                 app.status_message =
-                    "Edit rig config (Tab: next, Up/Down: change, b: load bookmark, s: save bookmark, Enter: apply, Esc: cancel)"
+                    "Edit rig config (Tab: next, Up/Down: change, F2: load bookmark, F3: save bookmark, Enter: apply, Esc: cancel)"
                         .to_string();
             }
             KeyCode::Char('?') => {
@@ -2471,7 +2479,7 @@ impl TuiRunner {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Tab: next | Up/Down: change | b: load | s: save | Enter: apply | Esc: cancel",
+            "Tab: next | Up/Down: change | F2: load | F3: save | Enter: apply | Esc: cancel",
             Style::default().fg(Color::DarkGray),
         )));
 
@@ -2482,7 +2490,11 @@ impl TuiRunner {
     /// Render the "save as bookmark" name-input overlay (PAN-61), stacked
     /// on top of the rig-config modal. Mirrors
     /// `render_rig_selection_modal`'s sizing/centering/clear idiom.
-    fn render_bookmark_name_input(f: &mut Frame, area: Rect, state: &crate::app::RigSelectionState) {
+    fn render_bookmark_name_input(
+        f: &mut Frame,
+        area: Rect,
+        state: &crate::app::RigSelectionState,
+    ) {
         use ratatui::text::{Line, Span};
 
         if area.width < 10 || area.height < 4 {
@@ -2541,7 +2553,7 @@ impl TuiRunner {
             return;
         }
         let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
-        let modal_height = (state.bookmarks.len() as u16 + 5).clamp(6, area.height);
+        let modal_height = (state.bookmarks.len() as u16 + 5).max(6).min(area.height);
 
         let modal_area = Rect {
             x: (area.width.saturating_sub(modal_width)) / 2,
@@ -2564,7 +2576,7 @@ impl TuiRunner {
         let mut lines: Vec<Line> = Vec::with_capacity(state.bookmarks.len().max(1) + 2);
         if state.bookmarks.is_empty() {
             lines.push(Line::from(
-                "(no saved bookmarks — press 's' from the form to save one)",
+                "(no saved bookmarks — press F3 from the form to save one)",
             ));
         } else {
             for (idx, bookmark) in state.bookmarks.iter().enumerate() {
@@ -5377,12 +5389,10 @@ mod key_tests {
         {
             let mut app = app.write().await;
             app.rig_selection.visible = true;
-            // Off the Model field: the Model-field printable-char guard
-            // (added in this task, see the `s`-vs-Model test below) takes
-            // priority over the `b` arm whenever active_field == Model, so
-            // this test — which presses `b` as a modal-level shortcut, not
-            // as Model-field text entry — must not leave active_field at
-            // its RigSelectionState::default() value of Model.
+            // F(2)/F(3) never collide with the Model-field printable-char
+            // guard (they're not KeyCode::Char at all), so active_field no
+            // longer needs to dodge RigField::Model here. Left off Model
+            // anyway since it's harmless and matches the other tests below.
             app.rig_selection.active_field = crate::app::RigField::Ptt;
             app.rig_selection.available_ports = vec!["/dev/ttyUSB0".to_string()];
             app.rig_selection.bookmarks = vec![pancetta_config::rig::RigBookmark {
@@ -5394,7 +5404,9 @@ mod key_tests {
             }];
         }
 
-        r.handle_key_event(key('b')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert!(app.read().await.rig_selection.bookmark_overlay_visible);
 
         r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
@@ -5420,8 +5432,8 @@ mod key_tests {
             let mut app = app.write().await;
             app.rig_selection.visible = true;
             // See the comment in rig_modal_b_opens_bookmark_overlay_...
-            // above: `b` is a modal-level shortcut, so keep active_field
-            // off Model.
+            // above: F(2) never collides with Model-field text entry, but
+            // active_field is kept off Model here anyway for consistency.
             app.rig_selection.active_field = crate::app::RigField::Ptt;
             app.rig_selection.model = "Original".to_string();
             app.rig_selection.bookmarks = vec![pancetta_config::rig::RigBookmark {
@@ -5432,7 +5444,9 @@ mod key_tests {
                 ptt_method: pancetta_config::rig::PttMethod::None,
             }];
         }
-        r.handle_key_event(key('b')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .await
+            .unwrap();
         r.handle_key_event(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
             .await
             .unwrap();
@@ -5456,8 +5470,8 @@ mod key_tests {
             let mut app = app.write().await;
             app.rig_selection.visible = true;
             // See the comment in rig_modal_b_opens_bookmark_overlay_...
-            // above: `b` is a modal-level shortcut, so keep active_field
-            // off Model.
+            // above: F(2) never collides with Model-field text entry, but
+            // active_field is kept off Model here anyway for consistency.
             app.rig_selection.active_field = crate::app::RigField::Ptt;
             app.rig_selection.bookmarks = vec![pancetta_config::rig::RigBookmark {
                 name: "Shack".to_string(),
@@ -5467,7 +5481,9 @@ mod key_tests {
                 ptt_method: pancetta_config::rig::PttMethod::None,
             }];
         }
-        r.handle_key_event(key('b')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE))
+            .await
+            .unwrap();
         r.handle_key_event(key('x')).await.unwrap();
 
         match cmd_rx.try_recv() {
@@ -5487,7 +5503,9 @@ mod key_tests {
             app.rig_selection.available_ports = vec!["/dev/ttyUSB0".to_string()];
         }
 
-        r.handle_key_event(key('s')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .await
+            .unwrap();
         assert!(app.read().await.rig_selection.naming_bookmark);
 
         r.handle_key_event(key('S')).await.unwrap();
@@ -5507,35 +5525,19 @@ mod key_tests {
     }
 
     #[tokio::test]
-    async fn rig_modal_s_while_editing_model_types_the_letter_instead() {
-        let (mut r, _cmd_rx, app) = make_runner().await;
-        {
-            let mut app = app.write().await;
-            app.rig_selection.visible = true;
-            app.rig_selection.active_field = crate::app::RigField::Model;
-            app.rig_selection.model = "FTdx10".to_string();
-        }
-        r.handle_key_event(key('s')).await.unwrap();
-        let app = app.read().await;
-        assert_eq!(
-            app.rig_selection.model, "FTdx10s",
-            "'s' typed into the Model field must edit the model, not open naming"
-        );
-        assert!(!app.rig_selection.naming_bookmark);
-    }
-
-    #[tokio::test]
     async fn rig_modal_s_name_input_enter_with_empty_name_refuses() {
         let (mut r, cmd_rx, app) = make_runner().await;
         {
             let mut app = app.write().await;
             app.rig_selection.visible = true;
             // See the comment in rig_modal_b_opens_bookmark_overlay_...
-            // above: `s` is a modal-level shortcut, so keep active_field
-            // off Model.
+            // above: F(3) never collides with Model-field text entry, but
+            // active_field is kept off Model here anyway for consistency.
             app.rig_selection.active_field = crate::app::RigField::Ptt;
         }
-        r.handle_key_event(key('s')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .await
+            .unwrap();
         r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
             .await
             .unwrap();
@@ -5543,6 +5545,38 @@ mod key_tests {
         assert!(
             app.read().await.rig_selection.naming_bookmark,
             "must stay open on an empty name"
+        );
+        assert!(cmd_rx.try_recv().is_err());
+    }
+
+    /// Fix 4 (PAN-61 final review): saving a bookmark with no port
+    /// selected (e.g. no ports were enumerated) must be refused, mirroring
+    /// the I-2b guard already in place on the main form's Enter key --
+    /// otherwise the saved bookmark's empty `port` silently preselects
+    /// whatever device happens to be first in `available_ports` on a
+    /// later load.
+    #[tokio::test]
+    async fn rig_modal_s_name_input_enter_with_empty_port_refuses() {
+        let (mut r, cmd_rx, app) = make_runner().await;
+        {
+            let mut app = app.write().await;
+            app.rig_selection.visible = true;
+            app.rig_selection.active_field = crate::app::RigField::Ptt;
+            // No ports enumerated -- selected_port() returns "".
+            app.rig_selection.available_ports = Vec::new();
+        }
+        r.handle_key_event(KeyEvent::new(KeyCode::F(3), KeyModifiers::NONE))
+            .await
+            .unwrap();
+        r.handle_key_event(key('S')).await.unwrap();
+        r.handle_key_event(key('K')).await.unwrap();
+        r.handle_key_event(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))
+            .await
+            .unwrap();
+
+        assert!(
+            app.read().await.rig_selection.naming_bookmark,
+            "must stay open when no port is selected"
         );
         assert!(cmd_rx.try_recv().is_err());
     }

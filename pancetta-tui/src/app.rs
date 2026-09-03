@@ -778,11 +778,11 @@ pub struct RigSelectionState {
     /// Saved rig-config bookmarks (PAN-61), seeded from the coordinator's
     /// `RigConfigUpdate`/`RigBookmarksUpdate` pushes.
     pub bookmarks: Vec<pancetta_config::rig::RigBookmark>,
-    /// Whether the `b`-opened "load bookmark" overlay is showing.
+    /// Whether the `F2`-opened "load bookmark" overlay is showing.
     pub bookmark_overlay_visible: bool,
     /// Index into `bookmarks` currently highlighted in the overlay.
     pub selected_bookmark_idx: usize,
-    /// Whether the `s`-opened "name this bookmark" input is showing.
+    /// Whether the `F3`-opened "name this bookmark" input is showing.
     pub naming_bookmark: bool,
     /// Text typed into the bookmark-name input.
     pub bookmark_name_input: String,
