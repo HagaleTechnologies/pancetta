@@ -925,13 +925,18 @@ impl RigSelectionState {
     /// default) with a different wrong value (whatever the form happened
     /// to be showing), silently presenting a hybrid of the bookmark and
     /// the prior form state as if it were the bookmark. The whole load is
-    /// now atomic: baud/PTT are validated as representable BEFORE any
-    /// field is mutated, and the load is rejected outright (returning an
-    /// operator-facing reason, no fields touched) if either isn't. An
-    /// empty port is NOT part of this all-or-nothing check — it's a
-    /// legitimately representable "no port set" state, not an
-    /// unrepresentable value, so it still degrades to "leave the port
-    /// field as-is" rather than blocking the whole load.
+    /// atomic: every field is validated as representable BEFORE any field
+    /// is mutated, and the load is rejected outright (returning an
+    /// operator-facing reason, no fields touched) if any isn't.
+    ///
+    /// I-15 fix (PAN-61 review round 10, superseding round 3's "leave
+    /// unchanged" for port): an empty bookmarked port is the same class of
+    /// bug as an unsupported baud/PTT — round 3's "leave the port field at
+    /// its current value" fallback still let the load return `Ok` and
+    /// silently combine the bookmark's model/baud/PTT with whatever port
+    /// the form happened to be showing, presenting that hybrid as "the
+    /// bookmark". An empty port is now part of the same all-or-nothing
+    /// check as baud/PTT.
     pub fn load_bookmark(&mut self, idx: usize) -> Result<(), String> {
         let Some(bookmark) = self.bookmarks.get(idx).cloned() else {
             return Ok(());
@@ -947,6 +952,13 @@ impl RigSelectionState {
                 bookmark.name
             ));
         };
+        if bookmark.port.is_empty() {
+            return Err(format!(
+                "Bookmark '{}' has no saved port (edit it in pancetta.toml or re-save it \
+                 from the form) — not loaded",
+                bookmark.name
+            ));
+        }
 
         self.model = bookmark.model;
         self.selected_port_idx = match self
@@ -956,28 +968,18 @@ impl RigSelectionState {
         {
             Some(pos) => pos,
             None => {
-                if bookmark.port.is_empty() {
-                    // I-8 fix (PAN-61 review round 3): an empty bookmarked
-                    // port (reachable via a hand-edited config file even
-                    // though the TUI's own save path refuses to create
-                    // one) must never fall back to index 0 -- that would
-                    // silently substitute an unrelated enumerated device.
-                    // Leave the port field at its current value instead.
-                    self.selected_port_idx
-                } else {
-                    // I-4 fix (PAN-61 review round 1): prepending shifts
-                    // every existing index in `available_ports` up by one.
-                    // `committed_port_idx` is a snapshot into that same
-                    // list (used by `restore_committed()` on Esc) and must
-                    // shift with it, or Esc after loading a bookmark with
-                    // an unenumerated port restores an index that now
-                    // names a DIFFERENT device than the one committed at
-                    // modal-open time -- a later bare Enter would silently
-                    // persist and connect to the wrong port.
-                    self.available_ports.insert(0, bookmark.port.clone());
-                    self.committed_port_idx += 1;
-                    0
-                }
+                // I-4 fix (PAN-61 review round 1): prepending shifts
+                // every existing index in `available_ports` up by one.
+                // `committed_port_idx` is a snapshot into that same
+                // list (used by `restore_committed()` on Esc) and must
+                // shift with it, or Esc after loading a bookmark with
+                // an unenumerated port restores an index that now
+                // names a DIFFERENT device than the one committed at
+                // modal-open time -- a later bare Enter would silently
+                // persist and connect to the wrong port.
+                self.available_ports.insert(0, bookmark.port.clone());
+                self.committed_port_idx += 1;
+                0
             }
         };
         self.selected_baud_idx = baud_idx;
@@ -6625,14 +6627,16 @@ mod tests {
         );
     }
 
-    /// PAN-61 review round 3 (Codex P2): a bookmark with an empty port
-    /// (reachable via a hand-edited config file even though the TUI's own
-    /// save path refuses to create one) must never fall back to index 0 --
-    /// that would silently substitute an unrelated enumerated device the
-    /// operator never chose.
+    /// PAN-61 review round 10 (Codex P1, superseding round 3's "leave
+    /// unchanged"): a bookmark with an empty port (reachable via a
+    /// hand-edited config file even though the TUI's own save path refuses
+    /// to create one) must reject the whole load, not silently combine the
+    /// bookmark's model/baud/PTT with whatever port the form happened to
+    /// be showing and report that hybrid as "the bookmark loaded".
     #[test]
-    fn rig_selection_state_load_bookmark_with_empty_port_leaves_port_field_unchanged() {
+    fn rig_selection_state_load_bookmark_with_empty_port_is_rejected() {
         let mut state = RigSelectionState {
+            model: "Unchanged".to_string(),
             available_ports: vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
             selected_port_idx: 1,
             bookmarks: vec![pancetta_config::rig::RigBookmark {
@@ -6644,20 +6648,28 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(state.load_bookmark(0), Ok(()));
+        let result = state.load_bookmark(0);
 
+        assert!(
+            result.is_err(),
+            "a bookmark with no saved port must be rejected outright"
+        );
+        assert!(result.unwrap_err().contains("NoPort"));
+        assert_eq!(
+            state.model, "Unchanged",
+            "a rejected load must not mutate any field, including the other 3 that would \
+             otherwise have loaded fine"
+        );
         assert_eq!(
             state.selected_port(),
             "/dev/ttyUSB1",
-            "an empty bookmarked port must not silently substitute a different real device"
+            "a rejected load must leave the port field untouched"
         );
         assert_eq!(
             state.available_ports,
             vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
-            "an empty port must not be prepended into the list"
+            "a rejected load must not prepend the empty port into the list"
         );
-        // The other 3 fields still load normally.
-        assert_eq!(state.model, "FTdx10");
     }
 
     /// PAN-61 review round 5 (Codex P2, escalating round 4's "leave

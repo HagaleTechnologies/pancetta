@@ -2526,6 +2526,48 @@ impl super::ApplicationCoordinator {
                     Err(crossbeam_channel::TryRecvError::Disconnected) => break,
                 }
             }
+            // PAN-61 review round 10 (Codex P1): `tui_wrapper` (below, near
+            // the TUI's spawn_blocking site) stores `shutdown_signal = true`
+            // the instant the TUI's own event loop returns -- independent
+            // of whether this relay loop has dequeued everything the TUI
+            // already sent into `tui_cmd_rx`. An operator who saves or
+            // deletes a bookmark and then quits in the same keystroke burst
+            // can have that command still queued when the `while
+            // !cmd_shutdown` guard above observes shutdown=true and exits.
+            // Drain any remaining bookmark commands here, once, before this
+            // task returns: `cmd_bookmark_mutation_tx` is still owned by
+            // this closure and its worker (registered right after this
+            // task, below) hasn't been touched by shutdown yet, so a late
+            // `send` here still reaches it before the sender is dropped.
+            while let Ok(cmd) = tui_cmd_rx.try_recv() {
+                match cmd {
+                    pancetta_tui::tui_runner::TuiCommand::SaveRigBookmark {
+                        name,
+                        model,
+                        port,
+                        baud_rate,
+                        ptt_method,
+                    } => {
+                        info!(
+                            "TUI SaveRigBookmark (post-shutdown drain): name={} model={} port={} baud={} ptt={:?}",
+                            name, model, port, baud_rate, ptt_method
+                        );
+                        let bookmark = pancetta_config::rig::RigBookmark {
+                            name,
+                            model,
+                            port,
+                            baud_rate,
+                            ptt_method,
+                        };
+                        let _ = cmd_bookmark_mutation_tx.send(BookmarkMutation::Save(bookmark));
+                    }
+                    pancetta_tui::tui_runner::TuiCommand::DeleteRigBookmark { name } => {
+                        info!("TUI DeleteRigBookmark (post-shutdown drain): name={}", name);
+                        let _ = cmd_bookmark_mutation_tx.send(BookmarkMutation::Delete(name));
+                    }
+                    _ => {}
+                }
+            }
             Ok(())
         });
         self.named_task_handles.push((ComponentId::Tui, cmd_handle));
