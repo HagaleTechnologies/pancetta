@@ -615,7 +615,7 @@ impl LotwClient {
             .stderr(std::process::Stdio::piped())
             .spawn();
 
-        let child = match spawned {
+        let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
                 let _ = tokio::fs::remove_file(&path).await;
@@ -631,18 +631,38 @@ impl LotwClient {
             }
         };
 
-        let result = tokio::time::timeout(
-            Duration::from_secs(UPLOAD_TIMEOUT_SECS),
-            child.wait_with_output(),
-        )
-        .await;
+        // Wait via `child.wait()` (borrows, doesn't consume) rather than
+        // `child.wait_with_output()` so a timeout still leaves us holding
+        // `child`: on the timeout path below we explicitly kill *and reap*
+        // it before touching the temp file. Dropping a consumed
+        // `wait_with_output` future on timeout only *initiates*
+        // `kill_on_drop` without waiting for exit — on Windows, `remove_file`
+        // running immediately after can then hit a sharing violation while
+        // tqsl still holds the file open, silently leaking a QSO-data temp
+        // file on every such timeout (PAN-65 review). tqsl's stdout/stderr
+        // are a few short status lines (observed <2KB live), well under a
+        // pipe buffer, so reading them after `wait()` rather than
+        // concurrently with it doesn't risk the classic full-pipe deadlock.
+        let wait_result =
+            tokio::time::timeout(Duration::from_secs(UPLOAD_TIMEOUT_SECS), child.wait()).await;
 
-        // Always attempt cleanup, ignoring errors.
-        let _ = tokio::fs::remove_file(&path).await;
-
-        let output = match result {
-            Ok(Ok(o)) => o,
+        let output = match wait_result {
+            Ok(Ok(_status)) => match child.wait_with_output().await {
+                Ok(o) => o,
+                Err(e) => {
+                    let _ = tokio::fs::remove_file(&path).await;
+                    warn!(
+                        target: "qso.upload",
+                        "LoTW: failed to invoke tqsl ({}): {}", self.tqsl_path, e
+                    );
+                    return Err(DxError::ExternalService(format!(
+                        "LoTW: tqsl invocation failed ({}): {}",
+                        self.tqsl_path, e
+                    )));
+                }
+            },
             Ok(Err(e)) => {
+                let _ = tokio::fs::remove_file(&path).await;
                 warn!(
                     target: "qso.upload",
                     "LoTW: failed to invoke tqsl ({}): {}", self.tqsl_path, e
@@ -653,6 +673,9 @@ impl LotwClient {
                 )));
             }
             Err(_elapsed) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                let _ = tokio::fs::remove_file(&path).await;
                 warn!(
                     target: "qso.upload",
                     "LoTW: tqsl ({}) timed out after {}s — killed",
@@ -664,6 +687,9 @@ impl LotwClient {
                 )));
             }
         };
+
+        // Always attempt cleanup on the success path, ignoring errors.
+        let _ = tokio::fs::remove_file(&path).await;
 
         let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
