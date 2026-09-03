@@ -885,20 +885,27 @@ impl super::ApplicationCoordinator {
         // Shared config — the SelectDevice handler persists the operator's
         // chosen output device into it (and into ~/.pancetta/pancetta.toml).
         let cmd_config = self.config.clone();
-        // PAN-61 review round 6 (Codex P1): serializes every targeted-write
-        // persist call to ~/.pancetta/pancetta.toml -- SelectDevice,
-        // SelectRig, SaveRigBookmark, and DeleteRigBookmark all write into
-        // it via `write_secure_atomic`, which reuses the same `<path>.tmp`
-        // sibling for every caller. The two bookmark handlers persist from
-        // their own detached `tokio::spawn`ed tasks (round 5's relay-
-        // nonblocking fix), so without this lock two bookmark writes -- or
-        // a bookmark write racing SelectRig/SelectDevice's own inline
-        // write -- can now genuinely run concurrently and interleave their
-        // read/patch/write/rename sequences, losing an update or
-        // corrupting the file. Held only around the write itself, so it
-        // never affects command dispatch ordering.
-        let cmd_config_file_write_lock: std::sync::Arc<tokio::sync::Mutex<()>> =
-            std::sync::Arc::new(tokio::sync::Mutex::new(()));
+        // PAN-61 review round 7 (Codex P1, superseding round 6's Mutex):
+        // serializes every targeted-write persist call to
+        // ~/.pancetta/pancetta.toml -- SelectDevice, SelectRig,
+        // SaveRigBookmark, and DeleteRigBookmark all write into it via
+        // `write_secure_atomic`, which reuses the same `<path>.tmp`
+        // sibling for every caller. See `spawn_config_file_write_worker`'s
+        // doc comment for why a plain shared lock isn't enough here.
+        let cmd_config_write_tx = spawn_config_file_write_worker();
+        // Serializes the bookmark stage-mutate-commit sequence across the
+        // two bookmark commands specifically -- see
+        // `spawn_bookmark_mutation_worker`'s doc comment.
+        let cmd_bookmark_config_path = dirs::home_dir()
+            .unwrap_or_else(|| std::path::PathBuf::from("."))
+            .join(".pancetta")
+            .join("pancetta.toml");
+        let cmd_bookmark_mutation_tx = spawn_bookmark_mutation_worker(
+            cmd_config.clone(),
+            cmd_config_write_tx.clone(),
+            cmd_tui_msg_tx.clone(),
+            cmd_bookmark_config_path,
+        );
         // Live device-switch channel into the audio thread. `None` in
         // stub/`--no-audio` modes — the SelectDevice handler then persists the
         // choice (applies on next restart) and tells the operator it can't apply
@@ -2070,33 +2077,71 @@ impl super::ApplicationCoordinator {
                                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                                 .join(".pancetta")
                                 .join("pancetta.toml");
-                            let persist_result = {
-                                // PAN-61 review round 6: serialize against
-                                // every other targeted-write persist call
-                                // to this same file (see
-                                // `cmd_config_file_write_lock`'s doc
-                                // comment).
-                                let _write_guard = cmd_config_file_write_lock.lock().await;
-                                let cfg = cmd_config.read().await;
-                                cfg.set_audio_devices_in_file(
-                                    &config_path,
-                                    input_device.as_deref(),
-                                    output_device.as_deref(),
-                                )
-                            };
-                            if let Err(e) = persist_result {
-                                warn!("Failed to persist audio device selection: {}", e);
-                                let _ = cmd_tui_msg_tx.send(
-                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                        component: "audio".to_string(),
-                                        status: format!("Failed to save device choice: {}", e),
-                                    },
-                                );
-                            } else {
-                                info!(
-                                    "Persisted audio device selection to {}",
-                                    config_path.display()
-                                );
+                            // PAN-61 review round 7 (P1): submit to the
+                            // serialized write worker and do NOT await the
+                            // result inline -- the persist outcome is
+                            // reported from a short spawned task instead
+                            // (mirrors SelectRig's existing reconnect-wait
+                            // pattern below), so this arm never blocks the
+                            // relay loop on disk I/O, no matter how long
+                            // this write or anything queued ahead of it
+                            // takes. The live-switch dance a few lines down
+                            // is unconditional either way (not gated on
+                            // persist outcome), exactly as before.
+                            {
+                                let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                                let write_path = config_path.clone();
+                                let write_input = input_device.clone();
+                                let write_output = output_device.clone();
+                                let submitted = cmd_config_write_tx.send(ConfigFileWriteRequest {
+                                    work: Box::new(move || {
+                                        pancetta_config::Config::default()
+                                            .set_audio_devices_in_file(
+                                                &write_path,
+                                                write_input.as_deref(),
+                                                write_output.as_deref(),
+                                            )
+                                    }),
+                                    respond: resp_tx,
+                                });
+                                if submitted.is_ok() {
+                                    let report_tui_msg_tx = cmd_tui_msg_tx.clone();
+                                    let report_path = config_path.clone();
+                                    tokio::spawn(async move {
+                                        match resp_rx.await {
+                                            Ok(Ok(())) => {
+                                                info!(
+                                                    "Persisted audio device selection to {}",
+                                                    report_path.display()
+                                                );
+                                            }
+                                            Ok(Err(e)) => {
+                                                warn!(
+                                                    "Failed to persist audio device selection: {}",
+                                                    e
+                                                );
+                                                let _ = report_tui_msg_tx.send(
+                                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                                        component: "audio".to_string(),
+                                                        status: format!(
+                                                            "Failed to save device choice: {}",
+                                                            e
+                                                        ),
+                                                    },
+                                                );
+                                            }
+                                            Err(_) => {
+                                                warn!(
+                                                    "Config write worker dropped the response for audio device persist"
+                                                );
+                                            }
+                                        }
+                                    });
+                                } else {
+                                    warn!(
+                                        "Config write worker channel closed; audio device selection not persisted"
+                                    );
+                                }
                             }
 
                             // Apply LIVE: ask the audio thread to reopen the
@@ -2236,29 +2281,60 @@ impl super::ApplicationCoordinator {
                                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                                     .join(".pancetta")
                                     .join("pancetta.toml");
-                                let persist_result = {
-                                    // PAN-61 review round 6: serialize
-                                    // against every other targeted-write
-                                    // persist call to this same file (see
-                                    // `cmd_config_file_write_lock`'s doc
-                                    // comment).
-                                    let _write_guard = cmd_config_file_write_lock.lock().await;
-                                    let cfg = cmd_config.read().await;
-                                    cfg.set_rig_in_file(
-                                        &config_path,
-                                        &model,
-                                        &port,
-                                        baud_rate,
-                                        ptt_method.clone(),
-                                    )
-                                };
-                                if let Err(e) = persist_result {
-                                    warn!("Failed to persist rig config selection: {}", e);
-                                } else {
-                                    info!(
-                                        "Persisted rig config selection to {}",
-                                        config_path.display()
-                                    );
+                                // PAN-61 review round 7 (P1): submit to the
+                                // serialized write worker and do NOT await
+                                // the result inline -- see SelectDevice's
+                                // identical comment above. The Hamlib
+                                // reconnect request below is unconditional
+                                // either way (not gated on persist
+                                // outcome), exactly as before.
+                                {
+                                    let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+                                    let write_path = config_path.clone();
+                                    let write_model = model.clone();
+                                    let write_port = port.clone();
+                                    let write_ptt = ptt_method.clone();
+                                    let submitted =
+                                        cmd_config_write_tx.send(ConfigFileWriteRequest {
+                                            work: Box::new(move || {
+                                                pancetta_config::Config::default().set_rig_in_file(
+                                                    &write_path,
+                                                    &write_model,
+                                                    &write_port,
+                                                    baud_rate,
+                                                    write_ptt,
+                                                )
+                                            }),
+                                            respond: resp_tx,
+                                        });
+                                    if submitted.is_ok() {
+                                        let report_path = config_path.clone();
+                                        tokio::spawn(async move {
+                                            match resp_rx.await {
+                                                Ok(Ok(())) => {
+                                                    info!(
+                                                        "Persisted rig config selection to {}",
+                                                        report_path.display()
+                                                    );
+                                                }
+                                                Ok(Err(e)) => {
+                                                    warn!(
+                                                        "Failed to persist rig config selection: {}",
+                                                        e
+                                                    );
+                                                }
+                                                Err(_) => {
+                                                    warn!(
+                                                        "Config write worker dropped the response for rig config persist"
+                                                    );
+                                                }
+                                            }
+                                        });
+                                    } else {
+                                        warn!(
+                                            "Config write worker channel closed; rig config selection not persisted"
+                                        );
+                                    }
                                 }
 
                                 // I4 fix (PAN-59 review): this relay task's loop
@@ -2380,171 +2456,25 @@ impl super::ApplicationCoordinator {
                                 "TUI SaveRigBookmark: name={} model={} port={} baud={} ptt={:?}",
                                 name, model, port, baud_rate, ptt_method
                             );
+                            // PAN-61 review round 7 (P1): hand off to the
+                            // dedicated, serialized bookmark-mutation
+                            // worker (see `spawn_bookmark_mutation_worker`'s
+                            // doc comment) -- this `send` never awaits, so
+                            // the relay loop returns to `try_recv`
+                            // immediately no matter how long the worker's
+                            // queue takes to drain.
                             let bookmark = pancetta_config::rig::RigBookmark {
-                                name: name.clone(),
+                                name,
                                 model,
                                 port,
                                 baud_rate,
                                 ptt_method,
                             };
-                            let config_path = dirs::home_dir()
-                                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                .join(".pancetta")
-                                .join("pancetta.toml");
-                            // I-11 fix (PAN-61 review round 5): don't await
-                            // persistence inline in this loop's own future.
-                            // `spawn_blocking` alone (round 4) frees the
-                            // underlying OS thread, but the JoinHandle
-                            // `.await` still suspends THIS relay loop's own
-                            // task until it resolves -- and this is the one
-                            // and only task dequeuing
-                            // OperatorEmergencyStop/StopTx/TogglePtt/
-                            // AbortQso, so it still delayed those commands
-                            // by exactly the write's duration. Spawn a
-                            // fully detached task instead (mirrors the
-                            // existing SelectRig Hamlib-reconnect-wait
-                            // pattern elsewhere in this match): the arm
-                            // hands off and returns to `try_recv`
-                            // immediately.
-                            let task_config = cmd_config.clone();
-                            let task_tui_msg_tx = cmd_tui_msg_tx.clone();
-                            let task_write_lock = cmd_config_file_write_lock.clone();
-                            tokio::spawn(async move {
-                                // PAN-61 review round 6 (Codex P1): held for
-                                // the WHOLE stage-persist-commit sequence,
-                                // not just the write call -- two concurrent
-                                // bookmark commands both staging from the
-                                // same pre-mutation list would otherwise let
-                                // the later one's commit silently discard
-                                // the earlier one's change even if the
-                                // actual disk writes themselves didn't
-                                // interleave. See
-                                // `cmd_config_file_write_lock`'s doc comment
-                                // for the full file-corruption angle too.
-                                let _write_guard = task_write_lock.lock().await;
-                                // I-7 fix (PAN-61 review round 2): stage the
-                                // mutated list without touching the shared
-                                // `cfg.rig.bookmarks` yet. Committing the
-                                // mutation into shared state BEFORE
-                                // persistence is confirmed (round-1's
-                                // approach) meant a failed write left the
-                                // in-memory list silently diverged from
-                                // disk -- an unrelated LATER save would
-                                // then persist this un-persisted change as
-                                // a side effect, and the operator had no
-                                // way to retry the original failed save
-                                // directly.
-                                let mut staged = {
-                                    let cfg = task_config.read().await;
-                                    cfg.rig.bookmarks.clone()
-                                };
-                                upsert_rig_bookmark(&mut staged, bookmark);
-                                let persist_result = persist_rig_bookmarks_off_thread(
-                                    config_path.clone(),
-                                    staged.clone(),
-                                )
-                                .await;
-                                let status = if let Err(e) = persist_result {
-                                    warn!("Failed to persist rig bookmark: {}", e);
-                                    format!("Failed to save bookmark '{}': {}", name, e)
-                                } else {
-                                    info!(
-                                        "Persisted rig bookmark '{}' to {}",
-                                        name,
-                                        config_path.display()
-                                    );
-                                    // Only now, with the write confirmed on
-                                    // disk, commit the staged list into
-                                    // shared state and resync the TUI.
-                                    {
-                                        let mut cfg = task_config.write().await;
-                                        cfg.rig.bookmarks = staged.clone();
-                                    }
-                                    let _ = task_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
-                                            bookmarks: staged.clone(),
-                                        },
-                                    );
-                                    rig_bookmark_saved_status(&name, staged.len())
-                                };
-                                let _ = task_tui_msg_tx.send(
-                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                        component: "rig".to_string(),
-                                        status,
-                                    },
-                                );
-                            });
+                            let _ = cmd_bookmark_mutation_tx.send(BookmarkMutation::Save(bookmark));
                         }
                         pancetta_tui::tui_runner::TuiCommand::DeleteRigBookmark { name } => {
                             info!("TUI DeleteRigBookmark: name={}", name);
-                            let config_path = dirs::home_dir()
-                                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                .join(".pancetta")
-                                .join("pancetta.toml");
-                            // I-11 fix (PAN-61 review round 5): see
-                            // SaveRigBookmark's comment above -- persistence
-                            // must run in a fully detached task, not
-                            // awaited inline in this relay loop.
-                            let task_config = cmd_config.clone();
-                            let task_tui_msg_tx = cmd_tui_msg_tx.clone();
-                            let task_write_lock = cmd_config_file_write_lock.clone();
-                            tokio::spawn(async move {
-                                // PAN-61 review round 6: see
-                                // SaveRigBookmark's identical comment above
-                                // -- held for the whole stage-persist-commit
-                                // sequence.
-                                let _write_guard = task_write_lock.lock().await;
-                                // I-7 fix (PAN-61 review round 2): same
-                                // stage-then-commit-on-success pattern as
-                                // SaveRigBookmark above.
-                                let mut staged = {
-                                    let cfg = task_config.read().await;
-                                    cfg.rig.bookmarks.clone()
-                                };
-                                let before = staged.len();
-                                staged.retain(|b| b.name != name);
-                                let found = staged.len() != before;
-                                if !found {
-                                    let _ = task_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                            component: "rig".to_string(),
-                                            status: format!("No bookmark named '{}'", name),
-                                        },
-                                    );
-                                    return;
-                                }
-                                let persist_result = persist_rig_bookmarks_off_thread(
-                                    config_path.clone(),
-                                    staged.clone(),
-                                )
-                                .await;
-                                let status = if let Err(e) = persist_result {
-                                    warn!("Failed to persist rig bookmark deletion: {}", e);
-                                    format!("Failed to delete bookmark '{}': {}", name, e)
-                                } else {
-                                    info!(
-                                        "Persisted rig bookmark deletion of '{}' to {}",
-                                        name,
-                                        config_path.display()
-                                    );
-                                    {
-                                        let mut cfg = task_config.write().await;
-                                        cfg.rig.bookmarks = staged.clone();
-                                    }
-                                    let _ = task_tui_msg_tx.send(
-                                        pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
-                                            bookmarks: staged.clone(),
-                                        },
-                                    );
-                                    format!("Deleted bookmark '{}'", name)
-                                };
-                                let _ = task_tui_msg_tx.send(
-                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                        component: "rig".to_string(),
-                                        status,
-                                    },
-                                );
-                            });
+                            let _ = cmd_bookmark_mutation_tx.send(BookmarkMutation::Delete(name));
                         }
                         pancetta_tui::tui_runner::TuiCommand::ToggleFoxMode => {
                             // Operator pressed `Shift+X`: toggle Fox mode.
@@ -2902,36 +2832,172 @@ fn rig_bookmark_saved_status(name: &str, count: usize) -> String {
     }
 }
 
-/// Persist rig bookmarks off the safety-command relay loop's own task
-/// (PAN-61 review round 4, P1): `Config::set_rig_bookmarks_in_file` does
-/// synchronous disk I/O (read, parse, rewrite, atomic write+fsync). Run
-/// inline on the task that also dequeues `OperatorEmergencyStop`/`StopTx`/
-/// `TogglePtt`/`AbortQso`, a slow or stalled filesystem (a network-mounted
-/// home directory, antivirus scanning, a failing disk) could delay every
-/// one of those safety commands until the write returns. `spawn_blocking`
-/// moves the blocking call onto tokio's dedicated blocking-thread pool so
-/// the relay loop's task stays free to keep dequeuing safety commands
-/// while the write is in flight.
+/// One targeted `~/.pancetta/pancetta.toml` write, queued for serialized
+/// processing by the worker `spawn_config_file_write_worker` spawns
+/// (PAN-61 review round 7, P1). `work` performs the actual blocking
+/// `std::fs` I/O (matching the `set_*_in_file` methods' shape) and is only
+/// ever run on tokio's blocking-thread pool inside the worker, never
+/// inline on the caller's own task.
+struct ConfigFileWriteRequest {
+    work: Box<dyn FnOnce() -> pancetta_config::ConfigResult<()> + Send + 'static>,
+    respond: tokio::sync::oneshot::Sender<pancetta_config::ConfigResult<()>>,
+}
+
+/// Spawn the single serialized worker that processes every targeted
+/// `pancetta.toml` write in this coordinator (`SelectDevice`, `SelectRig`,
+/// `SaveRigBookmark`, `DeleteRigBookmark`) one at a time, and return the
+/// sender callers submit requests through.
 ///
-/// `set_rig_bookmarks_in_file` never reads any of `Config`'s own fields --
-/// it's a pure function of `path`/`bookmarks` (see its implementation) --
-/// so a throwaway `Config::default()` is a safe, zero-cost receiver here;
-/// no live config data needs to cross into the blocking task.
-async fn persist_rig_bookmarks_off_thread(
-    path: std::path::PathBuf,
-    bookmarks: Vec<pancetta_config::rig::RigBookmark>,
-) -> pancetta_config::ConfigResult<()> {
-    match tokio::task::spawn_blocking(move || {
-        pancetta_config::Config::default().set_rig_bookmarks_in_file(&path, &bookmarks)
-    })
-    .await
-    {
-        Ok(result) => result,
-        Err(join_err) => Err(pancetta_config::ConfigError::Validation(format!(
-            "bookmark persist task panicked or was cancelled: {}",
-            join_err
-        ))),
-    }
+/// PAN-61 review round 6 tried a shared `Mutex` instead; round 7 (P1)
+/// found that still suspended whichever task's `.lock().await` lost the
+/// race -- when that task was the relay loop's own inline `SelectRig`/
+/// `SelectDevice` arm, a concurrent bookmark write's disk I/O could delay
+/// `OperatorEmergencyStop`/`StopTx`/`TogglePtt`/`AbortQso` all over again,
+/// reopening exactly what rounds 4-5 fixed. Submitting a request to this
+/// worker's unbounded channel is fire-and-forget from every caller's
+/// perspective -- the `send` itself never waits for the write, so NO
+/// caller (relay loop included) is ever suspended by another writer's I/O,
+/// no matter which arm is submitting or how long the queue is.
+fn spawn_config_file_write_worker() -> tokio::sync::mpsc::UnboundedSender<ConfigFileWriteRequest> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ConfigFileWriteRequest>();
+    tokio::spawn(async move {
+        while let Some(req) = rx.recv().await {
+            let result = match tokio::task::spawn_blocking(req.work).await {
+                Ok(result) => result,
+                Err(join_err) => Err(pancetta_config::ConfigError::Validation(format!(
+                    "config file write task panicked or was cancelled: {}",
+                    join_err
+                ))),
+            };
+            let _ = req.respond.send(result);
+        }
+    });
+    tx
+}
+
+/// One bookmark mutation, queued for serialized processing by the worker
+/// `spawn_bookmark_mutation_worker` spawns (PAN-61 review round 7, P1).
+///
+/// `spawn_config_file_write_worker` above serializes the raw FILE WRITE
+/// across all 4 targeted writers in this coordinator, which prevents
+/// `write_secure_atomic` corruption -- but it does nothing to stop two
+/// concurrent bookmark commands from both staging their edit off the same
+/// pre-mutation `cfg.rig.bookmarks` snapshot, in which case the later
+/// commit would silently discard the earlier one's change even though the
+/// disk writes themselves never interleaved. This worker is the other
+/// half: a single task processes one mutation fully (stage, submit to the
+/// file-write worker, await its result, commit to shared state) before
+/// starting the next, so every stage-read is guaranteed fresh.
+enum BookmarkMutation {
+    Save(pancetta_config::rig::RigBookmark),
+    Delete(String),
+}
+
+/// Spawn the single serialized worker that processes every
+/// `SaveRigBookmark`/`DeleteRigBookmark` mutation one at a time, and
+/// return the sender the relay loop submits mutations through. The relay
+/// loop's own arms do nothing but build the request and `send` it --
+/// never awaited, so they return to `try_recv` immediately regardless of
+/// how long this worker's queue takes to drain.
+fn spawn_bookmark_mutation_worker(
+    config: std::sync::Arc<tokio::sync::RwLock<pancetta_config::Config>>,
+    write_tx: tokio::sync::mpsc::UnboundedSender<ConfigFileWriteRequest>,
+    tui_msg_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
+    config_path: std::path::PathBuf,
+) -> tokio::sync::mpsc::UnboundedSender<BookmarkMutation> {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BookmarkMutation>();
+    tokio::spawn(async move {
+        while let Some(mutation) = rx.recv().await {
+            // Stage fresh at the top of every iteration -- this only runs
+            // after the PREVIOUS mutation (if any) fully committed below,
+            // since this loop processes one item at a time.
+            let mut staged = {
+                let cfg = config.read().await;
+                cfg.rig.bookmarks.clone()
+            };
+
+            let name = match &mutation {
+                BookmarkMutation::Save(bookmark) => bookmark.name.clone(),
+                BookmarkMutation::Delete(name) => name.clone(),
+            };
+
+            match &mutation {
+                BookmarkMutation::Save(bookmark) => {
+                    upsert_rig_bookmark(&mut staged, bookmark.clone());
+                }
+                BookmarkMutation::Delete(_) => {
+                    let before = staged.len();
+                    staged.retain(|b| b.name != name);
+                    if staged.len() == before {
+                        let _ =
+                            tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                component: "rig".to_string(),
+                                status: format!("No bookmark named '{}'", name),
+                            });
+                        continue;
+                    }
+                }
+            }
+
+            let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
+            let write_path = config_path.clone();
+            let write_staged = staged.clone();
+            if write_tx
+                .send(ConfigFileWriteRequest {
+                    work: Box::new(move || {
+                        pancetta_config::Config::default()
+                            .set_rig_bookmarks_in_file(&write_path, &write_staged)
+                    }),
+                    respond: resp_tx,
+                })
+                .is_err()
+            {
+                warn!(
+                    "Config write worker channel closed; bookmark '{}' change not persisted",
+                    name
+                );
+                continue;
+            }
+            let persist_result = match resp_rx.await {
+                Ok(result) => result,
+                Err(_) => Err(pancetta_config::ConfigError::Validation(
+                    "config write worker dropped the response".to_string(),
+                )),
+            };
+
+            let verb = match &mutation {
+                BookmarkMutation::Save(_) => "save",
+                BookmarkMutation::Delete(_) => "delete",
+            };
+            let status = if let Err(e) = persist_result {
+                warn!("Failed to persist rig bookmark {}: {}", verb, e);
+                format!("Failed to {} bookmark '{}': {}", verb, name, e)
+            } else {
+                info!(
+                    "Persisted rig bookmark {} ('{}') to {}",
+                    verb,
+                    name,
+                    config_path.display()
+                );
+                {
+                    let mut cfg = config.write().await;
+                    cfg.rig.bookmarks = staged.clone();
+                }
+                let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
+                    bookmarks: staged.clone(),
+                });
+                match &mutation {
+                    BookmarkMutation::Save(_) => rig_bookmark_saved_status(&name, staged.len()),
+                    BookmarkMutation::Delete(_) => format!("Deleted bookmark '{}'", name),
+                }
+            };
+            let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                component: "rig".to_string(),
+                status,
+            });
+        }
+    });
+    tx
 }
 
 #[cfg(test)]
