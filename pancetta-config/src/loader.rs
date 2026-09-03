@@ -12,6 +12,26 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 use tracing::{debug, error, info, warn};
 
+/// Whether `path` should be parsed/written as JSON rather than TOML --
+/// extension first (`.json`/`.toml` win outright), then content-sniffing
+/// (does the file start with `{`) for an ambiguous or missing extension.
+/// Exactly mirrors [`ConfigLoader::load_from_file`]'s own format
+/// detection, so a write-time format check (PAN-62 review round 1:
+/// `pancetta/src/main.rs`'s `config_write_path`) never disagrees with
+/// what was actually loaded. A path that can't be read (e.g. a
+/// not-yet-created first-run default config) defaults to TOML, matching
+/// `Config::write_secure_atomic`'s own TOML default target.
+pub fn path_is_json_format(path: &Path) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("json") => true,
+        Some("toml") => false,
+        _ => match fs::read_to_string(path) {
+            Ok(content) => content.trim_start().starts_with('{'),
+            Err(_) => false,
+        },
+    }
+}
+
 /// Configuration loader with hierarchical loading and hot-reload support
 pub struct ConfigLoader {
     /// Search paths for configuration files
@@ -307,17 +327,10 @@ impl ConfigLoader {
         // Load and parse file
         let content = fs::read_to_string(path).map_err(ConfigError::Io)?;
 
-        let config = match path.extension().and_then(|ext| ext.to_str()) {
-            Some("toml") => self.parse_toml(&content)?,
-            Some("json") => self.parse_json(&content)?,
-            _ => {
-                // Try to determine format from content
-                if content.trim_start().starts_with('{') {
-                    self.parse_json(&content)?
-                } else {
-                    self.parse_toml(&content)?
-                }
-            }
+        let config = if path_is_json_format(path) {
+            self.parse_json(&content)?
+        } else {
+            self.parse_toml(&content)?
         };
 
         // Cache the result
@@ -975,6 +988,57 @@ mod tests {
         assert_eq!(parsed.station.callsign, "K1ABC");
         assert_eq!(parsed.station.grid_square, "FN31pr");
         assert_eq!(parsed.station.power_watts, 100);
+    }
+
+    /// PAN-62 review round 1 (Codex P2): `path_is_json_format` must agree
+    /// with `load_from_file`'s own extension-then-content sniffing exactly
+    /// -- a write-time format check that disagreed with the load-time
+    /// detection could reject a config that actually loaded fine as TOML,
+    /// or accept one that actually loaded as JSON.
+    #[test]
+    fn path_is_json_format_detects_by_extension_first() {
+        let dir = TempDir::new().unwrap();
+        let json_path = dir.path().join("config.json");
+        std::fs::write(&json_path, "station = \"not actually json\"").unwrap();
+        assert!(
+            path_is_json_format(&json_path),
+            ".json extension must win regardless of content"
+        );
+
+        let toml_path = dir.path().join("config.toml");
+        std::fs::write(&toml_path, "{}").unwrap();
+        assert!(
+            !path_is_json_format(&toml_path),
+            ".toml extension must win regardless of content"
+        );
+    }
+
+    #[test]
+    fn path_is_json_format_sniffs_content_when_extension_is_ambiguous() {
+        let dir = TempDir::new().unwrap();
+        let json_like = dir.path().join("config");
+        std::fs::write(&json_like, "{\"station\": {}}").unwrap();
+        assert!(
+            path_is_json_format(&json_like),
+            "extensionless content starting with '{{' must sniff as JSON"
+        );
+
+        let toml_like = dir.path().join("config2");
+        std::fs::write(&toml_like, "[station]\ncallsign = \"K1ABC\"").unwrap();
+        assert!(
+            !path_is_json_format(&toml_like),
+            "extensionless content not starting with '{{' must sniff as TOML"
+        );
+    }
+
+    #[test]
+    fn path_is_json_format_treats_a_nonexistent_path_as_toml() {
+        let missing = std::path::Path::new("/nonexistent/pancetta-test-config.cfg");
+        assert!(
+            !path_is_json_format(missing),
+            "a not-yet-created config (first run) must default to TOML, matching \
+             write_secure_atomic's own TOML default target"
+        );
     }
 
     #[test]

@@ -323,16 +323,28 @@ impl Config {
     fn write_secure_atomic(path: &std::path::Path, contents: &str) -> ConfigResult<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
+                // PAN-62 review round 1 (Codex P1): only harden a directory
+                // WE just created. A pre-existing parent -- the default
+                // `~/.pancetta` from a prior run, or a custom `--config`
+                // path under a shared/dotfiles-managed directory -- was
+                // already set up however its owner (pancetta or an
+                // operator/admin) intended; forcing it to 0700 on every
+                // write could lock other users/services out of a directory
+                // pancetta doesn't own.
+                let parent_existed = parent.exists();
                 std::fs::create_dir_all(parent)?;
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    // Best-effort: lock the .pancetta dir to the owner. Ignore
-                    // failure (e.g. the operator deliberately set a different
-                    // mode, or a non-owned ancestor) — the 0600 file is the
-                    // real guarantee.
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                    if !parent_existed {
+                        use std::os::unix::fs::PermissionsExt;
+                        // Best-effort: lock a freshly-created dir to the
+                        // owner. Ignore failure — the 0600 file is the real
+                        // guarantee.
+                        let _ = std::fs::set_permissions(
+                            parent,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
                 }
             }
         }
@@ -643,6 +655,39 @@ mod tests {
         // Round-trips and preserved the device write.
         let reloaded = Config::load_from_file(&path).unwrap();
         assert_eq!(reloaded.audio.output_device, "Rig CODEC");
+    }
+
+    /// PAN-62 review round 1 (Codex P1): a custom `--config` path's parent
+    /// directory may be a shared location (`/srv/shared`, a dotfiles repo
+    /// checkout) the operator deliberately left at some non-0700 mode.
+    /// `write_secure_atomic` must only force 0700 on a directory IT just
+    /// created, never on one that already existed -- otherwise the first
+    /// picker/bookmark save silently locks other users/services out of a
+    /// directory pancetta doesn't own.
+    #[cfg(unix)]
+    #[test]
+    fn save_to_file_preserves_permissions_of_a_preexisting_parent_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Parent already exists (unlike `save_to_file_is_owner_only_and_atomic`'s
+        // freshly-created "nested" dir) with an explicit, non-0700 mode --
+        // simulating a shared directory pancetta does not own.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("pancetta.toml");
+
+        Config::default().save_to_file(&path).unwrap();
+
+        let dmode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dmode, 0o755,
+            "a pre-existing parent dir's permissions must be left alone, got {dmode:o}"
+        );
+        // The file itself is still owner-only regardless.
+        let fmode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            fmode, 0o600,
+            "config file must still be owner-only, got {fmode:o}"
+        );
     }
 
     #[test]

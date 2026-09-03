@@ -941,10 +941,21 @@ fn default_pancetta_toml_path() -> PathBuf {
 /// operator passed one, matching what `load_configuration_with_warnings`
 /// actually loaded from; otherwise the same default `pancetta.toml`
 /// location that function falls back to.
+///
+/// PAN-62 review round 1 (Codex P2): resolved to its real target via
+/// `canonicalize` -- a `--config` path pointing at a symlink (common with
+/// a dotfiles-managed config) would otherwise have its first picker/
+/// bookmark write's atomic rename replace the symlink itself with a plain
+/// file, silently disconnecting the managed target startup actually read
+/// from. `canonicalize` requires the path to exist; a not-yet-created
+/// default config on first run can't be a symlink, so falling back to the
+/// raw path when it fails is correct, not a gap.
 fn config_write_path(cli: &Cli) -> PathBuf {
-    cli.config
+    let raw = cli
+        .config
         .clone()
-        .unwrap_or_else(default_pancetta_toml_path)
+        .unwrap_or_else(default_pancetta_toml_path);
+    std::fs::canonicalize(&raw).unwrap_or(raw)
 }
 
 /// Like [`load_configuration`] but also returns non-fatal config-load warnings
@@ -1924,6 +1935,43 @@ mod tests {
     fn config_write_path_falls_back_to_the_default_pancetta_toml_location() {
         let cli = Cli::try_parse_from(["pancetta"]).expect("valid CLI args");
         assert_eq!(config_write_path(&cli), default_pancetta_toml_path());
+    }
+
+    /// PAN-62 review round 1 (Codex P2): when `--config` points to a
+    /// symlink (common with a dotfiles-managed config), the write target
+    /// must be the symlink's real target, not the symlink pathname itself
+    /// -- otherwise the first picker/bookmark write's atomic rename
+    /// replaces the symlink with a plain file, silently disconnecting the
+    /// managed target that startup actually read from.
+    #[cfg(unix)]
+    #[test]
+    fn config_write_path_resolves_a_symlinked_config_flag_to_its_real_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("real-pancetta.toml");
+        std::fs::write(&real, "").unwrap();
+        let link = dir.path().join("pancetta.toml");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let cli = Cli::try_parse_from(["pancetta", "--config", link.to_str().unwrap()])
+            .expect("valid CLI args");
+        assert_eq!(
+            config_write_path(&cli),
+            real.canonicalize().unwrap(),
+            "a symlinked --config path must resolve to its real target"
+        );
+    }
+
+    /// A `--config` path that doesn't exist yet (nothing to canonicalize)
+    /// must be used as given, not treated as an error.
+    #[test]
+    fn config_write_path_uses_a_nonexistent_config_flag_path_as_given() {
+        let cli =
+            Cli::try_parse_from(["pancetta", "--config", "/tmp/does-not-exist-pancetta.toml"])
+                .expect("valid CLI args");
+        assert_eq!(
+            config_write_path(&cli),
+            PathBuf::from("/tmp/does-not-exist-pancetta.toml")
+        );
     }
 }
 

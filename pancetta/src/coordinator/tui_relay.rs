@@ -2101,7 +2101,26 @@ impl super::ApplicationCoordinator {
                             // takes. The live-switch dance a few lines down
                             // is unconditional either way (not gated on
                             // persist outcome), exactly as before.
-                            {
+                            // PAN-62 review round 1 (Codex P2): the targeted
+                            // setters below parse the existing file
+                            // exclusively as TOML -- persisting against a
+                            // JSON `--config` file would fail every time
+                            // with a raw parser error. Reject up front with
+                            // a clear operator-facing message instead.
+                            if pancetta_config::path_is_json_format(&config_path) {
+                                warn!(
+                                    "Config file {} is not TOML; audio device selection not persisted",
+                                    config_path.display()
+                                );
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "audio".to_string(),
+                                        status: "Device choice applied live, but not persisted \
+                                                 (config file isn't TOML)"
+                                            .to_string(),
+                                    },
+                                );
+                            } else {
                                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                                 let write_path = config_path.clone();
                                 let write_input = input_device.clone();
@@ -2301,7 +2320,22 @@ impl super::ApplicationCoordinator {
                                 // reconnect request below is unconditional
                                 // either way (not gated on persist
                                 // outcome), exactly as before.
-                                {
+                                // PAN-62 review round 1 (Codex P2): see
+                                // SelectDevice's identical guard above.
+                                if pancetta_config::path_is_json_format(&config_path) {
+                                    warn!(
+                                        "Config file {} is not TOML; rig config selection not persisted",
+                                        config_path.display()
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "rig".to_string(),
+                                            status: "Rig applied live, but not persisted (config \
+                                                     file isn't TOML)"
+                                                .to_string(),
+                                        },
+                                    );
+                                } else {
                                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                                     let write_path = config_path.clone();
                                     let write_model = model.clone();
@@ -2999,8 +3033,33 @@ fn spawn_bookmark_mutation_worker(
     tokio::task::JoinHandle<Result<()>>,
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BookmarkMutation>();
+    // PAN-62 review round 1 (Codex P2): `set_rig_bookmarks_in_file` parses
+    // the existing file exclusively as TOML -- checked once here, not per
+    // mutation, since `config_path`'s format never changes for this
+    // worker's lifetime.
+    let config_is_toml = !pancetta_config::path_is_json_format(&config_path);
     let handle = tokio::spawn(async move {
         while let Some(mutation) = rx.recv().await {
+            // Bookmarks have no "live apply" fallback the way SelectDevice/
+            // SelectRig do -- a save/delete IS the persist, so a non-TOML
+            // config file means the whole mutation is rejected outright
+            // rather than reporting a confusing raw parser failure.
+            if !config_is_toml {
+                let name = match &mutation {
+                    BookmarkMutation::Save(bookmark) => bookmark.name.clone(),
+                    BookmarkMutation::Delete(name) => name.clone(),
+                };
+                warn!(
+                    "Config file {} is not TOML; bookmark '{}' not saved/deleted",
+                    config_path.display(),
+                    name
+                );
+                let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                    component: "rig".to_string(),
+                    status: "Bookmarks aren't supported for a non-TOML config file".to_string(),
+                });
+                continue;
+            }
             // Stage fresh at the top of every iteration -- this only runs
             // after the PREVIOUS mutation (if any) fully committed below,
             // since this loop processes one item at a time.
@@ -3167,6 +3226,65 @@ mod tui_relay_tests {
             "must overwrite, not append a duplicate name"
         );
         assert_eq!(bookmarks[0].model, "IC-7300");
+    }
+
+    /// PAN-62 review round 1 (Codex P2): saving a bookmark against a JSON
+    /// `--config` file must be rejected with a clear operator-facing
+    /// message -- not silently accepted (the file is never actually
+    /// written, since `set_rig_bookmarks_in_file` only understands TOML)
+    /// and not a raw "failed to parse config" parser error.
+    #[tokio::test]
+    async fn bookmark_worker_rejects_a_save_against_a_json_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("pancetta.json");
+        std::fs::write(&json_path, "{}").unwrap();
+
+        let config = Arc::new(tokio::sync::RwLock::new(pancetta_config::Config::default()));
+        let (write_tx, _write_handle) = spawn_config_file_write_worker();
+        let (tui_msg_tx, tui_msg_rx) = crossbeam_channel::unbounded();
+        let (bookmark_tx, _bookmark_handle) =
+            spawn_bookmark_mutation_worker(config.clone(), write_tx, tui_msg_tx, json_path.clone());
+
+        bookmark_tx
+            .send(BookmarkMutation::Save(pancetta_config::rig::RigBookmark {
+                name: "Shack".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }))
+            .unwrap();
+
+        // `crossbeam_channel::Receiver::recv()` blocks the OS thread (not
+        // just the future), which would starve `tokio::time::timeout`'s own
+        // cancellation -- poll with `try_recv` + an async sleep instead so
+        // the runtime keeps making progress.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(pancetta_tui::tui_runner::TuiMessage::StatusUpdate { status, .. }) =
+                    tui_msg_rx.try_recv()
+                {
+                    return status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker must report a status within 5s");
+
+        assert!(
+            msg.contains("aren't supported") && msg.contains("non-TOML"),
+            "expected a clear non-TOML rejection message, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&json_path).unwrap(),
+            "{}",
+            "the JSON file must be left completely untouched"
+        );
+        assert!(
+            config.read().await.rig.bookmarks.is_empty(),
+            "in-memory bookmarks must NOT reflect a rejected save"
+        );
     }
 
     #[test]
