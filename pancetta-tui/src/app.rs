@@ -914,13 +914,40 @@ impl RigSelectionState {
 
     /// Load the bookmark at `idx` into the 4 form fields (PAN-61). Does
     /// **not** apply anything live — only the form's own Enter does that.
-    /// Out-of-range `idx` is a no-op. Mirrors
-    /// `App::apply_rig_config_update`'s port/baud/PTT index-resolution
-    /// logic so an unenumerated bookmarked port is never silently dropped.
-    pub fn load_bookmark(&mut self, idx: usize) {
+    /// Out-of-range `idx` is a no-op (`Ok(())`, nothing to load).
+    ///
+    /// I-12 fix (PAN-61 review round 5): a bookmarked baud rate or PTT
+    /// method outside the picker's fixed enumerated choices (reachable via
+    /// a hand-edited config, even though the TUI's own save path only ever
+    /// offers these enumerated values) has NO value this method could
+    /// substitute that would be correct — round 4's "leave the field
+    /// unchanged" fallback just replaced one wrong value (a hardcoded
+    /// default) with a different wrong value (whatever the form happened
+    /// to be showing), silently presenting a hybrid of the bookmark and
+    /// the prior form state as if it were the bookmark. The whole load is
+    /// now atomic: baud/PTT are validated as representable BEFORE any
+    /// field is mutated, and the load is rejected outright (returning an
+    /// operator-facing reason, no fields touched) if either isn't. An
+    /// empty port is NOT part of this all-or-nothing check — it's a
+    /// legitimately representable "no port set" state, not an
+    /// unrepresentable value, so it still degrades to "leave the port
+    /// field as-is" rather than blocking the whole load.
+    pub fn load_bookmark(&mut self, idx: usize) -> Result<(), String> {
         let Some(bookmark) = self.bookmarks.get(idx).cloned() else {
-            return;
+            return Ok(());
         };
+        let baud_idx = RIG_BAUD_RATES.iter().position(|b| *b == bookmark.baud_rate);
+        let ptt_idx = rig_ptt_methods()
+            .iter()
+            .position(|m| format!("{:?}", m) == format!("{:?}", bookmark.ptt_method));
+        let (Some(baud_idx), Some(ptt_idx)) = (baud_idx, ptt_idx) else {
+            return Err(format!(
+                "Bookmark '{}' has a baud rate or PTT method the picker doesn't support \
+                 (edit it in pancetta.toml or re-save it from the form) — not loaded",
+                bookmark.name
+            ));
+        };
+
         self.model = bookmark.model;
         self.selected_port_idx = match self
             .available_ports
@@ -953,22 +980,9 @@ impl RigSelectionState {
                 }
             }
         };
-        // I-10 fix (PAN-61 review round 4): a bookmark can carry a baud
-        // rate or PTT method outside the picker's fixed enumerated choices
-        // (reachable via a hand-edited config, even though the TUI's own
-        // save path only ever offers these enumerated values) -- falling
-        // back to a hardcoded index would silently substitute a DIFFERENT
-        // value than what the bookmark actually stored, the same class of
-        // bug as the empty-port fix above. Leave the field at its current
-        // value instead of guessing.
-        self.selected_baud_idx = RIG_BAUD_RATES
-            .iter()
-            .position(|b| *b == bookmark.baud_rate)
-            .unwrap_or(self.selected_baud_idx);
-        self.selected_ptt_idx = rig_ptt_methods()
-            .iter()
-            .position(|m| format!("{:?}", m) == format!("{:?}", bookmark.ptt_method))
-            .unwrap_or(self.selected_ptt_idx);
+        self.selected_baud_idx = baud_idx;
+        self.selected_ptt_idx = ptt_idx;
+        Ok(())
     }
 
     /// The port value to submit — empty string if no ports were enumerated.
@@ -6532,7 +6546,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        state.load_bookmark(0);
+        assert_eq!(state.load_bookmark(0), Ok(()));
         assert_eq!(state.model, "FTdx10");
         assert_eq!(state.selected_port(), "/dev/ttyUSB0");
         assert_eq!(state.selected_baud(), 38400);
@@ -6555,7 +6569,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        state.load_bookmark(0);
+        assert_eq!(state.load_bookmark(0), Ok(()));
         assert_eq!(state.selected_port(), "remote-rig.example:4532");
         assert!(state
             .available_ports
@@ -6583,7 +6597,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        state.load_bookmark(0);
+        assert_eq!(state.load_bookmark(0), Ok(()));
 
         // The bookmark's port is prepended at index 0, shifting the
         // previously-committed /dev/ttyUSB1 from index 1 to index 2.
@@ -6630,7 +6644,7 @@ mod tests {
             }],
             ..Default::default()
         };
-        state.load_bookmark(0);
+        assert_eq!(state.load_bookmark(0), Ok(()));
 
         assert_eq!(
             state.selected_port(),
@@ -6646,14 +6660,16 @@ mod tests {
         assert_eq!(state.model, "FTdx10");
     }
 
-    /// PAN-61 review round 4 (Codex P2): a bookmarked baud rate outside
-    /// `RIG_BAUD_RATES` (reachable via a hand-edited config, even though
-    /// the picker only ever offers the 6 enumerated choices) must not
-    /// silently substitute a hardcoded default -- that would apply a
-    /// DIFFERENT baud rate than the one actually stored.
+    /// PAN-61 review round 5 (Codex P2, escalating round 4's "leave
+    /// unchanged" fix): a bookmarked baud rate outside `RIG_BAUD_RATES`
+    /// (reachable via a hand-edited config, even though the picker only
+    /// ever offers the 6 enumerated choices) has no correct substitute
+    /// value -- the whole load must be rejected, not partially applied
+    /// with the baud field silently left at its prior value.
     #[test]
-    fn rig_selection_state_load_bookmark_with_unsupported_baud_leaves_baud_field_unchanged() {
+    fn rig_selection_state_load_bookmark_with_unsupported_baud_is_rejected() {
         let mut state = RigSelectionState {
+            model: "Unchanged".to_string(),
             selected_baud_idx: 3, // 38400
             bookmarks: vec![pancetta_config::rig::RigBookmark {
                 name: "OddBaud".to_string(),
@@ -6664,19 +6680,30 @@ mod tests {
             }],
             ..Default::default()
         };
-        state.load_bookmark(0);
+        let result = state.load_bookmark(0);
 
+        assert!(
+            result.is_err(),
+            "a bookmark with an unrepresentable baud rate must be rejected outright"
+        );
+        assert!(result.unwrap_err().contains("OddBaud"));
+        assert_eq!(
+            state.model, "Unchanged",
+            "a rejected load must not mutate any field, including the other 3 that would \
+             otherwise have loaded fine"
+        );
         assert_eq!(
             state.selected_baud(),
             38400,
-            "an unsupported bookmarked baud rate must not silently substitute a different value"
+            "a rejected load must leave the baud field untouched"
         );
     }
 
     /// Same class of bug as the baud-rate case above, for PTT method.
     #[test]
-    fn rig_selection_state_load_bookmark_with_unsupported_ptt_leaves_ptt_field_unchanged() {
+    fn rig_selection_state_load_bookmark_with_unsupported_ptt_is_rejected() {
         let mut state = RigSelectionState {
+            model: "Unchanged".to_string(),
             selected_ptt_idx: 1, // Cat
             bookmarks: vec![pancetta_config::rig::RigBookmark {
                 name: "OddPtt".to_string(),
@@ -6688,11 +6715,16 @@ mod tests {
             }],
             ..Default::default()
         };
-        state.load_bookmark(0);
+        let result = state.load_bookmark(0);
 
         assert!(
+            result.is_err(),
+            "a bookmark with an unrepresentable PTT method must be rejected outright"
+        );
+        assert_eq!(state.model, "Unchanged");
+        assert!(
             matches!(state.selected_ptt(), pancetta_config::rig::PttMethod::Cat),
-            "an unsupported bookmarked PTT method must not silently substitute a different value"
+            "a rejected load must leave the PTT field untouched"
         );
     }
 
@@ -6702,7 +6734,7 @@ mod tests {
             model: "Unchanged".to_string(),
             ..Default::default()
         };
-        state.load_bookmark(5);
+        assert_eq!(state.load_bookmark(5), Ok(()));
         assert_eq!(state.model, "Unchanged");
     }
 

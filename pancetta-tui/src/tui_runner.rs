@@ -1160,9 +1160,24 @@ impl TuiRunner {
                             app.status_message = "No saved bookmarks".to_string();
                         } else {
                             let idx = app.rig_selection.selected_bookmark_idx;
-                            app.rig_selection.load_bookmark(idx);
-                            app.rig_selection.bookmark_overlay_visible = false;
-                            app.status_message = "Bookmark loaded — Enter to apply".to_string();
+                            // I-12 fix (PAN-61 review round 5): load_bookmark
+                            // now rejects (rather than partially applying)
+                            // a bookmark with an unrepresentable baud/PTT
+                            // value -- surface that reason and keep the
+                            // overlay open so the operator can pick a
+                            // different bookmark or Esc out, instead of
+                            // silently closing on a load that didn't fully
+                            // happen.
+                            match app.rig_selection.load_bookmark(idx) {
+                                Ok(()) => {
+                                    app.rig_selection.bookmark_overlay_visible = false;
+                                    app.status_message =
+                                        "Bookmark loaded — Enter to apply".to_string();
+                                }
+                                Err(reason) => {
+                                    app.status_message = reason;
+                                }
+                            }
                         }
                     }
                     KeyCode::Char('x') => {

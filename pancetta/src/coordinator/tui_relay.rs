@@ -2361,95 +2361,113 @@ impl super::ApplicationCoordinator {
                                 baud_rate,
                                 ptt_method,
                             };
-                            // I-7 fix (PAN-61 review round 2): stage the
-                            // mutated list without touching the shared
-                            // `cfg.rig.bookmarks` yet. Committing the
-                            // mutation into shared state BEFORE persistence
-                            // is confirmed (round-1's approach) meant a
-                            // failed write left the in-memory list silently
-                            // diverged from disk -- an unrelated LATER save
-                            // would then persist this un-persisted change
-                            // as a side effect, and the operator had no way
-                            // to retry the original failed save directly.
-                            let mut staged = {
-                                let cfg = cmd_config.read().await;
-                                cfg.rig.bookmarks.clone()
-                            };
-                            upsert_rig_bookmark(&mut staged, bookmark);
                             let config_path = dirs::home_dir()
                                 .unwrap_or_else(|| std::path::PathBuf::from("."))
                                 .join(".pancetta")
                                 .join("pancetta.toml");
-                            // I-9 fix (PAN-61 review round 4): persist off
-                            // this loop's own task -- see
-                            // `persist_rig_bookmarks_off_thread`'s doc
-                            // comment for why inline blocking I/O here is
-                            // a TX-safety hazard.
-                            let persist_result = persist_rig_bookmarks_off_thread(
-                                config_path.clone(),
-                                staged.clone(),
-                            )
-                            .await;
-                            let status = if let Err(e) = persist_result {
-                                warn!("Failed to persist rig bookmark: {}", e);
-                                format!("Failed to save bookmark '{}': {}", name, e)
-                            } else {
-                                info!(
-                                    "Persisted rig bookmark '{}' to {}",
-                                    name,
-                                    config_path.display()
-                                );
-                                // Only now, with the write confirmed on
-                                // disk, commit the staged list into shared
-                                // state and resync the TUI.
-                                {
-                                    let mut cfg = cmd_config.write().await;
-                                    cfg.rig.bookmarks = staged.clone();
-                                }
-                                let _ = cmd_tui_msg_tx.send(
-                                    pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
-                                        bookmarks: staged.clone(),
+                            // I-11 fix (PAN-61 review round 5): don't await
+                            // persistence inline in this loop's own future.
+                            // `spawn_blocking` alone (round 4) frees the
+                            // underlying OS thread, but the JoinHandle
+                            // `.await` still suspends THIS relay loop's own
+                            // task until it resolves -- and this is the one
+                            // and only task dequeuing
+                            // OperatorEmergencyStop/StopTx/TogglePtt/
+                            // AbortQso, so it still delayed those commands
+                            // by exactly the write's duration. Spawn a
+                            // fully detached task instead (mirrors the
+                            // existing SelectRig Hamlib-reconnect-wait
+                            // pattern elsewhere in this match): the arm
+                            // hands off and returns to `try_recv`
+                            // immediately.
+                            let task_config = cmd_config.clone();
+                            let task_tui_msg_tx = cmd_tui_msg_tx.clone();
+                            tokio::spawn(async move {
+                                // I-7 fix (PAN-61 review round 2): stage the
+                                // mutated list without touching the shared
+                                // `cfg.rig.bookmarks` yet. Committing the
+                                // mutation into shared state BEFORE
+                                // persistence is confirmed (round-1's
+                                // approach) meant a failed write left the
+                                // in-memory list silently diverged from
+                                // disk -- an unrelated LATER save would
+                                // then persist this un-persisted change as
+                                // a side effect, and the operator had no
+                                // way to retry the original failed save
+                                // directly.
+                                let mut staged = {
+                                    let cfg = task_config.read().await;
+                                    cfg.rig.bookmarks.clone()
+                                };
+                                upsert_rig_bookmark(&mut staged, bookmark);
+                                let persist_result = persist_rig_bookmarks_off_thread(
+                                    config_path.clone(),
+                                    staged.clone(),
+                                )
+                                .await;
+                                let status = if let Err(e) = persist_result {
+                                    warn!("Failed to persist rig bookmark: {}", e);
+                                    format!("Failed to save bookmark '{}': {}", name, e)
+                                } else {
+                                    info!(
+                                        "Persisted rig bookmark '{}' to {}",
+                                        name,
+                                        config_path.display()
+                                    );
+                                    // Only now, with the write confirmed on
+                                    // disk, commit the staged list into
+                                    // shared state and resync the TUI.
+                                    {
+                                        let mut cfg = task_config.write().await;
+                                        cfg.rig.bookmarks = staged.clone();
+                                    }
+                                    let _ = task_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
+                                            bookmarks: staged.clone(),
+                                        },
+                                    );
+                                    rig_bookmark_saved_status(&name, staged.len())
+                                };
+                                let _ = task_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "rig".to_string(),
+                                        status,
                                     },
                                 );
-                                rig_bookmark_saved_status(&name, staged.len())
-                            };
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                    component: "rig".to_string(),
-                                    status,
-                                },
-                            );
+                            });
                         }
                         pancetta_tui::tui_runner::TuiCommand::DeleteRigBookmark { name } => {
                             info!("TUI DeleteRigBookmark: name={}", name);
-                            // I-7 fix (PAN-61 review round 2): same
-                            // stage-then-commit-on-success pattern as
-                            // SaveRigBookmark above -- see its comment for
-                            // why committing the mutation before persist is
-                            // confirmed is unsafe.
-                            let mut staged = {
-                                let cfg = cmd_config.read().await;
-                                cfg.rig.bookmarks.clone()
-                            };
-                            let before = staged.len();
-                            staged.retain(|b| b.name != name);
-                            let found = staged.len() != before;
-                            if !found {
-                                let _ = cmd_tui_msg_tx.send(
-                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
-                                        component: "rig".to_string(),
-                                        status: format!("No bookmark named '{}'", name),
-                                    },
-                                );
-                            } else {
-                                let config_path = dirs::home_dir()
-                                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                    .join(".pancetta")
-                                    .join("pancetta.toml");
-                                // I-9 fix (PAN-61 review round 4): persist
-                                // off this loop's own task -- see
-                                // `persist_rig_bookmarks_off_thread`'s doc
-                                // comment.
+                            let config_path = dirs::home_dir()
+                                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                .join(".pancetta")
+                                .join("pancetta.toml");
+                            // I-11 fix (PAN-61 review round 5): see
+                            // SaveRigBookmark's comment above -- persistence
+                            // must run in a fully detached task, not
+                            // awaited inline in this relay loop.
+                            let task_config = cmd_config.clone();
+                            let task_tui_msg_tx = cmd_tui_msg_tx.clone();
+                            tokio::spawn(async move {
+                                // I-7 fix (PAN-61 review round 2): same
+                                // stage-then-commit-on-success pattern as
+                                // SaveRigBookmark above.
+                                let mut staged = {
+                                    let cfg = task_config.read().await;
+                                    cfg.rig.bookmarks.clone()
+                                };
+                                let before = staged.len();
+                                staged.retain(|b| b.name != name);
+                                let found = staged.len() != before;
+                                if !found {
+                                    let _ = task_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "rig".to_string(),
+                                            status: format!("No bookmark named '{}'", name),
+                                        },
+                                    );
+                                    return;
+                                }
                                 let persist_result = persist_rig_bookmarks_off_thread(
                                     config_path.clone(),
                                     staged.clone(),
@@ -2465,23 +2483,23 @@ impl super::ApplicationCoordinator {
                                         config_path.display()
                                     );
                                     {
-                                        let mut cfg = cmd_config.write().await;
+                                        let mut cfg = task_config.write().await;
                                         cfg.rig.bookmarks = staged.clone();
                                     }
-                                    let _ = cmd_tui_msg_tx.send(
+                                    let _ = task_tui_msg_tx.send(
                                         pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
                                             bookmarks: staged.clone(),
                                         },
                                     );
                                     format!("Deleted bookmark '{}'", name)
                                 };
-                                let _ = cmd_tui_msg_tx.send(
+                                let _ = task_tui_msg_tx.send(
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                         component: "rig".to_string(),
                                         status,
                                     },
                                 );
-                            }
+                            });
                         }
                         pancetta_tui::tui_runner::TuiCommand::ToggleFoxMode => {
                             // Operator pressed `Shift+X`: toggle Fox mode.
