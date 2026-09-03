@@ -2423,14 +2423,27 @@ impl TuiRunner {
         let mut lines: u16 = 1;
         let mut col = 0usize;
         for word in text.split_whitespace() {
-            let word_len = word.chars().count();
+            let mut remaining = word.chars().count();
             let sep = if col == 0 { 0 } else { 1 };
-            if col != 0 && col + sep + word_len > width {
-                lines += 1;
-                col = word_len.min(width);
-            } else {
-                col += sep + word_len;
+            if col + sep + remaining <= width {
+                col += sep + remaining;
+                continue;
             }
+            // Doesn't fit on the current line: wrap to a fresh one first.
+            if col != 0 {
+                lines += 1;
+            }
+            // A single word wider than the entire line (e.g. a long device
+            // path with no internal whitespace to break on) must itself
+            // hard-wrap across as many lines as it needs — round-1 review
+            // finding on PAN-66's original fix undercounted this exact case
+            // (an edited Port field wrapping consumed a row the footer's
+            // reservation didn't account for, clipping the footer again).
+            while remaining > width {
+                lines += 1;
+                remaining -= width;
+            }
+            col = remaining;
         }
         lines
     }
@@ -2459,31 +2472,6 @@ impl TuiRunner {
         const FOOTER: &str =
             "Tab: next | Up/Down: change | F2: load | F3: save | Enter: apply | Esc: cancel";
 
-        let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
-        let inner_width = modal_width.saturating_sub(2);
-        let footer_lines = Self::wrapped_line_count(FOOTER, inner_width);
-        // border(2, title rides the top border row) + 4 fields + blank + footer rows
-        let modal_height = (2 + 4 + 1 + footer_lines).min(area.height);
-
-        let modal_area = Rect {
-            x: (area.width.saturating_sub(modal_width)) / 2,
-            y: (area.height.saturating_sub(modal_height)) / 2,
-            width: modal_width,
-            height: modal_height,
-        };
-
-        // Clear background behind modal
-        f.render_widget(ratatui::widgets::Clear, modal_area);
-
-        let outer_block = Block::default()
-            .title(" Rig Config ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Double)
-            .style(Style::default().bg(Color::Black).fg(Color::White));
-
-        let inner = outer_block.inner(modal_area);
-        f.render_widget(outer_block, modal_area);
-
         let fields: [(&str, String, bool); 4] = [
             (
                 "Model",
@@ -2506,6 +2494,42 @@ impl TuiRunner {
                 state.active_field == RigField::Ptt,
             ),
         ];
+
+        let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
+        let inner_width = modal_width.saturating_sub(2);
+        // Every rendered line can wrap — not just the footer. A long edited
+        // value (e.g. a `/dev/serial/by-id/...` port path) wraps exactly
+        // like the footer does, and the modal must reserve its rows too, or
+        // a wrapped field pushes into the footer's space and clips it right
+        // back (round-1 review finding, PAN-66).
+        let field_rows: u16 = fields
+            .iter()
+            .map(|(label, value, _)| {
+                Self::wrapped_line_count(&format!("{:>6}: {value}", label), inner_width)
+            })
+            .sum();
+        let footer_lines = Self::wrapped_line_count(FOOTER, inner_width);
+        // border(2, title rides the top border row) + field rows + blank + footer rows
+        let modal_height = (2 + field_rows + 1 + footer_lines).min(area.height);
+
+        let modal_area = Rect {
+            x: (area.width.saturating_sub(modal_width)) / 2,
+            y: (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        };
+
+        // Clear background behind modal
+        f.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let outer_block = Block::default()
+            .title(" Rig Config ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+
+        let inner = outer_block.inner(modal_area);
+        f.render_widget(outer_block, modal_area);
 
         let mut lines: Vec<Line> = Vec::with_capacity(fields.len() + 2);
         for (label, value, active) in &fields {
@@ -3205,6 +3229,47 @@ mod key_tests {
                 })
                 .unwrap();
         }
+    }
+
+    /// PAN-66 round-1 review: a wrapped FIELD line (not just the footer)
+    /// must not consume the footer's reserved space. A long edited port
+    /// path (e.g. `/dev/serial/by-id/...`) forces the Port field to wrap at
+    /// the modal's clamped inner width — the full footer, including its
+    /// last word, must still render unclipped.
+    #[test]
+    fn rig_modal_footer_survives_a_wrapped_field_value() {
+        use crate::app::RigSelectionState;
+        use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+        let long_port = "/dev/serial/by-id/usb-Yaesu_Corporation_FTdx10_00000000-if00-port0";
+        let mut state = RigSelectionState::new();
+        state.visible = true;
+        state.available_ports = vec![long_port.to_string()];
+        state.selected_port_idx = 0;
+        state.model = "FTdx10".to_string();
+
+        let backend = TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                TuiRunner::render_rig_selection_modal(f, f.area(), &state);
+            })
+            .unwrap();
+
+        let buf: Buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("Esc: cancel")),
+            "footer's last word must render unclipped even with a wrapped field \
+             above it; rendered rows:\n{}",
+            rows.join("\n")
+        );
     }
 
     /// Task 20f: confirm-on-`x`. A single press must NOT clear (it only
