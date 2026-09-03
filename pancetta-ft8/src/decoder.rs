@@ -3453,12 +3453,19 @@ impl Ft8Decoder {
             let mut ft8lib_seed_keys: std::collections::HashSet<(usize, usize, usize)> =
                 std::collections::HashSet::new();
             let mut translated = 0usize;
-            // Set only when the FFI seed search actually ran (budget had
-            // time) -- `(elapsed_ms, raw)`. The `S0-ft8lib-seed` budget
-            // stage is pushed from this, AFTER the merge decision below,
-            // since its `kept_seeds` counter needs the FINAL merged
-            // `sync_candidates` regardless of which merge path was taken.
-            let mut seed_search_timing: Option<(u32, usize)> = None;
+            // Set whenever `should_run_seed_union` is true (regardless of
+            // whether the FFI itself ran) -- `(seed_start, raw)`. The
+            // `S0-ft8lib-seed` budget stage is pushed from this, AFTER the
+            // merge decision below, for two reasons (Codex round-1
+            // findings on PR #343): its `kept_seeds` counter needs the
+            // FINAL merged `sync_candidates`, which doesn't exist until
+            // the merge decision has run; and `elapsed_ms` must be
+            // measured from `seed_start` through the END of whichever
+            // merge/finalize branch runs (PAN-47's full pre-cap NMS pass
+            // is real, seed-search-attributable cost, not just the FFI
+            // call itself) rather than stopping the clock right after
+            // translation the way an earlier revision of this fix did.
+            let mut seed_search_timing: Option<(std::time::Instant, usize)> = None;
             // PAN-32: FT2 has no ft8_lib counterpart, so every seed is rejected
             // downstream by the translator's block_size guard anyway — skip the
             // FFI search entirely rather than pay its wall-clock cost for zero
@@ -3476,6 +3483,14 @@ impl Ft8Decoder {
             // check here could disagree with the first and leave the
             // candidate list with NO NMS pass at all.
             if should_run_seed_union {
+                // Captured once, at the very top, so it spans everything
+                // attributable to the seed-union attempt -- the FFI call
+                // (when it runs) AND the merge/finalize branch afterward
+                // (Codex round-1 finding on PR #343: an earlier revision
+                // stopped the clock right after translation, undercounting
+                // PAN-47's now-real full pre-cap NMS pass whenever the
+                // union path is taken).
+                let seed_start = std::time::Instant::now();
                 // PAN-46 (Codex round-3 finding on PR #306, PAN-31
                 // follow-up): `should_run_seed_union` above is frozen ONCE,
                 // before the native Costas search and the optional
@@ -3495,6 +3510,16 @@ impl Ft8Decoder {
                 // the deferred NMS `defer_nms` (used above) skipped on
                 // the assumption a merge here would supply it.
                 if !self.current_budget.has_time() {
+                    // Codex round-1 finding on PR #343: optional work (the
+                    // seed search) was explicitly cut short by the
+                    // deadline -- the coordinator's budget-exhausted
+                    // indication must reflect that, the same as every
+                    // other has_time()-gated skip in this file (see e.g.
+                    // the multipass-outer stage above). `raw = 0` in the
+                    // recorded stage below: the FFI never ran, so there's
+                    // nothing to report beyond "this stage was skipped".
+                    self.current_budget_report.budget_exhausted = true;
+                    seed_search_timing = Some((seed_start, 0));
                     debug!(
                         target: "ft8.seed",
                         cap = self.config.max_sync_candidates,
@@ -3502,8 +3527,6 @@ impl Ft8Decoder {
                          skipped, deferred NMS applied to native/sweep candidates only"
                     );
                 } else {
-                    let seed_start = std::time::Instant::now();
-
                     // Reproduce the native sweep's envelope EXACTLY (see
                     // `costas_sync_search_with_threshold_and_partner`). Seeds must
                     // obey the same bounds natives do, or the "scoped out of range
@@ -3620,32 +3643,44 @@ impl Ft8Decoder {
                     // which is what the whole measurement runs under — but without
                     // it the flag is a latent Eco / Auto+Slow regression, where the
                     // entire per-window budget is 1 ms and this pass runs before
-                    // the pass's first `has_time()` checkpoint. Stage push itself
-                    // deferred to after the merge decision below — see
-                    // `seed_search_timing`'s doc comment.
-                    let elapsed_ms = seed_start.elapsed().as_millis() as u32;
-                    seed_search_timing = Some((elapsed_ms, raw));
+                    // the pass's first `has_time()` checkpoint. Stage push (and
+                    // the `elapsed_ms` it needs) deferred to after the merge
+                    // decision below — see `seed_search_timing`'s doc comment.
+                    seed_search_timing = Some((seed_start, raw));
                 }
             }
 
-            // Merge decision (PAN-48): when the seed search actually
-            // translated at least one usable seed, the union genuinely
-            // differs from native/sweep-only, so the PAN-31 union-wide NMS
-            // pass is correct and necessary — a candidate from one sweep
-            // (or a seed) may legitimately need to suppress, or be
-            // suppressed by, a candidate from a DIFFERENT sweep/seed, which
-            // per-group NMS could never see. When it translated NOTHING —
-            // `ft8lib_sync_seeds_enabled` was on, but this window yielded no
-            // usable seed (e.g. an `ft8lib_stub` build, or genuinely none
-            // found), or PAN-46 skipped the FFI call on an expired budget —
-            // the union is IDENTICAL to native/sweep-only, so this restores
-            // the exact ORIGINAL (flag-off) per-sweep NMS placement instead
-            // of the union pass, preserving the documented byte-identical-
-            // when-no-seeds guarantee: research deltas measured with the
-            // flag toggled then genuinely come from seeds, not from an
+            // Merge decision (PAN-48): the union-wide NMS pass is only
+            // correct/necessary when a seed actually adds or alters a
+            // candidate — a candidate from one sweep (or a genuinely novel
+            // seed) may legitimately need to suppress, or be suppressed
+            // by, a candidate from a DIFFERENT sweep/seed, which per-group
+            // NMS could never see. Codex round-1 finding on PR #343:
+            // gating this on `translated > 0` (raw translated count) was
+            // too loose — the common saturated-window case (see the
+            // seed-survival tests) is every translated seed landing on a
+            // key `sweep_candidate_groups` ALREADY has, which
+            // `finalize_native_and_seed_candidate_union`'s exact-key dedup
+            // removes immediately; `ft8lib_seed_keys` (novel keys only) is
+            // then empty even though `translated > 0`, and taking the
+            // union path anyway still merges all sweeps together for ONE
+            // NMS pass — changing the candidate set purely because
+            // separate spectral sweeps can now suppress each other, not
+            // because seeding added anything. `!ft8lib_seed_keys.is_empty()`
+            // is the actual criterion: did a seed add a genuinely new
+            // position. When it's empty (no usable seed at all —
+            // `ft8lib_sync_seeds_enabled` was on but this window yielded
+            // nothing, e.g. an `ft8lib_stub` build; PAN-46 skipped the FFI
+            // call on an expired budget; or every translated seed
+            // duplicated an existing key), the union is IDENTICAL to
+            // native/sweep-only, so this restores the exact ORIGINAL
+            // (flag-off) per-sweep NMS placement instead of the union
+            // pass, preserving the documented byte-identical-when-no-
+            // seeds guarantee: research deltas measured with the flag
+            // toggled then genuinely come from seeds, not from an
             // incidentally different NMS grouping.
             let mut sync_candidates: Vec<CostasCandidate>;
-            if translated > 0 {
+            if !ft8lib_seed_keys.is_empty() {
                 sync_candidates = sweep_candidate_groups.into_iter().flatten().collect();
                 sync_candidates.extend(seed_candidates);
                 // Dedup exact-key collisions, cap, and (PAN-31) re-run NMS
@@ -3671,13 +3706,16 @@ impl Ft8Decoder {
                     cap = self.config.max_sync_candidates,
                     "PAN-7 ft8_lib sync-seed union"
                 );
-            } else {
-                // No seed contributed anything (or the seed search never
-                // ran/was skipped) — if the sweeps deferred their own NMS on
-                // the expectation a union pass would supply it, supply it
-                // NOW, but per-group (mirroring exactly what each sweep
-                // would have applied internally had `defer_nms` been
-                // `false`) rather than across the merged set.
+            } else if sweep_candidate_groups.len() > 1 {
+                // No seed contributed a genuinely novel position (or the
+                // seed search never ran/was skipped), but MULTIPLE sweeps
+                // did run (hb-228) — a real merge across groups is needed
+                // regardless of seeding. If the sweeps deferred their own
+                // NMS on the expectation a union pass would supply it,
+                // supply it NOW, but per-group (mirroring exactly what
+                // each sweep would have applied internally had
+                // `defer_nms` been `false`) rather than across the merged
+                // set.
                 if defer_nms && self.config.nms_enabled {
                     for group in sweep_candidate_groups.iter_mut() {
                         self.nms_candidates(group);
@@ -3686,9 +3724,7 @@ impl Ft8Decoder {
                 sync_candidates = sweep_candidate_groups.into_iter().flatten().collect();
                 // Dedup exact (time,freq) collisions (keeping the highest sync
                 // score), re-sort best-first, and restore the configured cap —
-                // identical to the original hb-228 merge tail. Idempotent when
-                // there was only ever one group (no NMS re-application, since
-                // that group's own internal NMS/dedup/truncate already ran).
+                // identical to the original hb-228 merge tail.
                 sync_candidates.sort_by(|a, b| {
                     (a.time_step, a.freq_bin, a.freq_sub)
                         .cmp(&(b.time_step, b.freq_bin, b.freq_sub))
@@ -3705,15 +3741,44 @@ impl Ft8Decoder {
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
                 sync_candidates.truncate(self.config.max_sync_candidates);
+            } else {
+                // Codex round-1 finding on PR #343: exactly ONE sweep ran
+                // (hb-228 off) and no seed changed anything — there is no
+                // merge to do at all, so none may run. The original
+                // flag-off/no-three-method path never touched this
+                // group's own output past what
+                // `costas_sync_search_with_threshold_and_partner` itself
+                // already returned (sorted, capped, and — when `!defer_nms`
+                // — NMS'd internally); re-sorting/deduping/truncating it
+                // again here is not a no-op in every configuration.
+                // `costas_two_baseline_enabled` (with `nms_enabled: false`)
+                // deliberately leaves same-key candidates with different
+                // refinements for downstream evaluation to choose between
+                // — an unconditional `dedup_by_key` would silently discard
+                // one, changing the candidate count/composition even
+                // though neither multi-sweep merging nor seeding ever
+                // occurred. Only apply the deferred per-group NMS (if
+                // `defer_nms` was true) and use that group's own output
+                // as-is.
+                if defer_nms && self.config.nms_enabled {
+                    for group in sweep_candidate_groups.iter_mut() {
+                        self.nms_candidates(group);
+                    }
+                }
+                sync_candidates = sweep_candidate_groups.into_iter().flatten().collect();
             }
 
-            // Budget-report stage push, deferred until here (only when the
-            // FFI search actually ran — see `seed_search_timing`): its
-            // `kept_seeds` counter is seeds BOTH novel AND surviving the
+            // Budget-report stage push, deferred until here (only when
+            // `should_run_seed_union` was true — see `seed_search_timing`):
+            // its `kept_seeds` counter is seeds BOTH novel AND surviving the
             // FINAL merged/capped `sync_candidates`, which only exists now
-            // that the merge decision above has run, regardless of which
-            // branch it took.
-            if let Some((elapsed_ms, raw)) = seed_search_timing {
+            // that the merge decision above has run; and `elapsed_ms` is
+            // measured from `seed_start` through the END of whichever merge
+            // branch just ran, so it includes that branch's real cost
+            // (Codex round-1 finding on PR #343 — see `seed_search_timing`'s
+            // doc comment).
+            if let Some((seed_start, raw)) = seed_search_timing {
+                let elapsed_ms = seed_start.elapsed().as_millis() as u32;
                 let kept_seeds = sync_candidates
                     .iter()
                     .filter(|c| ft8lib_seed_keys.contains(&(c.time_step, c.freq_bin, c.freq_sub)))
