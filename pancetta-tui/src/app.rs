@@ -6423,9 +6423,11 @@ mod tests {
 
     #[test]
     fn rig_selection_state_move_up_down_clamp_on_baud_field() {
-        let mut state = RigSelectionState::default();
-        state.active_field = RigField::Baud;
-        state.selected_baud_idx = 0;
+        let mut state = RigSelectionState {
+            active_field: RigField::Baud,
+            selected_baud_idx: 0,
+            ..Default::default()
+        };
         state.move_up();
         assert_eq!(state.selected_baud_idx, 0, "must clamp at 0, not wrap");
 
