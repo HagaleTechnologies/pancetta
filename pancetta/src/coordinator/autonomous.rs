@@ -495,6 +495,36 @@ pub(crate) struct SlotPlan {
 /// `self_cq_emitted` is `true` iff `decide_at`'s actions this cycle included
 /// a self-CQ (`Transmit` with `qso_id: None` and CQ-shaped text — distinct
 /// from a pounce opening, which doesn't affect the no-response streak).
+/// Drain the queue-independent self-CQ dispatch-failure fallback
+/// (`ApplicationCoordinator::pending_autonomous_cq_dispatch_failures`) into
+/// real rollbacks against the live operator.
+///
+/// PAN-43/45 follow-up (Codex round 2 on PR #342): the QSO task falls back
+/// to pushing an `attempt_id` onto this shared list once its own bounded
+/// `AutonomousCqDispatchFailed` message-bus retries are exhausted --
+/// mirroring `hamlib_pending_frequency`'s (PAN-19 round 10) shared-state
+/// pattern for the identical class of problem. This is the other half:
+/// called once per `slot_interval` tick, entirely independent of this
+/// task's own message-bus channel, so it drains correctly no matter how
+/// congested that channel currently is. Behavior is intentionally
+/// identical to the message-driven `AutonomousCqDispatchFailed` handler in
+/// the same task's `select!` loop -- same two calls, same order.
+fn drain_pending_autonomous_cq_dispatch_failures(
+    op: &mut pancetta_qso::AutonomousOperator,
+    pending_self_cq_qsos: &mut std::collections::HashMap<String, u64>,
+    pending_autonomous_cq_dispatch_failures: &std::sync::Mutex<Vec<u64>>,
+) {
+    let failed_attempts: Vec<u64> = std::mem::take(
+        &mut *pending_autonomous_cq_dispatch_failures
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    for attempt_id in failed_attempts {
+        op.restore_cq_state_for_attempt(attempt_id);
+        pending_self_cq_qsos.retain(|_, id| *id != attempt_id);
+    }
+}
+
 pub(crate) fn self_cq_suppressed(
     self_cq_emitted: bool,
     runtime_gate_open: bool,
@@ -1028,6 +1058,13 @@ impl super::ApplicationCoordinator {
         // degradation in coverage at the parked bin, independent of the
         // TUI-side transient warning (Task 14).
         let tx_offset_hold_hz = self.tx_offset_hold_hz();
+        // PAN-43/45 follow-up (Codex round 2 on PR #342): the
+        // queue-independent fallback the QSO task falls back to once its
+        // own bounded `AutonomousCqDispatchFailed` message-bus retries are
+        // exhausted -- drained once per `slot_interval` tick below,
+        // independent of this task's own message-bus channel entirely.
+        let pending_autonomous_cq_dispatch_failures =
+            self.pending_autonomous_cq_dispatch_failures.clone();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -1100,6 +1137,23 @@ impl super::ApplicationCoordinator {
                             }
 
                             let mut op = operator.lock().await;
+
+                            // PAN-43/45 follow-up (Codex round 2 on PR
+                            // #342): drain any self-CQ dispatch failures
+                            // the QSO task couldn't deliver through the
+                            // message bus even after its own bounded
+                            // retries (sustained backpressure on this
+                            // task's own channel) -- queue-independent, so
+                            // this always succeeds regardless of how
+                            // congested that channel currently is. Mirrors
+                            // exactly what the message-driven
+                            // `AutonomousCqDispatchFailed` handler below
+                            // does.
+                            drain_pending_autonomous_cq_dispatch_failures(
+                                &mut op,
+                                &mut pending_self_cq_qsos,
+                                &pending_autonomous_cq_dispatch_failures,
+                            );
 
                             // Update spectral data from waterfall
                             if let Ok(rows) = waterfall_to_auto_rx.try_recv() {
@@ -2710,6 +2764,91 @@ mod self_cq_suppressed_tests {
     #[test]
     fn dry_run_suppresses_self_cq() {
         assert!(self_cq_suppressed(true, true, TxPolicy::Full, true, true));
+    }
+}
+
+#[cfg(test)]
+mod drain_pending_autonomous_cq_dispatch_failures_tests {
+    use super::*;
+
+    #[allow(clippy::field_reassign_with_default)]
+    fn operator_with_one_real_self_cq_dispatched() -> (pancetta_qso::AutonomousOperator, u64) {
+        let mut config = pancetta_qso::AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = pancetta_qso::SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 2;
+        config.listen_cycle.initial_interval = 100;
+        let mut op =
+            pancetta_qso::AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        op.decide_at(0); // idle
+        op.decide_at(0); // CQ -- takes a real snapshot
+        let attempt_id = op
+            .last_cq_attempt_id()
+            .expect("a self-CQ ran this cycle and took a snapshot");
+        (op, attempt_id)
+    }
+
+    /// PAN-43/45 follow-up (Codex round 2 on PR #342) regression: before
+    /// this fix, an `attempt_id` that never got through the QSO task's
+    /// message-bus retries was lost entirely -- nothing ever drained
+    /// `pending_autonomous_cq_dispatch_failures` into a real rollback.
+    /// `last_cq_attempt_id()` going from `Some` to `None` is the
+    /// observable proof that `restore_cq_state_for_attempt` (a private
+    /// `pancetta-qso` method, not directly assertable from this crate)
+    /// actually ran for this exact attempt, via its `.take()` on the
+    /// matching snapshot.
+    #[test]
+    fn drains_a_pending_failure_into_a_real_rollback() {
+        let (mut op, attempt_id) = operator_with_one_real_self_cq_dispatched();
+        let mut pending_self_cq_qsos: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::from([("some-qso-id".to_string(), attempt_id)]);
+        let pending_failures = std::sync::Mutex::new(vec![attempt_id]);
+
+        drain_pending_autonomous_cq_dispatch_failures(
+            &mut op,
+            &mut pending_self_cq_qsos,
+            &pending_failures,
+        );
+
+        assert!(
+            op.last_cq_attempt_id().is_none(),
+            "the drain must actually invoke restore_cq_state_for_attempt for this attempt, \
+             not just clear the pending list"
+        );
+        assert!(
+            pending_failures.lock().unwrap().is_empty(),
+            "a drained failure must be removed from the pending list, not reprocessed forever"
+        );
+        assert!(
+            pending_self_cq_qsos.is_empty(),
+            "the matching pending_self_cq_qsos entry must be cleaned up too, mirroring the \
+             message-driven AutonomousCqDispatchFailed handler"
+        );
+    }
+
+    #[test]
+    fn an_empty_pending_list_is_a_complete_no_op() {
+        let (mut op, attempt_id) = operator_with_one_real_self_cq_dispatched();
+        let mut pending_self_cq_qsos: std::collections::HashMap<String, u64> =
+            std::collections::HashMap::new();
+        let pending_failures = std::sync::Mutex::new(Vec::new());
+
+        drain_pending_autonomous_cq_dispatch_failures(
+            &mut op,
+            &mut pending_self_cq_qsos,
+            &pending_failures,
+        );
+
+        assert_eq!(
+            op.last_cq_attempt_id(),
+            Some(attempt_id),
+            "nothing pending must mean nothing is touched"
+        );
     }
 }
 

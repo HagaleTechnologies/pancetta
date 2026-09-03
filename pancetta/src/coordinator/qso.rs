@@ -1213,6 +1213,7 @@ async fn notify_autonomous_cq_dispatch_failed_if_self_cq(
     message_bus: &MessageBus,
     callsign: &Option<String>,
     cq_attempt_id: Option<u64>,
+    pending_dispatch_failures: &std::sync::Mutex<Vec<u64>>,
 ) {
     let (None, Some(attempt_id)) = (callsign, cq_attempt_id) else {
         return;
@@ -1243,12 +1244,28 @@ async fn notify_autonomous_cq_dispatch_failed_if_self_cq(
             Ok(false) => match RETRY_DELAYS_MS.get(attempt) {
                 Some(&delay_ms) => tokio::time::sleep(Duration::from_millis(delay_ms)).await,
                 None => {
-                    error!(
-                        "AutonomousCqDispatchFailed dropped for attempt {} after {} attempts \
-                         -- its speculative streak/offset mutation may remain uncorrected",
+                    // PAN-43/45 follow-up (Codex round 2 on PR #342): the
+                    // message-bus retries above are still bounded by a
+                    // ~75ms budget -- sustained congestion past that
+                    // window (the Autonomous task itself stuck/backlogged,
+                    // not just a momentary blip) would otherwise still
+                    // drop this permanently. Fall back to shared state the
+                    // Autonomous task drains directly every
+                    // `slot_interval` tick, independent of its own
+                    // message-bus channel entirely -- same pattern as
+                    // `hamlib_pending_frequency` (PAN-19 round 10) for the
+                    // identical class of problem.
+                    warn!(
+                        "AutonomousCqDispatchFailed dropped for attempt {} after {} \
+                         message-bus attempts -- falling back to the queue-independent \
+                         pending-failures list",
                         attempt_id,
                         RETRY_DELAYS_MS.len() + 1
                     );
+                    pending_dispatch_failures
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .push(attempt_id);
                 }
             },
             Err(e) => {
@@ -1532,8 +1549,9 @@ mod pan6_diagnostic_tests {
     async fn dispatch_failed_notification_sends_exactly_once_when_delivered_immediately() {
         let bus = MessageBus::new(16).unwrap();
         let (_sender, receiver) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let pending = std::sync::Mutex::new(Vec::new());
 
-        notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(42)).await;
+        notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(42), &pending).await;
 
         let message = receiver
             .try_recv()
@@ -1547,6 +1565,10 @@ mod pan6_diagnostic_tests {
         assert!(
             receiver.try_recv().is_err(),
             "must send exactly once when the first attempt is delivered, not keep retrying"
+        );
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "the queue-independent fallback must NOT be used when the bus delivery succeeded"
         );
     }
 
@@ -1591,7 +1613,8 @@ mod pan6_diagnostic_tests {
             }
         });
 
-        notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(99)).await;
+        let pending = std::sync::Mutex::new(Vec::new());
+        notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(99), &pending).await;
 
         let message = tokio::time::timeout(Duration::from_secs(1), async {
             loop {
@@ -1612,20 +1635,36 @@ mod pan6_diagnostic_tests {
             ),
             other => panic!("expected AutonomousCqDispatchFailed, got {other:?}"),
         }
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "the queue-independent fallback must NOT be used when a retry succeeded"
+        );
     }
 
-    /// A permanently unreachable destination (no channel registered at
-    /// all) must still cause this to return in bounded time -- not hang or
-    /// retry forever.
+    /// PAN-43/45 follow-up (Codex round 2 on PR #342) regression: a
+    /// destination that stays unreachable through every bounded
+    /// message-bus retry (here: no channel registered at all, simulating
+    /// sustained congestion outlasting the ~75ms retry budget) must fall
+    /// back to the queue-independent pending-failures list instead of
+    /// silently losing the rollback forever -- and must still return in
+    /// bounded time, not hang.
     #[tokio::test]
-    async fn dispatch_failed_notification_gives_up_within_a_bounded_time_when_never_delivered() {
+    async fn dispatch_failed_notification_falls_back_to_the_pending_list_when_never_delivered_via_the_bus(
+    ) {
         let bus = MessageBus::new(16).unwrap(); // no Autonomous channel registered
+        let pending = std::sync::Mutex::new(Vec::new());
         tokio::time::timeout(
             Duration::from_secs(2),
-            notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(7)),
+            notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(7), &pending),
         )
         .await
-        .expect("must give up after its bounded retries, not hang indefinitely");
+        .expect("must give up on the bus after its bounded retries, not hang indefinitely");
+        assert_eq!(
+            *pending.lock().unwrap(),
+            vec![7],
+            "a rollback that never got through the bus must land in the queue-independent \
+             fallback instead of being lost"
+        );
     }
 }
 
@@ -2088,6 +2127,8 @@ impl super::ApplicationCoordinator {
             .await?;
         let message_bus = self.message_bus.clone();
         let display_feed_enabled = self.display_feed_enabled.clone();
+        let pending_autonomous_cq_dispatch_failures =
+            self.pending_autonomous_cq_dispatch_failures.clone();
 
         // Read station config for callsign/grid
         let config = self.config.read().await;
@@ -3840,6 +3881,7 @@ impl super::ApplicationCoordinator {
                                                     &message_bus,
                                                     &callsign,
                                                     cq_attempt_id,
+                                                    &pending_autonomous_cq_dispatch_failures,
                                                 )
                                                 .await;
                                                 continue;
@@ -3983,6 +4025,7 @@ impl super::ApplicationCoordinator {
                                                         &message_bus,
                                                         &callsign,
                                                         cq_attempt_id,
+                                                        &pending_autonomous_cq_dispatch_failures,
                                                     )
                                                     .await;
                                                 }
