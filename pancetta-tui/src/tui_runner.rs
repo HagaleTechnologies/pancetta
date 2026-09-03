@@ -2410,6 +2410,31 @@ impl TuiRunner {
     /// Render the rig-config picker as a centered modal (PAN-59). Mirrors
     /// `render_device_selection_modal`'s sizing/centering/clear idiom, but as
     /// a 4-field single form (model/port/baud/PTT) instead of a 2-panel list.
+    /// Number of rows `text` wraps into at `width` columns under greedy
+    /// word-boundary wrapping — mirrors ratatui's `Wrap { trim: true }`
+    /// closely enough to size a modal that must reserve exactly the rows
+    /// it renders (PAN-66: the rig-config modal's key legend was clipped
+    /// because its reserved height never accounted for wrapping at all).
+    fn wrapped_line_count(text: &str, width: u16) -> u16 {
+        if width == 0 {
+            return 1;
+        }
+        let width = width as usize;
+        let mut lines: u16 = 1;
+        let mut col = 0usize;
+        for word in text.split_whitespace() {
+            let word_len = word.chars().count();
+            let sep = if col == 0 { 0 } else { 1 };
+            if col != 0 && col + sep + word_len > width {
+                lines += 1;
+                col = word_len.min(width);
+            } else {
+                col += sep + word_len;
+            }
+        }
+        lines
+    }
+
     fn render_rig_selection_modal(
         f: &mut Frame,
         area: Rect,
@@ -2431,9 +2456,14 @@ impl TuiRunner {
         if area.width < 10 || area.height < 4 {
             return;
         }
+        const FOOTER: &str =
+            "Tab: next | Up/Down: change | F2: load | F3: save | Enter: apply | Esc: cancel";
+
         let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
-        // title(1) + border(2) + 4 fields + blank + footer + border
-        let modal_height = 9u16.min(area.height);
+        let inner_width = modal_width.saturating_sub(2);
+        let footer_lines = Self::wrapped_line_count(FOOTER, inner_width);
+        // border(2, title rides the top border row) + 4 fields + blank + footer rows
+        let modal_height = (2 + 4 + 1 + footer_lines).min(area.height);
 
         let modal_area = Rect {
             x: (area.width.saturating_sub(modal_width)) / 2,
@@ -2494,11 +2524,11 @@ impl TuiRunner {
         }
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
-            "Tab: next | Up/Down: change | F2: load | F3: save | Enter: apply | Esc: cancel",
+            FOOTER,
             Style::default().fg(Color::DarkGray),
         )));
 
-        let paragraph = Paragraph::new(lines);
+        let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
         f.render_widget(paragraph, inner);
     }
 
@@ -5620,6 +5650,31 @@ mod key_tests {
 #[cfg(test)]
 mod pan_59_command_tests {
     use super::*;
+
+    #[test]
+    fn wrapped_line_count_fits_on_one_line_when_width_suffices() {
+        assert_eq!(
+            TuiRunner::wrapped_line_count("Tab: next | Esc: cancel", 40),
+            1
+        );
+    }
+
+    #[test]
+    fn wrapped_line_count_wraps_the_rig_modal_footer_at_its_clamped_width() {
+        // PAN-66: the rig-config modal's footer legend was silently clipped
+        // because the modal's reserved height never accounted for wrapping.
+        // At the modal's narrowest clamped inner width (38 = 40 - 2 border
+        // cols), the 78-char footer must wrap onto more than one line.
+        const FOOTER: &str =
+            "Tab: next | Up/Down: change | F2: load | F3: save | Enter: apply | Esc: cancel";
+        assert!(TuiRunner::wrapped_line_count(FOOTER, 38) > 1);
+    }
+
+    #[test]
+    fn wrapped_line_count_never_reports_zero_lines() {
+        assert_eq!(TuiRunner::wrapped_line_count("", 40), 1);
+        assert_eq!(TuiRunner::wrapped_line_count("anything", 0), 1);
+    }
 
     #[test]
     fn select_rig_command_round_trips_all_four_fields() {
