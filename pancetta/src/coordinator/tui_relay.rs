@@ -885,6 +885,20 @@ impl super::ApplicationCoordinator {
         // Shared config — the SelectDevice handler persists the operator's
         // chosen output device into it (and into ~/.pancetta/pancetta.toml).
         let cmd_config = self.config.clone();
+        // PAN-61 review round 6 (Codex P1): serializes every targeted-write
+        // persist call to ~/.pancetta/pancetta.toml -- SelectDevice,
+        // SelectRig, SaveRigBookmark, and DeleteRigBookmark all write into
+        // it via `write_secure_atomic`, which reuses the same `<path>.tmp`
+        // sibling for every caller. The two bookmark handlers persist from
+        // their own detached `tokio::spawn`ed tasks (round 5's relay-
+        // nonblocking fix), so without this lock two bookmark writes -- or
+        // a bookmark write racing SelectRig/SelectDevice's own inline
+        // write -- can now genuinely run concurrently and interleave their
+        // read/patch/write/rename sequences, losing an update or
+        // corrupting the file. Held only around the write itself, so it
+        // never affects command dispatch ordering.
+        let cmd_config_file_write_lock: std::sync::Arc<tokio::sync::Mutex<()>> =
+            std::sync::Arc::new(tokio::sync::Mutex::new(()));
         // Live device-switch channel into the audio thread. `None` in
         // stub/`--no-audio` modes — the SelectDevice handler then persists the
         // choice (applies on next restart) and tells the operator it can't apply
@@ -2057,6 +2071,12 @@ impl super::ApplicationCoordinator {
                                 .join(".pancetta")
                                 .join("pancetta.toml");
                             let persist_result = {
+                                // PAN-61 review round 6: serialize against
+                                // every other targeted-write persist call
+                                // to this same file (see
+                                // `cmd_config_file_write_lock`'s doc
+                                // comment).
+                                let _write_guard = cmd_config_file_write_lock.lock().await;
                                 let cfg = cmd_config.read().await;
                                 cfg.set_audio_devices_in_file(
                                     &config_path,
@@ -2217,6 +2237,12 @@ impl super::ApplicationCoordinator {
                                     .join(".pancetta")
                                     .join("pancetta.toml");
                                 let persist_result = {
+                                    // PAN-61 review round 6: serialize
+                                    // against every other targeted-write
+                                    // persist call to this same file (see
+                                    // `cmd_config_file_write_lock`'s doc
+                                    // comment).
+                                    let _write_guard = cmd_config_file_write_lock.lock().await;
                                     let cfg = cmd_config.read().await;
                                     cfg.set_rig_in_file(
                                         &config_path,
@@ -2382,7 +2408,20 @@ impl super::ApplicationCoordinator {
                             // immediately.
                             let task_config = cmd_config.clone();
                             let task_tui_msg_tx = cmd_tui_msg_tx.clone();
+                            let task_write_lock = cmd_config_file_write_lock.clone();
                             tokio::spawn(async move {
+                                // PAN-61 review round 6 (Codex P1): held for
+                                // the WHOLE stage-persist-commit sequence,
+                                // not just the write call -- two concurrent
+                                // bookmark commands both staging from the
+                                // same pre-mutation list would otherwise let
+                                // the later one's commit silently discard
+                                // the earlier one's change even if the
+                                // actual disk writes themselves didn't
+                                // interleave. See
+                                // `cmd_config_file_write_lock`'s doc comment
+                                // for the full file-corruption angle too.
+                                let _write_guard = task_write_lock.lock().await;
                                 // I-7 fix (PAN-61 review round 2): stage the
                                 // mutated list without touching the shared
                                 // `cfg.rig.bookmarks` yet. Committing the
@@ -2448,7 +2487,13 @@ impl super::ApplicationCoordinator {
                             // awaited inline in this relay loop.
                             let task_config = cmd_config.clone();
                             let task_tui_msg_tx = cmd_tui_msg_tx.clone();
+                            let task_write_lock = cmd_config_file_write_lock.clone();
                             tokio::spawn(async move {
+                                // PAN-61 review round 6: see
+                                // SaveRigBookmark's identical comment above
+                                // -- held for the whole stage-persist-commit
+                                // sequence.
+                                let _write_guard = task_write_lock.lock().await;
                                 // I-7 fix (PAN-61 review round 2): same
                                 // stage-then-commit-on-success pattern as
                                 // SaveRigBookmark above.
