@@ -39,9 +39,10 @@
 //!   digitally signed with the operator's TQSL certificate. This client shells
 //!   out (`tokio::process::Command`) to the operator's installed `tqsl` CLI,
 //!   which signs the temp ADIF and uploads the resulting `.tq8` to LoTW. The
-//!   exact invocation is marked `OPERATOR-CONFIRM(lotw)` because it cannot be
-//!   exercised without the operator's certificate. A missing/failing `tqsl`
-//!   never panics — it maps to a failed [`QsoUploadOutcome`].
+//!   invocation was verified live (TQSL 2.8.6) against a real certificate —
+//!   see the `-x`/`--batch` note on [`LotwClient::build_args`]. A missing/
+//!   failing/hanging `tqsl` never panics — it maps to a failed
+//!   [`QsoUploadOutcome`] (a bounded timeout kills a hung invocation).
 
 // rationale: the crate-wide `DxError` is intentionally a flat (non-boxed) enum for
 // ergonomic `?`; boxing it crate-wide to satisfy this lint is out of scope here.
@@ -519,23 +520,31 @@ impl LotwClient {
     /// Build the `tqsl` command-line arguments for signing + uploading
     /// `adif_path`.
     ///
-    // OPERATOR-CONFIRM(lotw): the standard batch/non-interactive invocation is
-    //   tqsl -d -a all -l "<station_location>" -u <input.adi>
+    // Verified live against TQSL 2.8.6 (`tqsl --help`) with a real
+    // certificate:
+    //   tqsl -a all -d -x -u -l "<station_location>" <input.adi>
     // where:
-    //   -d        suppress all dialogs (batch mode)
     //   -a all    automatically handle duplicate QSOs without prompting
+    //   -d        suppress the date-range dialog (NOT "all dialogs" — that
+    //             was this comment's prior, incorrect claim)
+    //   -x        --batch: exit after processing instead of starting the
+    //             normal interactive GUI. This is the flag that was missing:
+    //             without it, tqsl does exactly what --help documents —
+    //             starts normally (its GUI) and never exits, so windows pile
+    //             up one per QSO. Confirmed fixed by running sign-only
+    //             (no -u) with -x: process exited 0 in ~0.2s, no window.
+    //   -u        upload after signing (independent switch from -x per
+    //             `tqsl --help`; combined they sign, upload, then exit)
     //   -l NAME   use the named TQSL Station Location
-    //   -u FILE   sign AND upload the file to LoTW (vs. -x = sign to file only)
-    // This exact invocation can only be verified against a real TQSL install
-    // with the operator's certificate; confirm flag spelling/behavior there.
     fn build_args(&self, adif_path: &str) -> Vec<String> {
         vec![
-            "-d".to_string(),
             "-a".to_string(),
             "all".to_string(),
+            "-d".to_string(),
+            "-x".to_string(),
+            "-u".to_string(),
             "-l".to_string(),
             self.station_location.clone(),
-            "-u".to_string(),
             adif_path.to_string(),
         ]
     }
@@ -543,9 +552,11 @@ impl LotwClient {
     /// Write `adif_record` to a temp file, invoke `tqsl` to sign + upload it,
     /// and map the result to a [`QsoUploadOutcome`].
     ///
-    /// Best-effort: a missing/erroring `tqsl`, a non-zero exit, or an I/O error
-    /// returns a [`DxError`] (logged by the caller) rather than panicking. The
-    /// temp file is removed regardless of outcome. Never blocks the pipeline.
+    /// Best-effort: a missing/erroring/hung `tqsl`, a non-zero exit, or an I/O
+    /// error returns a [`DxError`] (logged by the caller) rather than
+    /// panicking. A hung invocation is killed after [`UPLOAD_TIMEOUT_SECS`]
+    /// rather than left to accumulate. The temp file is removed regardless of
+    /// outcome. Never blocks the pipeline.
     pub async fn upload_adif(&self, adif_record: &str) -> Result<QsoUploadOutcome> {
         use tokio::process::Command;
 
@@ -592,14 +603,22 @@ impl LotwClient {
         let path_str = path.to_string_lossy().to_string();
         let args = self.build_args(&path_str);
 
-        let result = Command::new(&self.tqsl_path).args(&args).output().await;
+        // Spawn (rather than `.output()`) so a hung/wedged tqsl can be killed
+        // on timeout instead of leaving an orphaned process behind — the
+        // exact failure mode that motivated this timeout (PAN-65: tqsl
+        // windows accumulating unbounded across a session). `kill_on_drop`
+        // kills the child if the timeout below drops its future.
+        let spawned = Command::new(&self.tqsl_path)
+            .args(&args)
+            .kill_on_drop(true)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn();
 
-        // Always attempt cleanup, ignoring errors.
-        let _ = tokio::fs::remove_file(&path).await;
-
-        let output = match result {
-            Ok(o) => o,
+        let child = match spawned {
+            Ok(c) => c,
             Err(e) => {
+                let _ = tokio::fs::remove_file(&path).await;
                 // tqsl missing / not executable — non-fatal, best-effort.
                 warn!(
                     target: "qso.upload",
@@ -608,6 +627,40 @@ impl LotwClient {
                 return Err(DxError::ExternalService(format!(
                     "LoTW: tqsl invocation failed ({}): {}",
                     self.tqsl_path, e
+                )));
+            }
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(UPLOAD_TIMEOUT_SECS),
+            child.wait_with_output(),
+        )
+        .await;
+
+        // Always attempt cleanup, ignoring errors.
+        let _ = tokio::fs::remove_file(&path).await;
+
+        let output = match result {
+            Ok(Ok(o)) => o,
+            Ok(Err(e)) => {
+                warn!(
+                    target: "qso.upload",
+                    "LoTW: failed to invoke tqsl ({}): {}", self.tqsl_path, e
+                );
+                return Err(DxError::ExternalService(format!(
+                    "LoTW: tqsl invocation failed ({}): {}",
+                    self.tqsl_path, e
+                )));
+            }
+            Err(_elapsed) => {
+                warn!(
+                    target: "qso.upload",
+                    "LoTW: tqsl ({}) timed out after {}s — killed",
+                    self.tqsl_path, UPLOAD_TIMEOUT_SECS
+                );
+                return Err(DxError::ExternalService(format!(
+                    "LoTW: tqsl ({}) timed out after {}s",
+                    self.tqsl_path, UPLOAD_TIMEOUT_SECS
                 )));
             }
         };
@@ -812,7 +865,9 @@ mod tests {
         assert_eq!(adif_field("X", ""), "<X:0>");
     }
 
-    // --- LoTW (command-line construction only; tqsl is never executed) ---
+    // --- LoTW (command-line construction only; this test suite never
+    // executes tqsl — the invocation itself was verified live against a
+    // real TQSL 2.8.6 install/certificate, see build_args' doc comment) ---
 
     #[test]
     fn lotw_client_constructs() {
@@ -825,19 +880,30 @@ mod tests {
     fn lotw_build_args_matches_expected_invocation() {
         let c = LotwClient::new("/usr/bin/tqsl", "Home Station");
         let args = c.build_args("/tmp/x.adi");
-        // OPERATOR-CONFIRM(lotw): tqsl -d -a all -l "Home Station" -u /tmp/x.adi
+        // tqsl -a all -d -x -u -l "Home Station" /tmp/x.adi
         assert_eq!(
             args,
             vec![
-                "-d".to_string(),
                 "-a".to_string(),
                 "all".to_string(),
+                "-d".to_string(),
+                "-x".to_string(),
+                "-u".to_string(),
                 "-l".to_string(),
                 "Home Station".to_string(),
-                "-u".to_string(),
                 "/tmp/x.adi".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn lotw_build_args_includes_batch_exit_flag() {
+        // PAN-65: `-x` is the flag that makes tqsl exit after processing
+        // instead of starting its interactive GUI — its absence was the
+        // root cause of orphaned tqsl windows accumulating per QSO.
+        let c = LotwClient::new("/usr/bin/tqsl", "Home Station");
+        let args = c.build_args("/tmp/x.adi");
+        assert!(args.contains(&"-x".to_string()));
     }
 
     #[test]
