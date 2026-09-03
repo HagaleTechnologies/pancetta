@@ -1217,16 +1217,45 @@ async fn notify_autonomous_cq_dispatch_failed_if_self_cq(
     let (None, Some(attempt_id)) = (callsign, cq_attempt_id) else {
         return;
     };
-    let fail_msg = ComponentMessage::new(
-        ComponentId::Qso,
-        ComponentId::Autonomous,
-        MessageType::QsoMessage(crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
-            attempt_id,
-        }),
-        Instant::now(),
-    );
-    if let Err(e) = message_bus.send_message(fail_msg).await {
-        warn!("Failed to send AutonomousCqDispatchFailed: {}", e);
+    // PAN-43/45 follow-up (Codex round 1 on PR #342): this notification is
+    // the ONLY way a self-CQ's speculative streak/offset mutation ever
+    // gets rolled back after a failed open -- including when the failure
+    // itself was the Autonomous channel rejecting `AutonomousCqOpened`
+    // for being full (PAN-45). A single unchecked `send_message` attempt
+    // right after that same channel just rejected a delivery is exactly
+    // the condition most likely to drop this one too, silently leaving
+    // the mutation uncorrected forever. Retry with a short backoff
+    // instead of one best-effort attempt -- bounded so a genuinely
+    // wedged/disconnected Autonomous component doesn't stall this task
+    // indefinitely.
+    const RETRY_DELAYS_MS: [u64; 3] = [5, 20, 50];
+    for attempt in 0..=RETRY_DELAYS_MS.len() {
+        let fail_msg = ComponentMessage::new(
+            ComponentId::Qso,
+            ComponentId::Autonomous,
+            MessageType::QsoMessage(crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
+                attempt_id,
+            }),
+            Instant::now(),
+        );
+        match message_bus.send_message_checked(fail_msg).await {
+            Ok(true) => return,
+            Ok(false) => match RETRY_DELAYS_MS.get(attempt) {
+                Some(&delay_ms) => tokio::time::sleep(Duration::from_millis(delay_ms)).await,
+                None => {
+                    error!(
+                        "AutonomousCqDispatchFailed dropped for attempt {} after {} attempts \
+                         -- its speculative streak/offset mutation may remain uncorrected",
+                        attempt_id,
+                        RETRY_DELAYS_MS.len() + 1
+                    );
+                }
+            },
+            Err(e) => {
+                warn!("Failed to send AutonomousCqDispatchFailed: {}", e);
+                return;
+            }
+        }
     }
 }
 
@@ -1497,6 +1526,106 @@ mod pan6_diagnostic_tests {
             }
             other => panic!("expected DiagnosticEvent, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn dispatch_failed_notification_sends_exactly_once_when_delivered_immediately() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+
+        notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(42)).await;
+
+        let message = receiver
+            .try_recv()
+            .expect("exactly one dispatch-failed message");
+        match message.message_type {
+            MessageType::QsoMessage(
+                crate::message_bus::QsoMessage::AutonomousCqDispatchFailed { attempt_id },
+            ) => assert_eq!(attempt_id, 42),
+            other => panic!("expected AutonomousCqDispatchFailed, got {other:?}"),
+        }
+        assert!(
+            receiver.try_recv().is_err(),
+            "must send exactly once when the first attempt is delivered, not keep retrying"
+        );
+    }
+
+    /// PAN-43/45 follow-up (Codex round 1 on PR #342): a single unchecked
+    /// `send_message` used to be this notification's only delivery
+    /// attempt. If the Autonomous channel happened to be transiently full
+    /// -- exactly the condition PAN-45's registration-decline path can
+    /// itself trigger -- the notification silently dropped and the
+    /// speculative streak/offset mutation it exists to roll back was
+    /// never corrected. This must now retry past a transient full channel
+    /// instead of giving up on the first attempt.
+    #[tokio::test]
+    async fn dispatch_failed_notification_retries_past_a_transient_full_channel() {
+        let bus = MessageBus::new(1).unwrap(); // capacity 1 -- easy to fill
+        let (sender, receiver) = bus.create_channel(ComponentId::Autonomous).await.unwrap();
+
+        // Fill the one slot with an unrelated message so the notification's
+        // FIRST send attempt is guaranteed to see a full channel.
+        sender
+            .try_send(ComponentMessage::new(
+                ComponentId::Qso,
+                ComponentId::Autonomous,
+                MessageType::QsoMessage(
+                    crate::message_bus::QsoMessage::AutonomousCqDispatchFailed {
+                        attempt_id: 0, // unrelated filler, distinguishable from attempt_id below
+                    },
+                ),
+                Instant::now(),
+            ))
+            .expect("fill the one slot");
+
+        // Drain that filler shortly after the notification's first (failed)
+        // attempt but well before its bounded retries give up -- simulates
+        // the transient congestion clearing on its own.
+        let receiver_for_drain = receiver.clone();
+        tokio::spawn(async move {
+            loop {
+                if receiver_for_drain.try_recv().is_ok() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(99)).await;
+
+        let message = tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if let Ok(m) = receiver.try_recv() {
+                    return m;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the real AutonomousCqDispatchFailed must eventually arrive");
+        match message.message_type {
+            MessageType::QsoMessage(
+                crate::message_bus::QsoMessage::AutonomousCqDispatchFailed { attempt_id },
+            ) => assert_eq!(
+                attempt_id, 99,
+                "the retried send must be the real notification, not the filler"
+            ),
+            other => panic!("expected AutonomousCqDispatchFailed, got {other:?}"),
+        }
+    }
+
+    /// A permanently unreachable destination (no channel registered at
+    /// all) must still cause this to return in bounded time -- not hang or
+    /// retry forever.
+    #[tokio::test]
+    async fn dispatch_failed_notification_gives_up_within_a_bounded_time_when_never_delivered() {
+        let bus = MessageBus::new(16).unwrap(); // no Autonomous channel registered
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            notify_autonomous_cq_dispatch_failed_if_self_cq(&bus, &None, Some(7)),
+        )
+        .await
+        .expect("must give up after its bounded retries, not hang indefinitely");
     }
 }
 

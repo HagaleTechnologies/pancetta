@@ -1235,7 +1235,8 @@ impl AutonomousOperator {
                          switch); state may be off by one attempt",
                         attempt_id
                     );
-                } else if self.last_cq_snapshot.is_some_and(|s| s.did_switch) {
+                } else if let Some(newer) = self.last_cq_snapshot.as_mut().filter(|s| s.did_switch)
+                {
                     // PAN-43 (Codex round 6 on PR #301): a NEWER attempt
                     // (still in `last_cq_snapshot`, i.e. exactly one
                     // generation ahead of this stale one) reaching the
@@ -1244,17 +1245,36 @@ impl AutonomousOperator {
                     // reset deliberately does NOT bump `streak_generation`
                     // (so a SUPPRESSED switch can still be fully undone via
                     // `restore_cq_state`), so the generation check below
-                    // would wrongly still match. A blind `-1` here would
-                    // then remove the NEWER attempt's own contribution
-                    // instead of the (already-superseded, already-wiped-out
-                    // by the reset) stale attempt's -- there is nothing
-                    // left to compensate.
+                    // would wrongly still match. A blind `-1` against the
+                    // CURRENT live streak would remove the newer attempt's
+                    // own contribution instead of the stale one's -- the
+                    // reset already wiped the stale attempt's speculative
+                    // "+1" from the LIVE streak, so no live correction is
+                    // needed here.
+                    //
+                    // PAN-43 follow-up (Codex round 1 on PR #342): that's
+                    // not the whole story -- `newer`'s OWN saved snapshot
+                    // (`last_cq_snapshot`) still carries the stale
+                    // attempt's uncorrected contribution as its
+                    // pre-switch `streak` baseline (captured before the
+                    // reset). If the newer attempt itself later fails
+                    // downstream, `restore_cq_state_for_attempt` finds it
+                    // in `last_cq_snapshot` and does a FULL restore to
+                    // that baseline via `restore_cq_state` -- resurrecting
+                    // the stale attempt's speculative "+1" right back.
+                    // Correct the SAVED baseline instead of the live
+                    // streak: harmless if the newer attempt goes on to
+                    // succeed (its snapshot is simply discarded, never
+                    // consumed), but ensures a later restore lands on the
+                    // right value if it doesn't.
+                    newer.streak = newer.streak.saturating_sub(1);
                     warn!(
                         "Autonomous self-CQ attempt {} failed downstream after a newer attempt \
                          already superseded it, and that newer attempt performed a frequency \
-                         switch (resetting the streak) -- streak NOT auto-corrected (its \
-                         speculative contribution was already erased by the reset; a -1 would \
-                         wrongly eat into the newer attempt's own increment)",
+                         switch (resetting the streak) -- the live streak needed no correction \
+                         (already reset), but the newer attempt's own saved rollback baseline \
+                         was decremented so a LATER failure of that attempt can't resurrect \
+                         this one's contribution",
                         attempt_id
                     );
                 } else if self.streak_generation == snapshot.streak_generation {
@@ -4416,6 +4436,58 @@ mod tests {
             "a newer attempt's switch-triggered streak reset must block the bounded- \
              compensation -1 for an older, non-switching stale attempt -- applying it anyway \
              would wrongly eat into the newer attempt's own genuine increment"
+        );
+    }
+
+    #[test]
+    fn restore_cq_state_for_attempt_corrects_the_newer_switching_snapshots_baseline_not_just_the_live_streak(
+    ) {
+        // PAN-43 follow-up (Codex round 1 on PR #342): the previous test
+        // only checks that CQ #1's late failure leaves the LIVE streak
+        // alone. But CQ #2's own saved snapshot (`last_cq_snapshot`) still
+        // carries CQ #1's uncorrected "+1" as its pre-switch baseline
+        // (captured before the reset) -- if CQ #2 ITSELF later fails
+        // downstream too, `restore_cq_state_for_attempt` finds it in
+        // `last_cq_snapshot` and does a FULL restore to that baseline via
+        // `restore_cq_state`, resurrecting CQ #1's speculative "+1" right
+        // back even though neither CQ ever actually succeeded. The fix
+        // must correct CQ #2's SAVED baseline (not just decline to touch
+        // the live streak) so a later CQ #2 failure restores to the right
+        // value.
+        let mut op = primed_operator(2, 1, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #1: streak (0) < switch_after (1), no switch, streak -> 1
+        let cq1_attempt_id = op
+            .last_cq_attempt_id()
+            .expect("a self-CQ ran this cycle and took a snapshot");
+
+        op.decide_at(even_ts); // idle
+        op.decide_at(even_ts); // CQ #2: streak (1) >= switch_after (1) -> switches, 0 -> 1
+        let cq2_attempt_id = op
+            .last_cq_attempt_id()
+            .expect("CQ #2 ran this cycle and took a snapshot");
+        assert!(
+            op.last_cq_snapshot.is_some_and(|s| s.did_switch),
+            "precondition: CQ #2 must have performed the switch this test exercises"
+        );
+
+        // CQ #1 fails late -- per the test above, the live streak is left
+        // alone, but CQ #2's saved baseline must now be corrected.
+        op.restore_cq_state_for_attempt(cq1_attempt_id);
+
+        // CQ #2 ALSO fails downstream now -- a full restore to its
+        // (corrected) pre-switch baseline.
+        op.restore_cq_state_for_attempt(cq2_attempt_id);
+
+        assert_eq!(
+            op.cq_no_response_streak, 0,
+            "neither CQ #1 nor CQ #2 ever actually succeeded, so the fully-undone streak must \
+             be 0 -- resurrecting CQ #1's uncorrected contribution via CQ #2's stale saved \
+             baseline would wrongly leave it at 1"
         );
     }
 
