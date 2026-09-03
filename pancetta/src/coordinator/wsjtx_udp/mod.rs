@@ -231,6 +231,13 @@ impl super::ApplicationCoordinator {
                     match wsjtx_rx.try_recv() {
                         Ok(message) => {
                             if let MessageType::DecodedMessage(decoded) = message.message_type {
+                                if is_stale_band_decode(decoded.captured_dial_hz, last_band) {
+                                    debug!(
+                                        "WSJT-X UDP: dropping decode captured on a prior \
+                                         band (band switch happened mid-decode)"
+                                    );
+                                    continue;
+                                }
                                 let mode = pancetta_config::OperatingMode::from_u8(
                                     state.active_protocol_mode.load(Ordering::Relaxed),
                                 );
@@ -882,6 +889,30 @@ fn band_changed(dial_hz: u64, last_band: Option<u64>) -> Option<u64> {
         None
     } else {
         Some(band)
+    }
+}
+
+/// PAN-67 review round 5 (folded into PAN-69's broader stale-band-rejection
+/// scope): true when a decode's own captured band differs from the band
+/// this WSJT-X relay currently believes it's on (`last_band`, kept in sync
+/// by the `band_changed` sampler above).
+///
+/// Decoding is real CPU work with a wall-clock gap after window-close, so a
+/// band switch mid-decode can otherwise land an old-band decode in the
+/// ring right after `Clear` already invalidated it for the new band —
+/// GridTracker/JTAlert would then interpret its offset against the NEW
+/// Status dial, and with `allow_tx_initiation` on, a Reply could match that
+/// retained entry and send `StartQso` on the wrong band.
+///
+/// Never treats an unknown value as stale: `captured_dial_hz` of `None` or
+/// `0` (dsp.rs's "not yet established" sentinel) and `current_band` of
+/// `None` (no rig sample yet) both fall through to "not stale" — there's
+/// nothing concrete to compare against, and a live decode should never be
+/// silently dropped on a false positive.
+fn is_stale_band_decode(captured_dial_hz: Option<u64>, current_band: Option<u64>) -> bool {
+    match (captured_dial_hz, current_band) {
+        (Some(hz), Some(band)) if hz != 0 => band_of(hz) != band,
+        _ => false,
     }
 }
 
@@ -1819,6 +1850,30 @@ mod decode_tests {
     #[test]
     fn band_changed_some_on_first_sample_with_no_prior_band() {
         assert_eq!(band_changed(14_074_000, None), Some(14));
+    }
+
+    /// PAN-67 review round 5 (folded into PAN-69): a decode captured on the
+    /// OLD band before a switch must not be treated as belonging to the
+    /// current band just because it arrives after the switch.
+    #[test]
+    fn is_stale_band_decode_true_when_captured_band_differs_from_current() {
+        assert!(is_stale_band_decode(Some(7_074_000), Some(14)));
+    }
+
+    #[test]
+    fn is_stale_band_decode_false_when_captured_band_matches_current() {
+        assert!(!is_stale_band_decode(Some(14_074_000), Some(14)));
+    }
+
+    #[test]
+    fn is_stale_band_decode_false_when_captured_is_unknown() {
+        assert!(!is_stale_band_decode(None, Some(14)));
+        assert!(!is_stale_band_decode(Some(0), Some(14)));
+    }
+
+    #[test]
+    fn is_stale_band_decode_false_when_current_band_is_unknown() {
+        assert!(!is_stale_band_decode(Some(7_074_000), None));
     }
 
     #[test]

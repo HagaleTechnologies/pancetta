@@ -151,6 +151,23 @@ async fn handle_socket(mut socket: WebSocket, state: GatewayState) {
     }
 }
 
+/// The dial frequency (Hz) to enrich a remote decode event with: the
+/// frequency the decode's own audio window was captured on
+/// (`DecodedMessage::captured_dial_hz`), falling back to `live_dial_hz` when
+/// unstamped (`None`) or still at the "not yet established" sentinel
+/// (`Some(0)` — see `dsp.rs`'s `band_ref_dial_hz`/`cur_dial_hz`).
+///
+/// PAN-67 review round 4: reloading `op_freq` live here would reintroduce
+/// the same race already fixed for the TUI and PSKReporter — decoding is
+/// real CPU work, so a band switch mid-decode could label an old-band
+/// reception under the operator's new band for remote-display clients too.
+fn remote_decode_dial_hz(decoded: &pancetta_ft8::DecodedMessage, live_dial_hz: u64) -> u64 {
+    match decoded.captured_dial_hz {
+        Some(hz) if hz != 0 => hz,
+        _ => live_dial_hz,
+    }
+}
+
 /// Translate one bus message, broadcast the resulting `ServerEvent`, and fold
 /// it into the rolling snapshot. Decoded frames are enriched with dial
 /// frequency, station-lookup flags, and our callsign here rather than in the
@@ -168,7 +185,7 @@ async fn handle_bus_msg(
 
     let event = match msg {
         MessageType::DecodedMessage(decoded) => {
-            let dial_hz = op_freq.load(Ordering::Relaxed) as f64;
+            let dial_hz = remote_decode_dial_hz(decoded, op_freq.load(Ordering::Relaxed)) as f64;
             let call = decoded.message.from_callsign.as_deref();
             let (worked_before, needed, atno) = match call {
                 Some(c) if !c.is_empty() => {
@@ -483,6 +500,53 @@ impl super::ApplicationCoordinator {
             .push((ComponentId::RemoteGateway, server));
         info!("remote_gateway component started");
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod remote_decode_dial_hz_tests {
+    use super::remote_decode_dial_hz;
+
+    fn decoded_at(captured_dial_hz: Option<u64>) -> pancetta_ft8::DecodedMessage {
+        let mut d = pancetta_ft8::DecodedMessage::new(
+            pancetta_ft8::Ft8Message::default(),
+            -10.0,
+            0.5,
+            1500.0,
+            0.1,
+        );
+        d.captured_dial_hz = captured_dial_hz;
+        d
+    }
+
+    /// PAN-67 review round 4: a remote-display client must see the band the
+    /// decode's own audio was captured on, not whatever the rig has since
+    /// moved to.
+    #[test]
+    fn uses_the_captured_dial_not_the_live_one() {
+        let old_band_decode = decoded_at(Some(7_074_000));
+        assert_eq!(
+            remote_decode_dial_hz(&old_band_decode, 14_074_000),
+            7_074_000
+        );
+    }
+
+    #[test]
+    fn falls_back_to_live_dial_when_uncaptured() {
+        let unstamped_decode = decoded_at(None);
+        assert_eq!(
+            remote_decode_dial_hz(&unstamped_decode, 14_074_000),
+            14_074_000
+        );
+    }
+
+    #[test]
+    fn falls_back_to_live_dial_when_captured_is_zero() {
+        let zero_captured_decode = decoded_at(Some(0));
+        assert_eq!(
+            remote_decode_dial_hz(&zero_captured_decode, 14_074_000),
+            14_074_000
+        );
     }
 }
 
