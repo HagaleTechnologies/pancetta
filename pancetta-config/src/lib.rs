@@ -361,35 +361,41 @@ impl Config {
             }
         }
 
-        let mut tmp_os = path.as_os_str().to_owned();
-        tmp_os.push(".tmp");
-        let tmp = std::path::PathBuf::from(tmp_os);
-
-        // Create the temp file owner-only from the outset so the secret is never
-        // momentarily world-readable between create and chmod.
+        // PAN-62 review round 3 (Codex P1): a hand-rolled `<path>.tmp`
+        // sibling is a PREDICTABLE name -- in a pre-existing group/world-
+        // writable custom parent (exactly the case the block above
+        // deliberately leaves writable by other users), another writer
+        // could pre-create that exact name as a symlink to any file the
+        // pancetta user can write, and a plain `OpenOptions::create(true)`
+        // (no `O_EXCL`, no no-follow) would follow it -- writing the
+        // plaintext config, credentials included, straight through the
+        // symlink before the final rename ever ran. `tempfile` creates a
+        // randomly-named file exclusively (`O_CREAT | O_EXCL` on Unix),
+        // which can never resolve to an attacker-planted symlink at a
+        // guessable name -- eliminating this attack class outright rather
+        // than patching around each new angle on it.
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut builder = tempfile::Builder::new();
         #[cfg(unix)]
         {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(contents.as_bytes())?;
-            f.sync_all()?;
+            use std::os::unix::fs::PermissionsExt;
+            // Owner-only from the outset so the secret is never momentarily
+            // world-readable between create and chmod.
+            builder.permissions(std::fs::Permissions::from_mode(0o600));
         }
-        #[cfg(not(unix))]
+        let mut tmp = builder.tempfile_in(dir)?;
         {
-            std::fs::write(&tmp, contents)?;
+            use std::io::Write;
+            tmp.write_all(contents.as_bytes())?;
+            tmp.as_file().sync_all()?;
         }
-
-        // Atomic replace. On the rare rename failure, clean up the temp.
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
-        }
+        // Atomic replace (same `rename` guarantee as before). On failure,
+        // `PersistError` hands back the still-unpersisted `NamedTempFile`,
+        // which cleans itself up on drop -- no manual `remove_file` needed.
+        tmp.persist(path).map_err(|e| e.error)?;
         Ok(())
     }
 
@@ -699,6 +705,47 @@ mod tests {
         assert_eq!(
             fmode, 0o600,
             "config file must still be owner-only, got {fmode:o}"
+        );
+    }
+
+    /// PAN-62 review round 3 (Codex P1): the old hand-rolled `<path>.tmp`
+    /// temp sibling was a PREDICTABLE name -- in a pre-existing
+    /// group/world-writable custom parent (exactly the case the round-1/
+    /// round-2 permission fixes deliberately leave writable by other
+    /// users), another directory writer could pre-place that exact name
+    /// as a symlink to any file the pancetta user can write. The old
+    /// `OpenOptions::create(true)` (no `O_EXCL`/no-follow) would follow
+    /// it, overwriting the symlink's target -- credentials and all --
+    /// before the final rename replaced the symlink itself. Plant that
+    /// exact attack and confirm the "victim" file is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn save_to_file_never_follows_a_symlink_planted_at_the_old_predictable_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "do not touch").unwrap();
+        let predictable_tmp = dir.path().join("pancetta.toml.tmp");
+        std::os::unix::fs::symlink(&victim, &predictable_tmp).unwrap();
+
+        Config::default().save_to_file(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not touch",
+            "a symlink planted at the old predictable temp name must never be \
+             followed/overwritten"
+        );
+        assert!(
+            path.exists(),
+            "the actual config file must still be written"
+        );
+        assert!(
+            std::fs::symlink_metadata(&predictable_tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted symlink itself must be left exactly as it was"
         );
     }
 

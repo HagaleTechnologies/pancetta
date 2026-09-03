@@ -28,6 +28,7 @@ notify = "6.1"
 # Path and environment utilities
 dirs = "5.0"
 shellexpand = "3.1"
+tempfile = "3.27"
 
 # Validation and utilities
 validator = { version = "0.21", features = ["derive"] }
@@ -43,4 +44,3 @@ cli = ["clap"]
 
 [dev-dependencies]
 tokio = { version = "1.50", features = ["full"] }
-tempfile = "3.27"

@@ -12,21 +12,41 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::SystemTime;
 use tracing::{debug, error, info, warn};
 
+/// Whether `path` (with `content` already read from it) should be parsed
+/// as JSON rather than TOML -- extension first (`.json`/`.toml` win
+/// outright), then content-sniffing (does it start with `{`) for an
+/// ambiguous or missing extension. Takes `content` directly rather than
+/// reading `path` itself: [`ConfigLoader::load_from_file`] already has the
+/// bytes it just parsed in hand, and a SECOND separate read here could
+/// race a concurrent atomic file replace (PAN-62 review round 3, Codex
+/// P2) -- applying a new generation's format decision to old-generation
+/// bytes, corrupting a valid load into a spurious parse failure.
+pub fn content_is_json_format(path: &Path, content: &str) -> bool {
+    match path.extension().and_then(|ext| ext.to_str()) {
+        Some("json") => true,
+        Some("toml") => false,
+        _ => content.trim_start().starts_with('{'),
+    }
+}
+
 /// Whether `path` should be parsed/written as JSON rather than TOML --
-/// extension first (`.json`/`.toml` win outright), then content-sniffing
-/// (does the file start with `{`) for an ambiguous or missing extension.
-/// Exactly mirrors [`ConfigLoader::load_from_file`]'s own format
-/// detection, so a write-time format check (PAN-62 review round 1:
-/// `pancetta/src/main.rs`'s `config_write_path`) never disagrees with
-/// what was actually loaded. A path that can't be read (e.g. a
-/// not-yet-created first-run default config) defaults to TOML, matching
-/// `Config::write_secure_atomic`'s own TOML default target.
+/// same detection as [`content_is_json_format`], reading `path` itself for
+/// the content-sniffing fallback. Exactly mirrors
+/// [`ConfigLoader::load_from_file`]'s own format detection, so a
+/// write-time format check (PAN-62 review round 1:
+/// `pancetta/src/main.rs`'s `config_write_path`) never disagrees with what
+/// was actually loaded. Prefer [`content_is_json_format`] when the content
+/// has already been read (as `load_from_file` does), to avoid a second
+/// read racing a concurrent atomic file replace. A path that can't be
+/// read (e.g. a not-yet-created first-run default config) defaults to
+/// TOML, matching `Config::write_secure_atomic`'s own TOML default
+/// target.
 pub fn path_is_json_format(path: &Path) -> bool {
     match path.extension().and_then(|ext| ext.to_str()) {
         Some("json") => true,
         Some("toml") => false,
         _ => match fs::read_to_string(path) {
-            Ok(content) => content.trim_start().starts_with('{'),
+            Ok(content) => content_is_json_format(path, &content),
             Err(_) => false,
         },
     }
@@ -327,7 +347,10 @@ impl ConfigLoader {
         // Load and parse file
         let content = fs::read_to_string(path).map_err(ConfigError::Io)?;
 
-        let config = if path_is_json_format(path) {
+        // PAN-62 review round 3 (Codex P2): format is detected from
+        // `content` (already read above), never by re-reading `path` --
+        // see `content_is_json_format`'s doc comment.
+        let config = if content_is_json_format(path, &content) {
             self.parse_json(&content)?
         } else {
             self.parse_toml(&content)?
@@ -1038,6 +1061,41 @@ mod tests {
             !path_is_json_format(missing),
             "a not-yet-created config (first run) must default to TOML, matching \
              write_secure_atomic's own TOML default target"
+        );
+    }
+
+    /// PAN-62 review round 3 (Codex P2): `load_from_file` must detect
+    /// format from the CONTENT IT ALREADY READ, not by re-opening the path
+    /// a second time -- a second read racing a concurrent atomic file
+    /// replace (an editor or config manager swapping in the other
+    /// format) could apply the NEW generation's format decision to the
+    /// OLD generation's bytes, corrupting a valid startup/hot-reload into
+    /// a spurious parse failure. `content_is_json_format` takes the bytes
+    /// directly; no I/O, no second read to race.
+    #[test]
+    fn content_is_json_format_extension_wins_regardless_of_content() {
+        assert!(
+            content_is_json_format(std::path::Path::new("config.json"), "not actually json"),
+            ".json extension must win regardless of content"
+        );
+        assert!(
+            !content_is_json_format(std::path::Path::new("config.toml"), "{}"),
+            ".toml extension must win regardless of content"
+        );
+    }
+
+    #[test]
+    fn content_is_json_format_sniffs_the_given_content_when_extension_is_ambiguous() {
+        assert!(
+            content_is_json_format(std::path::Path::new("config"), "{\"station\": {}}"),
+            "content starting with '{{' must sniff as JSON"
+        );
+        assert!(
+            !content_is_json_format(
+                std::path::Path::new("config"),
+                "[station]\ncallsign = \"K1ABC\""
+            ),
+            "content not starting with '{{' must sniff as TOML"
         );
     }
 
