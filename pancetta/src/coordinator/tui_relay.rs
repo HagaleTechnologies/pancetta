@@ -943,13 +943,14 @@ impl super::ApplicationCoordinator {
             // above -- the coordinator enumerates hardware, the TUI stays a
             // passive renderer.
             {
-                let (current_model, current_port, current_baud_rate, current_ptt_method) = {
+                let (current_model, current_port, current_baud_rate, current_ptt_method, bookmarks) = {
                     let cfg = cmd_config.read().await;
                     (
                         cfg.rig.model.clone(),
                         cfg.rig.interface.port.clone(),
                         cfg.rig.interface.baud_rate,
                         cfg.rig.ptt.method.clone(),
+                        cfg.rig.bookmarks.clone(),
                     )
                 };
                 let available_ports = serialport::available_ports()
@@ -962,6 +963,7 @@ impl super::ApplicationCoordinator {
                         current_port,
                         current_baud_rate,
                         current_ptt_method,
+                        bookmarks,
                     })
                 {
                     debug!("Failed to send initial rig config to TUI: {}", e);
@@ -2341,6 +2343,109 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                         }
+                        pancetta_tui::tui_runner::TuiCommand::SaveRigBookmark {
+                            name,
+                            model,
+                            port,
+                            baud_rate,
+                            ptt_method,
+                        } => {
+                            info!(
+                                "TUI SaveRigBookmark: name={} model={} port={} baud={} ptt={:?}",
+                                name, model, port, baud_rate, ptt_method
+                            );
+                            let bookmark = pancetta_config::rig::RigBookmark {
+                                name: name.clone(),
+                                model,
+                                port,
+                                baud_rate,
+                                ptt_method,
+                            };
+                            let bookmarks = {
+                                let mut cfg = cmd_config.write().await;
+                                upsert_rig_bookmark(&mut cfg.rig.bookmarks, bookmark);
+                                cfg.rig.bookmarks.clone()
+                            };
+                            let config_path = dirs::home_dir()
+                                .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                .join(".pancetta")
+                                .join("pancetta.toml");
+                            let persist_result = {
+                                let cfg = cmd_config.read().await;
+                                cfg.set_rig_bookmarks_in_file(&config_path, &bookmarks)
+                            };
+                            let status = if let Err(e) = persist_result {
+                                warn!("Failed to persist rig bookmark: {}", e);
+                                format!("Failed to save bookmark '{}': {}", name, e)
+                            } else {
+                                info!(
+                                    "Persisted rig bookmark '{}' to {}",
+                                    name,
+                                    config_path.display()
+                                );
+                                rig_bookmark_saved_status(&name, bookmarks.len())
+                            };
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
+                                    bookmarks: bookmarks.clone(),
+                                },
+                            );
+                            let _ = cmd_tui_msg_tx.send(
+                                pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                    component: "rig".to_string(),
+                                    status,
+                                },
+                            );
+                        }
+                        pancetta_tui::tui_runner::TuiCommand::DeleteRigBookmark { name } => {
+                            info!("TUI DeleteRigBookmark: name={}", name);
+                            let (bookmarks, found) = {
+                                let mut cfg = cmd_config.write().await;
+                                let before = cfg.rig.bookmarks.len();
+                                cfg.rig.bookmarks.retain(|b| b.name != name);
+                                let found = cfg.rig.bookmarks.len() != before;
+                                (cfg.rig.bookmarks.clone(), found)
+                            };
+                            if !found {
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "rig".to_string(),
+                                        status: format!("No bookmark named '{}'", name),
+                                    },
+                                );
+                            } else {
+                                let config_path = dirs::home_dir()
+                                    .unwrap_or_else(|| std::path::PathBuf::from("."))
+                                    .join(".pancetta")
+                                    .join("pancetta.toml");
+                                let persist_result = {
+                                    let cfg = cmd_config.read().await;
+                                    cfg.set_rig_bookmarks_in_file(&config_path, &bookmarks)
+                                };
+                                let status = if let Err(e) = persist_result {
+                                    warn!("Failed to persist rig bookmark deletion: {}", e);
+                                    format!("Failed to delete bookmark '{}': {}", name, e)
+                                } else {
+                                    info!(
+                                        "Persisted rig bookmark deletion of '{}' to {}",
+                                        name,
+                                        config_path.display()
+                                    );
+                                    format!("Deleted bookmark '{}'", name)
+                                };
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
+                                        bookmarks: bookmarks.clone(),
+                                    },
+                                );
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "rig".to_string(),
+                                        status,
+                                    },
+                                );
+                            }
+                        }
                         pancetta_tui::tui_runner::TuiCommand::ToggleFoxMode => {
                             // Operator pressed `Shift+X`: toggle Fox mode.
                             // Read the authoritative atomic (not the TUI's
@@ -2667,6 +2772,36 @@ fn ptt_on_refusal(
     .map(|reason| format!("Can't key PTT — {reason}"))
 }
 
+/// Upsert a bookmark into a list by name (PAN-61: save-as, overwrite if the
+/// name already exists). Extracted as a pure function so the semantics are
+/// unit-testable outside the coordinator's spawned command-relay task --
+/// mirrors the `ptt_on_refusal`/`map_qso_snapshot_item` pure-helper pattern
+/// already used in this file's test module.
+fn upsert_rig_bookmark(
+    bookmarks: &mut Vec<pancetta_config::rig::RigBookmark>,
+    bookmark: pancetta_config::rig::RigBookmark,
+) {
+    if let Some(existing) = bookmarks.iter_mut().find(|b| b.name == bookmark.name) {
+        *existing = bookmark;
+    } else {
+        bookmarks.push(bookmark);
+    }
+}
+
+/// Build the operator-facing status message after a bookmark save
+/// (PAN-61). The 20-bookmark soft cap is advisory only: `count` past the
+/// cap never blocks the save, it just appends a warning.
+fn rig_bookmark_saved_status(name: &str, count: usize) -> String {
+    if count >= 20 {
+        format!(
+            "Saved bookmark '{}' ({} bookmarks saved — consider deleting unused ones)",
+            name, count
+        )
+    } else {
+        format!("Saved bookmark '{}'", name)
+    }
+}
+
 #[cfg(test)]
 mod tui_relay_tests {
     use super::*;
@@ -2690,6 +2825,69 @@ mod tui_relay_tests {
     /// Not in flight -- the common case (no CAT call currently executing).
     fn not_in_flight() -> Arc<std::sync::atomic::AtomicU32> {
         Arc::new(std::sync::atomic::AtomicU32::new(0))
+    }
+
+    #[test]
+    fn upsert_rig_bookmark_appends_when_name_is_new() {
+        let mut bookmarks = vec![pancetta_config::rig::RigBookmark {
+            name: "Shack".to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 38400,
+            ptt_method: pancetta_config::rig::PttMethod::Cat,
+        }];
+        upsert_rig_bookmark(
+            &mut bookmarks,
+            pancetta_config::rig::RigBookmark {
+                name: "Portable".to_string(),
+                model: "IC-7300".to_string(),
+                port: "/dev/ttyUSB1".to_string(),
+                baud_rate: 19200,
+                ptt_method: pancetta_config::rig::PttMethod::Vox,
+            },
+        );
+        assert_eq!(bookmarks.len(), 2);
+        assert_eq!(bookmarks[1].name, "Portable");
+    }
+
+    #[test]
+    fn upsert_rig_bookmark_overwrites_when_name_matches() {
+        let mut bookmarks = vec![pancetta_config::rig::RigBookmark {
+            name: "Shack".to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 38400,
+            ptt_method: pancetta_config::rig::PttMethod::Cat,
+        }];
+        upsert_rig_bookmark(
+            &mut bookmarks,
+            pancetta_config::rig::RigBookmark {
+                name: "Shack".to_string(),
+                model: "IC-7300".to_string(),
+                port: "/dev/ttyUSB1".to_string(),
+                baud_rate: 19200,
+                ptt_method: pancetta_config::rig::PttMethod::Vox,
+            },
+        );
+        assert_eq!(
+            bookmarks.len(),
+            1,
+            "must overwrite, not append a duplicate name"
+        );
+        assert_eq!(bookmarks[0].model, "IC-7300");
+    }
+
+    #[test]
+    fn rig_bookmark_saved_status_under_cap_has_no_warning() {
+        let status = rig_bookmark_saved_status("Shack", 5);
+        assert_eq!(status, "Saved bookmark 'Shack'");
+    }
+
+    #[test]
+    fn rig_bookmark_saved_status_at_cap_warns_but_still_reports_success() {
+        let status = rig_bookmark_saved_status("Shack", 20);
+        assert!(status.starts_with("Saved bookmark 'Shack'"));
+        assert!(status.contains("consider deleting"));
     }
 
     /// PAN-19 round-12 review (Codex P1) regression guard: "apply loop
