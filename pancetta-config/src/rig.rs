@@ -121,10 +121,14 @@ pub struct RigConfig {
     pub custom_commands: HashMap<String, String>,
 
     /// Saved rig-config bookmarks (PAN-61) — named shortcuts for the 4
-    /// fields the `i` picker edits. Empty by default; grows only via
-    /// explicit operator "save" actions in the TUI.
+    /// fields the `i` picker edits. `None` by default (this config-source
+    /// layer said nothing about bookmarks); `Some(vec![])` is a distinct,
+    /// explicit "this layer has zero bookmarks" that a lower-priority
+    /// layer's bookmarks must NOT show through (PAN-63) — use
+    /// [`RigConfig::effective_bookmarks`] rather than matching on this
+    /// field directly.
     #[serde(default)]
-    pub bookmarks: Vec<RigBookmark>,
+    pub bookmarks: Option<Vec<RigBookmark>>,
 }
 
 /// CAT (Computer Aided Transceiver) interface configuration
@@ -814,7 +818,7 @@ impl Default for RigConfig {
             timing: TimingConfig::default(),
             rig_parameters: RigParametersConfig::default(),
             custom_commands: HashMap::new(),
-            bookmarks: Vec::new(),
+            bookmarks: None,
         }
     }
 }
@@ -1000,6 +1004,16 @@ impl Default for TimingConfig {
 }
 
 impl RigConfig {
+    /// The saved rig-config bookmarks (PAN-61) this config layer resolved
+    /// to, after merging — `bookmarks` is `None` when no config-source
+    /// layer ever set any (see [`RigConfig::bookmarks`] for why that's
+    /// distinct from an explicit empty list). Every consumer outside this
+    /// module should read bookmarks through this method rather than
+    /// matching on the field directly.
+    pub fn effective_bookmarks(&self) -> &[RigBookmark] {
+        self.bookmarks.as_deref().unwrap_or(&[])
+    }
+
     /// Parse the configured [`RigConfig::mode`] string into an
     /// [`OperatingMode`], case-insensitively (leading/trailing whitespace is
     /// trimmed). Returns a [`ConfigError::Validation`] for any unrecognized
@@ -1079,11 +1093,14 @@ impl ConfigSection for RigConfig {
         }
 
         // PAN-61: bookmarks replace wholesale (matches every sibling nested
-        // config's merge_with below) rather than per-entry union — an unset
-        // higher-priority layer (empty list) leaves the lower layer's saved
-        // bookmarks untouched.
-        if !other.bookmarks.is_empty() {
-            self.bookmarks = other.bookmarks;
+        // config's merge_with below) rather than per-entry union. PAN-63: an
+        // `Option` (not "skip if empty") is what lets this tell "this layer
+        // said nothing about bookmarks" (`None` — keep the lower layer's
+        // list) apart from "this layer explicitly has zero bookmarks"
+        // (`Some(vec![])` — must replace the lower layer's list, not leave
+        // it showing through).
+        if let Some(bookmarks) = other.bookmarks {
+            self.bookmarks = Some(bookmarks);
         }
 
         // Merge complex configurations
@@ -1337,49 +1354,82 @@ mod tests {
     #[test]
     fn rig_bookmarks_default_to_empty() {
         let config = RigConfig::default();
-        assert!(config.bookmarks.is_empty());
+        assert!(config.bookmarks.is_none());
+        assert!(config.effective_bookmarks().is_empty());
     }
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]
     fn merge_with_replaces_bookmarks_wholesale_when_other_nonempty() {
         let mut base = RigConfig::default();
-        base.bookmarks = vec![RigBookmark {
+        base.bookmarks = Some(vec![RigBookmark {
             name: "Old".to_string(),
             model: "OldRig".to_string(),
             port: "/dev/ttyUSB0".to_string(),
             baud_rate: 9600,
             ptt_method: PttMethod::None,
-        }];
+        }]);
 
         let mut other = RigConfig::default();
-        other.bookmarks = vec![RigBookmark {
+        other.bookmarks = Some(vec![RigBookmark {
             name: "New".to_string(),
             model: "FTdx10".to_string(),
             port: "/dev/ttyUSB1".to_string(),
             baud_rate: 38400,
             ptt_method: PttMethod::Cat,
-        }];
+        }]);
 
         base.merge_with(other);
-        assert_eq!(base.bookmarks.len(), 1);
-        assert_eq!(base.bookmarks[0].name, "New");
+        assert_eq!(base.effective_bookmarks().len(), 1);
+        assert_eq!(base.effective_bookmarks()[0].name, "New");
     }
 
     #[test]
     #[allow(clippy::field_reassign_with_default)]
-    fn merge_with_keeps_bookmarks_when_other_empty() {
+    fn merge_with_keeps_bookmarks_when_other_absent() {
         let mut base = RigConfig::default();
-        base.bookmarks = vec![RigBookmark {
+        base.bookmarks = Some(vec![RigBookmark {
             name: "Keep".to_string(),
             model: "FTdx10".to_string(),
             port: "/dev/ttyUSB0".to_string(),
             baud_rate: 38400,
             ptt_method: PttMethod::None,
-        }];
+        }]);
+        // `other` never touched `bookmarks` (still `None`) — this layer said
+        // nothing about bookmarks, so `base`'s must survive untouched.
         let other = RigConfig::default();
         base.merge_with(other);
-        assert_eq!(base.bookmarks.len(), 1);
-        assert_eq!(base.bookmarks[0].name, "Keep");
+        assert_eq!(base.effective_bookmarks().len(), 1);
+        assert_eq!(base.effective_bookmarks()[0].name, "Keep");
+    }
+
+    /// PAN-63 regression: a higher-priority layer that explicitly saved an
+    /// empty bookmark list (`Some(vec![])`, e.g. the operator deleted their
+    /// last bookmark via the TUI) must clear the lower-priority layer's
+    /// bookmarks, not let them show through. Before this fix, `bookmarks`
+    /// was a plain `Vec` and `merge_with` treated any empty list — absent
+    /// or explicit — as "this layer said nothing", so a deleted bookmark
+    /// silently reappeared from a lower-priority config source on restart.
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn merge_with_clears_bookmarks_when_other_explicitly_empty() {
+        let mut base = RigConfig::default();
+        base.bookmarks = Some(vec![RigBookmark {
+            name: "FromLowerPriorityLayer".to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 38400,
+            ptt_method: PttMethod::None,
+        }]);
+
+        let mut other = RigConfig::default();
+        other.bookmarks = Some(Vec::new());
+
+        base.merge_with(other);
+        assert!(
+            base.effective_bookmarks().is_empty(),
+            "an explicit empty list from the higher-priority layer must win, \
+             not fall through to the lower-priority layer's bookmarks"
+        );
     }
 }

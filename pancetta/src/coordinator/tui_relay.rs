@@ -971,7 +971,7 @@ impl super::ApplicationCoordinator {
                         cfg.rig.interface.port.clone(),
                         cfg.rig.interface.baud_rate,
                         cfg.rig.ptt.method.clone(),
-                        cfg.rig.bookmarks.clone(),
+                        cfg.rig.effective_bookmarks().to_vec(),
                     )
                 };
                 let available_ports = serialport::available_ports()
@@ -3080,7 +3080,7 @@ fn spawn_bookmark_mutation_worker(
             // since this loop processes one item at a time.
             let mut staged = {
                 let cfg = config.read().await;
-                cfg.rig.bookmarks.clone()
+                cfg.rig.effective_bookmarks().to_vec()
             };
 
             let name = match &mutation {
@@ -3148,7 +3148,13 @@ fn spawn_bookmark_mutation_worker(
                 );
                 {
                     let mut cfg = config.write().await;
-                    cfg.rig.bookmarks = staged.clone();
+                    // PAN-63: always `Some`, even for a delete-to-empty --
+                    // this in-memory commit is an explicit "the operator
+                    // set bookmarks to this list", so the on-disk write
+                    // this mirrors (`set_rig_bookmarks_in_file`, below)
+                    // must not let a lower-priority source's list show
+                    // through on the next config load's merge.
+                    cfg.rig.bookmarks = Some(staged.clone());
                 }
                 let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
                     bookmarks: staged.clone(),
@@ -3350,7 +3356,7 @@ mod tui_relay_tests {
             "the JSON file must be left completely untouched"
         );
         assert!(
-            config.read().await.rig.bookmarks.is_empty(),
+            config.read().await.rig.effective_bookmarks().is_empty(),
             "in-memory bookmarks must NOT reflect a rejected save"
         );
     }
