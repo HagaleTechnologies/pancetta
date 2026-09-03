@@ -865,15 +865,27 @@ impl super::ApplicationCoordinator {
         // autonomous slot tick, ≤15s later).
         let cmd_tui_msg_tx = tui_msg_tx.clone();
         // Shared config — the SelectDevice handler persists the operator's
-        // chosen output device into it (and into ~/.pancetta/pancetta.toml).
+        // chosen output device into it (and into `cmd_config_path`).
         let cmd_config = self.config.clone();
+        // PAN-62: the config file `main.rs` actually loaded from --
+        // `--config <path>` if given, else the same default
+        // `~/.pancetta/pancetta.toml`. SelectDevice, SelectRig,
+        // SaveRigBookmark, and DeleteRigBookmark all persist here instead
+        // of a hardcoded `~/.pancetta/pancetta.toml`, so an operator
+        // running under `--config <custom-path>` doesn't have picker/
+        // bookmark saves silently land in the wrong file.
+        let cmd_config_path = self.config_path.clone();
+        // PAN-62 review round 2 (Codex P1): precomputed at startup (never
+        // in this relay loop, which must stay free of synchronous disk
+        // I/O -- see `config_write_is_toml`'s doc comment in main.rs).
+        let cmd_config_write_is_toml = self.config_write_is_toml;
         // PAN-61 review round 7 (Codex P1, superseding round 6's Mutex):
         // serializes every targeted-write persist call to
-        // ~/.pancetta/pancetta.toml -- SelectDevice, SelectRig,
-        // SaveRigBookmark, and DeleteRigBookmark all write into it via
-        // `write_secure_atomic`, which reuses the same `<path>.tmp`
-        // sibling for every caller. See `spawn_config_file_write_worker`'s
-        // doc comment for why a plain shared lock isn't enough here.
+        // `cmd_config_path` -- SelectDevice, SelectRig, SaveRigBookmark,
+        // and DeleteRigBookmark all write into it via `write_secure_atomic`,
+        // which reuses the same `<path>.tmp` sibling for every caller. See
+        // `spawn_config_file_write_worker`'s doc comment for why a plain
+        // shared lock isn't enough here.
         let (cmd_config_write_tx, cmd_config_write_handle) = spawn_config_file_write_worker();
         // PAN-61 review round 8 (Codex P1): registered so graceful
         // shutdown (`shutdown.rs`) awaits this worker draining any writes
@@ -886,16 +898,13 @@ impl super::ApplicationCoordinator {
         // Serializes the bookmark stage-mutate-commit sequence across the
         // two bookmark commands specifically -- see
         // `spawn_bookmark_mutation_worker`'s doc comment.
-        let cmd_bookmark_config_path = dirs::home_dir()
-            .unwrap_or_else(|| std::path::PathBuf::from("."))
-            .join(".pancetta")
-            .join("pancetta.toml");
         let (cmd_bookmark_mutation_tx, cmd_bookmark_mutation_handle) =
             spawn_bookmark_mutation_worker(
                 cmd_config.clone(),
                 cmd_config_write_tx.clone(),
                 cmd_tui_msg_tx.clone(),
-                cmd_bookmark_config_path,
+                cmd_config_path.clone(),
+                cmd_config_write_is_toml,
             );
         // Live device-switch channel into the audio thread. `None` in
         // stub/`--no-audio` modes — the SelectDevice handler then persists the
@@ -2049,8 +2058,8 @@ impl super::ApplicationCoordinator {
                                 input_device, output_device
                             );
                             // Persist the operator's choice to the in-memory
-                            // config and to ~/.pancetta/pancetta.toml so it
-                            // survives a restart, AND apply it live by asking the
+                            // config and to `cmd_config_path` so it survives
+                            // a restart, AND apply it live by asking the
                             // audio thread to reopen the cpal stream(s) on the new
                             // device(s) — no restart required.
                             {
@@ -2062,10 +2071,10 @@ impl super::ApplicationCoordinator {
                                     cfg.audio.input_device = inp.clone();
                                 }
                             }
-                            let config_path = dirs::home_dir()
-                                .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                .join(".pancetta")
-                                .join("pancetta.toml");
+                            // PAN-62: the actually-loaded config path
+                            // (`--config <path>`, or the default), not a
+                            // hardcoded `~/.pancetta/pancetta.toml`.
+                            let config_path = cmd_config_path.clone();
                             // PAN-61 review round 7 (P1): submit to the
                             // serialized write worker and do NOT await the
                             // result inline -- the persist outcome is
@@ -2077,7 +2086,28 @@ impl super::ApplicationCoordinator {
                             // takes. The live-switch dance a few lines down
                             // is unconditional either way (not gated on
                             // persist outcome), exactly as before.
-                            {
+                            // PAN-62 review round 1 (Codex P2), format
+                            // precomputed at startup per round 2 (Codex
+                            // P1): the targeted setters below parse the
+                            // existing file exclusively as TOML --
+                            // persisting against a JSON `--config` file
+                            // would fail every time with a raw parser
+                            // error. Reject up front with a clear
+                            // operator-facing message instead.
+                            if !cmd_config_write_is_toml {
+                                warn!(
+                                    "Config file {} is not TOML; audio device selection not persisted",
+                                    config_path.display()
+                                );
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                        component: "audio".to_string(),
+                                        status: "Device choice applied live, but not persisted \
+                                                 (config file isn't TOML)"
+                                            .to_string(),
+                                    },
+                                );
+                            } else {
                                 let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                                 let write_path = config_path.clone();
                                 let write_input = input_device.clone();
@@ -2254,8 +2284,8 @@ impl super::ApplicationCoordinator {
                                 );
                             } else {
                                 // Persist the operator's choice to the in-memory
-                                // config and to ~/.pancetta/pancetta.toml so it
-                                // survives a restart, AND apply it live by asking
+                                // config and to `cmd_config_path` so it survives
+                                // a restart, AND apply it live by asking
                                 // run_main_loop (via hamlib_reconnect_tx) to tear
                                 // down and reconnect Hamlib on the new config --
                                 // same live-switch pattern as SelectDevice above.
@@ -2266,10 +2296,10 @@ impl super::ApplicationCoordinator {
                                     cfg.rig.interface.baud_rate = baud_rate;
                                     cfg.rig.ptt.method = ptt_method.clone();
                                 }
-                                let config_path = dirs::home_dir()
-                                    .unwrap_or_else(|| std::path::PathBuf::from("."))
-                                    .join(".pancetta")
-                                    .join("pancetta.toml");
+                                // PAN-62: the actually-loaded config path
+                                // (`--config <path>`, or the default), not
+                                // a hardcoded `~/.pancetta/pancetta.toml`.
+                                let config_path = cmd_config_path.clone();
                                 // PAN-61 review round 7 (P1): submit to the
                                 // serialized write worker and do NOT await
                                 // the result inline -- see SelectDevice's
@@ -2277,7 +2307,24 @@ impl super::ApplicationCoordinator {
                                 // reconnect request below is unconditional
                                 // either way (not gated on persist
                                 // outcome), exactly as before.
-                                {
+                                // PAN-62 review round 1 (Codex P2), format
+                                // precomputed at startup per round 2
+                                // (Codex P1): see SelectDevice's identical
+                                // guard above.
+                                if !cmd_config_write_is_toml {
+                                    warn!(
+                                        "Config file {} is not TOML; rig config selection not persisted",
+                                        config_path.display()
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "rig".to_string(),
+                                            status: "Rig applied live, but not persisted (config \
+                                                     file isn't TOML)"
+                                                .to_string(),
+                                        },
+                                    );
+                                } else {
                                     let (resp_tx, resp_rx) = tokio::sync::oneshot::channel();
                                     let write_path = config_path.clone();
                                     let write_model = model.clone();
@@ -2905,7 +2952,8 @@ fn rig_bookmark_saved_status(name: &str, count: usize) -> String {
     }
 }
 
-/// One targeted `~/.pancetta/pancetta.toml` write, queued for serialized
+/// One targeted config-file write (PAN-62: the coordinator's `config_path`,
+/// not always `~/.pancetta/pancetta.toml`), queued for serialized
 /// processing by the worker `spawn_config_file_write_worker` spawns
 /// (PAN-61 review round 7, P1). `work` performs the actual blocking
 /// `std::fs` I/O (matching the `set_*_in_file` methods' shape) and is only
@@ -2992,6 +3040,14 @@ fn spawn_bookmark_mutation_worker(
     write_tx: tokio::sync::mpsc::UnboundedSender<ConfigFileWriteRequest>,
     tui_msg_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
     config_path: std::path::PathBuf,
+    // PAN-62 review round 1 (Codex P2) / round 2 (Codex P1):
+    // `set_rig_bookmarks_in_file` parses the existing file exclusively as
+    // TOML -- taken as a precomputed argument (never checked here via
+    // synchronous disk I/O) so this stays consistent with `main.rs`'s
+    // `config_write_is_toml`, the single source of truth for the format
+    // detection that must match what `load_configuration_with_warnings`
+    // actually parsed.
+    config_is_toml: bool,
 ) -> (
     tokio::sync::mpsc::UnboundedSender<BookmarkMutation>,
     tokio::task::JoinHandle<Result<()>>,
@@ -2999,6 +3055,26 @@ fn spawn_bookmark_mutation_worker(
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BookmarkMutation>();
     let handle = tokio::spawn(async move {
         while let Some(mutation) = rx.recv().await {
+            // Bookmarks have no "live apply" fallback the way SelectDevice/
+            // SelectRig do -- a save/delete IS the persist, so a non-TOML
+            // config file means the whole mutation is rejected outright
+            // rather than reporting a confusing raw parser failure.
+            if !config_is_toml {
+                let name = match &mutation {
+                    BookmarkMutation::Save(bookmark) => bookmark.name.clone(),
+                    BookmarkMutation::Delete(name) => name.clone(),
+                };
+                warn!(
+                    "Config file {} is not TOML; bookmark '{}' not saved/deleted",
+                    config_path.display(),
+                    name
+                );
+                let _ = tui_msg_tx.send(pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                    component: "rig".to_string(),
+                    status: "Bookmarks aren't supported for a non-TOML config file".to_string(),
+                });
+                continue;
+            }
             // Stage fresh at the top of every iteration -- this only runs
             // after the PREVIOUS mutation (if any) fully committed below,
             // since this loop processes one item at a time.
@@ -3212,6 +3288,71 @@ mod tui_relay_tests {
             "must overwrite, not append a duplicate name"
         );
         assert_eq!(bookmarks[0].model, "IC-7300");
+    }
+
+    /// PAN-62 review round 1 (Codex P2): saving a bookmark against a JSON
+    /// `--config` file must be rejected with a clear operator-facing
+    /// message -- not silently accepted (the file is never actually
+    /// written, since `set_rig_bookmarks_in_file` only understands TOML)
+    /// and not a raw "failed to parse config" parser error.
+    #[tokio::test]
+    async fn bookmark_worker_rejects_a_save_against_a_json_config_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let json_path = dir.path().join("pancetta.json");
+        std::fs::write(&json_path, "{}").unwrap();
+
+        let config = Arc::new(tokio::sync::RwLock::new(pancetta_config::Config::default()));
+        let (write_tx, _write_handle) = spawn_config_file_write_worker();
+        let (tui_msg_tx, tui_msg_rx) = crossbeam_channel::unbounded();
+        let (bookmark_tx, _bookmark_handle) = spawn_bookmark_mutation_worker(
+            config.clone(),
+            write_tx,
+            tui_msg_tx,
+            json_path.clone(),
+            false, // config_is_toml: mirrors what main.rs's config_write_is_toml
+                   // would compute for this .json path
+        );
+
+        bookmark_tx
+            .send(BookmarkMutation::Save(pancetta_config::rig::RigBookmark {
+                name: "Shack".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }))
+            .unwrap();
+
+        // `crossbeam_channel::Receiver::recv()` blocks the OS thread (not
+        // just the future), which would starve `tokio::time::timeout`'s own
+        // cancellation -- poll with `try_recv` + an async sleep instead so
+        // the runtime keeps making progress.
+        let msg = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                if let Ok(pancetta_tui::tui_runner::TuiMessage::StatusUpdate { status, .. }) =
+                    tui_msg_rx.try_recv()
+                {
+                    return status;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("worker must report a status within 5s");
+
+        assert!(
+            msg.contains("aren't supported") && msg.contains("non-TOML"),
+            "expected a clear non-TOML rejection message, got: {msg}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&json_path).unwrap(),
+            "{}",
+            "the JSON file must be left completely untouched"
+        );
+        assert!(
+            config.read().await.rig.bookmarks.is_empty(),
+            "in-memory bookmarks must NOT reflect a rejected save"
+        );
     }
 
     #[test]

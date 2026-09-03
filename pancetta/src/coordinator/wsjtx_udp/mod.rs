@@ -2319,7 +2319,9 @@ mod replay_gate_tests {
             None, // no test-tx
             1500.0,
             Arc::new(AtomicBool::new(false)),
-            Vec::new(), // no config warnings
+            Vec::new(),                                             // no config warnings
+            std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed")
