@@ -90,11 +90,20 @@ use, so every other TOML key in the file is preserved untouched.
 PAN-59's modal-scoped keys (Tab/Up/Down/Esc/Enter inside the rig picker) are deliberately *not*
 in the top-level `KEYBINDINGS` table (`keymap.rs`'s own comment: "Modal-scoped keys ... are
 documented by each modal's own footer, not here"). Bookmarks add two more modal-scoped keys,
-`b` and `s`, with zero top-level keymap/README/docs churn.
+with zero top-level keymap/README/docs churn.
+
+> **Implementation note (post-final-review correction):** this section originally specified
+> plain `b`/`s` as the trigger keys. The final whole-branch review found that the modal opens
+> with the Model field focused by default, and Model's free-text-entry arm has match priority
+> over any plain-letter binding — so `b`/`s` were unreachable on first use (pressing either right
+> after opening the modal just typed the letter into the model name). Shipped as **`F2`**
+> (load) / **`F3`** (save) instead — unambiguous, never collides with free-text entry, and
+> avoids the terminal-compatibility fragility of a Ctrl+letter binding. Every reference to `b`/`s`
+> below is historical design intent; the actual keys are `F2`/`F3`.
 
 **From the 4-field form** (`RigSelectionState`, unchanged Tab-cycle over Model/Port/Baud/Ptt):
 
-- **`b`** — opens a stacked "load bookmark" overlay on top of the form:
+- **`F2`** — opens a stacked "load bookmark" overlay on top of the form:
   - Up/Down selects among `rig_selection.bookmarks` (each row shows name + `model @ port,
     baud, ptt`)
   - **Enter** loads the highlighted bookmark's 4 values into the underlying form's
@@ -104,7 +113,7 @@ documented by each modal's own footer, not here"). Bookmarks add two more modal-
   - **Esc** closes the overlay without loading anything.
   - **`x`** deletes the highlighted bookmark: sends `TuiCommand::DeleteRigBookmark`, list
     refreshes in place from the coordinator's response.
-- **`s`** — opens an inline name-input (reuses the Model field's existing char-push/pop text-edit
+- **`F3`** — opens an inline name-input (reuses the Model field's existing char-push/pop text-edit
   idiom, new `RigSelectionState` field `bookmark_name_input: String` + `naming_bookmark: bool`):
   captures the form's **current** 4 values (whatever's displayed right now — pre-filled from live
   config when the modal opened, or mid-edit values if the operator changed something first,
@@ -165,13 +174,13 @@ around Hamlib reconnect safety; PAN-61 must not reopen that surface).
    seeds `rig_selection.bookmarks` from it, same call site that already seeds the 4 live-value
    fields.
 2. **Operator presses `i`**: existing modal opens, pre-populated with live values (unchanged).
-3. **Operator presses `b`**, picks a bookmark, presses Enter on the overlay: overlay closes, the
+3. **Operator presses `F2`**, picks a bookmark, presses Enter on the overlay: overlay closes, the
    4 underlying form fields now show the bookmark's values (local `App` state only — no message
    sent yet).
 4. **Operator presses the form's Enter**: unchanged `TuiCommand::SelectRig` path — validates the
    model, persists via `set_rig_in_file`, requests a live Hamlib reconnect exactly as PAN-59
    built it.
-5. **Operator presses `s`**, types a name, presses Enter: `TuiCommand::SaveRigBookmark` sent →
+5. **Operator presses `F3`**, types a name, presses Enter: `TuiCommand::SaveRigBookmark` sent →
    coordinator upserts + persists + pushes `RigBookmarksUpdate` → `App` refreshes
    `rig_selection.bookmarks` (same handling as any other `TuiMessage` in the TUI's receive loop).
 6. **Operator presses `x` on a bookmark row**: `TuiCommand::DeleteRigBookmark` → same

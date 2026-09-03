@@ -2383,13 +2383,25 @@ impl super::ApplicationCoordinator {
                                     name,
                                     config_path.display()
                                 );
+                                // I-5 fix (PAN-61 review round 1): only
+                                // resync the TUI's bookmark list on a
+                                // successful persist. Pushing it
+                                // unconditionally would show the operator
+                                // a saved/updated row that doesn't actually
+                                // exist on disk -- the in-memory
+                                // `cfg.rig.bookmarks` stays mutated either
+                                // way (matching this file's existing
+                                // SelectDevice/SelectRig risk tolerance for
+                                // a failed persist), but the TUI's list
+                                // view must not silently diverge from what
+                                // will actually survive a restart.
+                                let _ = cmd_tui_msg_tx.send(
+                                    pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
+                                        bookmarks: bookmarks.clone(),
+                                    },
+                                );
                                 rig_bookmark_saved_status(&name, bookmarks.len())
                             };
-                            let _ = cmd_tui_msg_tx.send(
-                                pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
-                                    bookmarks: bookmarks.clone(),
-                                },
-                            );
                             let _ = cmd_tui_msg_tx.send(
                                 pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                     component: "rig".to_string(),
@@ -2431,13 +2443,22 @@ impl super::ApplicationCoordinator {
                                         name,
                                         config_path.display()
                                     );
+                                    // I-5 fix (PAN-61 review round 1): only
+                                    // resync the TUI's bookmark list on a
+                                    // successful persist. Pushing it
+                                    // unconditionally would remove the row
+                                    // from the operator's view even though
+                                    // the delete didn't actually take on
+                                    // disk, leaving them unable to see (and
+                                    // retry) the bookmark they just failed
+                                    // to delete.
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
+                                            bookmarks: bookmarks.clone(),
+                                        },
+                                    );
                                     format!("Deleted bookmark '{}'", name)
                                 };
-                                let _ = cmd_tui_msg_tx.send(
-                                    pancetta_tui::tui_runner::TuiMessage::RigBookmarksUpdate {
-                                        bookmarks: bookmarks.clone(),
-                                    },
-                                );
                                 let _ = cmd_tui_msg_tx.send(
                                     pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                         component: "rig".to_string(),

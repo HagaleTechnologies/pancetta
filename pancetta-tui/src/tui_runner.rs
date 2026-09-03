@@ -2579,7 +2579,27 @@ impl TuiRunner {
                 "(no saved bookmarks — press F3 from the form to save one)",
             ));
         } else {
-            for (idx, bookmark) in state.bookmarks.iter().enumerate() {
+            // I-6 fix (PAN-61 review round 1): the 20-bookmark soft cap is
+            // advisory, so the list can exceed `inner`'s available rows on
+            // a short terminal. Without windowing, `Paragraph` silently
+            // clips trailing rows -- a selection past the visible slice
+            // could be loaded/deleted while its highlight is off-screen.
+            // Reserve 2 rows for the trailing blank line + footer (added
+            // below) and render a window anchored around the current
+            // selection, clamped to the list's own bounds.
+            let visible_rows = (inner.height.saturating_sub(2) as usize).max(1);
+            let total = state.bookmarks.len();
+            let window_start = if total <= visible_rows {
+                0
+            } else {
+                state
+                    .selected_bookmark_idx
+                    .saturating_sub(visible_rows / 2)
+                    .min(total - visible_rows)
+            };
+            let window_end = (window_start + visible_rows).min(total);
+            for (offset, bookmark) in state.bookmarks[window_start..window_end].iter().enumerate() {
+                let idx = window_start + offset;
                 let selected = idx == state.selected_bookmark_idx;
                 let style = if selected {
                     Style::default()

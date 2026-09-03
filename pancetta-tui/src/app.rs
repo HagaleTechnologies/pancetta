@@ -930,7 +930,17 @@ impl RigSelectionState {
             Some(pos) => pos,
             None => {
                 if !bookmark.port.is_empty() {
+                    // I-4 fix (PAN-61 review round 1): prepending shifts
+                    // every existing index in `available_ports` up by one.
+                    // `committed_port_idx` is a snapshot into that same
+                    // list (used by `restore_committed()` on Esc) and must
+                    // shift with it, or Esc after loading a bookmark with
+                    // an unenumerated port restores an index that now
+                    // names a DIFFERENT device than the one committed at
+                    // modal-open time -- a later bare Enter would silently
+                    // persist and connect to the wrong port.
                     self.available_ports.insert(0, bookmark.port.clone());
+                    self.committed_port_idx += 1;
                 }
                 0
             }
@@ -6534,6 +6544,55 @@ mod tests {
         assert!(state
             .available_ports
             .contains(&"remote-rig.example:4532".to_string()));
+    }
+
+    /// PAN-61 review round 1 (Codex P1): loading a bookmark with an
+    /// unenumerated port prepends it to `available_ports`, shifting every
+    /// existing index up by one. `committed_port_idx` is a snapshot into
+    /// that same list -- it must shift too, or Esc after loading such a
+    /// bookmark restores an index that now names a different device than
+    /// the one actually committed when the modal opened.
+    #[test]
+    fn rig_selection_state_load_bookmark_prepend_preserves_committed_port_idx() {
+        let mut state = RigSelectionState {
+            available_ports: vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
+            selected_port_idx: 1,
+            committed_port_idx: 1, // committed to /dev/ttyUSB1 at modal-open time
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "Remote".to_string(),
+                model: "FTdx10".to_string(),
+                port: "remote-rig.example:4532".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }],
+            ..Default::default()
+        };
+        state.load_bookmark(0);
+
+        // The bookmark's port is prepended at index 0, shifting the
+        // previously-committed /dev/ttyUSB1 from index 1 to index 2.
+        assert_eq!(
+            state.available_ports,
+            vec![
+                "remote-rig.example:4532".to_string(),
+                "/dev/ttyUSB0".to_string(),
+                "/dev/ttyUSB1".to_string(),
+            ]
+        );
+        assert_eq!(
+            state.committed_port_idx, 2,
+            "committed_port_idx must shift with the list so it still names /dev/ttyUSB1"
+        );
+
+        // Esc after abandoning the loaded bookmark must restore the
+        // ORIGINAL committed port, not some other device that happens to
+        // now sit at the stale index.
+        state.restore_committed();
+        assert_eq!(
+            state.selected_port(),
+            "/dev/ttyUSB1",
+            "restore_committed must land back on the port that was actually committed"
+        );
     }
 
     #[test]
