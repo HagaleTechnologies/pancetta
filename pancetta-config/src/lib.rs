@@ -917,9 +917,7 @@ mod tests {
             baud_rate: 38400,
             ptt_method: crate::rig::PttMethod::None,
         }];
-        config
-            .set_rig_bookmarks_in_file(&path, &bookmarks)
-            .unwrap();
+        config.set_rig_bookmarks_in_file(&path, &bookmarks).unwrap();
 
         let written = std::fs::read_to_string(&path).unwrap();
         let parsed: toml::Table = written.parse().unwrap();
