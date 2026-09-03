@@ -3681,91 +3681,74 @@ impl Ft8Decoder {
             // incidentally different NMS grouping.
             let mut sync_candidates: Vec<CostasCandidate>;
             if !ft8lib_seed_keys.is_empty() {
-                sync_candidates = sweep_candidate_groups.into_iter().flatten().collect();
-                sync_candidates.extend(seed_candidates);
+                // Try the union path first — cloned (both types are
+                // `Copy`, so this is cheap), since a novel seed that
+                // doesn't survive NMS+cap means falling back to
+                // `finalize_no_seed_effect_candidate_groups` below using
+                // the ORIGINAL, not-yet-merged groups.
+                let mut union_candidates: Vec<CostasCandidate> =
+                    sweep_candidate_groups.iter().flatten().copied().collect();
+                union_candidates.extend(seed_candidates.iter().copied());
                 // Dedup exact-key collisions, cap, and (PAN-31) re-run NMS
                 // over the native+seed union. See
                 // `finalize_native_and_seed_candidate_union` for the mechanics.
                 let after_dedup =
-                    self.finalize_native_and_seed_candidate_union(&mut sync_candidates);
+                    self.finalize_native_and_seed_candidate_union(&mut union_candidates);
 
                 // Seeds that were BOTH novel AND survived the cap. These
                 // counters are LOAD-BEARING, not diagnostics: at the default
                 // cap the native sweep is already saturated on busy audio, so
                 // without them an inert run and a genuine null result are
                 // indistinguishable.
-                let kept_seeds = sync_candidates
+                let kept_seeds = union_candidates
                     .iter()
                     .filter(|c| ft8lib_seed_keys.contains(&(c.time_step, c.freq_bin, c.freq_sub)))
                     .count();
-                debug!(
-                    target: "ft8.seed",
-                    after_dedup,
-                    kept_seeds,
-                    total = sync_candidates.len(),
-                    cap = self.config.max_sync_candidates,
-                    "PAN-7 ft8_lib sync-seed union"
-                );
-            } else if sweep_candidate_groups.len() > 1 {
-                // No seed contributed a genuinely novel position (or the
-                // seed search never ran/was skipped), but MULTIPLE sweeps
-                // did run (hb-228) — a real merge across groups is needed
-                // regardless of seeding. If the sweeps deferred their own
-                // NMS on the expectation a union pass would supply it,
-                // supply it NOW, but per-group (mirroring exactly what
-                // each sweep would have applied internally had
-                // `defer_nms` been `false`) rather than across the merged
-                // set.
-                if defer_nms && self.config.nms_enabled {
-                    for group in sweep_candidate_groups.iter_mut() {
-                        self.nms_candidates(group);
-                    }
+
+                if kept_seeds > 0 {
+                    sync_candidates = union_candidates;
+                    debug!(
+                        target: "ft8.seed",
+                        after_dedup,
+                        kept_seeds,
+                        total = sync_candidates.len(),
+                        cap = self.config.max_sync_candidates,
+                        "PAN-7 ft8_lib sync-seed union"
+                    );
+                } else {
+                    // Codex round-2 finding on PR #343: a novel seed
+                    // existed (so the union path was attempted), but NONE
+                    // of them survived NMS + the cap — the seed itself
+                    // contributes nothing to the final output either way.
+                    // Discard the union attempt anyway: merely having run
+                    // ONE union-wide NMS pass over ALL sweeps together
+                    // (rather than per-group) already let candidates from
+                    // DIFFERENT sweeps suppress each other, which
+                    // per-group NMS never would — e.g. a primary candidate
+                    // suppressing a nearby alternate-sweep candidate
+                    // purely because the since-discarded seed's presence
+                    // triggered the union path at all. Recompute via the
+                    // untouched original groups instead.
+                    sync_candidates = self.finalize_no_seed_effect_candidate_groups(
+                        sweep_candidate_groups,
+                        defer_nms,
+                    );
+                    debug!(
+                        target: "ft8.seed",
+                        total = sync_candidates.len(),
+                        cap = self.config.max_sync_candidates,
+                        "PAN-48: novel seed(s) existed but none survived NMS -- falling back \
+                         to per-group NMS instead of the union pass"
+                    );
                 }
-                sync_candidates = sweep_candidate_groups.into_iter().flatten().collect();
-                // Dedup exact (time,freq) collisions (keeping the highest sync
-                // score), re-sort best-first, and restore the configured cap —
-                // identical to the original hb-228 merge tail.
-                sync_candidates.sort_by(|a, b| {
-                    (a.time_step, a.freq_bin, a.freq_sub)
-                        .cmp(&(b.time_step, b.freq_bin, b.freq_sub))
-                        .then(
-                            b.sync_score
-                                .partial_cmp(&a.sync_score)
-                                .unwrap_or(std::cmp::Ordering::Equal),
-                        )
-                });
-                sync_candidates.dedup_by_key(|c| (c.time_step, c.freq_bin, c.freq_sub));
-                sync_candidates.sort_by(|a, b| {
-                    b.sync_score
-                        .partial_cmp(&a.sync_score)
-                        .unwrap_or(std::cmp::Ordering::Equal)
-                });
-                sync_candidates.truncate(self.config.max_sync_candidates);
             } else {
-                // Codex round-1 finding on PR #343: exactly ONE sweep ran
-                // (hb-228 off) and no seed changed anything — there is no
-                // merge to do at all, so none may run. The original
-                // flag-off/no-three-method path never touched this
-                // group's own output past what
-                // `costas_sync_search_with_threshold_and_partner` itself
-                // already returned (sorted, capped, and — when `!defer_nms`
-                // — NMS'd internally); re-sorting/deduping/truncating it
-                // again here is not a no-op in every configuration.
-                // `costas_two_baseline_enabled` (with `nms_enabled: false`)
-                // deliberately leaves same-key candidates with different
-                // refinements for downstream evaluation to choose between
-                // — an unconditional `dedup_by_key` would silently discard
-                // one, changing the candidate count/composition even
-                // though neither multi-sweep merging nor seeding ever
-                // occurred. Only apply the deferred per-group NMS (if
-                // `defer_nms` was true) and use that group's own output
-                // as-is.
-                if defer_nms && self.config.nms_enabled {
-                    for group in sweep_candidate_groups.iter_mut() {
-                        self.nms_candidates(group);
-                    }
-                }
-                sync_candidates = sweep_candidate_groups.into_iter().flatten().collect();
+                // No seed contributed a genuinely novel position at all
+                // (or the seed search never ran/was skipped) — the union
+                // is identical to native/sweep-only, so this restores the
+                // exact ORIGINAL (flag-off) per-sweep NMS placement
+                // instead of the union pass.
+                sync_candidates = self
+                    .finalize_no_seed_effect_candidate_groups(sweep_candidate_groups, defer_nms);
             }
 
             // Budget-report stage push, deferred until here (only when
@@ -6974,6 +6957,65 @@ impl Ft8Decoder {
         candidates.truncate(self.config.max_sync_candidates);
 
         after_dedup
+    }
+
+    /// PAN-48 fallback merge: NMS each sweep group SEPARATELY (mirroring
+    /// exactly what each sweep would have applied internally had
+    /// `defer_nms` been `false`) when `defer_nms` deferred it, then merge
+    /// -- but only actually merge (dedup exact keys, re-sort, re-truncate)
+    /// when there is more than one group. A single group's own output
+    /// (already sorted/capped, and NMS'd internally when `!defer_nms`) is
+    /// used completely untouched: `costas_two_baseline_enabled` (with
+    /// `nms_enabled: false`) deliberately leaves same-key candidates with
+    /// different refinements for downstream evaluation, so an
+    /// unconditional dedup would silently discard one even when neither
+    /// multi-sweep merging nor seeding occurred (Codex round-1 finding on
+    /// PR #343).
+    ///
+    /// Used both when no seed ever contributed a genuinely novel
+    /// candidate, and (Codex round-2 finding on PR #343) when a novel
+    /// seed existed but none of them survived the union path's NMS+cap --
+    /// in that case the union attempt is discarded in favor of this,
+    /// since merely having attempted a union (even one where the seed
+    /// itself doesn't survive) still lets candidates from DIFFERENT
+    /// sweeps suppress each other in the one shared NMS pass, which
+    /// per-group NMS never would -- the same class of contamination
+    /// PAN-48 exists to prevent, just triggered by the seed's mere
+    /// presence rather than its survival.
+    fn finalize_no_seed_effect_candidate_groups(
+        &self,
+        mut groups: Vec<Vec<CostasCandidate>>,
+        defer_nms: bool,
+    ) -> Vec<CostasCandidate> {
+        if defer_nms && self.config.nms_enabled {
+            for group in groups.iter_mut() {
+                self.nms_candidates(group);
+            }
+        }
+        let multi = groups.len() > 1;
+        let mut candidates: Vec<CostasCandidate> = groups.into_iter().flatten().collect();
+        if multi {
+            // Dedup exact (time,freq) collisions (keeping the highest sync
+            // score), re-sort best-first, and restore the configured cap —
+            // identical to the original hb-228 merge tail.
+            candidates.sort_by(|a, b| {
+                (a.time_step, a.freq_bin, a.freq_sub)
+                    .cmp(&(b.time_step, b.freq_bin, b.freq_sub))
+                    .then(
+                        b.sync_score
+                            .partial_cmp(&a.sync_score)
+                            .unwrap_or(std::cmp::Ordering::Equal),
+                    )
+            });
+            candidates.dedup_by_key(|c| (c.time_step, c.freq_bin, c.freq_sub));
+            candidates.sort_by(|a, b| {
+                b.sync_score
+                    .partial_cmp(&a.sync_score)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+            candidates.truncate(self.config.max_sync_candidates);
+        }
+        candidates
     }
 
     /// Non-maximum suppression: remove weaker candidates near stronger ones.
@@ -25314,6 +25356,98 @@ mod pan7_ft8lib_sync_seed_tests {
             "must keep `strong` and `distinct` (the two candidates NMS itself would keep) -- \
              not `strong` and the redundant `redundant` that only survived by ranking above \
              the truncation cap before NMS got a chance to suppress it; got {candidates:?}"
+        );
+    }
+
+    /// PAN-48 fallback mechanism (Codex round-2 finding on PR #343): the
+    /// merge decision falls back to `finalize_no_seed_effect_candidate_
+    /// groups` whenever a novel seed doesn't survive the union path's
+    /// NMS+cap -- this pins that the fallback itself actually behaves
+    /// like independent per-sweep NMS (the whole point of falling back to
+    /// it), not like a disguised union pass. Two groups -- modeling
+    /// primary vs. an hb-228 alternate-transform sweep -- with candidates
+    /// that WOULD suppress each other under union-wide NMS (same
+    /// TF-radius) but must NOT under correct per-group NMS, since they
+    /// were found by separate sweeps that never compare against each
+    /// other in the flag-off world.
+    #[test]
+    fn finalize_no_seed_effect_candidate_groups_nms_never_crosses_a_group_boundary() {
+        let primary_candidate = CostasCandidate {
+            time_step: 100,
+            freq_bin: 50,
+            freq_sub: 0,
+            sync_score: 10.0,
+            time_refinement: 0.0,
+        };
+        // Default NMS radii are (time: 8, freq: 2) -- one bin over is
+        // trivially within radius, so a union pass WOULD suppress this.
+        let alt_sweep_candidate = CostasCandidate {
+            time_step: 100,
+            freq_bin: 51,
+            freq_sub: 0,
+            sync_score: 9.0,
+            time_refinement: 0.0,
+        };
+
+        let dec = Ft8Decoder::new(Ft8Config {
+            nms_enabled: true,
+            max_sync_candidates: 10,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+
+        let groups = vec![vec![primary_candidate], vec![alt_sweep_candidate]];
+        let result = dec.finalize_no_seed_effect_candidate_groups(groups, true);
+
+        let kept_times: Vec<(usize, usize)> =
+            result.iter().map(|c| (c.time_step, c.freq_bin)).collect();
+        assert!(
+            kept_times.contains(&(primary_candidate.time_step, primary_candidate.freq_bin))
+                && kept_times
+                    .contains(&(alt_sweep_candidate.time_step, alt_sweep_candidate.freq_bin)),
+            "per-group NMS must keep candidates from BOTH sweeps -- a union-wide pass would \
+             have suppressed alt_sweep_candidate as within primary_candidate's radius, but \
+             they were found by separate sweeps that never compare against each other in the \
+             flag-off world; got {result:?}"
+        );
+    }
+
+    /// Sanity companion: when `defer_nms` is `false` (each sweep already
+    /// applied its own internal NMS before this ever runs, e.g. the
+    /// seed-union feature is off entirely), the fallback must NOT
+    /// re-apply NMS on top -- that would be a redundant (if usually
+    /// harmless) second pass this specific fn is not supposed to add.
+    #[test]
+    fn finalize_no_seed_effect_candidate_groups_skips_nms_when_not_deferred() {
+        let a = CostasCandidate {
+            time_step: 100,
+            freq_bin: 50,
+            freq_sub: 0,
+            sync_score: 10.0,
+            time_refinement: 0.0,
+        };
+        let b = CostasCandidate {
+            time_step: 100,
+            freq_bin: 51,
+            freq_sub: 0,
+            sync_score: 9.0,
+            time_refinement: 0.0,
+        };
+        let dec = Ft8Decoder::new(Ft8Config {
+            nms_enabled: true,
+            max_sync_candidates: 10,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+
+        let groups = vec![vec![a], vec![b]];
+        let result = dec.finalize_no_seed_effect_candidate_groups(groups, false);
+
+        assert_eq!(
+            result.len(),
+            2,
+            "defer_nms=false means each group's own internal NMS already ran (or the group \
+             wasn't deferred in the first place) -- this fn must not suppress anything itself"
         );
     }
 
