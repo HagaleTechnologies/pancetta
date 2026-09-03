@@ -62,6 +62,18 @@ fn default_operating_mode() -> String {
     "FT8".to_string()
 }
 
+/// A saved rig-config bookmark — the same 4 fields the `i` picker edits
+/// (PAN-59), named so the operator can save-as and load-later instead of
+/// re-typing them each time (PAN-61).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RigBookmark {
+    pub name: String,
+    pub model: String,
+    pub port: String,
+    pub baud_rate: u32,
+    pub ptt_method: PttMethod,
+}
+
 /// Rig control configuration
 #[derive(Debug, Clone, Serialize, Deserialize)]
 // Container-level serde default: omitted fields fall back to defaults rather
@@ -107,6 +119,12 @@ pub struct RigConfig {
     /// Custom commands and macros
     #[serde(default)]
     pub custom_commands: HashMap<String, String>,
+
+    /// Saved rig-config bookmarks (PAN-61) — named shortcuts for the 4
+    /// fields the `i` picker edits. Empty by default; grows only via
+    /// explicit operator "save" actions in the TUI.
+    #[serde(default)]
+    pub bookmarks: Vec<RigBookmark>,
 }
 
 /// CAT (Computer Aided Transceiver) interface configuration
@@ -796,6 +814,7 @@ impl Default for RigConfig {
             timing: TimingConfig::default(),
             rig_parameters: RigParametersConfig::default(),
             custom_commands: HashMap::new(),
+            bookmarks: Vec::new(),
         }
     }
 }
@@ -1059,6 +1078,14 @@ impl ConfigSection for RigConfig {
             self.mode = other.mode;
         }
 
+        // PAN-61: bookmarks replace wholesale (matches every sibling nested
+        // config's merge_with below) rather than per-entry union — an unset
+        // higher-priority layer (empty list) leaves the lower layer's saved
+        // bookmarks untouched.
+        if !other.bookmarks.is_empty() {
+            self.bookmarks = other.bookmarks;
+        }
+
         // Merge complex configurations
         self.interface.merge_with(other.interface);
         self.ptt.merge_with(other.ptt);
@@ -1305,5 +1332,54 @@ mod tests {
         assert_eq!(OperatingMode::Ft8.cycle(), OperatingMode::Ft4);
         assert_eq!(OperatingMode::Ft4.cycle(), OperatingMode::Ft2);
         assert_eq!(OperatingMode::Ft2.cycle(), OperatingMode::Ft8);
+    }
+
+    #[test]
+    fn rig_bookmarks_default_to_empty() {
+        let config = RigConfig::default();
+        assert!(config.bookmarks.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn merge_with_replaces_bookmarks_wholesale_when_other_nonempty() {
+        let mut base = RigConfig::default();
+        base.bookmarks = vec![RigBookmark {
+            name: "Old".to_string(),
+            model: "OldRig".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 9600,
+            ptt_method: PttMethod::None,
+        }];
+
+        let mut other = RigConfig::default();
+        other.bookmarks = vec![RigBookmark {
+            name: "New".to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB1".to_string(),
+            baud_rate: 38400,
+            ptt_method: PttMethod::Cat,
+        }];
+
+        base.merge_with(other);
+        assert_eq!(base.bookmarks.len(), 1);
+        assert_eq!(base.bookmarks[0].name, "New");
+    }
+
+    #[test]
+    #[allow(clippy::field_reassign_with_default)]
+    fn merge_with_keeps_bookmarks_when_other_empty() {
+        let mut base = RigConfig::default();
+        base.bookmarks = vec![RigBookmark {
+            name: "Keep".to_string(),
+            model: "FTdx10".to_string(),
+            port: "/dev/ttyUSB0".to_string(),
+            baud_rate: 38400,
+            ptt_method: PttMethod::None,
+        }];
+        let other = RigConfig::default();
+        base.merge_with(other);
+        assert_eq!(base.bookmarks.len(), 1);
+        assert_eq!(base.bookmarks[0].name, "Keep");
     }
 }

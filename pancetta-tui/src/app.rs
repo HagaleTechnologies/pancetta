@@ -775,6 +775,17 @@ pub struct RigSelectionState {
     pub committed_port_idx: usize,
     pub committed_baud_idx: usize,
     pub committed_ptt_idx: usize,
+    /// Saved rig-config bookmarks (PAN-61), seeded from the coordinator's
+    /// `RigConfigUpdate`/`RigBookmarksUpdate` pushes.
+    pub bookmarks: Vec<pancetta_config::rig::RigBookmark>,
+    /// Whether the `F2`-opened "load bookmark" overlay is showing.
+    pub bookmark_overlay_visible: bool,
+    /// Index into `bookmarks` currently highlighted in the overlay.
+    pub selected_bookmark_idx: usize,
+    /// Whether the `F3`-opened "name this bookmark" input is showing.
+    pub naming_bookmark: bool,
+    /// Text typed into the bookmark-name input.
+    pub bookmark_name_input: String,
 }
 
 impl Default for RigSelectionState {
@@ -791,6 +802,11 @@ impl Default for RigSelectionState {
             committed_port_idx: 0,
             committed_baud_idx: 1,
             committed_ptt_idx: 0,
+            bookmarks: Vec::new(),
+            bookmark_overlay_visible: false,
+            selected_bookmark_idx: 0,
+            naming_bookmark: false,
+            bookmark_name_input: String::new(),
         }
     }
 }
@@ -868,6 +884,107 @@ impl RigSelectionState {
     /// Backspace the model text field.
     pub fn pop_model_char(&mut self) {
         self.model.pop();
+    }
+
+    /// Append a character to the bookmark-name input (PAN-61), meaningful
+    /// only while `naming_bookmark` is true.
+    pub fn push_bookmark_name_char(&mut self, c: char) {
+        self.bookmark_name_input.push(c);
+    }
+
+    /// Backspace the bookmark-name input.
+    pub fn pop_bookmark_name_char(&mut self) {
+        self.bookmark_name_input.pop();
+    }
+
+    /// Move the bookmark-overlay selection up (Up arrow). Clamps at 0.
+    pub fn move_bookmark_selection_up(&mut self) {
+        if self.selected_bookmark_idx > 0 {
+            self.selected_bookmark_idx -= 1;
+        }
+    }
+
+    /// Move the bookmark-overlay selection down (Down arrow). Clamps at the
+    /// last index.
+    pub fn move_bookmark_selection_down(&mut self) {
+        if self.selected_bookmark_idx + 1 < self.bookmarks.len() {
+            self.selected_bookmark_idx += 1;
+        }
+    }
+
+    /// Load the bookmark at `idx` into the 4 form fields (PAN-61). Does
+    /// **not** apply anything live — only the form's own Enter does that.
+    /// Out-of-range `idx` is a no-op (`Ok(())`, nothing to load).
+    ///
+    /// I-12 fix (PAN-61 review round 5): a bookmarked baud rate or PTT
+    /// method outside the picker's fixed enumerated choices (reachable via
+    /// a hand-edited config, even though the TUI's own save path only ever
+    /// offers these enumerated values) has NO value this method could
+    /// substitute that would be correct — round 4's "leave the field
+    /// unchanged" fallback just replaced one wrong value (a hardcoded
+    /// default) with a different wrong value (whatever the form happened
+    /// to be showing), silently presenting a hybrid of the bookmark and
+    /// the prior form state as if it were the bookmark. The whole load is
+    /// atomic: every field is validated as representable BEFORE any field
+    /// is mutated, and the load is rejected outright (returning an
+    /// operator-facing reason, no fields touched) if any isn't.
+    ///
+    /// I-15 fix (PAN-61 review round 10, superseding round 3's "leave
+    /// unchanged" for port): an empty bookmarked port is the same class of
+    /// bug as an unsupported baud/PTT — round 3's "leave the port field at
+    /// its current value" fallback still let the load return `Ok` and
+    /// silently combine the bookmark's model/baud/PTT with whatever port
+    /// the form happened to be showing, presenting that hybrid as "the
+    /// bookmark". An empty port is now part of the same all-or-nothing
+    /// check as baud/PTT.
+    pub fn load_bookmark(&mut self, idx: usize) -> Result<(), String> {
+        let Some(bookmark) = self.bookmarks.get(idx).cloned() else {
+            return Ok(());
+        };
+        let baud_idx = RIG_BAUD_RATES.iter().position(|b| *b == bookmark.baud_rate);
+        let ptt_idx = rig_ptt_methods()
+            .iter()
+            .position(|m| format!("{:?}", m) == format!("{:?}", bookmark.ptt_method));
+        let (Some(baud_idx), Some(ptt_idx)) = (baud_idx, ptt_idx) else {
+            return Err(format!(
+                "Bookmark '{}' has a baud rate or PTT method the picker doesn't support \
+                 (edit it in pancetta.toml or re-save it from the form) — not loaded",
+                bookmark.name
+            ));
+        };
+        if bookmark.port.is_empty() {
+            return Err(format!(
+                "Bookmark '{}' has no saved port (edit it in pancetta.toml or re-save it \
+                 from the form) — not loaded",
+                bookmark.name
+            ));
+        }
+
+        self.model = bookmark.model;
+        self.selected_port_idx = match self
+            .available_ports
+            .iter()
+            .position(|p| *p == bookmark.port)
+        {
+            Some(pos) => pos,
+            None => {
+                // I-4 fix (PAN-61 review round 1): prepending shifts
+                // every existing index in `available_ports` up by one.
+                // `committed_port_idx` is a snapshot into that same
+                // list (used by `restore_committed()` on Esc) and must
+                // shift with it, or Esc after loading a bookmark with
+                // an unenumerated port restores an index that now
+                // names a DIFFERENT device than the one committed at
+                // modal-open time -- a later bare Enter would silently
+                // persist and connect to the wrong port.
+                self.available_ports.insert(0, bookmark.port.clone());
+                self.committed_port_idx += 1;
+                0
+            }
+        };
+        self.selected_baud_idx = baud_idx;
+        self.selected_ptt_idx = ptt_idx;
+        Ok(())
     }
 
     /// The port value to submit — empty string if no ports were enumerated.
@@ -3689,6 +3806,7 @@ impl App {
         current_port: String,
         current_baud_rate: u32,
         current_ptt_method: pancetta_config::rig::PttMethod,
+        bookmarks: Vec<pancetta_config::rig::RigBookmark>,
     ) {
         // I-2a fix (PAN-59 final review): if the configured port isn't
         // among the enumerated ones (the rig is unplugged, or it's a
@@ -3726,6 +3844,7 @@ impl App {
         // Keep the committed snapshot (I-3) in sync with this freshly-
         // authoritative baseline.
         self.rig_selection.snapshot_committed();
+        self.rig_selection.bookmarks = bookmarks;
     }
 
     pub fn toggle_autonomous(&mut self) {
@@ -6346,9 +6465,11 @@ mod tests {
 
     #[test]
     fn rig_selection_state_move_up_down_clamp_on_baud_field() {
-        let mut state = RigSelectionState::default();
-        state.active_field = RigField::Baud;
-        state.selected_baud_idx = 0;
+        let mut state = RigSelectionState {
+            active_field: RigField::Baud,
+            selected_baud_idx: 0,
+            ..Default::default()
+        };
         state.move_up();
         assert_eq!(state.selected_baud_idx, 0, "must clamp at 0, not wrap");
 
@@ -6371,6 +6492,285 @@ mod tests {
         assert_eq!(state.model, "I");
     }
 
+    #[test]
+    fn rig_selection_state_bookmark_name_input_text_editing() {
+        let mut state = RigSelectionState::default();
+        state.push_bookmark_name_char('S');
+        state.push_bookmark_name_char('K');
+        assert_eq!(state.bookmark_name_input, "SK");
+        state.pop_bookmark_name_char();
+        assert_eq!(state.bookmark_name_input, "S");
+    }
+
+    #[test]
+    fn rig_selection_state_move_bookmark_selection_clamps_at_bounds() {
+        let mut state = RigSelectionState {
+            bookmarks: vec![
+                pancetta_config::rig::RigBookmark {
+                    name: "A".to_string(),
+                    model: "FTdx10".to_string(),
+                    port: "/dev/ttyUSB0".to_string(),
+                    baud_rate: 38400,
+                    ptt_method: pancetta_config::rig::PttMethod::None,
+                },
+                pancetta_config::rig::RigBookmark {
+                    name: "B".to_string(),
+                    model: "IC-7300".to_string(),
+                    port: "/dev/ttyUSB1".to_string(),
+                    baud_rate: 19200,
+                    ptt_method: pancetta_config::rig::PttMethod::Cat,
+                },
+            ],
+            ..Default::default()
+        };
+        state.move_bookmark_selection_up();
+        assert_eq!(state.selected_bookmark_idx, 0, "must clamp at 0, not wrap");
+
+        state.move_bookmark_selection_down();
+        assert_eq!(state.selected_bookmark_idx, 1);
+        state.move_bookmark_selection_down();
+        assert_eq!(
+            state.selected_bookmark_idx, 1,
+            "must clamp at the last index, not wrap"
+        );
+    }
+
+    #[test]
+    fn rig_selection_state_load_bookmark_populates_form_fields() {
+        let mut state = RigSelectionState {
+            available_ports: vec!["/dev/ttyUSB0".to_string()],
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "Shack".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::Cat,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(state.load_bookmark(0), Ok(()));
+        assert_eq!(state.model, "FTdx10");
+        assert_eq!(state.selected_port(), "/dev/ttyUSB0");
+        assert_eq!(state.selected_baud(), 38400);
+        assert!(matches!(
+            state.selected_ptt(),
+            pancetta_config::rig::PttMethod::Cat
+        ));
+    }
+
+    #[test]
+    fn rig_selection_state_load_bookmark_prepends_unenumerated_port() {
+        let mut state = RigSelectionState {
+            available_ports: vec!["/dev/ttyUSB0".to_string()],
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "Remote".to_string(),
+                model: "FTdx10".to_string(),
+                port: "remote-rig.example:4532".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(state.load_bookmark(0), Ok(()));
+        assert_eq!(state.selected_port(), "remote-rig.example:4532");
+        assert!(state
+            .available_ports
+            .contains(&"remote-rig.example:4532".to_string()));
+    }
+
+    /// PAN-61 review round 1 (Codex P1): loading a bookmark with an
+    /// unenumerated port prepends it to `available_ports`, shifting every
+    /// existing index up by one. `committed_port_idx` is a snapshot into
+    /// that same list -- it must shift too, or Esc after loading such a
+    /// bookmark restores an index that now names a different device than
+    /// the one actually committed when the modal opened.
+    #[test]
+    fn rig_selection_state_load_bookmark_prepend_preserves_committed_port_idx() {
+        let mut state = RigSelectionState {
+            available_ports: vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
+            selected_port_idx: 1,
+            committed_port_idx: 1, // committed to /dev/ttyUSB1 at modal-open time
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "Remote".to_string(),
+                model: "FTdx10".to_string(),
+                port: "remote-rig.example:4532".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(state.load_bookmark(0), Ok(()));
+
+        // The bookmark's port is prepended at index 0, shifting the
+        // previously-committed /dev/ttyUSB1 from index 1 to index 2.
+        assert_eq!(
+            state.available_ports,
+            vec![
+                "remote-rig.example:4532".to_string(),
+                "/dev/ttyUSB0".to_string(),
+                "/dev/ttyUSB1".to_string(),
+            ]
+        );
+        assert_eq!(
+            state.committed_port_idx, 2,
+            "committed_port_idx must shift with the list so it still names /dev/ttyUSB1"
+        );
+
+        // Esc after abandoning the loaded bookmark must restore the
+        // ORIGINAL committed port, not some other device that happens to
+        // now sit at the stale index.
+        state.restore_committed();
+        assert_eq!(
+            state.selected_port(),
+            "/dev/ttyUSB1",
+            "restore_committed must land back on the port that was actually committed"
+        );
+    }
+
+    /// PAN-61 review round 10 (Codex P1, superseding round 3's "leave
+    /// unchanged"): a bookmark with an empty port (reachable via a
+    /// hand-edited config file even though the TUI's own save path refuses
+    /// to create one) must reject the whole load, not silently combine the
+    /// bookmark's model/baud/PTT with whatever port the form happened to
+    /// be showing and report that hybrid as "the bookmark loaded".
+    #[test]
+    fn rig_selection_state_load_bookmark_with_empty_port_is_rejected() {
+        let mut state = RigSelectionState {
+            model: "Unchanged".to_string(),
+            available_ports: vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
+            selected_port_idx: 1,
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "NoPort".to_string(),
+                model: "FTdx10".to_string(),
+                port: String::new(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }],
+            ..Default::default()
+        };
+        let result = state.load_bookmark(0);
+
+        assert!(
+            result.is_err(),
+            "a bookmark with no saved port must be rejected outright"
+        );
+        assert!(result.unwrap_err().contains("NoPort"));
+        assert_eq!(
+            state.model, "Unchanged",
+            "a rejected load must not mutate any field, including the other 3 that would \
+             otherwise have loaded fine"
+        );
+        assert_eq!(
+            state.selected_port(),
+            "/dev/ttyUSB1",
+            "a rejected load must leave the port field untouched"
+        );
+        assert_eq!(
+            state.available_ports,
+            vec!["/dev/ttyUSB0".to_string(), "/dev/ttyUSB1".to_string()],
+            "a rejected load must not prepend the empty port into the list"
+        );
+    }
+
+    /// PAN-61 review round 5 (Codex P2, escalating round 4's "leave
+    /// unchanged" fix): a bookmarked baud rate outside `RIG_BAUD_RATES`
+    /// (reachable via a hand-edited config, even though the picker only
+    /// ever offers the 6 enumerated choices) has no correct substitute
+    /// value -- the whole load must be rejected, not partially applied
+    /// with the baud field silently left at its prior value.
+    #[test]
+    fn rig_selection_state_load_bookmark_with_unsupported_baud_is_rejected() {
+        let mut state = RigSelectionState {
+            model: "Unchanged".to_string(),
+            selected_baud_idx: 3, // 38400
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "OddBaud".to_string(),
+                model: "FTdx10".to_string(),
+                port: String::new(),
+                baud_rate: 230_400, // not in RIG_BAUD_RATES
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }],
+            ..Default::default()
+        };
+        let result = state.load_bookmark(0);
+
+        assert!(
+            result.is_err(),
+            "a bookmark with an unrepresentable baud rate must be rejected outright"
+        );
+        assert!(result.unwrap_err().contains("OddBaud"));
+        assert_eq!(
+            state.model, "Unchanged",
+            "a rejected load must not mutate any field, including the other 3 that would \
+             otherwise have loaded fine"
+        );
+        assert_eq!(
+            state.selected_baud(),
+            38400,
+            "a rejected load must leave the baud field untouched"
+        );
+    }
+
+    /// Same class of bug as the baud-rate case above, for PTT method.
+    #[test]
+    fn rig_selection_state_load_bookmark_with_unsupported_ptt_is_rejected() {
+        let mut state = RigSelectionState {
+            model: "Unchanged".to_string(),
+            selected_ptt_idx: 1, // Cat
+            bookmarks: vec![pancetta_config::rig::RigBookmark {
+                name: "OddPtt".to_string(),
+                model: "FTdx10".to_string(),
+                port: String::new(),
+                baud_rate: 9600,
+                // Not one of the 4 choices `rig_ptt_methods()` offers.
+                ptt_method: pancetta_config::rig::PttMethod::Parallel,
+            }],
+            ..Default::default()
+        };
+        let result = state.load_bookmark(0);
+
+        assert!(
+            result.is_err(),
+            "a bookmark with an unrepresentable PTT method must be rejected outright"
+        );
+        assert_eq!(state.model, "Unchanged");
+        assert!(
+            matches!(state.selected_ptt(), pancetta_config::rig::PttMethod::Cat),
+            "a rejected load must leave the PTT field untouched"
+        );
+    }
+
+    #[test]
+    fn rig_selection_state_load_bookmark_out_of_range_is_a_no_op() {
+        let mut state = RigSelectionState {
+            model: "Unchanged".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(state.load_bookmark(5), Ok(()));
+        assert_eq!(state.model, "Unchanged");
+    }
+
+    #[tokio::test]
+    async fn apply_rig_config_update_seeds_bookmarks() {
+        let mut app = fixture_app().await;
+        app.apply_rig_config_update(
+            vec!["/dev/ttyUSB0".to_string()],
+            "FTdx10".to_string(),
+            "/dev/ttyUSB0".to_string(),
+            38400,
+            pancetta_config::rig::PttMethod::None,
+            vec![pancetta_config::rig::RigBookmark {
+                name: "Shack".to_string(),
+                model: "FTdx10".to_string(),
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 38400,
+                ptt_method: pancetta_config::rig::PttMethod::None,
+            }],
+        );
+        assert_eq!(app.rig_selection.bookmarks.len(), 1);
+        assert_eq!(app.rig_selection.bookmarks[0].name, "Shack");
+    }
+
     #[tokio::test]
     async fn apply_rig_config_update_preselects_current_values() {
         let mut app = fixture_app().await;
@@ -6380,6 +6780,7 @@ mod tests {
             "/dev/ttyUSB1".to_string(),
             38400,
             pancetta_config::rig::PttMethod::Serial,
+            vec![],
         );
         assert_eq!(app.rig_selection.model, "FTdx10");
         assert_eq!(app.rig_selection.selected_port_idx, 1);
@@ -6407,6 +6808,7 @@ mod tests {
             "remote-rig.example:4532".to_string(), // network rig -- never enumerated
             38400,
             pancetta_config::rig::PttMethod::Cat,
+            vec![],
         );
         assert_eq!(
             app.rig_selection.selected_port(),

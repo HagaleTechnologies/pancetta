@@ -442,6 +442,7 @@ include_itu_zones = []
 great_circle = true
 
 [rig]
+bookmarks = []
 mode = "FT8"
 model = "Generic"
 
