@@ -1496,7 +1496,10 @@ impl super::ApplicationCoordinator {
 
             while !shutdown.load(Ordering::Acquire) {
                 match ft8_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(window) => {
+                    Ok(super::pipeline::DecodeWindow {
+                        samples: window,
+                        dial_hz,
+                    }) => {
                         // Capture receipt time immediately — before any decode
                         // work — so parity tagging is invariant under decode
                         // latency. (If we captured now() after decode, a slow
@@ -2124,6 +2127,13 @@ impl super::ApplicationCoordinator {
 
                         for decoded_msg in decoded_messages.iter_mut() {
                             decoded_msg.slot_parity = Some(window_parity);
+                            // PAN-67 review round 2: stamp the dial frequency
+                            // THIS window's audio was captured on (same value
+                            // sent to the TUI relay below) onto the message
+                            // itself, so every bus consumer (PSKReporter,
+                            // autonomous, QSO) has it available too, not just
+                            // the TUI channel.
+                            decoded_msg.captured_dial_hz = Some(dial_hz);
                             // I-16: strip control/ANSI chars and cap length on
                             // the human-facing string fields, once, at the bus
                             // boundary before any consumer (cross-slot state,
@@ -2343,8 +2353,17 @@ impl super::ApplicationCoordinator {
                                 decoded_msg.ap_level
                             );
 
-                            // Send to TUI via point-to-point channel
-                            if ft8_to_tui_tx.send(decoded_msg.clone()).is_err() {
+                            // Send to TUI via point-to-point channel, tagged with the
+                            // dial frequency THIS window's audio was captured on (PAN-67:
+                            // never a live re-read at relay time, which races an
+                            // in-flight decode against a since-happened band switch).
+                            if ft8_to_tui_tx
+                                .send(super::pipeline::RelayedDecode {
+                                    message: decoded_msg.clone(),
+                                    dial_hz,
+                                })
+                                .is_err()
+                            {
                                 warn!("TUI channel disconnected");
                             }
 
