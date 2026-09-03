@@ -2410,51 +2410,6 @@ impl TuiRunner {
     /// Render the rig-config picker as a centered modal (PAN-59). Mirrors
     /// `render_device_selection_modal`'s sizing/centering/clear idiom, but as
     /// a 4-field single form (model/port/baud/PTT) instead of a 2-panel list.
-    /// Number of rows `text` wraps into at `width` columns under greedy
-    /// word-boundary wrapping — mirrors ratatui's `Wrap { trim: true }`
-    /// closely enough to size a modal that must reserve exactly the rows
-    /// it renders (PAN-66: the rig-config modal's key legend was clipped
-    /// because its reserved height never accounted for wrapping at all).
-    ///
-    /// Measures each word by ratatui's own `Span::width()` (backed by
-    /// `unicode-width`), not `chars().count()` — a CJK character or emoji
-    /// renders as 2 terminal columns but is 1 `char`, and the editable
-    /// Model field accepts any non-control input, so undercounting here
-    /// (round-2 review finding) reproduces the exact same footer-clipping
-    /// bug this function exists to prevent.
-    fn wrapped_line_count(text: &str, width: u16) -> u16 {
-        if width == 0 {
-            return 1;
-        }
-        let width = width as usize;
-        let mut lines: u16 = 1;
-        let mut col = 0usize;
-        for word in text.split_whitespace() {
-            let mut remaining = ratatui::text::Span::raw(word).width();
-            let sep = if col == 0 { 0 } else { 1 };
-            if col + sep + remaining <= width {
-                col += sep + remaining;
-                continue;
-            }
-            // Doesn't fit on the current line: wrap to a fresh one first.
-            if col != 0 {
-                lines += 1;
-            }
-            // A single word wider than the entire line (e.g. a long device
-            // path with no internal whitespace to break on) must itself
-            // hard-wrap across as many lines as it needs — round-1 review
-            // finding on PAN-66's original fix undercounted this exact case
-            // (an edited Port field wrapping consumed a row the footer's
-            // reservation didn't account for, clipping the footer again).
-            while remaining > width {
-                lines += 1;
-                remaining -= width;
-            }
-            col = remaining;
-        }
-        lines
-    }
-
     fn render_rig_selection_modal(
         f: &mut Frame,
         area: Rect,
@@ -2502,42 +2457,6 @@ impl TuiRunner {
             ),
         ];
 
-        let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
-        let inner_width = modal_width.saturating_sub(2);
-        // Every rendered line can wrap — not just the footer. A long edited
-        // value (e.g. a `/dev/serial/by-id/...` port path) wraps exactly
-        // like the footer does, and the modal must reserve its rows too, or
-        // a wrapped field pushes into the footer's space and clips it right
-        // back (round-1 review finding, PAN-66).
-        let field_rows: u16 = fields
-            .iter()
-            .map(|(label, value, _)| {
-                Self::wrapped_line_count(&format!("{:>6}: {value}", label), inner_width)
-            })
-            .sum();
-        let footer_lines = Self::wrapped_line_count(FOOTER, inner_width);
-        // border(2, title rides the top border row) + field rows + blank + footer rows
-        let modal_height = (2 + field_rows + 1 + footer_lines).min(area.height);
-
-        let modal_area = Rect {
-            x: (area.width.saturating_sub(modal_width)) / 2,
-            y: (area.height.saturating_sub(modal_height)) / 2,
-            width: modal_width,
-            height: modal_height,
-        };
-
-        // Clear background behind modal
-        f.render_widget(ratatui::widgets::Clear, modal_area);
-
-        let outer_block = Block::default()
-            .title(" Rig Config ")
-            .borders(Borders::ALL)
-            .border_type(BorderType::Double)
-            .style(Style::default().bg(Color::Black).fg(Color::White));
-
-        let inner = outer_block.inner(modal_area);
-        f.render_widget(outer_block, modal_area);
-
         let mut lines: Vec<Line> = Vec::with_capacity(fields.len() + 2);
         for (label, value, active) in &fields {
             let value_style = if *active {
@@ -2558,6 +2477,43 @@ impl TuiRunner {
             FOOTER,
             Style::default().fg(Color::DarkGray),
         )));
+
+        let modal_width = (area.width * 3 / 5).clamp(40, 70).min(area.width);
+        let inner_width = modal_width.saturating_sub(2);
+        // Every rendered line can wrap, not just the footer — a long edited
+        // value (e.g. a `/dev/serial/by-id/...` port path) wraps exactly
+        // like the footer does, and the modal must reserve its rows too, or
+        // a wrapped field pushes into the footer's space and clips it right
+        // back (round-1 review finding, PAN-66). A hand-rolled column-count
+        // approximation of wrapping undercounts wide (CJK/emoji) graphemes
+        // that don't divide evenly into the line width, since ratatui packs
+        // whole graphemes rather than splitting at arbitrary column offsets
+        // (round-2 AND round-3 review findings) — so ask ratatui itself how
+        // many rows this exact content wraps to, rather than re-deriving it.
+        let content_rows = Paragraph::new(lines.clone())
+            .wrap(Wrap { trim: true })
+            .line_count(inner_width) as u16;
+        // border(2, title rides the top border row) + content rows
+        let modal_height = (2 + content_rows).min(area.height);
+
+        let modal_area = Rect {
+            x: (area.width.saturating_sub(modal_width)) / 2,
+            y: (area.height.saturating_sub(modal_height)) / 2,
+            width: modal_width,
+            height: modal_height,
+        };
+
+        // Clear background behind modal
+        f.render_widget(ratatui::widgets::Clear, modal_area);
+
+        let outer_block = Block::default()
+            .title(" Rig Config ")
+            .borders(Borders::ALL)
+            .border_type(BorderType::Double)
+            .style(Style::default().bg(Color::Black).fg(Color::White));
+
+        let inner = outer_block.inner(modal_area);
+        f.render_widget(outer_block, modal_area);
 
         let paragraph = Paragraph::new(lines).wrap(Wrap { trim: true });
         f.render_widget(paragraph, inner);
@@ -3275,6 +3231,49 @@ mod key_tests {
             rows.iter().any(|r| r.contains("Esc: cancel")),
             "footer's last word must render unclipped even with a wrapped field \
              above it; rendered rows:\n{}",
+            rows.join("\n")
+        );
+    }
+
+    /// PAN-66 round-3 review: sizing the modal from a column-count
+    /// approximation of wrapping (aggregate display width / line width)
+    /// undercounts when double-width graphemes don't divide the line width
+    /// evenly — ratatui packs whole graphemes per row rather than splitting
+    /// one across a row boundary, so a run of 9 double-width (CJK) glyphs
+    /// at a 9-column inner width needs 3 rows (4 glyphs + 4 glyphs + 1
+    /// glyph), not the 2 a naive `18 / 9` would compute. Reserving too few
+    /// rows clips the footer again. Uses a narrow terminal (11 cols; below
+    /// the modal's 40-col clamp floor so `modal_width == area.width`) to
+    /// force `inner_width == 9`, matching the review comment's example.
+    #[test]
+    fn rig_modal_footer_survives_ungainly_wide_grapheme_packing() {
+        use crate::app::RigSelectionState;
+        use ratatui::{backend::TestBackend, buffer::Buffer, Terminal};
+
+        let mut state = RigSelectionState::new();
+        state.visible = true;
+        state.model = "模".repeat(9);
+
+        let backend = TestBackend::new(11, 24);
+        let mut terminal = Terminal::new(backend).unwrap();
+        terminal
+            .draw(|f| {
+                TuiRunner::render_rig_selection_modal(f, f.area(), &state);
+            })
+            .unwrap();
+
+        let buf: Buffer = terminal.backend().buffer().clone();
+        let rows: Vec<String> = (0..buf.area.height)
+            .map(|y| {
+                (0..buf.area.width)
+                    .map(|x| buf[(x, y)].symbol().chars().next().unwrap_or(' '))
+                    .collect::<String>()
+            })
+            .collect();
+        assert!(
+            rows.iter().any(|r| r.contains("cancel")),
+            "footer must render unclipped even when a field's double-width \
+             graphemes don't divide the inner width evenly; rendered rows:\n{}",
             rows.join("\n")
         );
     }
@@ -5722,41 +5721,6 @@ mod key_tests {
 #[cfg(test)]
 mod pan_59_command_tests {
     use super::*;
-
-    #[test]
-    fn wrapped_line_count_fits_on_one_line_when_width_suffices() {
-        assert_eq!(
-            TuiRunner::wrapped_line_count("Tab: next | Esc: cancel", 40),
-            1
-        );
-    }
-
-    #[test]
-    fn wrapped_line_count_wraps_the_rig_modal_footer_at_its_clamped_width() {
-        // PAN-66: the rig-config modal's footer legend was silently clipped
-        // because the modal's reserved height never accounted for wrapping.
-        // At the modal's narrowest clamped inner width (38 = 40 - 2 border
-        // cols), the 78-char footer must wrap onto more than one line.
-        const FOOTER: &str =
-            "Tab: next | Up/Down: change | F2: load | F3: save | Enter: apply | Esc: cancel";
-        assert!(TuiRunner::wrapped_line_count(FOOTER, 38) > 1);
-    }
-
-    #[test]
-    fn wrapped_line_count_never_reports_zero_lines() {
-        assert_eq!(TuiRunner::wrapped_line_count("", 40), 1);
-        assert_eq!(TuiRunner::wrapped_line_count("anything", 0), 1);
-    }
-
-    #[test]
-    fn wrapped_line_count_measures_display_width_not_char_count() {
-        // PAN-66 round-2 review: a CJK glyph is 1 `char` but renders as 2
-        // terminal columns. 10 glyphs is 10 chars but 20 display columns,
-        // so it must wrap at a 10-column width even though a char-count
-        // measurement would (wrongly) say it fits on one line.
-        let wide_word = "模".repeat(10);
-        assert!(TuiRunner::wrapped_line_count(&wide_word, 10) > 1);
-    }
 
     #[test]
     fn select_rig_command_round_trips_all_four_fields() {
