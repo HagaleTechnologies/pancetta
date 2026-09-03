@@ -3369,7 +3369,7 @@ impl Ft8Decoder {
             // budget the intervening work consumes.
             let should_run_seed_union = self.should_run_ft8lib_seed_union(pass);
             let defer_nms = should_run_seed_union;
-            let mut sync_candidates = self.costas_sync_search_with_threshold_and_partner(
+            let primary_candidates = self.costas_sync_search_with_threshold_and_partner(
                 &spectrogram,
                 self.config.min_sync_score,
                 effective_scope,
@@ -3398,6 +3398,25 @@ impl Ft8Decoder {
             // that the seed-union block below reconsiders as a whole, so
             // all three must share the SAME `defer_nms` /
             // `should_run_seed_union` decision.
+            //
+            // PAN-48 (Codex round-3 finding on PR #306, PAN-31
+            // follow-up): each sweep's candidates are kept as a SEPARATE
+            // group (`sweep_candidate_groups`), not merged into one list
+            // here, because whether they get NMS'd per-group (mirroring
+            // exactly what each sweep would have done internally had
+            // `defer_nms` been false) or merged first and NMS'd once as a
+            // union depends on whether the seed-union block below ends up
+            // actually contributing anything — that isn't known until
+            // AFTER it runs. Merging eagerly here, before that's known,
+            // is exactly what silently broke the documented "byte-
+            // identical when no seeds are found" guarantee: even with
+            // zero seeds, the merged-then-deferred set still got ONE
+            // union-wide NMS pass at the very end instead of the
+            // original per-sweep passes, which is not the same operation
+            // (a union pass lets one sweep's candidate suppress another
+            // sweep's, which independent per-sweep NMS never could) —
+            // see the merge decision after the seed-union block below.
+            let mut sweep_candidate_groups: Vec<Vec<CostasCandidate>> = vec![primary_candidates];
             if self.config.three_method_spectral_sweep_enabled && pass == 0 {
                 for transform in [MagnitudeTransform::Sqrt, MagnitudeTransform::Linear] {
                     if let Ok(alt_spec) = self.compute_spectrogram_with(&audio, transform) {
@@ -3407,12 +3426,269 @@ impl Ft8Decoder {
                             partner_freq_hz,
                             defer_nms,
                         ) {
-                            sync_candidates.extend(extra);
+                            sweep_candidate_groups.push(extra);
                         }
                     }
                 }
-                // Dedup exact (time,freq) collisions, keeping the highest sync
-                // score, then re-sort best-first and restore the configured cap.
+            }
+
+            // PAN-7: seed the pass-0 candidate list from ft8_lib's own sync
+            // search (vendor/ft8_lib/ft8/decode.c `ftx_find_candidates`, MIT).
+            // POSITIONS ONLY — every seed is RE-SCORED on pancetta's own
+            // spectrogram below, so ft8_lib contributes candidate LOCATIONS,
+            // never scores. Seeds bypass the sweep's inline `min_sync_score`
+            // gate, and that bypass IS the mechanism: a seed is interesting
+            // exactly when pancetta scored its position below threshold.
+            //
+            // Pass-0 only, mirroring hb-228 — residual passes re-search
+            // subtracted audio, where candidates computed on the unsubtracted
+            // slot would be stale.
+            //
+            // PAN-48: seed candidates accumulate in their OWN list
+            // (`seed_candidates`), separate from `sweep_candidate_groups`,
+            // for the same reason those stay separate from each other —
+            // the merge strategy is decided once, after this block, based
+            // on whether any seed was actually translated.
+            let mut seed_candidates: Vec<CostasCandidate> = Vec::new();
+            let mut ft8lib_seed_keys: std::collections::HashSet<(usize, usize, usize)> =
+                std::collections::HashSet::new();
+            let mut translated = 0usize;
+            // Set only when the FFI seed search actually ran (budget had
+            // time) -- `(elapsed_ms, raw)`. The `S0-ft8lib-seed` budget
+            // stage is pushed from this, AFTER the merge decision below,
+            // since its `kept_seeds` counter needs the FINAL merged
+            // `sync_candidates` regardless of which merge path was taken.
+            let mut seed_search_timing: Option<(u32, usize)> = None;
+            // PAN-32: FT2 has no ft8_lib counterpart, so every seed is rejected
+            // downstream by the translator's block_size guard anyway — skip the
+            // FFI search entirely rather than pay its wall-clock cost for zero
+            // surviving seeds (and, under a finite `DecodeBudget`, at the expense
+            // of legitimate candidate decoding).
+            //
+            // Codex round-2 finding on PR #306 (PAN-31 follow-up): this
+            // guard used to re-derive the same condition independently
+            // (including its own fresh `self.current_budget.has_time()`
+            // call) instead of reusing `should_run_seed_union`, computed
+            // once above before the native Costas search and the
+            // optional three-method spectral sweep ran. Reusing that
+            // frozen value here is the actual fix — see the comment at
+            // its definition for why a second, independent `has_time()`
+            // check here could disagree with the first and leave the
+            // candidate list with NO NMS pass at all.
+            if should_run_seed_union {
+                // PAN-46 (Codex round-3 finding on PR #306, PAN-31
+                // follow-up): `should_run_seed_union` above is frozen ONCE,
+                // before the native Costas search and the optional
+                // three-method spectral sweep run — that freezing (round
+                // 2's own fix) closed a TOCTOU between two independent
+                // `has_time()` calls, but it also removed the JUST-IN-TIME
+                // budget check that used to gate the ft8_lib FFI call
+                // itself. If a finite `DecodeBudget` (e.g. Eco mode's 1ms
+                // budget) expires during that intervening native
+                // search/sweep work, the frozen `true` decision would
+                // otherwise still run the full ft8_lib seed search past
+                // the deadline, spending time budget meant for candidate
+                // decoding. Re-check here, immediately before the FFI
+                // call: if expired, skip the seed search entirely —
+                // `translated` stays 0, so the merge decision below takes
+                // the no-seeds fallback path (PAN-48) and still applies
+                // the deferred NMS `defer_nms` (used above) skipped on
+                // the assumption a merge here would supply it.
+                if !self.current_budget.has_time() {
+                    debug!(
+                        target: "ft8.seed",
+                        cap = self.config.max_sync_candidates,
+                        "PAN-46: budget expired before the ft8_lib FFI call -- seed search \
+                         skipped, deferred NMS applied to native/sweep candidates only"
+                    );
+                } else {
+                    let seed_start = std::time::Instant::now();
+
+                    // Reproduce the native sweep's envelope EXACTLY (see
+                    // `costas_sync_search_with_threshold_and_partner`). Seeds must
+                    // obey the same bounds natives do, or the "scoped out of range
+                    // -> zero candidates" contract breaks for scoped decodes.
+                    let msg_span = self.protocol_params.num_symbols * TIME_OSR;
+                    let max_time_step = spectrogram.num_steps.saturating_sub(msg_span + 1);
+                    let max_freq_bin = spectrogram
+                        .num_bins
+                        .saturating_sub(self.protocol_params.num_tones)
+                        .min((4000.0 / self.protocol_params.tone_spacing) as usize);
+                    let (lo, hi) = match effective_scope {
+                        Some(range) => (
+                            MIN_FREQ_BIN.max(*range.start()),
+                            max_freq_bin.min(range.end().saturating_add(1)),
+                        ),
+                        None => (MIN_FREQ_BIN, max_freq_bin),
+                    };
+
+                    let protocol = match self.protocol_params.protocol {
+                        Protocol::Ft4 => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT4,
+                        // Ft2 is excluded by the `is_ft2()` guard above.
+                        _ => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT8,
+                    };
+
+                    // ft8_lib gets the RAW f32 residual — identical to `samples` at
+                    // pass 0, but preferred so a future change to the pass-1
+                    // smoothing above cannot silently alter the seed input. NOT
+                    // `audio`: that is f64 *and* amplitude-rescaled by
+                    // `0.95/max_abs`, which would change ft8_lib's uint8
+                    // quantization and diverge from the already-measured
+                    // `ft8lib_decode_audio`. The request size tracks the union cap
+                    // so the `--max-sync-candidates` measurement arm widens the
+                    // seed budget along with it.
+                    let seed_set = crate::ft8_lib_ffi::ft8lib_find_candidate_seeds(
+                        &residual_samples,
+                        protocol,
+                        self.config.max_sync_candidates,
+                    );
+
+                    // Positions the native/sweep search already found (across
+                    // ALL groups). A seed landing on one of these adds
+                    // nothing; recording that distinction is what lets a
+                    // null result be read as "nothing was gained" rather
+                    // than "nothing was admitted".
+                    let native_keys: std::collections::HashSet<(usize, usize, usize)> =
+                        sweep_candidate_groups
+                            .iter()
+                            .flatten()
+                            .map(|c| (c.time_step, c.freq_bin, c.freq_sub))
+                            .collect();
+
+                    let raw = seed_set.seeds.len();
+                    let mut dropped_negative_row = 0usize;
+                    let mut dropped_out_of_envelope = 0usize;
+
+                    for seed in &seed_set.seeds {
+                        // Recomputed only to attribute the drop reason; the
+                        // translator is the authority on whether it is usable.
+                        let row = seed.time_offset as isize * TIME_OSR as isize
+                            + seed.time_sub as isize
+                            + spectrogram.time_padding as isize;
+                        match translate_ft8lib_seed(
+                            seed,
+                            &seed_set,
+                            &spectrogram,
+                            &self.protocol_params,
+                            max_time_step,
+                            lo,
+                            hi,
+                        ) {
+                            Some(mut c) => {
+                                translated += 1;
+                                // Re-score through the SAME expression the native
+                                // sweep uses, parabolic refinement included, so
+                                // seeds and natives share one score scale.
+                                let base = self.costas_score_full_or_partial(
+                                    &spectrogram,
+                                    c.time_step,
+                                    c.freq_bin,
+                                    c.freq_sub,
+                                );
+                                let (score, refinement) = self.refine_costas_score(
+                                    &spectrogram,
+                                    c.time_step,
+                                    c.freq_bin,
+                                    c.freq_sub,
+                                    max_time_step,
+                                    base,
+                                );
+                                c.sync_score = score;
+                                c.time_refinement = refinement;
+                                let key = (c.time_step, c.freq_bin, c.freq_sub);
+                                if !native_keys.contains(&key) {
+                                    ft8lib_seed_keys.insert(key);
+                                }
+                                seed_candidates.push(c);
+                            }
+                            None if row < 0 => dropped_negative_row += 1,
+                            None => dropped_out_of_envelope += 1,
+                        }
+                    }
+
+                    debug!(
+                        target: "ft8.seed",
+                        raw,
+                        translated,
+                        dropped_negative_row,
+                        dropped_out_of_envelope,
+                        novel = ft8lib_seed_keys.len(),
+                        "PAN-7 ft8_lib sync-seed search"
+                    );
+
+                    // Budget hygiene. Inert under `DecodeBudget::unlimited()` —
+                    // which is what the whole measurement runs under — but without
+                    // it the flag is a latent Eco / Auto+Slow regression, where the
+                    // entire per-window budget is 1 ms and this pass runs before
+                    // the pass's first `has_time()` checkpoint. Stage push itself
+                    // deferred to after the merge decision below — see
+                    // `seed_search_timing`'s doc comment.
+                    let elapsed_ms = seed_start.elapsed().as_millis() as u32;
+                    seed_search_timing = Some((elapsed_ms, raw));
+                }
+            }
+
+            // Merge decision (PAN-48): when the seed search actually
+            // translated at least one usable seed, the union genuinely
+            // differs from native/sweep-only, so the PAN-31 union-wide NMS
+            // pass is correct and necessary — a candidate from one sweep
+            // (or a seed) may legitimately need to suppress, or be
+            // suppressed by, a candidate from a DIFFERENT sweep/seed, which
+            // per-group NMS could never see. When it translated NOTHING —
+            // `ft8lib_sync_seeds_enabled` was on, but this window yielded no
+            // usable seed (e.g. an `ft8lib_stub` build, or genuinely none
+            // found), or PAN-46 skipped the FFI call on an expired budget —
+            // the union is IDENTICAL to native/sweep-only, so this restores
+            // the exact ORIGINAL (flag-off) per-sweep NMS placement instead
+            // of the union pass, preserving the documented byte-identical-
+            // when-no-seeds guarantee: research deltas measured with the
+            // flag toggled then genuinely come from seeds, not from an
+            // incidentally different NMS grouping.
+            let mut sync_candidates: Vec<CostasCandidate>;
+            if translated > 0 {
+                sync_candidates = sweep_candidate_groups.into_iter().flatten().collect();
+                sync_candidates.extend(seed_candidates);
+                // Dedup exact-key collisions, cap, and (PAN-31) re-run NMS
+                // over the native+seed union. See
+                // `finalize_native_and_seed_candidate_union` for the mechanics.
+                let after_dedup =
+                    self.finalize_native_and_seed_candidate_union(&mut sync_candidates);
+
+                // Seeds that were BOTH novel AND survived the cap. These
+                // counters are LOAD-BEARING, not diagnostics: at the default
+                // cap the native sweep is already saturated on busy audio, so
+                // without them an inert run and a genuine null result are
+                // indistinguishable.
+                let kept_seeds = sync_candidates
+                    .iter()
+                    .filter(|c| ft8lib_seed_keys.contains(&(c.time_step, c.freq_bin, c.freq_sub)))
+                    .count();
+                debug!(
+                    target: "ft8.seed",
+                    after_dedup,
+                    kept_seeds,
+                    total = sync_candidates.len(),
+                    cap = self.config.max_sync_candidates,
+                    "PAN-7 ft8_lib sync-seed union"
+                );
+            } else {
+                // No seed contributed anything (or the seed search never
+                // ran/was skipped) — if the sweeps deferred their own NMS on
+                // the expectation a union pass would supply it, supply it
+                // NOW, but per-group (mirroring exactly what each sweep
+                // would have applied internally had `defer_nms` been
+                // `false`) rather than across the merged set.
+                if defer_nms && self.config.nms_enabled {
+                    for group in sweep_candidate_groups.iter_mut() {
+                        self.nms_candidates(group);
+                    }
+                }
+                sync_candidates = sweep_candidate_groups.into_iter().flatten().collect();
+                // Dedup exact (time,freq) collisions (keeping the highest sync
+                // score), re-sort best-first, and restore the configured cap —
+                // identical to the original hb-228 merge tail. Idempotent when
+                // there was only ever one group (no NMS re-application, since
+                // that group's own internal NMS/dedup/truncate already ran).
                 sync_candidates.sort_by(|a, b| {
                     (a.time_step, a.freq_bin, a.freq_sub)
                         .cmp(&(b.time_step, b.freq_bin, b.freq_sub))
@@ -3431,183 +3707,17 @@ impl Ft8Decoder {
                 sync_candidates.truncate(self.config.max_sync_candidates);
             }
 
-            // PAN-7: seed the pass-0 candidate list from ft8_lib's own sync
-            // search (vendor/ft8_lib/ft8/decode.c `ftx_find_candidates`, MIT).
-            // POSITIONS ONLY — every seed is RE-SCORED on pancetta's own
-            // spectrogram below, so ft8_lib contributes candidate LOCATIONS,
-            // never scores. Seeds bypass the sweep's inline `min_sync_score`
-            // gate, and that bypass IS the mechanism: a seed is interesting
-            // exactly when pancetta scored its position below threshold.
-            //
-            // Pass-0 only, mirroring hb-228 — residual passes re-search
-            // subtracted audio, where candidates computed on the unsubtracted
-            // slot would be stale.
-            //
-            // Deliberately a self-contained SIBLING of the hb-228 block above,
-            // with its own dedup + re-sort + truncate tail rather than reusing
-            // hb-228's: that tail lives inside hb-228's `if`, so a sibling
-            // relying on it would silently blow the cap in the default
-            // configuration. Hoisting the dedup to run unconditionally is not
-            // an option either — `costas_two_baseline_enabled` deliberately
-            // emits exact-duplicate keys expecting downstream dedup, so a
-            // shared tail would change behavior whenever that flag is on.
-            let mut ft8lib_seed_keys: std::collections::HashSet<(usize, usize, usize)> =
-                std::collections::HashSet::new();
-            // PAN-32: FT2 has no ft8_lib counterpart, so every seed is rejected
-            // downstream by the translator's block_size guard anyway — skip the
-            // FFI search entirely rather than pay its wall-clock cost for zero
-            // surviving seeds (and, under a finite `DecodeBudget`, at the expense
-            // of legitimate candidate decoding).
-            //
-            // Codex round-2 finding on PR #306 (PAN-31 follow-up): this
-            // guard used to re-derive the same condition independently
-            // (including its own fresh `self.current_budget.has_time()`
-            // call) instead of reusing `should_run_seed_union`, computed
-            // once above before the native Costas search and the
-            // optional three-method spectral sweep ran. Reusing that
-            // frozen value here is the actual fix — see the comment at
-            // its definition for why a second, independent `has_time()`
-            // check here could disagree with the first and leave the
-            // candidate list with NO NMS pass at all.
-            if should_run_seed_union {
-                let seed_start = std::time::Instant::now();
-
-                // Reproduce the native sweep's envelope EXACTLY (see
-                // `costas_sync_search_with_threshold_and_partner`). Seeds must
-                // obey the same bounds natives do, or the "scoped out of range
-                // -> zero candidates" contract breaks for scoped decodes.
-                let msg_span = self.protocol_params.num_symbols * TIME_OSR;
-                let max_time_step = spectrogram.num_steps.saturating_sub(msg_span + 1);
-                let max_freq_bin = spectrogram
-                    .num_bins
-                    .saturating_sub(self.protocol_params.num_tones)
-                    .min((4000.0 / self.protocol_params.tone_spacing) as usize);
-                let (lo, hi) = match effective_scope {
-                    Some(range) => (
-                        MIN_FREQ_BIN.max(*range.start()),
-                        max_freq_bin.min(range.end().saturating_add(1)),
-                    ),
-                    None => (MIN_FREQ_BIN, max_freq_bin),
-                };
-
-                let protocol = match self.protocol_params.protocol {
-                    Protocol::Ft4 => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT4,
-                    // Ft2 is excluded by the `is_ft2()` guard above.
-                    _ => crate::ft8_lib_ffi::ftx_protocol_t::FTX_PROTOCOL_FT8,
-                };
-
-                // ft8_lib gets the RAW f32 residual — identical to `samples` at
-                // pass 0, but preferred so a future change to the pass-1
-                // smoothing above cannot silently alter the seed input. NOT
-                // `audio`: that is f64 *and* amplitude-rescaled by
-                // `0.95/max_abs`, which would change ft8_lib's uint8
-                // quantization and diverge from the already-measured
-                // `ft8lib_decode_audio`. The request size tracks the union cap
-                // so the `--max-sync-candidates` measurement arm widens the
-                // seed budget along with it.
-                let seed_set = crate::ft8_lib_ffi::ft8lib_find_candidate_seeds(
-                    &residual_samples,
-                    protocol,
-                    self.config.max_sync_candidates,
-                );
-
-                // Positions the native sweep already found. A seed landing on
-                // one of these adds nothing; recording that distinction is what
-                // lets a null result be read as "nothing was gained" rather
-                // than "nothing was admitted".
-                let native_keys: std::collections::HashSet<(usize, usize, usize)> = sync_candidates
-                    .iter()
-                    .map(|c| (c.time_step, c.freq_bin, c.freq_sub))
-                    .collect();
-
-                let raw = seed_set.seeds.len();
-                let mut translated = 0usize;
-                let mut dropped_negative_row = 0usize;
-                let mut dropped_out_of_envelope = 0usize;
-
-                for seed in &seed_set.seeds {
-                    // Recomputed only to attribute the drop reason; the
-                    // translator is the authority on whether it is usable.
-                    let row = seed.time_offset as isize * TIME_OSR as isize
-                        + seed.time_sub as isize
-                        + spectrogram.time_padding as isize;
-                    match translate_ft8lib_seed(
-                        seed,
-                        &seed_set,
-                        &spectrogram,
-                        &self.protocol_params,
-                        max_time_step,
-                        lo,
-                        hi,
-                    ) {
-                        Some(mut c) => {
-                            translated += 1;
-                            // Re-score through the SAME expression the native
-                            // sweep uses, parabolic refinement included, so
-                            // seeds and natives share one score scale.
-                            let base = self.costas_score_full_or_partial(
-                                &spectrogram,
-                                c.time_step,
-                                c.freq_bin,
-                                c.freq_sub,
-                            );
-                            let (score, refinement) = self.refine_costas_score(
-                                &spectrogram,
-                                c.time_step,
-                                c.freq_bin,
-                                c.freq_sub,
-                                max_time_step,
-                                base,
-                            );
-                            c.sync_score = score;
-                            c.time_refinement = refinement;
-                            let key = (c.time_step, c.freq_bin, c.freq_sub);
-                            if !native_keys.contains(&key) {
-                                ft8lib_seed_keys.insert(key);
-                            }
-                            sync_candidates.push(c);
-                        }
-                        None if row < 0 => dropped_negative_row += 1,
-                        None => dropped_out_of_envelope += 1,
-                    }
-                }
-
-                // Dedup exact-key collisions, cap, and (PAN-31) re-run NMS
-                // over the native+seed union. See
-                // `finalize_native_and_seed_candidate_union` for the mechanics.
-                let after_dedup =
-                    self.finalize_native_and_seed_candidate_union(&mut sync_candidates);
-
-                // Seeds that were BOTH novel AND survived the cap. These
-                // counters are LOAD-BEARING, not diagnostics: at the default
-                // cap the native sweep is already saturated on busy audio, so
-                // without them an inert run and a genuine null result are
-                // indistinguishable.
+            // Budget-report stage push, deferred until here (only when the
+            // FFI search actually ran — see `seed_search_timing`): its
+            // `kept_seeds` counter is seeds BOTH novel AND surviving the
+            // FINAL merged/capped `sync_candidates`, which only exists now
+            // that the merge decision above has run, regardless of which
+            // branch it took.
+            if let Some((elapsed_ms, raw)) = seed_search_timing {
                 let kept_seeds = sync_candidates
                     .iter()
                     .filter(|c| ft8lib_seed_keys.contains(&(c.time_step, c.freq_bin, c.freq_sub)))
                     .count();
-
-                debug!(
-                    target: "ft8.seed",
-                    raw,
-                    translated,
-                    dropped_negative_row,
-                    dropped_out_of_envelope,
-                    novel = ft8lib_seed_keys.len(),
-                    after_dedup,
-                    kept_seeds,
-                    total = sync_candidates.len(),
-                    cap = self.config.max_sync_candidates,
-                    "PAN-7 ft8_lib sync-seed union"
-                );
-
-                // Budget hygiene. Inert under `DecodeBudget::unlimited()` —
-                // which is what the whole measurement runs under — but without
-                // it the flag is a latent Eco / Auto+Slow regression, where the
-                // entire per-window budget is 1 ms and this pass runs before
-                // the pass's first `has_time()` checkpoint.
-                let elapsed_ms = seed_start.elapsed().as_millis() as u32;
                 self.current_budget_report.stages.push((
                     "S0-ft8lib-seed",
                     elapsed_ms,
@@ -6766,17 +6876,37 @@ impl Ft8Decoder {
                 .unwrap_or(std::cmp::Ordering::Equal)
         });
         let after_dedup = candidates.len();
-        candidates.truncate(self.config.max_sync_candidates);
 
         // PAN-31: NMS runs inside `costas_sync_search_with_threshold_and_partner`
         // on the native-only set, before ft8_lib seeds are appended by the
         // caller — so a seed landing near a stronger native candidate would
         // otherwise bypass suppression entirely (only exact-key dedup above
         // applies to it). Re-run NMS now over the union, sorted-descending
-        // per `nms_candidates`'s precondition (already true post-truncate).
+        // per `nms_candidates`'s precondition (already true here).
+        //
+        // PAN-47 (Codex round-3 finding on PR #306, PAN-31 follow-up): NMS
+        // must run BEFORE truncating to `max_sync_candidates`, not after.
+        // Truncating first can silently discard a genuinely-distinct
+        // candidate (outside every survivor's suppression radius) purely
+        // because a stronger, nearby candidate happened to rank higher and
+        // pushed it past the cap -- before NMS ever got a chance to
+        // suppress the actually-redundant neighbor in its favor instead.
+        // Example: cap=2, native A and a distinct B both belong under
+        // union-wide NMS, but a stronger seed S outranks B into 3rd place;
+        // truncating to 2 first keeps [S, A] and discards B, even though
+        // NMS run on the full set would have suppressed A (near S) and
+        // kept B. This is the same class of bug PAN-31 round 1/2 already
+        // fixed (native NMS running before the seed union completed), just
+        // relocated to this truncation step. Runs on the full pre-cap
+        // union (this file's own `costas_sync_search_with_threshold_and_
+        // partner` docs put the untruncated candidate pool at roughly 10x
+        // `max_sync_candidates` on busy audio) -- `nms_candidates` is O(n^2)
+        // but over integer TF-distance comparisons, cheap enough at that
+        // scale to not threaten a finite `DecodeBudget`.
         if self.config.nms_enabled {
             self.nms_candidates(candidates);
         }
+        candidates.truncate(self.config.max_sync_candidates);
 
         after_dedup
     }
@@ -24742,6 +24872,60 @@ mod pan7_ft8lib_sync_seed_tests {
         );
     }
 
+    /// PAN-48 (Codex round-3 finding on PR #306, PAN-31 follow-up): even
+    /// with `ft8lib_sync_seeds_enabled: true`, if the ft8_lib FFI search
+    /// yields NO usable (translatable) seed for this window — guaranteed
+    /// under `ft8lib_stub` (no vendored C sources, the build this test is
+    /// gated to) — the flag must still be a true no-op versus flag-off.
+    /// Before this fix, the pass-0 sweeps still deferred their own
+    /// per-sweep NMS on the expectation the seed-union block would supply
+    /// ONE union-wide pass afterward; with zero seeds that union is
+    /// identical to native/sweep-only, but a single union-wide NMS pass
+    /// over the ALREADY-MERGED three-sweep set is not the same operation
+    /// as three INDEPENDENT per-sweep NMS passes applied before merging
+    /// (a union pass lets one sweep's candidate suppress another sweep's;
+    /// independent per-sweep NMS never could) — so the flag silently
+    /// changed the candidate set even with zero seeds involved, exactly
+    /// the design guarantee this test pins. Both `nms_enabled` and
+    /// `three_method_spectral_sweep_enabled` are deliberately on: they're
+    /// what the two NMS placements would visibly disagree over if the fix
+    /// regressed.
+    #[cfg(ft8lib_stub)]
+    #[test]
+    fn ft8lib_sync_seeds_enabled_is_byte_identical_when_it_yields_no_seeds() {
+        let tx = noisy_window();
+
+        let mut dec_on = Ft8Decoder::new(Ft8Config {
+            ft8lib_sync_seeds_enabled: true,
+            three_method_spectral_sweep_enabled: true,
+            nms_enabled: true,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let mut dec_off = Ft8Decoder::new(Ft8Config {
+            ft8lib_sync_seeds_enabled: false,
+            three_method_spectral_sweep_enabled: true,
+            nms_enabled: true,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+
+        let a = dec_on.decode_window(&tx).expect("decode flag-on");
+        let b = dec_off.decode_window(&tx).expect("decode flag-off");
+
+        assert_eq!(
+            key(&a),
+            key(&b),
+            "ft8lib_sync_seeds_enabled must be a true no-op when it yields zero usable seeds \
+             (guaranteed under ft8lib_stub) -- any difference means the NMS placement itself \
+             changed, not the candidate set seeds actually contributed"
+        );
+        assert!(
+            a.iter().any(|m| m.text == "CQ K5ARH EM10"),
+            "synthetic signal must decode — otherwise the comparison is vacuous"
+        );
+    }
+
     /// The end-to-end anchor for the coordinate translator, and the one guard
     /// the unit tests in `ft8lib_seed_translate_tests` cannot substitute for.
     /// Those tests pin the translator's *arithmetic* against hand-built inputs;
@@ -25000,6 +25184,72 @@ mod pan7_ft8lib_sync_seed_tests {
             "the surviving candidate must be the stronger native one"
         );
         assert_eq!(candidates_on[0].sync_score, native.sync_score);
+    }
+
+    /// PAN-47 (Codex round-3 finding on PR #306, PAN-31 follow-up):
+    /// `finalize_native_and_seed_candidate_union` used to truncate to
+    /// `max_sync_candidates` BEFORE running its union-wide NMS pass. Three
+    /// candidates: `strong` (highest score), `redundant` (2nd-highest,
+    /// within NMS radius of `strong` -- should be suppressed by it under
+    /// correct union-wide NMS) and `distinct` (3rd-highest, OUTSIDE
+    /// everyone's radius -- a genuinely separate signal that should
+    /// survive). With `max_sync_candidates: 2`: truncating first keeps
+    /// only [`strong`, `redundant`] (dropping `distinct` purely for
+    /// ranking 3rd), then NMS suppresses `redundant` -- leaving ONLY
+    /// `strong`, silently losing `distinct` even though it was never
+    /// within anyone's suppression radius. Running NMS on the full
+    /// pre-truncate union first correctly suppresses `redundant` (near
+    /// `strong`) while `distinct` survives on its own merit, so truncating
+    /// to 2 afterward keeps exactly [`strong`, `distinct`].
+    #[test]
+    fn pan47_nms_runs_before_truncation_not_after() {
+        let strong = CostasCandidate {
+            time_step: 100,
+            freq_bin: 50,
+            freq_sub: 0,
+            sync_score: 10.0,
+            time_refinement: 0.0,
+        };
+        let redundant = CostasCandidate {
+            time_step: 100,
+            freq_bin: 50,
+            freq_sub: 1, // distinct exact key (survives dedup), within NMS radius of `strong`
+            sync_score: 8.0,
+            time_refinement: 0.0,
+        };
+        // Default NMS radii are (time: 8, freq: 2) -- this is far outside both.
+        let distinct = CostasCandidate {
+            time_step: 200,
+            freq_bin: 150,
+            freq_sub: 0,
+            sync_score: 6.0,
+            time_refinement: 0.0,
+        };
+
+        let dec = Ft8Decoder::new(Ft8Config {
+            nms_enabled: true,
+            max_sync_candidates: 2,
+            ..Ft8Config::default()
+        })
+        .unwrap();
+        let mut candidates = vec![strong, redundant, distinct];
+        let after_dedup = dec.finalize_native_and_seed_candidate_union(&mut candidates);
+        assert_eq!(
+            after_dedup, 3,
+            "all three are distinct exact keys and must all survive the dedup pass"
+        );
+        assert_eq!(
+            candidates.len(),
+            2,
+            "must truncate to the cap after NMS, not before -- got {candidates:?}"
+        );
+        let kept_times: Vec<usize> = candidates.iter().map(|c| c.time_step).collect();
+        assert!(
+            kept_times.contains(&strong.time_step) && kept_times.contains(&distinct.time_step),
+            "must keep `strong` and `distinct` (the two candidates NMS itself would keep) -- \
+             not `strong` and the redundant `redundant` that only survived by ranking above \
+             the truncation cap before NMS got a chance to suppress it; got {candidates:?}"
+        );
     }
 
     /// Codex round-1 finding on PR #306 (PAN-31 follow-up): PAN-31's fix
