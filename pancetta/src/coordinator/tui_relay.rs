@@ -38,7 +38,7 @@ impl super::ApplicationCoordinator {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn start_tui_pipeline(
         &mut self,
-        ft8_to_tui_rx: crossbeam_channel::Receiver<pancetta_ft8::DecodedMessage>,
+        ft8_to_tui_rx: crossbeam_channel::Receiver<super::pipeline::RelayedDecode>,
         tui_bus_rx: crossbeam_channel::Receiver<ComponentMessage>,
         waterfall_rx: crossbeam_channel::Receiver<Vec<Vec<f32>>>,
         audio_level_rx: crossbeam_channel::Receiver<f32>,
@@ -63,19 +63,6 @@ impl super::ApplicationCoordinator {
             crossbeam_channel::bounded::<pancetta_tui::tui_runner::TuiMessage>(1000);
         let (tui_cmd_tx, tui_cmd_rx) =
             crossbeam_channel::bounded::<pancetta_tui::tui_runner::TuiCommand>(1000);
-
-        // Use the rig's current frequency if hamlib has already read it,
-        // otherwise fall back to 14.074 MHz. Updated by FrequencyResponse messages.
-        let current_hz = self.operating_frequency_hz.load(Ordering::Relaxed);
-        let operating_freq_mhz = if current_hz > 0 {
-            current_hz as f64 / 1_000_000.0
-        } else {
-            14.074_f64
-        };
-        let operating_freq = Arc::new(std::sync::atomic::AtomicU64::new(
-            operating_freq_mhz.to_bits(),
-        ));
-        let operating_freq_relay = operating_freq.clone();
 
         // Set up station coordinates for distance/bearing calculation
         let station_coords = {
@@ -183,7 +170,8 @@ impl super::ApplicationCoordinator {
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
-                        Ok(decoded_msg) => {
+                        Ok(relayed) => {
+                            let decoded_msg = &relayed.message;
                             let call_sign = decoded_msg.message.from_callsign.clone();
                             let grid_square = decoded_msg.message.grid_square.clone();
                             // "Calling me" detection: the parser sets
@@ -235,8 +223,7 @@ impl super::ApplicationCoordinator {
                             // stripping on the TUI side only would make the
                             // TUI flag stations the scorer still treats as
                             // new (divergence).
-                            let dial_mhz =
-                                f64::from_bits(operating_freq_relay.load(Ordering::Relaxed));
+                            let dial_mhz = decode_view_dial_mhz(&relayed);
                             let worked_before = worked_before_for(
                                 &relay_station_lookup,
                                 call_sign.as_deref(),
@@ -479,10 +466,6 @@ impl super::ApplicationCoordinator {
                                 frequency,
                             },
                         ) => {
-                            // Update operating frequency for decoded message enrichment
-                            let freq_mhz = frequency as f64 / 1_000_000.0;
-                            // Relaxed ordering is fine -- this is a best-effort display value for the TUI
-                            operating_freq_relay.store(freq_mhz.to_bits(), Ordering::Relaxed);
                             let _ = tui_msg_tx_relay.send(
                                 pancetta_tui::tui_runner::TuiMessage::FrequencyUpdate {
                                     vfo,
@@ -793,7 +776,6 @@ impl super::ApplicationCoordinator {
         // Task: relay TUI commands (e.g. SendMessage) to message bus as TransmitRequests
         let cmd_shutdown = self.shutdown_signal.clone();
         let cmd_message_bus = self.message_bus.clone();
-        let cmd_operating_freq = operating_freq.clone();
         let cmd_operating_freq_hz = self.operating_frequency_hz.clone();
         // Split TX dial atomic (0 = simplex). Written by SetSplit relay, read
         // by QSO RF-stamp and cleared here on any band change.
@@ -1353,8 +1335,6 @@ impl super::ApplicationCoordinator {
                             // *old* dial frequency BEFORE we overwrite the atomic, then
                             // decide whether this dial move is a genuine band change.
                             let old_freq_hz = cmd_operating_freq_hz.load(Ordering::Relaxed);
-                            let freq_mhz = frequency as f64 / 1_000_000.0;
-                            cmd_operating_freq.store(freq_mhz.to_bits(), Ordering::Relaxed);
                             cmd_operating_freq_hz.store(frequency, Ordering::Relaxed);
                             // Stamp the C9 dedup anchor: pancetta commanded this
                             // freq, so the hamlib poll loop suppresses its own
@@ -2756,6 +2736,18 @@ fn map_recent_qso_outcome(
 /// full callsign as logged (no /P-style suffix stripping, because the
 /// scorer doesn't strip either). `None`/empty callsigns (unparsed
 /// decodes) are never "worked".
+/// The dial frequency (MHz) to stamp on this decode's `DecodedMessageView`.
+///
+/// PAN-67: this MUST come from the frequency the decode's own audio window
+/// was captured on (`RelayedDecode::dial_hz`), never from a live re-read of
+/// wherever the rig is tuned right now — decoding is real CPU work, and an
+/// in-flight decode's audio can predate a since-happened band switch. The
+/// signature enforces this at the type level: there is no live-state
+/// parameter to read here even by accident.
+fn decode_view_dial_mhz(relayed: &super::pipeline::RelayedDecode) -> f64 {
+    relayed.dial_hz as f64 / 1_000_000.0
+}
+
 fn worked_before_for(
     lookup: &crate::priority_evaluator::CachedStationLookup,
     callsign: Option<&str>,
@@ -3112,6 +3104,32 @@ mod tui_relay_tests {
     /// Not in flight -- the common case (no CAT call currently executing).
     fn not_in_flight() -> Arc<std::sync::atomic::AtomicU32> {
         Arc::new(std::sync::atomic::AtomicU32::new(0))
+    }
+
+    /// PAN-67: `decode_view_dial_mhz` takes no live-state argument at all —
+    /// it can only report the frequency captured with the decode's own
+    /// audio window, so a live band switch happening after that window
+    /// closed cannot leak into the displayed frequency.
+    #[test]
+    fn decode_view_dial_mhz_reports_the_relayed_windows_own_frequency() {
+        let message = pancetta_ft8::DecodedMessage::new(
+            pancetta_ft8::Ft8Message::default(),
+            -10.0,
+            0.5,
+            1500.0,
+            0.1,
+        );
+        let old_band = crate::coordinator::pipeline::RelayedDecode {
+            message: message.clone(),
+            dial_hz: 7_074_000,
+        };
+        let new_band = crate::coordinator::pipeline::RelayedDecode {
+            message,
+            dial_hz: 14_074_000,
+        };
+
+        assert_eq!(decode_view_dial_mhz(&old_band), 7.074);
+        assert_eq!(decode_view_dial_mhz(&new_band), 14.074);
     }
 
     #[test]

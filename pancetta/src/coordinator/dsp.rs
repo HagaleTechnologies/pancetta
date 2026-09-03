@@ -691,7 +691,10 @@ impl super::ApplicationCoordinator {
 
                             match super::pipeline::forward_or_drop(
                                 &dsp_to_ft8_tx,
-                                window,
+                                super::pipeline::DecodeWindow {
+                                    samples: window,
+                                    dial_hz: band_ref_dial_hz,
+                                },
                                 super::pipeline::DECODE_FORWARD_TIMEOUT,
                             ) {
                                 super::pipeline::ForwardOutcome::Sent => {}

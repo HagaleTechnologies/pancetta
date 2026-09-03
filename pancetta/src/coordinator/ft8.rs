@@ -1496,7 +1496,10 @@ impl super::ApplicationCoordinator {
 
             while !shutdown.load(Ordering::Acquire) {
                 match ft8_rx.recv_timeout(std::time::Duration::from_millis(100)) {
-                    Ok(window) => {
+                    Ok(super::pipeline::DecodeWindow {
+                        samples: window,
+                        dial_hz,
+                    }) => {
                         // Capture receipt time immediately — before any decode
                         // work — so parity tagging is invariant under decode
                         // latency. (If we captured now() after decode, a slow
@@ -2343,8 +2346,17 @@ impl super::ApplicationCoordinator {
                                 decoded_msg.ap_level
                             );
 
-                            // Send to TUI via point-to-point channel
-                            if ft8_to_tui_tx.send(decoded_msg.clone()).is_err() {
+                            // Send to TUI via point-to-point channel, tagged with the
+                            // dial frequency THIS window's audio was captured on (PAN-67:
+                            // never a live re-read at relay time, which races an
+                            // in-flight decode against a since-happened band switch).
+                            if ft8_to_tui_tx
+                                .send(super::pipeline::RelayedDecode {
+                                    message: decoded_msg.clone(),
+                                    dial_hz,
+                                })
+                                .is_err()
+                            {
                                 warn!("TUI channel disconnected");
                             }
 
