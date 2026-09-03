@@ -1495,6 +1495,63 @@ check_frequency = true
         assert_eq!(loader.sources[2].name, "low");
     }
 
+    /// PAN-63 regression: `load()` merges sources lowest-to-highest
+    /// priority. If a lower-priority source has bookmarks and the
+    /// higher-priority source explicitly saved an empty list (exactly what
+    /// the TUI writes to the user's config on "delete last bookmark"), the
+    /// merged result must show zero bookmarks -- not silently revive the
+    /// lower-priority source's list.
+    #[test]
+    fn load_merges_explicit_empty_bookmarks_over_lower_priority_source() {
+        let dir = TempDir::new().unwrap();
+        let low_path = dir.path().join("low.toml");
+        let high_path = dir.path().join("high.toml");
+        std::fs::write(
+            &low_path,
+            r#"
+[[rig.bookmarks]]
+name = "FromLowPrioritySource"
+model = "FTdx10"
+port = "/dev/ttyUSB0"
+baud_rate = 38400
+ptt_method = "none"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            &high_path,
+            r#"
+[rig]
+bookmarks = []
+"#,
+        )
+        .unwrap();
+
+        let mut loader = ConfigLoader::new().unwrap();
+        loader.add_source(ConfigSource {
+            name: "low".to_string(),
+            path: low_path,
+            priority: 1,
+            required: true,
+            source_type: SourceType::Toml,
+        });
+        loader.add_source(ConfigSource {
+            name: "high".to_string(),
+            path: high_path,
+            priority: 10,
+            required: true,
+            source_type: SourceType::Toml,
+        });
+
+        let config = loader.load().unwrap();
+        assert!(
+            config.rig.effective_bookmarks().is_empty(),
+            "the higher-priority source's explicit empty bookmarks list must \
+             win over the lower-priority source's saved bookmark, got: {:?}",
+            config.rig.effective_bookmarks()
+        );
+    }
+
     #[test]
     fn test_shell_expansion() {
         let loader = ConfigLoader::new().unwrap();
