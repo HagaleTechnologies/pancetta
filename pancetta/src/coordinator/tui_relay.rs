@@ -893,6 +893,10 @@ impl super::ApplicationCoordinator {
         // running under `--config <custom-path>` doesn't have picker/
         // bookmark saves silently land in the wrong file.
         let cmd_config_path = self.config_path.clone();
+        // PAN-62 review round 2 (Codex P1): precomputed at startup (never
+        // in this relay loop, which must stay free of synchronous disk
+        // I/O -- see `config_write_is_toml`'s doc comment in main.rs).
+        let cmd_config_write_is_toml = self.config_write_is_toml;
         // PAN-61 review round 7 (Codex P1, superseding round 6's Mutex):
         // serializes every targeted-write persist call to
         // `cmd_config_path` -- SelectDevice, SelectRig, SaveRigBookmark,
@@ -918,6 +922,7 @@ impl super::ApplicationCoordinator {
                 cmd_config_write_tx.clone(),
                 cmd_tui_msg_tx.clone(),
                 cmd_config_path.clone(),
+                cmd_config_write_is_toml,
             );
         // Live device-switch channel into the audio thread. `None` in
         // stub/`--no-audio` modes — the SelectDevice handler then persists the
@@ -2101,13 +2106,15 @@ impl super::ApplicationCoordinator {
                             // takes. The live-switch dance a few lines down
                             // is unconditional either way (not gated on
                             // persist outcome), exactly as before.
-                            // PAN-62 review round 1 (Codex P2): the targeted
-                            // setters below parse the existing file
-                            // exclusively as TOML -- persisting against a
-                            // JSON `--config` file would fail every time
-                            // with a raw parser error. Reject up front with
-                            // a clear operator-facing message instead.
-                            if pancetta_config::path_is_json_format(&config_path) {
+                            // PAN-62 review round 1 (Codex P2), format
+                            // precomputed at startup per round 2 (Codex
+                            // P1): the targeted setters below parse the
+                            // existing file exclusively as TOML --
+                            // persisting against a JSON `--config` file
+                            // would fail every time with a raw parser
+                            // error. Reject up front with a clear
+                            // operator-facing message instead.
+                            if !cmd_config_write_is_toml {
                                 warn!(
                                     "Config file {} is not TOML; audio device selection not persisted",
                                     config_path.display()
@@ -2320,9 +2327,11 @@ impl super::ApplicationCoordinator {
                                 // reconnect request below is unconditional
                                 // either way (not gated on persist
                                 // outcome), exactly as before.
-                                // PAN-62 review round 1 (Codex P2): see
-                                // SelectDevice's identical guard above.
-                                if pancetta_config::path_is_json_format(&config_path) {
+                                // PAN-62 review round 1 (Codex P2), format
+                                // precomputed at startup per round 2
+                                // (Codex P1): see SelectDevice's identical
+                                // guard above.
+                                if !cmd_config_write_is_toml {
                                     warn!(
                                         "Config file {} is not TOML; rig config selection not persisted",
                                         config_path.display()
@@ -3028,16 +3037,19 @@ fn spawn_bookmark_mutation_worker(
     write_tx: tokio::sync::mpsc::UnboundedSender<ConfigFileWriteRequest>,
     tui_msg_tx: crossbeam_channel::Sender<pancetta_tui::tui_runner::TuiMessage>,
     config_path: std::path::PathBuf,
+    // PAN-62 review round 1 (Codex P2) / round 2 (Codex P1):
+    // `set_rig_bookmarks_in_file` parses the existing file exclusively as
+    // TOML -- taken as a precomputed argument (never checked here via
+    // synchronous disk I/O) so this stays consistent with `main.rs`'s
+    // `config_write_is_toml`, the single source of truth for the format
+    // detection that must match what `load_configuration_with_warnings`
+    // actually parsed.
+    config_is_toml: bool,
 ) -> (
     tokio::sync::mpsc::UnboundedSender<BookmarkMutation>,
     tokio::task::JoinHandle<Result<()>>,
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<BookmarkMutation>();
-    // PAN-62 review round 1 (Codex P2): `set_rig_bookmarks_in_file` parses
-    // the existing file exclusively as TOML -- checked once here, not per
-    // mutation, since `config_path`'s format never changes for this
-    // worker's lifetime.
-    let config_is_toml = !pancetta_config::path_is_json_format(&config_path);
     let handle = tokio::spawn(async move {
         while let Some(mutation) = rx.recv().await {
             // Bookmarks have no "live apply" fallback the way SelectDevice/
@@ -3242,8 +3254,14 @@ mod tui_relay_tests {
         let config = Arc::new(tokio::sync::RwLock::new(pancetta_config::Config::default()));
         let (write_tx, _write_handle) = spawn_config_file_write_worker();
         let (tui_msg_tx, tui_msg_rx) = crossbeam_channel::unbounded();
-        let (bookmark_tx, _bookmark_handle) =
-            spawn_bookmark_mutation_worker(config.clone(), write_tx, tui_msg_tx, json_path.clone());
+        let (bookmark_tx, _bookmark_handle) = spawn_bookmark_mutation_worker(
+            config.clone(),
+            write_tx,
+            tui_msg_tx,
+            json_path.clone(),
+            false, // config_is_toml: mirrors what main.rs's config_write_is_toml
+                   // would compute for this .json path
+        );
 
         bookmark_tx
             .send(BookmarkMutation::Save(pancetta_config::rig::RigBookmark {

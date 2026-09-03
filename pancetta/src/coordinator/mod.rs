@@ -855,6 +855,17 @@ pub struct ApplicationCoordinator {
     /// land in the file that actually gets reloaded on restart.
     pub(crate) config_path: PathBuf,
 
+    /// PAN-62 review round 2 (Codex P1): whether `config_path` is TOML
+    /// (the targeted setters `SelectDevice`/`SelectRig`/`SaveRigBookmark`/
+    /// `DeleteRigBookmark` write through only understand TOML). Computed
+    /// ONCE at startup from the raw `--config` path (see `main.rs`'s
+    /// `config_write_is_toml` for why it must NOT use `config_path`'s own,
+    /// possibly-symlink-resolved, name) and stored here so the TUI relay
+    /// loop never performs synchronous disk I/O to check it -- that loop
+    /// also services OperatorEmergencyStop/StopTx/TogglePtt/AbortQso, and
+    /// a stalled filesystem must never suspend those.
+    pub(crate) config_write_is_toml: bool,
+
     /// PAN-41 round 3: test-only override for the `~/.pancetta` directory
     /// `start_qso_component` otherwise always derives from `dirs::home_dir()`
     /// -- including under `--replay`, whose own documented contract is to
@@ -1492,6 +1503,7 @@ impl ApplicationCoordinator {
         shutdown_signal: Arc<AtomicBool>,
         config_warnings: Vec<String>,
         config_path: PathBuf,
+        config_write_is_toml: bool,
     ) -> Result<Self> {
         let span = span!(Level::INFO, "coordinator_init");
         let _enter = span.enter();
@@ -1744,6 +1756,7 @@ impl ApplicationCoordinator {
             wav_path,
             replay_path,
             config_path,
+            config_write_is_toml,
             pancetta_home_override: None,
             test_tx,
             test_tx_offset,
@@ -2647,6 +2660,7 @@ mod tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed")
@@ -2675,6 +2689,7 @@ mod tests {
             shutdown,
             Vec::new(), // no config warnings
             custom.clone(),
+            true, // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed");
@@ -2746,6 +2761,7 @@ mod tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed")
@@ -2773,6 +2789,7 @@ mod tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed")
@@ -3274,6 +3291,7 @@ mod tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await;
 
@@ -3312,6 +3330,7 @@ mod tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed");
@@ -3357,6 +3376,7 @@ mod tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed");
@@ -3444,6 +3464,7 @@ mod tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed");

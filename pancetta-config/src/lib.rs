@@ -219,6 +219,16 @@ impl Default for Config {
     }
 }
 
+/// Whether `parent` is the default application-owned `~/.pancetta`
+/// directory, as opposed to an arbitrary custom `--config` parent this
+/// crate doesn't own. `home_dir` is taken explicitly (rather than calling
+/// `dirs::home_dir()` internally) purely for testability -- the real home
+/// directory can't be faked in a test process; production code always
+/// passes `dirs::home_dir()`.
+fn is_default_app_dir(parent: &std::path::Path, home_dir: Option<&std::path::Path>) -> bool {
+    home_dir.map(|h| h.join(".pancetta")).as_deref() == Some(parent)
+}
+
 impl Config {
     /// Load configuration using the default search paths and hierarchy
     pub fn load_default() -> ConfigResult<Self> {
@@ -323,23 +333,25 @@ impl Config {
     fn write_secure_atomic(path: &std::path::Path, contents: &str) -> ConfigResult<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
-                // PAN-62 review round 1 (Codex P1): only harden a directory
-                // WE just created. A pre-existing parent -- the default
-                // `~/.pancetta` from a prior run, or a custom `--config`
-                // path under a shared/dotfiles-managed directory -- was
-                // already set up however its owner (pancetta or an
-                // operator/admin) intended; forcing it to 0700 on every
-                // write could lock other users/services out of a directory
-                // pancetta doesn't own.
+                // PAN-62 review round 1 (Codex P1), refined round 2 (Codex
+                // P1): harden a directory WE just created, OR the default
+                // application-owned `~/.pancetta` directory even if it
+                // pre-existed (an older install's lax chmod, or an
+                // accidental chmod, must not permanently escape hardening
+                // -- the 0600 file alone doesn't protect its own directory
+                // entry from another local user with write access to a
+                // world-writable parent). An arbitrary CUSTOM `--config`
+                // parent that already existed is left alone either way --
+                // it was already set up however its owner (an operator or
+                // admin, not pancetta) intended, and pancetta doesn't own it.
                 let parent_existed = parent.exists();
                 std::fs::create_dir_all(parent)?;
                 #[cfg(unix)]
                 {
-                    if !parent_existed {
+                    if !parent_existed || is_default_app_dir(parent, dirs::home_dir().as_deref()) {
                         use std::os::unix::fs::PermissionsExt;
-                        // Best-effort: lock a freshly-created dir to the
-                        // owner. Ignore failure — the 0600 file is the real
-                        // guarantee.
+                        // Best-effort. Ignore failure — the 0600 file is
+                        // the real guarantee.
                         let _ = std::fs::set_permissions(
                             parent,
                             std::fs::Permissions::from_mode(0o700),
@@ -687,6 +699,36 @@ mod tests {
         assert_eq!(
             fmode, 0o600,
             "config file must still be owner-only, got {fmode:o}"
+        );
+    }
+
+    /// PAN-62 review round 2 (Codex P1): the round-1 "only harden a
+    /// freshly-created parent" fix also suppressed re-hardening of a
+    /// PRE-EXISTING default `~/.pancetta` directory left lax by an older
+    /// install or an accidental `chmod` -- that directory is
+    /// application-owned and must always be forced back to 0700,
+    /// regardless of whether this call created it. Only an arbitrary
+    /// CUSTOM `--config` parent (one pancetta doesn't own) should be left
+    /// alone when it already existed. `home_dir` is passed explicitly
+    /// since `dirs::home_dir()` can't be faked in a test process.
+    #[test]
+    fn is_default_app_dir_matches_only_the_dot_pancetta_child_of_home() {
+        let home = std::path::Path::new("/home/operator");
+        assert!(
+            is_default_app_dir(&home.join(".pancetta"), Some(home)),
+            "the default app-owned directory must be recognized"
+        );
+        assert!(
+            !is_default_app_dir(&home.join("shared-configs"), Some(home)),
+            "a different directory under home must NOT be treated as app-owned"
+        );
+        assert!(
+            !is_default_app_dir(std::path::Path::new("/srv/shared"), Some(home)),
+            "an unrelated custom directory must NOT be treated as app-owned"
+        );
+        assert!(
+            !is_default_app_dir(&home.join(".pancetta"), None),
+            "with no resolvable home dir, nothing can be recognized as the default"
         );
     }
 

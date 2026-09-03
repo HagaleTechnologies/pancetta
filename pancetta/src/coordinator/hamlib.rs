@@ -4039,6 +4039,7 @@ mod restart_orphan_tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed")
@@ -4524,6 +4525,7 @@ mod teardown_stall_tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed")
@@ -4641,6 +4643,7 @@ mod teardown_replay_tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed")
@@ -6552,6 +6555,7 @@ mod pan_59_reconnect_tests {
             shutdown,
             Vec::new(),                                             // no config warnings
             std::env::temp_dir().join("pancetta-test-config.toml"), // test-only config path
+            true,                                                   // test-only: assume TOML
         )
         .await
         .expect("coordinator creation should succeed")
