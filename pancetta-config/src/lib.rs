@@ -219,6 +219,16 @@ impl Default for Config {
     }
 }
 
+/// Whether `parent` is the default application-owned `~/.pancetta`
+/// directory, as opposed to an arbitrary custom `--config` parent this
+/// crate doesn't own. `home_dir` is taken explicitly (rather than calling
+/// `dirs::home_dir()` internally) purely for testability -- the real home
+/// directory can't be faked in a test process; production code always
+/// passes `dirs::home_dir()`.
+fn is_default_app_dir(parent: &std::path::Path, home_dir: Option<&std::path::Path>) -> bool {
+    home_dir.map(|h| h.join(".pancetta")).as_deref() == Some(parent)
+}
+
 impl Config {
     /// Load configuration using the default search paths and hierarchy
     pub fn load_default() -> ConfigResult<Self> {
@@ -323,49 +333,69 @@ impl Config {
     fn write_secure_atomic(path: &std::path::Path, contents: &str) -> ConfigResult<()> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
+                // PAN-62 review round 1 (Codex P1), refined round 2 (Codex
+                // P1): harden a directory WE just created, OR the default
+                // application-owned `~/.pancetta` directory even if it
+                // pre-existed (an older install's lax chmod, or an
+                // accidental chmod, must not permanently escape hardening
+                // -- the 0600 file alone doesn't protect its own directory
+                // entry from another local user with write access to a
+                // world-writable parent). An arbitrary CUSTOM `--config`
+                // parent that already existed is left alone either way --
+                // it was already set up however its owner (an operator or
+                // admin, not pancetta) intended, and pancetta doesn't own it.
+                let parent_existed = parent.exists();
                 std::fs::create_dir_all(parent)?;
                 #[cfg(unix)]
                 {
-                    use std::os::unix::fs::PermissionsExt;
-                    // Best-effort: lock the .pancetta dir to the owner. Ignore
-                    // failure (e.g. the operator deliberately set a different
-                    // mode, or a non-owned ancestor) — the 0600 file is the
-                    // real guarantee.
-                    let _ =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+                    if !parent_existed || is_default_app_dir(parent, dirs::home_dir().as_deref()) {
+                        use std::os::unix::fs::PermissionsExt;
+                        // Best-effort. Ignore failure — the 0600 file is
+                        // the real guarantee.
+                        let _ = std::fs::set_permissions(
+                            parent,
+                            std::fs::Permissions::from_mode(0o700),
+                        );
+                    }
                 }
             }
         }
 
-        let mut tmp_os = path.as_os_str().to_owned();
-        tmp_os.push(".tmp");
-        let tmp = std::path::PathBuf::from(tmp_os);
-
-        // Create the temp file owner-only from the outset so the secret is never
-        // momentarily world-readable between create and chmod.
+        // PAN-62 review round 3 (Codex P1): a hand-rolled `<path>.tmp`
+        // sibling is a PREDICTABLE name -- in a pre-existing group/world-
+        // writable custom parent (exactly the case the block above
+        // deliberately leaves writable by other users), another writer
+        // could pre-create that exact name as a symlink to any file the
+        // pancetta user can write, and a plain `OpenOptions::create(true)`
+        // (no `O_EXCL`, no no-follow) would follow it -- writing the
+        // plaintext config, credentials included, straight through the
+        // symlink before the final rename ever ran. `tempfile` creates a
+        // randomly-named file exclusively (`O_CREAT | O_EXCL` on Unix),
+        // which can never resolve to an attacker-planted symlink at a
+        // guessable name -- eliminating this attack class outright rather
+        // than patching around each new angle on it.
+        let dir = path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or_else(|| std::path::Path::new("."));
+        let mut builder = tempfile::Builder::new();
         #[cfg(unix)]
         {
-            use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
-            let mut f = std::fs::OpenOptions::new()
-                .write(true)
-                .create(true)
-                .truncate(true)
-                .mode(0o600)
-                .open(&tmp)?;
-            f.write_all(contents.as_bytes())?;
-            f.sync_all()?;
+            use std::os::unix::fs::PermissionsExt;
+            // Owner-only from the outset so the secret is never momentarily
+            // world-readable between create and chmod.
+            builder.permissions(std::fs::Permissions::from_mode(0o600));
         }
-        #[cfg(not(unix))]
+        let mut tmp = builder.tempfile_in(dir)?;
         {
-            std::fs::write(&tmp, contents)?;
+            use std::io::Write;
+            tmp.write_all(contents.as_bytes())?;
+            tmp.as_file().sync_all()?;
         }
-
-        // Atomic replace. On the rare rename failure, clean up the temp.
-        if let Err(e) = std::fs::rename(&tmp, path) {
-            let _ = std::fs::remove_file(&tmp);
-            return Err(e.into());
-        }
+        // Atomic replace (same `rename` guarantee as before). On failure,
+        // `PersistError` hands back the still-unpersisted `NamedTempFile`,
+        // which cleans itself up on drop -- no manual `remove_file` needed.
+        tmp.persist(path).map_err(|e| e.error)?;
         Ok(())
     }
 
@@ -643,6 +673,110 @@ mod tests {
         // Round-trips and preserved the device write.
         let reloaded = Config::load_from_file(&path).unwrap();
         assert_eq!(reloaded.audio.output_device, "Rig CODEC");
+    }
+
+    /// PAN-62 review round 1 (Codex P1): a custom `--config` path's parent
+    /// directory may be a shared location (`/srv/shared`, a dotfiles repo
+    /// checkout) the operator deliberately left at some non-0700 mode.
+    /// `write_secure_atomic` must only force 0700 on a directory IT just
+    /// created, never on one that already existed -- otherwise the first
+    /// picker/bookmark save silently locks other users/services out of a
+    /// directory pancetta doesn't own.
+    #[cfg(unix)]
+    #[test]
+    fn save_to_file_preserves_permissions_of_a_preexisting_parent_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Parent already exists (unlike `save_to_file_is_owner_only_and_atomic`'s
+        // freshly-created "nested" dir) with an explicit, non-0700 mode --
+        // simulating a shared directory pancetta does not own.
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = dir.path().join("pancetta.toml");
+
+        Config::default().save_to_file(&path).unwrap();
+
+        let dmode = std::fs::metadata(dir.path()).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            dmode, 0o755,
+            "a pre-existing parent dir's permissions must be left alone, got {dmode:o}"
+        );
+        // The file itself is still owner-only regardless.
+        let fmode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            fmode, 0o600,
+            "config file must still be owner-only, got {fmode:o}"
+        );
+    }
+
+    /// PAN-62 review round 3 (Codex P1): the old hand-rolled `<path>.tmp`
+    /// temp sibling was a PREDICTABLE name -- in a pre-existing
+    /// group/world-writable custom parent (exactly the case the round-1/
+    /// round-2 permission fixes deliberately leave writable by other
+    /// users), another directory writer could pre-place that exact name
+    /// as a symlink to any file the pancetta user can write. The old
+    /// `OpenOptions::create(true)` (no `O_EXCL`/no-follow) would follow
+    /// it, overwriting the symlink's target -- credentials and all --
+    /// before the final rename replaced the symlink itself. Plant that
+    /// exact attack and confirm the "victim" file is never touched.
+    #[cfg(unix)]
+    #[test]
+    fn save_to_file_never_follows_a_symlink_planted_at_the_old_predictable_temp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("pancetta.toml");
+        let victim = dir.path().join("victim.txt");
+        std::fs::write(&victim, "do not touch").unwrap();
+        let predictable_tmp = dir.path().join("pancetta.toml.tmp");
+        std::os::unix::fs::symlink(&victim, &predictable_tmp).unwrap();
+
+        Config::default().save_to_file(&path).unwrap();
+
+        assert_eq!(
+            std::fs::read_to_string(&victim).unwrap(),
+            "do not touch",
+            "a symlink planted at the old predictable temp name must never be \
+             followed/overwritten"
+        );
+        assert!(
+            path.exists(),
+            "the actual config file must still be written"
+        );
+        assert!(
+            std::fs::symlink_metadata(&predictable_tmp)
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the planted symlink itself must be left exactly as it was"
+        );
+    }
+
+    /// PAN-62 review round 2 (Codex P1): the round-1 "only harden a
+    /// freshly-created parent" fix also suppressed re-hardening of a
+    /// PRE-EXISTING default `~/.pancetta` directory left lax by an older
+    /// install or an accidental `chmod` -- that directory is
+    /// application-owned and must always be forced back to 0700,
+    /// regardless of whether this call created it. Only an arbitrary
+    /// CUSTOM `--config` parent (one pancetta doesn't own) should be left
+    /// alone when it already existed. `home_dir` is passed explicitly
+    /// since `dirs::home_dir()` can't be faked in a test process.
+    #[test]
+    fn is_default_app_dir_matches_only_the_dot_pancetta_child_of_home() {
+        let home = std::path::Path::new("/home/operator");
+        assert!(
+            is_default_app_dir(&home.join(".pancetta"), Some(home)),
+            "the default app-owned directory must be recognized"
+        );
+        assert!(
+            !is_default_app_dir(&home.join("shared-configs"), Some(home)),
+            "a different directory under home must NOT be treated as app-owned"
+        );
+        assert!(
+            !is_default_app_dir(std::path::Path::new("/srv/shared"), Some(home)),
+            "an unrelated custom directory must NOT be treated as app-owned"
+        );
+        assert!(
+            !is_default_app_dir(&home.join(".pancetta"), None),
+            "with no resolvable home dir, nothing can be recognized as the default"
+        );
     }
 
     #[test]
