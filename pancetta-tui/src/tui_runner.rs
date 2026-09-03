@@ -2415,6 +2415,13 @@ impl TuiRunner {
     /// closely enough to size a modal that must reserve exactly the rows
     /// it renders (PAN-66: the rig-config modal's key legend was clipped
     /// because its reserved height never accounted for wrapping at all).
+    ///
+    /// Measures each word by ratatui's own `Span::width()` (backed by
+    /// `unicode-width`), not `chars().count()` — a CJK character or emoji
+    /// renders as 2 terminal columns but is 1 `char`, and the editable
+    /// Model field accepts any non-control input, so undercounting here
+    /// (round-2 review finding) reproduces the exact same footer-clipping
+    /// bug this function exists to prevent.
     fn wrapped_line_count(text: &str, width: u16) -> u16 {
         if width == 0 {
             return 1;
@@ -2423,7 +2430,7 @@ impl TuiRunner {
         let mut lines: u16 = 1;
         let mut col = 0usize;
         for word in text.split_whitespace() {
-            let mut remaining = word.chars().count();
+            let mut remaining = ratatui::text::Span::raw(word).width();
             let sep = if col == 0 { 0 } else { 1 };
             if col + sep + remaining <= width {
                 col += sep + remaining;
@@ -5739,6 +5746,16 @@ mod pan_59_command_tests {
     fn wrapped_line_count_never_reports_zero_lines() {
         assert_eq!(TuiRunner::wrapped_line_count("", 40), 1);
         assert_eq!(TuiRunner::wrapped_line_count("anything", 0), 1);
+    }
+
+    #[test]
+    fn wrapped_line_count_measures_display_width_not_char_count() {
+        // PAN-66 round-2 review: a CJK glyph is 1 `char` but renders as 2
+        // terminal columns. 10 glyphs is 10 chars but 20 display columns,
+        // so it must wrap at a 10-column width even though a char-count
+        // measurement would (wrongly) say it fits on one line.
+        let wide_word = "模".repeat(10);
+        assert!(TuiRunner::wrapped_line_count(&wide_word, 10) > 1);
     }
 
     #[test]
