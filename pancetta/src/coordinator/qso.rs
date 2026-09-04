@@ -870,12 +870,10 @@ fn ft8_message_to_qso_type(
             from_station: from(),
             report: report(),
         },
-        Some(StandardMessageType::Rrr) | Some(StandardMessageType::RR73) => {
-            Mt::FinalConfirmation {
-                to_station: to(),
-                from_station: from(),
-            }
-        }
+        Some(StandardMessageType::Rrr) | Some(StandardMessageType::RR73) => Mt::FinalConfirmation {
+            to_station: to(),
+            from_station: from(),
+        },
         Some(StandardMessageType::Final73) => Mt::SeventyThree {
             to_station: to(),
             from_station: from(),
@@ -3521,132 +3519,132 @@ impl super::ApplicationCoordinator {
                                     let msg_type =
                                         ft8_message_to_qso_type(&decoded_msg.message, &raw_text);
                                     {
-                                            // item-2-auto-73: a directed RR73/RRR from
-                                            // a station we just MANUALLY completed with
-                                            // means they didn't copy our 73 — bounded
-                                            // auto-re-send. Detect before process_message
-                                            // moves the parsed type. The map/window/cap
-                                            // gating lives in the helper.
-                                            maybe_auto_resend_73(
+                                        // item-2-auto-73: a directed RR73/RRR from
+                                        // a station we just MANUALLY completed with
+                                        // means they didn't copy our 73 — bounded
+                                        // auto-re-send. Detect before process_message
+                                        // moves the parsed type. The map/window/cap
+                                        // gating lives in the helper.
+                                        maybe_auto_resend_73(
+                                            &msg_type,
+                                            &our_callsign,
+                                            frequency,
+                                            decoded_msg.slot_parity,
+                                            &qso_manager,
+                                            &recent_manual_completions,
+                                            &tx_policy,
+                                            &message_bus,
+                                        )
+                                        .await;
+
+                                        // process_message advances any active
+                                        // QSO — runs unconditionally for every
+                                        // decode so the state machine always
+                                        // sees the latest copy.
+                                        // Use the parity-carrying entry point: this
+                                        // is a live decode, so `slot_parity` is a
+                                        // real observation, letting a
+                                        // provisionally-latched QSO (e.g. answered
+                                        // from a DX-cluster/DX-Hunter spot before any
+                                        // live decode existed) refine its `tx_parity`
+                                        // to the true opposite-of-DX value on first
+                                        // contact — see
+                                        // `QsoMetadata::tx_parity_provisional`.
+                                        if let Err(e) = qso_manager
+                                            .process_message_with_parity(
+                                                msg_type.clone(),
+                                                raw_text.clone(),
+                                                frequency,
+                                                Some(snr),
+                                                decoded_msg.slot_parity,
+                                            )
+                                            .await
+                                        {
+                                            debug!("QSO process_message error: {}", e);
+                                        }
+
+                                        // Per-slot dedup gate for always-answer
+                                        // creation. Derive the slot key from the
+                                        // decode timestamp (floor(unix_secs/15)).
+                                        let decode_slot_key =
+                                            caller_creation_slot_key(decoded_msg.timestamp);
+
+                                        // Refresh the dedup set when the slot
+                                        // changes (new 15-second window).
+                                        if decode_slot_key != caller_dedup.0 {
+                                            caller_dedup.0 = decode_slot_key;
+                                            caller_dedup.1.clear();
+                                        }
+
+                                        // Peek at the caller's base callsign
+                                        // without consuming msg_type — we only
+                                        // need it to key the dedup set.
+                                        let caller_base = classify_caller_answer(
+                                            &msg_type,
+                                            &our_callsign,
+                                        )
+                                        .map(|a| {
+                                            pancetta_qso::exchange::base_callsign(&a.their_call)
+                                        });
+
+                                        // Always-answer-callers (#39): if a
+                                        // station is calling US and no QSO
+                                        // with them is already in progress,
+                                        // come back to them — independent of
+                                        // the autonomous toggle, gated by TX
+                                        // policy / parity / capacity.
+                                        //
+                                        // Skip if we already attempted creation
+                                        // for this station in this slot (Part B
+                                        // of duplicate-QSO fix).
+                                        let skip_creation = caller_base
+                                            .as_deref()
+                                            .is_some_and(|base| caller_dedup.1.contains(base));
+
+                                        if skip_creation {
+                                            debug!(
+                                                target: "qso",
+                                                "Per-slot dedup: skipping maybe_answer_caller for {} (slot {})",
+                                                caller_base.as_deref().unwrap_or("?"),
+                                                decode_slot_key,
+                                            );
+                                        } else {
+                                            // Record the attempt BEFORE the
+                                            // async call so that a second
+                                            // decode arriving while we await
+                                            // would also be suppressed if this
+                                            // loop were ever concurrent (it
+                                            // isn't today, but is defensive).
+                                            if let Some(ref base) = caller_base {
+                                                caller_dedup.1.insert(base.clone());
+                                            }
+                                            maybe_answer_caller(
                                                 &msg_type,
                                                 &our_callsign,
                                                 frequency,
                                                 decoded_msg.slot_parity,
+                                                snr,
                                                 &qso_manager,
-                                                &recent_manual_completions,
                                                 &tx_policy,
+                                                auto_answer_max_concurrent,
                                                 &message_bus,
+                                                &fox_mode,
+                                                &fox_max_streams,
                                             )
                                             .await;
-
-                                            // process_message advances any active
-                                            // QSO — runs unconditionally for every
-                                            // decode so the state machine always
-                                            // sees the latest copy.
-                                            // Use the parity-carrying entry point: this
-                                            // is a live decode, so `slot_parity` is a
-                                            // real observation, letting a
-                                            // provisionally-latched QSO (e.g. answered
-                                            // from a DX-cluster/DX-Hunter spot before any
-                                            // live decode existed) refine its `tx_parity`
-                                            // to the true opposite-of-DX value on first
-                                            // contact — see
-                                            // `QsoMetadata::tx_parity_provisional`.
-                                            if let Err(e) = qso_manager
-                                                .process_message_with_parity(
-                                                    msg_type.clone(),
-                                                    raw_text.clone(),
-                                                    frequency,
-                                                    Some(snr),
-                                                    decoded_msg.slot_parity,
-                                                )
-                                                .await
-                                            {
-                                                debug!("QSO process_message error: {}", e);
-                                            }
-
-                                            // Per-slot dedup gate for always-answer
-                                            // creation. Derive the slot key from the
-                                            // decode timestamp (floor(unix_secs/15)).
-                                            let decode_slot_key =
-                                                caller_creation_slot_key(decoded_msg.timestamp);
-
-                                            // Refresh the dedup set when the slot
-                                            // changes (new 15-second window).
-                                            if decode_slot_key != caller_dedup.0 {
-                                                caller_dedup.0 = decode_slot_key;
-                                                caller_dedup.1.clear();
-                                            }
-
-                                            // Peek at the caller's base callsign
-                                            // without consuming msg_type — we only
-                                            // need it to key the dedup set.
-                                            let caller_base =
-                                                classify_caller_answer(&msg_type, &our_callsign)
-                                                    .map(|a| {
-                                                        pancetta_qso::exchange::base_callsign(
-                                                            &a.their_call,
-                                                        )
-                                                    });
-
-                                            // Always-answer-callers (#39): if a
-                                            // station is calling US and no QSO
-                                            // with them is already in progress,
-                                            // come back to them — independent of
-                                            // the autonomous toggle, gated by TX
-                                            // policy / parity / capacity.
-                                            //
-                                            // Skip if we already attempted creation
-                                            // for this station in this slot (Part B
-                                            // of duplicate-QSO fix).
-                                            let skip_creation = caller_base
-                                                .as_deref()
-                                                .is_some_and(|base| caller_dedup.1.contains(base));
-
-                                            if skip_creation {
-                                                debug!(
-                                                    target: "qso",
-                                                    "Per-slot dedup: skipping maybe_answer_caller for {} (slot {})",
-                                                    caller_base.as_deref().unwrap_or("?"),
-                                                    decode_slot_key,
-                                                );
-                                            } else {
-                                                // Record the attempt BEFORE the
-                                                // async call so that a second
-                                                // decode arriving while we await
-                                                // would also be suppressed if this
-                                                // loop were ever concurrent (it
-                                                // isn't today, but is defensive).
-                                                if let Some(ref base) = caller_base {
-                                                    caller_dedup.1.insert(base.clone());
-                                                }
-                                                maybe_answer_caller(
-                                                    &msg_type,
-                                                    &our_callsign,
-                                                    frequency,
-                                                    decoded_msg.slot_parity,
-                                                    snr,
-                                                    &qso_manager,
-                                                    &tx_policy,
-                                                    auto_answer_max_concurrent,
-                                                    &message_bus,
-                                                    &fox_mode,
-                                                    &fox_max_streams,
-                                                )
-                                                .await;
-                                            }
-
-                                            // #41: record what this sender is
-                                            // doing on the band so the QSO panel
-                                            // can show whether the DX we're
-                                            // calling is busy / CQing / on us.
-                                            record_dx_activity(
-                                                &dx_activity,
-                                                &msg_type,
-                                                &our_callsign,
-                                                chrono::Utc::now(),
-                                            );
                                         }
+
+                                        // #41: record what this sender is
+                                        // doing on the band so the QSO panel
+                                        // can show whether the DX we're
+                                        // calling is busy / CQing / on us.
+                                        record_dx_activity(
+                                            &dx_activity,
+                                            &msg_type,
+                                            &our_callsign,
+                                            chrono::Utc::now(),
+                                        );
+                                    }
                                 }
 
                                 // QSO control messages (start QSO, log, etc.)
