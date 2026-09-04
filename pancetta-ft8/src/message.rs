@@ -1397,6 +1397,20 @@ impl Ft8Message {
                     msg.standard_type = Some(StandardMessageType::ReportWithR);
                     msg.signal_report = Self::text_parse_report(report);
                 }
+                // Standard wire form: "R"+report as ONE token (no space),
+                // e.g. "R-12" -- distinct from the two-token ["R", report]
+                // arm above. Missing this arm made every combined-token
+                // report ack fall through to the `_` catch-all below and get
+                // misclassified as a gridless Reply, dropping the report
+                // (PR #344 round-1 review).
+                [tok]
+                    if tok.len() > 1
+                        && tok.starts_with('R')
+                        && Self::text_looks_like_report(&tok[1..]) =>
+                {
+                    msg.standard_type = Some(StandardMessageType::ReportWithR);
+                    msg.signal_report = Self::text_parse_report(&tok[1..]);
+                }
                 [grid] if Self::text_looks_like_grid(grid) => {
                     msg.standard_type = Some(StandardMessageType::Reply);
                     msg.grid_square = Some(grid.to_string());
@@ -2872,6 +2886,38 @@ mod tests {
 
         let display = message.to_string();
         assert_eq!(display, "K1ABC W9XYZ R+05");
+    }
+
+    #[test]
+    fn from_text_parses_single_token_r_report_negative() {
+        // PR #344 round-1 Codex P1: from_text (the parser `from_ft8lib`
+        // feeds every primary/FFI-sourced decode through) did not recognize
+        // this exact wire form -- the same one test_report_with_r_display_
+        // no_space_before_report above proves this codebase's own Display
+        // emits -- and silently misclassified it as a gridless Reply,
+        // dropping the report entirely.
+        let msg = Ft8Message::from_text("K1ABC W9XYZ R-12");
+        assert_eq!(msg.standard_type, Some(StandardMessageType::ReportWithR));
+        assert_eq!(msg.to_callsign, Some("K1ABC".to_string()));
+        assert_eq!(msg.from_callsign, Some("W9XYZ".to_string()));
+        assert_eq!(msg.signal_report, Some(-12));
+    }
+
+    #[test]
+    fn from_text_parses_single_token_r_report_positive() {
+        let msg = Ft8Message::from_text("K1ABC W9XYZ R+05");
+        assert_eq!(msg.standard_type, Some(StandardMessageType::ReportWithR));
+        assert_eq!(msg.signal_report, Some(5));
+    }
+
+    #[test]
+    fn from_text_still_parses_two_token_r_grid_as_reply_with_r() {
+        // Regression guard: the new single-token arm must not shadow the
+        // pre-existing two-token "R"+grid case (a distinct wire shape).
+        let msg = Ft8Message::from_text("K1ABC W9XYZ R EN37");
+        assert_eq!(msg.standard_type, Some(StandardMessageType::ReplyWithR));
+        assert_eq!(msg.grid_square, Some("EN37".to_string()));
+        assert_eq!(msg.signal_report, None);
     }
 
     #[test]

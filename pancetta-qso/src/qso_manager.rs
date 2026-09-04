@@ -2649,6 +2649,14 @@ impl QsoManager {
         let qso_tx_parity = progress.metadata.tx_parity;
         let qso_remote_origin = progress.metadata.remote_origin;
         let qso_initiated_by = progress.metadata.initiated_by;
+        // PR #344 round-1 Codex P2: a natively-typed ContestReply (PAN-51 --
+        // ft8_message_to_qso_type classifies a ReplyWithR decode directly,
+        // never routing through the NonStandard reclassification below that
+        // used to be the only place this QSO-engagement gate ran) must still
+        // be gated the same way, or an ordinary non-contest QSO advances and
+        // logs a contest-shaped exchange the moment its real partner happens
+        // to send an "R"+grid/report shape.
+        let qso_contest_engaged = progress.metadata.contest_info.is_some();
         progress.messages.push(message.clone());
 
         // Compound-callsign equivalence (catalog C18 / peer D4): if this frame
@@ -2718,6 +2726,7 @@ impl QsoManager {
                 &message.message_type,
                 message.signal_strength,
                 qso_initiated_by,
+                qso_contest_engaged,
             )
             .await?;
 
@@ -2817,6 +2826,13 @@ impl QsoManager {
         // metadata. The CqResponse latch above is protected the equivalent
         // way structurally: `(RespondingToCq, CqResponse)` has a dedicated
         // relevance arm requiring `is_partner` before it is ever reached.
+        //
+        // Also gated by `qso_contest_engaged` (PR #344 round-1 Codex P2):
+        // this block is unconditional on the transition arm actually
+        // advancing, so without this an ordinary non-contest QSO's
+        // `grids.theirs` could still get overwritten by a stray
+        // ContestReply-shaped decode from its real partner even after the
+        // transition arm itself correctly declines to advance.
         if let MessageType::ContestReply {
             grid, from_station, ..
         } = &message.message_type
@@ -2824,7 +2840,7 @@ impl QsoManager {
             let from_partner = old_state
                 .their_callsign()
                 .is_some_and(|partner| Self::is_partner(from_station, partner));
-            if from_partner && !grid.is_empty() {
+            if qso_contest_engaged && from_partner && !grid.is_empty() {
                 progress.metadata.grids.theirs = Some(grid.clone());
             }
         }
@@ -3195,6 +3211,7 @@ impl QsoManager {
         message_type: &MessageType,
         signal_strength: Option<f32>,
         initiated_by: CallInitiation,
+        contest_engaged: bool,
     ) -> Result<QsoState, QsoManagerError> {
         match (current_state, message_type) {
             // CQ call received response (CQer flow). A station answered our CQ
@@ -3609,9 +3626,11 @@ impl QsoManager {
             // report" sentinel used throughout this file (e.g. lines 3238,
             // 3544, 10260) for exactly this situation. `is_ack: false`
             // (the plain first-exchange grid, already handled by the
-            // ordinary CqResponse path) never reaches this arm because
-            // process_message_with_parity's reclassification step
-            // (PAN-49) only ever produces `is_ack: true`.
+            // ordinary CqResponse path) never reaches this arm: both
+            // producers of `ContestReply` -- process_message_with_parity's
+            // text reclassification (PAN-49) and ft8_message_to_qso_type's
+            // direct typed classification (PAN-51) -- only ever set
+            // `is_ack: true`.
             (
                 QsoState::RespondingToCq {
                     target_callsign,
@@ -3625,6 +3644,26 @@ impl QsoManager {
                     is_ack: true,
                 },
             ) => {
+                // PR #344 round-1 Codex P2: PAN-51 lets a native ReplyWithR
+                // decode reach this arm directly, bypassing the QSO-
+                // engagement check process_message_with_parity's text-
+                // reclassification path applies before ever producing
+                // ContestReply. Without this, an ORDINARY non-contest QSO
+                // advances and logs a contest-shaped exchange the moment
+                // its real partner sends an "R"+grid shape for any reason.
+                // `contest_engaged` is this QSO's own
+                // `metadata.contest_info.is_some()`, captured by the caller
+                // -- scoped per-QSO, matching the reclassification gate's
+                // own scoping (final review Finding 2 there).
+                if !contest_engaged {
+                    debug!(
+                        target: "qso.security",
+                        qso_id = %qso_id,
+                        from = %from_station,
+                        "native ContestReply in RespondingToCq ignored — QSO is not contest-engaged"
+                    );
+                    return Ok(current_state.clone());
+                }
                 if self
                     .reject_sender(qso_id, from_station, target_callsign, to_station)
                     .await
@@ -7441,6 +7480,104 @@ mod tests {
         );
     }
 
+    /// PR #344 round-1 Codex P2 regression: PAN-51's `ft8_message_to_qso_type`
+    /// classifies a native ReplyWithR decode directly as `ContestReply`,
+    /// never routing through `process_message_with_parity`'s NonStandard
+    /// reclassification step -- so a QSO that never called
+    /// `engage_contest_profile` must still decline to advance (and must not
+    /// latch the grid) when it receives a natively-typed `ContestReply` from
+    /// its own real partner, exactly matching the pre-PAN-51 (no-contest)
+    /// behavior for a decode ft8_lib recognized but pancetta never engaged a
+    /// contest profile for.
+    #[tokio::test]
+    async fn native_contest_reply_ignored_when_qso_not_contest_engaged() {
+        let mut config = test_config();
+        config.our_callsign = "K5ARH".to_string();
+        let manager = QsoManager::new(config);
+
+        let qso_id = manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        // Deliberately never calls engage_contest_profile.
+
+        manager
+            .process_message(
+                MessageType::ContestReply {
+                    to_station: "K5ARH".to_string(),
+                    from_station: "K9ZZ".to_string(),
+                    grid: "EN37".to_string(),
+                    is_ack: true,
+                },
+                "K5ARH K9ZZ R EN37".to_string(),
+                1500.0,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::RespondingToCq { .. }),
+            "non-contest-engaged QSO must not advance on a native ContestReply, got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.grids.theirs, None,
+            "grid must not latch for a non-contest-engaged QSO's native ContestReply"
+        );
+    }
+
+    /// Companion to the above: the SAME frame DOES advance the QSO once it
+    /// is contest-engaged -- proving the new gate blocks only the
+    /// unengaged case, not `ContestReply` handling generally.
+    #[tokio::test]
+    async fn native_contest_reply_advances_when_qso_contest_engaged() {
+        let mut config = test_config();
+        config.our_callsign = "K5ARH".to_string();
+        let manager = QsoManager::new(config);
+        let profile = crate::contest::catalog::builtin_catalog()
+            .into_iter()
+            .find(|p| p.id == "us-state-qso-party")
+            .unwrap();
+
+        let qso_id = manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+        manager
+            .engage_contest_profile(qso_id, profile)
+            .await
+            .unwrap();
+
+        manager
+            .process_message(
+                MessageType::ContestReply {
+                    to_station: "K5ARH".to_string(),
+                    from_station: "K9ZZ".to_string(),
+                    grid: "EN37".to_string(),
+                    is_ack: true,
+                },
+                "K5ARH K9ZZ R EN37".to_string(),
+                1500.0,
+                Some(-11.0),
+            )
+            .await
+            .unwrap();
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(progress.state, QsoState::WaitingForConfirmation { .. }),
+            "contest-engaged QSO must advance on a native ContestReply, got {:?}",
+            progress.state
+        );
+        assert_eq!(
+            progress.metadata.grids.theirs,
+            Some("EN37".to_string()),
+            "grid must latch for a contest-engaged QSO's native ContestReply"
+        );
+    }
+
     /// Repetitive-TX watchdog: a QSO stuck in the same active TX state (we keep
     /// re-sending the same message) is retired at repetitive_tx_timeout_secs,
     /// independent of (and tighter than) the manual keep-call watchdog.
@@ -9435,7 +9572,7 @@ mod sender_verification_tests {
             report: -12,
         };
         let new_state = manager
-            .determine_state_transition(qso_id, &state, &spoof, None, CallInitiation::Auto)
+            .determine_state_transition(qso_id, &state, &spoof, None, CallInitiation::Auto, false)
             .await
             .unwrap();
         // State must NOT advance.
@@ -9470,7 +9607,14 @@ mod sender_verification_tests {
             report: -12,
         };
         let new_state = manager
-            .determine_state_transition(Uuid::new_v4(), &state, &legit, None, CallInitiation::Auto)
+            .determine_state_transition(
+                Uuid::new_v4(),
+                &state,
+                &legit,
+                None,
+                CallInitiation::Auto,
+                false,
+            )
             .await
             .unwrap();
         assert!(
@@ -10644,7 +10788,14 @@ mod sender_verification_tests {
             report: -10,
         };
         let new_state = manager
-            .determine_state_transition(Uuid::new_v4(), &state, &spoof, None, CallInitiation::Auto)
+            .determine_state_transition(
+                Uuid::new_v4(),
+                &state,
+                &spoof,
+                None,
+                CallInitiation::Auto,
+                false,
+            )
             .await
             .unwrap();
         assert!(matches!(new_state, QsoState::SendingReport { .. }));
@@ -10666,7 +10817,14 @@ mod sender_verification_tests {
             from_station: "NF4KE".into(),
         };
         let new_state = manager
-            .determine_state_transition(Uuid::new_v4(), &state, &spoof, None, CallInitiation::Auto)
+            .determine_state_transition(
+                Uuid::new_v4(),
+                &state,
+                &spoof,
+                None,
+                CallInitiation::Auto,
+                false,
+            )
             .await
             .unwrap();
         assert!(matches!(new_state, QsoState::WaitingForConfirmation { .. }));
@@ -10688,7 +10846,14 @@ mod sender_verification_tests {
             from_station: "K9ZZ".into(),
         };
         let new_state = manager
-            .determine_state_transition(Uuid::new_v4(), &state, &legit, None, CallInitiation::Auto)
+            .determine_state_transition(
+                Uuid::new_v4(),
+                &state,
+                &legit,
+                None,
+                CallInitiation::Auto,
+                false,
+            )
             .await
             .unwrap();
         assert!(matches!(new_state, QsoState::Completed { .. }));
@@ -12222,6 +12387,7 @@ mod state_regression_tests {
                 },
                 Some(-15.0),
                 CallInitiation::Manual,
+                false,
             )
             .await
             .unwrap();
