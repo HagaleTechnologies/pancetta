@@ -1420,8 +1420,15 @@ impl Ft8Message {
                     msg.signal_report = Self::text_parse_report(report);
                 }
                 _ => {
-                    // Unrecognized suffix — store as free text
-                    msg.standard_type = Some(StandardMessageType::Reply);
+                    // Unrecognized suffix (PR #344 round-2 Codex P1): do NOT
+                    // guess Reply for arbitrary text -- e.g. "K5ARH W1AW X"
+                    // is two valid-looking callsigns with a junk suffix, and
+                    // silently treating it as a blank-exchange Reply lets an
+                    // unroutable free-text frame masquerade as a real
+                    // CqResponse. None correctly signals "not one of the
+                    // eight standard shapes", which ft8_message_to_qso_type
+                    // routes through the real validated text parser.
+                    msg.standard_type = None;
                 }
             }
             return msg;
@@ -2918,6 +2925,27 @@ mod tests {
         assert_eq!(msg.standard_type, Some(StandardMessageType::ReplyWithR));
         assert_eq!(msg.grid_square, Some("EN37".to_string()));
         assert_eq!(msg.signal_report, None);
+    }
+
+    #[test]
+    fn from_text_unrecognized_suffix_is_none_not_guessed_reply() {
+        // PR #344 round-2 Codex P1: "K5ARH W1AW X" is two valid-looking
+        // callsigns with a junk third token that matches no known shape.
+        // The old catch-all silently guessed Reply (turning free text into
+        // a fake CqResponse); this must be None so
+        // ft8_message_to_qso_type routes it through real text validation
+        // instead of trusting a guess.
+        let msg = Ft8Message::from_text("K5ARH W1AW X");
+        assert_eq!(msg.standard_type, None);
+    }
+
+    #[test]
+    fn from_text_bare_two_token_exchange_still_reply() {
+        // Regression guard: the legitimate blank-exchange shape (no
+        // suffix at all -- a real i3=1/2 "no grid, no report, no token"
+        // decode) must still classify as Reply, not None.
+        let msg = Ft8Message::from_text("K5ARH W1AW");
+        assert_eq!(msg.standard_type, Some(StandardMessageType::Reply));
     }
 
     #[test]

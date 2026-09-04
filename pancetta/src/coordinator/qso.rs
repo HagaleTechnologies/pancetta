@@ -879,6 +879,29 @@ pub fn ft8_message_to_qso_type(
     let grid = || message.grid_square.clone();
     let report = || message.signal_report.unwrap_or_default();
 
+    // PR #344 round-2 Codex P2: an UNRESOLVED 12-bit hash callsign renders
+    // as "<...N>" (unpack28 / CallsignField::Hash::to_callsign, literal
+    // dots -- distinct from a RESOLVED hash render like "<K5ARH>", which
+    // has no dots and is a real, routable callsign). is_plausible()
+    // deliberately accepts both shapes (any "<"-prefixed string "looks
+    // like a callsign" for decode-acceptance purposes), so an unresolved
+    // hash can legitimately reach here with `standard_type: Some(..)` from
+    // the native bit-unpacked path -- copying it verbatim into a typed
+    // MessageType's callsign field would let maybe_answer_caller try to
+    // open a QSO with a station we cannot actually address. The old text
+    // parser's validate_callsign rejected this shape outright; route the
+    // same way here rather than trusting it.
+    let is_unresolved_hash =
+        |s: &Option<String>| s.as_deref().is_some_and(|c| c.starts_with("<..."));
+    if is_unresolved_hash(&message.from_callsign) || is_unresolved_hash(&message.to_callsign) {
+        return match pancetta_qso::utils::parse_ft8_message(rendered_text, our_callsign) {
+            Ok(Mt::NonStandard { .. }) | Err(_) => Mt::NonStandard {
+                text: rendered_text.to_string(),
+            },
+            Ok(classified) => classified,
+        };
+    }
+
     match message.standard_type {
         Some(StandardMessageType::Cq) => Mt::Cq {
             callsign: from(),
@@ -5663,6 +5686,71 @@ mod ft8_message_classification_tests {
 
     fn base_message() -> pancetta_ft8::Ft8Message {
         pancetta_ft8::Ft8Message::default()
+    }
+
+    /// PR #344 round-2 Codex P2: a native i3=1/2 decode with an UNRESOLVED
+    /// 12-bit hash callsign (unpack28 renders "<...N>", literal dots --
+    /// distinct from a RESOLVED render like "<K5ARH>") must not be routed
+    /// as a real caller. `standard_type` is `Some(Report)` here (the
+    /// native path classified the SHAPE correctly), but the callsign
+    /// itself is unroutable -- this must fall through to the same
+    /// validated-text-parser path as `None`, which correctly rejects it.
+    #[test]
+    fn unresolved_hash_from_callsign_falls_back_to_non_standard() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Report),
+            to_callsign: Some("K5ARH".to_string()),
+            from_callsign: Some("<...123>".to_string()),
+            signal_report: Some(-10),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "K5ARH <...123> -10", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::NonStandard {
+                text: "K5ARH <...123> -10".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unresolved_hash_to_callsign_falls_back_to_non_standard() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Cq),
+            from_callsign: Some("<...456>".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "CQ <...456>", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::NonStandard {
+                text: "CQ <...456>".to_string(),
+            }
+        );
+    }
+
+    /// Companion: a RESOLVED hash render ("<K5ARH>", no dots) is a real,
+    /// routable callsign (PAN-17) and must NOT hit the unresolved-hash
+    /// guard -- it takes the ordinary typed-field path like any other
+    /// callsign.
+    #[test]
+    fn resolved_hash_callsign_is_not_treated_as_unresolved() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Report),
+            to_callsign: Some("<K5ARH>".to_string()),
+            from_callsign: Some("W1ABC".to_string()),
+            signal_report: Some(-10),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "<K5ARH> W1ABC -10", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::SignalReport {
+                to_station: "<K5ARH>".to_string(),
+                from_station: "W1ABC".to_string(),
+                report: -10,
+            }
+        );
     }
 
     #[test]
