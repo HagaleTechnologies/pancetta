@@ -814,6 +814,78 @@ struct CallerAnswer {
     their_report: Option<i8>,
 }
 
+/// Classify a decoded FT8 message directly from its already-parsed
+/// `Ft8Message.standard_type`, instead of re-deriving classification
+/// from rendered text via `parse_message`/`QSO_PATTERNS` (PAN-51).
+///
+/// `standard_type` is `None` when the decode doesn't match any of the
+/// eight well-known shapes -- that decision was made against the raw
+/// 77-bit payload at decode time, strictly more information than a
+/// regex on rendered text can ever recover, so `None` here means
+/// `NonStandard`, full stop. This is the structural fix for PAN-49: a
+/// `ReplyWithR` decode used to fall through to `NonStandard` because no
+/// regex in `QSO_PATTERNS` matched an "R+grid" shape; here it's handled
+/// directly (see `ContestReply`'s own doc comment, which already
+/// described exactly this shape).
+///
+/// `rendered_text` is the ALREADY-COMPUTED `DecodedMessage.text`, passed
+/// in rather than re-derived via `Ft8Message`'s `Display` impl -- one
+/// render, not two, and the `NonStandard` fallback carries exactly what
+/// was actually logged for this decode.
+fn ft8_message_to_qso_type(
+    message: &pancetta_ft8::Ft8Message,
+    rendered_text: &str,
+) -> pancetta_qso::states::MessageType {
+    use pancetta_ft8::message::StandardMessageType;
+    use pancetta_qso::states::MessageType as Mt;
+
+    let from = || message.from_callsign.clone().unwrap_or_default();
+    let to = || message.to_callsign.clone().unwrap_or_default();
+    let grid = || message.grid_square.clone();
+    let report = || message.signal_report.unwrap_or_default();
+
+    match message.standard_type {
+        Some(StandardMessageType::Cq) => Mt::Cq {
+            callsign: from(),
+            grid: grid(),
+        },
+        Some(StandardMessageType::Reply) => Mt::CqResponse {
+            calling_station: to(),
+            responding_station: from(),
+            grid: grid(),
+        },
+        Some(StandardMessageType::ReplyWithR) => Mt::ContestReply {
+            to_station: to(),
+            from_station: from(),
+            grid: grid().unwrap_or_default(),
+            is_ack: true,
+        },
+        Some(StandardMessageType::Report) => Mt::SignalReport {
+            to_station: to(),
+            from_station: from(),
+            report: report(),
+        },
+        Some(StandardMessageType::ReportWithR) => Mt::ReportAck {
+            to_station: to(),
+            from_station: from(),
+            report: report(),
+        },
+        Some(StandardMessageType::Rrr) | Some(StandardMessageType::RR73) => {
+            Mt::FinalConfirmation {
+                to_station: to(),
+                from_station: from(),
+            }
+        }
+        Some(StandardMessageType::Final73) => Mt::SeventyThree {
+            to_station: to(),
+            from_station: from(),
+        },
+        None => Mt::NonStandard {
+            text: rendered_text.to_string(),
+        },
+    }
+}
+
 /// Pure classifier for the always-answer-callers path (#39).
 ///
 /// Maps a parsed FT8 message **directed at us** to the reply we owe, or `None`
@@ -5544,6 +5616,79 @@ mod caller_answer_tests {
             from_station: "JA1ABC".to_string(),
         };
         assert_eq!(classify_caller_answer(&seventythree, OUR), None);
+    }
+}
+
+#[cfg(test)]
+mod ft8_message_classification_tests {
+    use super::*;
+
+    fn base_message() -> pancetta_ft8::Ft8Message {
+        pancetta_ft8::Ft8Message::default()
+    }
+
+    #[test]
+    fn cq_maps_to_cq() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Cq),
+            from_callsign: Some("W1ABC".to_string()),
+            grid_square: Some("FN42".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "CQ W1ABC FN42");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::Cq {
+                callsign: "W1ABC".to_string(),
+                grid: Some("FN42".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn reply_maps_to_cq_response() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Reply),
+            to_callsign: Some("W1ABC".to_string()),
+            from_callsign: Some("K1DEF".to_string()),
+            grid_square: Some("FN31".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF FN31");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::CqResponse {
+                calling_station: "W1ABC".to_string(),
+                responding_station: "K1DEF".to_string(),
+                grid: Some("FN31".to_string()),
+            }
+        );
+    }
+
+    /// PAN-49: the structural fix. Before this design, no regex in
+    /// `QSO_PATTERNS` produced `ContestReply` from inbound text at all --
+    /// a real `ReplyWithR` decode fell through to `NonStandard` and the
+    /// QSO never advanced. This proves the fix is now direct and correct
+    /// on the first pass, not a workaround.
+    #[test]
+    fn reply_with_r_maps_to_contest_reply_pan_49_regression() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::ReplyWithR),
+            to_callsign: Some("K1ABC".to_string()),
+            from_callsign: Some("W9XYZ".to_string()),
+            grid_square: Some("EN37".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "K1ABC W9XYZ R EN37");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::ContestReply {
+                to_station: "K1ABC".to_string(),
+                from_station: "W9XYZ".to_string(),
+                grid: "EN37".to_string(),
+                is_ack: true,
+            }
+        );
     }
 }
 
