@@ -82,9 +82,10 @@ implementation time — likely alongside the other `qso.rs` decode-handling
 helpers):
 
 ```rust
-fn ft8_message_to_qso_type(
+pub fn ft8_message_to_qso_type(
     message: &pancetta_ft8::Ft8Message,
     rendered_text: &str,
+    our_callsign: &str,
 ) -> pancetta_qso::MessageType
 ```
 
@@ -112,7 +113,7 @@ this is not a guessed table:
 | `Some(Rrr)` | `"<to_call> <from_call> RRR"` | `FinalConfirmation { to_station: to_callsign, from_station: from_callsign }` — same variant as `RR73`, matching today's regex (`exchange.rs:114-115,819-823`), which treats plain `RRR` and `RR73` identically |
 | `Some(Final73)` | `"<to_call> <from_call> 73"` | `SeventyThree { to_station: to_callsign, from_station: from_callsign }` |
 | `Some(RR73)` | `"<to_call> <from_call> RR73"` | `FinalConfirmation { to_station: to_callsign, from_station: from_callsign }` |
-| `None` | anything else | `NonStandard { text: rendered_text.to_string() }` |
+| `None` | i3=4 NonStdCall (compound/DXpedition call) | fall back to `pancetta_qso::utils::parse_ft8_message(rendered_text, our_callsign)`; `NonStandard { text: rendered_text.to_string() }` only if that yields nothing — see below |
 
 `GridSquare` and `SignalReport` (`pancetta-qso/src/states.rs:15,18`) are
 plain type aliases (`String`, `i8`) — field mapping is a direct copy, not
@@ -128,16 +129,56 @@ separate contest-profile-matcher pass is needed to catch this specific
 case anymore (though that matcher still exists and still runs for
 genuinely contest-specific formats it alone recognizes — see §5).
 
-**`None` — trust the decoder, no text-regex fallback.** If
-`standard_type` is `None`, the message is classified `NonStandard`,
-full stop. The decoder's own classification runs against the raw payload
-structure at decode time — strictly more information than a regex can
-ever recover from rendered text — so `None` should mean the message
-genuinely isn't one of the eight shapes, not "the regex list hasn't
-caught up yet." (That gap is exactly PAN-49's failure mode, and this
-design closes it rather than reproducing it as a fallback path.) No
-evidence surfaced during investigation that `QSO_PATTERNS` currently
-classifies anything the decoder's own `standard_type` misses.
+**`None` — i3=4 NonStdCall, NOT "unrecognized shape."** *(Corrected in the
+final whole-branch review; the original draft of this section claimed
+`standard_type` is populated for every decoded message and that `None`
+should always mean `NonStandard`. That premise was factually wrong and
+would have silently reverted the shipped PAN-17 fix.)*
+
+`standard_type` is assigned in exactly one place:
+`parse_type1_standard` (`pancetta-ft8/src/message.rs`), the handler for
+i3=1/2 `MessageType::Standard` payloads. An i3=4
+`MessageType::NonStdCall` payload — a compound / DXpedition callsign such
+as `YS/WE9G`, where one call is an exact 58-bit base-38 pack and the
+other a 12-bit hash render (`<K5ARH>` resolved, `<...>` unresolved) —
+goes through `parse_nonstd_call`, which sets
+`to_callsign`/`from_callsign`/`contest_exchange` and **never touches
+`standard_type`**.
+
+In production, exactly two message types reach this function:
+`is_plausible` gates every decode-acceptance point in `decoder.rs` and
+rejects `FreeText`/`Telemetry`/`Contest`/`FieldDay`/`RTTYRoundup`/
+`DXpedition`/`Unknown`, while `Extended` is never produced. So `Standard`
+(always `Some(..)`) and `NonStdCall` (always `None`) are the only
+survivors — and `is_plausible` has a dedicated `NonStdCall` shape check
+added precisely so real compound callsigns are accepted (PAN-17).
+
+Therefore `None` here means "not an i3=1/2 Standard payload," i.e. a
+legitimate compound-callsign CQ, reply, or RR73/RRR/73 close — messages
+that are perfectly classifiable from their rendered text. That is exactly
+what `CALL_TOKEN` and `normalize_callsign_token`
+(`pancetta-qso/src/exchange.rs`) were widened/added for in PAN-17.
+Mapping them to `NonStandard` would make every compound-callsign QSO
+invisible to the QSO engine again (the "TX-only, not a working QSO" gap)
+and would also drop `normalize_callsign_token`'s bracket stripping, so a
+resolved hash render would latch as `<K5ARH>` — which the round-2
+unencodable-message watchdog then (correctly) rejects, self-sabotaging
+the QSO.
+
+The `None` arm therefore falls back to the existing, already-correct,
+already-tested text parser. PAN-49's structural fix is unaffected: it
+lives entirely in the `Some(ReplyWithR)` arm, which no longer depends on
+`QSO_PATTERNS` at all. The fallback's own `NonStandard` result (and any
+parse error) is collapsed to the verbatim `rendered_text`, because
+`parse_message` uppercases its input and would otherwise substitute a
+different string than what was actually logged.
+
+`our_callsign` is threaded in solely to construct the `MessageExchange`
+the text parser hangs off. The parse path (`parse_message` →
+`parse_cq_message`/`parse_qso_message`) never reads it — only the
+`generate_*` half of `MessageExchange` does — so it has no effect on
+classification, but it keeps the call honest rather than passing a
+placeholder.
 
 **Open item for implementation, not architecture:** confirm
 `Ft8Message.signal_report`/`grid_square` are always `Some` when
@@ -157,8 +198,11 @@ let raw_text = decoded_msg.text.clone();
 let parsed = pancetta_qso::utils::parse_ft8_message(&raw_text, ...);
 
 // After:
-let parsed = ft8_message_to_qso_type(&decoded_msg.message, &decoded_msg.text);
+let parsed = ft8_message_to_qso_type(&decoded_msg.message, &decoded_msg.text, &our_callsign);
 ```
+
+`our_callsign` is already in scope in the decode loop (it is passed to
+`maybe_auto_resend_73` a few lines below), so this is a one-line addition.
 
 Exact surrounding code (error handling, what `parse_ft8_message`'s other
 parameters were doing) to be confirmed against the live file at
@@ -191,12 +235,25 @@ etc.) still do, and nothing here changes that path's behavior.
   scenario (`ReplyWithR` from a real or synthetic decode) asserting it
   now produces `ContestReply { is_ack: true, .. }` directly from this
   conversion — proving the fix is structural, not another regex patch.
+- Dedicated i3=4 (`standard_type == None`) tests covering the three
+  NonStdCall shapes a compound-callsign station actually sends — CQ,
+  reply carrying a resolved hash render (asserting the brackets are
+  stripped), and RRR/RR73/73 closes — plus the unresolved `<...>`
+  placeholder. These are the PAN-17 regression guard for the `None` arm;
+  each one fails if `None` maps straight to `NonStandard`.
 - No changes needed to existing `exchange.rs`/`sim.rs` tests — they
   exercise `parse_message`, which is untouched.
-- Coordinator-level: confirm (via an existing or new integration test
-  around `qso.rs`'s decode-handling path, if one already covers this
-  call site) that a live decode still produces the correct `MessageType`
-  end-to-end through the new path.
+- Coordinator-level: `pancetta/tests/loopback_qso.rs` (encode → modulate
+  → decode → classify) must call `ft8_message_to_qso_type`, NOT
+  `utils::parse_ft8_message` — otherwise the flagship E2E suite exercises
+  code the coordinator no longer runs and cannot catch a regression in
+  this function at all. The function is `pub` and re-exported from
+  `pancetta_lib::coordinator` for this reason. Both the standard-callsign
+  legs and the PAN-17 compound-callsign legs are repointed; the compound
+  legs are what give the `None` arm end-to-end coverage.
+  (`test_loopback_pan_49_contest_r_grid_ack_advances_qso` deliberately
+  keeps using the text parser: it pins the contest-profile
+  *reclassification* path, which needs a `NonStandard` input.)
 
 ## 7. Non-goals
 
