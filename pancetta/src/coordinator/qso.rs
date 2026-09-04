@@ -5690,6 +5690,140 @@ mod ft8_message_classification_tests {
             }
         );
     }
+
+    #[test]
+    fn report_maps_to_signal_report() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Report),
+            to_callsign: Some("K1DEF".to_string()),
+            from_callsign: Some("W1ABC".to_string()),
+            signal_report: Some(-15),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "K1DEF W1ABC -15");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::SignalReport {
+                to_station: "K1DEF".to_string(),
+                from_station: "W1ABC".to_string(),
+                report: -15,
+            }
+        );
+    }
+
+    #[test]
+    fn report_with_r_maps_to_report_ack() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::ReportWithR),
+            to_callsign: Some("W1ABC".to_string()),
+            from_callsign: Some("K1DEF".to_string()),
+            signal_report: Some(-12),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF R-12");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::ReportAck {
+                to_station: "W1ABC".to_string(),
+                from_station: "K1DEF".to_string(),
+                report: -12,
+            }
+        );
+    }
+
+    /// Regression companion to `exchange.rs`'s own
+    /// `parse_message` test at line ~1148-1161: bare "RRR" (no digits,
+    /// syntactically distinct from a grid) must classify the same as
+    /// RR73, matching today's regex behavior exactly.
+    #[test]
+    fn rrr_maps_to_final_confirmation_same_as_rr73() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Rrr),
+            to_callsign: Some("K5ARH".to_string()),
+            from_callsign: Some("K9HJZ".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "K5ARH K9HJZ RRR");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::FinalConfirmation {
+                to_station: "K5ARH".to_string(),
+                from_station: "K9HJZ".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rr73_maps_to_final_confirmation() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::RR73),
+            to_callsign: Some("K1DEF".to_string()),
+            from_callsign: Some("W1ABC".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "K1DEF W1ABC RR73");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::FinalConfirmation {
+                to_station: "K1DEF".to_string(),
+                from_station: "W1ABC".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn final73_maps_to_seventy_three() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Final73),
+            to_callsign: Some("W1ABC".to_string()),
+            from_callsign: Some("K1DEF".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF 73");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::SeventyThree {
+                to_station: "W1ABC".to_string(),
+                from_station: "K1DEF".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn none_standard_type_maps_to_non_standard_with_rendered_text() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: None,
+            text: Some("HELLO WORLD".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "HELLO WORLD");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::NonStandard {
+                text: "HELLO WORLD".to_string(),
+            }
+        );
+    }
+
+    /// The `NonStandard` fallback must use the PASSED-IN rendered text,
+    /// not re-derive it from `Ft8Message` -- proven by making the two
+    /// diverge (a real `Display` impl could never do this, but the
+    /// conversion function must not assume that and re-render anyway).
+    #[test]
+    fn none_standard_type_uses_the_passed_in_text_not_a_re_render() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: None,
+            text: Some("SOMETHING ELSE ENTIRELY".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "EXACT LOGGED TEXT");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::NonStandard {
+                text: "EXACT LOGGED TEXT".to_string(),
+            }
+        );
+    }
 }
 
 #[cfg(test)]
