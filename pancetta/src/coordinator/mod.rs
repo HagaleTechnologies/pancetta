@@ -48,6 +48,13 @@ pub use tx::{
 
 pub use qso::compute_manual_tx_offset;
 
+// PAN-51: the decode-path message classifier. Re-exported so the loopback
+// integration test (`pancetta/tests/loopback_qso.rs`) exercises the REAL
+// production classification path end-to-end (encode → modulate → decode →
+// classify) instead of the raw text parser the coordinator no longer calls
+// directly for i3=1/2 frames.
+pub use qso::ft8_message_to_qso_type;
+
 // Re-export the C19 config-reload classifier (safe-live vs deferred) and the
 // C20 RF-present/no-decode detector so the coordinator-robustness integration
 // tests can exercise the real production decision logic. `record_panic`/

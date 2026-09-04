@@ -1397,6 +1397,20 @@ impl Ft8Message {
                     msg.standard_type = Some(StandardMessageType::ReportWithR);
                     msg.signal_report = Self::text_parse_report(report);
                 }
+                // Standard wire form: "R"+report as ONE token (no space),
+                // e.g. "R-12" -- distinct from the two-token ["R", report]
+                // arm above. Missing this arm made every combined-token
+                // report ack fall through to the `_` catch-all below and get
+                // misclassified as a gridless Reply, dropping the report
+                // (PR #344 round-1 review).
+                [tok]
+                    if tok.len() > 1
+                        && tok.starts_with('R')
+                        && Self::text_looks_like_report(&tok[1..]) =>
+                {
+                    msg.standard_type = Some(StandardMessageType::ReportWithR);
+                    msg.signal_report = Self::text_parse_report(&tok[1..]);
+                }
                 [grid] if Self::text_looks_like_grid(grid) => {
                     msg.standard_type = Some(StandardMessageType::Reply);
                     msg.grid_square = Some(grid.to_string());
@@ -1406,8 +1420,15 @@ impl Ft8Message {
                     msg.signal_report = Self::text_parse_report(report);
                 }
                 _ => {
-                    // Unrecognized suffix — store as free text
-                    msg.standard_type = Some(StandardMessageType::Reply);
+                    // Unrecognized suffix (PR #344 round-2 Codex P1): do NOT
+                    // guess Reply for arbitrary text -- e.g. "K5ARH W1AW X"
+                    // is two valid-looking callsigns with a junk suffix, and
+                    // silently treating it as a blank-exchange Reply lets an
+                    // unroutable free-text frame masquerade as a real
+                    // CqResponse. None correctly signals "not one of the
+                    // eight standard shapes", which ft8_message_to_qso_type
+                    // routes through the real validated text parser.
+                    msg.standard_type = None;
                 }
             }
             return msg;
@@ -2872,6 +2893,59 @@ mod tests {
 
         let display = message.to_string();
         assert_eq!(display, "K1ABC W9XYZ R+05");
+    }
+
+    #[test]
+    fn from_text_parses_single_token_r_report_negative() {
+        // PR #344 round-1 Codex P1: from_text (the parser `from_ft8lib`
+        // feeds every primary/FFI-sourced decode through) did not recognize
+        // this exact wire form -- the same one test_report_with_r_display_
+        // no_space_before_report above proves this codebase's own Display
+        // emits -- and silently misclassified it as a gridless Reply,
+        // dropping the report entirely.
+        let msg = Ft8Message::from_text("K1ABC W9XYZ R-12");
+        assert_eq!(msg.standard_type, Some(StandardMessageType::ReportWithR));
+        assert_eq!(msg.to_callsign, Some("K1ABC".to_string()));
+        assert_eq!(msg.from_callsign, Some("W9XYZ".to_string()));
+        assert_eq!(msg.signal_report, Some(-12));
+    }
+
+    #[test]
+    fn from_text_parses_single_token_r_report_positive() {
+        let msg = Ft8Message::from_text("K1ABC W9XYZ R+05");
+        assert_eq!(msg.standard_type, Some(StandardMessageType::ReportWithR));
+        assert_eq!(msg.signal_report, Some(5));
+    }
+
+    #[test]
+    fn from_text_still_parses_two_token_r_grid_as_reply_with_r() {
+        // Regression guard: the new single-token arm must not shadow the
+        // pre-existing two-token "R"+grid case (a distinct wire shape).
+        let msg = Ft8Message::from_text("K1ABC W9XYZ R EN37");
+        assert_eq!(msg.standard_type, Some(StandardMessageType::ReplyWithR));
+        assert_eq!(msg.grid_square, Some("EN37".to_string()));
+        assert_eq!(msg.signal_report, None);
+    }
+
+    #[test]
+    fn from_text_unrecognized_suffix_is_none_not_guessed_reply() {
+        // PR #344 round-2 Codex P1: "K5ARH W1AW X" is two valid-looking
+        // callsigns with a junk third token that matches no known shape.
+        // The old catch-all silently guessed Reply (turning free text into
+        // a fake CqResponse); this must be None so
+        // ft8_message_to_qso_type routes it through real text validation
+        // instead of trusting a guess.
+        let msg = Ft8Message::from_text("K5ARH W1AW X");
+        assert_eq!(msg.standard_type, None);
+    }
+
+    #[test]
+    fn from_text_bare_two_token_exchange_still_reply() {
+        // Regression guard: the legitimate blank-exchange shape (no
+        // suffix at all -- a real i3=1/2 "no grid, no report, no token"
+        // decode) must still classify as Reply, not None.
+        let msg = Ft8Message::from_text("K5ARH W1AW");
+        assert_eq!(msg.standard_type, Some(StandardMessageType::Reply));
     }
 
     #[test]

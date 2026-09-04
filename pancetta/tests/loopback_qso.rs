@@ -11,6 +11,7 @@
 use pancetta_ft8::{
     DecodedMessage, Ft8Config, Ft8Decoder, Ft8Encoder, Ft8Modulator, WINDOW_SAMPLES,
 };
+use pancetta_lib::coordinator::ft8_message_to_qso_type;
 use pancetta_qso::autonomous::{
     AutonomousConfig, AutonomousOperator, DecodedMessageInfo, NullDxEvaluator, OperatorAction,
     SlotParityConfig,
@@ -265,7 +266,11 @@ async fn test_loopback_state_machine_driven_qso() {
     assert_eq!(decoded_cq, "CQ W1ABC FN42");
 
     // === Step 2: Station B parses decoded CQ and responds via state machine ===
-    let parsed_cq = utils::parse_ft8_message(decoded_cq, "K2DEF").unwrap();
+    // PAN-51: classify through the REAL production path
+    // (`ft8_message_to_qso_type`, re-exported from the coordinator), not the
+    // raw text parser the decode loop no longer calls for i3=1/2 frames.
+    // This leg is what makes the E2E suite actually cover the classifier.
+    let parsed_cq = ft8_message_to_qso_type(&decoded[0].message, decoded_cq, "K2DEF");
     assert!(
         matches!(parsed_cq, MessageType::Cq { ref callsign, .. } if callsign == "W1ABC"),
         "Parsed message should be CQ from W1ABC, got: {:?}",
@@ -307,7 +312,7 @@ async fn test_loopback_state_machine_driven_qso() {
     let decoded_response = &decoded[0].text;
 
     // === Step 3: Station A processes the response, transitions to WaitingForReport ===
-    let parsed_response = utils::parse_ft8_message(decoded_response, "W1ABC").unwrap();
+    let parsed_response = ft8_message_to_qso_type(&decoded[0].message, decoded_response, "W1ABC");
     assert!(
         matches!(parsed_response, MessageType::CqResponse { .. }),
         "Parsed message should be CqResponse, got: {:?}",
@@ -346,7 +351,7 @@ async fn test_loopback_state_machine_driven_qso() {
     let decoded_report = &decoded[0].text;
 
     // Station B processes the report -> transitions to SendingReport
-    let parsed_report = utils::parse_ft8_message(decoded_report, "K2DEF").unwrap();
+    let parsed_report = ft8_message_to_qso_type(&decoded[0].message, decoded_report, "K2DEF");
     assert!(
         matches!(parsed_report, MessageType::SignalReport { .. }),
         "Parsed message should be SignalReport, got: {:?}",
@@ -380,7 +385,7 @@ async fn test_loopback_state_machine_driven_qso() {
     assert!(!decoded.is_empty(), "Station A should decode the R+report");
     let decoded_r_report = &decoded[0].text;
 
-    let parsed_r_report = utils::parse_ft8_message(decoded_r_report, "W1ABC").unwrap();
+    let parsed_r_report = ft8_message_to_qso_type(&decoded[0].message, decoded_r_report, "W1ABC");
     assert!(
         matches!(parsed_r_report, MessageType::ReportAck { .. }),
         "Parsed message should be ReportAck, got: {:?}",
@@ -1314,7 +1319,12 @@ async fn test_loopback_compound_callsign_qso_advances_state_machine() {
     // callsign instead of rejecting it as implausible (this is implicit in
     // `decoded` being non-empty above -- an implausible decode is filtered
     // out before it ever becomes a `DecodedMessage`).
-    let parsed_cq = utils::parse_ft8_message(decoded_cq, "K5ARH").unwrap();
+    // PAN-51 final review (Critical): this i3=4 frame carries
+    // `standard_type == None` (`parse_nonstd_call` never sets it), so it
+    // exercises the classifier's `None` arm end-to-end. Classifying it
+    // `NonStandard` would silently revert PAN-17 -- this assertion is the
+    // E2E guard against exactly that.
+    let parsed_cq = ft8_message_to_qso_type(&decoded[0].message, decoded_cq, "K5ARH");
     assert!(
         matches!(parsed_cq, MessageType::Cq { ref callsign, .. } if callsign == "YS/WE9G"),
         "parsed message should be CQ from YS/WE9G, got: {:?}",
@@ -1364,7 +1374,10 @@ async fn test_loopback_compound_callsign_qso_advances_state_machine() {
     // MessageType (not fall through to NonStandard) even though it
     // contains a compound callsign and no hash bracket is even needed on
     // THIS leg (the exact-58-bit form round-trips as plain text).
-    let parsed_response = utils::parse_ft8_message(decoded_response, "YS/WE9G").unwrap();
+    // Also an i3=4 frame (`standard_type == None`), and this one carries the
+    // RESOLVED hash render -- the production classifier must strip the
+    // brackets on the way through, asserted on the latched state below.
+    let parsed_response = ft8_message_to_qso_type(&decoded[0].message, decoded_response, "YS/WE9G");
     assert!(
         matches!(parsed_response, MessageType::CqResponse { .. }),
         "parsed message should be CqResponse, got: {:?}",
@@ -1484,8 +1497,14 @@ async fn test_loopback_pan_49_contest_r_grid_ack_advances_qso() {
     let decoded_text = &decoded[0].text;
     assert_eq!(decoded_text, "K5ARH K5TD R EM40");
 
-    // Today's classifier has no pattern for this shape -- it parses as
-    // NonStandard, exactly like the real 2026-08-29/30 PAN-49 decode did.
+    // This leg deliberately feeds the QSO engine a `NonStandard` to pin the
+    // CONTEST-PROFILE reclassification path (PAN-49's fix), so it keeps
+    // using the text parser -- which has no pattern for the "R"+grid shape.
+    // (The coordinator itself no longer produces `NonStandard` here: PAN-51's
+    // `ft8_message_to_qso_type` maps this i3=1/2 `ReplyWithR` decode straight
+    // to `ContestReply`. That direct mapping is covered by
+    // `reply_with_r_maps_to_contest_reply_pan_49_regression` in
+    // `coordinator/qso.rs`; this test covers the reclassifier behind it.)
     let parsed = pancetta_qso::utils::parse_ft8_message(decoded_text, "K5ARH").unwrap();
     assert!(matches!(parsed, MessageType::NonStandard { .. }));
 
@@ -1618,7 +1637,8 @@ async fn genuinely_unresolvable_caller_hash_never_resolves_but_retires_cleanly()
         "K1DEF, never previously heard, must decode as the unresolved placeholder"
     );
 
-    let parsed_response = utils::parse_ft8_message(decoded_response, "YS/WE9G").unwrap();
+    let parsed_response =
+        ft8_message_to_qso_type(&decoded2[0].message, decoded_response, "YS/WE9G");
     assert!(
         matches!(&parsed_response, MessageType::CqResponse { responding_station, .. } if responding_station == "<...>"),
         "parsed message must carry the unresolved placeholder unchanged \

@@ -814,6 +814,142 @@ struct CallerAnswer {
     their_report: Option<i8>,
 }
 
+/// Classify a decoded FT8 message directly from its already-parsed
+/// `Ft8Message.standard_type`, instead of re-deriving classification
+/// from rendered text via `parse_message`/`QSO_PATTERNS` (PAN-51).
+///
+/// For every `Some(..)` variant this is the whole PAN-51 win: the shape
+/// decision was made against the raw 77-bit payload at decode time,
+/// strictly more information than a regex on rendered text can ever
+/// recover. This is the structural fix for PAN-49: a `ReplyWithR` decode
+/// used to fall through to `NonStandard` because no regex in
+/// `QSO_PATTERNS` matched an "R+grid" shape; here it's handled directly
+/// (see `ContestReply`'s own doc comment, which already described
+/// exactly this shape).
+///
+/// **`None` does NOT mean "unrecognized shape."** `standard_type` is only
+/// ever assigned by `parse_type1_standard`
+/// (`pancetta-ft8/src/message.rs`), which handles i3=1/2
+/// `MessageType::Standard` payloads and nothing else. An i3=4
+/// `MessageType::NonStdCall` payload -- a compound / DXpedition callsign
+/// such as `YS/WE9G`, where one call is an exact 58-bit base-38 pack and
+/// the other a 12-bit hash render (`<K5ARH>` resolved, `<...>`
+/// unresolved) -- goes through `parse_nonstd_call`, which sets
+/// `to_callsign`/`from_callsign`/`contest_exchange` and NEVER touches
+/// `standard_type`. Those frames are perfectly ordinary CQs, replies, and
+/// RR73/RRR/73 closes that a compound-callsign station is working us
+/// with, and `is_plausible` (`message.rs`) explicitly accepts them via
+/// its own `NonStdCall` shape check (PAN-17).
+///
+/// So `None` here means "not an i3=1/2 Standard payload" -- in production
+/// exactly the i3=4 NonStdCall case, because `is_plausible` gates every
+/// decode-acceptance point and rejects `FreeText`/`Telemetry`/`Contest`/
+/// `FieldDay`/`RTTYRoundup`/`DXpedition`/`Unknown`, and `Extended` is
+/// never produced. Those frames ARE classifiable from their rendered
+/// text, which is precisely what `CALL_TOKEN` and
+/// `normalize_callsign_token` (`pancetta-qso/src/exchange.rs`) were
+/// widened/added for in PAN-17. Classifying them `NonStandard` would
+/// silently revert that shipped fix and make every compound-callsign
+/// QSO invisible to the QSO engine again, so the `None` arm falls back to
+/// the existing, already-correct text parser -- including its bracket
+/// stripping, so a resolved hash render latches as `K5ARH`, not
+/// `<K5ARH>`.
+///
+/// `rendered_text` is the ALREADY-COMPUTED `DecodedMessage.text`, passed
+/// in rather than re-derived via `Ft8Message`'s `Display` impl -- one
+/// render, not two, and the `NonStandard` fallback carries exactly what
+/// was actually logged for this decode (the text parser uppercases its
+/// input, so its own `NonStandard` result is deliberately discarded in
+/// favor of the verbatim `rendered_text`).
+///
+/// `our_callsign` is threaded through solely to construct the
+/// `MessageExchange` the text parser hangs off; the parse path
+/// (`parse_message` → `parse_cq_message`/`parse_qso_message`) never reads
+/// it -- only the `generate_*` half of `MessageExchange` does.
+pub fn ft8_message_to_qso_type(
+    message: &pancetta_ft8::Ft8Message,
+    rendered_text: &str,
+    our_callsign: &str,
+) -> pancetta_qso::states::MessageType {
+    use pancetta_ft8::message::StandardMessageType;
+    use pancetta_qso::states::MessageType as Mt;
+
+    let from = || message.from_callsign.clone().unwrap_or_default();
+    let to = || message.to_callsign.clone().unwrap_or_default();
+    let grid = || message.grid_square.clone();
+    let report = || message.signal_report.unwrap_or_default();
+
+    // PR #344 round-2 Codex P2: an UNRESOLVED 12-bit hash callsign renders
+    // as "<...N>" (unpack28 / CallsignField::Hash::to_callsign, literal
+    // dots -- distinct from a RESOLVED hash render like "<K5ARH>", which
+    // has no dots and is a real, routable callsign). is_plausible()
+    // deliberately accepts both shapes (any "<"-prefixed string "looks
+    // like a callsign" for decode-acceptance purposes), so an unresolved
+    // hash can legitimately reach here with `standard_type: Some(..)` from
+    // the native bit-unpacked path -- copying it verbatim into a typed
+    // MessageType's callsign field would let maybe_answer_caller try to
+    // open a QSO with a station we cannot actually address. The old text
+    // parser's validate_callsign rejected this shape outright; route the
+    // same way here rather than trusting it.
+    let is_unresolved_hash =
+        |s: &Option<String>| s.as_deref().is_some_and(|c| c.starts_with("<..."));
+    if is_unresolved_hash(&message.from_callsign) || is_unresolved_hash(&message.to_callsign) {
+        return match pancetta_qso::utils::parse_ft8_message(rendered_text, our_callsign) {
+            Ok(Mt::NonStandard { .. }) | Err(_) => Mt::NonStandard {
+                text: rendered_text.to_string(),
+            },
+            Ok(classified) => classified,
+        };
+    }
+
+    match message.standard_type {
+        Some(StandardMessageType::Cq) => Mt::Cq {
+            callsign: from(),
+            grid: grid(),
+        },
+        Some(StandardMessageType::Reply) => Mt::CqResponse {
+            calling_station: to(),
+            responding_station: from(),
+            grid: grid(),
+        },
+        Some(StandardMessageType::ReplyWithR) => Mt::ContestReply {
+            to_station: to(),
+            from_station: from(),
+            grid: grid().unwrap_or_default(),
+            is_ack: true,
+        },
+        Some(StandardMessageType::Report) => Mt::SignalReport {
+            to_station: to(),
+            from_station: from(),
+            report: report(),
+        },
+        Some(StandardMessageType::ReportWithR) => Mt::ReportAck {
+            to_station: to(),
+            from_station: from(),
+            report: report(),
+        },
+        Some(StandardMessageType::Rrr) | Some(StandardMessageType::RR73) => Mt::FinalConfirmation {
+            to_station: to(),
+            from_station: from(),
+        },
+        Some(StandardMessageType::Final73) => Mt::SeventyThree {
+            to_station: to(),
+            from_station: from(),
+        },
+        // i3=4 NonStdCall (compound/DXpedition callsigns) -- see the doc
+        // comment above. Fall back to the existing text parser, which is
+        // exactly the path PAN-17 hardened for these frames. Its own
+        // `NonStandard` result (and any parse error) collapses to the
+        // verbatim `rendered_text` so the logged text stays byte-exact.
+        None => match pancetta_qso::utils::parse_ft8_message(rendered_text, our_callsign) {
+            Ok(Mt::NonStandard { .. }) | Err(_) => Mt::NonStandard {
+                text: rendered_text.to_string(),
+            },
+            Ok(classified) => classified,
+        },
+    }
+}
+
 /// Pure classifier for the always-answer-callers path (#39).
 ///
 /// Maps a parsed FT8 message **directed at us** to the reply we owe, or `None`
@@ -3442,144 +3578,141 @@ impl super::ApplicationCoordinator {
                                     let frequency = decoded_msg.frequency_offset;
                                     let snr = decoded_msg.snr_db;
 
-                                    // Parse the FT8 message to determine its type
-                                    match pancetta_qso::utils::parse_ft8_message(
+                                    // PAN-51: classify directly from the decoder's own
+                                    // typed Ft8Message.standard_type instead of
+                                    // re-parsing the rendered text — see
+                                    // ft8_message_to_qso_type's doc comment.
+                                    let msg_type = ft8_message_to_qso_type(
+                                        &decoded_msg.message,
                                         &raw_text,
                                         &our_callsign,
-                                    ) {
-                                        Ok(msg_type) => {
-                                            // item-2-auto-73: a directed RR73/RRR from
-                                            // a station we just MANUALLY completed with
-                                            // means they didn't copy our 73 — bounded
-                                            // auto-re-send. Detect before process_message
-                                            // moves the parsed type. The map/window/cap
-                                            // gating lives in the helper.
-                                            maybe_auto_resend_73(
+                                    );
+                                    {
+                                        // item-2-auto-73: a directed RR73/RRR from
+                                        // a station we just MANUALLY completed with
+                                        // means they didn't copy our 73 — bounded
+                                        // auto-re-send. Detect before process_message
+                                        // moves the parsed type. The map/window/cap
+                                        // gating lives in the helper.
+                                        maybe_auto_resend_73(
+                                            &msg_type,
+                                            &our_callsign,
+                                            frequency,
+                                            decoded_msg.slot_parity,
+                                            &qso_manager,
+                                            &recent_manual_completions,
+                                            &tx_policy,
+                                            &message_bus,
+                                        )
+                                        .await;
+
+                                        // process_message advances any active
+                                        // QSO — runs unconditionally for every
+                                        // decode so the state machine always
+                                        // sees the latest copy.
+                                        // Use the parity-carrying entry point: this
+                                        // is a live decode, so `slot_parity` is a
+                                        // real observation, letting a
+                                        // provisionally-latched QSO (e.g. answered
+                                        // from a DX-cluster/DX-Hunter spot before any
+                                        // live decode existed) refine its `tx_parity`
+                                        // to the true opposite-of-DX value on first
+                                        // contact — see
+                                        // `QsoMetadata::tx_parity_provisional`.
+                                        if let Err(e) = qso_manager
+                                            .process_message_with_parity(
+                                                msg_type.clone(),
+                                                raw_text.clone(),
+                                                frequency,
+                                                Some(snr),
+                                                decoded_msg.slot_parity,
+                                            )
+                                            .await
+                                        {
+                                            debug!("QSO process_message error: {}", e);
+                                        }
+
+                                        // Per-slot dedup gate for always-answer
+                                        // creation. Derive the slot key from the
+                                        // decode timestamp (floor(unix_secs/15)).
+                                        let decode_slot_key =
+                                            caller_creation_slot_key(decoded_msg.timestamp);
+
+                                        // Refresh the dedup set when the slot
+                                        // changes (new 15-second window).
+                                        if decode_slot_key != caller_dedup.0 {
+                                            caller_dedup.0 = decode_slot_key;
+                                            caller_dedup.1.clear();
+                                        }
+
+                                        // Peek at the caller's base callsign
+                                        // without consuming msg_type — we only
+                                        // need it to key the dedup set.
+                                        let caller_base = classify_caller_answer(
+                                            &msg_type,
+                                            &our_callsign,
+                                        )
+                                        .map(|a| {
+                                            pancetta_qso::exchange::base_callsign(&a.their_call)
+                                        });
+
+                                        // Always-answer-callers (#39): if a
+                                        // station is calling US and no QSO
+                                        // with them is already in progress,
+                                        // come back to them — independent of
+                                        // the autonomous toggle, gated by TX
+                                        // policy / parity / capacity.
+                                        //
+                                        // Skip if we already attempted creation
+                                        // for this station in this slot (Part B
+                                        // of duplicate-QSO fix).
+                                        let skip_creation = caller_base
+                                            .as_deref()
+                                            .is_some_and(|base| caller_dedup.1.contains(base));
+
+                                        if skip_creation {
+                                            debug!(
+                                                target: "qso",
+                                                "Per-slot dedup: skipping maybe_answer_caller for {} (slot {})",
+                                                caller_base.as_deref().unwrap_or("?"),
+                                                decode_slot_key,
+                                            );
+                                        } else {
+                                            // Record the attempt BEFORE the
+                                            // async call so that a second
+                                            // decode arriving while we await
+                                            // would also be suppressed if this
+                                            // loop were ever concurrent (it
+                                            // isn't today, but is defensive).
+                                            if let Some(ref base) = caller_base {
+                                                caller_dedup.1.insert(base.clone());
+                                            }
+                                            maybe_answer_caller(
                                                 &msg_type,
                                                 &our_callsign,
                                                 frequency,
                                                 decoded_msg.slot_parity,
+                                                snr,
                                                 &qso_manager,
-                                                &recent_manual_completions,
                                                 &tx_policy,
+                                                auto_answer_max_concurrent,
                                                 &message_bus,
+                                                &fox_mode,
+                                                &fox_max_streams,
                                             )
                                             .await;
-
-                                            // process_message advances any active
-                                            // QSO — runs unconditionally for every
-                                            // decode so the state machine always
-                                            // sees the latest copy.
-                                            // Use the parity-carrying entry point: this
-                                            // is a live decode, so `slot_parity` is a
-                                            // real observation, letting a
-                                            // provisionally-latched QSO (e.g. answered
-                                            // from a DX-cluster/DX-Hunter spot before any
-                                            // live decode existed) refine its `tx_parity`
-                                            // to the true opposite-of-DX value on first
-                                            // contact — see
-                                            // `QsoMetadata::tx_parity_provisional`.
-                                            if let Err(e) = qso_manager
-                                                .process_message_with_parity(
-                                                    msg_type.clone(),
-                                                    raw_text.clone(),
-                                                    frequency,
-                                                    Some(snr),
-                                                    decoded_msg.slot_parity,
-                                                )
-                                                .await
-                                            {
-                                                debug!("QSO process_message error: {}", e);
-                                            }
-
-                                            // Per-slot dedup gate for always-answer
-                                            // creation. Derive the slot key from the
-                                            // decode timestamp (floor(unix_secs/15)).
-                                            let decode_slot_key =
-                                                caller_creation_slot_key(decoded_msg.timestamp);
-
-                                            // Refresh the dedup set when the slot
-                                            // changes (new 15-second window).
-                                            if decode_slot_key != caller_dedup.0 {
-                                                caller_dedup.0 = decode_slot_key;
-                                                caller_dedup.1.clear();
-                                            }
-
-                                            // Peek at the caller's base callsign
-                                            // without consuming msg_type — we only
-                                            // need it to key the dedup set.
-                                            let caller_base =
-                                                classify_caller_answer(&msg_type, &our_callsign)
-                                                    .map(|a| {
-                                                        pancetta_qso::exchange::base_callsign(
-                                                            &a.their_call,
-                                                        )
-                                                    });
-
-                                            // Always-answer-callers (#39): if a
-                                            // station is calling US and no QSO
-                                            // with them is already in progress,
-                                            // come back to them — independent of
-                                            // the autonomous toggle, gated by TX
-                                            // policy / parity / capacity.
-                                            //
-                                            // Skip if we already attempted creation
-                                            // for this station in this slot (Part B
-                                            // of duplicate-QSO fix).
-                                            let skip_creation = caller_base
-                                                .as_deref()
-                                                .is_some_and(|base| caller_dedup.1.contains(base));
-
-                                            if skip_creation {
-                                                debug!(
-                                                    target: "qso",
-                                                    "Per-slot dedup: skipping maybe_answer_caller for {} (slot {})",
-                                                    caller_base.as_deref().unwrap_or("?"),
-                                                    decode_slot_key,
-                                                );
-                                            } else {
-                                                // Record the attempt BEFORE the
-                                                // async call so that a second
-                                                // decode arriving while we await
-                                                // would also be suppressed if this
-                                                // loop were ever concurrent (it
-                                                // isn't today, but is defensive).
-                                                if let Some(ref base) = caller_base {
-                                                    caller_dedup.1.insert(base.clone());
-                                                }
-                                                maybe_answer_caller(
-                                                    &msg_type,
-                                                    &our_callsign,
-                                                    frequency,
-                                                    decoded_msg.slot_parity,
-                                                    snr,
-                                                    &qso_manager,
-                                                    &tx_policy,
-                                                    auto_answer_max_concurrent,
-                                                    &message_bus,
-                                                    &fox_mode,
-                                                    &fox_max_streams,
-                                                )
-                                                .await;
-                                            }
-
-                                            // #41: record what this sender is
-                                            // doing on the band so the QSO panel
-                                            // can show whether the DX we're
-                                            // calling is busy / CQing / on us.
-                                            record_dx_activity(
-                                                &dx_activity,
-                                                &msg_type,
-                                                &our_callsign,
-                                                chrono::Utc::now(),
-                                            );
                                         }
-                                        Err(e) => {
-                                            debug!(
-                                                "Could not parse FT8 message '{}': {}",
-                                                raw_text, e
-                                            );
-                                        }
+
+                                        // #41: record what this sender is
+                                        // doing on the band so the QSO panel
+                                        // can show whether the DX we're
+                                        // calling is busy / CQing / on us.
+                                        record_dx_activity(
+                                            &dx_activity,
+                                            &msg_type,
+                                            &our_callsign,
+                                            chrono::Utc::now(),
+                                        );
                                     }
                                 }
 
@@ -5544,6 +5677,413 @@ mod caller_answer_tests {
             from_station: "JA1ABC".to_string(),
         };
         assert_eq!(classify_caller_answer(&seventythree, OUR), None);
+    }
+}
+
+#[cfg(test)]
+mod ft8_message_classification_tests {
+    use super::*;
+
+    fn base_message() -> pancetta_ft8::Ft8Message {
+        pancetta_ft8::Ft8Message::default()
+    }
+
+    /// PR #344 round-2 Codex P2: a native i3=1/2 decode with an UNRESOLVED
+    /// 12-bit hash callsign (unpack28 renders "<...N>", literal dots --
+    /// distinct from a RESOLVED render like "<K5ARH>") must not be routed
+    /// as a real caller. `standard_type` is `Some(Report)` here (the
+    /// native path classified the SHAPE correctly), but the callsign
+    /// itself is unroutable -- this must fall through to the same
+    /// validated-text-parser path as `None`, which correctly rejects it.
+    #[test]
+    fn unresolved_hash_from_callsign_falls_back_to_non_standard() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Report),
+            to_callsign: Some("K5ARH".to_string()),
+            from_callsign: Some("<...123>".to_string()),
+            signal_report: Some(-10),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "K5ARH <...123> -10", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::NonStandard {
+                text: "K5ARH <...123> -10".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn unresolved_hash_to_callsign_falls_back_to_non_standard() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Cq),
+            from_callsign: Some("<...456>".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "CQ <...456>", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::NonStandard {
+                text: "CQ <...456>".to_string(),
+            }
+        );
+    }
+
+    /// Companion: a RESOLVED hash render ("<K5ARH>", no dots) is a real,
+    /// routable callsign (PAN-17) and must NOT hit the unresolved-hash
+    /// guard -- it takes the ordinary typed-field path like any other
+    /// callsign.
+    #[test]
+    fn resolved_hash_callsign_is_not_treated_as_unresolved() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Report),
+            to_callsign: Some("<K5ARH>".to_string()),
+            from_callsign: Some("W1ABC".to_string()),
+            signal_report: Some(-10),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "<K5ARH> W1ABC -10", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::SignalReport {
+                to_station: "<K5ARH>".to_string(),
+                from_station: "W1ABC".to_string(),
+                report: -10,
+            }
+        );
+    }
+
+    #[test]
+    fn cq_maps_to_cq() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Cq),
+            from_callsign: Some("W1ABC".to_string()),
+            grid_square: Some("FN42".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "CQ W1ABC FN42", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::Cq {
+                callsign: "W1ABC".to_string(),
+                grid: Some("FN42".to_string()),
+            }
+        );
+    }
+
+    #[test]
+    fn reply_maps_to_cq_response() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Reply),
+            to_callsign: Some("W1ABC".to_string()),
+            from_callsign: Some("K1DEF".to_string()),
+            grid_square: Some("FN31".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF FN31", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::CqResponse {
+                calling_station: "W1ABC".to_string(),
+                responding_station: "K1DEF".to_string(),
+                grid: Some("FN31".to_string()),
+            }
+        );
+    }
+
+    /// PAN-49: the structural fix. Before this design, no regex in
+    /// `QSO_PATTERNS` produced `ContestReply` from inbound text at all --
+    /// a real `ReplyWithR` decode fell through to `NonStandard` and the
+    /// QSO never advanced. This proves the fix is now direct and correct
+    /// on the first pass, not a workaround.
+    #[test]
+    fn reply_with_r_maps_to_contest_reply_pan_49_regression() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::ReplyWithR),
+            to_callsign: Some("K1ABC".to_string()),
+            from_callsign: Some("W9XYZ".to_string()),
+            grid_square: Some("EN37".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "K1ABC W9XYZ R EN37", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::ContestReply {
+                to_station: "K1ABC".to_string(),
+                from_station: "W9XYZ".to_string(),
+                grid: "EN37".to_string(),
+                is_ack: true,
+            }
+        );
+    }
+
+    #[test]
+    fn report_maps_to_signal_report() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Report),
+            to_callsign: Some("K1DEF".to_string()),
+            from_callsign: Some("W1ABC".to_string()),
+            signal_report: Some(-15),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "K1DEF W1ABC -15", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::SignalReport {
+                to_station: "K1DEF".to_string(),
+                from_station: "W1ABC".to_string(),
+                report: -15,
+            }
+        );
+    }
+
+    #[test]
+    fn report_with_r_maps_to_report_ack() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::ReportWithR),
+            to_callsign: Some("W1ABC".to_string()),
+            from_callsign: Some("K1DEF".to_string()),
+            signal_report: Some(-12),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF R-12", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::ReportAck {
+                to_station: "W1ABC".to_string(),
+                from_station: "K1DEF".to_string(),
+                report: -12,
+            }
+        );
+    }
+
+    /// Regression companion to `exchange.rs`'s own
+    /// `parse_message` test at line ~1148-1161: bare "RRR" (no digits,
+    /// syntactically distinct from a grid) must classify the same as
+    /// RR73, matching today's regex behavior exactly.
+    #[test]
+    fn rrr_maps_to_final_confirmation_same_as_rr73() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Rrr),
+            to_callsign: Some("K5ARH".to_string()),
+            from_callsign: Some("K9HJZ".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "K5ARH K9HJZ RRR", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::FinalConfirmation {
+                to_station: "K5ARH".to_string(),
+                from_station: "K9HJZ".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn rr73_maps_to_final_confirmation() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::RR73),
+            to_callsign: Some("K1DEF".to_string()),
+            from_callsign: Some("W1ABC".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "K1DEF W1ABC RR73", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::FinalConfirmation {
+                to_station: "K1DEF".to_string(),
+                from_station: "W1ABC".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn final73_maps_to_seventy_three() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: Some(pancetta_ft8::message::StandardMessageType::Final73),
+            to_callsign: Some("W1ABC".to_string()),
+            from_callsign: Some("K1DEF".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF 73", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::SeventyThree {
+                to_station: "W1ABC".to_string(),
+                from_station: "K1DEF".to_string(),
+            }
+        );
+    }
+
+    /// `None` + text that genuinely parses as nothing still lands on
+    /// `NonStandard`. "HELLO WORLD" is two callsign-shaped TOKENS as far as
+    /// `QSO_PATTERNS`' character class is concerned, but `validate_callsign`
+    /// rejects both (no digit, not compound, not a hash render), so the text
+    /// fallback errors out and we collapse to the verbatim rendered text.
+    #[test]
+    fn none_standard_type_maps_to_non_standard_with_rendered_text() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: None,
+            text: Some("HELLO WORLD".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "HELLO WORLD", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::NonStandard {
+                text: "HELLO WORLD".to_string(),
+            }
+        );
+    }
+
+    /// The `NonStandard` fallback must use the PASSED-IN rendered text,
+    /// not re-derive it from `Ft8Message` -- proven by making the two
+    /// diverge (a real `Display` impl could never do this, but the
+    /// conversion function must not assume that and re-render anyway).
+    /// Also pins the text parser's own `NonStandard` result being
+    /// discarded: it uppercases and re-emits its input, which would
+    /// silently substitute a DIFFERENT string than what was logged.
+    #[test]
+    fn none_standard_type_uses_the_passed_in_text_not_a_re_render() {
+        let msg = pancetta_ft8::Ft8Message {
+            standard_type: None,
+            text: Some("SOMETHING ELSE ENTIRELY".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "EXACT LOGGED TEXT", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::NonStandard {
+                text: "EXACT LOGGED TEXT".to_string(),
+            }
+        );
+    }
+
+    // ====================================================================
+    // i3=4 NonStdCall (`standard_type == None`) -- PAN-17 regression guard.
+    //
+    // `parse_nonstd_call` (pancetta-ft8/src/message.rs) NEVER sets
+    // `standard_type`, so every compound/DXpedition-callsign frame arrives
+    // here with `None`. These are real, workable QSO messages, not exotic
+    // shapes: classifying them `NonStandard` makes a compound-callsign
+    // station's CQ, reply, and close all invisible to the QSO engine --
+    // exactly the "TX-only, not a working QSO" gap PAN-17 fixed.
+    // ====================================================================
+
+    /// i3=4 CQ. `parse_nonstd_call`'s `icq` branch sets
+    /// `to_callsign = Some("CQ")` and `from_callsign` to the exact 58-bit
+    /// base-38 compound call (never a hash -- see that branch), rendering
+    /// as `"CQ YS/WE9G"`.
+    #[test]
+    fn nonstd_call_cq_classifies_as_cq_not_non_standard() {
+        let msg = pancetta_ft8::Ft8Message {
+            message_type: pancetta_ft8::message::MessageType::NonStdCall,
+            standard_type: None,
+            to_callsign: Some("CQ".to_string()),
+            from_callsign: Some("YS/WE9G".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "CQ YS/WE9G", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::Cq {
+                callsign: "YS/WE9G".to_string(),
+                grid: None,
+            }
+        );
+    }
+
+    /// i3=4 reply carrying a RESOLVED 12-bit hash render of OUR callsign.
+    /// The classified `to_station` must be the NORMALIZED plain call
+    /// (`K5ARH`), not the bracketed literal -- a bracketed callsign latched
+    /// into QSO state self-sabotages via the unencodable-message watchdog
+    /// (`<`/`>` are outside the wire charset). Mirrors
+    /// `exchange.rs::parse_message_routes_resolved_hash_reply_with_report`.
+    #[test]
+    fn nonstd_call_resolved_hash_reply_strips_brackets_and_classifies() {
+        let msg = pancetta_ft8::Ft8Message {
+            message_type: pancetta_ft8::message::MessageType::NonStdCall,
+            standard_type: None,
+            to_callsign: Some("<K5ARH>".to_string()),
+            from_callsign: Some("YS/WE9G".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "<K5ARH> YS/WE9G -12", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::SignalReport {
+                to_station: "K5ARH".to_string(),
+                from_station: "YS/WE9G".to_string(),
+                report: -12,
+            }
+        );
+    }
+
+    /// i3=4 close. `parse_nonstd_call` decodes the 2-bit `nrpt` field into
+    /// `contest_exchange` (`RRR`/`RR73`/`73`), which `Display` appends after
+    /// the two calls. All three must reach the QSO engine as real closes --
+    /// a dropped RR73 stalls the QSO one message short of completion.
+    #[test]
+    fn nonstd_call_closes_classify_as_confirmation_and_73() {
+        let close = |exchange: &str, text: &str| {
+            let msg = pancetta_ft8::Ft8Message {
+                message_type: pancetta_ft8::message::MessageType::NonStdCall,
+                standard_type: None,
+                to_callsign: Some("<K5ARH>".to_string()),
+                from_callsign: Some("YS/WE9G".to_string()),
+                contest_exchange: Some(exchange.to_string()),
+                ..base_message()
+            };
+            ft8_message_to_qso_type(&msg, text, "K5ARH")
+        };
+
+        assert_eq!(
+            close("RR73", "<K5ARH> YS/WE9G RR73"),
+            pancetta_qso::states::MessageType::FinalConfirmation {
+                to_station: "K5ARH".to_string(),
+                from_station: "YS/WE9G".to_string(),
+            }
+        );
+        assert_eq!(
+            close("RRR", "<K5ARH> YS/WE9G RRR"),
+            pancetta_qso::states::MessageType::FinalConfirmation {
+                to_station: "K5ARH".to_string(),
+                from_station: "YS/WE9G".to_string(),
+            }
+        );
+        assert_eq!(
+            close("73", "<K5ARH> YS/WE9G 73"),
+            pancetta_qso::states::MessageType::SeventyThree {
+                to_station: "K5ARH".to_string(),
+                from_station: "YS/WE9G".to_string(),
+            }
+        );
+    }
+
+    /// The UNRESOLVED hash-miss placeholder (`<...>`) must also route --
+    /// there is no real callsign behind it, but the surrounding message
+    /// shape is still a real close. `normalize_callsign_token` deliberately
+    /// leaves it bracketed (nothing to normalize to); higher-level sender
+    /// verification (`callsigns_match`) is what refuses to match it against
+    /// a specific station.
+    #[test]
+    fn nonstd_call_unresolved_hash_close_still_routes() {
+        let msg = pancetta_ft8::Ft8Message {
+            message_type: pancetta_ft8::message::MessageType::NonStdCall,
+            standard_type: None,
+            to_callsign: Some("<...>".to_string()),
+            from_callsign: Some("YS/WE9G".to_string()),
+            contest_exchange: Some("RR73".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "<...> YS/WE9G RR73", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::FinalConfirmation {
+                to_station: "<...>".to_string(),
+                from_station: "YS/WE9G".to_string(),
+            }
+        );
     }
 }
 
