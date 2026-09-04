@@ -818,23 +818,58 @@ struct CallerAnswer {
 /// `Ft8Message.standard_type`, instead of re-deriving classification
 /// from rendered text via `parse_message`/`QSO_PATTERNS` (PAN-51).
 ///
-/// `standard_type` is `None` when the decode doesn't match any of the
-/// eight well-known shapes -- that decision was made against the raw
-/// 77-bit payload at decode time, strictly more information than a
-/// regex on rendered text can ever recover, so `None` here means
-/// `NonStandard`, full stop. This is the structural fix for PAN-49: a
-/// `ReplyWithR` decode used to fall through to `NonStandard` because no
-/// regex in `QSO_PATTERNS` matched an "R+grid" shape; here it's handled
-/// directly (see `ContestReply`'s own doc comment, which already
-/// described exactly this shape).
+/// For every `Some(..)` variant this is the whole PAN-51 win: the shape
+/// decision was made against the raw 77-bit payload at decode time,
+/// strictly more information than a regex on rendered text can ever
+/// recover. This is the structural fix for PAN-49: a `ReplyWithR` decode
+/// used to fall through to `NonStandard` because no regex in
+/// `QSO_PATTERNS` matched an "R+grid" shape; here it's handled directly
+/// (see `ContestReply`'s own doc comment, which already described
+/// exactly this shape).
+///
+/// **`None` does NOT mean "unrecognized shape."** `standard_type` is only
+/// ever assigned by `parse_type1_standard`
+/// (`pancetta-ft8/src/message.rs`), which handles i3=1/2
+/// `MessageType::Standard` payloads and nothing else. An i3=4
+/// `MessageType::NonStdCall` payload -- a compound / DXpedition callsign
+/// such as `YS/WE9G`, where one call is an exact 58-bit base-38 pack and
+/// the other a 12-bit hash render (`<K5ARH>` resolved, `<...>`
+/// unresolved) -- goes through `parse_nonstd_call`, which sets
+/// `to_callsign`/`from_callsign`/`contest_exchange` and NEVER touches
+/// `standard_type`. Those frames are perfectly ordinary CQs, replies, and
+/// RR73/RRR/73 closes that a compound-callsign station is working us
+/// with, and `is_plausible` (`message.rs`) explicitly accepts them via
+/// its own `NonStdCall` shape check (PAN-17).
+///
+/// So `None` here means "not an i3=1/2 Standard payload" -- in production
+/// exactly the i3=4 NonStdCall case, because `is_plausible` gates every
+/// decode-acceptance point and rejects `FreeText`/`Telemetry`/`Contest`/
+/// `FieldDay`/`RTTYRoundup`/`DXpedition`/`Unknown`, and `Extended` is
+/// never produced. Those frames ARE classifiable from their rendered
+/// text, which is precisely what `CALL_TOKEN` and
+/// `normalize_callsign_token` (`pancetta-qso/src/exchange.rs`) were
+/// widened/added for in PAN-17. Classifying them `NonStandard` would
+/// silently revert that shipped fix and make every compound-callsign
+/// QSO invisible to the QSO engine again, so the `None` arm falls back to
+/// the existing, already-correct text parser -- including its bracket
+/// stripping, so a resolved hash render latches as `K5ARH`, not
+/// `<K5ARH>`.
 ///
 /// `rendered_text` is the ALREADY-COMPUTED `DecodedMessage.text`, passed
 /// in rather than re-derived via `Ft8Message`'s `Display` impl -- one
 /// render, not two, and the `NonStandard` fallback carries exactly what
-/// was actually logged for this decode.
-fn ft8_message_to_qso_type(
+/// was actually logged for this decode (the text parser uppercases its
+/// input, so its own `NonStandard` result is deliberately discarded in
+/// favor of the verbatim `rendered_text`).
+///
+/// `our_callsign` is threaded through solely to construct the
+/// `MessageExchange` the text parser hangs off; the parse path
+/// (`parse_message` → `parse_cq_message`/`parse_qso_message`) never reads
+/// it -- only the `generate_*` half of `MessageExchange` does.
+pub fn ft8_message_to_qso_type(
     message: &pancetta_ft8::Ft8Message,
     rendered_text: &str,
+    our_callsign: &str,
 ) -> pancetta_qso::states::MessageType {
     use pancetta_ft8::message::StandardMessageType;
     use pancetta_qso::states::MessageType as Mt;
@@ -878,8 +913,16 @@ fn ft8_message_to_qso_type(
             to_station: to(),
             from_station: from(),
         },
-        None => Mt::NonStandard {
-            text: rendered_text.to_string(),
+        // i3=4 NonStdCall (compound/DXpedition callsigns) -- see the doc
+        // comment above. Fall back to the existing text parser, which is
+        // exactly the path PAN-17 hardened for these frames. Its own
+        // `NonStandard` result (and any parse error) collapses to the
+        // verbatim `rendered_text` so the logged text stays byte-exact.
+        None => match pancetta_qso::utils::parse_ft8_message(rendered_text, our_callsign) {
+            Ok(Mt::NonStandard { .. }) | Err(_) => Mt::NonStandard {
+                text: rendered_text.to_string(),
+            },
+            Ok(classified) => classified,
         },
     }
 }
@@ -3516,8 +3559,11 @@ impl super::ApplicationCoordinator {
                                     // typed Ft8Message.standard_type instead of
                                     // re-parsing the rendered text — see
                                     // ft8_message_to_qso_type's doc comment.
-                                    let msg_type =
-                                        ft8_message_to_qso_type(&decoded_msg.message, &raw_text);
+                                    let msg_type = ft8_message_to_qso_type(
+                                        &decoded_msg.message,
+                                        &raw_text,
+                                        &our_callsign,
+                                    );
                                     {
                                         // item-2-auto-73: a directed RR73/RRR from
                                         // a station we just MANUALLY completed with
@@ -5627,7 +5673,7 @@ mod ft8_message_classification_tests {
             grid_square: Some("FN42".to_string()),
             ..base_message()
         };
-        let result = ft8_message_to_qso_type(&msg, "CQ W1ABC FN42");
+        let result = ft8_message_to_qso_type(&msg, "CQ W1ABC FN42", "K5ARH");
         assert_eq!(
             result,
             pancetta_qso::states::MessageType::Cq {
@@ -5646,7 +5692,7 @@ mod ft8_message_classification_tests {
             grid_square: Some("FN31".to_string()),
             ..base_message()
         };
-        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF FN31");
+        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF FN31", "K5ARH");
         assert_eq!(
             result,
             pancetta_qso::states::MessageType::CqResponse {
@@ -5671,7 +5717,7 @@ mod ft8_message_classification_tests {
             grid_square: Some("EN37".to_string()),
             ..base_message()
         };
-        let result = ft8_message_to_qso_type(&msg, "K1ABC W9XYZ R EN37");
+        let result = ft8_message_to_qso_type(&msg, "K1ABC W9XYZ R EN37", "K5ARH");
         assert_eq!(
             result,
             pancetta_qso::states::MessageType::ContestReply {
@@ -5692,7 +5738,7 @@ mod ft8_message_classification_tests {
             signal_report: Some(-15),
             ..base_message()
         };
-        let result = ft8_message_to_qso_type(&msg, "K1DEF W1ABC -15");
+        let result = ft8_message_to_qso_type(&msg, "K1DEF W1ABC -15", "K5ARH");
         assert_eq!(
             result,
             pancetta_qso::states::MessageType::SignalReport {
@@ -5712,7 +5758,7 @@ mod ft8_message_classification_tests {
             signal_report: Some(-12),
             ..base_message()
         };
-        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF R-12");
+        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF R-12", "K5ARH");
         assert_eq!(
             result,
             pancetta_qso::states::MessageType::ReportAck {
@@ -5735,7 +5781,7 @@ mod ft8_message_classification_tests {
             from_callsign: Some("K9HJZ".to_string()),
             ..base_message()
         };
-        let result = ft8_message_to_qso_type(&msg, "K5ARH K9HJZ RRR");
+        let result = ft8_message_to_qso_type(&msg, "K5ARH K9HJZ RRR", "K5ARH");
         assert_eq!(
             result,
             pancetta_qso::states::MessageType::FinalConfirmation {
@@ -5753,7 +5799,7 @@ mod ft8_message_classification_tests {
             from_callsign: Some("W1ABC".to_string()),
             ..base_message()
         };
-        let result = ft8_message_to_qso_type(&msg, "K1DEF W1ABC RR73");
+        let result = ft8_message_to_qso_type(&msg, "K1DEF W1ABC RR73", "K5ARH");
         assert_eq!(
             result,
             pancetta_qso::states::MessageType::FinalConfirmation {
@@ -5771,7 +5817,7 @@ mod ft8_message_classification_tests {
             from_callsign: Some("K1DEF".to_string()),
             ..base_message()
         };
-        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF 73");
+        let result = ft8_message_to_qso_type(&msg, "W1ABC K1DEF 73", "K5ARH");
         assert_eq!(
             result,
             pancetta_qso::states::MessageType::SeventyThree {
@@ -5781,6 +5827,11 @@ mod ft8_message_classification_tests {
         );
     }
 
+    /// `None` + text that genuinely parses as nothing still lands on
+    /// `NonStandard`. "HELLO WORLD" is two callsign-shaped TOKENS as far as
+    /// `QSO_PATTERNS`' character class is concerned, but `validate_callsign`
+    /// rejects both (no digit, not compound, not a hash render), so the text
+    /// fallback errors out and we collapse to the verbatim rendered text.
     #[test]
     fn none_standard_type_maps_to_non_standard_with_rendered_text() {
         let msg = pancetta_ft8::Ft8Message {
@@ -5788,7 +5839,7 @@ mod ft8_message_classification_tests {
             text: Some("HELLO WORLD".to_string()),
             ..base_message()
         };
-        let result = ft8_message_to_qso_type(&msg, "HELLO WORLD");
+        let result = ft8_message_to_qso_type(&msg, "HELLO WORLD", "K5ARH");
         assert_eq!(
             result,
             pancetta_qso::states::MessageType::NonStandard {
@@ -5801,6 +5852,9 @@ mod ft8_message_classification_tests {
     /// not re-derive it from `Ft8Message` -- proven by making the two
     /// diverge (a real `Display` impl could never do this, but the
     /// conversion function must not assume that and re-render anyway).
+    /// Also pins the text parser's own `NonStandard` result being
+    /// discarded: it uppercases and re-emits its input, which would
+    /// silently substitute a DIFFERENT string than what was logged.
     #[test]
     fn none_standard_type_uses_the_passed_in_text_not_a_re_render() {
         let msg = pancetta_ft8::Ft8Message {
@@ -5808,11 +5862,138 @@ mod ft8_message_classification_tests {
             text: Some("SOMETHING ELSE ENTIRELY".to_string()),
             ..base_message()
         };
-        let result = ft8_message_to_qso_type(&msg, "EXACT LOGGED TEXT");
+        let result = ft8_message_to_qso_type(&msg, "EXACT LOGGED TEXT", "K5ARH");
         assert_eq!(
             result,
             pancetta_qso::states::MessageType::NonStandard {
                 text: "EXACT LOGGED TEXT".to_string(),
+            }
+        );
+    }
+
+    // ====================================================================
+    // i3=4 NonStdCall (`standard_type == None`) -- PAN-17 regression guard.
+    //
+    // `parse_nonstd_call` (pancetta-ft8/src/message.rs) NEVER sets
+    // `standard_type`, so every compound/DXpedition-callsign frame arrives
+    // here with `None`. These are real, workable QSO messages, not exotic
+    // shapes: classifying them `NonStandard` makes a compound-callsign
+    // station's CQ, reply, and close all invisible to the QSO engine --
+    // exactly the "TX-only, not a working QSO" gap PAN-17 fixed.
+    // ====================================================================
+
+    /// i3=4 CQ. `parse_nonstd_call`'s `icq` branch sets
+    /// `to_callsign = Some("CQ")` and `from_callsign` to the exact 58-bit
+    /// base-38 compound call (never a hash -- see that branch), rendering
+    /// as `"CQ YS/WE9G"`.
+    #[test]
+    fn nonstd_call_cq_classifies_as_cq_not_non_standard() {
+        let msg = pancetta_ft8::Ft8Message {
+            message_type: pancetta_ft8::message::MessageType::NonStdCall,
+            standard_type: None,
+            to_callsign: Some("CQ".to_string()),
+            from_callsign: Some("YS/WE9G".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "CQ YS/WE9G", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::Cq {
+                callsign: "YS/WE9G".to_string(),
+                grid: None,
+            }
+        );
+    }
+
+    /// i3=4 reply carrying a RESOLVED 12-bit hash render of OUR callsign.
+    /// The classified `to_station` must be the NORMALIZED plain call
+    /// (`K5ARH`), not the bracketed literal -- a bracketed callsign latched
+    /// into QSO state self-sabotages via the unencodable-message watchdog
+    /// (`<`/`>` are outside the wire charset). Mirrors
+    /// `exchange.rs::parse_message_routes_resolved_hash_reply_with_report`.
+    #[test]
+    fn nonstd_call_resolved_hash_reply_strips_brackets_and_classifies() {
+        let msg = pancetta_ft8::Ft8Message {
+            message_type: pancetta_ft8::message::MessageType::NonStdCall,
+            standard_type: None,
+            to_callsign: Some("<K5ARH>".to_string()),
+            from_callsign: Some("YS/WE9G".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "<K5ARH> YS/WE9G -12", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::SignalReport {
+                to_station: "K5ARH".to_string(),
+                from_station: "YS/WE9G".to_string(),
+                report: -12,
+            }
+        );
+    }
+
+    /// i3=4 close. `parse_nonstd_call` decodes the 2-bit `nrpt` field into
+    /// `contest_exchange` (`RRR`/`RR73`/`73`), which `Display` appends after
+    /// the two calls. All three must reach the QSO engine as real closes --
+    /// a dropped RR73 stalls the QSO one message short of completion.
+    #[test]
+    fn nonstd_call_closes_classify_as_confirmation_and_73() {
+        let close = |exchange: &str, text: &str| {
+            let msg = pancetta_ft8::Ft8Message {
+                message_type: pancetta_ft8::message::MessageType::NonStdCall,
+                standard_type: None,
+                to_callsign: Some("<K5ARH>".to_string()),
+                from_callsign: Some("YS/WE9G".to_string()),
+                contest_exchange: Some(exchange.to_string()),
+                ..base_message()
+            };
+            ft8_message_to_qso_type(&msg, text, "K5ARH")
+        };
+
+        assert_eq!(
+            close("RR73", "<K5ARH> YS/WE9G RR73"),
+            pancetta_qso::states::MessageType::FinalConfirmation {
+                to_station: "K5ARH".to_string(),
+                from_station: "YS/WE9G".to_string(),
+            }
+        );
+        assert_eq!(
+            close("RRR", "<K5ARH> YS/WE9G RRR"),
+            pancetta_qso::states::MessageType::FinalConfirmation {
+                to_station: "K5ARH".to_string(),
+                from_station: "YS/WE9G".to_string(),
+            }
+        );
+        assert_eq!(
+            close("73", "<K5ARH> YS/WE9G 73"),
+            pancetta_qso::states::MessageType::SeventyThree {
+                to_station: "K5ARH".to_string(),
+                from_station: "YS/WE9G".to_string(),
+            }
+        );
+    }
+
+    /// The UNRESOLVED hash-miss placeholder (`<...>`) must also route --
+    /// there is no real callsign behind it, but the surrounding message
+    /// shape is still a real close. `normalize_callsign_token` deliberately
+    /// leaves it bracketed (nothing to normalize to); higher-level sender
+    /// verification (`callsigns_match`) is what refuses to match it against
+    /// a specific station.
+    #[test]
+    fn nonstd_call_unresolved_hash_close_still_routes() {
+        let msg = pancetta_ft8::Ft8Message {
+            message_type: pancetta_ft8::message::MessageType::NonStdCall,
+            standard_type: None,
+            to_callsign: Some("<...>".to_string()),
+            from_callsign: Some("YS/WE9G".to_string()),
+            contest_exchange: Some("RR73".to_string()),
+            ..base_message()
+        };
+        let result = ft8_message_to_qso_type(&msg, "<...> YS/WE9G RR73", "K5ARH");
+        assert_eq!(
+            result,
+            pancetta_qso::states::MessageType::FinalConfirmation {
+                to_station: "<...>".to_string(),
+                from_station: "YS/WE9G".to_string(),
             }
         );
     }
