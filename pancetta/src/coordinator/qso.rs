@@ -3514,12 +3514,13 @@ impl super::ApplicationCoordinator {
                                     let frequency = decoded_msg.frequency_offset;
                                     let snr = decoded_msg.snr_db;
 
-                                    // Parse the FT8 message to determine its type
-                                    match pancetta_qso::utils::parse_ft8_message(
-                                        &raw_text,
-                                        &our_callsign,
-                                    ) {
-                                        Ok(msg_type) => {
+                                    // PAN-51: classify directly from the decoder's own
+                                    // typed Ft8Message.standard_type instead of
+                                    // re-parsing the rendered text — see
+                                    // ft8_message_to_qso_type's doc comment.
+                                    let msg_type =
+                                        ft8_message_to_qso_type(&decoded_msg.message, &raw_text);
+                                    {
                                             // item-2-auto-73: a directed RR73/RRR from
                                             // a station we just MANUALLY completed with
                                             // means they didn't copy our 73 — bounded
@@ -3646,13 +3647,6 @@ impl super::ApplicationCoordinator {
                                                 chrono::Utc::now(),
                                             );
                                         }
-                                        Err(e) => {
-                                            debug!(
-                                                "Could not parse FT8 message '{}': {}",
-                                                raw_text, e
-                                            );
-                                        }
-                                    }
                                 }
 
                                 // QSO control messages (start QSO, log, etc.)
