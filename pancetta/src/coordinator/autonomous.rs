@@ -535,6 +535,26 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// completed/was removed between the event firing and this drain) are logged
 /// and skipped, not propagated — a stale request for a QSO that no longer
 /// exists is not this task's problem to recover from.
+///
+/// On success the QSO's entry in `active_tx_offsets` is rewritten to the
+/// offset `apply_tx_offset_switch` actually applied (post-clamp). Without
+/// this, the map — which the allocator reads every tick through
+/// `set_own_frequencies`, and which the `u` nudge reads to build its
+/// `avoid_hz` — only refreshed on a `QsoEvent::StateChanged` carrying a
+/// frequency, and `apply_tx_offset_switch` emits no event at all. The map
+/// would therefore keep the PRE-switch offset until the QSO's next state
+/// transition: self-avoidance would guard a slot the QSO has already
+/// vacated (and could hand it to something else) while being blind to the
+/// offset the QSO is really on, and the next nudge's `avoid_hz` would name
+/// the wrong frequency.
+///
+/// A direct map write (rather than a new event type) is the right shape
+/// here: `active_tx_offsets` is a plain `Arc<RwLock<HashMap<String, f64>>>`
+/// already written from several places in `coordinator/qso.rs`, and the key
+/// format is the same `active_tx_qso_key` the event-forwarder uses. Only
+/// entries that already exist are updated — an absent key means the
+/// forwarder does not consider this QSO TX-active, and resurrecting it here
+/// would re-admit a QSO the `Failed`/completion purge just removed.
 async fn drain_pending_qso_offset_requests(
     op: &mut pancetta_qso::AutonomousOperator,
     qso_manager: &pancetta_qso::QsoManager,
@@ -544,6 +564,7 @@ async fn drain_pending_qso_offset_requests(
             pancetta_qso::qso_manager::OffsetAction,
         )>,
     >,
+    active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
 ) {
     let requests: Vec<_> = std::mem::take(
         &mut *pending_qso_offset_requests
@@ -557,16 +578,26 @@ async fn drain_pending_qso_offset_requests(
             }
             pancetta_qso::qso_manager::OffsetAction::Revert { target_hz } => target_hz,
         };
-        if let Err(err) = qso_manager
+        match qso_manager
             .apply_tx_offset_switch(qso_id, resolved_hz)
             .await
         {
-            warn!(
-                target: "tx.freq",
-                qso_id = %qso_id,
-                error = %err,
-                "PAN-72: could not apply queued TX-offset action (QSO likely completed)"
-            );
+            Ok(applied_hz) => {
+                let key = super::active_tx_qso_key(&qso_id.to_string());
+                if let Ok(mut offsets) = active_tx_offsets.write() {
+                    if let Some(slot) = offsets.get_mut(&key) {
+                        *slot = applied_hz;
+                    }
+                }
+            }
+            Err(err) => {
+                warn!(
+                    target: "tx.freq",
+                    qso_id = %qso_id,
+                    error = %err,
+                    "PAN-72: could not apply queued TX-offset action (QSO likely completed)"
+                );
+            }
         }
     }
 }
@@ -1328,6 +1359,7 @@ impl super::ApplicationCoordinator {
                                     &mut op,
                                     &qso_manager,
                                     &pending_qso_offset_requests,
+                                    &active_tx_offsets,
                                 )
                                 .await;
                             }
@@ -3087,6 +3119,15 @@ mod drain_pending_autonomous_cq_dispatch_failures_tests {
     }
 }
 
+/// An empty `active_tx_offsets` snapshot for drain tests whose assertions
+/// are about the QSO-side mutation rather than the map mirror. The drain
+/// only rewrites keys that already exist (see its doc comment), so an empty
+/// map makes the mirror a deliberate no-op.
+#[cfg(test)]
+fn no_offsets() -> std::sync::RwLock<std::collections::HashMap<String, f64>> {
+    std::sync::RwLock::new(std::collections::HashMap::new())
+}
+
 #[cfg(test)]
 mod drain_pending_qso_offset_requests_tests {
     use super::*;
@@ -3137,7 +3178,7 @@ mod drain_pending_qso_offset_requests_tests {
             pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
         )]);
 
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending).await;
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &no_offsets()).await;
 
         assert!(
             pending.lock().unwrap().is_empty(),
@@ -3178,7 +3219,7 @@ mod drain_pending_qso_offset_requests_tests {
             pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
         )]);
 
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending).await;
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &no_offsets()).await;
 
         assert!(pending.lock().unwrap().is_empty());
         let (_, progress) = qso_manager
@@ -3199,9 +3240,114 @@ mod drain_pending_qso_offset_requests_tests {
         let qso_manager = manager();
         let pending = std::sync::Mutex::new(Vec::new());
 
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending).await;
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &no_offsets()).await;
 
         assert!(pending.lock().unwrap().is_empty());
+    }
+
+    /// PAN-72 final review (finding 4): the drain must mirror the applied
+    /// offset into `active_tx_offsets`.
+    ///
+    /// `apply_tx_offset_switch` emits no `QsoEvent`, and the map is otherwise
+    /// only refreshed on a `StateChanged` carrying a frequency — so without
+    /// this write the map keeps the PRE-switch offset until the QSO's next
+    /// state transition. The allocator reads the map every tick through
+    /// `set_own_frequencies`, so a stale entry both guards a slot the QSO has
+    /// already vacated and leaves the allocator blind to where the QSO really
+    /// is; the next `u` nudge's `avoid_hz` (also read from this map) would
+    /// name the wrong frequency too.
+    #[tokio::test]
+    async fn a_committed_switch_refreshes_the_active_tx_offsets_entry() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .start_cq(1500.0, None, false)
+            .await
+            .expect("start_cq should succeed");
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        // Seed the map the way the real event-forwarder does on StateChanged.
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 1500.0)]));
+        let pending = std::sync::Mutex::new(vec![(
+            qso_id,
+            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+        )]);
+
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &active_tx_offsets)
+            .await;
+
+        assert_eq!(
+            active_tx_offsets.read().unwrap().get(&key).copied(),
+            Some(1200.0),
+            "active_tx_offsets must reflect the offset the QSO actually moved to"
+        );
+    }
+
+    /// The mirror must not resurrect a key the forwarder already purged
+    /// (terminal-`Failed` / completion grace expiry). A late request for such
+    /// a QSO still commits QSO-side, but must not re-admit it to the
+    /// TX-active own-frequency map.
+    #[tokio::test]
+    async fn the_mirror_never_inserts_a_key_the_forwarder_has_not_admitted() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .start_cq(1500.0, None, false)
+            .await
+            .expect("start_cq should succeed");
+        let active_tx_offsets = no_offsets();
+        let pending = std::sync::Mutex::new(vec![(
+            qso_id,
+            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+        )]);
+
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &active_tx_offsets)
+            .await;
+
+        assert!(
+            active_tx_offsets.read().unwrap().is_empty(),
+            "an absent key means the forwarder does not consider this QSO \
+             TX-active; the drain must not insert one"
+        );
+    }
+
+    /// The mirror stores the offset `apply_tx_offset_switch` actually applied
+    /// (post-clamp), not the raw request — an out-of-band `Revert` target
+    /// must leave the map and the QSO agreeing with each other.
+    #[tokio::test]
+    async fn the_mirror_stores_the_clamped_offset_not_the_raw_request() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .start_cq(1500.0, None, false)
+            .await
+            .expect("start_cq should succeed");
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 1500.0)]));
+        let pending = std::sync::Mutex::new(vec![(
+            qso_id,
+            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 9000.0 },
+        )]);
+
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &active_tx_offsets)
+            .await;
+
+        let (_, progress) = qso_manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == qso_id)
+            .unwrap();
+        assert_eq!(
+            progress.metadata.frequency,
+            pancetta_qso::qso_manager::TX_OFFSET_MAX_HZ
+        );
+        assert_eq!(
+            active_tx_offsets.read().unwrap().get(&key).copied(),
+            Some(pancetta_qso::qso_manager::TX_OFFSET_MAX_HZ),
+            "the map must agree with the QSO after clamping"
+        );
     }
 
     #[tokio::test]
@@ -3214,7 +3360,7 @@ mod drain_pending_qso_offset_requests_tests {
         )]);
 
         // Must not panic even though the qso_id doesn't exist in the manager.
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending).await;
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &no_offsets()).await;
 
         assert!(pending.lock().unwrap().is_empty());
     }
@@ -3307,7 +3453,7 @@ mod qso_manager_watch_refresh_tests {
             qso_id,
             pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
         )]);
-        drain_pending_qso_offset_requests(&mut op, &current, &pending).await;
+        drain_pending_qso_offset_requests(&mut op, &current, &pending, &no_offsets()).await;
 
         assert!(
             pending.lock().unwrap().is_empty(),
@@ -3354,7 +3500,13 @@ mod qso_manager_watch_refresh_tests {
         // Must not panic -- mirrors the drain function's documented "log
         // and skip" behavior for a QSO the handed-in manager doesn't know
         // about.
-        drain_pending_qso_offset_requests(&mut op, &manager_before_restart, &pending).await;
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &manager_before_restart,
+            &pending,
+            &no_offsets(),
+        )
+        .await;
 
         assert!(
             pending.lock().unwrap().is_empty(),

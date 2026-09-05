@@ -719,6 +719,40 @@ impl QsoState {
         }
     }
 
+    /// Overwrite the frequency embedded in an **active** state, returning
+    /// `true` when a field was actually written.
+    ///
+    /// The mutable sibling of [`QsoState::frequency`], for the same reason
+    /// the Hound QSY block in `qso_manager.rs` hand-writes
+    /// `SendingReport.frequency` after a QSY: several later transitions
+    /// (notably `Completed`, built from the preceding state's `frequency`)
+    /// inherit this field, so a TX-offset move that updates only
+    /// `QsoMetadata::frequency` would log the pre-move offset.
+    ///
+    /// Terminal states (`Completed`, `ContestCompleted`, `Failed`) are
+    /// deliberately **not** writable here even though `frequency()` reads
+    /// `Completed`: their frequency is the historical record of where the
+    /// QSO actually happened, and a late offset action arriving after
+    /// completion must never rewrite it. `Idle` carries no frequency.
+    pub fn set_frequency(&mut self, hz: f64) -> bool {
+        match self {
+            QsoState::CallingCq { frequency, .. }
+            | QsoState::RespondingToCq { frequency, .. }
+            | QsoState::WaitingForReport { frequency, .. }
+            | QsoState::SendingReport { frequency, .. }
+            | QsoState::WaitingForConfirmation { frequency, .. }
+            | QsoState::SendingConfirmation { frequency, .. } => {
+                *frequency = hz;
+                true
+            }
+            QsoState::Contest(ContestState::ExchangingInfo { frequency, .. }) => {
+                *frequency = hz;
+                true
+            }
+            _ => false,
+        }
+    }
+
     /// Get the other station's callsign if known
     pub fn their_callsign(&self) -> Option<&str> {
         match self {
@@ -955,6 +989,44 @@ impl MessageType {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// PAN-72 final review (finding 4): `set_frequency` is the mutable
+    /// sibling of `frequency()` for ACTIVE states only. Terminal states hold
+    /// the historical record of where the QSO actually happened and must not
+    /// be rewritten by a late TX-offset action.
+    #[test]
+    fn set_frequency_writes_active_states_and_refuses_terminal_ones() {
+        let mut calling = QsoState::CallingCq {
+            frequency: 1000.0,
+            started_at: chrono::Utc::now(),
+            call_count: 1,
+        };
+        assert!(calling.set_frequency(1750.0));
+        assert_eq!(calling.frequency(), Some(1750.0));
+
+        // `Completed` is readable through `frequency()` but deliberately not
+        // writable -- rewriting it would falsify the logged QSO.
+        let mut completed = QsoState::Completed {
+            their_callsign: "K1DEF".to_string(),
+            frequency: 1000.0,
+            completed_at: chrono::Utc::now(),
+            our_report: -10,
+            their_report: -12,
+            grid_square: None,
+            duration_seconds: 60,
+        };
+        assert!(!completed.set_frequency(1750.0));
+        assert_eq!(
+            completed.frequency(),
+            Some(1000.0),
+            "a completed QSO's logged frequency must be immutable here"
+        );
+
+        // `Idle` carries no frequency at all.
+        let mut idle = QsoState::Idle;
+        assert!(!idle.set_frequency(1750.0));
+        assert_eq!(idle.frequency(), None);
+    }
 
     #[test]
     fn rejection_reason_classify_maps_each_verification_outcome() {

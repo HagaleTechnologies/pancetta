@@ -2602,27 +2602,51 @@ impl QsoManager {
     /// invariant). Does not force an immediate retransmission — the next
     /// naturally-scheduled send picks up the new value since message
     /// construction reads `metadata.frequency` fresh each time.
+    ///
+    /// The requested offset is clamped to
+    /// [`TX_OFFSET_MIN_HZ`]..=[`TX_OFFSET_MAX_HZ`] — the same band the
+    /// removed stuck-DX hop clamped to. Every current caller already supplies
+    /// an in-band value (the allocator's own candidates, or a
+    /// `last_known_good_offset_hz` that was itself in-band); this is a
+    /// defensive floor on a `pub` method documented as the sole external
+    /// mutator, so that invariant cannot be broken from outside the crate.
+    ///
+    /// Returns the offset that was **actually applied** (post-clamp), so the
+    /// coordinator can mirror it into its own `active_tx_offsets` snapshot
+    /// without re-deriving the clamp.
     pub async fn apply_tx_offset_switch(
         &self,
         qso_id: QsoId,
         new_offset_hz: f64,
-    ) -> Result<(), QsoManagerError> {
+    ) -> Result<f64, QsoManagerError> {
+        let applied_hz = new_offset_hz.clamp(TX_OFFSET_MIN_HZ, TX_OFFSET_MAX_HZ);
         let mut qsos = self.qsos.write().await;
         let progress = qsos
             .get_mut(&qso_id)
             .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
         let old_off = progress.metadata.frequency;
-        progress.metadata.frequency = new_offset_hz;
+        progress.metadata.frequency = applied_hz;
         progress.metadata.pending_freq_drift = None;
         progress.metadata.stall_cycles = 0;
-        warn!(
+        // Mirror the Hound QSY block's state write (see `process_message_for_
+        // qso`'s `QsoState::SendingReport` fix-up): several transitions —
+        // `Completed` above all — are built from the PRECEDING state's own
+        // `frequency` field, so updating only `metadata.frequency` would log
+        // the pre-switch offset. `set_frequency` is a no-op on terminal and
+        // `Idle` states by design.
+        progress.state.set_frequency(applied_hz);
+        // `info!`, not `warn!`: the removed hop fired only on an identical-
+        // repeat trigger and was genuinely rare, but the silence-based
+        // detector this replaced it with can fire roughly once a minute per
+        // stalled QSO. That is routine adaptive operation, not a warning.
+        info!(
             target: "tx.freq",
             qso_id = %qso_id,
             dx = progress.metadata.their_callsign.as_deref().unwrap_or("?"),
             "Adaptive TX-offset action: {:.0} Hz -> {:.0} Hz",
-            old_off, new_offset_hz
+            old_off, applied_hz
         );
-        Ok(())
+        Ok(applied_hz)
     }
 
     /// Get next contest serial number
@@ -7851,6 +7875,78 @@ mod tests {
         let after = manager.get_qso(qso_id).await.unwrap();
         assert_eq!(after.metadata.frequency, 1800.0);
         assert_eq!(after.metadata.stall_cycles, 0);
+    }
+
+    /// PAN-72 final review (finding 4): `apply_tx_offset_switch` must also
+    /// update the QSO **state**'s own embedded frequency, exactly as the
+    /// Hound QSY block hand-writes `SendingReport.frequency` for the same
+    /// reason: later transitions (notably `Completed`) are built from the
+    /// preceding state's `frequency`, so updating only `metadata.frequency`
+    /// would log the pre-switch offset.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_updates_the_state_embedded_frequency_too() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert_ne!(
+            before.state.frequency(),
+            Some(1800.0),
+            "precondition: the state is not already on the target offset"
+        );
+
+        manager
+            .apply_tx_offset_switch(qso_id, 1800.0)
+            .await
+            .unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.state.frequency(),
+            Some(1800.0),
+            "the state's embedded frequency must follow metadata.frequency, or \
+             the eventual Completed record logs the stale offset"
+        );
+        assert_eq!(after.metadata.frequency, 1800.0);
+    }
+
+    /// PAN-72 final review (finding 6.4): the offset is clamped defensively
+    /// to TX_OFFSET_MIN_HZ..=TX_OFFSET_MAX_HZ — the band the removed stuck-DX
+    /// hop clamped to — since this is a `pub` method documented as the sole
+    /// external mutator of an active QSO's TX offset. The applied (clamped)
+    /// value is returned so the coordinator can mirror it.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_clamps_out_of_band_offsets() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, 9000.0)
+            .await
+            .unwrap();
+        assert_eq!(applied, TX_OFFSET_MAX_HZ);
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after.metadata.frequency, TX_OFFSET_MAX_HZ);
+        assert_eq!(after.state.frequency(), Some(TX_OFFSET_MAX_HZ));
+
+        let applied = manager.apply_tx_offset_switch(qso_id, -50.0).await.unwrap();
+        assert_eq!(applied, TX_OFFSET_MIN_HZ);
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after.metadata.frequency, TX_OFFSET_MIN_HZ);
+        assert_eq!(after.state.frequency(), Some(TX_OFFSET_MIN_HZ));
+
+        // In-band values pass through untouched.
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, 1234.0)
+            .await
+            .unwrap();
+        assert_eq!(applied, 1234.0);
     }
 
     /// apply_tx_offset_switch on an unknown QSO id returns QsoNotFound.
