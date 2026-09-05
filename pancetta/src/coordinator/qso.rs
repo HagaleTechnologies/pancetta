@@ -2465,10 +2465,26 @@ impl super::ApplicationCoordinator {
         // the watch channel so the (not respawned on a Qso-only restart)
         // Autonomous task's drain can pick up this brand-new manager
         // instead of staying pinned to whatever instance existed when it
-        // spawned. `send`'s `Err` (no live receivers yet) is expected and
-        // harmless the very first time this runs, since `start_qso_component`
-        // is awaited before `start_autonomous_component` in `run()`.
-        let _ = self.qso_manager_watch.send(Some(qso_manager.clone()));
+        // spawned.
+        //
+        // `send_replace`, NOT `send`: tokio's `watch::Sender::send` bails out
+        // with `Err` *without storing the value* whenever `receiver_count()`
+        // is 0, and this store MUST land unconditionally:
+        //   * On first startup `run()` awaits `start_qso_component` BEFORE
+        //     `start_autonomous_component` (the only `.subscribe()` site), so
+        //     there are genuinely zero receivers here -- a `send` would drop
+        //     the very first handle on the floor and every later
+        //     `subscribe()` would be seeded with `None`, leaving the whole
+        //     mid-QSO offset-switch feature inert until the first Qso-component
+        //     crash+restart.
+        //   * The same applies to a Qso restart that lands in the window
+        //     between the Autonomous task dying and its replacement
+        //     re-subscribing.
+        // `send_replace` has no receiver-count precondition: it always stores
+        // (and notifies whatever receivers exist), which is exactly the
+        // "latest handle is always readable via `subscribe()`" contract the
+        // field's doc comment in mod.rs promises.
+        let _ = self.qso_manager_watch.send_replace(Some(qso_manager.clone()));
         // Share the rig dial-frequency source so completed QSOs log the
         // real RF frequency (dial + audio offset), not the bare offset
         // (was producing ADIF FREQ ~0.001 / BAND 0MHZ).
@@ -8871,6 +8887,62 @@ mod respond_to_caller_admission_tests {
         assert!(
             found,
             "TxOffsetActionNeeded must be forwarded into pending_qso_offset_requests"
+        );
+    }
+
+    /// PAN-72 final-review CRITICAL regression: `start_qso_component` must
+    /// publish its fresh `QsoManager` onto `qso_manager_watch` in a way that
+    /// is observable by a receiver that does not yet exist.
+    ///
+    /// `ApplicationCoordinator::new` builds the channel with
+    /// `watch::channel(None).0`, immediately dropping the initial `Receiver`;
+    /// `run()` then awaits `start_qso_component` BEFORE
+    /// `start_autonomous_component` (the sole `.subscribe()` site). Tokio's
+    /// `watch::Sender::send` returns `Err` *without storing the value* when
+    /// `receiver_count() == 0`, so the original `let _ = ...send(..)` silently
+    /// discarded the very first handle: every later `subscribe()` was seeded
+    /// with `None`, the Autonomous task's per-tick `borrow()` never yielded a
+    /// manager, and `drain_pending_qso_offset_requests` never ran — the whole
+    /// mid-QSO adaptive-offset feature was inert in production until the first
+    /// Qso-component crash+restart. `send_replace` stores unconditionally.
+    ///
+    /// Deliberately asserts against the REAL production path (a real
+    /// coordinator, a real `start_qso_component`), not a test-constructed
+    /// channel with an artificially retained seed receiver — that retained
+    /// receiver is exactly what hid this bug from
+    /// `autonomous::qso_manager_watch_refresh_tests`.
+    #[tokio::test]
+    async fn start_qso_component_seeds_qso_manager_watch_with_no_receivers_yet() {
+        let mut coordinator = test_coordinator().await;
+
+        // Precondition: the coordinator ships with zero live receivers, which
+        // is precisely the condition under which `send` would no-op.
+        assert_eq!(
+            coordinator.qso_manager_watch.receiver_count(),
+            0,
+            "precondition: no receiver exists before start_autonomous_component"
+        );
+        assert!(
+            coordinator.qso_manager_watch.borrow().is_none(),
+            "precondition: the watch starts empty"
+        );
+
+        coordinator.start_qso_component().await.unwrap();
+
+        assert!(
+            coordinator.qso_manager_watch.borrow().is_some(),
+            "start_qso_component must store the fresh QsoManager on the watch \
+             channel even with zero receivers (send_replace, not send)"
+        );
+
+        // The consumer-side view: a receiver subscribing AFTER the fact (the
+        // real ordering — `start_autonomous_component` runs later) must be
+        // seeded with the stored handle, not `None`.
+        let rx = coordinator.qso_manager_watch.subscribe();
+        assert!(
+            rx.borrow().is_some(),
+            "a late subscriber (the Autonomous task) must be seeded with the \
+             stored QsoManager, or drain_pending_qso_offset_requests never runs"
         );
     }
 }

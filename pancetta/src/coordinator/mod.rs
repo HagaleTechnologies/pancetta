@@ -1335,12 +1335,17 @@ pub struct ApplicationCoordinator {
     /// `health.rs`'s supervisor doesn't need this: it runs inline with
     /// `&mut self` in the single un-spawned coordinator loop, so
     /// `self.qso_manager_for_supervisor` is always already fresh there.
-    /// `start_qso_component` calls `.send()` on this alongside every
+    /// `start_qso_component` calls `.send_replace()` on this alongside every
     /// `qso_manager_for_supervisor` assignment (qso.rs); a consumer calls
     /// `.subscribe()` once at its own spawn time and `.borrow().clone()`
     /// fresh each tick -- `subscribe()` always seeds the new `Receiver`
-    /// with whatever value was most recently sent, so this is correct
+    /// with whatever value was most recently *stored*, so this is correct
     /// regardless of whether the Qso or Autonomous component starts first.
+    /// `send_replace` (never plain `send`) is load-bearing: this channel is
+    /// constructed below with `watch::channel(None).0`, dropping the initial
+    /// `Receiver`, and `run()` starts the Qso component before the Autonomous
+    /// one -- `send` would see `receiver_count() == 0` and discard the value
+    /// instead of storing it, leaving every later subscriber seeded `None`.
     pub(crate) qso_manager_watch: tokio::sync::watch::Sender<Option<pancetta_qso::QsoManager>>,
 }
 
