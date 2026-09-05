@@ -2625,8 +2625,16 @@ impl CoalesceOutcome {
 ///
 /// The single-request, no-backlog case returns `retained == [that request]`
 /// with all counters zero, so the worker's normal path is unchanged.
+///
+/// `max_concurrent_qsos` bounds the number of distinct QSO-keyed streams
+/// (never manual/`None`-keyed sends, which aren't concurrent QSOs) folded
+/// into this cycle's bundle — the same operator-configured limit the mid-TX
+/// supersede path (`supersede_and_rekey_or_bundle`) enforces. Without this,
+/// several manual QSOs opened in the same pre-PTT window bundled unconditionally
+/// up to [`MAX_RETAINED_TX_STREAMS`], silently exceeding the configured cap.
 pub fn coalesce_transmit_requests(
     drained: Vec<CoalesceEntry>,
+    max_concurrent_qsos: u32,
     mut qso_is_live: impl FnMut(Option<&str>) -> bool,
 ) -> CoalesceOutcome {
     use std::collections::HashMap;
@@ -2660,20 +2668,32 @@ pub fn coalesce_transmit_requests(
         }
     }
 
-    // Assemble retained in a stable order: coalesced QSO streams (first-seen
-    // order) followed by manual sends (drain order). Manual sends go last so a
-    // single-stream QSO backlog keeps the QSO as the headline item.
+    // Assemble the QSO-keyed portion first (first-seen order).
     let mut retained: Vec<CoalesceEntry> = Vec::with_capacity(order.len() + manual.len());
     for key in order {
         if let Some(e) = by_qso.remove(&key) {
             retained.push(e);
         }
     }
+
+    // Enforce the operator's configured concurrent-QSO cap on the QSO-keyed
+    // streams ONLY — manual/tune sends below are not concurrent QSOs and
+    // aren't subject to this limit. `MAX_RETAINED_TX_STREAMS` remains a hard
+    // backstop regardless of config.
+    let qso_cap = (max_concurrent_qsos.max(1) as usize).min(MAX_RETAINED_TX_STREAMS);
+    if retained.len() > qso_cap {
+        outcome.truncated += retained.len() - qso_cap;
+        retained.truncate(qso_cap);
+    }
+
+    // Manual sends go last so a single-stream QSO backlog keeps the QSO as
+    // the headline item.
     retained.append(&mut manual);
 
-    // Enforce the distinct-stream cap.
+    // Final hard safety cap across everything retained (QSO streams + manual
+    // sends together), independent of the concurrent-QSO setting.
     if retained.len() > MAX_RETAINED_TX_STREAMS {
-        outcome.truncated = retained.len() - MAX_RETAINED_TX_STREAMS;
+        outcome.truncated += retained.len() - MAX_RETAINED_TX_STREAMS;
         retained.truncate(MAX_RETAINED_TX_STREAMS);
     }
 
@@ -2779,6 +2799,7 @@ async fn coalesce_backlog_into(
     tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
     message_bus: &MessageBus,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
+    max_concurrent_qsos: u32,
 ) -> MessageType {
     // Decompose the head into a CoalesceEntry. (Caller guarantees the variant.)
     let head_entry = match head {
@@ -2855,7 +2876,9 @@ async fn coalesce_backlog_into(
     }
 
     let backlog_total = drained.len();
-    let outcome = coalesce_transmit_requests(drained, |id| tx_qso_is_live(id, active_tx_qsos));
+    let outcome = coalesce_transmit_requests(drained, max_concurrent_qsos, |id| {
+        tx_qso_is_live(id, active_tx_qsos)
+    });
 
     if !outcome.is_noop() {
         let text = format!(
@@ -3191,22 +3214,40 @@ async fn supersede_and_rekey_or_bundle(
         candidate_items.push(crate::message_bus::TransmitRequestItem {
             message_text: new_text,
             frequency_offset: new_freq,
-            qso_id: new_qso_id,
+            qso_id: new_qso_id.clone(),
         });
-        // Fail-safe origin fold: the bundle carries BOTH the in-flight stream
-        // and the new one, so it must be gated if EITHER is Remote.
-        let bundle_origin = if in_flight_origin == crate::message_bus::TxOrigin::Remote
-            || new_origin == crate::message_bus::TxOrigin::Remote
-        {
-            crate::message_bus::TxOrigin::Remote
-        } else {
-            crate::message_bus::TxOrigin::Local
-        };
-        return SupersedeOutcome::Bundle {
-            items: candidate_items,
-            bundle_origin,
-            new_origin,
-        };
+
+        // Enforce the configured concurrent-QSO ceiling on the DISTINCT
+        // stream count. A same-QSO refresh (the filter above already folded
+        // it into its existing slot) never grows `candidate_items`, so it's
+        // never blocked here — only a genuinely NEW stream that would push
+        // the bundle over `max_concurrent_qsos` falls through to `Replace`
+        // below (abandoning the whole in-flight bundle in favor of just the
+        // new request, the same fallback already used for a frequency
+        // collision).
+        if candidate_items.len() <= max_concurrent_qsos as usize {
+            // Fail-safe origin fold: the bundle carries BOTH the in-flight
+            // stream and the new one, so it must be gated if EITHER is Remote.
+            let bundle_origin = if in_flight_origin == crate::message_bus::TxOrigin::Remote
+                || new_origin == crate::message_bus::TxOrigin::Remote
+            {
+                crate::message_bus::TxOrigin::Remote
+            } else {
+                crate::message_bus::TxOrigin::Local
+            };
+            return SupersedeOutcome::Bundle {
+                items: candidate_items,
+                bundle_origin,
+                new_origin,
+            };
+        }
+        info!(
+            target: "pancetta::tx.policy",
+            "supersede: not bundling — {} distinct streams would exceed max_concurrent_qsos={}; \
+             replacing the in-flight transmission with just the new request instead",
+            candidate_items.len(),
+            max_concurrent_qsos
+        );
     }
 
     SupersedeOutcome::Replace {
@@ -3760,6 +3801,7 @@ impl super::ApplicationCoordinator {
                                     &tx_rx,
                                     &message_bus,
                                     &active_tx_qsos,
+                                    max_concurrent_qsos,
                                 )
                                 .await;
 
@@ -8190,6 +8232,93 @@ mod supersede_rekey_tests {
         }
     }
 
+    /// With `max_concurrent_qsos == 2` and 2 DISTINCT QSOs already in flight,
+    /// a genuinely NEW (not a same-QSO refresh) 3rd stream must NOT be folded
+    /// into a 3-item bundle — that would silently exceed the operator's
+    /// configured concurrency cap. It must fall back to `Replace`, the same
+    /// fallback already used for a frequency collision.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_falls_back_to_replace_when_bundle_would_exceed_cap() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        // Already 2 distinct in-flight QSOs — the configured cap.
+        let in_flight = [
+            crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-1".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "OTHER W5AU R-08".to_string(),
+                frequency_offset: 1400.0,
+                qso_id: Some("qso-other".to_string()),
+            },
+        ];
+
+        // A THIRD, genuinely new QSO — not a refresh of either in-flight one.
+        let new_request = MessageType::TransmitRequest {
+            message_text: "THIRD W5AU EM10".to_string(),
+            frequency_offset: 1800.0,
+            qso_id: Some("qso-third".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+
+        let outcome = super::supersede_and_rekey_or_bundle(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2, // max_concurrent_qsos — already met by the 2 in-flight items
+            crate::message_bus::TxOrigin::Local,
+            &in_flight,
+        )
+        .await;
+
+        match outcome {
+            super::SupersedeOutcome::Replace { qso_id, .. } => {
+                assert_eq!(
+                    qso_id.as_deref(),
+                    Some("qso-third"),
+                    "the Replace must carry the NEW request's own qso_id"
+                );
+            }
+            other => panic!(
+                "expected Replace (bundling a 3rd stream would exceed max_concurrent_qsos=2), got {other:?}"
+            ),
+        }
+        // Working state is mutated to the new (3rd) request either way.
+        assert_eq!(message_text, "THIRD W5AU EM10");
+        assert_eq!(frequency_offset, 1800.0);
+    }
+
     /// C1 REGRESSION: the `Replace` outcome must carry the SUPERSEDING request's
     /// OWN `origin`, independent of the aborted in-flight transmission's origin.
     ///
@@ -8770,6 +8899,12 @@ mod coalesce_tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// `max_concurrent_qsos` for tests that aren't about the concurrent-QSO
+    /// cap itself — large enough that it never becomes the limiting factor,
+    /// leaving `MAX_RETAINED_TX_STREAMS` as the only cap in play (unchanged
+    /// pre-existing behavior).
+    const UNBOUNDED: u32 = MAX_RETAINED_TX_STREAMS as u32;
+
     fn entry(text: &str, qso_id: Option<&str>) -> CoalesceEntry {
         CoalesceEntry {
             message_text: text.to_string(),
@@ -8815,7 +8950,11 @@ mod coalesce_tests {
     fn single_request_passthrough_unchanged() {
         // The no-backlog case: one request in, one retained out, zero reduced.
         let live = liveset(&["qso-a"]);
-        let out = coalesce_transmit_requests(vec![entry("CQ", Some("qso-a"))], live_in(&live));
+        let out = coalesce_transmit_requests(
+            vec![entry("CQ", Some("qso-a"))],
+            UNBOUNDED,
+            live_in(&live),
+        );
         assert_eq!(out.retained, vec![entry("CQ", Some("qso-a"))]);
         assert_eq!(out.coalesced, 0);
         assert_eq!(out.dropped_terminal, 0);
@@ -8833,6 +8972,7 @@ mod coalesce_tests {
                 entry("OLD-2", Some("qso-a")),
                 entry("NEWEST", Some("qso-a")),
             ],
+            UNBOUNDED,
             live_in(&live),
         );
         assert_eq!(out.retained, vec![entry("NEWEST", Some("qso-a"))]);
@@ -8847,6 +8987,7 @@ mod coalesce_tests {
         let live = liveset(&["qso-a"]);
         let out = coalesce_transmit_requests(
             vec![entry("OLD", Some("QSO-A")), entry("NEWEST", Some("qso-a"))],
+            UNBOUNDED,
             live_in(&live),
         );
         assert_eq!(out.retained.len(), 1);
@@ -8865,6 +9006,7 @@ mod coalesce_tests {
                 entry("LIVE", Some("qso-a")),
                 entry("DEAD-2", Some("qso-dead")),
             ],
+            UNBOUNDED,
             live_in(&live),
         );
         assert_eq!(out.retained, vec![entry("LIVE", Some("qso-a"))]);
@@ -8884,6 +9026,7 @@ mod coalesce_tests {
                 entry_freq("MANUAL-1", None, 1000.0),
                 entry_freq("MANUAL-2", None, 3000.0),
             ],
+            UNBOUNDED,
             live_in(&live),
         );
         assert_eq!(out.retained.len(), 2);
@@ -8907,6 +9050,7 @@ mod coalesce_tests {
                 entry_freq("MANUAL", None, 3000.0),
                 entry("KC-3", Some("qso-a")),
             ],
+            UNBOUNDED,
             live_in(&live),
         );
         // QSO stream first (first-seen), manual last.
@@ -8935,7 +9079,7 @@ mod coalesce_tests {
             .enumerate()
             .map(|(i, id)| entry_freq(id, Some(id), 1000.0 + i as f64 * 100.0))
             .collect();
-        let out = coalesce_transmit_requests(drained, live_in(&live));
+        let out = coalesce_transmit_requests(drained, UNBOUNDED, live_in(&live));
         assert_eq!(out.retained.len(), MAX_RETAINED_TX_STREAMS);
         assert_eq!(out.truncated, 3);
         // First-seen streams kept (FIFO fairness): qso-0..qso-7.
@@ -8957,6 +9101,7 @@ mod coalesce_tests {
                 entry("A", Some("qso-a")),
                 entry_freq("B", Some("qso-b"), 3000.0),
             ],
+            UNBOUNDED,
             live_in(&live),
         );
         assert_eq!(out.retained.len(), 2);
@@ -8966,7 +9111,7 @@ mod coalesce_tests {
     #[test]
     fn empty_input_yields_empty_retained() {
         let live = liveset(&[]);
-        let out = coalesce_transmit_requests(Vec::new(), live_in(&live));
+        let out = coalesce_transmit_requests(Vec::new(), UNBOUNDED, live_in(&live));
         assert!(out.retained.is_empty());
         assert!(out.is_noop());
     }
@@ -8976,6 +9121,7 @@ mod coalesce_tests {
         let live = liveset(&[]); // nothing live
         let out = coalesce_transmit_requests(
             vec![entry("D1", Some("qso-x")), entry("D2", Some("qso-y"))],
+            UNBOUNDED,
             live_in(&live),
         );
         assert!(out.retained.is_empty());
@@ -9040,6 +9186,7 @@ mod coalesce_tests {
                 entry_with_parity_freq("B", Some("qso-b"), Some(SlotParity::Even), 3000.0),
                 entry_with_parity("C", Some("qso-c"), Some(SlotParity::Odd)),
             ],
+            UNBOUNDED,
             live_in(&live),
         );
         assert_eq!(
@@ -9081,6 +9228,7 @@ mod coalesce_tests {
                 entry_with_parity("A", Some("qso-a"), Some(SlotParity::Even)),
                 entry_with_parity_freq("B", Some("qso-b"), None, 3000.0),
             ],
+            UNBOUNDED,
             live_in(&live),
         );
         assert_eq!(
@@ -9090,6 +9238,59 @@ mod coalesce_tests {
         );
         assert_eq!(out.parity_excluded, 0);
         assert!(out.is_noop());
+    }
+
+    // ── max_concurrent_qsos cap on the backlog coalescer ─────────────────────
+
+    #[test]
+    fn concurrent_qso_cap_truncates_qso_streams_below_hard_backstop() {
+        // Three distinct live QSOs land in the same pre-PTT window, but the
+        // station is configured for only 2 concurrent QSOs — well under the
+        // MAX_RETAINED_TX_STREAMS hard backstop. The 3rd (later-seen) stream
+        // must be excluded, not silently allowed through just because it's
+        // under the hard cap.
+        let live = liveset(&["qso-a", "qso-b", "qso-c"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry_freq("A", Some("qso-a"), 1000.0),
+                entry_freq("B", Some("qso-b"), 1300.0),
+                entry_freq("C", Some("qso-c"), 1600.0),
+            ],
+            2,
+            live_in(&live),
+        );
+        assert_eq!(
+            out.retained.len(),
+            2,
+            "only 2 of 3 concurrent QSO streams may survive under the configured cap"
+        );
+        assert_eq!(out.retained[0].message_text, "A");
+        assert_eq!(out.retained[1].message_text, "B");
+        assert_eq!(out.truncated, 1);
+        assert!(!out.is_noop());
+    }
+
+    #[test]
+    fn concurrent_qso_cap_never_excludes_manual_sends() {
+        // max_concurrent_qsos == 1, but manual/None-keyed sends (tune,
+        // free-text) are not concurrent QSOs and must never be excluded by
+        // this cap — only the QSO-keyed portion is bounded by it.
+        let live = liveset(&["qso-a"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry_freq("QSO", Some("qso-a"), 1000.0),
+                entry_freq("MANUAL-1", None, 1300.0),
+                entry_freq("MANUAL-2", None, 1600.0),
+            ],
+            1,
+            live_in(&live),
+        );
+        assert_eq!(
+            out.retained.len(),
+            3,
+            "manual sends must survive even when the QSO cap is 1"
+        );
+        assert_eq!(out.truncated, 0);
     }
 }
 
