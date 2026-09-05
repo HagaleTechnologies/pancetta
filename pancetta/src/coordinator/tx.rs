@@ -2617,29 +2617,59 @@ impl CoalesceOutcome {
 /// `fox_max_streams + 1` (the `+1` for Fox's independent CQ stream, which
 /// occupies a slot alongside — not carved out of — the Hound-answer count;
 /// see `maybe_answer_caller`'s "Capacity bound" comment in `coordinator/qso.rs`)
-/// whenever Fox mode is active. Both `fox_mode` and `fox_max_streams` are live
-/// `Atomic`s the operator/engine can flip at runtime, so this must be
-/// recomputed per cycle rather than folded into the `max_concurrent_qsos`
-/// snapshot the worker captures once at startup — Fox mode staying capped at
-/// the normal single/dual-QSO limit would truncate its own intended
-/// multi-stream Hound-answer bundle down to one signal.
+/// whenever Fox mode is active, and additionally floored at the number of
+/// QSOs ALREADY legitimately active (`active_tx_qsos`).
+///
+/// Both `fox_mode` and `fox_max_streams` are live `Atomic`s the operator/
+/// engine can flip at runtime, so this must be recomputed per cycle rather
+/// than folded into the `max_concurrent_qsos` snapshot the worker captures
+/// once at startup — Fox mode staying capped at the normal single/dual-QSO
+/// limit would truncate its own intended multi-stream Hound-answer bundle
+/// down to one signal.
+///
+/// The active-count floor (PR #348 review round 4, Codex P1) closes a
+/// distinct gap: `SetFoxMode(false)` only cancels the `CallingCq` QSO
+/// (`coordinator/qso.rs`'s Fox-disengage handling) — active Hound (caller-
+/// answer) QSOs are left running. Without this floor, the cap drops back to
+/// the normal ceiling (typically 1) the instant Fox mode disengages, and
+/// their next same-parity backlog cycle truncates every Hound but one, even
+/// though nothing asked those exchanges to end. This cap's actual job is to
+/// restrict ADMITTING a NEW stream beyond the configured/Fox limit — it must
+/// never evict a stream that's already legitimately active. Fails open
+/// (floors at the `MAX_RETAINED_TX_STREAMS` hard backstop, not 0) on a
+/// poisoned `active_tx_qsos` lock, matching this file's other reads of it
+/// (`tx_qso_is_live`) — the failure mode of "briefly don't truncate anything"
+/// is far safer here than "wrongly truncate active QSOs because the count
+/// couldn't be read."
 fn effective_max_concurrent_qsos(
     max_concurrent_qsos: u32,
     fox_mode: &std::sync::atomic::AtomicBool,
     fox_max_streams: &std::sync::atomic::AtomicUsize,
+    active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
 ) -> u32 {
-    if fox_mode.load(Ordering::Relaxed) {
+    let base = if fox_mode.load(Ordering::Relaxed) {
         let fox_total = fox_max_streams.load(Ordering::Relaxed) as u32 + 1;
         max_concurrent_qsos.max(fox_total)
     } else {
         max_concurrent_qsos
-    }
+    };
+    let active_count = match active_tx_qsos.read() {
+        Ok(set) => set.len() as u32,
+        Err(_) => MAX_RETAINED_TX_STREAMS as u32,
+    };
+    base.max(active_count)
 }
 
 #[cfg(test)]
 mod effective_max_concurrent_qsos_tests {
     use super::*;
+    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
+    use std::sync::{Arc, RwLock};
+
+    fn active_set(ids: &[&str]) -> Arc<RwLock<HashSet<String>>> {
+        Arc::new(RwLock::new(ids.iter().map(|s| s.to_string()).collect()))
+    }
 
     /// PR #348 review (Codex P1): Fox mode admits up to `fox.max_streams`
     /// Hound-answer QSOs plus its own independent CQ stream. Passing only
@@ -2650,8 +2680,9 @@ mod effective_max_concurrent_qsos_tests {
     fn fox_mode_raises_the_cap_above_the_normal_configured_value() {
         let fox_mode = AtomicBool::new(true);
         let fox_max_streams = AtomicUsize::new(5);
+        let active = active_set(&[]);
         assert_eq!(
-            effective_max_concurrent_qsos(1, &fox_mode, &fox_max_streams),
+            effective_max_concurrent_qsos(1, &fox_mode, &fox_max_streams, &active),
             6,
             "Fox mode must raise the cap to fox_max_streams (Hounds) + 1 (its own CQ stream)"
         );
@@ -2661,8 +2692,9 @@ mod effective_max_concurrent_qsos_tests {
     fn non_fox_mode_is_unaffected() {
         let fox_mode = AtomicBool::new(false);
         let fox_max_streams = AtomicUsize::new(5);
+        let active = active_set(&[]);
         assert_eq!(
-            effective_max_concurrent_qsos(2, &fox_mode, &fox_max_streams),
+            effective_max_concurrent_qsos(2, &fox_mode, &fox_max_streams, &active),
             2,
             "outside Fox mode the cap must be exactly the configured max_concurrent_qsos"
         );
@@ -2672,10 +2704,66 @@ mod effective_max_concurrent_qsos_tests {
     fn fox_mode_never_lowers_a_higher_configured_value() {
         let fox_mode = AtomicBool::new(true);
         let fox_max_streams = AtomicUsize::new(2);
+        let active = active_set(&[]);
         assert_eq!(
-            effective_max_concurrent_qsos(10, &fox_mode, &fox_max_streams),
+            effective_max_concurrent_qsos(10, &fox_mode, &fox_max_streams, &active),
             10,
             "Fox mode raises the cap, it must never lower an already-higher configured value"
+        );
+    }
+
+    /// PR #348 review round 4 (Codex P1): `SetFoxMode(false)` only cancels
+    /// the `CallingCq` QSO — active Hound QSOs are left running, but the cap
+    /// drops back to the normal ceiling immediately. The cap must never fall
+    /// below the count of QSOs already legitimately active.
+    #[test]
+    fn floors_at_the_currently_active_qso_count_even_outside_fox_mode() {
+        let fox_mode = AtomicBool::new(false);
+        let fox_max_streams = AtomicUsize::new(5);
+        // Fox mode just disengaged (fox_mode=false), but 3 Hound QSOs from
+        // before are still active.
+        let active = active_set(&["qso-a", "qso-b", "qso-c"]);
+        assert_eq!(
+            effective_max_concurrent_qsos(1, &fox_mode, &fox_max_streams, &active),
+            3,
+            "the cap must not drop below the 3 still-active Hound QSOs just because Fox mode \
+             disengaged"
+        );
+    }
+
+    #[test]
+    fn active_count_floor_never_lowers_a_higher_cap() {
+        let fox_mode = AtomicBool::new(false);
+        let fox_max_streams = AtomicUsize::new(5);
+        let active = active_set(&["qso-a"]);
+        assert_eq!(
+            effective_max_concurrent_qsos(4, &fox_mode, &fox_max_streams, &active),
+            4,
+            "1 active QSO must not lower an already-higher configured cap of 4"
+        );
+    }
+
+    /// Fails open (assume the hard backstop, not 0) on a poisoned lock,
+    /// matching this file's other reads of `active_tx_qsos` (`tx_qso_is_live`)
+    /// — briefly not truncating anything is far safer than wrongly
+    /// truncating active QSOs because the count couldn't be read.
+    #[test]
+    fn poisoned_active_set_lock_fails_open_to_the_hard_backstop() {
+        let fox_mode = AtomicBool::new(false);
+        let fox_max_streams = AtomicUsize::new(5);
+        let active = active_set(&[]);
+        {
+            let active_clone = active.clone();
+            let _ = std::thread::spawn(move || {
+                let _guard = active_clone.write().unwrap();
+                panic!("deliberately poison the lock");
+            })
+            .join();
+        }
+        assert_eq!(
+            effective_max_concurrent_qsos(1, &fox_mode, &fox_max_streams, &active),
+            MAX_RETAINED_TX_STREAMS as u32,
+            "a poisoned active-set lock must fail open to the hard backstop, not 0"
         );
     }
 }
@@ -3565,7 +3653,13 @@ async fn supersede_multi_reenqueue(
                     ComponentId::Ft8Transmitter,
                     MessageType::MultiTransmitRequest {
                         items,
-                        tx_parity: None,
+                        // PR #348 review round 4 (Codex P1): carry the established
+                        // in-flight bundle's own parity forward, not `None` — the
+                        // same reasoning as the `Replace` arm's `bundle_tx_parity`
+                        // fix above applies here too (an "Auto" re-resolution on
+                        // the next dequeue can pick the wrong slot for an
+                        // explicit-parity bundle).
+                        tx_parity: bundle_tx_parity,
                         // Fail-safe folded origin (Remote if either the in-flight
                         // bundle or the new request was Remote), NOT the in-flight
                         // bundle's origin — otherwise a Remote item folded onto a
@@ -4028,6 +4122,7 @@ impl super::ApplicationCoordinator {
                                         max_concurrent_qsos,
                                         &fox_mode,
                                         &fox_max_streams,
+                                        &active_tx_qsos,
                                     ),
                                 )
                                 .await;
@@ -4972,6 +5067,7 @@ impl super::ApplicationCoordinator {
                                                         max_concurrent_qsos,
                                                         &fox_mode,
                                                         &fox_max_streams,
+                                                        &active_tx_qsos,
                                                     ),
                                                     origin,
                                                     &in_flight_items,
@@ -5291,6 +5387,7 @@ impl super::ApplicationCoordinator {
                                                         max_concurrent_qsos,
                                                         &fox_mode,
                                                         &fox_max_streams,
+                                                        &active_tx_qsos,
                                                     ),
                                                     origin,
                                                     &in_flight_items,
@@ -6864,6 +6961,7 @@ impl super::ApplicationCoordinator {
                                                     max_concurrent_qsos,
                                                     &fox_mode,
                                                     &fox_max_streams,
+                                                    &active_tx_qsos,
                                                 ),
                                             )
                                             .await;
@@ -6982,6 +7080,7 @@ impl super::ApplicationCoordinator {
                                                     max_concurrent_qsos,
                                                     &fox_mode,
                                                     &fox_max_streams,
+                                                    &active_tx_qsos,
                                                 ),
                                             )
                                             .await;
@@ -9154,6 +9253,86 @@ mod supersede_rekey_tests {
             tx_rx.try_recv().is_err(),
             "exactly two messages re-enqueued: the preserved bundle and the deferred request"
         );
+    }
+
+    /// PR #348 review round 4 (Codex P1): a raised effective cap (e.g. Fox
+    /// mode) makes `SupersedeOutcome::Bundle` newly reachable through
+    /// `supersede_multi_reenqueue` for an explicit-parity in-flight bundle.
+    /// That arm's re-enqueued `MultiTransmitRequest` must carry the
+    /// established bundle parity forward too — the round-3 fix only covered
+    /// the sibling `Replace` arm.
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_reenqueue_bundle_success_preserves_bundle_parity() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let (_tx_tx, tx_rx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+
+        let mut encoder = super::Ft8Encoder::new();
+        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
+
+        // A single in-flight QSO — cap=2 leaves room for one more.
+        let in_flight = [crate::message_bus::TransmitRequestItem {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-1".to_string()),
+        }];
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+        // A genuinely new QSO, well clear in frequency — the Bundle path.
+        let superseding = MessageType::TransmitRequest {
+            message_text: "SECOND W5AU EM10".to_string(),
+            frequency_offset: 1400.0,
+            qso_id: Some("qso-2".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        super::supersede_multi_reenqueue(
+            superseding,
+            &in_flight,
+            crate::message_bus::TxOrigin::Local,
+            Some(cur_parity), // the ESTABLISHED in-flight bundle's own parity
+            &mut encoder,
+            pancetta_ft8::Protocol::Ft8,
+            &tx_params,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2, // max_concurrent_qsos — room for the 2nd QSO, Bundle is viable
+        )
+        .await;
+
+        let reenqueued = tx_rx
+            .try_recv()
+            .expect("the folded bundle must be re-enqueued");
+        match reenqueued.message_type {
+            MessageType::MultiTransmitRequest {
+                items, tx_parity, ..
+            } => {
+                assert_eq!(items.len(), 2, "in-flight + new item both bundled");
+                assert_eq!(
+                    tx_parity,
+                    Some(cur_parity),
+                    "the folded bundle must carry the established parity forward, not None"
+                );
+            }
+            other => panic!("expected a folded MultiTransmitRequest, got {other:?}"),
+        }
     }
 
     /// Grounding check (brief Step 1/2): the pre-existing multi-TX encode path
