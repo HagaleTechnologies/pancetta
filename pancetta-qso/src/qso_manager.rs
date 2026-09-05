@@ -2592,6 +2592,39 @@ impl QsoManager {
         Ok(())
     }
 
+    /// External commit point for PAN-72's stall-switch/revert and the manual
+    /// nudge keystroke — the only way outside code may change an
+    /// already-active QSO's TX offset. Mirrors the mutation the removed
+    /// stuck-DX hop used to perform inline; the caller (the coordinator) has
+    /// already resolved WHAT the new offset should be (via the smart
+    /// allocator for a Switch, or `last_known_good_offset_hz` for a Revert —
+    /// `QsoManager` itself never calls the allocator, see the single-scorer
+    /// invariant). Does not force an immediate retransmission — the next
+    /// naturally-scheduled send picks up the new value since message
+    /// construction reads `metadata.frequency` fresh each time.
+    pub async fn apply_tx_offset_switch(
+        &self,
+        qso_id: QsoId,
+        new_offset_hz: f64,
+    ) -> Result<(), QsoManagerError> {
+        let mut qsos = self.qsos.write().await;
+        let progress = qsos
+            .get_mut(&qso_id)
+            .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
+        let old_off = progress.metadata.frequency;
+        progress.metadata.frequency = new_offset_hz;
+        progress.metadata.pending_freq_drift = None;
+        progress.metadata.stall_cycles = 0;
+        warn!(
+            target: "tx.freq",
+            qso_id = %qso_id,
+            dx = progress.metadata.their_callsign.as_deref().unwrap_or("?"),
+            "Adaptive TX-offset action: {:.0} Hz -> {:.0} Hz",
+            old_off, new_offset_hz
+        );
+        Ok(())
+    }
+
     /// Get next contest serial number
     pub async fn get_next_serial(&self) -> SerialNumber {
         let mut next_serial = self.next_serial.write().await;
@@ -7784,6 +7817,45 @@ mod tests {
         let bogus = QsoId::new_v4();
         let err = manager.resend_last_tx(bogus).await.unwrap_err();
         assert!(matches!(err, QsoManagerError::QsoNotFound { .. }));
+    }
+
+    /// apply_tx_offset_switch on a QSO updates frequency and resets stall_cycles.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_updates_frequency_and_resets_stall_cycles() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+
+        // Bump stall_cycles by directly manipulating the QSO's metadata.
+        {
+            let mut qsos = manager.qsos.write().await;
+            if let Some(qso) = qsos.get_mut(&qso_id) {
+                qso.metadata.stall_cycles = 5;
+            }
+        }
+
+        // Verify stall_cycles was bumped.
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(before.metadata.stall_cycles, 5);
+        assert_ne!(before.metadata.frequency, 1800.0);
+
+        // Apply the offset switch.
+        manager.apply_tx_offset_switch(qso_id, 1800.0).await.unwrap();
+
+        // Verify frequency was updated and stall_cycles was reset.
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after.metadata.frequency, 1800.0);
+        assert_eq!(after.metadata.stall_cycles, 0);
+    }
+
+    /// apply_tx_offset_switch on an unknown QSO id returns QsoNotFound.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_on_unknown_qso_returns_not_found() {
+        let manager = QsoManager::new(test_config());
+        let result = manager.apply_tx_offset_switch(QsoId::new_v4(), 1800.0).await;
+        assert!(matches!(result, Err(QsoManagerError::QsoNotFound { .. })));
     }
 
     /// FIX 4: a manual QSO in SendingReport (we sent R, DX has not advanced)
