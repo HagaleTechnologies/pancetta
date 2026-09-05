@@ -267,7 +267,7 @@ pub enum IncomingDuringTx {
 pub fn classify_incoming_during_tx(
     candidate: &MessageType,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
-    pivoted_once: &std::collections::HashMap<String, String>,
+    pivoted_once: &std::collections::HashMap<String, (String, f64)>,
 ) -> IncomingDuringTx {
     // M1: normalize through `active_tx_qso_key` before comparing, matching
     // every sibling qso_id comparison (`tx_pivot_target`, `is_pivot_duplicate`,
@@ -288,7 +288,12 @@ pub fn classify_incoming_during_tx(
             tx_parity,
             ..
         } => {
-            if super::is_pivot_duplicate(qso_id.as_deref(), message_text, pivoted_once) {
+            if super::is_pivot_duplicate(
+                qso_id.as_deref(),
+                message_text,
+                *frequency_offset,
+                pivoted_once,
+            ) {
                 return IncomingDuringTx::Drop;
             }
             // Genuine manual/free-text/tune/test-TX (no qso_id at all) is the
@@ -342,15 +347,32 @@ pub fn classify_incoming_during_tx(
                 None => IncomingDuringTx::Requeue,
             }
         }
-        // A bundle only supersedes when it actually shares a QSO with the
-        // in-flight set — otherwise it's routine traffic for entirely other
-        // QSOs (PAN-73 round 2) and gets the same Requeue treatment as a
-        // single-item candidate.
+        // A bundle only supersedes when it actually carries FRESHER content
+        // for a QSO already in flight — a matching qso_id alone isn't
+        // enough (PAN-73 round 6, Codex): `autonomous.rs` can emit a bundle
+        // holding an UNCHANGED item for the currently-keyed QSO alongside
+        // items for entirely other QSOs. `supersede_and_rekey_or_bundle`
+        // can't merge an incoming `MultiTransmitRequest` at all (it returns
+        // `NotViable` for that shape unconditionally), so superseding on
+        // that coincidental ID-only match would still deassert PTT and
+        // abandon a perfectly good transmission for a bundle with nothing
+        // fresher to offer it — the exact PAN-73 dead-air failure this
+        // whole guard exists to close, just reached through a bundle
+        // instead of a single `TransmitRequest`. A bundle with NO changed
+        // overlap (including no overlap at all) gets the same Requeue
+        // treatment as a single-item candidate (PAN-73 round 2).
         MessageType::MultiTransmitRequest { items, .. } => {
-            let overlaps_in_flight = items
-                .iter()
-                .any(|it| find_in_flight(it.qso_id.as_deref()).is_some());
-            if overlaps_in_flight {
+            let has_changed_overlap =
+                items
+                    .iter()
+                    .any(|it| match find_in_flight(it.qso_id.as_deref()) {
+                        Some(in_flight_item) => {
+                            in_flight_item.message_text != it.message_text
+                                || in_flight_item.frequency_offset != it.frequency_offset
+                        }
+                        None => false,
+                    });
+            if has_changed_overlap {
                 IncomingDuringTx::Supersede {
                     text: String::new(),
                     frequency_offset: 0.0,
@@ -556,7 +578,7 @@ async fn interruptible_sleep_or_supersede(
     tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
     message_bus: &MessageBus,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
-    pivoted_once: &std::collections::HashMap<String, String>,
+    pivoted_once: &std::collections::HashMap<String, (String, f64)>,
 ) -> SleepOutcome {
     use std::sync::atomic::Ordering;
 
@@ -3255,7 +3277,7 @@ impl super::ApplicationCoordinator {
                 // consumer; no concurrent access), so a plain `HashMap`
                 // suffices — no new `Arc`/lock. See `is_pivot_duplicate`
                 // (coordinator/mod.rs) for the pure membership check.
-                let mut pivoted_once: std::collections::HashMap<String, String> =
+                let mut pivoted_once: std::collections::HashMap<String, (String, f64)> =
                     std::collections::HashMap::new();
 
                 'worker: while !shutdown.load(Ordering::Acquire) {
@@ -3535,6 +3557,7 @@ impl super::ApplicationCoordinator {
                                     if super::is_pivot_duplicate(
                                         qso_id.as_deref(),
                                         &message_text,
+                                        frequency_offset,
                                         &pivoted_once,
                                     ) {
                                         info!(
@@ -4260,7 +4283,10 @@ impl super::ApplicationCoordinator {
                                                     if let Some(id) = qso_id.as_deref() {
                                                         pivoted_once.insert(
                                                             super::active_tx_qso_key(id),
-                                                            message_text.clone(),
+                                                            (
+                                                                message_text.clone(),
+                                                                frequency_offset,
+                                                            ),
                                                         );
                                                     }
                                                 }
@@ -5017,6 +5043,7 @@ impl super::ApplicationCoordinator {
                                             if super::is_pivot_duplicate(
                                                 item.qso_id.as_deref(),
                                                 &item.message_text,
+                                                item.frequency_offset,
                                                 &pivoted_once,
                                             ) {
                                                 info!(
@@ -5812,12 +5839,13 @@ impl super::ApplicationCoordinator {
                                         .collect();
                                     let (pivoted_live_items, pivots) =
                                         super::pivot_bundle_items(live_items_pre, &latest_snapshot);
-                                    for (qso_key, new_text) in &pivots {
+                                    for (qso_key, new_text, new_freq) in &pivots {
                                         info!(
                                             target: "pancetta::tx.pivot",
-                                            "TX pivot (bundle): qso {} -> '{}' (fresher message arrived during pre-PTT wait)",
+                                            "TX pivot (bundle): qso {} -> '{}' @{:.0}Hz (fresher message arrived during pre-PTT wait)",
                                             qso_key,
-                                            new_text
+                                            new_text,
+                                            new_freq
                                         );
                                     }
                                     let mut piv_iter = pivoted_live_items.into_iter();
@@ -6084,8 +6112,8 @@ impl super::ApplicationCoordinator {
                                     // already-sent duplicate (Step 0-dup (bundle) above)
                                     // instead of keying PTT a second time for the same
                                     // text.
-                                    for (qso_key, new_text) in pivots {
-                                        pivoted_once.insert(qso_key, new_text);
+                                    for (qso_key, new_text, new_freq) in pivots {
+                                        pivoted_once.insert(qso_key, (new_text, new_freq));
                                     }
 
                                     // --- Step 3 (final): build the audio buffer,
@@ -9524,7 +9552,10 @@ mod classifier_tests {
     #[test]
     fn classify_drops_pivot_tombstone_duplicate() {
         let mut pivoted_once = std::collections::HashMap::new();
-        pivoted_once.insert(active_tx_qso_key("qso-1"), "KA1ABC K5ARH RR73".to_string());
+        pivoted_once.insert(
+            active_tx_qso_key("qso-1"),
+            ("KA1ABC K5ARH RR73".to_string(), 1500.0),
+        );
         let candidate = transmit_request("KA1ABC K5ARH RR73", Some("qso-1"));
         // in_flight_text is something else — the pivot already sent RR73 via
         // Step 4c, this is the stale second copy of the request that produced it.
@@ -9538,6 +9569,43 @@ mod classifier_tests {
             &pivoted_once,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Drop));
+    }
+
+    /// Codex round 6 (PR #346): a pivot tombstone for the same QSO and text
+    /// but a DIFFERENT frequency (a stuck-DX collision-avoidance hop that
+    /// happens to reuse the pivoted text) must NOT be treated as the stale
+    /// tombstone duplicate — `is_pivot_duplicate` runs BEFORE this
+    /// function's own frequency-aware same-QSO check, so without frequency
+    /// in the tombstone's identity this hop would be dropped here and never
+    /// reach that check at all, leaving the transmission on the collision
+    /// frequency the hop was trying to avoid.
+    #[test]
+    fn classify_does_not_drop_pivot_tombstone_when_frequency_differs() {
+        let mut pivoted_once = std::collections::HashMap::new();
+        pivoted_once.insert(
+            active_tx_qso_key("qso-1"),
+            ("KA1ABC K5ARH RR73".to_string(), 1500.0),
+        );
+        let mut candidate = transmit_request("KA1ABC K5ARH RR73", Some("qso-1"));
+        if let MessageType::TransmitRequest {
+            frequency_offset, ..
+        } = &mut candidate
+        {
+            *frequency_offset = 1800.0; // hopped off the tombstoned 1500.0
+        }
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH RR73".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "a hopped frequency must not be swallowed by the pivot tombstone check — got {outcome:?}"
+        );
     }
 
     /// Codex finding 3 (PR #346 round 1): a `MultiTransmitRequest` bundle
@@ -9608,6 +9676,51 @@ mod classifier_tests {
         assert!(
             matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
             "a bundle sharing an in-flight QSO must still supersede, got {outcome:?}"
+        );
+    }
+
+    /// Codex round 6 (PR #346): a bundle whose overlapping item is
+    /// BYTE-IDENTICAL (text and frequency) to the in-flight item it matches
+    /// — alongside unrelated items for other QSOs — must NOT supersede.
+    /// `supersede_and_rekey_or_bundle` cannot merge an incoming
+    /// `MultiTransmitRequest` at all, so superseding here would deassert
+    /// PTT and abandon the good transmission purely because of a
+    /// coincidental ID match, with nothing fresher to show for it — the
+    /// exact PAN-73 dead-air failure, reached via a bundle instead of a
+    /// single `TransmitRequest`.
+    #[test]
+    fn classify_requeues_multi_transmit_request_with_unchanged_overlap() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::MultiTransmitRequest {
+            items: vec![
+                crate::message_bus::TransmitRequestItem {
+                    message_text: "OTHER1 W5AU R-05".to_string(),
+                    frequency_offset: 900.0,
+                    qso_id: Some("qso-other1".to_string()),
+                },
+                // Byte-identical to the in-flight item below — no fresher
+                // content for the currently-keyed QSO.
+                crate::message_bus::TransmitRequestItem {
+                    message_text: "IN-FLIGHT W5AU R-01".to_string(),
+                    frequency_offset: 1000.0,
+                    qso_id: Some("qso-in-flight".to_string()),
+                },
+            ],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "IN-FLIGHT W5AU R-01".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-in-flight".to_string()),
+            }],
+            &pivoted_once,
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Requeue),
+            "an ID-only match with no changed content must not supersede, got {outcome:?}"
         );
     }
 }
