@@ -2484,7 +2484,9 @@ impl super::ApplicationCoordinator {
         // (and notifies whatever receivers exist), which is exactly the
         // "latest handle is always readable via `subscribe()`" contract the
         // field's doc comment in mod.rs promises.
-        let _ = self.qso_manager_watch.send_replace(Some(qso_manager.clone()));
+        let _ = self
+            .qso_manager_watch
+            .send_replace(Some(qso_manager.clone()));
         // Share the rig dial-frequency source so completed QSOs log the
         // real RF frequency (dial + audio offset), not the bare offset
         // (was producing ADIF FREQ ~0.001 / BAND 0MHZ).
