@@ -494,7 +494,7 @@ async fn interruptible_sleep(
 /// docs/superpowers/sdd/task-5-report.md) derive `PartialEq`. Tests that
 /// need to assert on a `Superseded` payload pattern-match and compare
 /// individual fields instead of using `assert_eq!` on the whole enum.
-// `Superseded(MessageType)` is intentionally not boxed: this keeps the
+// `Superseded(MessageType, _)` is intentionally not boxed: this keeps the
 // public shape exactly as specified (a later task's re-key consumer wants
 // the full `MessageType`, including `MultiTransmitRequest`'s `items` list —
 // see task-5-report.md), at the cost of a size-difference lint between
@@ -511,7 +511,19 @@ pub enum SleepOutcome {
     /// A qualifying request arrived; abort_current_tx was set by this
     /// function itself. Caller should attempt to re-key with the contained
     /// message.
-    Superseded(MessageType),
+    ///
+    /// The second field (PAN-73 round 4, Codex) carries every message this
+    /// wait siphoned or found left over in `tx_rx` — deliberately NOT
+    /// re-enqueued by this function for this outcome. The caller MUST
+    /// re-enqueue them itself, and only AFTER it finishes enqueuing its own
+    /// supersede-derived content (the re-keyed frame, or a folded bundle):
+    /// re-enqueuing them first would let lower-priority siphoned/leftover
+    /// traffic (e.g. a different QSO's routine message) jump the queue
+    /// ahead of the thing that actually won this supersede — an operator's
+    /// deliberate abort+re-key, delayed by an entire extra transmission.
+    /// Every other outcome has no competing caller-side enqueue to lose a
+    /// race against, so this function reenqueues immediately for those.
+    Superseded(MessageType, Vec<ComponentMessage>),
 }
 
 /// Like `interruptible_sleep`, but also polls `tx_rx` for a qualifying
@@ -582,7 +594,10 @@ async fn interruptible_sleep_or_supersede(
                     }
                     IncomingDuringTx::Supersede { .. } => {
                         abort.store(true, Ordering::Release);
-                        return Some(SleepOutcome::Superseded(message.message_type));
+                        // `pending` is filled in by the caller of `check_once`
+                        // once the full siphoned+remainder list is known —
+                        // see the post-loop handling below.
+                        return Some(SleepOutcome::Superseded(message.message_type, Vec::new()));
                     }
                 }
             } else {
@@ -627,12 +642,19 @@ async fn interruptible_sleep_or_supersede(
     while let Ok(message) = tx_rx.try_recv() {
         remainder.push(message);
     }
+    let pending: Vec<ComponentMessage> = siphoned.into_iter().chain(remainder).collect();
 
-    // Re-enqueue to the worker's own channel in true arrival order, so the
-    // main loop dequeues them normally on its next cycle (pre-feature
-    // behavior). Done for EVERY outcome — including Superseded — so nothing
-    // an operator sent, or another QSO's routine message, is lost.
-    for msg in siphoned.into_iter().chain(remainder) {
+    // PAN-73 round 4 (Codex): a `Superseded` outcome hands `pending` to the
+    // CALLER instead of re-enqueuing here — the caller's own supersede-
+    // derived content (a re-keyed frame or a folded bundle) must reach the
+    // channel FIRST, ahead of this lower-priority leftover traffic, or an
+    // operator's deliberate abort+re-key gets delayed behind it. Every
+    // other outcome has no such competing enqueue, so reenqueue immediately
+    // as before.
+    if let SleepOutcome::Superseded(msg, _) = outcome {
+        return SleepOutcome::Superseded(msg, pending);
+    }
+    for msg in pending {
         let reenqueue = ComponentMessage::new(
             ComponentId::Ft8Transmitter,
             ComponentId::Ft8Transmitter,
@@ -648,6 +670,29 @@ async fn interruptible_sleep_or_supersede(
     }
 
     outcome
+}
+
+/// Re-enqueue a `SleepOutcome::Superseded` pending list to the worker's own
+/// channel, in the arrival order `interruptible_sleep_or_supersede` already
+/// established. The CALLER invokes this only AFTER it finishes enqueuing
+/// its own supersede-derived content (a re-keyed frame or a folded bundle)
+/// — see that outcome variant's doc comment for why the ordering matters
+/// (PAN-73 round 4, Codex).
+async fn reenqueue_pending(message_bus: &MessageBus, pending: Vec<ComponentMessage>) {
+    for msg in pending {
+        let reenqueue = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Ft8Transmitter,
+            msg.message_type,
+            Instant::now(),
+        );
+        if let Err(e) = message_bus.send_message(reenqueue).await {
+            warn!(
+                "supersede sleep: failed to re-enqueue non-candidate message: {}",
+                e
+            );
+        }
+    }
 }
 
 #[cfg(test)]
@@ -761,12 +806,15 @@ mod interruptible_sleep_tests {
         .await;
 
         match outcome {
-            super::SleepOutcome::Superseded(MessageType::TransmitRequest {
-                message_text,
-                qso_id,
-                frequency_offset,
-                ..
-            }) => {
+            super::SleepOutcome::Superseded(
+                MessageType::TransmitRequest {
+                    message_text,
+                    qso_id,
+                    frequency_offset,
+                    ..
+                },
+                _pending,
+            ) => {
                 assert_eq!(message_text, "KA1ABC K5ARH RR73");
                 assert_eq!(qso_id.as_deref(), Some("qso-1"));
                 assert_eq!(frequency_offset, 1500.0);
@@ -1007,19 +1055,26 @@ mod interruptible_sleep_tests {
         );
     }
 
-    /// Codex round 3 (PR #346): re-enqueuing siphoned messages must preserve
-    /// TRUE arrival order relative to anything left untouched in the live
-    /// channel when the loop exits early on a supersede. Sequence queued
-    /// (in this order) BEFORE the function is even called: B1 (a different
-    /// QSO — gets siphoned by the very first `check_once` poll), A (a
-    /// fresher message for the SAME in-flight QSO — drained by the second
-    /// `check_once` poll, classified `Supersede`, and returned immediately
-    /// WITHOUT further draining), then B2 (a different QSO again — never
-    /// drained by this function at all, since the loop already returned).
-    /// Before the fix, only `siphoned` (containing B1) was appended to the
-    /// live channel's tail, landing AFTER the untouched B2 and inverting
-    /// their true arrival order. The fix drains that leftover remainder and
-    /// re-enqueues `siphoned` ahead of it.
+    /// Codex round 3 (PR #346): the pending list carried alongside a
+    /// `Superseded` outcome must preserve TRUE arrival order relative to
+    /// anything left untouched in the live channel when the loop exits
+    /// early on a supersede. Sequence queued (in this order) BEFORE the
+    /// function is even called: B1 (a different QSO — gets siphoned by the
+    /// very first `check_once` poll), A (a fresher message for the SAME
+    /// in-flight QSO — drained by the second `check_once` poll, classified
+    /// `Supersede`, and returned immediately WITHOUT further draining), then
+    /// B2 (a different QSO again — never drained by this function at all,
+    /// since the loop already returned). Before the fix, only `siphoned`
+    /// (containing B1) was appended to the live channel's tail, landing
+    /// AFTER the untouched B2 and inverting their true arrival order. The
+    /// fix drains that leftover remainder and orders it after `siphoned`.
+    ///
+    /// Round 4 (Codex): for a `Superseded` outcome, this pending list is
+    /// NOT reenqueued by this function at all — it's returned to the caller,
+    /// which must reenqueue it only after enqueuing its own supersede-
+    /// derived content (`reenqueue_pending`, called from the four worker
+    /// call sites). This test therefore asserts on the outcome's carried
+    /// `pending` field directly, not on `tx_rx`.
     #[tokio::test(flavor = "current_thread")]
     async fn supersede_sleep_preserves_arrival_order_between_siphoned_and_untouched_messages() {
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -1068,37 +1123,47 @@ mod interruptible_sleep_tests {
         )
         .await;
 
-        match outcome {
-            super::SleepOutcome::Superseded(MessageType::TransmitRequest { qso_id, .. }) => {
+        let pending = match outcome {
+            super::SleepOutcome::Superseded(
+                MessageType::TransmitRequest { qso_id, .. },
+                pending,
+            ) => {
                 assert_eq!(qso_id.as_deref(), Some("qso-1"), "A must win the supersede");
+                pending
             }
             other => panic!("expected Superseded(A), got {other:?}"),
-        }
+        };
 
-        // True arrival order preserved: B1 first, then B2 — never B2 before B1.
-        let first = tx_rx.try_recv().expect("B1 must be re-enqueued");
-        match first.message_type {
+        // Nothing reenqueued to tx_rx yet — the caller owns that, after its
+        // own supersede-derived enqueue (round 4).
+        assert!(
+            tx_rx.try_recv().is_err(),
+            "a Superseded outcome must not reenqueue anything itself"
+        );
+
+        // True arrival order preserved in the returned pending list: B1
+        // first, then B2 — never B2 before B1.
+        assert_eq!(pending.len(), 2, "expected exactly B1 and B2 pending");
+        match &pending[0].message_type {
             MessageType::TransmitRequest { qso_id, .. } => {
                 assert_eq!(
                     qso_id.as_deref(),
                     Some("qso-b1"),
-                    "B1 must be re-enqueued FIRST"
+                    "B1 must be pending FIRST"
                 );
             }
             other => panic!("expected B1, got {other:?}"),
         }
-        let second = tx_rx.try_recv().expect("B2 must also be re-enqueued");
-        match second.message_type {
+        match &pending[1].message_type {
             MessageType::TransmitRequest { qso_id, .. } => {
                 assert_eq!(
                     qso_id.as_deref(),
                     Some("qso-b2"),
-                    "B2 must be re-enqueued SECOND"
+                    "B2 must be pending SECOND"
                 );
             }
             other => panic!("expected B2, got {other:?}"),
         }
-        assert!(tx_rx.try_recv().is_err(), "no extra messages");
     }
 }
 
@@ -4295,7 +4360,7 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 continue 'worker;
                                             }
-                                            SleepOutcome::Superseded(new_request) => {
+                                            SleepOutcome::Superseded(new_request, pending) => {
                                                 // The current in-flight single item — passed to the
                                                 // helper so a bundle-add (max_concurrent_qsos > 1)
                                                 // can fold the new request alongside it.
@@ -4333,7 +4398,11 @@ impl super::ApplicationCoordinator {
                                                         // leave the retry loop and fall through to
                                                         // the next dequeue. The armed PttGuard's
                                                         // drop is the PTT-off safety net if the
-                                                        // explicit send failed.
+                                                        // explicit send failed. No competing enqueue
+                                                        // here, so `pending` can go back immediately
+                                                        // (PAN-73 round 4).
+                                                        reenqueue_pending(&message_bus, pending)
+                                                            .await;
                                                         break 'key_and_send;
                                                     }
                                                     SupersedeOutcome::Replace {
@@ -4401,6 +4470,12 @@ impl super::ApplicationCoordinator {
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
                                                         ptt_guard.disarm();
+                                                        // Re-key happens in-place on the next
+                                                        // 'key_and_send iteration, not via a channel
+                                                        // enqueue -- no competing content, so
+                                                        // `pending` goes back now (PAN-73 round 4).
+                                                        reenqueue_pending(&message_bus, pending)
+                                                            .await;
                                                         continue 'key_and_send;
                                                     }
                                                     SupersedeOutcome::Bundle {
@@ -4448,6 +4523,15 @@ impl super::ApplicationCoordinator {
                                                                 warn!("supersede: failed to re-enqueue multi-TX bundle: {}", e);
                                                             }
                                                             ptt_guard.disarm();
+                                                            // The bundle (the actual supersede
+                                                            // winner's content) is already enqueued
+                                                            // above -- `pending` goes back AFTER it,
+                                                            // never ahead (PAN-73 round 4).
+                                                            reenqueue_pending(
+                                                                &message_bus,
+                                                                pending,
+                                                            )
+                                                            .await;
                                                             break 'key_and_send;
                                                         }
                                                         // Frequency collision: single-item replace
@@ -4501,6 +4585,11 @@ impl super::ApplicationCoordinator {
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
                                                         ptt_guard.disarm();
+                                                        // Frequency-collision fallback re-keys
+                                                        // in-place, same as Replace -- no competing
+                                                        // enqueue (PAN-73 round 4).
+                                                        reenqueue_pending(&message_bus, pending)
+                                                            .await;
                                                         continue 'key_and_send;
                                                     }
                                                 }
@@ -4588,7 +4677,7 @@ impl super::ApplicationCoordinator {
                                                 }
                                                 continue 'worker;
                                             }
-                                            SleepOutcome::Superseded(new_request) => {
+                                            SleepOutcome::Superseded(new_request, pending) => {
                                                 // Same bundle-add-or-replace decision as Step 6.
                                                 let in_flight_items =
                                                     vec![crate::message_bus::TransmitRequestItem {
@@ -4622,7 +4711,10 @@ impl super::ApplicationCoordinator {
                                                         // Too late to re-key this slot — abandon
                                                         // THIS message (not the worker): leave the
                                                         // retry loop and fall through to next
-                                                        // dequeue.
+                                                        // dequeue. No competing enqueue, so
+                                                        // `pending` goes back now (PAN-73 round 4).
+                                                        reenqueue_pending(&message_bus, pending)
+                                                            .await;
                                                         break 'key_and_send;
                                                     }
                                                     SupersedeOutcome::Replace {
@@ -4680,6 +4772,12 @@ impl super::ApplicationCoordinator {
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
                                                         ptt_guard.disarm();
+                                                        // Re-key happens in-place on the next
+                                                        // 'key_and_send iteration, not via a channel
+                                                        // enqueue -- no competing content, so
+                                                        // `pending` goes back now (PAN-73 round 4).
+                                                        reenqueue_pending(&message_bus, pending)
+                                                            .await;
                                                         continue 'key_and_send;
                                                     }
                                                     SupersedeOutcome::Bundle {
@@ -4717,6 +4815,15 @@ impl super::ApplicationCoordinator {
                                                                 warn!("supersede: failed to re-enqueue multi-TX bundle: {}", e);
                                                             }
                                                             ptt_guard.disarm();
+                                                            // The bundle (the actual supersede
+                                                            // winner's content) is already enqueued
+                                                            // above -- `pending` goes back AFTER it,
+                                                            // never ahead (PAN-73 round 4).
+                                                            reenqueue_pending(
+                                                                &message_bus,
+                                                                pending,
+                                                            )
+                                                            .await;
                                                             break 'key_and_send;
                                                         }
                                                         // Frequency collision: single-item replace
@@ -4764,6 +4871,11 @@ impl super::ApplicationCoordinator {
                                                         abort_current_tx
                                                             .store(false, Ordering::Release);
                                                         ptt_guard.disarm();
+                                                        // Frequency-collision fallback re-keys
+                                                        // in-place, same as Replace -- no competing
+                                                        // enqueue (PAN-73 round 4).
+                                                        reenqueue_pending(&message_bus, pending)
+                                                            .await;
                                                         continue 'key_and_send;
                                                     }
                                                 }
@@ -6136,7 +6248,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
-                                        SleepOutcome::Superseded(new_request) => {
+                                        SleepOutcome::Superseded(new_request, pending) => {
                                             supersede_multi_reenqueue(
                                                 new_request,
                                                 &items,
@@ -6159,6 +6271,10 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
                                             ptt_guard.disarm();
+                                            // supersede_multi_reenqueue already enqueued its own
+                                            // resolved content above -- `pending` goes back AFTER
+                                            // it (PAN-73 round 4).
+                                            reenqueue_pending(&message_bus, pending).await;
                                             continue;
                                         }
                                     }
@@ -6245,7 +6361,7 @@ impl super::ApplicationCoordinator {
                                             }
                                             continue;
                                         }
-                                        SleepOutcome::Superseded(new_request) => {
+                                        SleepOutcome::Superseded(new_request, pending) => {
                                             supersede_multi_reenqueue(
                                                 new_request,
                                                 &items,
@@ -6268,6 +6384,10 @@ impl super::ApplicationCoordinator {
                                             )
                                             .await;
                                             ptt_guard.disarm();
+                                            // supersede_multi_reenqueue already enqueued its own
+                                            // resolved content above -- `pending` goes back AFTER
+                                            // it (PAN-73 round 4).
+                                            reenqueue_pending(&message_bus, pending).await;
                                             continue;
                                         }
                                     }
