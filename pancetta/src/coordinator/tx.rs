@@ -8950,11 +8950,8 @@ mod coalesce_tests {
     fn single_request_passthrough_unchanged() {
         // The no-backlog case: one request in, one retained out, zero reduced.
         let live = liveset(&["qso-a"]);
-        let out = coalesce_transmit_requests(
-            vec![entry("CQ", Some("qso-a"))],
-            UNBOUNDED,
-            live_in(&live),
-        );
+        let out =
+            coalesce_transmit_requests(vec![entry("CQ", Some("qso-a"))], UNBOUNDED, live_in(&live));
         assert_eq!(out.retained, vec![entry("CQ", Some("qso-a"))]);
         assert_eq!(out.coalesced, 0);
         assert_eq!(out.dropped_terminal, 0);

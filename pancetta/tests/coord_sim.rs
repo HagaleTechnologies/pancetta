@@ -640,9 +640,8 @@ impl CoordSim {
         // effectively-unbounded value so the only cap in play is the
         // production hard backstop (`MAX_RETAINED_TX_STREAMS`), matching
         // this simulator's pre-existing behavior.
-        let outcome = coalesce_transmit_requests(drained, u32::MAX, |id| {
-            tx_qso_is_live_shared(id, &active)
-        });
+        let outcome =
+            coalesce_transmit_requests(drained, u32::MAX, |id| tx_qso_is_live_shared(id, &active));
 
         // Record what coalescing / the gate removed, with a best-effort reason.
         // (We can't tell apart "coalesced" vs "dropped_terminal" per-entry from
