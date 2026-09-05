@@ -211,12 +211,30 @@ pub enum IncomingDuringTx {
     },
 }
 
-/// Phase 1 (manual trigger) classifier: any request arriving while another
-/// is in flight supersedes it UNLESS it's an exact duplicate (identical
-/// text) or a recognized pivot-tombstone (`is_pivot_duplicate`). Applies
-/// regardless of whether the candidate targets the same QSO or a different
-/// one — Phase 1 has no priority-tier gating (that's Phase 2, not built by
-/// this plan).
+/// Manual-trigger / same-QSO classifier: a request arriving while another is
+/// in flight supersedes it only when it is a genuine manual/free-text
+/// request (`qso_id == None` — operator CQ, tune, test-TX) or a fresher
+/// message for the SAME QSO already being transmitted. It is dropped when
+/// it is an exact duplicate (identical text), a recognized pivot-tombstone
+/// (`is_pivot_duplicate`), or — PAN-73 — belongs to a DIFFERENT QSO than the
+/// one in flight.
+///
+/// PAN-73: with `max_concurrent_qsos > 1`, every active QSO's autonomous
+/// auto-sequence loop independently enqueues its next `TransmitRequest`
+/// whenever its own turn comes up — with no operator involved at all. Before
+/// this fix, any such message arriving in the few-microsecond window right
+/// after a DIFFERENT QSO keyed PTT for the current slot was classified as a
+/// supersede candidate purely because *a* new request existed, tearing down
+/// a perfectly good in-flight transmission for content that frequently turns
+/// out to be unschedulable this slot anyway (see
+/// `supersede_and_rekey_or_bundle`'s unconditional PTT-off) — killing BOTH
+/// QSOs' turns and leaving the slot silent until some third QSO's unrelated
+/// retry timer opportunistically keyed into the leftover dead air. Confirmed
+/// live 2026-09-05 (VP2MAA/JF1RDH/JA5GYU). Real cross-QSO supersede/bundling
+/// during an in-flight transmission is Phase 2 (priority-tier gating), not
+/// built by this plan — until then, a different QSO's message during
+/// another QSO's TX just waits for that QSO's own next auto-sequence cycle,
+/// same as it would have if it had lost the race to be dequeued first.
 pub fn classify_incoming_during_tx(
     candidate: &MessageType,
     in_flight_qso_id: Option<&str>,
@@ -243,6 +261,15 @@ pub fn classify_incoming_during_tx(
             let same_target = qso_id.as_deref().map(super::active_tx_qso_key)
                 == in_flight_qso_id.map(super::active_tx_qso_key);
             if same_target && message_text == in_flight_text {
+                return IncomingDuringTx::Drop;
+            }
+            // PAN-73: a candidate with its own qso_id that differs from the
+            // in-flight QSO is another QSO's routine auto-sequence message,
+            // not an operator action — never let it tear down an unrelated
+            // in-flight transmission. `qso_id == None` (manual/free-text/
+            // tune/test-TX) is the actual operator-triggered case this
+            // classifier exists for, and always supersedes as before.
+            if qso_id.is_some() && !same_target {
                 return IncomingDuringTx::Drop;
             }
             IncomingDuringTx::Supersede {
@@ -8791,7 +8818,10 @@ mod classifier_tests {
     }
 
     #[test]
-    fn classify_supersedes_on_different_qso() {
+    fn classify_supersedes_on_manual_free_text_no_qso() {
+        // qso_id == None is the genuine manual/free-text/tune/test-TX case —
+        // this is the actual "operator trigger" this classifier exists for,
+        // and always supersedes.
         let pivoted_once = std::collections::HashMap::new();
         let candidate = transmit_request("CQ K5ARH EM12", None);
         let outcome = super::classify_incoming_during_tx(
@@ -8801,6 +8831,32 @@ mod classifier_tests {
             &pivoted_once,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
+    }
+
+    /// PAN-73 regression: reproduces the 2026-09-05 VP2MAA/JF1RDH/JA5GYU
+    /// live incident. A DIFFERENT QSO's own routine auto-sequence message
+    /// arriving in the channel while another QSO is in flight must NOT
+    /// supersede it — that killed a perfectly good in-flight transmission
+    /// for content that (in the live incident) wasn't even schedulable this
+    /// slot, leaving the slot silent until an unrelated third QSO's retry
+    /// timer opportunistically keyed into the dead air ~5s later.
+    #[test]
+    fn classify_drops_different_qsos_autonomous_message() {
+        let pivoted_once = std::collections::HashMap::new();
+        // In flight: VP2MAA's QSO. Candidate: JF1RDH's QSO, a distinct
+        // qso_id and distinct text — exactly the shape that raced in
+        // production.
+        let candidate = transmit_request("JF1RDH W5AU EM10", Some("qso-jf1rdh"));
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            Some("qso-vp2maa"),
+            "VP2MAA W5AU EM10",
+            &pivoted_once,
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Drop),
+            "a different QSO's own message must not supersede an unrelated in-flight TX, got {outcome:?}"
+        );
     }
 
     #[test]
