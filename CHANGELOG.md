@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Adaptive TX-offset switching (PAN-72): in `AUTO` TX-frequency mode, an
+  in-progress QSO that goes `[autonomous] qso_stall_switch_after` slots (default
+  4) without the DX advancing — **silence now counts, not just a repeated
+  frame** — moves to a fresh offset picked by the smart frequency allocator. If
+  it stalls again on that new offset it reverts to the last offset the QSO was
+  known to work on, ping-ponging rather than wandering. New `u` keystroke forces
+  the same move on demand without leaving `AUTO`: it nudges the active QSO, or
+  the CQ-hunting offset when no QSO is running. In `HOLD` the nudge reports a
+  no-op instead of breaking your pinned offset. Replaces the old blind
+  identical-repeat `+300 Hz` hop, which never noticed silence and ignored both
+  the spectrum and our other active streams. `[autonomous]
+  cq_no_response_switch_after` default lowered 5 → 4 to match.
+
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
 ## [0.9.6] - 2026-09-02

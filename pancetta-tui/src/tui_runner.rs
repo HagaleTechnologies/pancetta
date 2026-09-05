@@ -481,7 +481,8 @@ pub enum TuiCommand {
     /// Operator pressed `f`: toggle the TX-frequency mode Hold ↔ Auto. The
     /// coordinator flips the shared `tx_freq_mode` atomic. Hold (default) keeps
     /// the operator's picked offset sticky; Auto lets pancetta choose/adjust it
-    /// (smart allocator, collision jitter, stuck-DX hop).
+    /// (smart allocator, collision jitter, adaptive stall switch/revert, and
+    /// the `u` nudge).
     ToggleTxFreqMode,
     /// Operator used the `o` modal to set (or clear) the held TX audio offset.
     /// `Some(hz)` → store `hz` into `tx_offset_hold_hz` AND flip

@@ -1378,9 +1378,12 @@ impl Sim {
                 // change, so the simulated timeline is unaffected.
             }
             QsoEvent::TxOffsetActionNeeded { .. } => {
-                // PAN-72: nothing emits this yet (Task 4), and the coordinator
-                // (not the sim harness) resolves it (Task 8) — no timeline
-                // effect to record here.
+                // PAN-72: the coordinator's Autonomous-task drain — not this
+                // sim harness — resolves the action and commits it via
+                // `QsoManager::apply_tx_offset_switch`. The event itself
+                // carries no QSO state change, so there is no timeline effect
+                // to record here. Any resulting offset move shows up through
+                // the ordinary state/metadata channels instead.
             }
         }
     }

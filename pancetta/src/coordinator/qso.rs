@@ -2495,8 +2495,9 @@ impl super::ApplicationCoordinator {
         // TUI SetSplit relay; the QSO RF stamp uses this for the
         // effective TX dial frequency when split is active.
         qso_manager.set_split_tx_frequency_source(split_tx_frequency_hz.clone());
-        // Share the operator's Hold/Auto TX-frequency mode so the
-        // stuck-DX hop only fires in Auto (Hold keeps the offset sticky).
+        // Share the operator's Hold/Auto TX-frequency mode so the adaptive
+        // stall detector only emits `TxOffsetActionNeeded` in Auto (Hold keeps
+        // the offset sticky).
         qso_manager.set_tx_freq_mode_source(tx_freq_mode.clone());
 
         // Task 5 (QSOLogged/LoggedADIF): subscribe synchronously, before

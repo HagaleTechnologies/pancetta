@@ -1781,7 +1781,8 @@ impl super::ApplicationCoordinator {
                             // Hold ↔ Auto. Hold (default) keeps the operator's
                             // picked offset sticky; Auto lets pancetta choose and
                             // adjust it (smart allocator + collision jitter +
-                            // stuck-DX hop). Update the shared atomic; the TUI
+                            // adaptive stall switch/revert + the `u` nudge).
+                            // Update the shared atomic; the TUI
                             // chip is driven optimistically on the key side.
                             let prev = pancetta_core::TxFreqMode::from_u8(
                                 cmd_tx_freq_mode.load(Ordering::Acquire),

@@ -14008,16 +14008,18 @@ mod pan72_stall_detection_tests {
             "first stall (still on known-good offset) must Switch"
         );
 
-        // Simulate the coordinator having resolved the Switch by moving us
-        // to a new offset (Task 5's `apply_tx_offset_switch`, not yet
-        // implemented — mutate the test-visible field directly, same
-        // pattern used elsewhere in this file, e.g.
-        // `report_stage_watchdog_retires_compound_partner`).
+        // Resolve the Switch the way the coordinator's drain really does —
+        // through `apply_tx_offset_switch`, the sole external mutator — so
+        // the ping-pong below is driven by the production commit path rather
+        // than a hand-poked metadata field. `FREQ + 300` is comfortably
+        // inside TX_OFFSET_MIN_HZ..=TX_OFFSET_MAX_HZ, so the clamp is a no-op
+        // here.
         let new_freq = FREQ + 300.0;
-        {
-            let mut qsos = manager.qsos.write().await;
-            qsos.get_mut(&qso_id).unwrap().metadata.frequency = new_freq;
-        }
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, new_freq)
+            .await
+            .expect("committing the resolved Switch");
+        assert_eq!(applied, new_freq);
 
         // Two more silent rearm cycles on the NEW (non-known-good) offset ->
         // Revert back to the known-good offset, not another Switch.

@@ -2653,8 +2653,9 @@ impl AutonomousOperator {
             // offset anyway (an active QSO transmits on its own latched
             // `QsoMetadata.frequency`, not this global offset), so jittering
             // mid-QSO would surprise the operator without helping the live QSO.
-            // The QSO engine's own stuck-DX detector handles a collision on a
-            // live QSO's held offset. When idle, jitter as before so the next
+            // The QSO engine's own adaptive stall detector (`stall_cycles` ->
+            // `TxOffsetActionNeeded`) handles a collision on a live QSO's held
+            // offset. When idle, jitter as before so the next
             // CQ avoids the interferer — and only ever from a collision-LISTEN
             // slot, i.e. a slot we listened on without transmitting (exactly the
             // "new information" precondition the operator described).

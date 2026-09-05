@@ -865,8 +865,9 @@ pub struct ApplicationCoordinator {
     pub(crate) hamlib_command_in_flight: Arc<std::sync::atomic::AtomicU32>,
 
     /// Operator TX-frequency mode (`pancetta_core::TxFreqMode` as `u8`),
-    /// default `Hold`. Shared with the QSO engine (gates the stuck-DX TX-offset
-    /// hop) and the autonomous operator (gates the smart-frequency allocator and
+    /// default `Hold`. Shared with the QSO engine (gates the adaptive stall
+    /// detector's `TxOffsetActionNeeded` emission) and the autonomous operator
+    /// (gates the smart-frequency allocator, the manual `u` nudge, and
     /// collision-listen jitter). In `Hold` the operator's picked offset is
     /// sticky; `Auto` lets pancetta choose/adjust it. Toggled from the TUI
     /// (`f`). Orthogonal to [`Self::tx_policy`].
