@@ -487,8 +487,13 @@ Delete `DX_STUCK_REPEAT_THRESHOLD`, `STUCK_TX_HOP_HZ`, and `stuck_hopped_offset`
 three stuck-hop-specific items go). Delete the "Stuck-DX TX-frequency hold/escape" block inside
 `process_message_for_qso` (~lines 2985-3033) — the whole comment block plus the `if let
 Some(progress) = qsos.get_mut(&qso_id) { if dx_frame_advanced { ... } ... if tx_auto && ... {
-...hop... } }` body — but do NOT delete the `let tx_auto = ...` line (~2998-3001) or the `let
-rx_text = ...` line (~3002) — both are still needed by Step 4 below.
+...hop... } }` body. ALSO delete the `let tx_auto = ...` line (~2998-3001) and the `let rx_text =
+...` line (~3002) right above that block — both existed only to serve the removed
+`last_rx_text`/`dx_repeat_count` fields (already deleted in Task 1) and the removed hop's gate;
+Step 4 below needs neither. Before deleting `rx_text`, grep the ~40 lines immediately following
+(the Hound QSY block) for any other reference to it — if the compiler or that grep shows it's
+still used there, keep it and treat that as a plan error to note in your report rather than
+guessing; this plan's author did not find one when writing this task.
 
 - [ ] **Step 4: Implement forward-advance tracking**
 
