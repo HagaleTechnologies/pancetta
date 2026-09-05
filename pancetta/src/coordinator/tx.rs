@@ -3461,6 +3461,13 @@ async fn supersede_multi_reenqueue(
     new_request: MessageType,
     in_flight_items: &[crate::message_bus::TransmitRequestItem],
     origin: crate::message_bus::TxOrigin,
+    // The in-flight bundle's OWN `tx_parity` (from its `MultiTransmitRequest`
+    // message) — threaded through so a `Replace` outcome that preserves this
+    // bundle unchanged (see that arm below) carries the SAME parity forward,
+    // not `None`. `None` would let `resolve_required_parity` re-derive an
+    // "Auto" parity on the next dequeue, which can pick the wrong slot for an
+    // explicit-parity bundle (PR #348 review round 3).
+    bundle_tx_parity: Option<pancetta_core::slot::SlotParity>,
     encoder: &mut Ft8Encoder,
     active_protocol: pancetta_ft8::Protocol,
     tx_params: &pancetta_ft8::ProtocolParams,
@@ -3621,7 +3628,7 @@ async fn supersede_multi_reenqueue(
                     ComponentId::Ft8Transmitter,
                     MessageType::MultiTransmitRequest {
                         items: in_flight_items.to_vec(),
-                        tx_parity: None,
+                        tx_parity: bundle_tx_parity,
                         origin,
                     },
                     Instant::now(),
@@ -6838,6 +6845,7 @@ impl super::ApplicationCoordinator {
                                                 new_request,
                                                 &items,
                                                 origin,
+                                                tx_parity,
                                                 &mut encoder,
                                                 active_protocol,
                                                 &tx_params,
@@ -6955,6 +6963,7 @@ impl super::ApplicationCoordinator {
                                                 new_request,
                                                 &items,
                                                 origin,
+                                                tx_parity,
                                                 &mut encoder,
                                                 active_protocol,
                                                 &tx_params,
@@ -8974,6 +8983,7 @@ mod supersede_rekey_tests {
             superseding,
             &in_flight,
             crate::message_bus::TxOrigin::Local,
+            None,
             &mut encoder,
             pancetta_ft8::Protocol::Ft8,
             &tx_params,
@@ -9086,6 +9096,7 @@ mod supersede_rekey_tests {
             superseding,
             &in_flight,
             crate::message_bus::TxOrigin::Local,
+            Some(cur_parity),
             &mut encoder,
             pancetta_ft8::Protocol::Ft8,
             &tx_params,
@@ -9106,10 +9117,20 @@ mod supersede_rekey_tests {
             .try_recv()
             .expect("the in-flight bundle must be preserved, not dropped");
         match preserved.message_type {
-            MessageType::MultiTransmitRequest { items, .. } => {
+            MessageType::MultiTransmitRequest {
+                items, tx_parity, ..
+            } => {
                 assert_eq!(items.len(), 2, "both in-flight items must be preserved");
                 assert_eq!(items[0].message_text, "KA1ABC K5ARH R-15");
                 assert_eq!(items[1].message_text, "OTHER W5AU R-08");
+                assert_eq!(
+                    tx_parity,
+                    Some(cur_parity),
+                    "PR #348 review round 3 (Codex P1): the preserved bundle must carry the \
+                     ORIGINAL bundle's own tx_parity, not None — losing it would let \
+                     resolve_required_parity pick the wrong slot for an explicit-parity bundle \
+                     on the next dequeue"
+                );
             }
             other => panic!("expected the preserved MultiTransmitRequest, got {other:?}"),
         }
