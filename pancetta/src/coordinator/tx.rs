@@ -2811,67 +2811,90 @@ pub fn coalesce_transmit_requests(
         retained = kept;
     }
 
-    // FQ-F4/TX-F6 defense-in-depth: pairwise frequency-separation check.
-    // `modulate_multi_tx` fails the WHOLE bundle (not just the colliding
-    // pair) if any two folded streams' `frequency_offset`s are closer than
-    // its minimum separation (signal bandwidth + 25 Hz guard). Fix 5's own
-    // de-confliction at QSO-open time should make a collision here rare,
-    // but this is cheap insurance against any other path that still
-    // produces close-together streams. Greedy, order-preserving: the
-    // earliest-seen (already-kept) stream at a given offset wins; a later
-    // stream too close to ANY already-kept stream is excluded from this
-    // cycle's bundle only — not coerced onto a different offset, and not
-    // gone permanently (its own TX cadence produces a fresh request next
-    // cycle, which will then coalesce/bundle normally).
-    if retained.len() > 1 {
-        let mut kept: Vec<CoalesceEntry> = Vec::with_capacity(retained.len());
-        for entry in retained.into_iter() {
-            let too_close = kept.iter().any(|k: &CoalesceEntry| {
-                (k.frequency_offset - entry.frequency_offset).abs()
-                    < pancetta_qso::MIN_TX_SEPARATION_HZ
-            });
-            if too_close {
-                warn!(
-                    target: "pancetta::tx.policy",
-                    "TX bundle frequency conflict: stream qso_id={:?} at {:.0} Hz is within \
-                     {:.0} Hz of an already-retained stream this cycle; excluding it from \
-                     this bundle — it will be retried individually on its own offset next cycle",
-                    entry.qso_id, entry.frequency_offset, pancetta_qso::MIN_TX_SEPARATION_HZ
-                );
-                outcome.freq_excluded += 1;
-            } else {
-                kept.push(entry);
-            }
+    // Split QSO-keyed streams from manual/tune sends for the remaining
+    // passes. The frequency-conflict check and the concurrent-QSO cap must
+    // be resolved between QSO streams FIRST, entirely independent of manual
+    // sends — otherwise a manual stream can be wrongly excluded for
+    // conflicting with a QSO stream that turns out to be cap-truncated
+    // anyway (PR #348 review round 2: cap=1, QSO A/B where B conflicts with
+    // a manual send — checking the manual send against B before the cap
+    // decides B is truncated wrongly sacrifices a manual send that was
+    // actually compatible with the surviving QSO set). `partition`
+    // preserves each side's relative (first-seen / drain) order.
+    let (qso_entries, manual_entries): (Vec<CoalesceEntry>, Vec<CoalesceEntry>) =
+        retained.into_iter().partition(|e| e.qso_id.is_some());
+
+    // FQ-F4/TX-F6 defense-in-depth: pairwise frequency-separation check among
+    // QSO-keyed streams only. `modulate_multi_tx` fails the WHOLE bundle (not
+    // just the colliding pair) if any two folded streams' `frequency_offset`s
+    // are closer than its minimum separation (signal bandwidth + 25 Hz
+    // guard). Fix 5's own de-confliction at QSO-open time should make a
+    // collision here rare, but this is cheap insurance against any other
+    // path that still produces close-together streams. Greedy,
+    // order-preserving: the earliest-seen (already-kept) stream at a given
+    // offset wins; a later stream too close to ANY already-kept stream is
+    // excluded from this cycle's bundle only — not coerced onto a different
+    // offset, and not gone permanently (its own TX cadence produces a fresh
+    // request next cycle, which will then coalesce/bundle normally).
+    let mut qso_survivors: Vec<CoalesceEntry> = Vec::with_capacity(qso_entries.len());
+    for entry in qso_entries {
+        let too_close = qso_survivors.iter().any(|k: &CoalesceEntry| {
+            (k.frequency_offset - entry.frequency_offset).abs() < pancetta_qso::MIN_TX_SEPARATION_HZ
+        });
+        if too_close {
+            warn!(
+                target: "pancetta::tx.policy",
+                "TX bundle frequency conflict: stream qso_id={:?} at {:.0} Hz is within \
+                 {:.0} Hz of an already-retained stream this cycle; excluding it from \
+                 this bundle — it will be retried individually on its own offset next cycle",
+                entry.qso_id, entry.frequency_offset, pancetta_qso::MIN_TX_SEPARATION_HZ
+            );
+            outcome.freq_excluded += 1;
+        } else {
+            qso_survivors.push(entry);
         }
-        retained = kept;
     }
 
     // Enforce the operator's configured concurrent-QSO cap on the QSO-keyed
-    // SURVIVORS only, now that conflicting entries have already been
-    // filtered out above. Manual/tune sends (`qso_id == None`) are never
-    // concurrent QSOs and are always kept regardless of this cap — they're
-    // still bounded by the hard backstop below. A truncated entry represents
-    // an ADMITTED, still-live QSO whose call-bookkeeping has already
-    // advanced as if this frame would transmit, so its `CoalesceEntry` is
-    // retained in `truncated_entries` for the caller to report a failed
-    // `TransmitComplete` — silently dropping it here would let that QSO's
-    // retry/timeout accounting drift from what actually went on air.
+    // survivors — now that QSO-vs-QSO conflicts are already resolved, cap
+    // truncation only ever drops a genuinely bundleable stream. A truncated
+    // entry represents an ADMITTED, still-live QSO whose call-bookkeeping
+    // has already advanced as if this frame would transmit, so its
+    // `CoalesceEntry` is retained in `truncated_entries` for the caller to
+    // report a failed `TransmitComplete` — silently dropping it here would
+    // let that QSO's retry/timeout accounting drift from what actually went
+    // on air.
     let qso_cap = (max_concurrent_qsos.max(1) as usize).min(MAX_RETAINED_TX_STREAMS);
     outcome.qso_cap = qso_cap;
-    let mut qso_seen = 0usize;
-    let mut kept = Vec::with_capacity(retained.len());
-    for entry in retained.into_iter() {
-        if entry.qso_id.is_some() {
-            if qso_seen >= qso_cap {
-                outcome.truncated += 1;
-                outcome.truncated_entries.push(entry);
-                continue;
-            }
-            qso_seen += 1;
-        }
-        kept.push(entry);
+    if qso_survivors.len() > qso_cap {
+        let overflow = qso_survivors.split_off(qso_cap);
+        outcome.truncated += overflow.len();
+        outcome.truncated_entries.extend(overflow);
     }
-    retained = kept;
+
+    // Check manual/tune sends against the FINAL surviving QSO set (post
+    // conflict-filter, post-cap) plus each other — never against a QSO
+    // stream that was excluded or truncated above. Manual sends are never
+    // subject to the concurrent-QSO cap themselves.
+    let mut kept: Vec<CoalesceEntry> = qso_survivors;
+    for entry in manual_entries {
+        let too_close = kept.iter().any(|k: &CoalesceEntry| {
+            (k.frequency_offset - entry.frequency_offset).abs() < pancetta_qso::MIN_TX_SEPARATION_HZ
+        });
+        if too_close {
+            warn!(
+                target: "pancetta::tx.policy",
+                "TX bundle frequency conflict: stream qso_id={:?} at {:.0} Hz is within \
+                 {:.0} Hz of an already-retained stream this cycle; excluding it from \
+                 this bundle — it will be retried individually on its own offset next cycle",
+                entry.qso_id, entry.frequency_offset, pancetta_qso::MIN_TX_SEPARATION_HZ
+            );
+            outcome.freq_excluded += 1;
+        } else {
+            kept.push(entry);
+        }
+    }
+    let mut retained = kept;
 
     // Final hard safety cap across everything retained (QSO streams + manual
     // sends together), independent of the concurrent-QSO setting.
@@ -3577,6 +3600,39 @@ async fn supersede_multi_reenqueue(
             origin: new_origin,
             qso_id: new_qso_id,
         } => {
+            // PR #348 review round 2 (Codex P2): the multi-TX arm's in-flight
+            // item is ALWAYS a real bundle (`in_flight_items.len() >= 2` —
+            // this function is only reached from the multi-TX arm), so a
+            // `Replace` outcome here can only mean the candidate bundle
+            // would have exceeded `max_concurrent_qsos` (a frequency
+            // collision instead produces a `Bundle` whose caller falls back
+            // to a single-item re-enqueue in the arm above, never `Replace`).
+            // Silently dropping every previously-admitted bundle item to
+            // make room for one new request would burn all of their recorded
+            // attempts for nothing. Preserve the in-flight bundle unchanged
+            // (re-encoding happens fresh at pickup time, so there's no
+            // staleness concern) and defer the new, over-cap request as its
+            // own request for the coalescer to retry next cycle — same
+            // "excluded, not gone" semantics as a parity/frequency conflict
+            // exclusion elsewhere in this file.
+            if !in_flight_items.is_empty() {
+                let preserve = ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::MultiTransmitRequest {
+                        items: in_flight_items.to_vec(),
+                        tx_parity: None,
+                        origin,
+                    },
+                    Instant::now(),
+                );
+                if let Err(e) = message_bus.send_message(preserve).await {
+                    warn!(
+                        "supersede (multi-TX): failed to re-enqueue the preserved in-flight bundle: {}",
+                        e
+                    );
+                }
+            }
             let reenqueue = ComponentMessage::new(
                 ComponentId::Ft8Transmitter,
                 ComponentId::Ft8Transmitter,
@@ -8973,6 +9029,112 @@ mod supersede_rekey_tests {
         );
     }
 
+    /// PR #348 review round 2 (Codex P2): when a `Replace` reaches
+    /// `supersede_multi_reenqueue`, it can only mean the candidate bundle
+    /// would have exceeded `max_concurrent_qsos` (a frequency collision
+    /// instead produces `Bundle` + an encode-failure fallback, never
+    /// `Replace`, and this function is only ever called from the multi-TX
+    /// arm, so `in_flight_items` is always a real ≥1-item bundle). The
+    /// previously-admitted in-flight bundle must be PRESERVED (re-enqueued
+    /// unchanged), not silently abandoned to make room for the new,
+    /// over-cap request — which is instead deferred as its own request for
+    /// the coalescer to retry next cycle.
+    #[tokio::test(flavor = "current_thread")]
+    async fn multi_reenqueue_preserves_in_flight_bundle_when_new_request_would_exceed_cap() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+        let (_tx_tx, tx_rx) = bus
+            .create_channel(ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+
+        let mut encoder = super::Ft8Encoder::new();
+        let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
+
+        // Already a full 2-item bundle in flight — the configured cap.
+        let in_flight = [
+            crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-1".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "OTHER W5AU R-08".to_string(),
+                frequency_offset: 1400.0,
+                qso_id: Some("qso-other".to_string()),
+            },
+        ];
+
+        // A THIRD, genuinely new QSO request supersedes.
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+        let superseding = MessageType::TransmitRequest {
+            message_text: "THIRD W5AU EM10".to_string(),
+            frequency_offset: 1800.0,
+            qso_id: Some("qso-third".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        super::supersede_multi_reenqueue(
+            superseding,
+            &in_flight,
+            crate::message_bus::TxOrigin::Local,
+            &mut encoder,
+            pancetta_ft8::Protocol::Ft8,
+            &tx_params,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2, // max_concurrent_qsos — already met by the 2 in-flight items
+        )
+        .await;
+
+        // The preserved in-flight bundle is re-enqueued first, unchanged.
+        let preserved = tx_rx
+            .try_recv()
+            .expect("the in-flight bundle must be preserved, not dropped");
+        match preserved.message_type {
+            MessageType::MultiTransmitRequest { items, .. } => {
+                assert_eq!(items.len(), 2, "both in-flight items must be preserved");
+                assert_eq!(items[0].message_text, "KA1ABC K5ARH R-15");
+                assert_eq!(items[1].message_text, "OTHER W5AU R-08");
+            }
+            other => panic!("expected the preserved MultiTransmitRequest, got {other:?}"),
+        }
+
+        // The over-cap new request is deferred as its own request.
+        let deferred = tx_rx
+            .try_recv()
+            .expect("the over-cap new request must be deferred, not dropped");
+        match deferred.message_type {
+            MessageType::TransmitRequest {
+                message_text,
+                qso_id,
+                ..
+            } => {
+                assert_eq!(message_text, "THIRD W5AU EM10");
+                assert_eq!(qso_id.as_deref(), Some("qso-third"));
+            }
+            other => panic!("expected the deferred TransmitRequest, got {other:?}"),
+        }
+        assert!(
+            tx_rx.try_recv().is_err(),
+            "exactly two messages re-enqueued: the preserved bundle and the deferred request"
+        );
+    }
+
     /// Grounding check (brief Step 1/2): the pre-existing multi-TX encode path
     /// that bundle-add reuses succeeds when two items are well clear of the
     /// ~75 Hz FT8 minimum separation, yielding a 2-item summed waveform.
@@ -9608,6 +9770,46 @@ mod coalesce_tests {
             out.truncated, 0,
             "no QSO cap truncation should occur once B is correctly excluded by the conflict pass"
         );
+    }
+
+    /// PR #348 review round 2 (Codex P2): a manual send must be checked
+    /// against the FINAL surviving QSO set (post conflict-filter, post-cap),
+    /// never against a QSO stream that's doomed to be cap-truncated anyway.
+    /// cap=1, QSO A(1000) survives, QSO B(1300) is over-cap and will be
+    /// truncated, manual(1320) conflicts with B (20 Hz apart) but NOT with A
+    /// (320 Hz apart) — the manual send must survive alongside A.
+    #[test]
+    fn manual_send_not_excluded_by_a_qso_stream_that_gets_cap_truncated() {
+        let live = liveset(&["qso-a", "qso-b"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry_freq("A", Some("qso-a"), 1000.0),
+                entry_freq("B", Some("qso-b"), 1300.0),
+                entry_freq("MANUAL", None, 1320.0),
+            ],
+            1,
+            live_in(&live),
+        );
+        assert_eq!(
+            out.truncated, 1,
+            "B must be cap-truncated (cap=1, A wins first-seen)"
+        );
+        assert_eq!(
+            out.truncated_entries[0].message_text, "B",
+            "B is the one that's cap-truncated, not excluded by a frequency conflict"
+        );
+        assert_eq!(
+            out.freq_excluded, 0,
+            "the manual send is compatible with the SURVIVING QSO set (A) — it must not be \
+             excluded just because it conflicted with B, which never survives anyway"
+        );
+        assert_eq!(
+            out.retained.len(),
+            2,
+            "A and the manual send must both survive"
+        );
+        assert_eq!(out.retained[0].message_text, "A");
+        assert_eq!(out.retained[1].message_text, "MANUAL");
     }
 
     /// PR #348 review (Codex P1): a cap-truncated QSO-keyed stream already
