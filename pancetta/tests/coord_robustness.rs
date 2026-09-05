@@ -619,23 +619,40 @@ fn tx_pivot_target_swaps_only_on_a_fresher_message() {
 fn is_pivot_duplicate_flags_only_the_exact_already_sent_frame() {
     use std::collections::HashMap;
     let qid = "abc-123";
-    let mut pivoted_once: HashMap<String, String> = HashMap::new();
+    let mut pivoted_once: HashMap<String, (String, f64)> = HashMap::new();
 
     // Nothing pivoted yet → never a duplicate.
     assert!(!is_pivot_duplicate(
         Some(qid),
         "KF9UG K5ARH 73",
+        693.0,
         &pivoted_once
     ));
 
-    // A prior Step-4c pivot swapped in "73" and physically keyed it.
-    pivoted_once.insert(active_tx_qso_key(qid), "KF9UG K5ARH 73".to_string());
+    // A prior Step-4c pivot swapped in "73" @693.0Hz and physically keyed it.
+    pivoted_once.insert(
+        active_tx_qso_key(qid),
+        ("KF9UG K5ARH 73".to_string(), 693.0),
+    );
 
     // The second, genuinely-newer TransmitRequest that PRODUCED that "73"
-    // text dequeues next — same qso_id, identical text: flag as duplicate.
+    // text dequeues next — same qso_id, identical text and frequency: flag
+    // as duplicate.
     assert!(is_pivot_duplicate(
         Some(qid),
         "KF9UG K5ARH 73",
+        693.0,
+        &pivoted_once
+    ));
+
+    // PAN-73 round 6 (Codex): identical text at a DIFFERENT (hopped)
+    // frequency is NOT a duplicate — a stuck-DX collision-avoidance retry
+    // that keeps the rendered text but hops its offset must not be
+    // swallowed as the stale old-offset tombstone.
+    assert!(!is_pivot_duplicate(
+        Some(qid),
+        "KF9UG K5ARH 73",
+        993.0,
         &pivoted_once
     ));
 
@@ -644,6 +661,7 @@ fn is_pivot_duplicate_flags_only_the_exact_already_sent_frame() {
     assert!(!is_pivot_duplicate(
         Some("other-qso"),
         "KF9UG K5ARH 73",
+        693.0,
         &pivoted_once
     ));
 
@@ -652,18 +670,29 @@ fn is_pivot_duplicate_flags_only_the_exact_already_sent_frame() {
     assert!(!is_pivot_duplicate(
         Some(qid),
         "KF9UG K5ARH RR73",
+        693.0,
         &pivoted_once
     ));
 
     // Manual / tune (qso_id == None) is never pivoted, so never flagged.
-    assert!(!is_pivot_duplicate(None, "KF9UG K5ARH 73", &pivoted_once));
+    assert!(!is_pivot_duplicate(
+        None,
+        "KF9UG K5ARH 73",
+        693.0,
+        &pivoted_once
+    ));
 
     // Once the tombstone is cleared (as the drop-gate itself does after
     // firing, and as the Step-4b stale-QSO drop does on QSO end), a later
     // legitimate re-send of the identical text is no longer suppressed.
     let mut cleared = pivoted_once.clone();
     cleared.remove(&active_tx_qso_key(qid));
-    assert!(!is_pivot_duplicate(Some(qid), "KF9UG K5ARH 73", &cleared));
+    assert!(!is_pivot_duplicate(
+        Some(qid),
+        "KF9UG K5ARH 73",
+        693.0,
+        &cleared
+    ));
 }
 
 #[test]

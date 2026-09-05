@@ -151,22 +151,36 @@ pub fn tx_pivot_target(
 /// same text. This predicate lets the worker recognize and drop that
 /// duplicate instead of keying PTT a second time for the same message.
 ///
-/// The worker records `(qso_key -> text)` in its own `pivoted_once` map every
-/// time Step 4c successfully pivots (see `tx.rs`); this function is the pure
-/// membership check against that map. Returns `false` for `qso_id == None`
-/// (manual / tune / test-TX are never pivoted, so this never applies to
-/// them) and for any request whose text does not exactly match the recorded
-/// pivot text (a genuinely new / different message is never suppressed).
+/// The worker records `(qso_key -> (text, frequency_offset))` in its own
+/// `pivoted_once` map every time Step 4c successfully pivots (see `tx.rs`);
+/// this function is the pure membership check against that map. Returns
+/// `false` for `qso_id == None` (manual / tune / test-TX are never pivoted,
+/// so this never applies to them) and for any request whose text OR
+/// frequency does not exactly match the recorded pivot (a genuinely new /
+/// different message — including a same-text stuck-DX frequency hop — is
+/// never suppressed).
+///
+/// PAN-73 round 6 (Codex): frequency is part of the tombstone identity for
+/// the same reason `classify_incoming_during_tx`'s same-QSO duplicate check
+/// is (see that function's doc comment) — a stuck-DX retry that keeps the
+/// rendered text but hops to a new offset must not be swallowed here as the
+/// stale old-offset request, or the transmission stays on the collision
+/// frequency the hop was trying to avoid. Text-only comparison would match
+/// this hop and drop it before `classify_incoming_during_tx`'s OWN
+/// frequency-aware comparison is ever reached (this check runs first).
 pub fn is_pivot_duplicate(
     qso_id: Option<&str>,
     text: &str,
-    pivoted_once: &HashMap<String, String>,
+    frequency_offset: f64,
+    pivoted_once: &HashMap<String, (String, f64)>,
 ) -> bool {
     let Some(id) = qso_id else {
         return false;
     };
     match pivoted_once.get(&active_tx_qso_key(id)) {
-        Some(pivoted_text) => pivoted_text == text,
+        Some((pivoted_text, pivoted_freq)) => {
+            pivoted_text == text && *pivoted_freq == frequency_offset
+        }
         None => false,
     }
 }
@@ -187,11 +201,15 @@ pub fn is_pivot_duplicate(
 /// [`active_tx_qso_key`]`(id)` whose `message_text` differs from the item's
 /// current `message_text`, the item's `message_text` AND `frequency_offset`
 /// are replaced with the intent's values, and `(active_tx_qso_key(id),
-/// new_text)` is recorded in the returned pivot list. An item with `qso_id:
-/// None` (manual / tune / test-TX), an item whose intent text MATCHES its
-/// current text (not a genuine advance), or an item with no intent entry at
-/// all passes through completely unchanged and is never reported as a
-/// pivot — mirroring `tx_pivot_target`'s exact "differs → `Some`" semantics.
+/// new_text, new_frequency_offset)` is recorded in the returned pivot list
+/// — PAN-73 round 6 (Codex): the frequency is part of the pivot's identity,
+/// same as `is_pivot_duplicate`'s tombstone comparison this list feeds, so a
+/// same-text stuck-DX frequency hop can't be mistaken for the pivoted
+/// content. An item with `qso_id: None` (manual / tune / test-TX), an item
+/// whose intent text MATCHES its current text (not a genuine advance), or
+/// an item with no intent entry at all passes through completely unchanged
+/// and is never reported as a pivot — mirroring `tx_pivot_target`'s exact
+/// "differs → `Some`" semantics.
 ///
 /// Returns `(all_items_with_pivots_applied, list_of_what_was_pivoted)`.
 pub fn pivot_bundle_items(
@@ -199,7 +217,7 @@ pub fn pivot_bundle_items(
     latest: &HashMap<String, LatestTxIntent>,
 ) -> (
     Vec<crate::message_bus::TransmitRequestItem>,
-    Vec<(String, String)>,
+    Vec<(String, String, f64)>,
 ) {
     let mut pivots = Vec::new();
     let pivoted_items = items
@@ -217,7 +235,7 @@ pub fn pivot_bundle_items(
                 );
                 item.message_text = intent.message_text;
                 item.frequency_offset = intent.frequency_offset;
-                pivots.push((key, item.message_text.clone()));
+                pivots.push((key, item.message_text.clone(), item.frequency_offset));
             }
             item
         })
@@ -2426,25 +2444,48 @@ mod pivot_duplicate_tests {
     use super::{active_tx_qso_key, is_pivot_duplicate};
     use std::collections::HashMap;
 
-    /// A subsequent request for the same qso_id + identical text as an
-    /// already-recorded pivot is recognized as the stale duplicate that
-    /// caused the double-PTT bug.
+    /// A subsequent request for the same qso_id + identical text and
+    /// frequency as an already-recorded pivot is recognized as the stale
+    /// duplicate that caused the double-PTT bug.
     #[test]
     fn identical_text_after_pivot_is_duplicate() {
-        let mut pivoted_once: HashMap<String, String> = HashMap::new();
-        pivoted_once.insert(active_tx_qso_key("qso-a"), "KF9UG K5ARH 73".to_string());
+        let mut pivoted_once: HashMap<String, (String, f64)> = HashMap::new();
+        pivoted_once.insert(
+            active_tx_qso_key("qso-a"),
+            ("KF9UG K5ARH 73".to_string(), 693.0),
+        );
 
         assert!(is_pivot_duplicate(
             Some("qso-a"),
             "KF9UG K5ARH 73",
+            693.0,
             &pivoted_once
         ));
         // Case/whitespace-insensitive key match, matching active_tx_qso_key.
         assert!(is_pivot_duplicate(
             Some("QSO-a "),
             "KF9UG K5ARH 73",
+            693.0,
             &pivoted_once
         ));
+    }
+
+    /// PAN-73 round 6 (Codex): a same-QSO, same-text request at a DIFFERENT
+    /// frequency (a stuck-DX collision-avoidance hop) is NOT a duplicate —
+    /// frequency is part of the tombstone identity, same as
+    /// `classify_incoming_during_tx`'s own frequency-aware duplicate check.
+    #[test]
+    fn same_text_different_frequency_is_not_duplicate() {
+        let mut pivoted_once: HashMap<String, (String, f64)> = HashMap::new();
+        pivoted_once.insert(
+            active_tx_qso_key("qso-a"),
+            ("KF9UG K5ARH 73".to_string(), 693.0),
+        );
+
+        assert!(
+            !is_pivot_duplicate(Some("qso-a"), "KF9UG K5ARH 73", 993.0, &pivoted_once),
+            "a hopped frequency must not be swallowed as the stale tombstone"
+        );
     }
 
     /// A genuinely fresh keep-call re-send is NOT flagged as a duplicate:
@@ -2453,13 +2494,17 @@ mod pivot_duplicate_tests {
     /// transmit normally.
     #[test]
     fn fresh_resend_not_flagged_duplicate() {
-        let mut pivoted_once: HashMap<String, String> = HashMap::new();
-        pivoted_once.insert(active_tx_qso_key("qso-a"), "KF9UG K5ARH 73".to_string());
+        let mut pivoted_once: HashMap<String, (String, f64)> = HashMap::new();
+        pivoted_once.insert(
+            active_tx_qso_key("qso-a"),
+            ("KF9UG K5ARH 73".to_string(), 693.0),
+        );
 
         // Different qso_id, same text: not a duplicate.
         assert!(!is_pivot_duplicate(
             Some("qso-b"),
             "KF9UG K5ARH 73",
+            693.0,
             &pivoted_once
         ));
 
@@ -2468,6 +2513,7 @@ mod pivot_duplicate_tests {
         assert!(!is_pivot_duplicate(
             Some("qso-a"),
             "KF9UG K5ARH RR73",
+            693.0,
             &pivoted_once
         ));
 
@@ -2479,6 +2525,7 @@ mod pivot_duplicate_tests {
         assert!(!is_pivot_duplicate(
             Some("qso-a"),
             "KF9UG K5ARH 73",
+            693.0,
             &cleared
         ));
     }
@@ -2487,18 +2534,27 @@ mod pivot_duplicate_tests {
     /// never be flagged as a pivot duplicate either.
     #[test]
     fn no_qso_id_never_duplicate() {
-        let mut pivoted_once: HashMap<String, String> = HashMap::new();
-        pivoted_once.insert(active_tx_qso_key("qso-a"), "CQ K5ARH EM10".to_string());
-        assert!(!is_pivot_duplicate(None, "CQ K5ARH EM10", &pivoted_once));
+        let mut pivoted_once: HashMap<String, (String, f64)> = HashMap::new();
+        pivoted_once.insert(
+            active_tx_qso_key("qso-a"),
+            ("CQ K5ARH EM10".to_string(), 700.0),
+        );
+        assert!(!is_pivot_duplicate(
+            None,
+            "CQ K5ARH EM10",
+            700.0,
+            &pivoted_once
+        ));
     }
 
     /// No prior pivot recorded for this qso_id → not a duplicate.
     #[test]
     fn no_prior_pivot_not_duplicate() {
-        let pivoted_once: HashMap<String, String> = HashMap::new();
+        let pivoted_once: HashMap<String, (String, f64)> = HashMap::new();
         assert!(!is_pivot_duplicate(
             Some("qso-a"),
             "KF9UG K5ARH 73",
+            693.0,
             &pivoted_once
         ));
     }
@@ -2508,29 +2564,31 @@ mod pivot_duplicate_tests {
     /// `MessageType::MultiTransmitRequest` arm) rather than to a single
     /// request. Simulates that per-item filter directly: a `pivoted_once`
     /// map pre-populated from a prior bundle-arm pivot (SM2LIY's key ->
-    /// its already-sent "73" text), and a subsequent bundle containing an
-    /// item with that exact (qso_id, text) alongside an unrelated item —
-    /// the filter must drop only the duplicate and keep the other item.
+    /// its already-sent "73" text and frequency), and a subsequent bundle
+    /// containing an item with that exact (qso_id, text, frequency)
+    /// alongside an unrelated item — the filter must drop only the
+    /// duplicate and keep the other item.
     #[test]
     fn bundle_filter_drops_only_the_matching_duplicate_item() {
-        let mut pivoted_once: HashMap<String, String> = HashMap::new();
+        let mut pivoted_once: HashMap<String, (String, f64)> = HashMap::new();
         pivoted_once.insert(
             active_tx_qso_key("sm2liy-qso"),
-            "SM2LIY K5ARH 73".to_string(),
+            ("SM2LIY K5ARH 73".to_string(), 693.0),
         );
 
-        // (qso_id, message_text) pairs standing in for a bundle's items.
-        let bundle: Vec<(Option<&str>, &str)> = vec![
-            (Some("sm2liy-qso"), "SM2LIY K5ARH 73"),
-            (Some("c6avd-qso"), "C6AVD K5ARH EM10"),
+        // (qso_id, message_text, frequency_offset) triples standing in for
+        // a bundle's items.
+        let bundle: Vec<(Option<&str>, &str, f64)> = vec![
+            (Some("sm2liy-qso"), "SM2LIY K5ARH 73", 693.0),
+            (Some("c6avd-qso"), "C6AVD K5ARH EM10", 1728.0),
         ];
 
         let kept: Vec<_> = bundle
             .into_iter()
-            .filter(|(qso_id, text)| !is_pivot_duplicate(*qso_id, text, &pivoted_once))
+            .filter(|(qso_id, text, freq)| !is_pivot_duplicate(*qso_id, text, *freq, &pivoted_once))
             .collect();
 
-        assert_eq!(kept, vec![(Some("c6avd-qso"), "C6AVD K5ARH EM10")]);
+        assert_eq!(kept, vec![(Some("c6avd-qso"), "C6AVD K5ARH EM10", 1728.0)]);
     }
 }
 
@@ -2571,7 +2629,11 @@ mod pivot_bundle_tests {
         assert_eq!(pivoted[0].frequency_offset, 693.0);
         assert_eq!(
             pivots,
-            vec![(active_tx_qso_key("qso-a"), "SM2LIY K5ARH 73".to_string())]
+            vec![(
+                active_tx_qso_key("qso-a"),
+                "SM2LIY K5ARH 73".to_string(),
+                693.0
+            )]
         );
     }
 
@@ -2648,7 +2710,8 @@ mod pivot_bundle_tests {
             pivots,
             vec![(
                 active_tx_qso_key("sm2liy-qso"),
-                "SM2LIY K5ARH 73".to_string()
+                "SM2LIY K5ARH 73".to_string(),
+                693.0
             )]
         );
     }
