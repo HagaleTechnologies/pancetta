@@ -456,6 +456,21 @@ pub struct DuplicateCheckConfig {
     pub check_band: bool,
 }
 
+/// What an in-progress QSO's stall-detection (PAN-72) wants done about its
+/// TX offset. Emitted by `QsoManager` as `QsoEvent::TxOffsetActionNeeded`;
+/// resolved and committed by the coordinator (see
+/// `docs/superpowers/specs/2026-09-04-pan-72-adaptive-tx-offset-design.md`)
+/// since only `AutonomousOperator` may call the smart allocator.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum OffsetAction {
+    /// We're on the last known-good offset (or none is recorded yet) — find
+    /// a new one, avoiding this one.
+    Switch { avoid_hz: f64 },
+    /// We stalled again on a previously-switched offset — go back to the one
+    /// that was last confirmed working, no allocator call needed.
+    Revert { target_hz: f64 },
+}
+
 /// QSO event notifications
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QsoEvent {
@@ -527,6 +542,13 @@ pub enum QsoEvent {
         from_callsign: Option<String>,
         to_callsign: Option<String>,
     },
+
+    /// PAN-72: an in-progress QSO's TX offset needs an autonomous action
+    /// (Auto TX-freq mode only — see `QsoManager::rearm_manual_calls_at`).
+    /// The coordinator resolves `OffsetAction::Switch` via the smart
+    /// allocator and commits either variant via
+    /// `QsoManager::apply_tx_offset_switch`.
+    TxOffsetActionNeeded { qso_id: QsoId, action: OffsetAction },
 }
 
 /// Routing verdict plus an optional security classification.
@@ -5693,6 +5715,14 @@ mod tests {
             out.push(ev);
         }
         out
+    }
+
+    #[test]
+    fn offset_action_switch_and_revert_are_distinct() {
+        let switch = OffsetAction::Switch { avoid_hz: 1500.0 };
+        let revert = OffsetAction::Revert { target_hz: 1200.0 };
+        assert_ne!(switch, revert);
+        assert_eq!(switch, OffsetAction::Switch { avoid_hz: 1500.0 });
     }
 
     #[test]

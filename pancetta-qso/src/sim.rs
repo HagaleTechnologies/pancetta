@@ -1377,6 +1377,11 @@ impl Sim {
                 // Security rejections are observability-only and cause no state
                 // change, so the simulated timeline is unaffected.
             }
+            QsoEvent::TxOffsetActionNeeded { .. } => {
+                // PAN-72: nothing emits this yet (Task 4), and the coordinator
+                // (not the sim harness) resolves it (Task 8) — no timeline
+                // effect to record here.
+            }
         }
     }
 
