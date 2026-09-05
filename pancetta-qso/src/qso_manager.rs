@@ -617,7 +617,9 @@ pub struct QsoManager {
     split_tx_frequency_hz: Arc<AtomicU64>,
 
     /// Operator TX-frequency mode (`pancetta_core::TxFreqMode` as `u8`), shared
-    /// from the coordinator. The stuck-DX TX-offset hop only fires in `Auto`
+    /// from the coordinator. The silence-driven stall detector (`stall_cycles`
+    /// counted in `rearm_manual_calls_at`, emitting
+    /// `QsoEvent::TxOffsetActionNeeded` at threshold) only fires in `Auto`
     /// mode; in the default `Hold` mode the operator's picked offset is sticky
     /// and never moved autonomously. Defaults to a private `Hold` atomic so
     /// unit tests and any caller that never injects a source keep the
@@ -827,8 +829,9 @@ impl QsoManager {
             database: None,
             dial_frequency_hz: Arc::new(AtomicU64::new(0)),
             split_tx_frequency_hz: Arc::new(AtomicU64::new(0)),
-            // Default Hold: the stuck-DX hop stays off unless the coordinator
-            // injects a shared mode atomic and the operator switches to Auto.
+            // Default Hold: the silence-driven stall detector stays off unless
+            // the coordinator injects a shared mode atomic and the operator
+            // switches to Auto.
             tx_freq_mode: Arc::new(std::sync::atomic::AtomicU8::new(
                 pancetta_core::TxFreqMode::Hold.as_u8(),
             )),
@@ -851,7 +854,8 @@ impl QsoManager {
         self.split_tx_frequency_hz = source;
     }
 
-    /// Share the coordinator's TX-frequency-mode atomic so the stuck-DX hop
+    /// Share the coordinator's TX-frequency-mode atomic so the silence-driven
+    /// stall detector (`stall_cycles` → `QsoEvent::TxOffsetActionNeeded`)
     /// respects the operator's Hold/Auto choice at runtime. Pass the same
     /// `Arc<AtomicU8>` the TUI toggle updates (encoded via
     /// [`pancetta_core::TxFreqMode::as_u8`]). If never called, the manager keeps
@@ -2741,10 +2745,13 @@ impl QsoManager {
 
         // Did this received frame advance us up the responder ladder? Computed
         // here (before `old_state`/`new_state` are moved into emit_state_change)
-        // for the stuck-DX detector below. Off-ladder advances (CQer flow) read
-        // as `false`, which is harmless: the detector's identical-text guard
-        // means a genuinely-progressing QSO (whose DX frames change each step)
-        // never accumulates repeats regardless.
+        // for the forward-advance tracking below, which resets `stall_cycles`
+        // and records `last_known_good_offset_hz` on a real advance. Off-ladder
+        // advances (CQer flow) read as `false`, which is harmless: `stall_cycles`
+        // is driven purely by `rearm_manual_calls_at`'s silence check (a real
+        // per-slot re-send with no DX response), not by inspecting this frame's
+        // content, so a non-advancing frame here just leaves the counter to
+        // keep accumulating rather than being falsely reset.
         let dx_frame_advanced = Self::ladder_rank(&new_state) > Self::ladder_rank(&old_state);
 
         // Hound QSY gate: computed here while both `old_state` and `new_state`
@@ -3013,11 +3020,15 @@ impl QsoManager {
             //
             // Fires exactly once per QSO (`hound_qsyed` gate). Executes
             // INDEPENDENT of `TxFreqMode` (procedure-mandated, not an
-            // autonomous optimisation — unlike the Auto-gated stuck-hop above).
+            // autonomous optimisation — unlike the Auto-gated silence stall
+            // detector above, which only fires in `TxFreqMode::Auto`).
             //
-            // Pattern mirrors the stuck-hop: mutate BOTH `metadata.frequency`
-            // (used as `qso_frequency` on the NEXT process_message call) AND
-            // `qso_frequency` (rides the ReportAck emitted this cycle). We also
+            // This mutates BOTH `metadata.frequency` (used as `qso_frequency`
+            // on the NEXT process_message call) AND `qso_frequency` (rides the
+            // ReportAck emitted this cycle) directly, inline, here — unlike the
+            // stall detector above, which never mutates frequency itself; it
+            // only emits `QsoEvent::TxOffsetActionNeeded` for the coordinator's
+            // `apply_tx_offset_switch` to resolve. We also
             // update the frequency field inside the already-set `SendingReport`
             // state so the subsequent `Completed` state (built from
             // `SendingReport.frequency` on the Fox RR73 arm) logs our actual
@@ -14620,14 +14631,15 @@ mod hound_tests {
     /// T5-2: QSY fires even in `TxFreqMode::Hold`.
     ///
     /// The Hound QSY is procedure-mandated — independent of the autonomous
-    /// stuck-hop gate (`TxFreqMode::Auto`). In the default Hold mode the
-    /// operator's TX offset is "sticky" for the stuck-hop, but the Hound QSY
-    /// MUST still move to the response region on the Fox's first report.
+    /// silence-driven stall detector's gate (`TxFreqMode::Auto`). In the
+    /// default Hold mode the operator's TX offset is "sticky" for the stall
+    /// detector, but the Hound QSY MUST still move to the response region on
+    /// the Fox's first report.
     #[tokio::test]
     async fn hound_qsy_fires_in_hold_mode() {
         // Default manager uses Hold (the tx_freq_mode default is Hold).
         let manager = QsoManager::new(hound_test_config());
-        // Confirm it is in Hold mode (the stuck-hop would NOT fire in this mode).
+        // Confirm it is in Hold mode (the stall detector would NOT fire in this mode).
         // We do NOT set_tx_freq_mode_source to Auto — leave it as Hold.
 
         let qso_id = manager
