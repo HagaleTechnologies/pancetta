@@ -1159,6 +1159,16 @@ impl super::ApplicationCoordinator {
         // push-mailbox shape as `pending_autonomous_cq_dispatch_failures`
         // above.
         let pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
+        // PAN-72: the `u` "nudge" keystroke's CQ-hunting fallback (no QSO
+        // active at dispatch time) -- a one-shot flag the tui_relay task
+        // sets; drained here once per `slot_interval` tick, alongside
+        // `pending_qso_offset_requests` above, and forwarded into
+        // `AutonomousOperator::request_manual_switch` (consumed
+        // unconditionally at the top of `decide_at` itself, so this doesn't
+        // need any restart-safety handling of its own -- `op` lives inside
+        // THIS task and is fully re-created on an Autonomous-task restart,
+        // unlike the cross-component `QsoManager` handle above).
+        let pending_cq_offset_nudge = self.pending_cq_offset_nudge.clone();
         // PAN-72 (fixed after task-review Critical finding): the Autonomous
         // task doesn't otherwise hold any `QsoManager` handle. A plain
         // `self.qso_manager_for_supervisor.clone()` here would capture
@@ -1320,6 +1330,19 @@ impl super::ApplicationCoordinator {
                                     &pending_qso_offset_requests,
                                 )
                                 .await;
+                            }
+
+                            // PAN-72: the `u` nudge's CQ-hunting fallback --
+                            // forwarded into `request_manual_switch`, which
+                            // is itself only consumed inside `decide_at`
+                            // (called below via `op.decide()` when
+                            // `auto_config_enabled`). A manual-only operator
+                            // (`auto_config_enabled == false`) simply leaves
+                            // this pending on `op` until decide() actually
+                            // runs again -- not lost, just deferred, same as
+                            // any other field `decide_at` alone consumes.
+                            if pending_cq_offset_nudge.swap(false, Ordering::Relaxed) {
+                                op.request_manual_switch();
                             }
 
                             // Update spectral data from waterfall

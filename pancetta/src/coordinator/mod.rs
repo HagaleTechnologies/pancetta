@@ -709,6 +709,15 @@ pub struct ApplicationCoordinator {
         >,
     >,
 
+    /// PAN-72: one-shot flag set by the TUI's `u` "nudge" keystroke when NO
+    /// QSO is currently active (`active_tx_qsos` empty at dispatch time) --
+    /// the CQ-hunting fallback of `TuiCommand::NudgeTxOffset`. Drained once
+    /// per `slot_interval` tick by the Autonomous task, which forwards it
+    /// into `AutonomousOperator::request_manual_switch`. The "active QSO"
+    /// branch instead feeds `pending_qso_offset_requests` directly (the
+    /// existing Task 8/9 mailbox/drain pipeline) rather than using this flag.
+    pending_cq_offset_nudge: Arc<std::sync::atomic::AtomicBool>,
+
     /// Application state
     is_running: Arc<AtomicBool>,
     shutdown_signal: Arc<AtomicBool>,
@@ -1900,6 +1909,7 @@ impl ApplicationCoordinator {
             station_agent_poll: None,
             pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
             pending_qso_offset_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_cq_offset_nudge: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),

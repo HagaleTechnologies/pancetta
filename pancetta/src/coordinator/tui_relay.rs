@@ -844,6 +844,20 @@ impl super::ApplicationCoordinator {
         // `active_protocol_mode`/`active_slot_ns`/`active_decode_phase_ns` go
         // through their `pub(crate) fn` accessors.
         let cmd_active_tx_qsos = self.active_tx_qsos.clone();
+        // PAN-72: `u` "nudge" keystroke. `cmd_active_tx_offsets` supplies the
+        // current offset (the `avoid_hz` to switch away from) for the
+        // active-QSO branch; the other two feed the SAME mailbox/flag
+        // Task 8/9 built (`pending_qso_offset_requests` is drained by the
+        // Autonomous task via `apply_tx_offset_switch`, same as a stall-
+        // detected switch; `pending_cq_offset_nudge` is drained into
+        // `AutonomousOperator::request_manual_switch` for the CQ-hunting
+        // fallback when no QSO is active) — this relay never holds a
+        // `QsoManager` handle of its own, matching the established
+        // AbortQso/ResendQso pattern of forwarding rather than mutating
+        // QsoManager directly from this task.
+        let cmd_active_tx_offsets = self.active_tx_offsets.clone();
+        let cmd_pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
+        let cmd_pending_cq_offset_nudge = self.pending_cq_offset_nudge.clone();
         let cmd_ft8_config = self.ft8_config.clone();
         let cmd_active_protocol_mode = self.active_protocol_mode();
         let cmd_active_slot_ns = self.active_slot_ns();
@@ -1851,6 +1865,55 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                         }
+                        pancetta_tui::tui_runner::TuiCommand::NudgeTxOffset => {
+                            // PAN-72: prefer an active QSO (force a Switch,
+                            // bypassing stall_cycles -- operator-forced);
+                            // fall back to the CQ-hunting one-shot flag if
+                            // none is active. Does not touch
+                            // tx_freq_mode/tx_offset_hold_hz -- this must
+                            // not leave Auto mode. Actual decision logic
+                            // lives in `resolve_nudge_tx_offset` (directly
+                            // unit-tested); this arm just snapshots
+                            // `active_tx_qsos` and echoes a status line.
+                            let active: std::collections::HashSet<String> = cmd_active_tx_qsos
+                                .read()
+                                .map(|s| s.clone())
+                                .unwrap_or_default();
+                            let switched = resolve_nudge_tx_offset(
+                                &active,
+                                &cmd_active_tx_offsets,
+                                &cmd_pending_qso_offset_requests,
+                                &cmd_pending_cq_offset_nudge,
+                            );
+                            match switched {
+                                Some(qso_id) => {
+                                    info!(
+                                        target: "tx.freq",
+                                        "TUI NudgeTxOffset: forcing offset switch for active QSO {}",
+                                        qso_id
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status: "Nudging active QSO to a new offset"
+                                                .to_string(),
+                                        },
+                                    );
+                                }
+                                None => {
+                                    info!(
+                                        target: "tx.freq",
+                                        "TUI NudgeTxOffset: no active QSO, requesting a CQ-offset nudge"
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status: "Nudging CQ offset (once hunting)".to_string(),
+                                        },
+                                    );
+                                }
+                            }
+                        }
                         pancetta_tui::tui_runner::TuiCommand::StopTx => {
                             // Operator F8: abort the in-flight TX without
                             // exiting. The TX worker's interruptible_sleep
@@ -2774,6 +2837,65 @@ fn map_recent_qso_outcome(
     }
 }
 
+/// PAN-72: resolves and applies one `TuiCommand::NudgeTxOffset` dispatch.
+/// Prefers forcing a `Switch` for whatever QSO is in `active` (feeding the
+/// SAME `pending_qso_offset_requests` mailbox Task 8/9 built — this is NOT
+/// a new commit path, and this relay task never holds a `QsoManager` handle
+/// of its own; the Autonomous task's already-restart-safe `qso_manager_watch`
+/// is what eventually calls `apply_tx_offset_switch`, same as a stall-
+/// detected switch). Falls back to setting `pending_cq_offset_nudge` — a
+/// one-shot flag the Autonomous task forwards into
+/// `AutonomousOperator::request_manual_switch` — when no QSO is active.
+///
+/// Extracted to a plain, synchronously-testable function (mirroring
+/// `tx_qso_is_live`/`should_repark`'s extraction out of the giant spawned
+/// relay/tick-loop task) rather than only being exercised end-to-end through
+/// a live `start_tui_pipeline` task — no such harness exists in this test
+/// module for any existing `TuiCommand` arm (`SetTxOffset`/`ToggleAutonomous`
+/// included), so this keeps the new match arm's actual decision logic
+/// directly unit-testable.
+///
+/// `active_tx_qsos` keys are built via `active_tx_qso_key(&qso_id.to_string())`
+/// (`coordinator/mod.rs`) -- `qso_id.to_string()` on a `QsoId` (`= Uuid`)
+/// followed by `.trim().to_uppercase()`. `Uuid`'s `FromStr`/`parse_str` are
+/// case-insensitive, so `key.parse::<pancetta_qso::QsoId>()` round-trips
+/// this correctly with no separate inverse helper needed -- confirmed by
+/// reading `active_tx_qso_key`'s real definition and its one call site
+/// (`coordinator/qso.rs`), not assumed.
+///
+/// Returns `Some(qso_id)` when the active-QSO branch fired (for the
+/// caller's status echo/logging), `None` for the CQ-hunting fallback.
+fn resolve_nudge_tx_offset(
+    active: &std::collections::HashSet<String>,
+    active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
+    pending_qso_offset_requests: &std::sync::Mutex<
+        Vec<(
+            pancetta_qso::states::QsoId,
+            pancetta_qso::qso_manager::OffsetAction,
+        )>,
+    >,
+    pending_cq_offset_nudge: &std::sync::atomic::AtomicBool,
+) -> Option<pancetta_qso::states::QsoId> {
+    if let Some(key) = active.iter().next() {
+        if let Ok(qso_id) = key.parse::<pancetta_qso::QsoId>() {
+            let current = active_tx_offsets
+                .read()
+                .ok()
+                .and_then(|m| m.get(key).copied())
+                .unwrap_or(1500.0);
+            if let Ok(mut pending) = pending_qso_offset_requests.lock() {
+                pending.push((
+                    qso_id,
+                    pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: current },
+                ));
+            }
+            return Some(qso_id);
+        }
+    }
+    pending_cq_offset_nudge.store(true, Ordering::Relaxed);
+    None
+}
+
 /// The dial frequency (MHz) to stamp on this decode's `DecodedMessageView`.
 ///
 /// PAN-67: this MUST come from the frequency the decode's own audio window
@@ -3178,6 +3300,84 @@ fn spawn_bookmark_mutation_worker(
 mod tui_relay_tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8};
+
+    /// PAN-72: `NudgeTxOffset` with an active QSO must force a `Switch`
+    /// onto the EXISTING `pending_qso_offset_requests` mailbox (Task 8/9's
+    /// pipeline) -- not a new commit path -- and must NOT also set the
+    /// CQ-hunting fallback flag.
+    #[test]
+    fn nudge_forces_switch_for_active_qso() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 920.0)]));
+        let pending_qso_offset_requests: std::sync::Mutex<
+            Vec<(
+                pancetta_qso::states::QsoId,
+                pancetta_qso::qso_manager::OffsetAction,
+            )>,
+        > = std::sync::Mutex::new(Vec::new());
+        let pending_cq_offset_nudge = AtomicBool::new(false);
+
+        let result = resolve_nudge_tx_offset(
+            &active,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(result, Some(qso_id), "must resolve to the active QSO's id");
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1, "exactly one offset request queued");
+        assert_eq!(pending[0].0, qso_id);
+        assert!(
+            matches!(
+                pending[0].1,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } if avoid_hz == 920.0
+            ),
+            "must be a Switch{{avoid_hz}} keyed off the QSO's CURRENT offset, got {:?}",
+            pending[0].1
+        );
+        assert!(
+            !pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "the CQ-hunting fallback flag must NOT be set when an active QSO was nudged"
+        );
+    }
+
+    /// PAN-72: `NudgeTxOffset` with no active QSO must set the one-shot
+    /// `pending_cq_offset_nudge` flag (the CQ-hunting fallback) and must NOT
+    /// touch `pending_qso_offset_requests`.
+    #[test]
+    fn nudge_sets_cq_flag_when_no_active_qso() {
+        let active: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::new());
+        let pending_qso_offset_requests: std::sync::Mutex<
+            Vec<(
+                pancetta_qso::states::QsoId,
+                pancetta_qso::qso_manager::OffsetAction,
+            )>,
+        > = std::sync::Mutex::new(Vec::new());
+        let pending_cq_offset_nudge = AtomicBool::new(false);
+
+        let result = resolve_nudge_tx_offset(
+            &active,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(result, None, "no active QSO to resolve to");
+        assert!(
+            pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "the CQ-hunting fallback flag must be set when no QSO is active"
+        );
+        assert!(
+            pending_qso_offset_requests.lock().unwrap().is_empty(),
+            "must not queue an offset request when there's no active QSO"
+        );
+    }
 
     /// An empty pending slot -- the common case (nothing carried over from
     /// a prior failed teardown replay).
