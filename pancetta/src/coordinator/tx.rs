@@ -292,8 +292,19 @@ pub fn classify_incoming_during_tx(
                 return IncomingDuringTx::Drop;
             }
             // Genuine manual/free-text/tune/test-TX (no qso_id at all) is the
-            // one unambiguous operator-triggered case — always supersedes.
+            // one unambiguous operator-triggered case — supersedes UNLESS
+            // it's byte-identical to an in-flight untracked item's text
+            // (round 2, Codex): an unchanged re-send of the same manual
+            // frame is a no-op, not a fresh override, and treating it as one
+            // needlessly deasserts PTT and restarts (or, past
+            // `tx_late_max_ms`, abandons) the very frame already on the air.
             if qso_id.is_none() {
+                let is_untracked_duplicate = in_flight_items
+                    .iter()
+                    .any(|it| it.qso_id.is_none() && &it.message_text == message_text);
+                if is_untracked_duplicate {
+                    return IncomingDuringTx::Drop;
+                }
                 return IncomingDuringTx::Supersede {
                     text: message_text.clone(),
                     frequency_offset: *frequency_offset,
@@ -8981,6 +8992,48 @@ mod classifier_tests {
                 message_text: "KA1ABC K5ARH R-15".to_string(),
                 frequency_offset: 1500.0,
                 qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+        );
+        assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
+    }
+
+    /// Codex round 2 (PR #346): an untracked (qso_id == None) candidate that
+    /// is byte-identical to an in-flight untracked item's text (e.g. an
+    /// unchanged manual CQ re-arriving) is a no-op, not a fresh override —
+    /// must Drop, not Supersede (which would needlessly deassert PTT and
+    /// restart, or past `tx_late_max_ms` abandon, the very frame on the air).
+    #[test]
+    fn classify_drops_identical_untracked_duplicate_instead_of_superseding() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = transmit_request("CQ K5ARH EM12", None);
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "CQ K5ARH EM12".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: None,
+            }],
+            &pivoted_once,
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Drop),
+            "an unchanged untracked re-send must Drop, not Supersede — got {outcome:?}"
+        );
+    }
+
+    /// A DIFFERENT untracked candidate (distinct text, still qso_id == None)
+    /// must still supersede — only the identical-text case is a no-op.
+    #[test]
+    fn classify_supersedes_different_untracked_text_even_with_an_untracked_item_in_flight() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = transmit_request("CQ K5ARH EM12", None);
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "TEST TEST TEST".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: None,
             }],
             &pivoted_once,
         );
