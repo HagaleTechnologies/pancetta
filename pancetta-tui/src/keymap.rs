@@ -151,6 +151,12 @@ pub const KEYBINDINGS: &[KeyBinding] = &[
         false,
     ),
     kb(
+        "u",
+        "Nudge TX offset now: active QSO or CQ (Auto mode only)",
+        Category::TxControl,
+        false,
+    ),
+    kb(
         "Shift+F",
         "Set dial / split freq (RX MHz + optional TX MHz)",
         Category::TxControl,
