@@ -16,20 +16,6 @@ use tokio::time::{interval, Duration as TokioDuration, Interval};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-/// Consecutive identical-DX-frame count at which an in-progress QSO performs a
-/// one-time TX-frequency hop. The DX repeating the same message this many times
-/// without advancing is the operator's cue that it cannot copy our replies —
-/// most plausibly because something is colliding with us on our held TX offset.
-/// (FT8 receivers decode the entire passband, so our offset is otherwise
-/// irrelevant to whether the DX hears us; we therefore hold it for the QSO
-/// unless this stuck condition trips.)
-pub const DX_STUCK_REPEAT_THRESHOLD: u32 = 4;
-
-/// Amount (Hz) by which a stuck QSO hops its TX audio offset, wrapping within
-/// [`TX_OFFSET_MIN_HZ`, `TX_OFFSET_MAX_HZ`]. Sized to clear a co-channel FT8
-/// signal (50 Hz wide) and its neighbours by a comfortable margin.
-const STUCK_TX_HOP_HZ: f64 = 300.0;
-
 /// Usable FT8 audio passband for our TX offset (Hz). Matches the collision
 /// detector's clamp range in `autonomous.rs`.
 pub const TX_OFFSET_MIN_HZ: f64 = 300.0;
@@ -73,23 +59,6 @@ impl Default for HoundRegions {
             response_max_hz: HOUND_RESPONSE_MAX_HZ,
         }
     }
-}
-
-/// Hop a stuck QSO's TX audio offset by [`STUCK_TX_HOP_HZ`], wrapping back to
-/// the low end of the passband when it would exceed [`TX_OFFSET_MAX_HZ`]. Pure
-/// and deterministic so the move is unit-testable; the goal is simply to vacate
-/// the current offset, not to find a spectrally-optimal one (the engine has no
-/// spectral snapshot — picking a clear frequency is the allocator's job at QSO
-/// open). Inputs are the audio offset (pre dial-frequency stamping).
-fn stuck_hopped_offset(current: f64) -> f64 {
-    let next = current + STUCK_TX_HOP_HZ;
-    if next > TX_OFFSET_MAX_HZ {
-        // Wrap into the low half of the band, preserving the sub-hop remainder.
-        TX_OFFSET_MIN_HZ + (next - TX_OFFSET_MAX_HZ)
-    } else {
-        next
-    }
-    .clamp(TX_OFFSET_MIN_HZ, TX_OFFSET_MAX_HZ)
 }
 
 /// PAN-17: is `callsign` representable in *any* FT8 wire format the encoder
@@ -3022,52 +2991,19 @@ impl QsoManager {
             }
         }
 
-        // Stuck-DX TX-frequency hold/escape (operator request): we hold our TX
-        // offset for the whole QSO so long as it is "working". The cue that it
-        // has stopped working is the DX not advancing the QSO — they aren't
-        // copying our replies, most plausibly a collision on our held offset.
-        // After `DX_STUCK_REPEAT_THRESHOLD` non-advancing cycles we hop our TX
-        // offset once and reset the counter. A forward advance resets the
-        // counter to 0 (the hold is fine). Applies to both Manual and Auto
-        // QSOs.
-        // PAN-72 note: this counting (via `QsoMetadata::stall_cycles`) and the
-        // fixed-offset hop below are superseded by the adaptive TX-offset
-        // switch mechanism landing in a later task of that plan; until then
-        // this generalizes the old identical-frame-repeat check (which relied
-        // on the now-removed `last_rx_text` field) to "did not advance,"
-        // since `dx_frame_advanced` already tells us that directly.
-        // The stuck-DX hop is an autonomous TX-offset change, so it only fires
-        // in Auto mode. In the default Hold mode the operator's picked offset is
-        // sticky — we still TRACK the stall streak (cheap, and ready if they
-        // switch to Auto) but never move the frequency.
-        let tx_auto = pancetta_core::TxFreqMode::from_u8(
-            self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
-        )
-        .allows_auto_change();
-        let rx_text = message.raw_text.trim().to_uppercase();
+        // PAN-72: a genuine forward advance resets the stall streak and
+        // records the offset we were on as "known-good" — the offset a
+        // future stall-triggered Switch/Revert decision reasons about. The
+        // non-advancing case is no longer driven by inspecting incoming
+        // frame content here; `QsoManager::rearm_manual_calls_at` is now the
+        // sole site that increments `QsoMetadata::stall_cycles` (on silence
+        // — a real per-slot re-send with no DX response) and emits
+        // `QsoEvent::TxOffsetActionNeeded` once it trips
+        // `TimeoutConfig::qso_stall_switch_after`.
         if let Some(progress) = qsos.get_mut(&qso_id) {
             if dx_frame_advanced {
                 progress.metadata.stall_cycles = 0;
-            } else if !rx_text.is_empty() {
-                progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_add(1);
-            }
-
-            if tx_auto && progress.metadata.stall_cycles >= DX_STUCK_REPEAT_THRESHOLD {
-                let old_off = progress.metadata.frequency;
-                let new_off = stuck_hopped_offset(old_off);
-                progress.metadata.frequency = new_off;
-                progress.metadata.pending_freq_drift = None;
-                progress.metadata.stall_cycles = 0;
-                // Keep the reply we are about to emit this cycle on the new
-                // offset (the captured `qso_frequency` was the pre-hop value).
-                qso_frequency = new_off;
-                warn!(
-                    target: "tx.freq",
-                    qso_id = %qso_id,
-                    dx = progress.metadata.their_callsign.as_deref().unwrap_or("?"),
-                    "DX stuck (no forward progress x{}) — hopping our TX offset {:.0} Hz -> {:.0} Hz to clear a possible collision",
-                    DX_STUCK_REPEAT_THRESHOLD, old_off, new_off
-                );
+                progress.metadata.last_known_good_offset_hz = Some(progress.metadata.frequency);
             }
 
             // Hound QSY: when the Fox answers with a signal report
@@ -5179,6 +5115,11 @@ impl QsoManager {
             bool,
         )> = Vec::new();
 
+        // PAN-72: TX-offset actions (Switch/Revert) a stall-tripped QSO
+        // needs, collected here and emitted after the write lock below is
+        // dropped — same reason `to_recall` above is collect-then-emit.
+        let mut offset_actions_to_emit: Vec<(QsoId, OffsetAction)> = Vec::new();
+
         {
             let mut qsos = self.qsos.write().await;
             for (&qso_id, progress) in qsos.iter_mut() {
@@ -5292,6 +5233,35 @@ impl QsoManager {
                 progress.metadata.call_count += 1;
                 progress.metadata.last_call_at = Some(now);
 
+                // PAN-72: this real per-slot re-send IS the silence signal —
+                // the DX did not advance the QSO since the last slot, so we
+                // count it against the stall streak. A forward advance
+                // (`process_message_for_qso`) resets this to 0 elsewhere;
+                // this is now the sole increment site (see
+                // `QsoMetadata::stall_cycles`'s doc comment).
+                progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_add(1);
+
+                let tx_auto = pancetta_core::TxFreqMode::from_u8(
+                    self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
+                )
+                .allows_auto_change();
+
+                if tx_auto
+                    && progress.metadata.stall_cycles >= self.config.timeouts.qso_stall_switch_after
+                {
+                    let current = progress.metadata.frequency;
+                    let action = match progress.metadata.last_known_good_offset_hz {
+                        Some(known_good) if (current - known_good).abs() >= f64::EPSILON => {
+                            OffsetAction::Revert {
+                                target_hz: known_good,
+                            }
+                        }
+                        _ => OffsetAction::Switch { avoid_hz: current },
+                    };
+                    progress.metadata.stall_cycles = 0;
+                    offset_actions_to_emit.push((qso_id, action));
+                }
+
                 // Record the re-emitted call as a Sent message so the TUI's
                 // last-TX line and activity counter advance during keep-calling
                 // (UX audit Batch 2 — the panel previously froze because rearm
@@ -5330,6 +5300,11 @@ impl QsoManager {
                 remote_origin,
             })
             .await;
+        }
+
+        for (qso_id, action) in offset_actions_to_emit {
+            self.emit_event(QsoEvent::TxOffsetActionNeeded { qso_id, action })
+                .await;
         }
     }
 
@@ -13516,14 +13491,16 @@ mod sm_f5_qso_failed_event_tests {
 }
 
 #[cfg(test)]
-mod stuck_dx_tests {
-    //! Mid-QSO TX-frequency hold + stuck-DX escape (operator request).
-    //!
-    //! We hold the QSO's latched TX audio offset for the whole exchange so long
-    //! as it is "working" (the DX keeps advancing). The escape: when the DX
-    //! repeats the *same* frame `DX_STUCK_REPEAT_THRESHOLD` times without
-    //! advancing — they can't copy our replies, most plausibly a collision on
-    //! our offset — we hop the offset once and keep going.
+mod tx_frequency_hold_tests {
+    //! Mid-QSO TX-frequency hold (operator request): we hold the QSO's
+    //! latched TX audio offset for the whole exchange so long as it is
+    //! "working" (the DX keeps advancing) — offset is otherwise irrelevant
+    //! to whether the DX hears us, since FT8 receivers decode the whole
+    //! passband. What happens once it *stops* working (the DX stalls) is
+    //! `pan72_stall_detection_tests`, not this module — this module
+    //! previously also covered the fixed +300Hz repeat-frame "stuck-DX hop"
+    //! escape mechanism, removed by PAN-72 in favor of the silence-driven
+    //! stall detector there.
     use super::*;
 
     const OUR: &str = "K5ARH";
@@ -13541,15 +13518,6 @@ mod stuck_dx_tests {
             hound: HoundRegions::default(),
             active_mode: "FT8".to_string(),
         })
-    }
-
-    /// Manager in Auto TX-freq mode (the stuck-DX hop is active).
-    fn manager_auto() -> QsoManager {
-        let mut m = manager();
-        m.set_tx_freq_mode_source(Arc::new(std::sync::atomic::AtomicU8::new(
-            pancetta_core::TxFreqMode::Auto.as_u8(),
-        )));
-        m
     }
 
     async fn freq_of(manager: &QsoManager, id: QsoId) -> f64 {
@@ -13570,23 +13538,6 @@ mod stuck_dx_tests {
             )
             .await
             .unwrap();
-    }
-
-    #[test]
-    fn stuck_hop_adds_offset_then_wraps_within_band() {
-        assert_eq!(super::stuck_hopped_offset(1500.0), 1800.0);
-        // Near the top of the band it wraps into the low half.
-        let hop = super::stuck_hopped_offset(2600.0);
-        assert!(
-            (super::TX_OFFSET_MIN_HZ..=super::TX_OFFSET_MAX_HZ).contains(&hop),
-            "hop {hop} must stay in band"
-        );
-        assert!(hop < 2600.0, "a wrap must land below the starting offset");
-        // Always inside the usable passband.
-        for f in [300.0, 1000.0, 2699.0, 2700.0] {
-            let h = super::stuck_hopped_offset(f);
-            assert!((super::TX_OFFSET_MIN_HZ..=super::TX_OFFSET_MAX_HZ).contains(&h));
-        }
     }
 
     /// A normal advancing exchange holds the TX frequency unchanged.
@@ -13618,105 +13569,6 @@ mod stuck_dx_tests {
         assert_eq!(freq_of(&manager, id).await, FREQ, "held through the QSO");
     }
 
-    /// The DX repeating the SAME non-advancing frame trips the hop exactly at
-    /// the threshold — not before.
-    #[tokio::test]
-    async fn identical_repeats_hop_tx_frequency_at_threshold() {
-        let manager = manager_auto();
-        let id = manager
-            .respond_to_cq_manual(DX.into(), FREQ, None)
-            .await
-            .unwrap();
-
-        // First report advances RespondingToCq → SendingReport (resets counter).
-        let same = format!("{OUR} {DX} -07");
-        send_report(&manager, -7, &same).await;
-        assert_eq!(freq_of(&manager, id).await, FREQ);
-
-        // Now the DX re-sends the identical report. Each repeat is non-advancing
-        // (stays SendingReport). The hop fires on the DX_STUCK_REPEAT_THRESHOLD-th
-        // identical repeat.
-        for i in 1..DX_STUCK_REPEAT_THRESHOLD {
-            send_report(&manager, -7, &same).await;
-            assert_eq!(
-                freq_of(&manager, id).await,
-                FREQ,
-                "must still hold before the threshold (repeat {i})"
-            );
-        }
-        send_report(&manager, -7, &same).await;
-        assert_eq!(
-            freq_of(&manager, id).await,
-            stuck_hopped_offset(FREQ),
-            "the threshold-th identical repeat must hop the TX offset"
-        );
-    }
-
-    /// PAN-72 interim behavior: in Auto mode, a DX sending DIFFERENT
-    /// non-advancing frames (not identical, not empty/silent) now ALSO trips
-    /// the hop at the threshold — the counter (`stall_cycles`) increments on
-    /// any non-advancing frame regardless of content, not just identical
-    /// repeats as before this task's refactor. This is a deliberate, asserted
-    /// broadening of when Auto-mode QSOs get their TX offset moved by this
-    /// (still-live, pending-Task-4-removal) mechanism; see the PAN-72 note
-    /// above `DX_STUCK_REPEAT_THRESHOLD`'s use in `process_message`.
-    #[tokio::test]
-    async fn changing_frames_hop_tx_frequency_at_threshold_in_auto_mode() {
-        let manager = manager_auto();
-        let id = manager
-            .respond_to_cq_manual(DX.into(), FREQ, None)
-            .await
-            .unwrap();
-
-        // First report advances RespondingToCq → SendingReport (resets counter).
-        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
-        assert_eq!(freq_of(&manager, id).await, FREQ);
-
-        // Now the DX sends a DIFFERENT non-advancing frame each cycle (toggling
-        // report values), never repeating the same text twice. Each is still
-        // non-advancing (stays SendingReport). Under the OLD semantics
-        // (identical-frame-only counting) this would never hop; under the new
-        // stall_cycles semantics it hops on the threshold-th non-advancing
-        // cycle regardless of content change.
-        for i in 1..DX_STUCK_REPEAT_THRESHOLD {
-            let r = -7 - (i as i8 % 2); // toggles -07 / -08, never repeats
-            send_report(&manager, r, &format!("{OUR} {DX} {r:03}")).await;
-            assert_eq!(
-                freq_of(&manager, id).await,
-                FREQ,
-                "must still hold before the threshold (cycle {i})"
-            );
-        }
-        let r = -7 - (DX_STUCK_REPEAT_THRESHOLD as i8 % 2);
-        send_report(&manager, r, &format!("{OUR} {DX} {r:03}")).await;
-        assert_eq!(
-            freq_of(&manager, id).await,
-            stuck_hopped_offset(FREQ),
-            "the threshold-th non-advancing cycle must hop the TX offset even \
-             though the frame content kept changing (PAN-72 broadened semantics)"
-        );
-    }
-
-    /// In the default Hold mode the operator's offset is sticky: even a clearly
-    /// stuck DX (identical frame well past the threshold) never moves it.
-    #[tokio::test]
-    async fn hold_mode_never_hops_even_when_stuck() {
-        let manager = manager(); // default Hold
-        let id = manager
-            .respond_to_cq_manual(DX.into(), FREQ, None)
-            .await
-            .unwrap();
-        let same = format!("{OUR} {DX} -07");
-        for _ in 0..(DX_STUCK_REPEAT_THRESHOLD * 2 + 1) {
-            send_report(&manager, -7, &same).await;
-            assert_eq!(
-                freq_of(&manager, id).await,
-                FREQ,
-                "Hold mode must never move the TX offset"
-            );
-        }
-    }
-
     #[test]
     fn effective_tx_dial_simplex_and_split() {
         // Simplex: split == 0 → use RX dial.
@@ -13738,29 +13590,306 @@ mod stuck_dx_tests {
             super::effective_tx_dial(rx.load(Ordering::Relaxed), split.load(Ordering::Relaxed));
         assert_eq!(dial, 14_074_000);
     }
+}
 
-    /// A *different* non-advancing frame resets the streak, so alternating
-    /// frames never trip the hop.
+#[cfg(test)]
+mod pan72_stall_detection_tests {
+    //! PAN-72: silence-driven stall detection + Switch/Revert event emission.
+    //!
+    //! Replaces the old identical/differing-frame `DX_STUCK_REPEAT_THRESHOLD`
+    //! hop (see the deleted `stuck_dx_tests` cases) with a single counter
+    //! (`QsoMetadata::stall_cycles`) incremented solely by
+    //! `QsoManager::rearm_manual_calls_at` on each real per-slot re-send —
+    //! i.e. driven by *silence* (the DX not responding this slot), not by
+    //! inspecting incoming frame content. A genuine forward advance resets
+    //! the counter and records the current offset as
+    //! `QsoMetadata::last_known_good_offset_hz`. When the counter trips
+    //! `TimeoutConfig::qso_stall_switch_after` (Auto TX-freq mode only), the
+    //! manager emits `QsoEvent::TxOffsetActionNeeded`: `Switch` if we're
+    //! still on the known-good offset (or none is recorded yet), `Revert` if
+    //! we're on some other (previously-switched) offset.
+    use super::*;
+
+    const OUR: &str = "K5ARH";
+    const DX: &str = "K9ZZ";
+    const FREQ: f64 = 1500.0;
+
+    fn test_config() -> QsoManagerConfig {
+        QsoManagerConfig {
+            our_callsign: OUR.into(),
+            our_grid: Some("EM12".into()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
+            active_mode: default_active_mode(),
+        }
+    }
+
+    /// Manager in Auto TX-freq mode (autonomous offset actions enabled).
+    fn manager_auto(config: QsoManagerConfig) -> QsoManager {
+        let mut m = QsoManager::new(config);
+        m.set_tx_freq_mode_source(Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        m
+    }
+
+    fn drain(rx: &mut broadcast::Receiver<QsoEvent>) -> Vec<QsoEvent> {
+        let mut out = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            out.push(ev);
+        }
+        out
+    }
+
+    /// DX sends us a plain signal report — a genuine forward advance from
+    /// `RespondingToCq` to `SendingReport` (their_report: None rung).
+    async fn send_report(manager: &QsoManager, report: i8, text: &str) {
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report,
+                },
+                text.to_string(),
+                FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Two silent rearm cycles (threshold = 2) on an Auto, tx_freq_mode=Auto
+    /// QSO must increment `stall_cycles` and, on the threshold-hitting cycle,
+    /// emit `TxOffsetActionNeeded::Switch` (no known-good offset recorded
+    /// yet, so we're "on" it vacuously).
+    ///
+    /// Uses a Manual-initiated QSO (`respond_to_cq_manual`) so the rearm
+    /// loop's `manual_call_max_calls` bound (25, not the 2-call
+    /// `AUTO_RESEND_MAX_CALLS` cap for `CallInitiation::Auto` QSOs) doesn't
+    /// retire the QSO's resend eligibility before two rearm cycles complete
+    /// — "Auto" here refers to `TxFreqMode`, not `CallInitiation`, mirroring
+    /// the old (deleted) `stuck_dx_tests::manager_auto` +
+    /// `respond_to_cq_manual` combination.
     #[tokio::test]
-    async fn changing_frames_never_hop() {
-        let manager = manager();
-        let id = manager
+    async fn silence_increments_stall_cycles_via_rearm_and_emits_switch_at_threshold() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager
             .respond_to_cq_manual(DX.into(), FREQ, None)
             .await
             .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // First rearm tick: one slot after the initial call, no DX response.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "one silent rearm cycle must bump stall_cycles to 1"
+        );
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. })),
+            "no action expected before the threshold, got {events:?}"
+        );
+
+        // Second rearm tick: threshold (2) hit -> Switch.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .await;
+
+        let mut saw_switch = false;
+        for event in drain(&mut rx) {
+            if let QsoEvent::TxOffsetActionNeeded {
+                qso_id: id,
+                action: OffsetAction::Switch { avoid_hz },
+            } = event
+            {
+                assert_eq!(id, qso_id);
+                assert!(
+                    (avoid_hz - FREQ).abs() < f64::EPSILON,
+                    "Switch must avoid the current (held) offset"
+                );
+                saw_switch = true;
+            }
+        }
+        assert!(
+            saw_switch,
+            "expected a Switch action after 2 silent rearm cycles"
+        );
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "stall_cycles must reset once the action is emitted"
+        );
+    }
+
+    /// A genuine forward advance resets `stall_cycles` to 0 and records the
+    /// QSO's current offset as `last_known_good_offset_hz`.
+    #[tokio::test]
+    async fn forward_advance_resets_stall_cycles_and_records_known_good_offset() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // One silent rearm cycle: stall_cycles -> 1 (below threshold).
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1
+        );
+
+        // DX genuinely advances the QSO: RespondingToCq -> SendingReport.
         send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
 
-        // Alternate report values for well over the threshold — the text keeps
-        // changing, so the streak never accumulates.
-        for i in 0..(DX_STUCK_REPEAT_THRESHOLD * 3) {
-            let r = -7 - (i as i8 % 2); // toggles -07 / -08
-            send_report(&manager, r, &format!("{OUR} {DX} {r:03}")).await;
-            assert_eq!(
-                freq_of(&manager, id).await,
-                FREQ,
-                "changing frames must never hop (iter {i})"
-            );
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.stall_cycles, 0,
+            "forward advance must reset stall_cycles"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(after.metadata.frequency),
+            "forward advance must record the current offset as known-good"
+        );
+    }
+
+    /// A QSO that stalls a second time on an offset it was already switched
+    /// to (i.e. currently NOT on its recorded known-good offset) must emit
+    /// `Revert { target_hz }` back to the known-good offset, not another
+    /// `Switch`.
+    #[tokio::test]
+    async fn second_stall_on_switched_offset_reverts_to_known_good() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+
+        // Advance once to establish last_known_good_offset_hz = Some(FREQ).
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        let after_advance = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after_advance.metadata.stall_cycles, 0);
+        assert_eq!(after_advance.metadata.last_known_good_offset_hz, Some(FREQ));
+        let entered_at = after_advance.metadata.last_call_at.unwrap();
+        let _ = drain(&mut rx);
+
+        // Two silent rearm cycles on the (still known-good) offset -> Switch.
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(30))
+            .await;
+        let first_action = drain(&mut rx).into_iter().find_map(|e| match e {
+            QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
+            _ => None,
+        });
+        assert_eq!(
+            first_action,
+            Some(OffsetAction::Switch { avoid_hz: FREQ }),
+            "first stall (still on known-good offset) must Switch"
+        );
+
+        // Simulate the coordinator having resolved the Switch by moving us
+        // to a new offset (Task 5's `apply_tx_offset_switch`, not yet
+        // implemented — mutate the test-visible field directly, same
+        // pattern used elsewhere in this file, e.g.
+        // `report_stage_watchdog_retires_compound_partner`).
+        let new_freq = FREQ + 300.0;
+        {
+            let mut qsos = manager.qsos.write().await;
+            qsos.get_mut(&qso_id).unwrap().metadata.frequency = new_freq;
         }
+
+        // Two more silent rearm cycles on the NEW (non-known-good) offset ->
+        // Revert back to the known-good offset, not another Switch.
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(45))
+            .await;
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(60))
+            .await;
+        let second_action = drain(&mut rx).into_iter().find_map(|e| match e {
+            QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
+            _ => None,
+        });
+        assert_eq!(
+            second_action,
+            Some(OffsetAction::Revert { target_hz: FREQ }),
+            "second stall (now off the known-good offset) must Revert, not Switch"
+        );
+    }
+
+    /// In the default Hold mode, `stall_cycles` may still tick (cheap
+    /// tracking) but `TxOffsetActionNeeded` must never be emitted, no matter
+    /// how many silent rearm cycles elapse.
+    #[tokio::test]
+    async fn hold_mode_never_emits_tx_offset_action_needed() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = QsoManager::new(config); // default Hold
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // Well past the threshold (2) worth of silent rearm cycles.
+        for i in 1..=6i64 {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * i))
+                .await;
+        }
+
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. })),
+            "Hold mode must never emit TxOffsetActionNeeded, got {events:?}"
+        );
     }
 }
 
