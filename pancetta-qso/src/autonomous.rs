@@ -564,7 +564,7 @@ impl Default for AutonomousConfig {
             enabled: false,
             slot_parity: SlotParityConfig::Auto,
             cq_after_idle_cycles: 10,
-            cq_no_response_switch_after: 5,
+            cq_no_response_switch_after: 4,
             max_concurrent_qsos: 1,
             tx_offset_hz: 1500.0,
             min_dx_score: 0.3,
@@ -3258,9 +3258,9 @@ mod tests {
     }
 
     #[test]
-    fn autonomous_config_default_cq_no_response_switch_after_is_5() {
+    fn autonomous_config_default_cq_no_response_switch_after_is_4() {
         let config = AutonomousConfig::default();
-        assert_eq!(config.cq_no_response_switch_after, 5);
+        assert_eq!(config.cq_no_response_switch_after, 4);
     }
 
     #[test]

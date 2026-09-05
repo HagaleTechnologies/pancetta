@@ -132,7 +132,8 @@ baud_rate = 38400
 enabled = false            # Master enable. Off by default; opt-in to TX.
 slot_parity = "auto"       # "even", "odd", or "auto"
 cq_after_idle_cycles = 10  # Idle TX cycles before calling CQ (~150 s at 10)
-cq_no_response_switch_after = 5 # Consecutive no-response self-CQs before switching TX frequency (Auto mode only)
+cq_no_response_switch_after = 4 # Consecutive no-response self-CQs before switching TX frequency (Auto mode only)
+qso_stall_switch_after = 4 # Consecutive stalled mid-QSO cycles before switching/reverting TX offset (Auto mode only)
 max_concurrent_qsos = 1    # Cap on simultaneous in-flight QSOs
 tx_offset_hz = 1500.0      # Preferred TX audio offset (100–3000 Hz)
 min_dx_score = 0.3         # Minimum DX score (0–1) to answer a CQ
@@ -146,7 +147,8 @@ dry_run = false            # Log autonomous TX decisions without keying the rig
 | `enabled` | bool | `false` | When false, the autonomous engine never initiates TX. |
 | `slot_parity` | enum | `"auto"` | FT8 alternates even/odd 15 s slots; `auto` picks per conditions. |
 | `cq_after_idle_cycles` | integer | `10` | TX cycles with nothing to do before calling CQ. Must be ≥ 1. |
-| `cq_no_response_switch_after` | integer | `5` | Consecutive self-CQs with zero responses before switching TX frequency. Auto mode only (Hold mode tracks but never acts). Must be ≥ 1. |
+| `cq_no_response_switch_after` | integer | `4` | Consecutive self-CQs with zero responses before switching TX frequency. Auto mode only (Hold mode tracks but never acts). Must be ≥ 1. |
+| `qso_stall_switch_after` | integer | `4` | Consecutive stalled mid-QSO cycles before switching/reverting the QSO's TX offset. Auto mode only. Threaded into `pancetta_qso::QsoManagerConfig::TimeoutConfig::qso_stall_switch_after` by the coordinator. Must be ≥ 1. |
 | `max_concurrent_qsos` | integer | `1` | Simultaneous in-flight QSOs (multi-stream TX). Must be ≥ 1. |
 | `tx_offset_hz` | float | `1500.0` | Validated to 100–3000 Hz. |
 | `min_dx_score` | float | `0.3` | 0.0–1.0. Decoded CQs scoring below this are not answered. |
