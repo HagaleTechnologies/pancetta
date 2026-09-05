@@ -201,6 +201,18 @@ pub enum IncomingDuringTx {
     /// Not a genuine new request — either an exact-content repeat of what's
     /// already in flight, or a stale pivot-tombstone duplicate. Discard.
     Drop,
+    /// PAN-73 round 2 (Codex): a request for a QSO that is NOT any of the
+    /// in-flight items. Neither "kill the good in-flight TX for this" (the
+    /// original bug) nor "discard it forever" (round-1's own regression —
+    /// see the doc comment below) is safe, since today's data model cannot
+    /// tell an operator's deliberate action for a not-currently-keyed QSO
+    /// apart from another QSO's own routine autonomous message — both are a
+    /// `TransmitRequest`/`MultiTransmitRequest` with `qso_id: Some(..)` and
+    /// no other provenance. Siphon it (same mechanism as a non-candidate
+    /// message, e.g. a `TuneRequest`) so it's re-enqueued in arrival order
+    /// once this wait ends and picked up on the worker's very next dequeue
+    /// — not lost, just not instant.
+    Requeue,
     /// A genuinely different request. Abort the in-flight transmission and
     /// attempt to re-key with this content.
     Supersede {
@@ -214,10 +226,13 @@ pub enum IncomingDuringTx {
 /// Manual-trigger / same-QSO classifier: a request arriving while another is
 /// in flight supersedes it only when it is a genuine manual/free-text
 /// request (`qso_id == None` — operator CQ, tune, test-TX) or a fresher
-/// message for the SAME QSO already being transmitted. It is dropped when
-/// it is an exact duplicate (identical text), a recognized pivot-tombstone
-/// (`is_pivot_duplicate`), or — PAN-73 — belongs to a DIFFERENT QSO than the
-/// one in flight.
+/// message for one of the QSOs already being transmitted (single in-flight
+/// item for the single-TX arm, or any item of the in-flight bundle for the
+/// multi-TX arm). It is dropped (discarded) when it is an exact duplicate
+/// (identical text for that QSO) or a recognized pivot-tombstone
+/// (`is_pivot_duplicate`), and REQUEUED (not discarded, not instant — see
+/// `IncomingDuringTx::Requeue`) when it targets a QSO that isn't any of the
+/// in-flight items.
 ///
 /// PAN-73: with `max_concurrent_qsos > 1`, every active QSO's autonomous
 /// auto-sequence loop independently enqueues its next `TransmitRequest`
@@ -230,17 +245,41 @@ pub enum IncomingDuringTx {
 /// `supersede_and_rekey_or_bundle`'s unconditional PTT-off) — killing BOTH
 /// QSOs' turns and leaving the slot silent until some third QSO's unrelated
 /// retry timer opportunistically keyed into the leftover dead air. Confirmed
-/// live 2026-09-05 (VP2MAA/JF1RDH/JA5GYU). Real cross-QSO supersede/bundling
-/// during an in-flight transmission is Phase 2 (priority-tier gating), not
-/// built by this plan — until then, a different QSO's message during
-/// another QSO's TX just waits for that QSO's own next auto-sequence cycle,
-/// same as it would have if it had lost the race to be dequeued first.
+/// live 2026-09-05 (VP2MAA/JF1RDH/JA5GYU).
+///
+/// Round-1 review (Codex, PR #346) found this classifier's first version
+/// wrong in three further ways, all fixed here: (1) it treated ANY
+/// `Some(qso_id)` candidate not matching the in-flight QSO as autonomous and
+/// dropped it, but `coordinator/qso.rs`'s `MessageToSend` → `TransmitRequest`
+/// conversion is identical for operator-triggered actions (start a tracked
+/// call/CQ, answer a caller, request a resend) and routine auto-sequence
+/// ticks — both carry `Some(qso_id)` with no other marker, so there is no
+/// data-model way to tell them apart today; real disambiguation is Phase 2
+/// (priority-tier gating / explicit provenance), not built by this plan —
+/// `Requeue` is the honest interim answer: never silently discard (which
+/// would apply equally to a real operator override), but never let an
+/// unconfirmed candidate kill a good in-flight transmission either; (2) the
+/// multi-TX arm's two call sites compared only against `items.first()`
+/// instead of every in-flight bundle item, so a fresher message for the
+/// bundle's 2nd+ QSO was wrongly treated as unrelated; (3) the
+/// `MultiTransmitRequest` arm always superseded regardless of whether the
+/// incoming bundle actually overlapped the in-flight QSO(s) at all.
 pub fn classify_incoming_during_tx(
     candidate: &MessageType,
-    in_flight_qso_id: Option<&str>,
-    in_flight_text: &str,
+    in_flight_items: &[crate::message_bus::TransmitRequestItem],
     pivoted_once: &std::collections::HashMap<String, String>,
 ) -> IncomingDuringTx {
+    // M1: normalize through `active_tx_qso_key` before comparing, matching
+    // every sibling qso_id comparison (`tx_pivot_target`, `is_pivot_duplicate`,
+    // `tx_qso_is_live`).
+    let find_in_flight = |qso_id: Option<&str>| {
+        qso_id.map(super::active_tx_qso_key).and_then(|key| {
+            in_flight_items
+                .iter()
+                .find(|it| it.qso_id.as_deref().map(super::active_tx_qso_key) == Some(key.clone()))
+        })
+    };
+
     match candidate {
         MessageType::TransmitRequest {
             message_text,
@@ -252,43 +291,49 @@ pub fn classify_incoming_during_tx(
             if super::is_pivot_duplicate(qso_id.as_deref(), message_text, pivoted_once) {
                 return IncomingDuringTx::Drop;
             }
-            // M1: normalize BOTH sides through `active_tx_qso_key` before
-            // comparing, matching every sibling qso_id comparison
-            // (`tx_pivot_target`, `is_pivot_duplicate`, `tx_qso_is_live`). QSO
-            // ids are already deterministic-lowercase Uuids today so this
-            // doesn't change behavior, but it removes a raw-`Option<&str>`
-            // comparison that would silently diverge if casing ever drifted.
-            let same_target = qso_id.as_deref().map(super::active_tx_qso_key)
-                == in_flight_qso_id.map(super::active_tx_qso_key);
-            if same_target && message_text == in_flight_text {
-                return IncomingDuringTx::Drop;
+            // Genuine manual/free-text/tune/test-TX (no qso_id at all) is the
+            // one unambiguous operator-triggered case — always supersedes.
+            if qso_id.is_none() {
+                return IncomingDuringTx::Supersede {
+                    text: message_text.clone(),
+                    frequency_offset: *frequency_offset,
+                    qso_id: qso_id.clone(),
+                    tx_parity: *tx_parity,
+                };
             }
-            // PAN-73: a candidate with its own qso_id that differs from the
-            // in-flight QSO is another QSO's routine auto-sequence message,
-            // not an operator action — never let it tear down an unrelated
-            // in-flight transmission. `qso_id == None` (manual/free-text/
-            // tune/test-TX) is the actual operator-triggered case this
-            // classifier exists for, and always supersedes as before.
-            if qso_id.is_some() && !same_target {
-                return IncomingDuringTx::Drop;
-            }
-            IncomingDuringTx::Supersede {
-                text: message_text.clone(),
-                frequency_offset: *frequency_offset,
-                qso_id: qso_id.clone(),
-                tx_parity: *tx_parity,
+            match find_in_flight(qso_id.as_deref()) {
+                Some(item) if &item.message_text == message_text => IncomingDuringTx::Drop,
+                Some(_) => IncomingDuringTx::Supersede {
+                    text: message_text.clone(),
+                    frequency_offset: *frequency_offset,
+                    qso_id: qso_id.clone(),
+                    tx_parity: *tx_parity,
+                },
+                // Some(qso_id) that isn't any in-flight item: another QSO's
+                // request (autonomous or operator — indistinguishable today).
+                // See the doc comment above.
+                None => IncomingDuringTx::Requeue,
             }
         }
-        // A bundle is always new information (it carries its own set of
-        // items, not comparable 1:1 to a single in-flight text) — always
-        // supersede. Task 7 (multi-TX bundle-add) refines what happens next;
-        // this classifier only decides Drop vs Supersede.
-        MessageType::MultiTransmitRequest { .. } => IncomingDuringTx::Supersede {
-            text: String::new(),
-            frequency_offset: 0.0,
-            qso_id: None,
-            tx_parity: None,
-        },
+        // A bundle only supersedes when it actually shares a QSO with the
+        // in-flight set — otherwise it's routine traffic for entirely other
+        // QSOs (PAN-73 round 2) and gets the same Requeue treatment as a
+        // single-item candidate.
+        MessageType::MultiTransmitRequest { items, .. } => {
+            let overlaps_in_flight = items
+                .iter()
+                .any(|it| find_in_flight(it.qso_id.as_deref()).is_some());
+            if overlaps_in_flight {
+                IncomingDuringTx::Supersede {
+                    text: String::new(),
+                    frequency_offset: 0.0,
+                    qso_id: None,
+                    tx_parity: None,
+                }
+            } else {
+                IncomingDuringTx::Requeue
+            }
+        }
         _ => IncomingDuringTx::Drop,
     }
 }
@@ -449,7 +494,9 @@ pub enum SleepOutcome {
 /// re-key. A non-qualifying `TransmitRequest`/`MultiTransmitRequest` (exact
 /// duplicate or pivot tombstone) is silently consumed — same as it would have
 /// been had it reached the main dequeue loop naturally — and the sleep keeps
-/// waiting.
+/// waiting. One for a QSO that isn't any of `in_flight_items` (PAN-73 round
+/// 2) is siphoned and re-enqueued exactly like a non-candidate message
+/// below, rather than either superseding or being discarded.
 ///
 /// I1: a message that is NEITHER a `TransmitRequest` NOR a
 /// `MultiTransmitRequest` (e.g. an operator `TuneRequest`) is NOT a supersede
@@ -469,8 +516,7 @@ async fn interruptible_sleep_or_supersede(
     abort: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
     message_bus: &MessageBus,
-    in_flight_qso_id: Option<&str>,
-    in_flight_text: &str,
+    in_flight_items: &[crate::message_bus::TransmitRequestItem],
     pivoted_once: &std::collections::HashMap<String, String>,
 ) -> SleepOutcome {
     use std::sync::atomic::Ordering;
@@ -498,11 +544,15 @@ async fn interruptible_sleep_or_supersede(
             if is_supersede_candidate {
                 match classify_incoming_during_tx(
                     &message.message_type,
-                    in_flight_qso_id,
-                    in_flight_text,
+                    in_flight_items,
                     pivoted_once,
                 ) {
                     IncomingDuringTx::Drop => {}
+                    // PAN-73 round 2: not a match for any in-flight QSO —
+                    // requeue rather than discard (see IncomingDuringTx::Requeue).
+                    IncomingDuringTx::Requeue => {
+                        siphoned.push(message);
+                    }
                     IncomingDuringTx::Supersede { .. } => {
                         abort.store(true, Ordering::Release);
                         return Some(SleepOutcome::Superseded(message.message_type));
@@ -617,8 +667,11 @@ mod interruptible_sleep_tests {
             &abort,
             &rx,
             &bus,
-            Some("qso-1"),
-            "in flight text",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "in flight text".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
             &pivoted_once,
         )
         .await;
@@ -654,8 +707,11 @@ mod interruptible_sleep_tests {
             &abort,
             &rx,
             &bus,
-            Some("qso-1"),
-            "KA1ABC K5ARH R-15",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
             &pivoted_once,
         )
         .await;
@@ -710,8 +766,11 @@ mod interruptible_sleep_tests {
             &abort,
             &rx,
             &bus,
-            Some("qso-1"),
-            "KA1ABC K5ARH R-15",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
             &pivoted_once,
         )
         .await;
@@ -733,8 +792,11 @@ mod interruptible_sleep_tests {
             &abort,
             &rx,
             &bus,
-            Some("qso-1"),
-            "in flight text",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "in flight text".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
             &pivoted_once,
         )
         .await;
@@ -783,8 +845,11 @@ mod interruptible_sleep_tests {
             &abort,
             &tx_rx,
             &bus,
-            Some("qso-1"),
-            "KA1ABC K5ARH R-15",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
             &pivoted_once,
         )
         .await;
@@ -820,6 +885,81 @@ mod interruptible_sleep_tests {
         assert!(
             tx_rx.try_recv().is_err(),
             "the TuneRequest is re-enqueued exactly once"
+        );
+    }
+
+    /// Codex finding 4 (PR #346 round 1): a `TransmitRequest` for a
+    /// DIFFERENT QSO than the one in flight must be re-enqueued for the
+    /// worker's own next dequeue, not silently discarded. Before this fix,
+    /// `classify_incoming_during_tx` returned `Drop` for this shape, which
+    /// `check_once` consumes with no re-enqueue and no `TransmitComplete` —
+    /// fine for a genuine exact-duplicate/pivot-tombstone, but for a
+    /// different QSO's real content (e.g. a one-shot closing RR73/73) that
+    /// permanently loses the frame instead of merely delaying it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_reenqueues_different_qsos_transmit_request_instead_of_dropping() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let (tx_sender, tx_rx) = bus
+            .create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        // A different QSO's own closing RR73 arrives while qso-1 is in flight.
+        let other_qso_request = MessageType::TransmitRequest {
+            message_text: "OTHER1 W5AU RR73".to_string(),
+            frequency_offset: 900.0,
+            qso_id: Some("qso-other1".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+        tx_sender
+            .send(crate::message_bus::ComponentMessage::new(
+                crate::message_bus::ComponentId::Qso,
+                crate::message_bus::ComponentId::Ft8Transmitter,
+                other_qso_request,
+                std::time::Instant::now(),
+            ))
+            .unwrap();
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(120),
+            &shutdown,
+            &abort,
+            &tx_rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+        )
+        .await;
+
+        assert!(
+            matches!(outcome, super::SleepOutcome::Completed),
+            "a different QSO's request must not supersede the in-flight TX — got {outcome:?}"
+        );
+        assert!(
+            !abort.load(Ordering::Acquire),
+            "a different QSO's request must not set abort_current_tx"
+        );
+
+        let reenqueued = tx_rx
+            .try_recv()
+            .expect("the different QSO's request must be re-enqueued, not dropped");
+        match reenqueued.message_type {
+            MessageType::TransmitRequest { qso_id, .. } => {
+                assert_eq!(qso_id.as_deref(), Some("qso-other1"));
+            }
+            other => panic!("expected the re-enqueued TransmitRequest, got {other:?}"),
+        }
+        assert!(
+            tx_rx.try_recv().is_err(),
+            "the request is re-enqueued exactly once"
         );
     }
 }
@@ -3975,8 +4115,13 @@ impl super::ApplicationCoordinator {
                                             &abort_current_tx,
                                             &tx_rx,
                                             &message_bus,
-                                            qso_id.as_deref(),
-                                            &message_text,
+                                            std::slice::from_ref(
+                                                &crate::message_bus::TransmitRequestItem {
+                                                    message_text: message_text.clone(),
+                                                    frequency_offset,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                            ),
                                             &pivoted_once,
                                         )
                                         .await
@@ -4264,8 +4409,13 @@ impl super::ApplicationCoordinator {
                                             &abort_current_tx,
                                             &tx_rx,
                                             &message_bus,
-                                            qso_id.as_deref(),
-                                            &message_text,
+                                            std::slice::from_ref(
+                                                &crate::message_bus::TransmitRequestItem {
+                                                    message_text: message_text.clone(),
+                                                    frequency_offset,
+                                                    qso_id: qso_id.clone(),
+                                                },
+                                            ),
                                             &pivoted_once,
                                         )
                                         .await
@@ -5807,11 +5957,10 @@ impl super::ApplicationCoordinator {
                                         &abort_current_tx,
                                         &tx_rx,
                                         &message_bus,
-                                        items.first().and_then(|it| it.qso_id.as_deref()),
-                                        items
-                                            .first()
-                                            .map(|it| it.message_text.as_str())
-                                            .unwrap_or(""),
+                                        // PAN-73 round 2 (Codex): every in-flight bundle item,
+                                        // not just the first -- a fresher message for the
+                                        // bundle's 2nd+ QSO must match here too.
+                                        &items,
                                         &pivoted_once,
                                     )
                                     .await
@@ -5917,11 +6066,10 @@ impl super::ApplicationCoordinator {
                                         &abort_current_tx,
                                         &tx_rx,
                                         &message_bus,
-                                        items.first().and_then(|it| it.qso_id.as_deref()),
-                                        items
-                                            .first()
-                                            .map(|it| it.message_text.as_str())
-                                            .unwrap_or(""),
+                                        // PAN-73 round 2 (Codex): every in-flight bundle item,
+                                        // not just the first -- a fresher message for the
+                                        // bundle's 2nd+ QSO must match here too.
+                                        &items,
                                         &pivoted_once,
                                     )
                                     .await
@@ -8804,8 +8952,11 @@ mod classifier_tests {
         let candidate = transmit_request("KA1ABC K5ARH RR73", Some("qso-1"));
         let outcome = super::classify_incoming_during_tx(
             &candidate,
-            Some("qso-1"),
-            "KA1ABC K5ARH R-15",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
             &pivoted_once,
         );
         match outcome {
@@ -8813,7 +8964,7 @@ mod classifier_tests {
                 assert_eq!(text, "KA1ABC K5ARH RR73");
                 assert_eq!(qso_id.as_deref(), Some("qso-1"));
             }
-            super::IncomingDuringTx::Drop => panic!("expected Supersede"),
+            other => panic!("expected Supersede, got {other:?}"),
         }
     }
 
@@ -8826,22 +8977,27 @@ mod classifier_tests {
         let candidate = transmit_request("CQ K5ARH EM12", None);
         let outcome = super::classify_incoming_during_tx(
             &candidate,
-            Some("qso-1"),
-            "KA1ABC K5ARH R-15",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
             &pivoted_once,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
     }
 
     /// PAN-73 regression: reproduces the 2026-09-05 VP2MAA/JF1RDH/JA5GYU
-    /// live incident. A DIFFERENT QSO's own routine auto-sequence message
-    /// arriving in the channel while another QSO is in flight must NOT
-    /// supersede it — that killed a perfectly good in-flight transmission
-    /// for content that (in the live incident) wasn't even schedulable this
-    /// slot, leaving the slot silent until an unrelated third QSO's retry
-    /// timer opportunistically keyed into the dead air ~5s later.
+    /// live incident. A DIFFERENT QSO's own routine message arriving in the
+    /// channel while another QSO is in flight must NOT supersede it — that
+    /// killed a perfectly good in-flight transmission for content that (in
+    /// the live incident) wasn't even schedulable this slot, leaving the
+    /// slot silent until an unrelated third QSO's retry timer
+    /// opportunistically keyed into the dead air ~5s later. It also must
+    /// NOT be silently discarded (round-1's own regression, Codex finding
+    /// 4) — `Requeue`, not `Drop`.
     #[test]
-    fn classify_drops_different_qsos_autonomous_message() {
+    fn classify_requeues_different_qsos_message_instead_of_dropping_or_superseding() {
         let pivoted_once = std::collections::HashMap::new();
         // In flight: VP2MAA's QSO. Candidate: JF1RDH's QSO, a distinct
         // qso_id and distinct text — exactly the shape that raced in
@@ -8849,14 +9005,51 @@ mod classifier_tests {
         let candidate = transmit_request("JF1RDH W5AU EM10", Some("qso-jf1rdh"));
         let outcome = super::classify_incoming_during_tx(
             &candidate,
-            Some("qso-vp2maa"),
-            "VP2MAA W5AU EM10",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "VP2MAA W5AU EM10".to_string(),
+                frequency_offset: 1450.0,
+                qso_id: Some("qso-vp2maa".to_string()),
+            }],
             &pivoted_once,
         );
         assert!(
-            matches!(outcome, super::IncomingDuringTx::Drop),
-            "a different QSO's own message must not supersede an unrelated in-flight TX, got {outcome:?}"
+            matches!(outcome, super::IncomingDuringTx::Requeue),
+            "a different QSO's own message must neither supersede an unrelated in-flight TX \
+             nor be discarded — got {outcome:?}"
         );
+    }
+
+    /// Codex finding 2 (PR #346 round 1): the multi-TX arm's in-flight bundle
+    /// can hold more than one QSO. A fresher message for the SECOND (or
+    /// later) in-flight item must still be recognized as same-QSO and
+    /// supersede — not be misread as "a different QSO" just because it
+    /// isn't the bundle's first item.
+    #[test]
+    fn classify_matches_against_any_in_flight_bundle_item_not_just_the_first() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = transmit_request("SECOND W5AU RR73", Some("qso-second"));
+        let in_flight = [
+            crate::message_bus::TransmitRequestItem {
+                message_text: "FIRST W5AU R-10".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-first".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "SECOND W5AU R-08".to_string(),
+                frequency_offset: 1400.0,
+                qso_id: Some("qso-second".to_string()),
+            },
+        ];
+        let outcome = super::classify_incoming_during_tx(&candidate, &in_flight, &pivoted_once);
+        match outcome {
+            super::IncomingDuringTx::Supersede { text, qso_id, .. } => {
+                assert_eq!(text, "SECOND W5AU RR73");
+                assert_eq!(qso_id.as_deref(), Some("qso-second"));
+            }
+            other => panic!(
+                "expected Supersede for the 2nd in-flight item's fresher message, got {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -8865,8 +9058,11 @@ mod classifier_tests {
         let candidate = transmit_request("KA1ABC K5ARH R-15", Some("qso-1"));
         let outcome = super::classify_incoming_during_tx(
             &candidate,
-            Some("qso-1"),
-            "KA1ABC K5ARH R-15",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
             &pivoted_once,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Drop));
@@ -8881,27 +9077,84 @@ mod classifier_tests {
         // Step 4c, this is the stale second copy of the request that produced it.
         let outcome = super::classify_incoming_during_tx(
             &candidate,
-            Some("qso-1"),
-            "KA1ABC K5ARH R-15",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
             &pivoted_once,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Drop));
     }
 
+    /// Codex finding 3 (PR #346 round 1): a `MultiTransmitRequest` bundle
+    /// candidate must only supersede when it actually shares a QSO with the
+    /// in-flight set. `autonomous.rs` can enqueue a bundle covering entirely
+    /// OTHER QSOs while a transmission is in flight (the same PAN-73 race,
+    /// just bundle-shaped) — that must Requeue, same as a single-item
+    /// different-QSO candidate, not unconditionally supersede.
     #[test]
-    fn classify_always_supersedes_multi_transmit_request() {
+    fn classify_requeues_multi_transmit_request_with_no_overlap() {
         let pivoted_once = std::collections::HashMap::new();
         let candidate = MessageType::MultiTransmitRequest {
-            items: vec![],
+            items: vec![crate::message_bus::TransmitRequestItem {
+                message_text: "OTHER1 W5AU R-05".to_string(),
+                frequency_offset: 900.0,
+                qso_id: Some("qso-other1".to_string()),
+            }],
             tx_parity: None,
             origin: crate::message_bus::TxOrigin::Local,
         };
         let outcome = super::classify_incoming_during_tx(
             &candidate,
-            Some("qso-1"),
-            "anything",
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "IN-FLIGHT W5AU R-01".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-in-flight".to_string()),
+            }],
             &pivoted_once,
         );
-        assert!(matches!(outcome, super::IncomingDuringTx::Supersede { .. }));
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Requeue),
+            "a bundle covering entirely other QSOs must not supersede, got {outcome:?}"
+        );
+    }
+
+    /// A `MultiTransmitRequest` bundle that DOES share a QSO with the
+    /// in-flight set is legitimate new information for that QSO and must
+    /// still supersede (unchanged from before Codex round 1 — this is not
+    /// the PAN-73 race shape).
+    #[test]
+    fn classify_supersedes_multi_transmit_request_with_overlap() {
+        let pivoted_once = std::collections::HashMap::new();
+        let candidate = MessageType::MultiTransmitRequest {
+            items: vec![
+                crate::message_bus::TransmitRequestItem {
+                    message_text: "OTHER1 W5AU R-05".to_string(),
+                    frequency_offset: 900.0,
+                    qso_id: Some("qso-other1".to_string()),
+                },
+                crate::message_bus::TransmitRequestItem {
+                    message_text: "IN-FLIGHT W5AU RR73".to_string(),
+                    frequency_offset: 1000.0,
+                    qso_id: Some("qso-in-flight".to_string()),
+                },
+            ],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "IN-FLIGHT W5AU R-01".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-in-flight".to_string()),
+            }],
+            &pivoted_once,
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "a bundle sharing an in-flight QSO must still supersede, got {outcome:?}"
+        );
     }
 }
