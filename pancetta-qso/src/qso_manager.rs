@@ -2666,6 +2666,32 @@ impl QsoManager {
         // the pre-switch offset. `set_frequency` is a no-op on terminal and
         // `Idle` states by design.
         progress.state.set_frequency(applied_hz);
+        // ...and because `QsoState::frequency()` is dual-purposed, that write
+        // alone is not enough. Whenever `metadata.partner_freq` is `None`, the
+        // state's own frequency is ALSO the RX-side baseline every relevance/
+        // routing and drift gate keys on (`partner_freq.unwrap_or(qso_freq)` in
+        // `is_message_relevant`, `classify_relevance` and
+        // `maybe_confirm_frequency_drift_at`). This switch moves only OUR side:
+        // the DX is still transmitting on the old offset. Latching the offset
+        // we moved AWAY from into `partner_freq` keeps those gates pointed at
+        // the DX while `metadata.frequency`/the state frequency track our new
+        // TX offset — the same bookkeeping `compute_manual_tx_offset` performs
+        // for the analogous case (`partner = (tx_off != dx_freq).then_some(
+        // dx_freq)`), and it borrows that site's 1.0 Hz float-noise tolerance
+        // so a no-op switch never manufactures a split. Without it the DX's
+        // real replies fall outside `ESTABLISHED_FREQ_TOLERANCE_HZ` of our new
+        // offset and stop routing to this QSO altogether, and the drift gate
+        // then reads the DX's unchanged frequency as a confirmed drift and
+        // relatches us straight back onto the offset the switch existed to
+        // escape.
+        //
+        // An already-`Some` `partner_freq` (Hound, an offset hold, a collision
+        // nudge, a passband clamp) is deliberately left alone: it is already
+        // the correct "where we hear the DX", and this is purely a TX-side
+        // move.
+        if progress.metadata.partner_freq.is_none() && (applied_hz - old_off).abs() > 1.0 {
+            progress.metadata.partner_freq = Some(old_off);
+        }
         // `info!`, not `warn!`: the removed hop fired only on an identical-
         // repeat trigger and was genuinely rare, but the silence-based
         // detector this replaced it with can fire roughly once a minute per
@@ -14140,6 +14166,176 @@ mod pan72_stall_detection_tests {
                 .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. })),
             "Hold mode must never emit TxOffsetActionNeeded, got {events:?}"
         );
+    }
+
+    // ── partner_freq bookkeeping across an offset switch ──────────────────
+    //
+    // `QsoState::frequency()` is dual-purposed: it is our TX offset AND —
+    // whenever `metadata.partner_freq` is `None` — the RX-side baseline every
+    // routing/relevance and drift gate keys on
+    // (`metadata.partner_freq.unwrap_or(qso_freq)`). A stall switch moves
+    // only OUR side, so once it writes the new offset into the state it must
+    // also latch `partner_freq` to the offset it moved AWAY from — exactly
+    // the bookkeeping `compute_manual_tx_offset` already performs for the
+    // analogous "our TX diverges from the DX's frequency" case.
+
+    /// The DX's real replies keep arriving at the PRE-switch offset. They must
+    /// still route to this QSO after the switch; re-baselining the relevance
+    /// gate onto our new TX offset silently orphans every one of them (the
+    /// 400 Hz move here is far outside `ESTABLISHED_FREQ_TOLERANCE_HZ`).
+    #[tokio::test]
+    async fn stall_switch_keeps_routing_dx_replies_at_the_old_offset() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            before.metadata.partner_freq, None,
+            "precondition: the ordinary Tx=Rx path opens with partner_freq = None"
+        );
+
+        let new_offset = FREQ + 400.0;
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, new_offset)
+            .await
+            .unwrap();
+        assert_eq!(applied, new_offset);
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, new_offset,
+            "our TX offset must move to the switched-to value"
+        );
+        assert_eq!(after.state.frequency(), Some(new_offset));
+        assert_eq!(
+            after.metadata.partner_freq,
+            Some(FREQ),
+            "the switch must latch where we still expect to HEAR the DX (the \
+             offset we moved away from), or every RX-side gate re-baselines \
+             onto our own new TX offset"
+        );
+
+        let report = MessageType::SignalReport {
+            to_station: OUR.into(),
+            from_station: DX.into(),
+            report: -11,
+        };
+        assert!(
+            manager.is_message_relevant(&after.state, &after.metadata, &report, FREQ, false),
+            "the DX's reply at the pre-switch offset must stay relevant"
+        );
+        assert_eq!(
+            manager.find_qsos_for_message(&report, FREQ).await,
+            vec![qso_id],
+            "the DX's reply at the pre-switch offset must still route to this QSO"
+        );
+    }
+
+    /// The drift half of the same regression: with the RX baseline wrongly
+    /// pinned to our new TX offset, the DX's own (entirely unchanged)
+    /// frequency reads as a drift candidate, and two sightings >=5s apart
+    /// relatch `metadata.frequency` and the state frequency straight back onto
+    /// the offset the switch existed to escape.
+    #[tokio::test]
+    async fn stall_switch_does_not_relatch_back_onto_the_abandoned_offset() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let new_offset = FREQ + 400.0;
+        manager
+            .apply_tx_offset_switch(qso_id, new_offset)
+            .await
+            .unwrap();
+
+        let report = MessageType::SignalReport {
+            to_station: OUR.into(),
+            from_station: DX.into(),
+            report: -11,
+        };
+        let t0 = Utc::now();
+        manager
+            .maybe_confirm_frequency_drift_at(&report, FREQ, t0)
+            .await;
+        assert_eq!(
+            manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .pending_freq_drift,
+            None,
+            "a DX sitting exactly where we left it is not a drift candidate"
+        );
+        manager
+            .maybe_confirm_frequency_drift_at(&report, FREQ, t0 + Duration::seconds(6))
+            .await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, new_offset,
+            "the switch must survive: no relatch back onto the abandoned offset"
+        );
+        assert_eq!(after.state.frequency(), Some(new_offset));
+        assert_eq!(after.metadata.partner_freq, Some(FREQ));
+    }
+
+    /// A QSO that already diverged (Hound, an offset hold, a collision nudge,
+    /// a passband clamp) already carries the correct "where we hear the DX".
+    /// A stall switch is purely a TX-side move, so it must not clobber it.
+    #[tokio::test]
+    async fn stall_switch_preserves_an_existing_partner_freq() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                None,
+                CallInitiation::Manual,
+                Some(2400.0),
+                false,
+            )
+            .await
+            .unwrap();
+
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0)
+            .await
+            .unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.partner_freq,
+            Some(2400.0),
+            "an already-latched partner_freq is where we hear the DX; a TX-side \
+             switch must leave it untouched"
+        );
+        assert_eq!(after.metadata.frequency, FREQ + 400.0);
+    }
+
+    /// A no-op switch (a Revert onto the offset we are already sitting on)
+    /// must not manufacture a `partner_freq` — the QSO is still plainly Tx=Rx,
+    /// and inventing a split would change nothing but add a field the drift
+    /// gate then treats as a deliberate divergence.
+    #[tokio::test]
+    async fn no_op_switch_leaves_partner_freq_none() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+
+        manager.apply_tx_offset_switch(qso_id, FREQ).await.unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.partner_freq, None,
+            "a switch that changes nothing must leave the Tx=Rx path untouched"
+        );
+        assert_eq!(after.metadata.frequency, FREQ);
     }
 }
 
