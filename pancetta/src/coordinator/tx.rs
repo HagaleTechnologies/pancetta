@@ -899,33 +899,51 @@ async fn send_tx_status(message_bus: &MessageBus, active: bool) {
     }
 }
 
+/// Log one actually-keyed frame for Band Activity's own-TX history (#172).
+///
+/// `timestamp` must be captured AFTER Step 6's slot-boundary wait, not at
+/// Step 5's PTT-key time — Step 6's `duration_until` collapses to a no-op
+/// once `target_slot` is already past (the late-but-viable cursor-skip
+/// case), so a timestamp taken there is `target_slot` on an on-time key and
+/// the true late instant on a late-but-viable one. Stamping at Step 5
+/// instead would show every late-started frame at its nominal slot
+/// boundary even though the audio actually went out seconds later.
+async fn log_tx_frame(
+    message_bus: &MessageBus,
+    text: String,
+    freq_hz: f64,
+    qso_id: Option<String>,
+    timestamp: chrono::DateTime<chrono::Utc>,
+) {
+    let log_msg = ComponentMessage::new(
+        ComponentId::Ft8Transmitter,
+        ComponentId::Tui,
+        MessageType::TxFrameLogged {
+            text,
+            freq_hz,
+            qso_id,
+            timestamp,
+        },
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(log_msg).await {
+        tracing::debug!("TxFrameLogged relay failed (no TUI?): {}", e);
+    }
+}
+
 /// Push a richer TX-queue snapshot (NOW-SENDING + QUEUED) to the TUI.
 /// Best-effort, observation-only: never touches PTT/audio/scheduling.
+///
+/// Does NOT emit `TxFrameLogged` — that fires separately, at Step 7, once
+/// the actual audio-start instant is known (see [`log_tx_frame`]). This
+/// function's "NOW-SENDING" snapshot legitimately reflects Step 5 (PTT
+/// asserted now); Band Activity's history needs the later, more accurate
+/// timestamp instead.
 async fn send_tx_queue_status(
     message_bus: &MessageBus,
     sending: Option<crate::message_bus::TxItem>,
     queued: Vec<crate::message_bus::TxItem>,
 ) {
-    // #172: log every actually-keyed frame for Band Activity's own-TX
-    // history, before the existing NOW-SENDING snapshot below. Idle-clear
-    // calls (sending: None) emit nothing here — only real key events.
-    if let Some(item) = sending.as_ref() {
-        let log_msg = ComponentMessage::new(
-            ComponentId::Ft8Transmitter,
-            ComponentId::Tui,
-            MessageType::TxFrameLogged {
-                text: item.text.clone(),
-                freq_hz: item.freq_hz,
-                qso_id: item.qso_id.clone(),
-                timestamp: chrono::Utc::now(),
-            },
-            Instant::now(),
-        );
-        if let Err(e) = message_bus.send_message(log_msg).await {
-            tracing::debug!("TxFrameLogged relay failed (no TUI?): {}", e);
-        }
-    }
-
     let msg = ComponentMessage::new(
         ComponentId::Ft8Transmitter,
         ComponentId::Tui,
@@ -4180,6 +4198,17 @@ impl super::ApplicationCoordinator {
                                         }
 
                                         // --- Step 7: Route audio to output ---
+                                        // Band Activity's own-TX history logs the actual
+                                        // audio-start instant here, not Step 5's PTT-key
+                                        // time — see `log_tx_frame`'s doc comment.
+                                        log_tx_frame(
+                                            &message_bus,
+                                            message_text.clone(),
+                                            frequency_offset,
+                                            qso_id.clone(),
+                                            chrono::Utc::now(),
+                                        )
+                                        .await;
                                         let audio_msg = ComponentMessage::new(
                                             ComponentId::Ft8Transmitter,
                                             ComponentId::Audio,
@@ -5101,6 +5130,16 @@ impl super::ApplicationCoordinator {
                                                         .await;
                                                 }
 
+                                                // Rebind to `rebuild.encoded_items`, not the
+                                                // `live_items` passed IN to the rebuild —
+                                                // `encode_and_modulate_multi_tx`'s own doc
+                                                // comment on `encoded_items` requires this:
+                                                // a `live_items` entry whose re-encode failed
+                                                // (reported via `encode_failed` above) has no
+                                                // audio in `new_samples`, so returning it as
+                                                // `items` would log a Band Activity frame for
+                                                // a message that was never actually sent.
+                                                let rebuilt_items = rebuild.encoded_items;
                                                 let rebuilt_texts = rebuild.item_texts;
                                                 let rebuilt_qso_ids = rebuild.encoded_qso_ids;
 
@@ -5158,7 +5197,7 @@ impl super::ApplicationCoordinator {
                                                 };
 
                                                 (
-                                                    live_items,
+                                                    rebuilt_items,
                                                     new_samples,
                                                     rebuilt_texts,
                                                     rebuilt_qso_ids,
@@ -5446,6 +5485,11 @@ impl super::ApplicationCoordinator {
                                                     message_bus.send_message(complete_msg).await;
                                             }
 
+                                            // Rebind to `rebuild.encoded_items`, not the
+                                            // `live_items` passed IN to the rebuild — see
+                                            // the identical comment at the defer-time rebuild
+                                            // above; same reasoning applies here.
+                                            let rebuilt_items = rebuild.encoded_items;
                                             let rebuilt_texts = rebuild.item_texts;
                                             let rebuilt_qso_ids = rebuild.encoded_qso_ids;
 
@@ -5509,7 +5553,7 @@ impl super::ApplicationCoordinator {
                                             );
 
                                             (
-                                                live_items,
+                                                rebuilt_items,
                                                 new_samples,
                                                 rebuilt_texts,
                                                 rebuilt_qso_ids,
@@ -5806,6 +5850,22 @@ impl super::ApplicationCoordinator {
                                     }
 
                                     // --- Step 7: Route audio to output ---
+                                    // Band Activity's own-TX history logs the actual
+                                    // audio-start instant here, not Step 5's PTT-key
+                                    // time — see `log_tx_frame`'s doc comment. Every
+                                    // bundle item is keyed concurrently in this same
+                                    // slot, so all of them share this one timestamp.
+                                    let tx_logged_at = chrono::Utc::now();
+                                    for item in &items {
+                                        log_tx_frame(
+                                            &message_bus,
+                                            item.message_text.clone(),
+                                            item.frequency_offset,
+                                            item.qso_id.clone(),
+                                            tx_logged_at,
+                                        )
+                                        .await;
+                                    }
                                     let audio_msg = ComponentMessage::new(
                                         ComponentId::Ft8Transmitter,
                                         ComponentId::Audio,
@@ -7739,9 +7799,76 @@ mod supersede_rekey_tests {
 mod tx_frame_logged_tests {
     use super::*;
     use crate::message_bus::{ComponentId, MessageBus, MessageType};
+    use chrono::TimeZone;
 
     #[tokio::test]
-    async fn keying_a_frame_emits_tx_frame_logged_before_tx_queue_status() {
+    async fn log_tx_frame_emits_the_given_fields_and_timestamp() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+
+        // A late-but-viable key: the caller passes the ACTUAL audio-start
+        // instant, which can be well past the nominal slot boundary — this
+        // must round-trip untouched, not get snapped to any slot grid.
+        let actual_audio_start = chrono::Utc.with_ymd_and_hms(2026, 1, 1, 0, 0, 22).unwrap();
+        log_tx_frame(
+            &bus,
+            "K5ARH JA1ABC -12".to_string(),
+            1500.0,
+            Some("qso-1".to_string()),
+            actual_audio_start,
+        )
+        .await;
+
+        let msg = receiver
+            .try_recv()
+            .expect("a TxFrameLogged message should have been sent");
+        match msg.message_type {
+            MessageType::TxFrameLogged {
+                text,
+                freq_hz,
+                qso_id,
+                timestamp,
+            } => {
+                assert_eq!(text, "K5ARH JA1ABC -12");
+                assert_eq!(freq_hz, 1500.0);
+                assert_eq!(qso_id.as_deref(), Some("qso-1"));
+                assert_eq!(timestamp, actual_audio_start);
+            }
+            other => panic!("expected TxFrameLogged, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn cq_frame_qso_id_is_none() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+
+        log_tx_frame(
+            &bus,
+            "CQ K5ARH EM10".to_string(),
+            1200.0,
+            None,
+            chrono::Utc::now(),
+        )
+        .await;
+
+        let msg = receiver
+            .try_recv()
+            .expect("TxFrameLogged should send for CQ too");
+        match msg.message_type {
+            MessageType::TxFrameLogged { qso_id, .. } => assert_eq!(qso_id, None),
+            other => panic!("expected TxFrameLogged, got {other:?}"),
+        }
+    }
+
+    /// `send_tx_queue_status` must never emit `TxFrameLogged` itself, for
+    /// either a NOW-SENDING or an idle-clear push — Band Activity's history
+    /// timestamp comes only from Step 7's `log_tx_frame` call, made once the
+    /// actual audio-start instant is known (see `log_tx_frame`'s doc
+    /// comment). Guards against re-coupling the two and reintroducing the
+    /// stale-timestamp bug this decoupling fixed.
+    #[tokio::test]
+    async fn send_tx_queue_status_never_emits_tx_frame_logged() {
         let bus = MessageBus::new(16).unwrap();
         let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
 
@@ -7756,74 +7883,30 @@ mod tx_frame_logged_tests {
             Vec::new(),
         )
         .await;
-
-        let msg = receiver
-            .try_recv()
-            .expect("a TxFrameLogged message should have been sent");
-        match msg.message_type {
-            MessageType::TxFrameLogged {
-                text,
-                freq_hz,
-                qso_id,
-                ..
-            } => {
-                assert_eq!(text, "K5ARH JA1ABC -12");
-                assert_eq!(freq_hz, 1500.0);
-                assert_eq!(qso_id.as_deref(), Some("qso-1"));
-            }
-            other => panic!("expected TxFrameLogged, got {other:?}"),
-        }
-
-        let msg2 = receiver.try_recv().expect("TxQueueStatus should follow");
+        let msg = receiver.try_recv().expect("TxQueueStatus should send");
         assert!(matches!(
-            msg2.message_type,
-            MessageType::TxQueueStatus { .. }
+            msg.message_type,
+            MessageType::TxQueueStatus {
+                sending: Some(_),
+                ..
+            }
         ));
-    }
-
-    #[tokio::test]
-    async fn cq_frame_qso_id_is_none() {
-        let bus = MessageBus::new(16).unwrap();
-        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
-
-        send_tx_queue_status(
-            &bus,
-            Some(crate::message_bus::TxItem {
-                text: "CQ K5ARH EM10".to_string(),
-                freq_hz: 1200.0,
-                qso_id: None,
-                deferred: false,
-            }),
-            Vec::new(),
-        )
-        .await;
-
-        let msg = receiver
-            .try_recv()
-            .expect("TxFrameLogged should send for CQ too");
-        match msg.message_type {
-            MessageType::TxFrameLogged { qso_id, .. } => assert_eq!(qso_id, None),
-            other => panic!("expected TxFrameLogged, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn idle_clear_does_not_emit_tx_frame_logged() {
-        let bus = MessageBus::new(16).unwrap();
-        let (_sender, receiver) = bus.create_channel(ComponentId::Tui).await.unwrap();
+        assert!(
+            receiver.try_recv().is_err(),
+            "no TxFrameLogged from a NOW-SENDING push"
+        );
 
         send_tx_queue_status(&bus, None, Vec::new()).await;
-
-        let msg = receiver
+        let msg2 = receiver
             .try_recv()
             .expect("TxQueueStatus should still send");
         assert!(matches!(
-            msg.message_type,
+            msg2.message_type,
             MessageType::TxQueueStatus { sending: None, .. }
         ));
         assert!(
             receiver.try_recv().is_err(),
-            "no TxFrameLogged when sending is None"
+            "no TxFrameLogged from an idle-clear push"
         );
     }
 }

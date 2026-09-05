@@ -292,12 +292,15 @@ pub enum MessageType {
     },
 
     /// Pushed once per keyed TX frame (#172) — Band Activity's own-TX
-    /// history. Emitted from `send_tx_queue_status` alongside (not instead
-    /// of) `TxQueueStatus`, whenever `sending` is `Some`; additive, no
-    /// change to the existing NOW-SENDING/QUEUED snapshot. `qso_id: None`
-    /// means a CQ/manual frame, matching `TxItem`'s existing convention —
-    /// every keyed frame is logged regardless of origin (#172 scope: all
-    /// TX, not just QSO-related).
+    /// history. Emitted from `log_tx_frame` at Step 7 (after the slot-
+    /// boundary wait, once the actual audio-start instant is known),
+    /// separately from — not alongside — `TxQueueStatus`'s NOW-SENDING
+    /// push at Step 5; the two are decoupled so this event's `timestamp`
+    /// reflects when audio actually started, not when PTT was asserted
+    /// (see `log_tx_frame`'s doc comment in `coordinator/tx.rs`). `qso_id:
+    /// None` means a CQ/manual frame, matching `TxItem`'s existing
+    /// convention — every keyed frame is logged regardless of origin
+    /// (#172 scope: all TX, not just QSO-related).
     TxFrameLogged {
         text: String,
         freq_hz: f64,
