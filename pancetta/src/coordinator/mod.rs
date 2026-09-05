@@ -694,6 +694,21 @@ pub struct ApplicationCoordinator {
     /// `message_bus` at all.
     pending_autonomous_cq_dispatch_failures: Arc<std::sync::Mutex<Vec<u64>>>,
 
+    /// PAN-72: mailbox of resolved-needed TX-offset actions for in-progress
+    /// QSOs, pushed by the QSO event-forwarding task (`coordinator/qso.rs`)
+    /// on `QsoEvent::TxOffsetActionNeeded`, drained once per 15s slot by the
+    /// Autonomous task (`coordinator/autonomous.rs`) — same
+    /// push-mailbox/drain-once-per-tick shape as
+    /// `pending_autonomous_cq_dispatch_failures` above.
+    pending_qso_offset_requests: Arc<
+        std::sync::Mutex<
+            Vec<(
+                pancetta_qso::states::QsoId,
+                pancetta_qso::qso_manager::OffsetAction,
+            )>,
+        >,
+    >,
+
     /// Application state
     is_running: Arc<AtomicBool>,
     shutdown_signal: Arc<AtomicBool>,
@@ -1867,6 +1882,7 @@ impl ApplicationCoordinator {
             hamlib_pending_split: Arc::new(std::sync::Mutex::new(None)),
             station_agent_poll: None,
             pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_qso_offset_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),

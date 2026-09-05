@@ -2265,6 +2265,7 @@ impl super::ApplicationCoordinator {
         let display_feed_enabled = self.display_feed_enabled.clone();
         let pending_autonomous_cq_dispatch_failures =
             self.pending_autonomous_cq_dispatch_failures.clone();
+        let pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
 
         // Read station config for callsign/grid
         let config = self.config.read().await;
@@ -2811,6 +2812,7 @@ impl super::ApplicationCoordinator {
                 let pending_for_events = pending_manual_calls.clone();
                 let dx_activity_for_events = dx_activity.clone();
                 let display_feed_enabled = display_feed_enabled.clone();
+                let pending_qso_offset_requests = pending_qso_offset_requests.clone();
                 tokio::spawn(async move {
                     // Task 5 (gap 2/4): built once for this task's lifetime,
                     // mirroring the autonomous operator's own scorer
@@ -3547,6 +3549,11 @@ impl super::ApplicationCoordinator {
                                     from_callsign.as_deref(),
                                 )
                                 .await;
+                            }
+                            Ok(pancetta_qso::QsoEvent::TxOffsetActionNeeded { qso_id, action }) => {
+                                if let Ok(mut pending) = pending_qso_offset_requests.lock() {
+                                    pending.push((qso_id, action));
+                                }
                             }
                             Ok(_) => {} // Other events (StateChanged, etc.)
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -8735,6 +8742,127 @@ mod respond_to_caller_admission_tests {
             7,
             "operator's autonomous.qso_stall_switch_after must reach the \
              QsoManager's TimeoutConfig, not the Rust-side default"
+        );
+    }
+
+    /// PAN-72 (Task 8): the QSO event-forwarding task (this file, the
+    /// `match qso_events.recv().await { ... }` loop spawned in
+    /// `start_qso_component`) must push `QsoEvent::TxOffsetActionNeeded`
+    /// (Task 3's variant, emitted for real by `QsoManager::rearm_manual_
+    /// calls_at` once `QsoMetadata::stall_cycles` hits `TimeoutConfig::
+    /// qso_stall_switch_after` — see pancetta-qso's own
+    /// `silence_increments_stall_cycles_via_rearm_and_emits_switch_at_
+    /// threshold`) onto the new `pending_qso_offset_requests` mailbox.
+    ///
+    /// Drives the REAL forwarder end to end (real `start_qso_component`,
+    /// real spawned forwarder task, real `QsoManager` silence-driven stall
+    /// detector) rather than injecting a synthetic event — there is no
+    /// public way to inject an arbitrary `QsoEvent` onto a `QsoManager`'s
+    /// broadcast channel from outside `pancetta-qso`, so a real stall is
+    /// the only way to exercise this arm end to end.
+    ///
+    /// Readiness handshake (mirrors `coordinator::health`'s
+    /// `qso_restart_delivers_recent_qso_outcome_through_the_real_
+    /// forwarder`): the forwarder's `.subscribe()` happens inside the
+    /// spawned Qso-component task, not synchronously before
+    /// `start_qso_component` returns, and a `broadcast` channel only
+    /// delivers to subscribers already subscribed at send time. Probe with
+    /// a real `StateChanged`-producing call and poll `active_tx_qsos`
+    /// (populated by the SAME forwarder loop, same `match` block) until it
+    /// lands, before relying on the same subscription for the real
+    /// stall-and-Switch scenario below.
+    #[tokio::test]
+    async fn tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_requests() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        coordinator
+            .config
+            .write()
+            .await
+            .autonomous
+            .qso_stall_switch_after = 2;
+        // Auto TX-freq mode -- the silence-driven stall detector only fires
+        // there (Hold keeps the operator's offset sticky, no autonomous
+        // action is ever emitted).
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        coordinator.start_qso_component().await.unwrap();
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // `qso_manager_for_supervisor` is cloned INSIDE `start_qso_component`
+        // before `set_tx_freq_mode_source` reassigns the (moved-into-the-
+        // spawned-task) manager's `tx_freq_mode` to the coordinator's shared
+        // `Arc<AtomicU8>` -- so this clone's own `tx_freq_mode` field is
+        // still the manager's original Hold-default `Arc`, disconnected from
+        // `coordinator.tx_freq_mode`. Re-point it here so driving the stall
+        // through THIS clone (its `qsos` map is the same shared `Arc` either
+        // way) observes the same Auto mode the real forwarder-attached
+        // manager does.
+        manager.set_tx_freq_mode_source(coordinator.tx_freq_mode.clone());
+
+        let mut ready = false;
+        for i in 0..20 {
+            let probe_call = format!("K9RD{i}");
+            let probe_id = manager
+                .respond_to_cq_manual(probe_call.clone(), 1500.0, None)
+                .await
+                .expect("seeding a readiness-probe QSO");
+            let key = crate::coordinator::active_tx_qso_key(&probe_id.to_string());
+            for _ in 0..30 {
+                if coordinator.active_tx_qsos.read().unwrap().contains(&key) {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            if ready {
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "readiness probe: real forwarder never populated active_tx_qsos"
+        );
+
+        // Real scenario: a manual QSO stalls twice (threshold = 2) and the
+        // manager emits `TxOffsetActionNeeded::Switch`.
+        let qso_id = manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1501.0, None)
+            .await
+            .expect("seeding the stalling QSO");
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(30))
+            .await;
+
+        let mut found = false;
+        for _ in 0..100 {
+            if coordinator
+                .pending_qso_offset_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(id, _)| *id == qso_id)
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            found,
+            "TxOffsetActionNeeded must be forwarded into pending_qso_offset_requests"
         );
     }
 }
