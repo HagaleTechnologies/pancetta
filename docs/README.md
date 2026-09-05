@@ -26,7 +26,7 @@ Design plans, audits, and analyses, kept for context:
 - Decoder: `decoder-analysis.md`, `ap-decoding-design.md`, `neural-osd-design.md`
 - QSO engine: `qso-state-machine-analysis.md`, `qso-engine-bugs.md`, `qso-scenario-catalog-2026-06-16.md`
 - Platform: `audio-robustness-plan.md`, `observability-diagnostics-plan.md`, `task-supervision-plan.md`
-- Audits: `ux-audit-2026-06-14.md`, `security-review-2026-04-29.md`, `security-deep-analysis-2026-06-17.md`, `security-review-remote-rig-2026-07-02.md`
+- Audits: `reviews/2026-09-05-product-review/` (six-lane product review: TUI, onboarding, market, workflows, engineering quality, brand — start at its `README.md`), `ux-audit-2026-06-14.md`, `security-review-2026-04-29.md`, `security-deep-analysis-2026-06-17.md`, `security-review-remote-rig-2026-07-02.md`
 - `engineering/` — methodology audits; `operations/` — one-off procedures
 
 ## Process directories
