@@ -2336,6 +2336,11 @@ impl super::ApplicationCoordinator {
                 atno_bonus: p.atno_bonus,
             }
         };
+        // PAN-72 (Task 7): operator-configured stall-switch threshold,
+        // threaded into pancetta_qso::TimeoutConfig below so the TOML
+        // setting (Task 6) actually reaches the QSO engine's Rust default
+        // (Task 2) instead of being silently overridden by it.
+        let qso_stall_switch_after = config.autonomous.qso_stall_switch_after;
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -2415,7 +2420,9 @@ impl super::ApplicationCoordinator {
         // populated by the time the latter reads it — no channel, handoff, or
         // timeout needed.
         let qso_config = {
-            use pancetta_qso::{DuplicateCheckConfig, HoundRegions, QsoManagerConfig};
+            use pancetta_qso::{
+                DuplicateCheckConfig, HoundRegions, QsoManagerConfig, TimeoutConfig,
+            };
 
             QsoManagerConfig {
                 our_callsign: our_callsign.clone(),
@@ -2434,6 +2441,13 @@ impl super::ApplicationCoordinator {
                     // check_band is defined but unread in pancetta-qso;
                     // keep the qso-side default rather than exposing a
                     // dead knob in the config schema.
+                    ..Default::default()
+                },
+                // PAN-72 (Task 7): thread the operator's TOML
+                // autonomous.qso_stall_switch_after through; every other
+                // TimeoutConfig field keeps the qso-side default.
+                timeouts: TimeoutConfig {
+                    qso_stall_switch_after,
                     ..Default::default()
                 },
                 ..Default::default()
@@ -8694,5 +8708,33 @@ mod respond_to_caller_admission_tests {
         let _ = manager
             .fail_qso(priming_id, pancetta_qso::QsoFailureReason::UserCancelled)
             .await;
+    }
+
+    /// PAN-72 (Task 7): `start_qso_component`'s `QsoManagerConfig` literal
+    /// must thread `config.autonomous.qso_stall_switch_after` (Task 6's
+    /// TOML-facing field) into `TimeoutConfig::qso_stall_switch_after`
+    /// (Task 2's QSO-engine field) rather than always taking the Rust
+    /// default — proven here with a non-default value (7; both sides'
+    /// defaults are 4, so a default-value test couldn't distinguish
+    /// "threaded" from "coincidentally defaulted").
+    #[tokio::test]
+    async fn qso_stall_switch_after_threads_from_autonomous_config() {
+        let mut coordinator = test_coordinator().await;
+        coordinator
+            .config
+            .write()
+            .await
+            .autonomous
+            .qso_stall_switch_after = 7;
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+
+        assert_eq!(
+            manager.config().timeouts.qso_stall_switch_after,
+            7,
+            "operator's autonomous.qso_stall_switch_after must reach the \
+             QsoManager's TimeoutConfig, not the Rust-side default"
+        );
     }
 }
