@@ -882,6 +882,12 @@ pub struct AutonomousOperator {
     /// switches to Auto — same precedent as `QsoMetadata.stall_cycles`);
     /// only acted on in Auto mode.
     cq_no_response_streak: u32,
+    /// PAN-72: set by `request_manual_switch` (the TUI's `u` "nudge"
+    /// keystroke, relayed via the coordinator), consumed unconditionally at
+    /// the top of `decide_at` regardless of the current operating state — so
+    /// a nudge that arrives while not `CallingCq` doesn't leak into a LATER,
+    /// unrelated CQ cycle.
+    manual_switch_requested: bool,
     /// The offset actually used for the most recent self-CQ (Auto mode
     /// only). Sticky: a routine (non-switching) self-CQ reuses this value
     /// directly instead of re-ranking from scratch, so a threshold-driven
@@ -1050,6 +1056,7 @@ impl AutonomousOperator {
             state: OperatingState::Hunting,
             idle_cycles: 0,
             cq_no_response_streak: 0,
+            manual_switch_requested: false,
             current_cq_offset_hz: None,
             last_cq_snapshot: None,
             previous_cq_snapshot: None,
@@ -1916,6 +1923,14 @@ impl AutonomousOperator {
         self.active_qso_count = count;
     }
 
+    /// PAN-72: request an immediate CQ-offset switch on the next `decide_at`
+    /// call, bypassing `cq_no_response_switch_after` — used by the manual
+    /// `u` keystroke. A no-op if the next cycle isn't `CallingCq` (the flag
+    /// is still consumed, not left pending for some later cycle).
+    pub fn request_manual_switch(&mut self) {
+        self.manual_switch_requested = true;
+    }
+
     /// Feed a message the auto-sequencer wants to send this cycle.
     /// For backward compatibility, replaces any pending messages.
     pub fn set_pending_sequencer_message(&mut self, message_text: String, qso_id: Option<String>) {
@@ -2082,6 +2097,10 @@ impl AutonomousOperator {
     pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
         self.skip_log.clear();
         let mut actions = Vec::new();
+        // PAN-72: consumed unconditionally, before any state-dependent
+        // branching below, so a manual nudge that arrives while not
+        // `CallingCq` this cycle can't leak into a later, unrelated cycle.
+        let manual_switch_requested = std::mem::take(&mut self.manual_switch_requested);
 
         self.refresh_tx_freq_offset_invalidation();
 
@@ -2436,8 +2455,9 @@ impl AutonomousOperator {
                             self.refresh_tx_freq_offset_invalidation();
 
                             let should_switch = self.tx_freq_auto()
-                                && self.cq_no_response_streak
-                                    >= self.config.cq_no_response_switch_after;
+                                && (self.cq_no_response_streak
+                                    >= self.config.cq_no_response_switch_after
+                                    || manual_switch_requested);
 
                             if should_switch {
                                 let history_fresh = self.spectral_snapshot.is_some()
@@ -3728,6 +3748,59 @@ mod tests {
                 "Hold mode must never emit a FrequencyShift"
             );
         }
+    }
+
+    #[test]
+    fn request_manual_switch_forces_a_switch_below_the_streak_threshold() {
+        // switch_after=3, so streak(0) alone would never trigger a switch on
+        // the first CQ -- only `request_manual_switch()` forces it.
+        let mut op = primed_operator(2, 3, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle_cycles 0->1 < cq_after_idle_cycles(2): still Hunting
+        op.request_manual_switch();
+        let actions = op.decide_at(even_ts); // idle_cycles 1->2 >= 2: first CQ, entering streak=0
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "a manual switch request must force a FrequencyShift even though \
+             the no-response streak (0) is nowhere near switch_after (3)"
+        );
+    }
+
+    #[test]
+    fn request_manual_switch_is_consumed_even_when_not_calling_cq() {
+        // An operator not yet in CallingCq this cycle (idle_cycles still
+        // below cq_after_idle_cycles) must consume-and-discard a manual
+        // switch request the same as any other cycle -- it must NOT persist
+        // to leak into a LATER, unrelated cycle that does enter CallingCq.
+        let mut op = primed_operator(2, 3, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let even_ts: i64 = 0;
+        op.request_manual_switch();
+        let _ = op.decide_at(even_ts); // idle_cycles 0->1 < 2: not CallingCq this cycle; the
+                                       // request is consumed here and discarded, not saved.
+
+        // Second, later decide_at that WOULD enter CallingCq via the routine
+        // idle-cycles path -- must NOT force a switch now that the earlier
+        // request has already been consumed.
+        let actions = op.decide_at(even_ts); // idle_cycles 1->2 >= 2: first CQ, entering streak=0
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "a manual switch request consumed on an earlier, non-CallingCq \
+             cycle must not leak into this later cycle's CQ decision"
+        );
     }
 
     #[test]
