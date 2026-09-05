@@ -1316,6 +1316,23 @@ pub struct ApplicationCoordinator {
     /// even after the original task that constructed it has panicked.
     /// Populated by `start_qso_component`, overwritten on every (re)start.
     pub(crate) qso_manager_for_supervisor: Option<pancetta_qso::QsoManager>,
+
+    /// PAN-72 critical-finding fix: a `watch` channel mirroring
+    /// `qso_manager_for_supervisor`'s latest value, so an *independently
+    /// spawned, long-lived* task (the Autonomous task's own `tokio::spawn`,
+    /// which is NOT respawned when only the Qso component restarts) can
+    /// observe the CURRENT `QsoManager` on every tick instead of a plain
+    /// `Option<QsoManager>` clone captured once at its own spawn time.
+    /// `health.rs`'s supervisor doesn't need this: it runs inline with
+    /// `&mut self` in the single un-spawned coordinator loop, so
+    /// `self.qso_manager_for_supervisor` is always already fresh there.
+    /// `start_qso_component` calls `.send()` on this alongside every
+    /// `qso_manager_for_supervisor` assignment (qso.rs); a consumer calls
+    /// `.subscribe()` once at its own spawn time and `.borrow().clone()`
+    /// fresh each tick -- `subscribe()` always seeds the new `Receiver`
+    /// with whatever value was most recently sent, so this is correct
+    /// regardless of whether the Qso or Autonomous component starts first.
+    pub(crate) qso_manager_watch: tokio::sync::watch::Sender<Option<pancetta_qso::QsoManager>>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -1912,6 +1929,7 @@ impl ApplicationCoordinator {
             audit_log: audit_log_init,
             wsjtx_qso_events_rx: None,
             qso_manager_for_supervisor: None,
+            qso_manager_watch: tokio::sync::watch::channel(None).0,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);

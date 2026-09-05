@@ -1159,17 +1159,26 @@ impl super::ApplicationCoordinator {
         // push-mailbox shape as `pending_autonomous_cq_dispatch_failures`
         // above.
         let pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
-        // PAN-72: the Autonomous task doesn't otherwise hold any `QsoManager`
-        // handle -- clone the same cheap Arc-based handle the task
-        // supervisor uses (`qso_manager_for_supervisor`, populated by
-        // `start_qso_component` before this component starts, see
-        // `mod.rs`'s ordering in `run()`). `apply_tx_offset_switch` doesn't
-        // read `tx_freq_mode`, so Task 8's disconnected-tx_freq_mode-Arc
-        // caveat on this same field doesn't apply to this use. `None` here
-        // (Qso component not yet up) means nothing could have been pushed
-        // to `pending_qso_offset_requests` either, so the drain below is
-        // skipped as a true no-op rather than a bug.
-        let qso_manager_for_offset_drain = self.qso_manager_for_supervisor.clone();
+        // PAN-72 (fixed after task-review Critical finding): the Autonomous
+        // task doesn't otherwise hold any `QsoManager` handle. A plain
+        // `self.qso_manager_for_supervisor.clone()` here would capture
+        // whatever manager exists at THIS spawn time only -- health.rs's
+        // supervisor can independently restart the Qso component without
+        // restarting Autonomous, which reassigns
+        // `qso_manager_for_supervisor` to a brand-new `QsoManager` with an
+        // empty QSO map (see `start_qso_component`, qso.rs). A stale
+        // captured clone would then have every subsequent lookup miss
+        // ("QSO likely completed") for the rest of the process's uptime.
+        // Instead, subscribe to the `qso_manager_watch` channel
+        // (`mod.rs`), which `start_qso_component` sends the fresh handle
+        // into on every (re)start -- `.subscribe()` seeds this `Receiver`
+        // with whatever's most recently been sent, so this is correct
+        // whether Qso started before or after this component. The tick
+        // loop below re-reads it fresh via `.borrow().clone()` every
+        // cycle, not just once here. `apply_tx_offset_switch` doesn't read
+        // `tx_freq_mode`, so Task 8's disconnected-tx_freq_mode-Arc caveat
+        // is unrelated to this handle.
+        let qso_manager_watch = self.qso_manager_watch.subscribe();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -1287,14 +1296,27 @@ impl super::ApplicationCoordinator {
 
                             // PAN-72: resolve and commit any mid-QSO
                             // TX-offset actions the QSO event-forwarder
-                            // queued this cycle (stall-switch/revert). A
-                            // `None` handle here means the Qso component
-                            // isn't up yet, which also means nothing could
-                            // have been queued -- true no-op, not a bug.
-                            if let Some(ref qso_manager) = qso_manager_for_offset_drain {
+                            // queued this cycle (stall-switch/revert).
+                            // Re-borrow the watch channel FRESH every tick
+                            // (not a captured clone) so a Qso-only
+                            // component restart is picked up immediately --
+                            // see the doc comment on `qso_manager_watch`'s
+                            // subscribe site above. A `None` value here
+                            // means the Qso component isn't up yet, which
+                            // also means nothing could have been queued --
+                            // true no-op, not a bug. Clone out of the
+                            // `Ref` and drop it (a plain owned-value `let`,
+                            // not `borrow().clone()` inline in the `if
+                            // let`'s scrutinee) BEFORE the `.await` below --
+                            // otherwise the watch channel's internal read
+                            // lock would be held across the drain's own
+                            // `.await` points, needlessly blocking a
+                            // concurrent `start_qso_component`'s `.send()`.
+                            let current_qso_manager = qso_manager_watch.borrow().clone();
+                            if let Some(qso_manager) = current_qso_manager {
                                 drain_pending_qso_offset_requests(
                                     &mut op,
-                                    qso_manager,
+                                    &qso_manager,
                                     &pending_qso_offset_requests,
                                 )
                                 .await;
@@ -3172,6 +3194,164 @@ mod drain_pending_qso_offset_requests_tests {
         drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending).await;
 
         assert!(pending.lock().unwrap().is_empty());
+    }
+}
+
+/// PAN-72 task-review Critical-finding regression coverage: `self
+/// .qso_manager_watch.subscribe()` (autonomous.rs spawn setup) +
+/// `.borrow().clone()` fresh every tick, instead of the pre-fix plain
+/// `self.qso_manager_for_supervisor.clone()` captured ONCE at
+/// Autonomous-task spawn time. The bug lived entirely in "which
+/// `QsoManager` reference the tick loop uses to call
+/// `drain_pending_qso_offset_requests`" -- that function itself always
+/// correctly operates on whatever manager it's handed (proved by
+/// `drain_pending_qso_offset_requests_tests` above). Driving this through
+/// the REAL spawned `tokio::spawn` tick loop + `health.rs`'s real
+/// component-restart supervisor + `operator.lock().await` machinery would
+/// need a live coordinator, a real Qso-component panic/restart cycle, and
+/// slot-interval timing -- disproportionate infrastructure for what's
+/// fundamentally a two-line reference-selection bug. Instead, these tests
+/// exercise the handle-refresh mechanism itself (the `watch` subscribe +
+/// fresh-borrow pattern) directly, using `drain_pending_qso_offset_requests`
+/// as an oracle to make the difference observable and not just a
+/// type-level clone.
+#[cfg(test)]
+mod qso_manager_watch_refresh_tests {
+    use super::*;
+
+    fn manager() -> pancetta_qso::QsoManager {
+        pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W1ABC".to_string(),
+            our_grid: Some("FN42".to_string()),
+            ..Default::default()
+        })
+    }
+
+    fn hold_mode_operator() -> pancetta_qso::AutonomousOperator {
+        pancetta_qso::AutonomousOperator::new(
+            pancetta_qso::AutonomousConfig::default(),
+            "W1ABC".into(),
+            Some("FN42".into()),
+        )
+    }
+
+    #[tokio::test]
+    async fn tick_loop_observes_a_post_spawn_qso_component_restart() {
+        // "Before restart": the manager instance that existed when the
+        // Autonomous task's `tokio::spawn` closure ran its ONE-TIME
+        // `self.qso_manager_watch.subscribe()` capture.
+        let manager_before_restart = manager();
+        let (watch_tx, _seed_rx) =
+            tokio::sync::watch::channel(Some(manager_before_restart.clone()));
+        let qso_manager_watch = watch_tx.subscribe();
+
+        // Simulate health.rs restarting ONLY the Qso component:
+        // `start_qso_component` builds a brand-new `QsoManager` (a
+        // disjoint, empty QSO map) and now also publishes it onto the
+        // watch channel -- mirrors the `self.qso_manager_watch.send(...)`
+        // call added next to `qso_manager_for_supervisor`'s assignment in
+        // qso.rs.
+        let manager_after_restart = manager();
+        watch_tx
+            .send(Some(manager_after_restart.clone()))
+            .expect("the subscriber above is still alive");
+
+        // A QSO that exists ONLY on the post-restart manager -- exactly
+        // what the QSO event-forwarder (which IS respawned together with
+        // the new manager) would push a request for.
+        let qso_id = manager_after_restart
+            .start_cq(1500.0, None, false)
+            .await
+            .expect("start_cq should succeed on the new manager");
+        assert!(
+            manager_before_restart
+                .get_active_qsos()
+                .await
+                .into_iter()
+                .all(|(id, _)| id != qso_id),
+            "sanity: the pre-restart manager must NOT contain the post-restart QSO"
+        );
+
+        // THE FIX: re-borrow the watch channel FRESH, exactly as the tick
+        // loop does every cycle -- not a stale spawn-time clone.
+        let current = qso_manager_watch
+            .borrow()
+            .clone()
+            .expect("the receiver must observe the post-restart value");
+
+        let mut op = hold_mode_operator();
+        let pending = std::sync::Mutex::new(vec![(
+            qso_id,
+            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+        )]);
+        drain_pending_qso_offset_requests(&mut op, &current, &pending).await;
+
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "a drained request must be removed from the pending list"
+        );
+        let (_, progress) = manager_after_restart
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == qso_id)
+            .expect(
+                "the QSO must be found and updated on the NEW manager -- this is exactly the \
+                 scenario the pre-fix spawn-time-captured clone would have silently missed \
+                 ('QSO likely completed') for the rest of the process's uptime",
+            );
+        assert_eq!(
+            progress.metadata.frequency, 1200.0,
+            "the fresh-each-tick watch borrow must resolve against the post-restart manager"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_pre_restart_clone_would_have_missed_the_request() {
+        // Direct proof of the bug this fixes: a plain clone captured ONCE
+        // (the pre-fix `qso_manager_for_offset_drain`) never sees a QSO
+        // that only exists on the post-restart manager --
+        // `apply_tx_offset_switch` errors and the drain logs+skips it,
+        // exactly matching the reviewer's described misdiagnosis ("QSO
+        // likely completed" when it's actually alive on a different,
+        // newer manager).
+        let manager_before_restart = manager();
+        let manager_after_restart = manager();
+        let qso_id = manager_after_restart
+            .start_cq(1500.0, None, false)
+            .await
+            .expect("start_cq should succeed on the new manager");
+
+        let mut op = hold_mode_operator();
+        let pending = std::sync::Mutex::new(vec![(
+            qso_id,
+            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+        )]);
+
+        // Must not panic -- mirrors the drain function's documented "log
+        // and skip" behavior for a QSO the handed-in manager doesn't know
+        // about.
+        drain_pending_qso_offset_requests(&mut op, &manager_before_restart, &pending).await;
+
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "the request is still consumed off the mailbox even though it silently failed to \
+             apply -- this IS the bug: no crash, no test failure, just a permanently missed \
+             action"
+        );
+        let real_progress = manager_after_restart
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == qso_id)
+            .map(|(_, progress)| progress.metadata.frequency);
+        assert_ne!(
+            real_progress,
+            Some(1200.0),
+            "the QSO on the REAL (post-restart) manager must be untouched -- a drain against \
+             the stale pre-restart manager has no way to reach it, demonstrating the exact \
+             silent-failure this fix closes"
+        );
     }
 }
 

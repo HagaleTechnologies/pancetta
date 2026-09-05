@@ -2461,6 +2461,14 @@ impl super::ApplicationCoordinator {
         // in-flight QSOs after this component's task panics and dies. See
         // the field's doc-comment in mod.rs for why the clone stays valid.
         self.qso_manager_for_supervisor = Some(qso_manager.clone());
+        // PAN-72 critical-finding fix: also publish the fresh handle onto
+        // the watch channel so the (not respawned on a Qso-only restart)
+        // Autonomous task's drain can pick up this brand-new manager
+        // instead of staying pinned to whatever instance existed when it
+        // spawned. `send`'s `Err` (no live receivers yet) is expected and
+        // harmless the very first time this runs, since `start_qso_component`
+        // is awaited before `start_autonomous_component` in `run()`.
+        let _ = self.qso_manager_watch.send(Some(qso_manager.clone()));
         // Share the rig dial-frequency source so completed QSOs log the
         // real RF frequency (dial + audio offset), not the bare offset
         // (was producing ADIF FREQ ~0.001 / BAND 0MHZ).
