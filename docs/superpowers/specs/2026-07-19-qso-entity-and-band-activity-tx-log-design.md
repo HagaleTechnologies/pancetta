@@ -89,11 +89,17 @@ TxFrameLogged {
 },
 ```
 
-Emitted from the coordinator at the same PTT-key point(s) in `tx.rs` where `send_tx_queue_status`
-already fires (Step 5, PTT assert) — one `TxFrameLogged` per actual keyed frame, timestamped at
-key-time rather than at TUI-receive-time so the ordering is accurate even under scheduling jitter.
-No filtering by `qso_id` — per the "log all our TX, including CQ" scope decision, every keyed
-frame is logged regardless of origin.
+Emitted from the coordinator's `log_tx_frame` helper, called at Step 7 (`tx.rs`, once per
+keyed frame, after the Step 6 slot-boundary wait) — not from `send_tx_queue_status`'s Step 5
+NOW-SENDING push, which the two were originally coupled to. They were decoupled (2026-09-04)
+because Step 5 fires at PTT-key time, `ptt_lead_ms` before the slot boundary — correct for "PTT
+is asserted now," but wrong for this event's timestamp: it made every on-time frame log a few
+tens of ms early, and would be actively wrong for a late-but-viable cursor-skip key (Step 6's
+wait is a no-op once the target slot has already passed, so the real audio-start instant can be
+seconds after the nominal boundary). `log_tx_frame` is called with a timestamp captured after
+Step 6 completes, which is exactly `target_slot` when on-time and the true late instant when
+late — correct in both cases. No filtering by `qso_id` — per the "log all our TX, including CQ"
+scope decision, every keyed frame is logged regardless of origin.
 
 `pancetta/src/coordinator/tui_relay.rs` gets a new arm translating this into
 `TuiMessage::TxFrameLogged { text, freq_hz, qso_id, timestamp }`, and `tui_runner.rs` routes it to

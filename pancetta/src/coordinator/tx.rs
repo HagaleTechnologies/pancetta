@@ -5130,6 +5130,16 @@ impl super::ApplicationCoordinator {
                                                         .await;
                                                 }
 
+                                                // Rebind to `rebuild.encoded_items`, not the
+                                                // `live_items` passed IN to the rebuild —
+                                                // `encode_and_modulate_multi_tx`'s own doc
+                                                // comment on `encoded_items` requires this:
+                                                // a `live_items` entry whose re-encode failed
+                                                // (reported via `encode_failed` above) has no
+                                                // audio in `new_samples`, so returning it as
+                                                // `items` would log a Band Activity frame for
+                                                // a message that was never actually sent.
+                                                let rebuilt_items = rebuild.encoded_items;
                                                 let rebuilt_texts = rebuild.item_texts;
                                                 let rebuilt_qso_ids = rebuild.encoded_qso_ids;
 
@@ -5187,7 +5197,7 @@ impl super::ApplicationCoordinator {
                                                 };
 
                                                 (
-                                                    live_items,
+                                                    rebuilt_items,
                                                     new_samples,
                                                     rebuilt_texts,
                                                     rebuilt_qso_ids,
@@ -5475,6 +5485,11 @@ impl super::ApplicationCoordinator {
                                                     message_bus.send_message(complete_msg).await;
                                             }
 
+                                            // Rebind to `rebuild.encoded_items`, not the
+                                            // `live_items` passed IN to the rebuild — see
+                                            // the identical comment at the defer-time rebuild
+                                            // above; same reasoning applies here.
+                                            let rebuilt_items = rebuild.encoded_items;
                                             let rebuilt_texts = rebuild.item_texts;
                                             let rebuilt_qso_ids = rebuild.encoded_qso_ids;
 
@@ -5538,7 +5553,7 @@ impl super::ApplicationCoordinator {
                                             );
 
                                             (
-                                                live_items,
+                                                rebuilt_items,
                                                 new_samples,
                                                 rebuilt_texts,
                                                 rebuilt_qso_ids,
