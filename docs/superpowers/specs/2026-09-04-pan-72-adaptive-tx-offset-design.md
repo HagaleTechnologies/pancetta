@@ -146,9 +146,9 @@ tested.
 
 `pancetta/src/coordinator/autonomous.rs`:
 
-- `allocate_smart_frequency` gains a `pub(crate)` visibility bump (currently private on
-  `AutonomousOperator`) so the coordinator can call it from outside the module — no signature
-  change.
+- `allocate_smart_frequency` gains a `pub` visibility bump (currently private on
+  `AutonomousOperator`) so the coordinator — a separate crate (`pancetta`), for which
+  `pub(crate)` would not suffice — can call it. No signature change.
 - New drain step in the existing tick arm, mirroring
   `drain_pending_autonomous_cq_dispatch_failures`: for each queued `(qso_id, action)`, resolve
   `Switch{avoid_hz}` via `op.allocate_smart_frequency(None, None, Some(avoid_hz))`, or use
@@ -190,17 +190,40 @@ tested.
 
 Two independent `AutonomousConfig` types exist (`pancetta-config/src/autonomous.rs`, the
 TOML/hot-reload-facing type, and `pancetta-qso/src/autonomous.rs`, the runtime type
-`AutonomousOperator` holds) — both need the same two field changes, kept in sync by whatever
-code already maps one to the other:
+`AutonomousOperator` holds) — both need the `cq_no_response_switch_after` default change, kept in
+sync by whatever code already maps one to the other:
 
-- New `qso_stall_switch_after: u32`, default 4, same pattern as `cq_no_response_switch_after`
-  (`#[serde(default = "default_qso_stall_switch_after")]` + companion free fn + `merge_with` line
-  + `validate_section` `== 0` rejection + an old-TOML-compat test mirroring
-  `config_missing_cq_no_response_switch_after_field_uses_default`).
 - `cq_no_response_switch_after` default lowered 5 → 4 in both crates' defaults (and the test
   asserting the old default, `autonomous_config_default_cq_no_response_switch_after_is_5`, gets
   updated to assert 4).
-- `docs/CONFIG.md` documents both.
+
+`qso_stall_switch_after` is a **different** case: the threshold check for it lives in
+`pancetta-qso/src/qso_manager.rs`, which reads `pancetta_qso::QsoManagerConfig` — a completely
+separate Rust type from `AutonomousConfig` that `QsoManager` has no visibility into. Its natural
+new home is `QsoManagerConfig::TimeoutConfig` (sibling to `manual_call_max_calls`,
+`repetitive_tx_timeout_secs` — qso_manager.rs:345-384), **not** either `AutonomousConfig` type.
+`TimeoutConfig`'s fields currently have no TOML surface at all — the coordinator constructs
+`QsoManagerConfig` with `..Default::default()` for `timeouts`
+(`pancetta/src/coordinator/qso.rs:2420-2440`) — so this needs new plumbing, not just a new field:
+
+- New field `qso_stall_switch_after: u32` on `pancetta_qso::qso_manager::TimeoutConfig`, default
+  4, `#[serde(default = "default_qso_stall_switch_after")]` + companion free fn (mirrors
+  `repetitive_tx_timeout_secs`/`default_repetitive_tx_timeout_secs` immediately above it).
+- The operator-facing TOML knob stays under the existing `[autonomous]` section in
+  `pancetta-config/src/autonomous.rs` (same section as `cq_no_response_switch_after` — one
+  logical "adaptive TX behavior" section from the operator's point of view, even though the two
+  numbers land in different Rust types internally): new
+  `AutonomousConfig::qso_stall_switch_after: u32`, default 4, same
+  `#[serde(default = "...")]` + companion free fn + `merge_with` line + `validate_section` `== 0`
+  rejection + old-TOML-compat test pattern as `cq_no_response_switch_after`.
+- The coordinator threads it across the crate boundary at the `QsoManagerConfig` construction
+  site (`pancetta/src/coordinator/qso.rs:2417-2441`), the same way `hound_cfg`/`dup_cfg`/
+  `active_mode` locals already get threaded from disparate config sections into
+  `QsoManagerConfig` fields there: pull `self.config.autonomous.qso_stall_switch_after` into a
+  local, and set it explicitly on the `timeouts: TimeoutConfig { .. }` given to
+  `QsoManagerConfig` (which today relies on `..Default::default()` for the whole `timeouts`
+  field — this becomes the first explicitly-threaded `TimeoutConfig` field).
+- `docs/CONFIG.md` documents both `[autonomous]` fields.
 
 ## Explicitly out of scope / invariants preserved
 
