@@ -13604,6 +13604,51 @@ mod stuck_dx_tests {
         );
     }
 
+    /// PAN-72 interim behavior: in Auto mode, a DX sending DIFFERENT
+    /// non-advancing frames (not identical, not empty/silent) now ALSO trips
+    /// the hop at the threshold — the counter (`stall_cycles`) increments on
+    /// any non-advancing frame regardless of content, not just identical
+    /// repeats as before this task's refactor. This is a deliberate, asserted
+    /// broadening of when Auto-mode QSOs get their TX offset moved by this
+    /// (still-live, pending-Task-4-removal) mechanism; see the PAN-72 note
+    /// above `DX_STUCK_REPEAT_THRESHOLD`'s use in `process_message`.
+    #[tokio::test]
+    async fn changing_frames_hop_tx_frequency_at_threshold_in_auto_mode() {
+        let manager = manager_auto();
+        let id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+
+        // First report advances RespondingToCq → SendingReport (resets counter).
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        assert_eq!(freq_of(&manager, id).await, FREQ);
+
+        // Now the DX sends a DIFFERENT non-advancing frame each cycle (toggling
+        // report values), never repeating the same text twice. Each is still
+        // non-advancing (stays SendingReport). Under the OLD semantics
+        // (identical-frame-only counting) this would never hop; under the new
+        // stall_cycles semantics it hops on the threshold-th non-advancing
+        // cycle regardless of content change.
+        for i in 1..DX_STUCK_REPEAT_THRESHOLD {
+            let r = -7 - (i as i8 % 2); // toggles -07 / -08, never repeats
+            send_report(&manager, r, &format!("{OUR} {DX} {r:03}")).await;
+            assert_eq!(
+                freq_of(&manager, id).await,
+                FREQ,
+                "must still hold before the threshold (cycle {i})"
+            );
+        }
+        let r = -7 - (DX_STUCK_REPEAT_THRESHOLD as i8 % 2);
+        send_report(&manager, r, &format!("{OUR} {DX} {r:03}")).await;
+        assert_eq!(
+            freq_of(&manager, id).await,
+            stuck_hopped_offset(FREQ),
+            "the threshold-th non-advancing cycle must hop the TX offset even \
+             though the frame content kept changing (PAN-72 broadened semantics)"
+        );
+    }
+
     /// In the default Hold mode the operator's offset is sticky: even a clearly
     /// stuck DX (identical frame well past the threshold) never moves it.
     #[tokio::test]

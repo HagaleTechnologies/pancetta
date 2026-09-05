@@ -511,13 +511,14 @@ pub struct QsoMetadata {
     pub progressed_this_cycle: bool,
 
     /// Consecutive cycles since this QSO last made forward progress (a
-    /// genuinely new/advancing DX message). Incremented once per ~15s slot
-    /// while stalled — by [`QsoManager::rearm_manual_calls_at`] when we
-    /// re-transmit without an advance, which covers BOTH total silence and a
-    /// DX repeating the same non-advancing frame (the state simply stays the
-    /// same either way). Reset to 0 on any forward state advance. See
-    /// [`Self::last_known_good_offset_hz`] for what happens once this trips a
-    /// switch (PAN-72).
+    /// genuinely new/advancing DX message). Currently incremented inside
+    /// `QsoManager::process_message` whenever a non-empty DX frame is
+    /// received but does not advance the QSO — this covers a DX repeating
+    /// the same (or a different) non-advancing frame, but NOT total silence.
+    /// Reset to 0 on any forward state advance. A later change extends this
+    /// to also cover total silence via `QsoManager::rearm_manual_calls_at`.
+    /// See [`Self::last_known_good_offset_hz`] for what happens once this
+    /// trips a switch (PAN-72).
     #[serde(default)]
     pub stall_cycles: u32,
 
