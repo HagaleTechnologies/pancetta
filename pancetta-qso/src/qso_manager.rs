@@ -7842,7 +7842,10 @@ mod tests {
         assert_ne!(before.metadata.frequency, 1800.0);
 
         // Apply the offset switch.
-        manager.apply_tx_offset_switch(qso_id, 1800.0).await.unwrap();
+        manager
+            .apply_tx_offset_switch(qso_id, 1800.0)
+            .await
+            .unwrap();
 
         // Verify frequency was updated and stall_cycles was reset.
         let after = manager.get_qso(qso_id).await.unwrap();
@@ -7854,7 +7857,9 @@ mod tests {
     #[tokio::test]
     async fn apply_tx_offset_switch_on_unknown_qso_returns_not_found() {
         let manager = QsoManager::new(test_config());
-        let result = manager.apply_tx_offset_switch(QsoId::new_v4(), 1800.0).await;
+        let result = manager
+            .apply_tx_offset_switch(QsoId::new_v4(), 1800.0)
+            .await;
         assert!(matches!(result, Err(QsoManagerError::QsoNotFound { .. })));
     }
 
