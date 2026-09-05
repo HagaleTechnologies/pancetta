@@ -44,8 +44,25 @@ and never reaches into `QsoManager` directly.
 The established pattern in this codebase for "an external task needs the Autonomous task to do
 one specific thing once" is a `Mutex<Vec<_>>` mailbox, pushed to by the producer and drained via
 `std::mem::take` once per tick by the Autonomous task's own loop — already used for
-`pending_autonomous_cq_dispatch_failures`. This design reuses that exact shape rather than
-inventing a new concurrency primitive.
+`pending_autonomous_cq_dispatch_failures`. This design reuses that exact shape for the request
+queue itself.
+
+> **Amended during implementation (Task 9 review) — one deviation from the design as written
+> below.** The original design had the Autonomous task capture a `QsoManager` clone **once at
+> spawn time**, alongside `active_tx_qsos`/`tx_policy`/etc., to make the commit call. That is a
+> real bug: the Autonomous task is *not* respawned when only the Qso component restarts, so after
+> a supervised Qso restart the captured clone points at the dead manager's QSO map and every
+> commit would silently apply to an abandoned instance. The fix adds one genuinely new primitive —
+> `ApplicationCoordinator::qso_manager_watch: tokio::sync::watch::Sender<Option<QsoManager>>`.
+> `start_qso_component` publishes each fresh handle with **`send_replace`** (never `send`: tokio's
+> `send` discards the value when `receiver_count() == 0`, and the Qso component starts *before*
+> the Autonomous one, so a plain `send` would drop the very first handle and leave the feature
+> inert until the first crash); the Autonomous task `.subscribe()`s once at spawn and re-`borrow`s
+> fresh **every tick**. `health.rs`'s supervisor needs none of this — it runs inline with
+> `&mut self` in the un-spawned coordinator loop, where `self.qso_manager_for_supervisor` is
+> always already fresh. So the "no new concurrency primitive" claim below holds for the mailbox,
+> but not for the handle: restart-safety required one. Everything else in this section is as
+> built.
 
 ```
 QsoManager (detects stall, owns metadata)
@@ -125,9 +142,15 @@ tested.
   first stall, revert to known-good on a second stall while on the switched offset, switch away
   again if it stalls a third time, and so on.
 - New `pub async fn apply_tx_offset_switch(&self, qso_id: QsoId, new_offset_hz: f64) ->
-  Result<(), QsoManagerError>` — the one external mutation entry point. Sets
-  `metadata.frequency`, clears `pending_freq_drift`, resets `stall_cycles` to 0, logs at
-  `target: "tx.freq"` (mirrors the removed inline hop's own logging). Does **not** force an
+  Result<f64, QsoManagerError>` — the one external mutation entry point. Sets
+  `metadata.frequency` **and the QSO state's own embedded frequency** (via
+  `QsoState::set_frequency`, mirroring the Hound QSY block: `Completed` is built from the
+  preceding state's `frequency`, so metadata alone would log the pre-switch offset), clamps to
+  `TX_OFFSET_MIN_HZ..=TX_OFFSET_MAX_HZ` as the removed hop did, clears `pending_freq_drift`,
+  resets `stall_cycles` to 0, and logs at `target: "tx.freq"` — at `info!`, since the
+  silence-based detector fires far more often than the identical-repeat hop it replaced. Returns
+  the applied (post-clamp) offset so the coordinator's `active_tx_offsets` mirror stores what
+  actually landed. Does **not** force an
   immediate retransmission — the next naturally-scheduled send (the next `rearm_manual_calls_at`
   resend, or whatever event next constructs a message for this QSO) picks up the new value
   because message construction reads `metadata.frequency` fresh each time, same as today.
@@ -158,9 +181,17 @@ tested.
   nothing will transmit on it; actual TX gating still happens downstream at dispatch time as
   today).
 - This requires the Autonomous task to hold a callable handle to `QsoManager` for the commit
-  call — confirm/wire the same handle the coordinator already uses elsewhere (`send_message`
-  etc.) is reachable from this task; if it isn't already captured in the spawned closure, capture
-  a clone at spawn time the same way `active_tx_qsos`/`tx_policy`/etc. are captured today.
+  call. ~~Capture a clone at spawn time the same way `active_tx_qsos`/`tx_policy`/etc. are
+  captured today.~~ **As built:** a spawn-time capture is unsafe across a Qso-component restart
+  (the Autonomous task is not respawned with it), so the handle arrives over
+  `qso_manager_watch` — see the amendment note in "Architecture" above. The drain re-borrows it
+  fresh each tick; `None` means the Qso component isn't up yet, which also means nothing could
+  have been queued.
+- The drain also mirrors the applied offset into `active_tx_offsets` (the coordinator's
+  own-frequency snapshot). `apply_tx_offset_switch` emits no `QsoEvent`, and that map is otherwise
+  refreshed only on a `StateChanged` carrying a frequency, so without the mirror the allocator's
+  self-avoidance — and the manual nudge's `avoid_hz`, read from the same map — would keep seeing
+  the pre-switch offset until the QSO's next state transition.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 
@@ -171,7 +202,12 @@ tested.
   - If the coordinator's `active_tx_qsos` snapshot is non-empty, push a forced
     `(qso_id, OffsetAction::Switch{avoid_hz: current_offset})` onto
     `pending_qso_offset_requests` for that QSO — same mailbox, same drain path, threshold check
-    bypassed since this is operator-forced.
+    bypassed since this is operator-forced. **As built:** gated on
+    `TxFreqMode::allows_auto_change()` exactly like the CQ branch below. In Hold the allocator's
+    early return ignores `avoid_hz` and yields the parked offset, so a queued Switch would either
+    no-op or drag a held QSO onto the park offset while the status line claimed a nudge; instead
+    the operator gets "TX offset is Hold — press `f` for Auto to enable nudging" and neither the
+    mailbox nor the CQ flag is touched.
   - Else, if the Autonomous task's current state is `CallingCq` (hunting), trigger today's
     CQ-switch immediately: a new `pending_cq_offset_nudge: Arc<AtomicBool>` flag, set here and
     checked by the tick loop alongside its existing `should_switch` computation — same
