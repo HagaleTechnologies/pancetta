@@ -588,16 +588,72 @@ async fn interruptible_sleep_or_supersede(
     // channel, in order, once the sleep concludes.
     let mut siphoned: Vec<ComponentMessage> = Vec::new();
 
+    // PAN-73 round 7 (Codex): a requeued bundle can carry an item that's
+    // already byte-identical (text + frequency) to its matching in-flight
+    // counterpart alongside genuinely unrelated items (e.g. a closing 73
+    // for the currently-keyed QSO, riding along with content for other
+    // QSOs). Requeuing it verbatim risks that already-sent frame being
+    // keyed AGAIN once the multi-TX arm's next natural dequeue picks it up
+    // — the multi-TX arm bypasses single-request coalescing, so nothing
+    // else catches this. Strip any such item before requeuing; if nothing
+    // is left, drop the candidate entirely rather than requeuing an empty
+    // bundle.
+    let strip_already_sent_items =
+        |message_type: MessageType,
+         in_flight_items: &[crate::message_bus::TransmitRequestItem]|
+         -> Option<MessageType> {
+            let MessageType::MultiTransmitRequest {
+                items,
+                tx_parity,
+                origin,
+            } = message_type
+            else {
+                return Some(message_type);
+            };
+            let filtered: Vec<_> = items
+                .into_iter()
+                .filter(|it| {
+                    let key = it.qso_id.as_deref().map(super::active_tx_qso_key);
+                    !in_flight_items.iter().any(|fi| {
+                        fi.qso_id.as_deref().map(super::active_tx_qso_key) == key
+                            && fi.message_text == it.message_text
+                            && fi.frequency_offset == it.frequency_offset
+                    })
+                })
+                .collect();
+            if filtered.is_empty() {
+                None
+            } else {
+                Some(MessageType::MultiTransmitRequest {
+                    items: filtered,
+                    tx_parity,
+                    origin,
+                })
+            }
+        };
+
+    // PAN-73 round 7 (Codex): loop until the channel is genuinely empty (or
+    // a terminal outcome fires), not just once per call. Returning after a
+    // single Requeue/siphon left an already-queued, genuinely fresher
+    // same-QSO request sitting untouched until the NEXT 50ms sleep-and-poll
+    // tick — and if that tick happened to land past `deadline`, the wait
+    // ended as `Completed` with the fresher request never even examined,
+    // keying the stale in-flight frame for the whole slot. Draining
+    // everything currently available before going back to the caller (and
+    // ultimately to `sleep()`) closes that window.
     let check_once = |tx_rx: &crossbeam_channel::Receiver<ComponentMessage>,
                       siphoned: &mut Vec<ComponentMessage>|
      -> Option<SleepOutcome> {
-        if shutdown.load(Ordering::Acquire) {
-            return Some(SleepOutcome::AbortedByShutdown);
-        }
-        if abort.load(Ordering::Acquire) {
-            return Some(SleepOutcome::AbortedByOperator);
-        }
-        if let Ok(message) = tx_rx.try_recv() {
+        loop {
+            if shutdown.load(Ordering::Acquire) {
+                return Some(SleepOutcome::AbortedByShutdown);
+            }
+            if abort.load(Ordering::Acquire) {
+                return Some(SleepOutcome::AbortedByOperator);
+            }
+            let Ok(message) = tx_rx.try_recv() else {
+                return None;
+            };
             let is_supersede_candidate = matches!(
                 message.message_type,
                 MessageType::TransmitRequest { .. } | MessageType::MultiTransmitRequest { .. }
@@ -612,7 +668,14 @@ async fn interruptible_sleep_or_supersede(
                     // PAN-73 round 2: not a match for any in-flight QSO —
                     // requeue rather than discard (see IncomingDuringTx::Requeue).
                     IncomingDuringTx::Requeue => {
-                        siphoned.push(message);
+                        if let Some(message_type) =
+                            strip_already_sent_items(message.message_type, in_flight_items)
+                        {
+                            siphoned.push(ComponentMessage {
+                                message_type,
+                                ..message
+                            });
+                        }
                     }
                     IncomingDuringTx::Supersede { .. } => {
                         abort.store(true, Ordering::Release);
@@ -628,7 +691,6 @@ async fn interruptible_sleep_or_supersede(
                 siphoned.push(message);
             }
         }
-        None
     };
 
     let outcome = 'sleep: {
@@ -1074,6 +1136,215 @@ mod interruptible_sleep_tests {
         assert!(
             tx_rx.try_recv().is_err(),
             "the request is re-enqueued exactly once"
+        );
+    }
+
+    /// Codex round 7 (PR #346): an unrelated (Requeue-worthy) message
+    /// sitting at the head of `tx_rx`, with a genuinely fresher same-QSO
+    /// update already queued directly behind it, must not hide that update
+    /// even when the wait's total duration is vanishingly short. Before the
+    /// fix, `check_once` handled exactly one message per call and returned;
+    /// with `total` this short, the outer loop's very next `now < deadline`
+    /// check could already be false, ending the wait as `Completed` with
+    /// the fresher update never even examined — keying the STALE in-flight
+    /// frame for the whole slot. Both messages are pre-queued before the
+    /// function is even called, so this is deterministic: the fix drains
+    /// everything currently available in one `check_once` call, not just
+    /// one message, before ever consulting `total`/`deadline`.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_finds_same_qso_update_behind_unrelated_traffic_even_with_near_zero_budget(
+    ) {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let (tx_sender, tx_rx) = bus
+            .create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        let send = |qso_id: &str, text: &str| {
+            tx_sender
+                .send(crate::message_bus::ComponentMessage::new(
+                    crate::message_bus::ComponentId::Qso,
+                    crate::message_bus::ComponentId::Ft8Transmitter,
+                    MessageType::TransmitRequest {
+                        message_text: text.to_string(),
+                        frequency_offset: 900.0,
+                        qso_id: Some(qso_id.to_string()),
+                        tx_parity: None,
+                        origin: crate::message_bus::TxOrigin::Local,
+                    },
+                    std::time::Instant::now(),
+                ))
+                .unwrap();
+        };
+        // B1 (unrelated, Requeue-worthy) queued directly ahead of A (a
+        // genuinely fresher message for the in-flight QSO).
+        send("qso-b1", "B1 W5AU RR73");
+        send("qso-1", "KA1ABC K5ARH RR73");
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_nanos(1), // effectively zero budget
+            &shutdown,
+            &abort,
+            &tx_rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+        )
+        .await;
+
+        match outcome {
+            super::SleepOutcome::Superseded(MessageType::TransmitRequest { qso_id, .. }, _) => {
+                assert_eq!(
+                    qso_id.as_deref(),
+                    Some("qso-1"),
+                    "A must be found and win the supersede despite the near-zero budget"
+                );
+            }
+            other => panic!(
+                "expected Superseded(A) even with a near-zero budget, got {other:?} — \
+                 the fresher update behind unrelated traffic was hidden"
+            ),
+        }
+    }
+
+    /// Codex round 7 (PR #346): requeuing a `MultiTransmitRequest` bundle
+    /// classified `Requeue` (round 6: overlap with no changed content, or
+    /// round 2: no overlap at all) must strip any item that's already
+    /// byte-identical to its matching in-flight counterpart before putting
+    /// it back on the channel. Otherwise a closing 73 (or any other
+    /// already-sent frame) rides along and can be keyed a SECOND time once
+    /// the multi-TX arm's next natural dequeue picks up the requeued
+    /// bundle — the multi-TX arm bypasses single-request coalescing, so
+    /// nothing else would catch the duplicate.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_strips_already_sent_items_from_a_requeued_bundle() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let (tx_sender, tx_rx) = bus
+            .create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        // Bundle: one item byte-identical to the in-flight qso-1 frame
+        // (already sent), plus one genuinely unrelated item for qso-other.
+        let bundle = MessageType::MultiTransmitRequest {
+            items: vec![
+                crate::message_bus::TransmitRequestItem {
+                    message_text: "KA1ABC K5ARH R-15".to_string(),
+                    frequency_offset: 1500.0,
+                    qso_id: Some("qso-1".to_string()),
+                },
+                crate::message_bus::TransmitRequestItem {
+                    message_text: "OTHER W5AU RR73".to_string(),
+                    frequency_offset: 900.0,
+                    qso_id: Some("qso-other".to_string()),
+                },
+            ],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+        tx_sender
+            .send(crate::message_bus::ComponentMessage::new(
+                crate::message_bus::ComponentId::Autonomous,
+                crate::message_bus::ComponentId::Ft8Transmitter,
+                bundle,
+                std::time::Instant::now(),
+            ))
+            .unwrap();
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(120),
+            &shutdown,
+            &abort,
+            &tx_rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+        )
+        .await;
+
+        assert!(matches!(outcome, super::SleepOutcome::Completed));
+
+        let reenqueued = tx_rx
+            .try_recv()
+            .expect("the unrelated item must still be re-enqueued");
+        match reenqueued.message_type {
+            MessageType::MultiTransmitRequest { items, .. } => {
+                assert_eq!(
+                    items.len(),
+                    1,
+                    "the already-sent qso-1 item must be stripped, got {items:?}"
+                );
+                assert_eq!(items[0].qso_id.as_deref(), Some("qso-other"));
+            }
+            other => panic!("expected the stripped MultiTransmitRequest, got {other:?}"),
+        }
+        assert!(tx_rx.try_recv().is_err(), "re-enqueued exactly once");
+    }
+
+    /// The all-items-already-sent case: the whole bundle must be DROPPED,
+    /// not requeued as an empty (or otherwise degenerate) MultiTransmitRequest.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_drops_a_requeued_bundle_entirely_when_every_item_is_already_sent() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let (tx_sender, tx_rx) = bus
+            .create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        let bundle = MessageType::MultiTransmitRequest {
+            items: vec![crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+        tx_sender
+            .send(crate::message_bus::ComponentMessage::new(
+                crate::message_bus::ComponentId::Autonomous,
+                crate::message_bus::ComponentId::Ft8Transmitter,
+                bundle,
+                std::time::Instant::now(),
+            ))
+            .unwrap();
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(120),
+            &shutdown,
+            &abort,
+            &tx_rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+        )
+        .await;
+
+        assert!(matches!(outcome, super::SleepOutcome::Completed));
+        assert!(
+            tx_rx.try_recv().is_err(),
+            "a bundle with nothing left after stripping must be dropped entirely, not requeued"
         );
     }
 
