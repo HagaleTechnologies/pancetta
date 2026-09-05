@@ -293,15 +293,20 @@ pub fn classify_incoming_during_tx(
             }
             // Genuine manual/free-text/tune/test-TX (no qso_id at all) is the
             // one unambiguous operator-triggered case — supersedes UNLESS
-            // it's byte-identical to an in-flight untracked item's text
-            // (round 2, Codex): an unchanged re-send of the same manual
-            // frame is a no-op, not a fresh override, and treating it as one
-            // needlessly deasserts PTT and restarts (or, past
-            // `tx_late_max_ms`, abandons) the very frame already on the air.
+            // it's an exact duplicate (text AND frequency) of an in-flight
+            // untracked item (round 2, Codex): an unchanged re-send of the
+            // same manual frame is a no-op, not a fresh override, and
+            // treating it as one needlessly deasserts PTT and restarts (or,
+            // past `tx_late_max_ms`, abandons) the very frame already on the
+            // air. Frequency is part of the identity check (round 3, Codex):
+            // comparing text alone would also match a deliberate same-text
+            // frequency hop.
             if qso_id.is_none() {
-                let is_untracked_duplicate = in_flight_items
-                    .iter()
-                    .any(|it| it.qso_id.is_none() && &it.message_text == message_text);
+                let is_untracked_duplicate = in_flight_items.iter().any(|it| {
+                    it.qso_id.is_none()
+                        && it.message_text == *message_text
+                        && it.frequency_offset == *frequency_offset
+                });
                 if is_untracked_duplicate {
                     return IncomingDuringTx::Drop;
                 }
@@ -313,7 +318,18 @@ pub fn classify_incoming_during_tx(
                 };
             }
             match find_in_flight(qso_id.as_deref()) {
-                Some(item) if &item.message_text == message_text => IncomingDuringTx::Drop,
+                // PAN-73 round 3 (Codex): text alone isn't a safe duplicate
+                // check — a stuck-DX QSO can re-render the SAME text at a
+                // deliberately hopped frequency to dodge a collision
+                // (qso_manager.rs's stuck-DX offset hop). Matching on text
+                // alone would drop that hop and leave the old-offset signal
+                // transmitting into the collision it was trying to avoid.
+                Some(item)
+                    if item.message_text == *message_text
+                        && item.frequency_offset == *frequency_offset =>
+                {
+                    IncomingDuringTx::Drop
+                }
                 Some(_) => IncomingDuringTx::Supersede {
                     text: message_text.clone(),
                     frequency_offset: *frequency_offset,
@@ -595,11 +611,28 @@ async fn interruptible_sleep_or_supersede(
         SleepOutcome::Completed
     };
 
-    // Re-enqueue any siphoned non-candidate messages to the worker's own
-    // channel, in arrival order, so the main loop dequeues them normally on its
-    // next cycle (pre-feature behavior). Done for EVERY outcome — including
-    // Superseded — so nothing an operator sent is lost by the supersede path.
-    for msg in siphoned {
+    // PAN-73 round 3 (Codex): whatever the loop stopped for (shutdown,
+    // operator abort, or a same-QSO supersede that returns immediately
+    // without draining further) can leave later-arrived messages sitting
+    // UNTOUCHED in `tx_rx` — still in their true relative order, since
+    // crossbeam's FIFO guarantees anything left in the channel was queued
+    // at or after anything already drained into `siphoned`. Draining that
+    // remainder HERE, before re-enqueuing, and re-enqueuing `siphoned`
+    // (strictly earlier) ahead of it preserves true arrival order.
+    // Re-appending only `siphoned` to an already-nonempty live tail (the
+    // previous approach) could otherwise put an earlier-drained message
+    // behind a later message that was never touched, inverting the order
+    // `coalesce_backlog_into` and the bundle arms rely on.
+    let mut remainder: Vec<ComponentMessage> = Vec::new();
+    while let Ok(message) = tx_rx.try_recv() {
+        remainder.push(message);
+    }
+
+    // Re-enqueue to the worker's own channel in true arrival order, so the
+    // main loop dequeues them normally on its next cycle (pre-feature
+    // behavior). Done for EVERY outcome — including Superseded — so nothing
+    // an operator sent, or another QSO's routine message, is lost.
+    for msg in siphoned.into_iter().chain(remainder) {
         let reenqueue = ComponentMessage::new(
             ComponentId::Ft8Transmitter,
             ComponentId::Ft8Transmitter,
@@ -972,6 +1005,100 @@ mod interruptible_sleep_tests {
             tx_rx.try_recv().is_err(),
             "the request is re-enqueued exactly once"
         );
+    }
+
+    /// Codex round 3 (PR #346): re-enqueuing siphoned messages must preserve
+    /// TRUE arrival order relative to anything left untouched in the live
+    /// channel when the loop exits early on a supersede. Sequence queued
+    /// (in this order) BEFORE the function is even called: B1 (a different
+    /// QSO — gets siphoned by the very first `check_once` poll), A (a
+    /// fresher message for the SAME in-flight QSO — drained by the second
+    /// `check_once` poll, classified `Supersede`, and returned immediately
+    /// WITHOUT further draining), then B2 (a different QSO again — never
+    /// drained by this function at all, since the loop already returned).
+    /// Before the fix, only `siphoned` (containing B1) was appended to the
+    /// live channel's tail, landing AFTER the untouched B2 and inverting
+    /// their true arrival order. The fix drains that leftover remainder and
+    /// re-enqueues `siphoned` ahead of it.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_sleep_preserves_arrival_order_between_siphoned_and_untouched_messages() {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let abort = Arc::new(AtomicBool::new(false));
+        let bus = crate::message_bus::MessageBus::new(16).unwrap();
+        let (tx_sender, tx_rx) = bus
+            .create_channel(crate::message_bus::ComponentId::Ft8Transmitter)
+            .await
+            .unwrap();
+        let pivoted_once = std::collections::HashMap::new();
+
+        let send = |qso_id: &str, text: &str| {
+            tx_sender
+                .send(crate::message_bus::ComponentMessage::new(
+                    crate::message_bus::ComponentId::Qso,
+                    crate::message_bus::ComponentId::Ft8Transmitter,
+                    MessageType::TransmitRequest {
+                        message_text: text.to_string(),
+                        frequency_offset: 900.0,
+                        qso_id: Some(qso_id.to_string()),
+                        tx_parity: None,
+                        origin: crate::message_bus::TxOrigin::Local,
+                    },
+                    std::time::Instant::now(),
+                ))
+                .unwrap();
+        };
+        // Pre-queue all three before the function ever runs, in true
+        // arrival order: B1, A, B2.
+        send("qso-b1", "B1 W5AU RR73");
+        send("qso-1", "KA1ABC K5ARH RR73"); // A: fresher text for the in-flight QSO
+        send("qso-b2", "B2 W5AU RR73");
+
+        let outcome = super::interruptible_sleep_or_supersede(
+            Duration::from_millis(500),
+            &shutdown,
+            &abort,
+            &tx_rx,
+            &bus,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+        )
+        .await;
+
+        match outcome {
+            super::SleepOutcome::Superseded(MessageType::TransmitRequest { qso_id, .. }) => {
+                assert_eq!(qso_id.as_deref(), Some("qso-1"), "A must win the supersede");
+            }
+            other => panic!("expected Superseded(A), got {other:?}"),
+        }
+
+        // True arrival order preserved: B1 first, then B2 — never B2 before B1.
+        let first = tx_rx.try_recv().expect("B1 must be re-enqueued");
+        match first.message_type {
+            MessageType::TransmitRequest { qso_id, .. } => {
+                assert_eq!(
+                    qso_id.as_deref(),
+                    Some("qso-b1"),
+                    "B1 must be re-enqueued FIRST"
+                );
+            }
+            other => panic!("expected B1, got {other:?}"),
+        }
+        let second = tx_rx.try_recv().expect("B2 must also be re-enqueued");
+        match second.message_type {
+            MessageType::TransmitRequest { qso_id, .. } => {
+                assert_eq!(
+                    qso_id.as_deref(),
+                    Some("qso-b2"),
+                    "B2 must be re-enqueued SECOND"
+                );
+            }
+            other => panic!("expected B2, got {other:?}"),
+        }
+        assert!(tx_rx.try_recv().is_err(), "no extra messages");
     }
 }
 
@@ -9119,6 +9246,37 @@ mod classifier_tests {
             &pivoted_once,
         );
         assert!(matches!(outcome, super::IncomingDuringTx::Drop));
+    }
+
+    /// Codex round 3 (PR #346): a stuck-DX QSO can re-render the SAME text
+    /// at a deliberately hopped frequency to dodge a collision
+    /// (`qso_manager.rs`'s stuck-DX offset hop). Matching a same-QSO
+    /// duplicate on text alone would wrongly Drop this and leave the
+    /// old-offset signal transmitting into the collision it was trying to
+    /// avoid — frequency must be part of the identity check.
+    #[test]
+    fn classify_supersedes_same_text_different_frequency_same_qso() {
+        let pivoted_once = std::collections::HashMap::new();
+        let mut candidate = transmit_request("KA1ABC K5ARH R-15", Some("qso-1"));
+        if let MessageType::TransmitRequest {
+            frequency_offset, ..
+        } = &mut candidate
+        {
+            *frequency_offset = 1800.0; // hopped off 1500.0
+        }
+        let outcome = super::classify_incoming_during_tx(
+            &candidate,
+            &[crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1500.0,
+                qso_id: Some("qso-1".to_string()),
+            }],
+            &pivoted_once,
+        );
+        assert!(
+            matches!(outcome, super::IncomingDuringTx::Supersede { .. }),
+            "identical text at a hopped frequency must supersede, not Drop — got {outcome:?}"
+        );
     }
 
     #[test]
