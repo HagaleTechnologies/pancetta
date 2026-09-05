@@ -2877,8 +2877,24 @@ async fn supersede_and_rekey_or_bundle(
     // `encode_and_modulate_multi_tx`; the caller runs it and falls back to the
     // single-item `Replace` mutation above on a collision.
     if max_concurrent_qsos > 1 {
-        let mut candidate_items: Vec<crate::message_bus::TransmitRequestItem> =
-            in_flight_items.to_vec();
+        // PAN-73 round 5 (Codex): REPLACE the matching in-flight item, don't
+        // append alongside it. A same-QSO, different-frequency candidate
+        // (e.g. a stuck-DX collision-avoidance hop, now reachable here since
+        // round 3 made the duplicate check frequency-aware) shares its
+        // qso_id with an existing `in_flight_items` entry — appending a
+        // second entry for that QSO would transmit BOTH the stale
+        // old-frequency frame and the fresh new-frequency frame at once,
+        // defeating the hop's entire purpose of moving off the colliding
+        // frequency. `qso_id == None` (untracked/manual) never matches an
+        // existing item, so it's still a plain append, unchanged.
+        let new_key = new_qso_id.as_deref().map(super::active_tx_qso_key);
+        let mut candidate_items: Vec<crate::message_bus::TransmitRequestItem> = in_flight_items
+            .iter()
+            .filter(|it| {
+                new_key.is_none() || it.qso_id.as_deref().map(super::active_tx_qso_key) != new_key
+            })
+            .cloned()
+            .collect();
         candidate_items.push(crate::message_bus::TransmitRequestItem {
             message_text: new_text,
             frequency_offset: new_freq,
@@ -7767,6 +7783,112 @@ mod supersede_rekey_tests {
         // Working state also mutated to the new item (collision fallback).
         assert_eq!(message_text, "CQ K5ARH EM12");
         assert_eq!(frequency_offset, 1400.0);
+    }
+
+    /// Codex round 5 (PR #346): a same-QSO, different-frequency candidate
+    /// (e.g. a stuck-DX collision-avoidance hop — reachable here since round
+    /// 3 made the same-QSO duplicate check frequency-aware) must REPLACE the
+    /// matching in-flight bundle item, not sit alongside it. Appending a
+    /// second entry for the same QSO would transmit both the stale
+    /// old-frequency frame and the fresh new-frequency frame at once,
+    /// defeating the entire purpose of moving off the colliding frequency.
+    #[tokio::test]
+    async fn supersede_bundle_replaces_matching_qso_item_on_frequency_hop() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        // Two in-flight QSOs; qso-1 is about to hop off 1000.0 Hz.
+        let in_flight = [
+            crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-1".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "OTHER W5AU R-08".to_string(),
+                frequency_offset: 1400.0,
+                qso_id: Some("qso-other".to_string()),
+            },
+        ];
+
+        // Same text, same QSO, hopped 300 Hz off — the stuck-DX collision
+        // avoidance shape.
+        let new_request = MessageType::TransmitRequest {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1300.0,
+            qso_id: Some("qso-1".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+
+        let outcome = super::supersede_and_rekey_or_bundle(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2,
+            crate::message_bus::TxOrigin::Local,
+            &in_flight,
+        )
+        .await;
+
+        match outcome {
+            super::SupersedeOutcome::Bundle { items, .. } => {
+                assert_eq!(
+                    items.len(),
+                    2,
+                    "qso-1's old-frequency entry must be REPLACED, not appended alongside — \
+                     bundle should still hold exactly qso-1 (hopped) + qso-other, got {items:?}"
+                );
+                let qso1 = items
+                    .iter()
+                    .find(|it| it.qso_id.as_deref() == Some("qso-1"))
+                    .expect("qso-1 must still be present");
+                assert_eq!(
+                    qso1.frequency_offset, 1300.0,
+                    "qso-1's entry must carry the HOPPED frequency, not the stale one"
+                );
+                assert!(
+                    !items
+                        .iter()
+                        .any(|it| it.qso_id.as_deref() == Some("qso-1")
+                            && it.frequency_offset == 1000.0),
+                    "the stale old-frequency entry for qso-1 must not survive alongside the hop"
+                );
+                let other = items
+                    .iter()
+                    .find(|it| it.qso_id.as_deref() == Some("qso-other"))
+                    .expect("qso-other must be untouched");
+                assert_eq!(other.frequency_offset, 1400.0);
+            }
+            other => panic!("expected Bundle, got {other:?}"),
+        }
     }
 
     /// C1 REGRESSION: the `Replace` outcome must carry the SUPERSEDING request's
