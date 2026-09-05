@@ -381,11 +381,28 @@ pub struct TimeoutConfig {
     /// non-answering DX too quickly. The 5-min keep-call watchdog now governs.)
     #[serde(default = "default_repetitive_tx_timeout_secs")]
     pub repetitive_tx_timeout_secs: u64,
+
+    /// Consecutive stalled cycles (see [`crate::states::QsoMetadata::
+    /// stall_cycles`]) before an in-progress QSO's TX offset is switched (or
+    /// reverted to its last known-good offset) — Auto TX-freq mode only.
+    /// Default 4 (PAN-72). Distinct from `AutonomousConfig::
+    /// cq_no_response_switch_after` (a different struct, governs the
+    /// self-CQ-hunting case before any QSO exists), though the two are
+    /// exposed under the same `[autonomous]` TOML section by the coordinator
+    /// (see `pancetta-config`) since they're one logical "adaptive TX
+    /// behavior" knob from the operator's point of view.
+    #[serde(default = "default_qso_stall_switch_after")]
+    pub qso_stall_switch_after: u32,
 }
 
 /// Default for [`TimeoutConfig::repetitive_tx_timeout_secs`] (5 minutes).
 fn default_repetitive_tx_timeout_secs() -> u64 {
     300
+}
+
+/// Default for [`TimeoutConfig::qso_stall_switch_after`] (PAN-72).
+fn default_qso_stall_switch_after() -> u32 {
+    4
 }
 
 /// Contest configuration
@@ -544,6 +561,7 @@ impl Default for TimeoutConfig {
             manual_call_watchdog_minutes: 5,
             manual_call_max_calls: 25,
             repetitive_tx_timeout_secs: default_repetitive_tx_timeout_secs(),
+            qso_stall_switch_after: default_qso_stall_switch_after(),
         }
     }
 }
@@ -14662,5 +14680,16 @@ mod deconflict_tests {
         let a = deconflict_offset(1500.0, &occupied, SEP, LO, HI);
         let b = deconflict_offset(1500.0, &occupied, SEP, LO, HI);
         assert_eq!(a, b, "deconflict_offset must be deterministic");
+    }
+}
+
+#[cfg(test)]
+mod timeout_config_tests {
+    use super::TimeoutConfig;
+
+    #[test]
+    fn timeout_config_default_qso_stall_switch_after_is_4() {
+        let config = TimeoutConfig::default();
+        assert_eq!(config.qso_stall_switch_after, 4);
     }
 }
