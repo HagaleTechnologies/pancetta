@@ -22,6 +22,28 @@ pub const TX_OFFSET_MIN_HZ: f64 = 300.0;
 /// Upper bound of the usable FT8 audio passband for our TX offset (Hz).
 pub const TX_OFFSET_MAX_HZ: f64 = 2700.0;
 
+/// Widest audio offset an **already-active** QSO may legitimately sit on (Hz),
+/// and therefore the defensive clamp band for
+/// [`QsoManager::apply_tx_offset_switch`].
+///
+/// Deliberately WIDER than [`TX_OFFSET_MIN_HZ`]/[`TX_OFFSET_MAX_HZ`], which
+/// govern where we autonomously *pick a fresh* offset — not where an
+/// in-progress QSO is allowed to be. Answering a CQ ties our reply to wherever
+/// we decoded the DX, unclamped, for any DX up to ~2900 Hz (see the identical
+/// reasoning on `DRIFT_CANDIDATE_MIN_HZ`/`MAX_HZ` in the frequency-drift
+/// candidate gate). Clamping an offset action to the narrower *pick* band
+/// would therefore be actively wrong for `OffsetAction::Revert`, whose
+/// `target_hz` is a `last_known_good_offset_hz` that may itself be such an
+/// unclamped reply offset: reverting a QSO to 2700 when it demonstrably worked
+/// at 2850 defeats the point of reverting at all.
+///
+/// The real constraint is the modulator's transmittable envelope
+/// (`pancetta_ft8::modulator::MAX_FREQUENCY_DEVIATION` = 3100.0, which covers
+/// a 2900 Hz base plus the widest FT2 tone spread).
+pub const ACTIVE_QSO_TX_OFFSET_MIN_HZ: f64 = 200.0;
+/// Upper bound of [`ACTIVE_QSO_TX_OFFSET_MIN_HZ`]'s band. See its doc comment.
+pub const ACTIVE_QSO_TX_OFFSET_MAX_HZ: f64 = 2900.0;
+
 /// Hound calling region (low): Hounds call the Fox in 300–900 Hz.
 const HOUND_CALL_MIN_HZ: f64 = 300.0;
 const HOUND_CALL_MAX_HZ: f64 = 900.0;
@@ -2603,13 +2625,21 @@ impl QsoManager {
     /// naturally-scheduled send picks up the new value since message
     /// construction reads `metadata.frequency` fresh each time.
     ///
-    /// The requested offset is clamped to
-    /// [`TX_OFFSET_MIN_HZ`]..=[`TX_OFFSET_MAX_HZ`] — the same band the
-    /// removed stuck-DX hop clamped to. Every current caller already supplies
-    /// an in-band value (the allocator's own candidates, or a
-    /// `last_known_good_offset_hz` that was itself in-band); this is a
-    /// defensive floor on a `pub` method documented as the sole external
-    /// mutator, so that invariant cannot be broken from outside the crate.
+    /// The requested offset is clamped defensively to
+    /// [`ACTIVE_QSO_TX_OFFSET_MIN_HZ`]..=[`ACTIVE_QSO_TX_OFFSET_MAX_HZ`] —
+    /// this is a `pub` method documented as the sole external mutator of an
+    /// active QSO's TX offset, so it must not be able to park a QSO outside
+    /// the transmittable envelope from outside the crate. Every current
+    /// caller already supplies an in-band value.
+    ///
+    /// NOT [`TX_OFFSET_MIN_HZ`]..=[`TX_OFFSET_MAX_HZ`] (300–2700), the band
+    /// the removed stuck-DX hop used: those govern where we autonomously
+    /// *pick a fresh* offset, not where an in-progress QSO is allowed to sit.
+    /// A `Revert`'s `target_hz` is a `last_known_good_offset_hz` that may be
+    /// an unclamped reply offset up to ~2900 Hz (answering a CQ ties our reply
+    /// to wherever we decoded the DX), and narrowing that to 2700 would move
+    /// the QSO off the very offset it demonstrably worked on. See
+    /// [`ACTIVE_QSO_TX_OFFSET_MIN_HZ`]'s doc comment.
     ///
     /// Returns the offset that was **actually applied** (post-clamp), so the
     /// coordinator can mirror it into its own `active_tx_offsets` snapshot
@@ -2619,7 +2649,8 @@ impl QsoManager {
         qso_id: QsoId,
         new_offset_hz: f64,
     ) -> Result<f64, QsoManagerError> {
-        let applied_hz = new_offset_hz.clamp(TX_OFFSET_MIN_HZ, TX_OFFSET_MAX_HZ);
+        let applied_hz =
+            new_offset_hz.clamp(ACTIVE_QSO_TX_OFFSET_MIN_HZ, ACTIVE_QSO_TX_OFFSET_MAX_HZ);
         let mut qsos = self.qsos.write().await;
         let progress = qsos
             .get_mut(&qso_id)
@@ -7913,11 +7944,10 @@ mod tests {
         assert_eq!(after.metadata.frequency, 1800.0);
     }
 
-    /// PAN-72 final review (finding 6.4): the offset is clamped defensively
-    /// to TX_OFFSET_MIN_HZ..=TX_OFFSET_MAX_HZ — the band the removed stuck-DX
-    /// hop clamped to — since this is a `pub` method documented as the sole
-    /// external mutator of an active QSO's TX offset. The applied (clamped)
-    /// value is returned so the coordinator can mirror it.
+    /// PAN-72 final review (finding 6.4): the offset is clamped defensively,
+    /// since this is a `pub` method documented as the sole external mutator of
+    /// an active QSO's TX offset. The applied (clamped) value is returned so
+    /// the coordinator can mirror it into `active_tx_offsets`.
     #[tokio::test]
     async fn apply_tx_offset_switch_clamps_out_of_band_offsets() {
         let manager = QsoManager::new(test_config());
@@ -7930,16 +7960,16 @@ mod tests {
             .apply_tx_offset_switch(qso_id, 9000.0)
             .await
             .unwrap();
-        assert_eq!(applied, TX_OFFSET_MAX_HZ);
+        assert_eq!(applied, ACTIVE_QSO_TX_OFFSET_MAX_HZ);
         let after = manager.get_qso(qso_id).await.unwrap();
-        assert_eq!(after.metadata.frequency, TX_OFFSET_MAX_HZ);
-        assert_eq!(after.state.frequency(), Some(TX_OFFSET_MAX_HZ));
+        assert_eq!(after.metadata.frequency, ACTIVE_QSO_TX_OFFSET_MAX_HZ);
+        assert_eq!(after.state.frequency(), Some(ACTIVE_QSO_TX_OFFSET_MAX_HZ));
 
         let applied = manager.apply_tx_offset_switch(qso_id, -50.0).await.unwrap();
-        assert_eq!(applied, TX_OFFSET_MIN_HZ);
+        assert_eq!(applied, ACTIVE_QSO_TX_OFFSET_MIN_HZ);
         let after = manager.get_qso(qso_id).await.unwrap();
-        assert_eq!(after.metadata.frequency, TX_OFFSET_MIN_HZ);
-        assert_eq!(after.state.frequency(), Some(TX_OFFSET_MIN_HZ));
+        assert_eq!(after.metadata.frequency, ACTIVE_QSO_TX_OFFSET_MIN_HZ);
+        assert_eq!(after.state.frequency(), Some(ACTIVE_QSO_TX_OFFSET_MIN_HZ));
 
         // In-band values pass through untouched.
         let applied = manager
@@ -7947,6 +7977,40 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(applied, 1234.0);
+    }
+
+    /// The clamp must NOT be the narrower autonomous *pick* band
+    /// (`TX_OFFSET_MIN_HZ`..=`TX_OFFSET_MAX_HZ`, 300–2700). Answering a CQ
+    /// ties our reply to wherever we decoded the DX, unclamped, up to
+    /// ~2900 Hz — so a `Revert`'s `target_hz` (a `last_known_good_offset_hz`
+    /// that was itself such a reply offset) must survive intact. Narrowing it
+    /// would move the QSO off the very offset it demonstrably worked on,
+    /// defeating the point of reverting.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_preserves_a_legitimate_high_reply_offset() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+
+        // 2850 Hz: above the autonomous pick band's 2700 ceiling, but a
+        // perfectly legitimate place for an in-progress QSO to be sitting.
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, 2850.0)
+            .await
+            .unwrap();
+        assert_eq!(
+            applied, 2850.0,
+            "a revert to a real, previously-working high offset must not be \
+             narrowed to the autonomous pick band's ceiling"
+        );
+        assert!(applied > TX_OFFSET_MAX_HZ);
+
+        // Likewise at the low end (the pick band starts at 300).
+        let applied = manager.apply_tx_offset_switch(qso_id, 250.0).await.unwrap();
+        assert_eq!(applied, 250.0);
+        assert!(applied < TX_OFFSET_MIN_HZ);
     }
 
     /// apply_tx_offset_switch on an unknown QSO id returns QsoNotFound.

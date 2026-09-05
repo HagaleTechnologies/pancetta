@@ -145,8 +145,10 @@ tested.
   Result<f64, QsoManagerError>` — the one external mutation entry point. Sets
   `metadata.frequency` **and the QSO state's own embedded frequency** (via
   `QsoState::set_frequency`, mirroring the Hound QSY block: `Completed` is built from the
-  preceding state's `frequency`, so metadata alone would log the pre-switch offset), clamps to
-  `TX_OFFSET_MIN_HZ..=TX_OFFSET_MAX_HZ` as the removed hop did, clears `pending_freq_drift`,
+  preceding state's `frequency`, so metadata alone would log the pre-switch offset), clamps
+  defensively to `ACTIVE_QSO_TX_OFFSET_MIN_HZ..=ACTIVE_QSO_TX_OFFSET_MAX_HZ` (200–2900 — NOT
+  the removed hop's 300–2700 autonomous-*pick* band, which would narrow a `Revert` back to an
+  unclamped reply offset the QSO actually worked on), clears `pending_freq_drift`,
   resets `stall_cycles` to 0, and logs at `target: "tx.freq"` — at `info!`, since the
   silence-based detector fires far more often than the identical-repeat hop it replaced. Returns
   the applied (post-clamp) offset so the coordinator's `active_tx_offsets` mirror stores what

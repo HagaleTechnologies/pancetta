@@ -537,16 +537,17 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// exists is not this task's problem to recover from.
 ///
 /// On success the QSO's entry in `active_tx_offsets` is rewritten to the
-/// offset `apply_tx_offset_switch` actually applied (post-clamp). Without
-/// this, the map — which the allocator reads every tick through
-/// `set_own_frequencies`, and which the `u` nudge reads to build its
-/// `avoid_hz` — only refreshed on a `QsoEvent::StateChanged` carrying a
-/// frequency, and `apply_tx_offset_switch` emits no event at all. The map
-/// would therefore keep the PRE-switch offset until the QSO's next state
-/// transition: self-avoidance would guard a slot the QSO has already
-/// vacated (and could hand it to something else) while being blind to the
-/// offset the QSO is really on, and the next nudge's `avoid_hz` would name
-/// the wrong frequency.
+/// offset `apply_tx_offset_switch` actually applied (post-clamp). That map is
+/// otherwise refreshed only on a `QsoEvent::StateChanged` carrying a
+/// frequency, and `apply_tx_offset_switch` emits no event at all — so without
+/// this write the map keeps the PRE-switch offset until the QSO's next state
+/// transition. Two consumers read it: the allocator, every tick, via
+/// `set_own_frequencies` (a few statements below this drain's call site — so
+/// the mirror lands in time for the same tick's sync), and the `u` nudge,
+/// which builds its `avoid_hz` from it. A stale entry therefore both guards a
+/// slot the QSO has already vacated — leaving the allocator free to hand it to
+/// something else — and leaves the allocator blind to the offset the QSO is
+/// really on, while the next nudge would name the wrong frequency to avoid.
 ///
 /// A direct map write (rather than a new event type) is the right shape
 /// here: `active_tx_offsets` is a plain `Arc<RwLock<HashMap<String, f64>>>`
@@ -3341,11 +3342,11 @@ mod drain_pending_qso_offset_requests_tests {
             .unwrap();
         assert_eq!(
             progress.metadata.frequency,
-            pancetta_qso::qso_manager::TX_OFFSET_MAX_HZ
+            pancetta_qso::qso_manager::ACTIVE_QSO_TX_OFFSET_MAX_HZ
         );
         assert_eq!(
             active_tx_offsets.read().unwrap().get(&key).copied(),
-            Some(pancetta_qso::qso_manager::TX_OFFSET_MAX_HZ),
+            Some(pancetta_qso::qso_manager::ACTIVE_QSO_TX_OFFSET_MAX_HZ),
             "the map must agree with the QSO after clamping"
         );
     }
