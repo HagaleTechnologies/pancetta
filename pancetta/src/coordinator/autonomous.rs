@@ -527,6 +527,50 @@ fn drain_pending_autonomous_cq_dispatch_failures(
     }
 }
 
+/// PAN-72: resolves and commits every queued mid-QSO TX-offset action once
+/// per tick, mirroring `drain_pending_autonomous_cq_dispatch_failures`'s
+/// mailbox shape. `Switch` is resolved via the SAME `allocate_smart_frequency`
+/// the CQ-hunting switch uses (single-scorer invariant); `Revert` needs no
+/// allocator call. Errors from `apply_tx_offset_switch` (e.g. the QSO
+/// completed/was removed between the event firing and this drain) are logged
+/// and skipped, not propagated — a stale request for a QSO that no longer
+/// exists is not this task's problem to recover from.
+async fn drain_pending_qso_offset_requests(
+    op: &mut pancetta_qso::AutonomousOperator,
+    qso_manager: &pancetta_qso::QsoManager,
+    pending_qso_offset_requests: &std::sync::Mutex<
+        Vec<(
+            pancetta_qso::states::QsoId,
+            pancetta_qso::qso_manager::OffsetAction,
+        )>,
+    >,
+) {
+    let requests: Vec<_> = std::mem::take(
+        &mut *pending_qso_offset_requests
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()),
+    );
+    for (qso_id, action) in requests {
+        let resolved_hz = match action {
+            pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } => {
+                op.allocate_smart_frequency(None, None, Some(avoid_hz))
+            }
+            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz } => target_hz,
+        };
+        if let Err(err) = qso_manager
+            .apply_tx_offset_switch(qso_id, resolved_hz)
+            .await
+        {
+            warn!(
+                target: "tx.freq",
+                qso_id = %qso_id,
+                error = %err,
+                "PAN-72: could not apply queued TX-offset action (QSO likely completed)"
+            );
+        }
+    }
+}
+
 /// Bound on `rolled_back_attempt_tombstones` -- self-CQ attempts run at
 /// most one or two at a time in practice, so this is a defensive cap
 /// against pathological growth (a fallback-drained attempt whose
@@ -1109,6 +1153,23 @@ impl super::ApplicationCoordinator {
         // independent of this task's own message-bus channel entirely.
         let pending_autonomous_cq_dispatch_failures =
             self.pending_autonomous_cq_dispatch_failures.clone();
+        // PAN-72: the other half of `pending_qso_offset_requests` (see its
+        // own doc comment on the field) -- pushed by the QSO event-forwarder
+        // task, drained here once per `slot_interval` tick, same
+        // push-mailbox shape as `pending_autonomous_cq_dispatch_failures`
+        // above.
+        let pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
+        // PAN-72: the Autonomous task doesn't otherwise hold any `QsoManager`
+        // handle -- clone the same cheap Arc-based handle the task
+        // supervisor uses (`qso_manager_for_supervisor`, populated by
+        // `start_qso_component` before this component starts, see
+        // `mod.rs`'s ordering in `run()`). `apply_tx_offset_switch` doesn't
+        // read `tx_freq_mode`, so Task 8's disconnected-tx_freq_mode-Arc
+        // caveat on this same field doesn't apply to this use. `None` here
+        // (Qso component not yet up) means nothing could have been pushed
+        // to `pending_qso_offset_requests` either, so the drain below is
+        // skipped as a true no-op rather than a bug.
+        let qso_manager_for_offset_drain = self.qso_manager_for_supervisor.clone();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();
             let operator = operator.clone();
@@ -1223,6 +1284,21 @@ impl super::ApplicationCoordinator {
                                 &pending_autonomous_cq_dispatch_failures,
                                 &mut rolled_back_attempt_tombstones,
                             );
+
+                            // PAN-72: resolve and commit any mid-QSO
+                            // TX-offset actions the QSO event-forwarder
+                            // queued this cycle (stall-switch/revert). A
+                            // `None` handle here means the Qso component
+                            // isn't up yet, which also means nothing could
+                            // have been queued -- true no-op, not a bug.
+                            if let Some(ref qso_manager) = qso_manager_for_offset_drain {
+                                drain_pending_qso_offset_requests(
+                                    &mut op,
+                                    qso_manager,
+                                    &pending_qso_offset_requests,
+                                )
+                                .await;
+                            }
 
                             // Update spectral data from waterfall
                             if let Ok(rows) = waterfall_to_auto_rx.try_recv() {
@@ -2963,6 +3039,139 @@ mod drain_pending_autonomous_cq_dispatch_failures_tests {
             "nothing pending must mean nothing is touched"
         );
         assert!(tombstones.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod drain_pending_qso_offset_requests_tests {
+    use super::*;
+
+    /// Minimal manager config, mirroring `qso.rs`'s `replay_local_log_tests::manager()`.
+    fn manager() -> pancetta_qso::QsoManager {
+        pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+            our_callsign: "W1ABC".to_string(),
+            our_grid: Some("FN42".to_string()),
+            ..Default::default()
+        })
+    }
+
+    /// An operator with the smart allocator actually live (Auto mode +
+    /// spectral data), mirroring `pancetta-qso`'s own
+    /// `allocate_smart_frequency_avoids_the_given_offset` test -- this
+    /// operator's `tx_freq_mode` is its OWN internal atomic (set via
+    /// `set_tx_freq_mode_source`), unrelated to any `QsoManager`'s
+    /// `tx_freq_mode` source, so none of Task 8's `qso_manager_for_supervisor`
+    /// disconnected-Arc caveat applies here.
+    #[allow(clippy::field_reassign_with_default)]
+    fn operator_with_live_allocator() -> pancetta_qso::AutonomousOperator {
+        let mut config = pancetta_qso::AutonomousConfig::default();
+        config.enabled = true;
+        let mut op =
+            pancetta_qso::AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        op
+    }
+
+    #[tokio::test]
+    async fn switch_action_resolves_via_allocator_and_commits() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .start_cq(1500.0, None, false)
+            .await
+            .expect("start_cq should succeed");
+        let pending = std::sync::Mutex::new(vec![(
+            qso_id,
+            pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+        )]);
+
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending).await;
+
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "a drained request must be removed from the pending list"
+        );
+        let (_, progress) = qso_manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == qso_id)
+            .unwrap();
+        assert!(
+            (progress.metadata.frequency - 1500.0).abs() > f64::EPSILON,
+            "Switch must resolve to something other than the avoided 1500 Hz via the allocator, \
+             got {}",
+            progress.metadata.frequency
+        );
+    }
+
+    #[tokio::test]
+    async fn revert_action_uses_target_hz_directly_no_allocator_call() {
+        // Deliberately Hold mode / no spectral data -- if `Revert` ever
+        // routed through the allocator instead of using `target_hz`
+        // directly, `allocate_smart_frequency` would fall back to
+        // `config.tx_offset_hz` (default 1000.0), not land on 1200.0.
+        let mut op = pancetta_qso::AutonomousOperator::new(
+            pancetta_qso::AutonomousConfig::default(),
+            "W1ABC".into(),
+            Some("FN42".into()),
+        );
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .start_cq(1500.0, None, false)
+            .await
+            .expect("start_cq should succeed");
+        let pending = std::sync::Mutex::new(vec![(
+            qso_id,
+            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+        )]);
+
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending).await;
+
+        assert!(pending.lock().unwrap().is_empty());
+        let (_, progress) = qso_manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == qso_id)
+            .unwrap();
+        assert_eq!(
+            progress.metadata.frequency, 1200.0,
+            "Revert must land on target_hz exactly, not any allocator-derived value"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_empty_pending_list_is_a_complete_no_op() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let pending = std::sync::Mutex::new(Vec::new());
+
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending).await;
+
+        assert!(pending.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_request_for_a_since_removed_qso_is_logged_and_skipped_not_propagated() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let pending = std::sync::Mutex::new(vec![(
+            uuid::Uuid::new_v4(),
+            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+        )]);
+
+        // Must not panic even though the qso_id doesn't exist in the manager.
+        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending).await;
+
+        assert!(pending.lock().unwrap().is_empty());
     }
 }
 

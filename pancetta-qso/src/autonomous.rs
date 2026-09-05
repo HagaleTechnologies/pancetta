@@ -1732,7 +1732,14 @@ impl AutonomousOperator {
 
     /// Get the best frequency for a new QSO using the smart allocator.
     /// Falls back to the legacy allocator if no spectral data is available.
-    fn allocate_smart_frequency(
+    ///
+    /// Exposed (beyond this crate's own internal use in `decide_at`) for the
+    /// coordinator's PAN-72 mid-QSO stall-switch drain
+    /// (`pancetta::coordinator::autonomous`), which resolves an
+    /// `OffsetAction::Switch` the same way a CQ-hunting switch does — see
+    /// that call site's own doc comment. No signature change from the
+    /// pre-existing private method.
+    pub fn allocate_smart_frequency(
         &self,
         dx_target_hz: Option<f64>,
         target_parity: Option<pancetta_core::slot::SlotParity>,
