@@ -2550,8 +2550,28 @@ pub struct CoalesceOutcome {
     /// the active set (terminal / cancelled / completed-past-grace QSO).
     pub dropped_terminal: usize,
     /// How many distinct streams were dropped because the retained set hit
-    /// the [`MAX_RETAINED_TX_STREAMS`] cap (silent truncation made visible).
+    /// either the operator-configured concurrent-QSO cap
+    /// (`max_concurrent_qsos`, QSO-keyed streams only) or the hard
+    /// [`MAX_RETAINED_TX_STREAMS`] backstop (silent truncation made visible).
     pub truncated: usize,
+    /// The actual entries dropped by either truncation cap counted in
+    /// `truncated` above — unlike `dropped_terminal` (a QSO that already
+    /// ended, nothing to roll back) or `parity_excluded`/`freq_excluded`
+    /// (temporary, the QSO's own cadence retries it next cycle), a truncated
+    /// stream represents an ADMITTED, still-live QSO whose call-bookkeeping
+    /// (call_count, last_call_at, Sent timeline) already advanced as if this
+    /// frame would transmit. The caller must report a failed
+    /// `TransmitComplete` for each so that bookkeeping doesn't silently drift
+    /// from reality (a stream that's always last in FIFO order would
+    /// otherwise burn through its retry budget or time out having never
+    /// actually gone on air).
+    pub truncated_entries: Vec<CoalesceEntry>,
+    /// The effective concurrent-QSO cap actually applied to QSO-keyed
+    /// streams this cycle (`max_concurrent_qsos`, clamped into
+    /// `1..=MAX_RETAINED_TX_STREAMS`) — exposed so a truncation diagnostic
+    /// can report the cap that actually did the truncating instead of always
+    /// citing the (possibly much larger) hard backstop.
+    pub qso_cap: usize,
     /// How many retained streams were excluded from THIS cycle's bundle
     /// because their concrete `tx_parity` disagreed with the bundle anchor's
     /// (the first-seen retained stream's parity — see
@@ -2589,6 +2609,74 @@ impl CoalesceOutcome {
             && self.truncated == 0
             && self.parity_excluded == 0
             && self.freq_excluded == 0
+    }
+}
+
+/// The effective concurrent-QSO ceiling for THIS cycle: the operator's
+/// configured `autonomous.max_concurrent_qsos`, raised to Fox mode's own
+/// `fox_max_streams + 1` (the `+1` for Fox's independent CQ stream, which
+/// occupies a slot alongside — not carved out of — the Hound-answer count;
+/// see `maybe_answer_caller`'s "Capacity bound" comment in `coordinator/qso.rs`)
+/// whenever Fox mode is active. Both `fox_mode` and `fox_max_streams` are live
+/// `Atomic`s the operator/engine can flip at runtime, so this must be
+/// recomputed per cycle rather than folded into the `max_concurrent_qsos`
+/// snapshot the worker captures once at startup — Fox mode staying capped at
+/// the normal single/dual-QSO limit would truncate its own intended
+/// multi-stream Hound-answer bundle down to one signal.
+fn effective_max_concurrent_qsos(
+    max_concurrent_qsos: u32,
+    fox_mode: &std::sync::atomic::AtomicBool,
+    fox_max_streams: &std::sync::atomic::AtomicUsize,
+) -> u32 {
+    if fox_mode.load(Ordering::Relaxed) {
+        let fox_total = fox_max_streams.load(Ordering::Relaxed) as u32 + 1;
+        max_concurrent_qsos.max(fox_total)
+    } else {
+        max_concurrent_qsos
+    }
+}
+
+#[cfg(test)]
+mod effective_max_concurrent_qsos_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+    /// PR #348 review (Codex P1): Fox mode admits up to `fox.max_streams`
+    /// Hound-answer QSOs plus its own independent CQ stream. Passing only
+    /// the operator's normal `autonomous.max_concurrent_qsos` (default 1)
+    /// into the coalescer/mid-TX-supersede cap would truncate Fox's intended
+    /// multi-stream bundle down to one signal, dropping the rest.
+    #[test]
+    fn fox_mode_raises_the_cap_above_the_normal_configured_value() {
+        let fox_mode = AtomicBool::new(true);
+        let fox_max_streams = AtomicUsize::new(5);
+        assert_eq!(
+            effective_max_concurrent_qsos(1, &fox_mode, &fox_max_streams),
+            6,
+            "Fox mode must raise the cap to fox_max_streams (Hounds) + 1 (its own CQ stream)"
+        );
+    }
+
+    #[test]
+    fn non_fox_mode_is_unaffected() {
+        let fox_mode = AtomicBool::new(false);
+        let fox_max_streams = AtomicUsize::new(5);
+        assert_eq!(
+            effective_max_concurrent_qsos(2, &fox_mode, &fox_max_streams),
+            2,
+            "outside Fox mode the cap must be exactly the configured max_concurrent_qsos"
+        );
+    }
+
+    #[test]
+    fn fox_mode_never_lowers_a_higher_configured_value() {
+        let fox_mode = AtomicBool::new(true);
+        let fox_max_streams = AtomicUsize::new(2);
+        assert_eq!(
+            effective_max_concurrent_qsos(10, &fox_mode, &fox_max_streams),
+            10,
+            "Fox mode raises the cap, it must never lower an already-higher configured value"
+        );
     }
 }
 
@@ -2668,34 +2756,23 @@ pub fn coalesce_transmit_requests(
         }
     }
 
-    // Assemble the QSO-keyed portion first (first-seen order).
+    // Assemble QSO-keyed streams (first-seen order) followed by manual sends
+    // — UNCAPPED for now. The concurrent-QSO cap is applied further below,
+    // AFTER the parity/frequency conflict passes: capping first can truncate
+    // away a stream that would have survived while keeping one that gets
+    // excluded moments later for a conflict, missing an otherwise-valid
+    // bundle combination entirely (e.g. cap=2 with streams A/B/C where B
+    // conflicts with A — capping first keeps [A, B] then drops B to a
+    // conflict, leaving just A; filtering conflicts first correctly leaves
+    // [A, C] as the surviving two-stream bundle). Manual sends go last so a
+    // single-stream QSO backlog keeps the QSO as the headline item.
     let mut retained: Vec<CoalesceEntry> = Vec::with_capacity(order.len() + manual.len());
     for key in order {
         if let Some(e) = by_qso.remove(&key) {
             retained.push(e);
         }
     }
-
-    // Enforce the operator's configured concurrent-QSO cap on the QSO-keyed
-    // streams ONLY — manual/tune sends below are not concurrent QSOs and
-    // aren't subject to this limit. `MAX_RETAINED_TX_STREAMS` remains a hard
-    // backstop regardless of config.
-    let qso_cap = (max_concurrent_qsos.max(1) as usize).min(MAX_RETAINED_TX_STREAMS);
-    if retained.len() > qso_cap {
-        outcome.truncated += retained.len() - qso_cap;
-        retained.truncate(qso_cap);
-    }
-
-    // Manual sends go last so a single-stream QSO backlog keeps the QSO as
-    // the headline item.
     retained.append(&mut manual);
-
-    // Final hard safety cap across everything retained (QSO streams + manual
-    // sends together), independent of the concurrent-QSO setting.
-    if retained.len() > MAX_RETAINED_TX_STREAMS {
-        outcome.truncated += retained.len() - MAX_RETAINED_TX_STREAMS;
-        retained.truncate(MAX_RETAINED_TX_STREAMS);
-    }
 
     // Bundle-parity conflict check. When ≥2 distinct streams survive, they may
     // get folded into a single `MultiTransmitRequest` by the caller, stamped
@@ -2767,6 +2844,41 @@ pub fn coalesce_transmit_requests(
             }
         }
         retained = kept;
+    }
+
+    // Enforce the operator's configured concurrent-QSO cap on the QSO-keyed
+    // SURVIVORS only, now that conflicting entries have already been
+    // filtered out above. Manual/tune sends (`qso_id == None`) are never
+    // concurrent QSOs and are always kept regardless of this cap — they're
+    // still bounded by the hard backstop below. A truncated entry represents
+    // an ADMITTED, still-live QSO whose call-bookkeeping has already
+    // advanced as if this frame would transmit, so its `CoalesceEntry` is
+    // retained in `truncated_entries` for the caller to report a failed
+    // `TransmitComplete` — silently dropping it here would let that QSO's
+    // retry/timeout accounting drift from what actually went on air.
+    let qso_cap = (max_concurrent_qsos.max(1) as usize).min(MAX_RETAINED_TX_STREAMS);
+    outcome.qso_cap = qso_cap;
+    let mut qso_seen = 0usize;
+    let mut kept = Vec::with_capacity(retained.len());
+    for entry in retained.into_iter() {
+        if entry.qso_id.is_some() {
+            if qso_seen >= qso_cap {
+                outcome.truncated += 1;
+                outcome.truncated_entries.push(entry);
+                continue;
+            }
+            qso_seen += 1;
+        }
+        kept.push(entry);
+    }
+    retained = kept;
+
+    // Final hard safety cap across everything retained (QSO streams + manual
+    // sends together), independent of the concurrent-QSO setting.
+    if retained.len() > MAX_RETAINED_TX_STREAMS {
+        let overflow = retained.split_off(MAX_RETAINED_TX_STREAMS);
+        outcome.truncated += overflow.len();
+        outcome.truncated_entries.extend(overflow);
     }
 
     outcome.retained = retained;
@@ -2884,13 +2996,14 @@ async fn coalesce_backlog_into(
         let text = format!(
             "TX backlog coalesced: drained {} request(s) → {} retained; \
              coalesced {} stale (newest-per-QSO wins), dropped {} for ended QSOs, \
-             truncated {} over the {}-stream cap, excluded {} for a bundle-parity conflict, \
-             excluded {} for a bundle-frequency conflict",
+             truncated {} over the effective {}-QSO cap (hard backstop {}), excluded {} for a \
+             bundle-parity conflict, excluded {} for a bundle-frequency conflict",
             backlog_total,
             outcome.retained.len(),
             outcome.coalesced,
             outcome.dropped_terminal,
             outcome.truncated,
+            outcome.qso_cap,
             MAX_RETAINED_TX_STREAMS,
             outcome.parity_excluded,
             outcome.freq_excluded,
@@ -2904,6 +3017,31 @@ async fn coalesce_backlog_into(
             None,
         )
         .await;
+    }
+
+    // A truncated entry is an ADMITTED, still-live QSO whose call-bookkeeping
+    // (call_count, last_call_at, Sent timeline) already advanced as if this
+    // frame would transmit — report a failed TransmitComplete for each so
+    // that bookkeeping doesn't silently drift from what actually went on
+    // air (see `CoalesceOutcome::truncated_entries`'s doc comment).
+    for entry in &outcome.truncated_entries {
+        let complete_msg = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Autonomous,
+            MessageType::TransmitComplete {
+                success: false,
+                message_text: entry.message_text.clone(),
+                duration_ms: 0,
+                qso_id: entry.qso_id.clone(),
+            },
+            Instant::now(),
+        );
+        if let Err(e) = message_bus.send_message(complete_msg).await {
+            warn!(
+                "Failed to send TransmitComplete for a cap-truncated stream: {}",
+                e
+            );
+        }
     }
 
     // Every drained request belonged to an ended QSO (rare: needs ≥2 queued
@@ -3217,15 +3355,25 @@ async fn supersede_and_rekey_or_bundle(
             qso_id: new_qso_id.clone(),
         });
 
-        // Enforce the configured concurrent-QSO ceiling on the DISTINCT
-        // stream count. A same-QSO refresh (the filter above already folded
-        // it into its existing slot) never grows `candidate_items`, so it's
-        // never blocked here — only a genuinely NEW stream that would push
-        // the bundle over `max_concurrent_qsos` falls through to `Replace`
-        // below (abandoning the whole in-flight bundle in favor of just the
-        // new request, the same fallback already used for a frequency
+        // Enforce the configured concurrent-QSO ceiling on the QSO-KEYED
+        // stream count only — a manual/free-text item (`qso_id == None`) is
+        // not a concurrent QSO and must never count against
+        // `max_concurrent_qsos` (it's still bounded by the separate hard
+        // `MAX_RETAINED_TX_STREAMS` check below). A same-QSO refresh (the
+        // filter above already folded it into its existing slot) never
+        // grows the QSO count, so it's never blocked here — only a
+        // genuinely NEW QSO stream that would push the count over
+        // `max_concurrent_qsos` falls through to `Replace` below
+        // (abandoning the whole in-flight bundle in favor of just the new
+        // request, the same fallback already used for a frequency
         // collision).
-        if candidate_items.len() <= max_concurrent_qsos as usize {
+        let qso_count = candidate_items
+            .iter()
+            .filter(|it| it.qso_id.is_some())
+            .count();
+        if qso_count <= max_concurrent_qsos as usize
+            && candidate_items.len() <= MAX_RETAINED_TX_STREAMS
+        {
             // Fail-safe origin fold: the bundle carries BOTH the in-flight
             // stream and the new one, so it must be gated if EITHER is Remote.
             let bundle_origin = if in_flight_origin == crate::message_bus::TxOrigin::Remote
@@ -3243,10 +3391,13 @@ async fn supersede_and_rekey_or_bundle(
         }
         info!(
             target: "pancetta::tx.policy",
-            "supersede: not bundling — {} distinct streams would exceed max_concurrent_qsos={}; \
-             replacing the in-flight transmission with just the new request instead",
+            "supersede: not bundling — {} QSO-keyed stream(s) of {} total would exceed \
+             max_concurrent_qsos={} (hard cap {}); replacing the in-flight transmission \
+             with just the new request instead",
+            qso_count,
             candidate_items.len(),
-            max_concurrent_qsos
+            max_concurrent_qsos,
+            MAX_RETAINED_TX_STREAMS
         );
     }
 
@@ -3547,6 +3698,15 @@ impl super::ApplicationCoordinator {
             // autonomous.rs, qso.rs) — zero-cost no-op when neither the
             // localhost gateway nor the station agent's read stream is live.
             let display_feed_enabled = self.display_feed_enabled.clone();
+            // Fox mode raises the effective concurrent-stream cap above the
+            // operator's configured `max_concurrent_qsos` — see
+            // `effective_max_concurrent_qsos`'s doc comment and
+            // `maybe_answer_caller`'s "Capacity bound" comment in qso.rs for
+            // why these can't just be folded into the `max_concurrent_qsos`
+            // snapshot above (both are live Atomics the operator/engine can
+            // flip at runtime, not a startup-only config value).
+            let fox_mode = self.fox_mode();
+            let fox_max_streams = self.fox_max_streams();
 
             tokio::spawn(async move {
                 info!(
@@ -3801,7 +3961,11 @@ impl super::ApplicationCoordinator {
                                     &tx_rx,
                                     &message_bus,
                                     &active_tx_qsos,
-                                    max_concurrent_qsos,
+                                    effective_max_concurrent_qsos(
+                                        max_concurrent_qsos,
+                                        &fox_mode,
+                                        &fox_max_streams,
+                                    ),
                                 )
                                 .await;
 
@@ -4741,7 +4905,11 @@ impl super::ApplicationCoordinator {
                                                     slot_ns,
                                                     tx_self_parity,
                                                     request_received_at,
-                                                    max_concurrent_qsos,
+                                                    effective_max_concurrent_qsos(
+                                                        max_concurrent_qsos,
+                                                        &fox_mode,
+                                                        &fox_max_streams,
+                                                    ),
                                                     origin,
                                                     &in_flight_items,
                                                 )
@@ -5056,7 +5224,11 @@ impl super::ApplicationCoordinator {
                                                     slot_ns,
                                                     tx_self_parity,
                                                     request_received_at,
-                                                    max_concurrent_qsos,
+                                                    effective_max_concurrent_qsos(
+                                                        max_concurrent_qsos,
+                                                        &fox_mode,
+                                                        &fox_max_streams,
+                                                    ),
                                                     origin,
                                                     &in_flight_items,
                                                 )
@@ -6624,7 +6796,11 @@ impl super::ApplicationCoordinator {
                                                 slot_ns,
                                                 tx_self_parity,
                                                 request_received_at,
-                                                max_concurrent_qsos,
+                                                effective_max_concurrent_qsos(
+                                                    max_concurrent_qsos,
+                                                    &fox_mode,
+                                                    &fox_max_streams,
+                                                ),
                                             )
                                             .await;
                                             ptt_guard.disarm();
@@ -6737,7 +6913,11 @@ impl super::ApplicationCoordinator {
                                                 slot_ns,
                                                 tx_self_parity,
                                                 request_received_at,
-                                                max_concurrent_qsos,
+                                                effective_max_concurrent_qsos(
+                                                    max_concurrent_qsos,
+                                                    &fox_mode,
+                                                    &fox_max_streams,
+                                                ),
                                             )
                                             .await;
                                             ptt_guard.disarm();
@@ -8319,6 +8499,92 @@ mod supersede_rekey_tests {
         assert_eq!(frequency_offset, 1800.0);
     }
 
+    /// PR #348 review (Codex P2): a manual/untracked in-flight item
+    /// (`qso_id == None`) must NOT count against `max_concurrent_qsos` —
+    /// only QSO-keyed streams are concurrent QSOs. With cap=2, one tracked
+    /// QSO + one manual item already in flight, a SECOND new manual item
+    /// must still fold into a 3-item bundle (1 QSO-keyed + 2 manual), not
+    /// be rejected as a "three-QSO" overflow.
+    #[tokio::test(flavor = "current_thread")]
+    async fn supersede_bundle_cap_does_not_count_manual_items() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        // One tracked QSO + one manual (untracked) item already in flight.
+        let in_flight = [
+            crate::message_bus::TransmitRequestItem {
+                message_text: "KA1ABC K5ARH R-15".to_string(),
+                frequency_offset: 1000.0,
+                qso_id: Some("qso-1".to_string()),
+            },
+            crate::message_bus::TransmitRequestItem {
+                message_text: "MANUAL TUNE".to_string(),
+                frequency_offset: 1400.0,
+                qso_id: None,
+            },
+        ];
+
+        // A second new manual item — untracked, so `qso_id == None`.
+        let new_request = MessageType::TransmitRequest {
+            message_text: "SECOND MANUAL".to_string(),
+            frequency_offset: 1800.0,
+            qso_id: None,
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+
+        let outcome = super::supersede_and_rekey_or_bundle(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2, // max_concurrent_qsos — met by qso-1 alone; the 2 manual items must not count
+            crate::message_bus::TxOrigin::Local,
+            &in_flight,
+        )
+        .await;
+
+        match outcome {
+            super::SupersedeOutcome::Bundle { items, .. } => {
+                assert_eq!(
+                    items.len(),
+                    3,
+                    "1 QSO-keyed + 2 manual items must all bundle — manual items don't count \
+                     against max_concurrent_qsos"
+                );
+            }
+            other => panic!(
+                "expected Bundle (only 1 QSO-keyed stream is in flight, well under the cap of 2), got {other:?}"
+            ),
+        }
+    }
+
     /// C1 REGRESSION: the `Replace` outcome must carry the SUPERSEDING request's
     /// OWN `origin`, independent of the aborted in-flight transmission's origin.
     ///
@@ -9264,6 +9530,17 @@ mod coalesce_tests {
         assert_eq!(out.retained[0].message_text, "A");
         assert_eq!(out.retained[1].message_text, "B");
         assert_eq!(out.truncated, 1);
+        assert_eq!(
+            out.qso_cap, 2,
+            "the effective cap actually applied must be exposed"
+        );
+        assert_eq!(
+            out.truncated_entries.len(),
+            1,
+            "the truncated stream's own entry must be exposed so the caller can report a \
+             failed TransmitComplete for it"
+        );
+        assert_eq!(out.truncated_entries[0].message_text, "C");
         assert!(!out.is_noop());
     }
 
@@ -9288,6 +9565,117 @@ mod coalesce_tests {
             "manual sends must survive even when the QSO cap is 1"
         );
         assert_eq!(out.truncated, 0);
+        assert!(out.truncated_entries.is_empty());
+    }
+
+    /// PR #348 review (Codex P2): applying the QSO cap BEFORE the parity/
+    /// frequency conflict passes could truncate away a stream that would
+    /// have survived, while keeping one that gets excluded moments later for
+    /// a conflict — missing an otherwise-valid bundle combination. With
+    /// cap=2 and ordered offsets A=1000, B=1050 (50 Hz from A — a genuine
+    /// frequency conflict), C=1300 (300 Hz from A — fine): the OLD
+    /// cap-first order kept [A, B], then excluded B for the conflict,
+    /// leaving only A. Conflict-filtering first must instead exclude B
+    /// immediately and let the cap see [A, C] — a valid two-stream bundle.
+    #[test]
+    fn conflicting_entries_filtered_before_cap_not_after() {
+        let live = liveset(&["qso-a", "qso-b", "qso-c"]);
+        let out = coalesce_transmit_requests(
+            vec![
+                entry_freq("A", Some("qso-a"), 1000.0),
+                entry_freq("B", Some("qso-b"), 1050.0),
+                entry_freq("C", Some("qso-c"), 1300.0),
+            ],
+            2,
+            live_in(&live),
+        );
+        assert_eq!(
+            out.freq_excluded, 1,
+            "B must be excluded for the frequency conflict with A"
+        );
+        assert_eq!(
+            out.retained.len(),
+            2,
+            "the cap must not additionally truncate a valid post-conflict-filter bundle"
+        );
+        assert_eq!(out.retained[0].message_text, "A");
+        assert_eq!(
+            out.retained[1].message_text, "C",
+            "C must survive as the valid second stream once B (not C) is filtered for the \
+             frequency conflict"
+        );
+        assert_eq!(
+            out.truncated, 0,
+            "no QSO cap truncation should occur once B is correctly excluded by the conflict pass"
+        );
+    }
+
+    /// PR #348 review (Codex P1): a cap-truncated QSO-keyed stream already
+    /// has live call-bookkeeping (call_count, last_call_at, Sent timeline)
+    /// advanced as though it would transmit — dropping it silently would let
+    /// that bookkeeping drift from what actually went on air. Prove the
+    /// wiring end to end: `coalesce_backlog_into` must report a failed
+    /// `TransmitComplete` for every entry the cap truncates.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backlog_into_reports_transmit_complete_for_cap_truncated_streams() {
+        use crate::message_bus::MessageBus;
+        use std::sync::Arc;
+
+        let bus = MessageBus::new(16).unwrap();
+        let (_autonomous_tx, autonomous_rx) =
+            bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&[
+            "qso-a", "qso-b", "qso-c",
+        ])));
+
+        let head = MessageType::TransmitRequest {
+            message_text: "A".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-a".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Local,
+        };
+        for (text, id, freq) in [("B", "qso-b", 1300.0), ("C", "qso-c", 1600.0)] {
+            backlog_tx
+                .send(ComponentMessage::new(
+                    ComponentId::Ft8Transmitter,
+                    ComponentId::Ft8Transmitter,
+                    MessageType::TransmitRequest {
+                        message_text: text.to_string(),
+                        frequency_offset: freq,
+                        qso_id: Some(id.to_string()),
+                        tx_parity: None,
+                        origin: crate::message_bus::TxOrigin::Local,
+                    },
+                    Instant::now(),
+                ))
+                .unwrap();
+        }
+
+        // max_concurrent_qsos = 1: only "A" survives, "B" and "C" are cap-truncated.
+        let _ = coalesce_backlog_into(head, &backlog_rx, &bus, &active_tx_qsos, 1).await;
+
+        let mut got = Vec::new();
+        while let Ok(msg) = autonomous_rx.try_recv() {
+            got.push(msg);
+        }
+        assert_eq!(
+            got.len(),
+            2,
+            "a TransmitComplete must be reported for each of the 2 cap-truncated streams"
+        );
+        for msg in &got {
+            match &msg.message_type {
+                MessageType::TransmitComplete { success, .. } => {
+                    assert!(
+                        !success,
+                        "a cap-truncated stream's TransmitComplete must report failure"
+                    );
+                }
+                other => panic!("expected TransmitComplete, got {other:?}"),
+            }
+        }
     }
 }
 
