@@ -1028,8 +1028,8 @@ impl QsoManager {
             first_call_at: Some(now),
             last_call_at: Some(now),
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -1162,8 +1162,8 @@ impl QsoManager {
             first_call_at: Some(now),
             last_call_at: Some(now),
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -1556,8 +1556,8 @@ impl QsoManager {
             first_call_at: Some(now),
             last_call_at: Some(now),
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
             hound: false,
             // When our TX offset != the DX's RX offset (Hold mode / de-conflict),
             // the caller supplies `partner_freq = Some(dx_freq)` so the relevance
@@ -1915,8 +1915,8 @@ impl QsoManager {
             first_call_at: Some(now),
             last_call_at: Some(now),
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
             hound: false,
             // When our TX offset != the DX's RX offset (Hold mode / de-conflict),
             // the caller supplies `partner_freq = Some(dx_freq)` so the relevance
@@ -2984,16 +2984,21 @@ impl QsoManager {
 
         // Stuck-DX TX-frequency hold/escape (operator request): we hold our TX
         // offset for the whole QSO so long as it is "working". The cue that it
-        // has stopped working is the DX repeating the *same* frame without the
-        // QSO advancing — they aren't copying our replies, most plausibly a
-        // collision on our held offset. After `DX_STUCK_REPEAT_THRESHOLD`
-        // identical non-advancing frames we hop our TX offset once and reset the
-        // counter. A forward advance resets the counter to 0 (the hold is fine);
-        // a *different* non-advancing frame resets it to 1. Applies to both
-        // Manual and Auto QSOs.
+        // has stopped working is the DX not advancing the QSO — they aren't
+        // copying our replies, most plausibly a collision on our held offset.
+        // After `DX_STUCK_REPEAT_THRESHOLD` non-advancing cycles we hop our TX
+        // offset once and reset the counter. A forward advance resets the
+        // counter to 0 (the hold is fine). Applies to both Manual and Auto
+        // QSOs.
+        // PAN-72 note: this counting (via `QsoMetadata::stall_cycles`) and the
+        // fixed-offset hop below are superseded by the adaptive TX-offset
+        // switch mechanism landing in a later task of that plan; until then
+        // this generalizes the old identical-frame-repeat check (which relied
+        // on the now-removed `last_rx_text` field) to "did not advance,"
+        // since `dx_frame_advanced` already tells us that directly.
         // The stuck-DX hop is an autonomous TX-offset change, so it only fires
         // in Auto mode. In the default Hold mode the operator's picked offset is
-        // sticky — we still TRACK the repeat streak (cheap, and ready if they
+        // sticky — we still TRACK the stall streak (cheap, and ready if they
         // switch to Auto) but never move the frequency.
         let tx_auto = pancetta_core::TxFreqMode::from_u8(
             self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
@@ -3002,24 +3007,17 @@ impl QsoManager {
         let rx_text = message.raw_text.trim().to_uppercase();
         if let Some(progress) = qsos.get_mut(&qso_id) {
             if dx_frame_advanced {
-                progress.metadata.dx_repeat_count = 0;
-                progress.metadata.last_rx_text = Some(rx_text);
-            } else if !rx_text.is_empty()
-                && progress.metadata.last_rx_text.as_deref() == Some(rx_text.as_str())
-            {
-                progress.metadata.dx_repeat_count =
-                    progress.metadata.dx_repeat_count.saturating_add(1);
+                progress.metadata.stall_cycles = 0;
             } else if !rx_text.is_empty() {
-                progress.metadata.dx_repeat_count = 1;
-                progress.metadata.last_rx_text = Some(rx_text);
+                progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_add(1);
             }
 
-            if tx_auto && progress.metadata.dx_repeat_count >= DX_STUCK_REPEAT_THRESHOLD {
+            if tx_auto && progress.metadata.stall_cycles >= DX_STUCK_REPEAT_THRESHOLD {
                 let old_off = progress.metadata.frequency;
                 let new_off = stuck_hopped_offset(old_off);
                 progress.metadata.frequency = new_off;
                 progress.metadata.pending_freq_drift = None;
-                progress.metadata.dx_repeat_count = 0;
+                progress.metadata.stall_cycles = 0;
                 // Keep the reply we are about to emit this cycle on the new
                 // offset (the captured `qso_frequency` was the pre-hop value).
                 qso_frequency = new_off;
@@ -3027,7 +3025,7 @@ impl QsoManager {
                     target: "tx.freq",
                     qso_id = %qso_id,
                     dx = progress.metadata.their_callsign.as_deref().unwrap_or("?"),
-                    "DX stuck (repeated frame x{}) — hopping our TX offset {:.0} Hz -> {:.0} Hz to clear a possible collision",
+                    "DX stuck (no forward progress x{}) — hopping our TX offset {:.0} Hz -> {:.0} Hz to clear a possible collision",
                     DX_STUCK_REPEAT_THRESHOLD, old_off, new_off
                 );
             }
@@ -8997,8 +8995,8 @@ mod tests {
                 first_call_at: Some(now),
                 last_call_at: Some(now),
                 progressed_this_cycle: false,
-                last_rx_text: None,
-                dx_repeat_count: 0,
+                stall_cycles: 0,
+                last_known_good_offset_hz: None,
                 hound: false,
                 partner_freq: None,
                 pending_freq_drift: None,
@@ -9544,8 +9542,8 @@ mod sender_verification_tests {
             first_call_at: None,
             last_call_at: None,
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -13720,8 +13718,8 @@ mod has_active_or_recent_qso_tests {
             first_call_at: Some(now),
             last_call_at: Some(now),
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -13955,8 +13953,8 @@ mod hound_tests {
             first_call_at: Some(now),
             last_call_at: Some(now),
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,

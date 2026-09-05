@@ -510,23 +510,25 @@ pub struct QsoMetadata {
     #[serde(default)]
     pub progressed_this_cycle: bool,
 
-    /// The last DX frame text received on this QSO (uppercased, trimmed).
-    /// Paired with [`Self::dx_repeat_count`] to detect a DX that keeps sending
-    /// the *same* message because it isn't copying our replies — the cue to
-    /// move our TX frequency off a possible collision (the only on-air reason
-    /// a held TX frequency would stop "working" mid-QSO; FT8 receivers decode
-    /// the whole passband, so our offset only matters when something is
-    /// stepping on it). `None` until the first DX frame.
+    /// Consecutive cycles since this QSO last made forward progress (a
+    /// genuinely new/advancing DX message). Incremented once per ~15s slot
+    /// while stalled — by [`QsoManager::rearm_manual_calls_at`] when we
+    /// re-transmit without an advance, which covers BOTH total silence and a
+    /// DX repeating the same non-advancing frame (the state simply stays the
+    /// same either way). Reset to 0 on any forward state advance. See
+    /// [`Self::last_known_good_offset_hz`] for what happens once this trips a
+    /// switch (PAN-72).
     #[serde(default)]
-    pub last_rx_text: Option<String>,
+    pub stall_cycles: u32,
 
-    /// Consecutive count of identical DX frames that did NOT advance the QSO.
-    /// Reset to 0 on any forward state advance, and to 1 when a *different*
-    /// non-advancing frame arrives. When it reaches the stuck-repeat threshold
-    /// the QSO performs a one-time TX-frequency hop (then resets to 0). See
-    /// [`Self::last_rx_text`].
+    /// The TX audio offset this QSO was on the last time it made forward
+    /// progress (a genuinely new/advancing DX message). `None` until the
+    /// first advance. Used to decide, when [`Self::stall_cycles`] trips a
+    /// switch: if we're currently ON this offset (or it's `None`), search for
+    /// a new one; if we're currently on some OTHER (previously-switched)
+    /// offset, revert to this one instead of searching again (PAN-72).
     #[serde(default)]
-    pub dx_repeat_count: u32,
+    pub last_known_good_offset_hz: Option<f64>,
 
     /// Hound (DXpedition chaser) mode: this QSO calls a Fox low and QSYs up on
     /// the Fox's report. `false` for every normal QSO. This flag, rather than

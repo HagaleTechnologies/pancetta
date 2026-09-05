@@ -879,7 +879,7 @@ pub struct AutonomousOperator {
     /// `CallingCq` QSO that is itself "active" until it times out, which
     /// would otherwise reset the streak against our own unanswered call.
     /// Tracked regardless of `TxFreqMode` (cheap, and ready if the operator
-    /// switches to Auto — same precedent as `QsoMetadata.dx_repeat_count`);
+    /// switches to Auto — same precedent as `QsoMetadata.stall_cycles`);
     /// only acted on in Auto mode.
     cq_no_response_streak: u32,
     /// The offset actually used for the most recent self-CQ (Auto mode
