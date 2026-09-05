@@ -2689,7 +2689,21 @@ impl QsoManager {
         // nudge, a passband clamp) is deliberately left alone: it is already
         // the correct "where we hear the DX", and this is purely a TX-side
         // move.
-        if progress.metadata.partner_freq.is_none() && (applied_hz - old_off).abs() > 1.0 {
+        //
+        // The latch also requires an ESTABLISHED DX identity
+        // (`their_callsign().is_some()` — the same discriminator
+        // `is_message_relevant`/`classify_relevance` use to pick between
+        // `FREQ_TOLERANCE_HZ` and `ESTABLISHED_FREQ_TOLERANCE_HZ`). On an
+        // unanswered `CallingCq` there is no DX at the old offset at all: it
+        // was OUR abandoned CQ frequency. Latching it would aim the RX gates
+        // at dead air, and — being pre-establishment — they would judge a
+        // caller answering us on our REAL (new) offset against it with the
+        // tight 15 Hz bound, rejecting every answer for the life of the QSO
+        // and spawning a duplicate QSO object in its place.
+        if progress.metadata.partner_freq.is_none()
+            && progress.state.their_callsign().is_some()
+            && (applied_hz - old_off).abs() > 1.0
+        {
             progress.metadata.partner_freq = Some(old_off);
         }
         // `info!`, not `warn!`: the removed hop fired only on an identical-
@@ -14336,6 +14350,93 @@ mod pan72_stall_detection_tests {
             "a switch that changes nothing must leave the Tx=Rx path untouched"
         );
         assert_eq!(after.metadata.frequency, FREQ);
+    }
+
+    /// A manual CQ QSO that nobody has answered yet has NO DX to keep pointing
+    /// at: `their_callsign()` is `None`, and the offset we move away from is
+    /// our own abandoned CQ frequency, not a partner's. Latching it into
+    /// `partner_freq` re-points every RX-side gate at an offset no one is
+    /// transmitting on — and because a pre-establishment QSO is judged with
+    /// the TIGHT `FREQ_TOLERANCE_HZ` (15 Hz), not the 100 Hz established
+    /// bound, a caller answering us at the offset we are ACTUALLY calling on
+    /// is rejected forever and a duplicate QSO object gets spawned in its
+    /// place. The latch must therefore be gated on an established DX identity,
+    /// the same discriminator `is_message_relevant`/`classify_relevance`
+    /// already use to choose between the two tolerances.
+    #[tokio::test]
+    async fn cq_stall_switch_leaves_partner_freq_none_and_keeps_answering_callers_routing() {
+        const CALLER: &str = "W9XYZ";
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // Two silent rearm cycles: nobody has come back to our CQ, so the
+        // stall detector trips and asks for a Switch off this offset.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .await;
+        let action = drain(&mut rx).into_iter().find_map(|e| match e {
+            QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
+            _ => None,
+        });
+        assert_eq!(
+            action,
+            Some(OffsetAction::Switch { avoid_hz: FREQ }),
+            "a silent CQ must stall into a Switch off its current offset"
+        );
+
+        // The coordinator commits the resolved Switch: we are now CALLING CQ
+        // on the new offset.
+        let new_offset = FREQ + 400.0;
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, new_offset)
+            .await
+            .unwrap();
+        assert_eq!(applied, new_offset);
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after.metadata.frequency, new_offset);
+        assert_eq!(after.state.frequency(), Some(new_offset));
+        assert!(
+            after.state.their_callsign().is_none(),
+            "precondition: an unanswered CQ has no DX identity yet"
+        );
+        assert_eq!(
+            after.metadata.partner_freq, None,
+            "there is no DX at the abandoned CQ offset to point the RX gates \
+             at — latching one strands the QSO at a frequency nobody uses"
+        );
+
+        // A caller answers us where we are actually calling: the new offset.
+        let answer = MessageType::CqResponse {
+            calling_station: OUR.into(),
+            responding_station: CALLER.into(),
+            grid: Some("FN31".into()),
+        };
+        assert!(
+            manager.is_message_relevant(&after.state, &after.metadata, &answer, new_offset, false),
+            "an answer at the offset we are calling on must stay relevant"
+        );
+        assert_eq!(
+            manager.find_qsos_for_message(&answer, new_offset).await,
+            vec![qso_id],
+            "an answer at the offset we are calling on must route to this CQ, \
+             not spawn a duplicate QSO"
+        );
     }
 }
 
