@@ -53,6 +53,24 @@ fn unquote(value: &str) -> String {
     value.trim().trim_matches(['\'', '"']).to_string()
 }
 
+/// Strips a trailing `#` comment from a line, honoring both `'...'` and
+/// `"..."` quoting (YAML and TOML both use one or the other) so a `#` inside
+/// either quote style survives. Everything from the first unquoted `#`
+/// onward is dropped.
+fn strip_comment(line: &str) -> &str {
+    let mut quote: Option<char> = None;
+    for (i, c) in line.char_indices() {
+        match quote {
+            Some(q) if c == q => quote = None,
+            Some(_) => {}
+            None if c == '\'' || c == '"' => quote = Some(c),
+            None if c == '#' => return &line[..i],
+            None => {}
+        }
+    }
+    line
+}
+
 #[derive(Default)]
 struct FlatYaml {
     scalars: HashMap<String, String>,
@@ -74,8 +92,8 @@ fn parse_flat_yaml(src: &str) -> FlatYaml {
             }
             in_block_scalar = false;
         }
-        let line = raw_line.trim_end();
-        if line.is_empty() || line.trim_start().starts_with('#') {
+        let line = strip_comment(raw_line).trim_end();
+        if line.is_empty() {
             continue;
         }
 
@@ -109,21 +127,6 @@ fn parse_flat_yaml(src: &str) -> FlatYaml {
     out
 }
 
-/// Strips a TOML `#` comment from a line, honoring `"..."` quoting so a `#`
-/// inside a quoted string is not mistaken for one. Everything from the first
-/// unquoted `#` onward is dropped.
-fn strip_toml_comment(line: &str) -> &str {
-    let mut in_quotes = false;
-    for (i, c) in line.char_indices() {
-        match c {
-            '"' => in_quotes = !in_quotes,
-            '#' if !in_quotes => return &line[..i],
-            _ => {}
-        }
-    }
-    line
-}
-
 /// Extracts a `key = [ "a", "b", ... ]` TOML array's entries. Used for
 /// `Cargo.toml`'s `members = [...]` block, which is TOML, not the YAML subset
 /// `parse_flat_yaml` understands.
@@ -145,16 +148,17 @@ fn parse_toml_string_array(src: &str, key: &str) -> Vec<String> {
         }
         search_from = abs + marker.len();
     };
-    let end = after.find(']').expect("unterminated members array");
-    // Strip trailing `# comment`s line-by-line before splitting on commas, so
-    // e.g. `"pancetta-core", # core types` doesn't fold the comment text into
-    // a bogus member entry.
-    let cleaned: String = after[..end]
+    // Strip trailing `# comment`s line-by-line *before* looking for the
+    // closing `]`, so a `]` that appears inside a comment (e.g.
+    // `"pancetta-audio", # excluded from default-members [1]`) is not
+    // mistaken for the array terminator and does not truncate the list.
+    let cleaned: String = after
         .lines()
-        .map(strip_toml_comment)
+        .map(strip_comment)
         .collect::<Vec<_>>()
         .join(",");
-    cleaned
+    let end = cleaned.find(']').expect("unterminated members array");
+    cleaned[..end]
         .split(',')
         .map(|s| s.trim().trim_matches('"').to_string())
         .filter(|s| !s.is_empty())
@@ -168,12 +172,30 @@ fn parse_toml_string_array(src: &str, key: &str) -> Vec<String> {
 /// any depth (gitignore semantics). A `/` anywhere else (leading or internal)
 /// anchors the pattern to the repo root instead.
 fn glob_shadows(pattern: &str, path: &str) -> bool {
+    // `?` and `[...]` are not implemented below; failing loudly on them beats
+    // silently answering "no shadow" for a pattern this matcher cannot
+    // actually evaluate — a shadow guard that means "I don't know" must never
+    // report that as "safe".
+    assert!(
+        !pattern.contains(['?', '[']),
+        "glob_shadows does not support `?`/`[...]` wildcard syntax (pattern: {pattern:?}); \
+         rewrite the ignored_paths entry to use only literal segments and `*`/`**`, or extend \
+         segment_matches to support it"
+    );
+    // Handles any number of `*`s within a segment by peeling off the literal
+    // prefix before the first `*`, then trying every position at which that
+    // `*` could stop consuming characters and recursing on the remainder —
+    // so e.g. "*research*" matches "pancetta-research" via the `*` at index 0
+    // consuming "pancetta-" and the trailing `*` consuming nothing.
     fn segment_matches(pat: &str, seg: &str) -> bool {
         match pat.split_once('*') {
             None => pat == seg,
-            Some((pre, post)) => {
-                seg.len() >= pre.len() + post.len() && seg.starts_with(pre) && seg.ends_with(post)
-            }
+            Some((pre, rest)) => match seg.strip_prefix(pre) {
+                None => false,
+                Some(after_pre) => (0..=after_pre.len())
+                    .filter(|&i| after_pre.is_char_boundary(i))
+                    .any(|i| segment_matches(rest, &after_pre[i..])),
+            },
         }
     }
     fn matches(pat: &[&str], path: &[&str]) -> bool {

@@ -9,7 +9,7 @@ sources:
   - .serena/.gitignore
   - pancetta-core/tests/serena_project_config.rs
 verified:
-  commit: 2f676fb
+  commit: 4ba5ace
   date: 2026-09-06
 links:
   - overview
