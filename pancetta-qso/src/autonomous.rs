@@ -2469,6 +2469,24 @@ impl AutonomousOperator {
                                     // alternative — skip this window and listen instead
                                     // of guessing blind. Streak stays put; retried next
                                     // window once history fills in from ordinary RX.
+                                    //
+                                    // PAN-72 (Codex round 1 on PR #350, finding 9): a
+                                    // STREAK-driven switch retries on its own — the
+                                    // streak is untouched here, so the next window
+                                    // re-enters this branch and switches as soon as
+                                    // history fills in. A MANUAL (`u`) request has no
+                                    // such backing state: `manual_switch_requested` was
+                                    // already consumed by the `mem::take` at the top of
+                                    // `decide_at`, and the streak on the manual path is
+                                    // typically still below threshold, so returning here
+                                    // would silently drop the operator's nudge forever.
+                                    // Thin decode history is exactly the common case
+                                    // right after startup or a band hop — precisely when
+                                    // an operator is most likely to press `u`. Put the
+                                    // request back so a later cycle honors it.
+                                    if manual_switch_requested {
+                                        self.manual_switch_requested = true;
+                                    }
                                     self.state = OperatingState::Hunting;
                                     actions.push(OperatorAction::Listen);
                                     actions.push(self.status_action());
@@ -3832,6 +3850,52 @@ mod tests {
             "must not switch while history is thin"
         );
         assert!(actions.iter().any(|a| matches!(a, OperatorAction::Listen)));
+    }
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 9): a manual `u` nudge that
+    /// lands while decode history is still thin must NOT be silently lost.
+    /// `manual_switch_requested` is consumed by `mem::take` at the top of
+    /// `decide_at`, so the thin-history early return used to discard it
+    /// outright — and because the no-response streak on the manual path is
+    /// typically still below threshold, no later cycle would retry. Thin
+    /// history is exactly the post-startup / post-band-hop case where an
+    /// operator is most likely to press `u`.
+    #[test]
+    fn manual_switch_request_survives_a_thin_history_skip_and_fires_later() {
+        // switch_after = 3 so the streak alone can never force a switch in
+        // this test — only the retained manual request can.
+        let mut op = primed_operator(1, 3, true);
+        // Deliberately do NOT prime decode history yet: cycles_recorded()
+        // stays below decode_history_cycles (4), so the first CQ-eligible
+        // cycle takes the thin-history early return.
+
+        let even_ts: i64 = 0;
+        op.request_manual_switch();
+        let thin = op.decide_at(even_ts); // idle_cycles 0->1 >= 1: CQ cycle, history thin
+        assert!(
+            thin.iter().any(|a| matches!(a, OperatorAction::Listen)),
+            "thin history must still take the listen-instead-of-guess path"
+        );
+        assert!(
+            !thin
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "no blind switch while history is thin"
+        );
+
+        // History now fills in from ordinary RX, exactly as it would on-air.
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let later = op.decide_at(even_ts);
+        assert!(
+            later
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "the retained manual nudge must fire once history fills in \
+             (streak is only 0/1, nowhere near switch_after=3)"
+        );
     }
 
     #[test]
