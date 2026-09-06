@@ -11,11 +11,15 @@
 //! break — which would put the repo straight back into the silent grep-fallback
 //! state PAN-77 was filed for, with nothing to notice.
 //!
-//! This file is also load-bearing for CI itself. `.github/workflows/ci.yml`'s
-//! `changes` job filters on `**/*.rs`, `**/Cargo.toml`, `**/Cargo.lock`, and
-//! `ci.yml` only — a `.serena/`-only diff matches none of them and runs NO Rust
-//! job at all. Being a `.rs` file, this test is what makes a Serena config change
-//! visible to the gate that verifies it.
+//! This file is also load-bearing for CI itself, but only conditionally.
+//! `.github/workflows/ci.yml`'s `changes` job filters on `**/*.rs`,
+//! `**/Cargo.toml`, `**/Cargo.lock`, and `ci.yml` only — a `.serena/`-only diff
+//! matches none of them and runs NO Rust job at all. This test makes a Serena
+//! config change visible to the gate only when the same commit *also* touches
+//! a `.rs`/`Cargo.toml`/`Cargo.lock` file; a PR that edits `.serena/` alone
+//! still runs no Rust job, so this test never executes for it. The weekly
+//! schedule lane (`ci.yml`'s `cron` trigger) would eventually catch a
+//! `.serena/`-only regression, but only post-merge, not as a merge gate.
 //!
 //! Parsed with a purpose-built reader rather than a YAML crate on purpose: this
 //! workspace has no YAML parser (`Cargo.toml` declares `serde`, `serde_json`,
@@ -137,7 +141,9 @@ fn parse_toml_string_array(src: &str, key: &str) -> Vec<String> {
 /// Minimal gitignore-style glob match, sufficient for `ignored_paths`: `**`
 /// matches any number of path segments (including none), `*` matches any run
 /// of non-`/` characters within one segment, and a pattern with no `/` at all
-/// matches at any depth (gitignore semantics), not just at the repo root.
+/// — or with only a *trailing* `/` marking "must be a directory" — matches at
+/// any depth (gitignore semantics). A `/` anywhere else (leading or internal)
+/// anchors the pattern to the repo root instead.
 fn glob_shadows(pattern: &str, path: &str) -> bool {
     fn segment_matches(pat: &str, seg: &str) -> bool {
         match pat.split_once('*') {
@@ -156,12 +162,17 @@ fn glob_shadows(pattern: &str, path: &str) -> bool {
             }
         }
     }
-    let normalized = if pattern.contains('/') {
-        pattern.trim_start_matches('/').to_string()
+    // A trailing-only slash (e.g. "src/") does not anchor under gitignore
+    // semantics, so it must not be treated the same as a leading or internal
+    // one (e.g. ".serena/cache", "/assets") when deciding anchoring.
+    let core = pattern.trim_matches('/');
+    let anchored = pattern.starts_with('/') || core.contains('/');
+    let normalized = if anchored {
+        core.to_string()
     } else {
-        format!("**/{pattern}")
+        format!("**/{core}")
     };
-    let pat_segs: Vec<&str> = normalized.trim_matches('/').split('/').collect();
+    let pat_segs: Vec<&str> = normalized.split('/').collect();
     let path_segs: Vec<&str> = path.trim_matches('/').split('/').collect();
     matches(&pat_segs, &path_segs)
 }
@@ -258,6 +269,20 @@ fn no_ignored_path_shadows_a_workspace_member_source_root() {
             );
         }
     }
+}
+
+#[test]
+fn glob_shadows_treats_trailing_slash_as_any_depth_directory_match() {
+    // "src/" has only a trailing slash, so gitignore semantics still match it
+    // at any depth — the same as bare "src" would. A version of this matcher
+    // that treated any '/' as anchoring would let `src/` in `ignored_paths`
+    // silently miss every workspace crate's `<crate>/src`, defeating
+    // `no_ignored_path_shadows_a_workspace_member_source_root` above.
+    assert!(glob_shadows("src/", "pancetta-core/src"));
+    assert!(glob_shadows("src", "pancetta-core/src"));
+    // A leading or internal slash still anchors to the repo root.
+    assert!(!glob_shadows("/assets", "pancetta-ft8/assets"));
+    assert!(glob_shadows("/assets", "assets"));
 }
 
 #[test]

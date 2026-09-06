@@ -28,13 +28,14 @@ agent session that never touched it.
 
 ## The four traps
 
-1. **CI's `changes` filter runs no Rust job on a `.serena/`-only diff.**
-   `.github/workflows/ci.yml`'s `changes` job matches only `**/*.rs`,
-   `**/Cargo.toml`, `**/Cargo.lock`, and `ci.yml` — a pure `.serena/` edit
-   matches none of them. `pancetta-core/tests/serena_project_config.rs` exists
-   specifically to be the `.rs` file that makes a config change visible to the
-   gate at all; touching `.serena/` without it means the change ships
-   unverified.
+1. **CI's `changes` filter runs no Rust job on a `.serena/`-only diff — and
+   that includes this guard test.** `.github/workflows/ci.yml`'s `changes` job
+   matches only `**/*.rs`, `**/Cargo.toml`, `**/Cargo.lock`, and `ci.yml` — a
+   pure `.serena/` edit matches none of them, so no Rust job runs and
+   `pancetta-core/tests/serena_project_config.rs` does not execute either. The
+   guard only fires when a `.serena/` change is bundled into the same commit
+   as a `.rs`/`Cargo.toml`/`Cargo.lock` edit; a `.serena/`-only PR ships
+   unverified until the weekly schedule lane runs (post-merge, not a gate).
 2. **`thoughts` in `ignored_paths` guards a symlink, not a directory.** It
    points out of the repo at the shared thoughts pool (`.gitignore:188`).
    Without the entry, Serena's directory walker would follow it into the

@@ -24,8 +24,12 @@ ignored_paths:
 - ".catalyst"
 # Transient parallel-work checkouts (.gitignore:91), not canonical source.
 - ".worktrees"
-# 3.8 MB of pure binary demo media (WAV/PNG/GIF/SVG). No symbols, no text value.
-- "assets"
+# 3.8 MB of pure binary demo media (WAV/PNG/GIF/SVG) at the repo root. No
+# symbols, no text value. Anchored with a leading slash: a slash-less entry
+# also matches at any depth under gitignore semantics, which would silently
+# de-index pancetta-ft8/assets/neural_osd_weights.provenance.json too — a
+# real text file inside a workspace crate, not root-level demo media.
+- "/assets"
 # Vendored upstream C reference decoder (git submodule, .gitmodules:1-3; usually
 # uninitialized). Different language, not code contributors edit.
 - "pancetta-ft8/vendor/ft8_lib"
