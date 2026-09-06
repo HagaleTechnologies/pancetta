@@ -246,11 +246,10 @@ const PRE_SWITCH_OFFSET_GRACE: chrono::Duration = chrono::Duration::seconds(30);
 fn live_pre_switch_offset_at(
     metadata: &crate::states::QsoMetadata,
     now: DateTime<Utc>,
-) -> Option<f64> {
+) -> Option<crate::states::PreSwitchOffset> {
     metadata
         .pre_switch_offset
-        .filter(|(_, left_at)| now.signed_duration_since(*left_at) <= PRE_SWITCH_OFFSET_GRACE)
-        .map(|(hz, _)| hz)
+        .filter(|pre| now.signed_duration_since(pre.left_at) <= PRE_SWITCH_OFFSET_GRACE)
 }
 
 /// FIX B (one-QSO-per-(callsign,band) close idempotency,
@@ -637,22 +636,63 @@ pub enum OffsetAction {
     Revert { target_hz: f64 },
 }
 
+/// Who asked for a TX-offset relocation — and, for the stall detector, the
+/// staleness token that guards its request at commit time.
+///
+/// PAN-72. Two separate consumers read this, which is why the provenance is
+/// modelled explicitly rather than inferred from the presence of a token:
+///
+/// - [`QsoManager::apply_tx_offset_switch`]'s staleness guard (round 1, finding
+///   8) discards a `StallDetected` request whose
+///   [`crate::states::QsoMetadata::advance_generation`] has moved since it was
+///   raised. An `OperatorForced` nudge is current by definition and carries no
+///   token, so nothing can supersede it;
+/// - the known-good crediting site in `process_message_for_qso` (round 6,
+///   finding 2) needs to know whether anything actually indicted the offset we
+///   left. A stall switch happens BECAUSE the old offset stopped working; an
+///   operator nudge implies nothing about it. See
+///   [`crate::states::PreSwitchOffset::operator_forced`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum OffsetRelocationOrigin {
+    /// Raised by the silence-driven stall detector, carrying the QSO's
+    /// `advance_generation` as it stood under the same write lock that raised
+    /// the action.
+    StallDetected { raised_at_generation: u32 },
+    /// Forced by the operator's `u` nudge.
+    OperatorForced,
+}
+
+impl OffsetRelocationOrigin {
+    /// The staleness token to validate at commit time, if this origin has one.
+    pub fn raised_at_generation(&self) -> Option<u32> {
+        match self {
+            Self::StallDetected {
+                raised_at_generation,
+            } => Some(*raised_at_generation),
+            Self::OperatorForced => None,
+        }
+    }
+
+    /// `true` for the operator's `u` nudge.
+    pub fn is_operator_forced(&self) -> bool {
+        matches!(self, Self::OperatorForced)
+    }
+}
+
 /// PAN-72 (Codex round 1 on PR #350, finding 8): one queued TX-offset action
-/// plus the staleness token that guards it at commit time.
+/// plus the origin that guards and explains it at commit time.
 ///
 /// This is the element type of the coordinator's `pending_qso_offset_requests`
 /// mailbox. It lives here, next to [`OffsetAction`], because
-/// [`QsoManager::apply_tx_offset_switch`] is what actually validates the
-/// token — the coordinator only carries it across the once-per-slot gap
+/// [`QsoManager::apply_tx_offset_switch`] is what actually consumes the
+/// origin — the coordinator only carries it across the once-per-slot gap
 /// between the QSO event firing and the autonomous tick draining it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OffsetActionRequest {
     pub qso_id: QsoId,
     pub action: OffsetAction,
-    /// [`crate::states::QsoMetadata::advance_generation`] as it stood when
-    /// this action was raised. `None` for an operator-forced `u` nudge, which
-    /// is by definition current and must never be discarded as stale.
-    pub raised_at_generation: Option<u32>,
+    /// What asked for this relocation — see [`OffsetRelocationOrigin`].
+    pub origin: OffsetRelocationOrigin,
 }
 
 impl OffsetActionRequest {
@@ -661,7 +701,9 @@ impl OffsetActionRequest {
         Self {
             qso_id,
             action,
-            raised_at_generation: Some(raised_at_generation),
+            origin: OffsetRelocationOrigin::StallDetected {
+                raised_at_generation,
+            },
         }
     }
 
@@ -670,7 +712,7 @@ impl OffsetActionRequest {
         Self {
             qso_id,
             action,
-            raised_at_generation: None,
+            origin: OffsetRelocationOrigin::OperatorForced,
         }
     }
 }
@@ -2944,12 +2986,13 @@ impl QsoManager {
     ///    final frame still goes out on the original one. Refuse outright.
     /// 2. **Superseded by a DX advance** (finding 8). If the QSO's
     ///    [`crate::states::QsoMetadata::advance_generation`] has moved since
-    ///    `raised_at_generation` was captured, the DX answered in the
-    ///    meantime: `stall_cycles` is already reset and the CURRENT offset is
-    ///    already recorded known-good, so applying the queued action would
-    ///    move us off the offset that just demonstrably worked. Pass `None`
-    ///    for an operator-forced nudge, which is current by construction and
-    ///    must never be discarded this way.
+    ///    the origin's `raised_at_generation` was captured, the DX answered in
+    ///    the meantime: `stall_cycles` is already reset and the CURRENT offset
+    ///    is already recorded known-good, so applying the queued action would
+    ///    move us off the offset that just demonstrably worked.
+    ///    [`OffsetRelocationOrigin::OperatorForced`] carries no generation —
+    ///    the nudge is current by construction and must never be discarded this
+    ///    way.
     /// 3. **Outside the live Hound region** (Codex round 4, finding 2). A
     ///    Hound's TX offset is procedurally pinned to the calling region before
     ///    the Fox answers and to the response region after the QSY, and the
@@ -2975,12 +3018,18 @@ impl QsoManager {
     ///
     /// All four refusals are expected outcomes, not faults — see
     /// [`QsoManagerError::is_expected_offset_action_refusal`].
+    ///
+    /// `origin` is also what the known-good crediting site reads back off
+    /// [`crate::states::PreSwitchOffset::operator_forced`] when the next
+    /// forward advance arrives — see that field's doc comment (round 6,
+    /// finding 2).
     pub async fn apply_tx_offset_switch(
         &self,
         qso_id: QsoId,
         new_offset_hz: f64,
-        raised_at_generation: Option<u32>,
+        origin: OffsetRelocationOrigin,
     ) -> Result<f64, QsoManagerError> {
+        let raised_at_generation = origin.raised_at_generation();
         let applied_hz =
             new_offset_hz.clamp(ACTIVE_QSO_TX_OFFSET_MIN_HZ, ACTIVE_QSO_TX_OFFSET_MAX_HZ);
         let mut qsos = self.qsos.write().await;
@@ -3049,10 +3098,20 @@ impl QsoManager {
         // coordinator's next drain — so any answer to that frame arrives at
         // `old_off` AFTER this mutation. For `PRE_SWITCH_OFFSET_GRACE` the
         // vacated offset therefore stays a valid RX baseline
-        // (`is_message_relevant`) and stays the offset a forward advance
-        // credits as known-good (`process_message_for_qso`). See
-        // `QsoMetadata::pre_switch_offset`.
-        progress.metadata.pre_switch_offset = Some((old_off, Utc::now()));
+        // (`is_message_relevant`) and stays a CANDIDATE for the offset a
+        // forward advance credits as known-good (`process_message_for_qso`).
+        //
+        // Round 6, finding 2: the provenance travels with it. On a pre-existing
+        // split the DX's reply frequency cannot discriminate our two offsets,
+        // and the right fallback there depends entirely on whether the stall
+        // detector or the operator moved us. See
+        // `QsoMetadata::pre_switch_offset` and
+        // `PreSwitchOffset::operator_forced`.
+        progress.metadata.pre_switch_offset = Some(crate::states::PreSwitchOffset {
+            offset_hz: old_off,
+            left_at: Utc::now(),
+            operator_forced: origin.is_operator_forced(),
+        });
         // Mirror the Hound QSY block's state write (see `process_message_for_
         // qso`'s `QsoState::SendingReport` fix-up): several transitions —
         // `Completed` above all — are built from the PRECEDING state's own
@@ -3611,27 +3670,55 @@ impl QsoManager {
                 // split this very switch created (`partner_freq` still equal to
                 // the offset we just vacated, compared with the same
                 // [`TX_OFFSET_NOOP_TOLERANCE_HZ`] float-noise bound that latch
-                // site uses). On a pre-existing split we fall back to crediting
-                // the vacated offset unconditionally — it remains the only one
-                // with a proven history.
+                // site uses).
+                //
+                // Round 6, finding 2: on a PRE-EXISTING split the fallback is
+                // not one answer but two, and the provenance of the relocation
+                // picks between them (`PreSwitchOffset::operator_forced`). The
+                // DX transmits at `partner_freq` no matter where we key, so its
+                // reply frequency is silent about which of our offsets it
+                // answered — but the two provenances carry different priors:
+                //
+                // - a STALL-triggered switch only fires BECAUSE the old offset
+                //   demonstrably stopped working, and the triggering resend went
+                //   out on it a slot before this commit. The vacated offset is
+                //   the one with a proven history and the new one has never been
+                //   transmitted on, so credit the vacated offset — round 4/5's
+                //   behaviour, unchanged;
+                // - an OPERATOR-forced `u` nudge indicts nothing. The operator
+                //   chose to move; our very next frame goes out on the NEW
+                //   offset, so an advancing reply after it is better evidence
+                //   for the new offset than for the one we left deliberately.
+                //   Crediting the vacated one there would aim a later `Revert`
+                //   straight back at the offset the operator just escaped.
                 //
                 // Consumed here either way: the first advance after a switch is
                 // the one that resolves the ambiguity, and everything after it
                 // is unambiguously about the current offset.
-                let vacated_hz = live_pre_switch_offset_at(&progress.metadata, message.timestamp);
-                let tx_equals_rx = match progress.metadata.partner_freq {
-                    None => true,
-                    Some(partner_hz) => vacated_hz
-                        .is_some_and(|hz| (partner_hz - hz).abs() <= TX_OFFSET_NOOP_TOLERANCE_HZ),
-                };
-                progress.metadata.last_known_good_offset_hz = Some(
-                    vacated_hz
-                        .filter(|pre_switch_hz| {
-                            !tx_equals_rx
-                                || (pre_switch_hz - message.frequency).abs() <= rx_tolerance_hz
-                        })
-                        .unwrap_or(progress.metadata.frequency),
-                );
+                let vacated = live_pre_switch_offset_at(&progress.metadata, message.timestamp);
+                let current_hz = progress.metadata.frequency;
+                progress.metadata.last_known_good_offset_hz = Some(match vacated {
+                    None => current_hz,
+                    Some(pre) => {
+                        let tx_equals_rx =
+                            progress.metadata.partner_freq.is_none_or(|partner_hz| {
+                                (partner_hz - pre.offset_hz).abs() <= TX_OFFSET_NOOP_TOLERANCE_HZ
+                            });
+                        if tx_equals_rx {
+                            // The decode frequency IS evidence here: it is the
+                            // same number as our own TX offset.
+                            if (pre.offset_hz - message.frequency).abs() <= rx_tolerance_hz {
+                                pre.offset_hz
+                            } else {
+                                current_hz
+                            }
+                        } else if pre.operator_forced {
+                            current_hz
+                        } else {
+                            pre.offset_hz
+                        }
+                    }
+                });
                 progress.metadata.pre_switch_offset = None;
                 // PAN-72 (Codex round 1 on PR #350, finding 8): bump the
                 // staleness token in lockstep with the two fields above, so a
@@ -4996,7 +5083,8 @@ impl QsoManager {
             };
             let matches_baseline = |baseline: f64| (baseline - frequency).abs() <= tolerance;
             matches_baseline(match_frequency)
-                || live_pre_switch_offset_at(metadata, Utc::now()).is_some_and(matches_baseline)
+                || live_pre_switch_offset_at(metadata, Utc::now())
+                    .is_some_and(|pre| matches_baseline(pre.offset_hz))
         });
         if !within_frequency_gate {
             return Relevance {
@@ -5266,7 +5354,8 @@ impl QsoManager {
             };
             let matches_baseline = |baseline: f64| (baseline - frequency).abs() <= tolerance;
             if !matches_baseline(match_freq)
-                && !live_pre_switch_offset_at(metadata, Utc::now()).is_some_and(matches_baseline)
+                && !live_pre_switch_offset_at(metadata, Utc::now())
+                    .is_some_and(|pre| matches_baseline(pre.offset_hz))
             {
                 return false;
             }
@@ -8611,7 +8700,7 @@ mod tests {
 
         // Apply the offset switch.
         manager
-            .apply_tx_offset_switch(qso_id, 1800.0, None)
+            .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .unwrap();
 
@@ -8643,7 +8732,7 @@ mod tests {
         );
 
         manager
-            .apply_tx_offset_switch(qso_id, 1800.0, None)
+            .apply_tx_offset_switch(qso_id, 1800.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .unwrap();
 
@@ -8670,7 +8759,7 @@ mod tests {
             .unwrap();
 
         let applied = manager
-            .apply_tx_offset_switch(qso_id, 9000.0, None)
+            .apply_tx_offset_switch(qso_id, 9000.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .unwrap();
         assert_eq!(applied, ACTIVE_QSO_TX_OFFSET_MAX_HZ);
@@ -8679,7 +8768,7 @@ mod tests {
         assert_eq!(after.state.frequency(), Some(ACTIVE_QSO_TX_OFFSET_MAX_HZ));
 
         let applied = manager
-            .apply_tx_offset_switch(qso_id, -50.0, None)
+            .apply_tx_offset_switch(qso_id, -50.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .unwrap();
         assert_eq!(applied, ACTIVE_QSO_TX_OFFSET_MIN_HZ);
@@ -8689,7 +8778,7 @@ mod tests {
 
         // In-band values pass through untouched.
         let applied = manager
-            .apply_tx_offset_switch(qso_id, 1234.0, None)
+            .apply_tx_offset_switch(qso_id, 1234.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .unwrap();
         assert_eq!(applied, 1234.0);
@@ -8713,7 +8802,7 @@ mod tests {
         // 2850 Hz: above the autonomous pick band's 2700 ceiling, but a
         // perfectly legitimate place for an in-progress QSO to be sitting.
         let applied = manager
-            .apply_tx_offset_switch(qso_id, 2850.0, None)
+            .apply_tx_offset_switch(qso_id, 2850.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .unwrap();
         assert_eq!(
@@ -8725,7 +8814,7 @@ mod tests {
 
         // Likewise at the low end (the pick band starts at 300).
         let applied = manager
-            .apply_tx_offset_switch(qso_id, 250.0, None)
+            .apply_tx_offset_switch(qso_id, 250.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .unwrap();
         assert_eq!(applied, 250.0);
@@ -8737,7 +8826,11 @@ mod tests {
     async fn apply_tx_offset_switch_on_unknown_qso_returns_not_found() {
         let manager = QsoManager::new(test_config());
         let result = manager
-            .apply_tx_offset_switch(QsoId::new_v4(), 1800.0, None)
+            .apply_tx_offset_switch(
+                QsoId::new_v4(),
+                1800.0,
+                OffsetRelocationOrigin::OperatorForced,
+            )
             .await;
         assert!(matches!(result, Err(QsoManagerError::QsoNotFound { .. })));
     }
@@ -14615,6 +14708,21 @@ mod pan72_stall_detection_tests {
         out
     }
 
+    /// The origin a STALL-detected relocation commits with, built from the
+    /// QSO's live `advance_generation` so the staleness guard passes for the
+    /// reason it exists rather than by accident. The operator's `u` nudge uses
+    /// [`OffsetRelocationOrigin::OperatorForced`] directly.
+    async fn stall_origin(manager: &QsoManager, qso_id: QsoId) -> OffsetRelocationOrigin {
+        OffsetRelocationOrigin::StallDetected {
+            raised_at_generation: manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .advance_generation,
+        }
+    }
+
     /// DX sends us a plain signal report — a genuine forward advance from
     /// `RespondingToCq` to `SendingReport` (their_report: None rung).
     async fn send_report(manager: &QsoManager, report: i8, text: &str) {
@@ -14874,7 +14982,7 @@ mod pan72_stall_detection_tests {
         // here.
         let new_freq = FREQ + 300.0;
         let applied = manager
-            .apply_tx_offset_switch(qso_id, new_freq, None)
+            .apply_tx_offset_switch(qso_id, new_freq, OffsetRelocationOrigin::OperatorForced)
             .await
             .expect("committing the resolved Switch");
         assert_eq!(applied, new_freq);
@@ -15117,7 +15225,7 @@ mod pan72_stall_detection_tests {
 
         // Operator-forced (no generation token), exactly as the `u` nudge is.
         let err = manager
-            .apply_tx_offset_switch(qso_id, resolved_hz, None)
+            .apply_tx_offset_switch(qso_id, resolved_hz, OffsetRelocationOrigin::OperatorForced)
             .await
             .expect_err("a calling-region offset must not commit onto a QSY'd Hound");
         assert!(
@@ -15170,7 +15278,7 @@ mod pan72_stall_detection_tests {
 
         assert_eq!(
             manager
-                .apply_tx_offset_switch(qso_id, target, None)
+                .apply_tx_offset_switch(qso_id, target, OffsetRelocationOrigin::OperatorForced)
                 .await
                 .expect("an in-region relocation must still commit"),
             target
@@ -15217,7 +15325,7 @@ mod pan72_stall_detection_tests {
         );
 
         let err = manager
-            .apply_tx_offset_switch(qso_id, FREQ + 400.0, None)
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .expect_err("a terminal QSO must refuse an offset action");
         assert!(
@@ -15278,7 +15386,13 @@ mod pan72_stall_detection_tests {
         );
 
         let err = manager
-            .apply_tx_offset_switch(qso_id, FREQ + 400.0, Some(raised_at))
+            .apply_tx_offset_switch(
+                qso_id,
+                FREQ + 400.0,
+                OffsetRelocationOrigin::StallDetected {
+                    raised_at_generation: raised_at,
+                },
+            )
             .await
             .expect_err("a superseded request must be discarded");
         assert!(
@@ -15299,12 +15413,18 @@ mod pan72_stall_detection_tests {
         // A request raised at the CURRENT generation still commits normally,
         // and an operator-forced nudge (`None`) is never staleness-checked.
         let applied = manager
-            .apply_tx_offset_switch(qso_id, FREQ + 400.0, Some(raised_at + 1))
+            .apply_tx_offset_switch(
+                qso_id,
+                FREQ + 400.0,
+                OffsetRelocationOrigin::StallDetected {
+                    raised_at_generation: raised_at + 1,
+                },
+            )
             .await
             .expect("a current-generation request must still commit");
         assert_eq!(applied, FREQ + 400.0);
         let forced = manager
-            .apply_tx_offset_switch(qso_id, FREQ + 500.0, None)
+            .apply_tx_offset_switch(qso_id, FREQ + 500.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .expect("an operator-forced nudge is never stale");
         assert_eq!(forced, FREQ + 500.0);
@@ -15338,7 +15458,7 @@ mod pan72_stall_detection_tests {
         let _ = drain(&mut rx);
 
         let err = manager
-            .apply_tx_offset_switch(qso_id, FREQ, None)
+            .apply_tx_offset_switch(qso_id, FREQ, OffsetRelocationOrigin::OperatorForced)
             .await
             .expect_err("a resolution equal to the current offset relocates nothing");
         assert!(
@@ -15384,14 +15504,14 @@ mod pan72_stall_detection_tests {
         // A float-noise-sized "move" is the same no-op (the 1.0 Hz tolerance
         // this method already uses for its partner_freq latch)...
         let err = manager
-            .apply_tx_offset_switch(qso_id, FREQ + 0.5, None)
+            .apply_tx_offset_switch(qso_id, FREQ + 0.5, OffsetRelocationOrigin::OperatorForced)
             .await
             .expect_err("a sub-Hz move is still a no-op");
         assert!(matches!(err, QsoManagerError::OffsetActionNoOp { .. }));
 
         // ...while a real relocation still commits, and clears the streak.
         let applied = manager
-            .apply_tx_offset_switch(qso_id, FREQ + 400.0, None)
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, OffsetRelocationOrigin::OperatorForced)
             .await
             .expect("a real move must still commit");
         assert_eq!(applied, FREQ + 400.0);
@@ -15467,7 +15587,7 @@ mod pan72_stall_detection_tests {
 
         let new_offset = FREQ + 400.0;
         let applied = manager
-            .apply_tx_offset_switch(qso_id, new_offset, None)
+            .apply_tx_offset_switch(qso_id, new_offset, stall_origin(&manager, qso_id).await)
             .await
             .unwrap();
         assert_eq!(applied, new_offset);
@@ -15516,7 +15636,7 @@ mod pan72_stall_detection_tests {
             .unwrap();
         let new_offset = FREQ + 400.0;
         manager
-            .apply_tx_offset_switch(qso_id, new_offset, None)
+            .apply_tx_offset_switch(qso_id, new_offset, stall_origin(&manager, qso_id).await)
             .await
             .unwrap();
 
@@ -15571,7 +15691,7 @@ mod pan72_stall_detection_tests {
             .unwrap();
 
         manager
-            .apply_tx_offset_switch(qso_id, FREQ + 400.0, None)
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, stall_origin(&manager, qso_id).await)
             .await
             .unwrap();
 
@@ -15603,7 +15723,7 @@ mod pan72_stall_detection_tests {
             .unwrap();
 
         let err = manager
-            .apply_tx_offset_switch(qso_id, FREQ, None)
+            .apply_tx_offset_switch(qso_id, FREQ, OffsetRelocationOrigin::OperatorForced)
             .await
             .expect_err("a no-op switch is refused, not committed");
         assert!(matches!(err, QsoManagerError::OffsetActionNoOp { .. }));
@@ -15667,7 +15787,7 @@ mod pan72_stall_detection_tests {
         // on the new offset.
         let new_offset = FREQ + 400.0;
         let applied = manager
-            .apply_tx_offset_switch(qso_id, new_offset, None)
+            .apply_tx_offset_switch(qso_id, new_offset, OffsetRelocationOrigin::OperatorForced)
             .await
             .unwrap();
         assert_eq!(applied, new_offset);
@@ -15769,7 +15889,7 @@ mod pan72_stall_detection_tests {
         let new_offset = FREQ + 400.0;
         assert_eq!(
             manager
-                .apply_tx_offset_switch(qso_id, new_offset, None)
+                .apply_tx_offset_switch(qso_id, new_offset, stall_origin(&manager, qso_id).await)
                 .await
                 .unwrap(),
             new_offset
@@ -15815,7 +15935,7 @@ mod pan72_stall_detection_tests {
         let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
         let new_offset = FREQ + 400.0;
         manager
-            .apply_tx_offset_switch(qso_id, new_offset, None)
+            .apply_tx_offset_switch(qso_id, new_offset, OffsetRelocationOrigin::OperatorForced)
             .await
             .unwrap();
 
@@ -15830,10 +15950,11 @@ mod pan72_stall_detection_tests {
             "precondition: inside the grace the vacated offset is still accepted"
         );
 
-        progress.metadata.pre_switch_offset = Some((
-            FREQ,
-            Utc::now() - PRE_SWITCH_OFFSET_GRACE - Duration::seconds(1),
-        ));
+        progress.metadata.pre_switch_offset = Some(crate::states::PreSwitchOffset {
+            offset_hz: FREQ,
+            left_at: Utc::now() - PRE_SWITCH_OFFSET_GRACE - Duration::seconds(1),
+            operator_forced: true,
+        });
         assert!(
             !manager.is_message_relevant(&progress.state, &progress.metadata, &answer, FREQ, false),
             "a lapsed pre-switch baseline must stop accepting traffic at the \
@@ -15883,7 +16004,7 @@ mod pan72_stall_detection_tests {
             .await;
         let new_offset = FREQ + 400.0;
         manager
-            .apply_tx_offset_switch(qso_id, new_offset, None)
+            .apply_tx_offset_switch(qso_id, new_offset, stall_origin(&manager, qso_id).await)
             .await
             .unwrap();
 
@@ -15929,7 +16050,7 @@ mod pan72_stall_detection_tests {
         let new_offset = FREQ + 400.0;
         assert_eq!(
             manager
-                .apply_tx_offset_switch(qso_id, new_offset, None)
+                .apply_tx_offset_switch(qso_id, new_offset, OffsetRelocationOrigin::OperatorForced)
                 .await
                 .unwrap(),
             new_offset
@@ -15980,9 +16101,12 @@ mod pan72_stall_detection_tests {
     /// keeps transmitting at `partner_freq`, nowhere near the offset we vacated.
     /// The match check then fails for a reason that says nothing about which of
     /// our frames was answered, and falling through would credit the brand-new
-    /// offset — never transmitted on, zero evidence behind it. In that shape the
-    /// check must be skipped entirely and the vacated offset credited
-    /// unconditionally, exactly as round 4 did.
+    /// offset — never transmitted on, zero evidence behind it. For a
+    /// STALL-triggered switch — this test — the check is therefore skipped and
+    /// the vacated offset credited, exactly as round 4 did: the switch only
+    /// happened BECAUSE that offset stopped working, so the triggering resend
+    /// went out on it and the new one has never been keyed. (Round 6, finding 2
+    /// splits the OPERATOR-forced case out — see the test below.)
     #[tokio::test]
     async fn an_advance_on_a_pre_existing_split_credits_the_vacated_offset() {
         const DX_FREQ: f64 = 2400.0;
@@ -16003,7 +16127,7 @@ mod pan72_stall_detection_tests {
         let new_offset = FREQ + 400.0;
         assert_eq!(
             manager
-                .apply_tx_offset_switch(qso_id, new_offset, None)
+                .apply_tx_offset_switch(qso_id, new_offset, stall_origin(&manager, qso_id).await)
                 .await
                 .unwrap(),
             new_offset
@@ -16044,6 +16168,88 @@ mod pan72_stall_detection_tests {
              reply cannot discriminate our two TX offsets — the vacated {FREQ} \
              Hz is the only one with a proven history, and {new_offset} Hz has \
              never been transmitted on"
+        );
+    }
+
+    /// PAN-72 (Codex round 6 on PR #350, finding 2): the same pre-existing
+    /// split, moved by the OPERATOR's `u` nudge instead of the stall detector —
+    /// and the opposite answer.
+    ///
+    /// The decode frequency is just as useless here (the DX transmits at
+    /// `partner_freq` no matter where we key), but the priors are reversed. A
+    /// stall switch fires because the old offset demonstrably stopped working;
+    /// a nudge indicts nothing — the operator simply chose to move, our very
+    /// next frame goes out on the NEW offset, and an advancing reply after it is
+    /// better evidence for that new offset than for the one we left
+    /// deliberately. Crediting the vacated offset here records an offset with no
+    /// standing over the new one as known-good, and a later stall then emits
+    /// `Revert` straight back onto it — undoing the nudge that had just worked.
+    #[tokio::test]
+    async fn an_operator_nudge_on_a_pre_existing_split_credits_the_new_offset() {
+        const DX_FREQ: f64 = 2400.0;
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                None,
+                CallInitiation::Manual,
+                Some(DX_FREQ),
+                false,
+            )
+            .await
+            .unwrap();
+
+        // Operator `u` nudge: no stall evidence, no triggering old-offset
+        // resend, no raised generation.
+        let new_offset = FREQ + 400.0;
+        assert_eq!(
+            manager
+                .apply_tx_offset_switch(qso_id, new_offset, OffsetRelocationOrigin::OperatorForced)
+                .await
+                .unwrap(),
+            new_offset
+        );
+        let switched = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            switched.metadata.partner_freq,
+            Some(DX_FREQ),
+            "precondition: the pre-existing split survives the TX-side nudge"
+        );
+
+        // The DX answers where it has always transmitted — at `partner_freq`,
+        // which matches neither of our TX offsets. Well inside
+        // `PRE_SWITCH_OFFSET_GRACE`.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{OUR} {DX} -07"),
+                DX_FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, new_offset,
+            "precondition: the advance routed and the QSO is on the nudged offset"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(new_offset),
+            "the operator moved us to {new_offset} Hz and the DX advanced right \
+             after — crediting the vacated {FREQ} Hz would aim a later Revert at \
+             the offset the nudge deliberately left"
+        );
+        assert_eq!(
+            after.metadata.pre_switch_offset, None,
+            "the first advance after a relocation consumes the grace either way"
         );
     }
 

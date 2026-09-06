@@ -383,6 +383,38 @@ pub enum MessageDirection {
     Received,
 }
 
+/// The TX offset a QSO most recently moved away from, and what moved it.
+///
+/// PAN-72. See [`QsoMetadata::pre_switch_offset`], which owns the narrative;
+/// this type exists so the *provenance* of the relocation travels with the
+/// vacated offset rather than being re-derived (or guessed) at crediting time.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PreSwitchOffset {
+    /// The offset we left, in Hz.
+    pub offset_hz: f64,
+    /// When we left it.
+    pub left_at: DateTime<Utc>,
+    /// `true` when the operator's `u` nudge forced the move, `false` when the
+    /// silence-driven stall detector did.
+    ///
+    /// PAN-72 (Codex round 6 on PR #350, finding 2). This is the ONLY thing
+    /// that can separate the two cases on a pre-existing split, where the DX
+    /// transmits at `partner_freq` no matter where we key and its reply
+    /// frequency therefore cannot discriminate our vacated offset from our new
+    /// one. The two provenances warrant opposite conclusions there:
+    ///
+    /// - a STALL-triggered switch only happens BECAUSE the old offset
+    ///   demonstrably stopped working, and the frame that triggered it went out
+    ///   on that old offset one slot before the commit — so the vacated offset
+    ///   is the one with a proven history and gets the credit;
+    /// - an OPERATOR-forced nudge indicts nothing. The operator chose to move;
+    ///   our very next frame goes out on the NEW offset, and an advancing reply
+    ///   after it is better evidence for that new offset than for the one we
+    ///   left of our own accord.
+    #[serde(default)]
+    pub operator_forced: bool,
+}
+
 /// QSO metadata and additional information
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QsoMetadata {
@@ -630,8 +662,16 @@ pub struct QsoMetadata {
     /// at, and only falls back to the vacated offset when the frame matches it.
     /// Crediting it blindly would record an offset that had just failed as
     /// known-good and aim a later `Revert` straight back at it.
+    ///
+    /// Round 6, finding 2: the decode-frequency comparison round 5 added is
+    /// evidence only on a Tx=Rx QSO. On a PRE-EXISTING split (Hound, an `o`
+    /// hold, a de-conflict nudge, a passband clamp) the DX's frequency does not
+    /// move when OUR TX offset moves, so it can never say which of our two
+    /// offsets was answered — which is exactly why
+    /// [`PreSwitchOffset::operator_forced`] is carried alongside the offset. See
+    /// its doc comment.
     #[serde(default)]
-    pub pre_switch_offset: Option<(f64, DateTime<Utc>)>,
+    pub pre_switch_offset: Option<PreSwitchOffset>,
 
     /// Hound: whether we have already QSY'd up to the response region after the
     /// Fox answered us (so the QSY fires exactly once).

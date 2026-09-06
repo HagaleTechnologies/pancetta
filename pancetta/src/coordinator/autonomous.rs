@@ -742,7 +742,7 @@ async fn drain_pending_qso_offset_requests(
         let pancetta_qso::qso_manager::OffsetActionRequest {
             qso_id,
             action,
-            raised_at_generation,
+            origin,
         } = request;
         // Round 2, findings 1 + 2: one authoritative read of the QSO before
         // anything is resolved. It answers two questions the queued action
@@ -814,7 +814,7 @@ async fn drain_pending_qso_offset_requests(
             }
         };
         match qso_manager
-            .apply_tx_offset_switch(qso_id, resolved_hz, raised_at_generation)
+            .apply_tx_offset_switch(qso_id, resolved_hz, origin)
             .await
         {
             Ok(applied_hz) => {

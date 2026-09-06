@@ -8929,7 +8929,7 @@ mod respond_to_caller_admission_tests {
                 .unwrap()
                 .iter()
                 .find(|req| req.qso_id == qso_id)
-                .map(|req| req.raised_at_generation.is_some())
+                .map(|req| req.origin.raised_at_generation().is_some())
                 .unwrap_or(false),
             "a stall-detected request must carry the QSO's advance generation \
              so a DX advance landing before the once-per-slot drain invalidates \
@@ -8987,7 +8987,11 @@ mod respond_to_caller_admission_tests {
 
         let new_offset = 1900.0;
         let applied = manager
-            .apply_tx_offset_switch(qso_id, new_offset, None)
+            .apply_tx_offset_switch(
+                qso_id,
+                new_offset,
+                pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+            )
             .await
             .expect("committing the offset switch");
         assert_eq!(applied, new_offset);

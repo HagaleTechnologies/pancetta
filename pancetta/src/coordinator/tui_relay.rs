@@ -3522,7 +3522,8 @@ mod tui_relay_tests {
             pending[0].action
         );
         assert_eq!(
-            pending[0].raised_at_generation, None,
+            pending[0].origin.raised_at_generation(),
+            None,
             "an operator-forced `u` nudge carries no staleness token — it is \
              current by construction and must never be discarded as stale \
              (PAN-72 finding 8)"
