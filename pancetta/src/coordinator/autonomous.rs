@@ -566,11 +566,12 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// bounded in practice by `max_concurrent_qsos` (default 1), but it is a real
 /// bug the moment that is raised.
 ///
-/// Caveat: this reservation only binds when `allocate_smart_frequency_avoiding`
-/// takes its spectral-snapshot branch — with no spectral snapshot yet it falls
-/// through to the deterministic legacy allocator, which ignores `reserved_hz`
-/// entirely, so two same-batch `Switch` actions could still collide in that
-/// fallback case (see that function's own doc comment).
+/// The reservation binds on BOTH of the allocator's resolution paths (round 3,
+/// finding 1): the ranked spectral branch and the deterministic legacy fallback
+/// it takes before the first waterfall lands. The fallback used to ignore
+/// `reserved_hz` entirely, which — being deterministic over the same stale
+/// own-frequency map — meant two same-batch `Switch` actions reliably collided
+/// there. See `AutonomousOperator::allocate_smart_frequency_avoiding`.
 ///
 /// **Hound picks stay inside the Hound region** (round 2, finding 1) and
 /// **revert targets are re-checked for occupancy** (round 2, finding 2) — see
