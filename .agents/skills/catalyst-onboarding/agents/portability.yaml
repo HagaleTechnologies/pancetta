@@ -1,0 +1,3 @@
+identity: { pack: catalyst-starter, skill: catalyst-onboarding }
+effects: []
+invocation: implicit
