@@ -569,6 +569,13 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// bounded in practice by `max_concurrent_qsos` (default 1), but it is a real
 /// bug the moment that is raised.
 ///
+/// **Every OTHER live QSO's offset is hard-excluded too** (round 4, finding 1).
+/// `reserved_hz` alone covers only batch-mates, and the overwhelmingly common
+/// crowded-spectrum shape is several live QSOs of which exactly one is
+/// switching — the rest never enter the batch, so before this their offsets
+/// reached the allocator only as a soft `-50` score penalty applied against a
+/// one-tick-stale occupancy view. See [`other_live_tx_offsets`].
+///
 /// The reservation binds on BOTH of the allocator's resolution paths (round 3,
 /// finding 1): the ranked spectral branch and the deterministic legacy fallback
 /// it takes before the first waterfall lands. The fallback used to ignore
@@ -637,6 +644,46 @@ fn hound_switch_range_hz(
     } else {
         (config.hound.call_min_hz, config.hound.call_max_hz)
     })
+}
+
+/// Every offset in `active_tx_offsets` that belongs to some OTHER live QSO of
+/// ours — i.e. the whole current occupancy view minus the QSO being resolved.
+///
+/// PAN-72 (Codex round 4 on PR #350, finding 1). Round 1 gave the drain a
+/// batch-local `reserved_hz` so two QSOs switching in the SAME batch can't
+/// collapse onto one offset, but that set is empty for the very common shape
+/// where several QSOs are live and only one of them is switching: the others
+/// never enter the batch at all. Their offsets then reach the allocator only as
+/// [`crate::coordinator::autonomous`]'s soft `own_frequencies` `-50` score
+/// penalty (`frequency.rs`'s `score_candidate`), which that site's own comment
+/// admits is "effectively eliminates" rather than *does* eliminate — on a
+/// crowded band a clean candidate sitting on top of an existing stream can
+/// still outrank every alternative. Worse, the operator's own-frequency
+/// snapshot is only synced from this map LATER in the same tick
+/// (`set_own_frequencies`), so at drain time even that soft penalty is applied
+/// against the PREVIOUS tick's view.
+///
+/// Feeding these through the same hard `also_avoid_hz` channel the batch
+/// reservations use makes a switching QSO hard-avoid every other live stream,
+/// exactly as [`revert_target_is_taken`] already does for a `Revert` target.
+///
+/// Fails OPEN (empty list) on a poisoned lock, matching every other read of
+/// this map in this task: this is placement quality, not a TX-safety gate, and
+/// refusing to relocate stalled QSOs because a lock is poisoned would strand
+/// them on offsets that demonstrably are not working.
+fn other_live_tx_offsets(
+    qso_id: pancetta_qso::states::QsoId,
+    active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
+) -> Vec<f64> {
+    let own_key = super::active_tx_qso_key(&qso_id.to_string());
+    match active_tx_offsets.read() {
+        Ok(offsets) => offsets
+            .iter()
+            .filter(|(key, _)| **key != own_key)
+            .map(|(_, &hz)| hz)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
 }
 
 /// Is `target_hz` — a queued `OffsetAction::Revert`'s known-good offset — now
@@ -730,13 +777,20 @@ async fn drain_pending_qso_offset_requests(
             .as_ref()
             .and_then(|p| hound_switch_range_hz(p, qso_manager.config()));
         let current_hz = progress.as_ref().map(|p| p.metadata.frequency);
+        // Round 4, finding 1: the hard exclusion set is this batch's own
+        // reservations PLUS every other live QSO's current offset. The latter
+        // never enter the batch when they are not themselves switching, and a
+        // soft score penalty is not enough to keep a switching QSO off them —
+        // see `other_live_tx_offsets`.
+        let mut exclusions_hz = reserved_hz.clone();
+        exclusions_hz.extend(other_live_tx_offsets(qso_id, active_tx_offsets));
         let resolved_hz = match action {
             pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } => op
                 .allocate_smart_frequency_in_range(
                     None,
                     None,
                     Some(avoid_hz),
-                    &reserved_hz,
+                    &exclusions_hz,
                     range_hz,
                 ),
             pancetta_qso::qso_manager::OffsetAction::Revert { target_hz } => {
@@ -763,8 +817,9 @@ async fn drain_pending_qso_offset_requests(
                     // Resolve exactly as a `Switch` would: avoid the offset the
                     // QSO is stalling on (its live one, not the stale revert
                     // target), and treat the now-occupied target as one more
-                    // hard exclusion on top of this batch's reservations.
-                    let mut also_avoid = reserved_hz.clone();
+                    // hard exclusion on top of this batch's reservations and
+                    // the other live QSOs' offsets.
+                    let mut also_avoid = exclusions_hz.clone();
                     also_avoid.push(target_hz);
                     op.allocate_smart_frequency_in_range(
                         None,
@@ -3825,6 +3880,197 @@ mod drain_pending_qso_offset_requests_tests {
             a, b,
             "two concurrent switches resolved in one batch must not land on \
              the same TX offset ({a} Hz)"
+        );
+    }
+
+    /// PAN-72 (Codex round 4 on PR #350, finding 1): when several QSOs are live
+    /// and only ONE of them is switching, the others never enter the drain
+    /// batch, so `reserved_hz` is empty and their offsets used to reach the
+    /// allocator only as the soft `-50` `own_frequencies` penalty — which, on a
+    /// crowded band, a clean candidate sitting on top of an existing stream can
+    /// still outrank. They must be hard exclusions, exactly like batch-mates.
+    ///
+    /// The band is rigged with two quiet windows: the best one straddles the
+    /// bystander QSO's live offset, the second-best is far away. Without the
+    /// hard exclusion the switch lands in the first.
+    #[tokio::test]
+    async fn a_switch_hard_avoids_a_live_qso_that_is_not_in_this_batch() {
+        const OCCUPIED_HZ: f64 = 1200.0;
+        let mut op = operator_with_live_allocator();
+        // Quiet at ~1200 Hz (best), slightly less quiet at ~2400 Hz
+        // (second-best), noisy everywhere else.
+        let bins = 140usize;
+        let (fmin, fmax) = (200.0f64, 2800.0f64);
+        let width = (fmax - fmin) / bins as f64;
+        let power: Vec<f32> = (0..bins)
+            .map(|i| {
+                let f = fmin + (i as f64 + 0.5) * width;
+                if (1100.0..=1300.0).contains(&f) {
+                    0.0
+                } else if (2300.0..=2500.0).contains(&f) {
+                    0.3
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
+            power_bins: power,
+            freq_min_hz: fmin,
+            freq_max_hz: fmax,
+        });
+
+        let qso_manager = manager();
+        let switching = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        let bystander = qso_manager
+            .start_cq(OCCUPIED_HZ, None, false)
+            .await
+            .unwrap();
+        // The occupancy view the coordinator holds at drain time: BOTH QSOs are
+        // TX-active, but only `switching` has a queued action.
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
+            (
+                crate::coordinator::active_tx_qso_key(&switching.to_string()),
+                1500.0,
+            ),
+            (
+                crate::coordinator::active_tx_qso_key(&bystander.to_string()),
+                OCCUPIED_HZ,
+            ),
+        ]));
+        let separation = op.min_own_separation_hz();
+        assert!(
+            (op.allocate_smart_frequency(None, None, Some(1500.0)) - OCCUPIED_HZ).abs()
+                < separation,
+            "test premise broken: the UNCONSTRAINED allocator must prefer the \
+             occupied {OCCUPIED_HZ} Hz window on this rigged band"
+        );
+
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                switching,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+        ]);
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+        )
+        .await;
+
+        let moved_to = qso_manager
+            .get_qso(switching)
+            .await
+            .unwrap()
+            .metadata
+            .frequency;
+        assert!(
+            (moved_to - OCCUPIED_HZ).abs() >= separation,
+            "a switch must hard-avoid an unchanged live QSO's offset, got \
+             {moved_to} Hz against an occupied {OCCUPIED_HZ} Hz (separation \
+             {separation} Hz)"
+        );
+        assert_eq!(
+            qso_manager
+                .get_qso(bystander)
+                .await
+                .unwrap()
+                .metadata
+                .frequency,
+            OCCUPIED_HZ,
+            "the bystander QSO must not be touched by this batch"
+        );
+    }
+
+    /// The `Revert` half of round 4, finding 1: when a revert target is already
+    /// taken, the fallback re-resolution must avoid every other live QSO too,
+    /// not just the target and this batch's reservations.
+    #[tokio::test]
+    async fn a_reallocated_revert_also_avoids_every_other_live_qso() {
+        const OCCUPIED_HZ: f64 = 1200.0;
+        const TAKEN_TARGET_HZ: f64 = 1900.0;
+        let mut op = operator_with_live_allocator();
+        let bins = 140usize;
+        let (fmin, fmax) = (200.0f64, 2800.0f64);
+        let width = (fmax - fmin) / bins as f64;
+        let power: Vec<f32> = (0..bins)
+            .map(|i| {
+                let f = fmin + (i as f64 + 0.5) * width;
+                if (1100.0..=1300.0).contains(&f) {
+                    0.0
+                } else if (2300.0..=2500.0).contains(&f) {
+                    0.3
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
+            power_bins: power,
+            freq_min_hz: fmin,
+            freq_max_hz: fmax,
+        });
+
+        let qso_manager = manager();
+        let stalled = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        let on_target = qso_manager
+            .start_cq(TAKEN_TARGET_HZ, None, false)
+            .await
+            .unwrap();
+        let bystander = qso_manager
+            .start_cq(OCCUPIED_HZ, None, false)
+            .await
+            .unwrap();
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
+            (
+                crate::coordinator::active_tx_qso_key(&stalled.to_string()),
+                1500.0,
+            ),
+            (
+                crate::coordinator::active_tx_qso_key(&on_target.to_string()),
+                TAKEN_TARGET_HZ,
+            ),
+            (
+                crate::coordinator::active_tx_qso_key(&bystander.to_string()),
+                OCCUPIED_HZ,
+            ),
+        ]));
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                stalled,
+                pancetta_qso::qso_manager::OffsetAction::Revert {
+                    target_hz: TAKEN_TARGET_HZ,
+                },
+            ),
+        ]);
+
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+        )
+        .await;
+
+        let separation = op.min_own_separation_hz();
+        let moved_to = qso_manager
+            .get_qso(stalled)
+            .await
+            .unwrap()
+            .metadata
+            .frequency;
+        assert!(
+            (moved_to - TAKEN_TARGET_HZ).abs() >= separation,
+            "the re-resolved revert must clear the occupied target, got {moved_to} Hz"
+        );
+        assert!(
+            (moved_to - OCCUPIED_HZ).abs() >= separation,
+            "the re-resolved revert must also clear every OTHER live QSO's \
+             offset, got {moved_to} Hz against an occupied {OCCUPIED_HZ} Hz"
         );
     }
 
