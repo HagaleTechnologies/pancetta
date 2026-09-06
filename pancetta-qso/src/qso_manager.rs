@@ -3572,9 +3572,13 @@ impl QsoManager {
                 // `PRE_SWITCH_OFFSET_GRACE` of such a move is answering the
                 // PRE-switch transmission — the new offset has not been
                 // transmitted on even once. Crediting it would record an
-                // unproven offset as known-good and poison the Revert target: a
-                // later stall would "revert" to the offset it is already on
-                // (refused as a no-op) and the genuinely proven one is lost.
+                // unproven offset as known-good and degrade the next stall's
+                // adaptation: with `last_known_good` equal to the offset we are
+                // already on, the `>= f64::EPSILON` guard in
+                // `rearm_manual_calls_at` skips `Revert` and falls through to a
+                // fresh `Switch` — not a hard failure, but the genuinely proven
+                // offset is lost and the QSO hops on blindly instead of
+                // returning to what worked.
                 //
                 // Round 5, finding 2: but the clock alone does not identify
                 // which frame was answered. An operator-forced `u` nudge is NOT
@@ -3586,20 +3590,45 @@ impl QsoManager {
                 // matches that baseline, judged with the SAME tolerance the
                 // relevance gate admitted it under (`rx_tolerance_hz`, taken
                 // from the pre-transition state so a callsign latched by this
-                // very advance cannot widen it retroactively). Anything else —
-                // the new offset, or a `partner_freq` split matching neither —
-                // credits the offset we are on now, which is where we are
+                // very advance cannot widen it retroactively). Otherwise we
+                // credit the offset we are on now, which is where we are
                 // actually transmitting. Where the two baselines overlap (a
                 // move smaller than the tolerance) the vacated one still wins:
                 // it is the offset with a proven history.
                 //
+                // Round 5 re-review: that comparison holds the DX's decode
+                // frequency against OUR vacated TX offset, so it is evidence
+                // ONLY on a Tx=Rx QSO, where those are the same number. A QSO
+                // that already carried a `partner_freq` before the switch
+                // (Hound, an `o` hold, a de-conflict nudge, a passband clamp)
+                // keeps it — `apply_tx_offset_switch` leaves an already-`Some`
+                // latch alone — so the DX still transmits at `partner_freq`,
+                // which matches neither of our offsets. The check would fail for
+                // a reason that says nothing about which frame was answered, and
+                // crediting the never-transmitted new offset off the back of it
+                // is strictly worse than round 4's behaviour. So the check is
+                // applied only when the QSO is Tx=Rx: no split at all, or a
+                // split this very switch created (`partner_freq` still equal to
+                // the offset we just vacated, compared with the same
+                // [`TX_OFFSET_NOOP_TOLERANCE_HZ`] float-noise bound that latch
+                // site uses). On a pre-existing split we fall back to crediting
+                // the vacated offset unconditionally — it remains the only one
+                // with a proven history.
+                //
                 // Consumed here either way: the first advance after a switch is
                 // the one that resolves the ambiguity, and everything after it
                 // is unambiguously about the current offset.
+                let vacated_hz = live_pre_switch_offset_at(&progress.metadata, message.timestamp);
+                let tx_equals_rx = match progress.metadata.partner_freq {
+                    None => true,
+                    Some(partner_hz) => vacated_hz
+                        .is_some_and(|hz| (partner_hz - hz).abs() <= TX_OFFSET_NOOP_TOLERANCE_HZ),
+                };
                 progress.metadata.last_known_good_offset_hz = Some(
-                    live_pre_switch_offset_at(&progress.metadata, message.timestamp)
+                    vacated_hz
                         .filter(|pre_switch_hz| {
-                            (pre_switch_hz - message.frequency).abs() <= rx_tolerance_hz
+                            !tx_equals_rx
+                                || (pre_switch_hz - message.frequency).abs() <= rx_tolerance_hz
                         })
                         .unwrap_or(progress.metadata.frequency),
                 );
@@ -15897,6 +15926,84 @@ mod pan72_stall_detection_tests {
         assert_eq!(
             after.metadata.pre_switch_offset, None,
             "the ambiguity is resolved either way — the grace is consumed"
+        );
+    }
+
+    /// PAN-72 (Codex round 5 re-review on PR #350): the decode-frequency match
+    /// check above is only *evidence* when the QSO is Tx=Rx — it compares the
+    /// DX's transmit frequency against OUR vacated TX offset, which are the
+    /// same number only when no split exists.
+    ///
+    /// A QSO that already carried a `partner_freq` before the switch (Hound, an
+    /// operator `o` hold, a de-conflict nudge, a passband clamp) is not Tx=Rx:
+    /// `apply_tx_offset_switch` deliberately leaves that latch alone, so the DX
+    /// keeps transmitting at `partner_freq`, nowhere near the offset we vacated.
+    /// The match check then fails for a reason that says nothing about which of
+    /// our frames was answered, and falling through would credit the brand-new
+    /// offset — never transmitted on, zero evidence behind it. In that shape the
+    /// check must be skipped entirely and the vacated offset credited
+    /// unconditionally, exactly as round 4 did.
+    #[tokio::test]
+    async fn an_advance_on_a_pre_existing_split_credits_the_vacated_offset() {
+        const DX_FREQ: f64 = 2400.0;
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                None,
+                CallInitiation::Manual,
+                Some(DX_FREQ),
+                false,
+            )
+            .await
+            .unwrap();
+
+        let new_offset = FREQ + 400.0;
+        assert_eq!(
+            manager
+                .apply_tx_offset_switch(qso_id, new_offset, None)
+                .await
+                .unwrap(),
+            new_offset
+        );
+        let switched = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            switched.metadata.partner_freq,
+            Some(DX_FREQ),
+            "precondition: the pre-existing split survives the TX-side switch"
+        );
+
+        // The DX answers where it has been transmitting all along — at
+        // `partner_freq`, which matches neither the vacated nor the new TX
+        // offset. Well inside `PRE_SWITCH_OFFSET_GRACE`.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -7,
+                },
+                format!("{OUR} {DX} -07"),
+                DX_FREQ,
+                Some(-15.0),
+            )
+            .await
+            .unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, new_offset,
+            "precondition: the advance routed and the QSO is on the new offset"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(FREQ),
+            "the DX transmits at {DX_FREQ} Hz regardless of where we key, so its \
+             reply cannot discriminate our two TX offsets — the vacated {FREQ} \
+             Hz is the only one with a proven history, and {new_offset} Hz has \
+             never been transmitted on"
         );
     }
 }
