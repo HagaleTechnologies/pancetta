@@ -405,6 +405,75 @@ tested.
     scoring — it never filters a candidate out — so the search can never fail more often, and a
     QSO with no latched parity degrades to exactly the previous behaviour.
 
+- **Amended by Codex round 7 on PR #350.** Six findings, all fixed inline. Finding 6 is the one
+  that could make this mechanism actively harmful:
+  - *Finding 6 — recentre the DECODER after an applied switch, not just the UI.* With the QSO
+    filter enabled (the default, `coordinator::qso_filter`) the main FT8 decode is collapsed to
+    ±60 Hz around the shared `active_qso_freq_hz` hint, and that hint was written in exactly one
+    place: the forwarder's `StateChanged` arm. Round 1's `TxOffsetApplied` arm refreshed only the
+    `ActiveQsosSnapshot`, so an applied move left the hint on the offset the QSO had just
+    abandoned — while the allocator guarantees the relocation is at least `min_separation_hz`
+    (75 Hz) away. On an unanswered `CallingCq` the result is self-sustaining deafness:
+    `partner_freq` is deliberately `None` there (round 5's fix), so the state frequency IS the
+    hint and the switch just changed it; an answer to the NEW CQ offset fell outside the decode
+    search entirely, and since only a decode can produce the `StateChanged` that refreshes the
+    hint, nothing ever recovered. The station kept calling CQ on a frequency it was structurally
+    unable to hear replies on, for the life of the QSO. The arm now recomputes the hint from the
+    POST-switch QSO through the extracted `decoder_hint_freq_for` — `partner_freq` when the DX's
+    RX offset is known, the state frequency otherwise. That same rule is what keeps an
+    ESTABLISHED QSO pointed at the DX (which is still transmitting on the offset we vacated; the
+    switch moves only our TX side), so it is not merely "use the new offset". A QSO that has gone
+    terminal in the meantime yields `None` and the hint is LEFT ALONE rather than cleared: the
+    terminal arms already own that transition, and a co-active QSO's hint must not be wiped by a
+    late event for a dead one. `StateChanged`'s own inline computation is deliberately left
+    byte-identical (it reads the event's `new_state`, not the live map).
+  - *Finding 1 — at most one relocation per QSO per drain.* Two requests for one `qso_id` are
+    ordinary: the operator can press `u` twice inside one slot, and (given finding 2 below) an
+    automatic stall action is re-raised each slot until something commits, so it can land
+    alongside a manual nudge. Committing both in sequence overwrites `pre_switch_offset` with the
+    FIRST commit's destination — an intermediate offset nothing ever transmitted on — losing the
+    record of where an answer to the real pre-drain frame is arriving. New
+    `coalesce_offset_requests_by_qso` reduces the batch before anything is resolved;
+    `OperatorForced` outranks `StallDetected` in either arrival order (the nudge is deliberate
+    and current by construction; the automatic action re-raises next slot anyway), and
+    first-arrival wins otherwise so the `reserved_hz` exclusion chain stays deterministic.
+  - *Finding 2 — the threshold streak must survive a relocation that never happens.* PAN-79
+    taught `apply_tx_offset_switch` to refuse a no-op relocation precisely so a crowded band
+    would not clear valid stall evidence — but the threshold-tripping path had already zeroed
+    `stall_cycles` at EMISSION time, one slot earlier, so the refusal preserved a streak that no
+    longer existed and recovery was pushed out by another full `qso_stall_switch_after` window
+    even if a slot opened up immediately. The emission-time reset is removed: raising an action
+    is not relocating. `stall_cycles` now has exactly two reset sites — a successful commit in
+    `apply_tx_offset_switch`, and a genuine DX advance in `process_message_for_qso`.
+  - *Finding 4 — revalidate Hold immediately before each commit.* Round 1's check runs once,
+    before the request loop, and each iteration then awaits twice (`get_qso`, the commit). A
+    contended QSO lock leaves a real window for the operator's `f` press, after which every
+    remaining request in the batch still committed against the pre-press reading — a `Switch`
+    resolving through the allocator's Hold early return onto the parked offset, and a `Revert`
+    never consulting the allocator at all. The mode is re-read per request now; the batch-level
+    check remains as the cheap early-out.
+  - *Finding 3 — count a stall only after EVERY TX gate permits the frame.* Round 2 closed the
+    `TxPolicy` hard mute, but a `remote_origin` QSO emits every frame as `TxOrigin::Remote` and
+    the TX worker independently checks the station-agent arm right before PTT. An arm expiry or
+    explicit remote disarm drops those frames while `TxPolicy` still reads `Full`, and the
+    detector counted that self-inflicted silence as "the DX ignored us". New
+    `QsoManager::set_remote_tx_permitted_source` mirrors `set_tx_policy_source`, backed by
+    `coordinator::tx::remote_tx_permitted`, consulted ONLY for QSOs that are actually
+    `remote_origin` and defaulting to "permitted" so every existing caller is unchanged. This is
+    read-only evidence and never a TX gate: the fail-CLOSED armed-TX check stays exactly where
+    AGENTS.md requires it, and since `remote_tx_permitted` denies on a poisoned lock a poisoned
+    arm also stops the counting — conservative in both places.
+  - *Finding 5 — count on the active mode's slot cadence.* The rearm gate hardcoded 15 s, which
+    is FT8's period alone, while `qso_stall_switch_after` is documented in slots: under FT4
+    (7.5 s) a threshold of 4 took ~60 s / 8 real slots, and under FT2 (3.2 s) far worse, often
+    letting the ordinary QSO watchdog win first. `rearm_slot_millis_for_mode` derives the period
+    from `QsoManagerConfig::active_mode` (15_000 / 7_500 / 3_200 ms, matching
+    `pancetta_ft8::ProtocolParams`'s `cycle_duration`; duplicated as literals because
+    `pancetta-qso` does not depend on `pancetta-ft8` outside the `sim` feature, and pinned by a
+    unit test), and the gate moved to millisecond resolution so 7.5 s is expressible. `"FT8"` and
+    anything unrecognized resolve to 15_000 ms, and the comparison is arithmetically identical to
+    the old `num_seconds() < 15`, so mode=FT8 stays byte-identical.
+
 ## Manual "nudge" keystroke — `pancetta-tui`
 
 - New key: **`u`** ("un-stick"; confirmed unused against the full existing keymap). Sends a new

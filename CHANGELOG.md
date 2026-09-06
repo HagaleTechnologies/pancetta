@@ -60,6 +60,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   TO rather than the one it left, a Hound response region above 2800 Hz is now
   actually searched instead of silently refusing every move, and a switch is
   scored against the slot the QSO really transmits in rather than slot-blind.
+  Last hardening pass: after moving an unanswered CQ the receiver is now
+  re-centred on the new frequency — it previously stayed listening on the
+  abandoned one, so an answer to the CQ could never be heard and nothing ever
+  corrected it. Alongside that: repeated `u` presses in one slot no longer
+  corrupt the record of where a reply is expected, switching to Hold mid-move
+  now stops the move, a recovery attempt that finds no free slot keeps its
+  evidence instead of waiting out another full threshold, silence caused by an
+  expired remote-TX arm no longer counts against the DX, and FT4/FT2 count
+  stalls on their own (shorter) slot instead of FT8's 15 seconds.
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
