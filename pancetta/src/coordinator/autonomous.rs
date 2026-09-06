@@ -585,7 +585,8 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 ///
 /// **Hound picks stay inside the Hound region** (round 2, finding 1) and
 /// **revert targets are re-checked for occupancy** (round 2, finding 2) — see
-/// [`hound_switch_range_hz`] and [`revert_target_is_taken`]. Both hang off a
+/// [`pancetta_qso::qso_manager::hound_switch_range_hz`] and
+/// [`revert_target_is_taken`]. Both hang off a
 /// single `get_qso` read taken before the action is resolved; it is a plain
 /// read-lock clone that is dropped before `apply_tx_offset_switch` takes the
 /// write lock, and it is advisory only — every authoritative refusal (unknown,
@@ -613,39 +614,18 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// entries that already exist are updated — an absent key means the
 /// forwarder does not consider this QSO TX-active, and resurrecting it here
 /// would re-admit a QSO the `Failed`/completion purge just removed.
-/// The Hz window a queued TX-offset action for this QSO is allowed to resolve
-/// inside, or `None` for the general 300–2800 Hz allocation range.
 ///
-/// PAN-72 (Codex round 2 on PR #350, finding 1). A **Hound**'s TX offset is
-/// procedurally pinned, not free: while calling the Fox we must sit in the low
-/// calling region, and once the Fox has answered and we have QSY'd we must sit
-/// in the response region — that is where the Fox is listening, and nowhere
-/// else. The generic allocator knows nothing about either region, so a stall
-/// switch (or a finding-2 fallback switch) resolved through it could move a
-/// post-QSY Hound back down into the calling region and guarantee the QSO dies.
-///
-/// `hound_qsyed` is the discriminator rather than the QSO's state, because it
-/// is exactly the flag the QSY itself sets (`process_message_for_qso`'s Hound
-/// block): before it flips we are calling low, after it flips we are answering
-/// high. Non-Hound QSOs are unconstrained, exactly as before.
-///
-/// The bounds come from the live `QsoManagerConfig` — the operator's own
-/// `[hound]` TOML, wired in by `coordinator/qso.rs` — not from the module
-/// constants, so a customized region is honored here too.
-fn hound_switch_range_hz(
-    progress: &pancetta_qso::states::QsoProgress,
-    config: &pancetta_qso::QsoManagerConfig,
-) -> Option<(f64, f64)> {
-    if !progress.metadata.hound {
-        return None;
-    }
-    Some(if progress.metadata.hound_qsyed {
-        (config.hound.response_min_hz, config.hound.response_max_hz)
-    } else {
-        (config.hound.call_min_hz, config.hound.call_max_hz)
-    })
-}
-
+/// **Hound windows are revalidated at commit time** (round 4, finding 2). The
+/// window this drain resolves against comes from a `get_qso` snapshot taken
+/// before the allocator runs, and the Fox's report can perform the mandatory
+/// calling-region → response-region QSY across the intervening `.await`. The
+/// window itself now lives in `pancetta_qso::qso_manager::hound_switch_range_hz`
+/// and `apply_tx_offset_switch` re-derives it under the write lock it mutates
+/// through, so a pick that has gone out of region is refused
+/// (`OffsetActionOutsideHoundRegion`) rather than committed. This site's read
+/// stays as the *resolution* constraint — it is what keeps the allocator
+/// searching inside the region in the first place — but it is no longer what
+/// makes the outcome safe.
 /// Every offset in `active_tx_offsets` that belongs to some OTHER live QSO of
 /// ours — i.e. the whole current occupancy view minus the QSO being resolved.
 ///
@@ -773,9 +753,9 @@ async fn drain_pending_qso_offset_requests(
         // both answers unset and let `apply_tx_offset_switch` below produce the
         // authoritative refusal rather than second-guessing it here.
         let progress = qso_manager.get_qso(qso_id).await.ok();
-        let range_hz = progress
-            .as_ref()
-            .and_then(|p| hound_switch_range_hz(p, qso_manager.config()));
+        let range_hz = progress.as_ref().and_then(|p| {
+            pancetta_qso::qso_manager::hound_switch_range_hz(p, qso_manager.config())
+        });
         let current_hz = progress.as_ref().map(|p| p.metadata.frequency);
         // Round 4, finding 1: the hard exclusion set is this batch's own
         // reservations PLUS every other live QSO's current offset. The latter

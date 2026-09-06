@@ -330,6 +330,27 @@ pub enum QsoManagerError {
          ({offset_hz:.0} Hz) — nothing to relocate"
     )]
     OffsetActionNoOp { qso_id: QsoId, offset_hz: f64 },
+
+    /// PAN-72 (Codex round 4 on PR #350, finding 2): the resolved offset falls
+    /// outside the Hound region this QSO is procedurally pinned to *right now*.
+    /// The coordinator resolves against a `get_qso` snapshot taken before the
+    /// allocator runs, and the Fox's first report performs the mandatory
+    /// calling-region → response-region QSY; if that lands in between, the
+    /// resolved (low, calling-region) offset would undo the QSY and put our
+    /// R+report where the Fox is not listening. Revalidated under the same
+    /// write lock that performs the mutation, so check and commit are atomic.
+    /// Expected, not a fault — the stall detector re-raises against the new
+    /// region on its own.
+    #[error(
+        "TX-offset action for QSO {qso_id} resolves to {offset_hz:.0} Hz, \
+         outside the Hound region it is now pinned to ({min_hz:.0}-{max_hz:.0} Hz)"
+    )]
+    OffsetActionOutsideHoundRegion {
+        qso_id: QsoId,
+        offset_hz: f64,
+        min_hz: f64,
+        max_hz: f64,
+    },
 }
 
 impl QsoManagerError {
@@ -345,8 +366,61 @@ impl QsoManagerError {
                 | QsoManagerError::QsoNotActive { .. }
                 | QsoManagerError::OffsetActionStale { .. }
                 | QsoManagerError::OffsetActionNoOp { .. }
+                | QsoManagerError::OffsetActionOutsideHoundRegion { .. }
         )
     }
+}
+
+/// The Hz window a TX-offset action for this QSO is allowed to resolve inside,
+/// or `None` for the general allocation range.
+///
+/// PAN-72 (Codex round 2 on PR #350, finding 1; hoisted here in round 4,
+/// finding 2). A **Hound**'s TX offset is procedurally pinned, not free: while
+/// calling the Fox we must sit in the low calling region, and once the Fox has
+/// answered and we have QSY'd we must sit in the response region — that is
+/// where the Fox is listening, and nowhere else. The generic allocator knows
+/// nothing about either region, so a stall switch resolved through it could
+/// move a post-QSY Hound back down into the calling region and guarantee the
+/// QSO dies.
+///
+/// [`QsoMetadata::hound_qsyed`](crate::states::QsoMetadata::hound_qsyed) is the
+/// discriminator rather than the QSO's state, because it is exactly the flag
+/// the QSY itself sets (`process_message_for_qso`'s Hound block): before it
+/// flips we are calling low, after it flips we are answering high. Non-Hound
+/// QSOs are unconstrained.
+///
+/// Lives in this crate, not in the coordinator, so the constraint the
+/// coordinator *resolves* against and the one
+/// [`QsoManager::apply_tx_offset_switch`] *revalidates* at commit time are one
+/// definition rather than two that can drift apart.
+///
+/// The window is sanitized rather than trusted: the bounds ultimately come from
+/// operator TOML (`[hound]`), so a non-finite or inverted window degrades to
+/// "no constraint" instead of filtering every candidate away (or, at the commit
+/// end, refusing every action).
+pub fn hound_switch_range_hz(
+    progress: &crate::states::QsoProgress,
+    config: &QsoManagerConfig,
+) -> Option<(f64, f64)> {
+    hound_switch_range_for(&progress.metadata, config)
+}
+
+/// [`hound_switch_range_hz`] against a bare metadata borrow — what
+/// [`QsoManager::apply_tx_offset_switch`] has in hand while it holds the write
+/// lock on the QSO it is about to mutate.
+fn hound_switch_range_for(
+    metadata: &crate::states::QsoMetadata,
+    config: &QsoManagerConfig,
+) -> Option<(f64, f64)> {
+    if !metadata.hound {
+        return None;
+    }
+    let (lo, hi) = if metadata.hound_qsyed {
+        (config.hound.response_min_hz, config.hound.response_max_hz)
+    } else {
+        (config.hound.call_min_hz, config.hound.call_max_hz)
+    };
+    (lo.is_finite() && hi.is_finite() && lo <= hi).then_some((lo, hi))
 }
 
 /// QSO manager configuration
@@ -2812,10 +2886,10 @@ impl QsoManager {
     /// coordinator can mirror it into its own `active_tx_offsets` snapshot
     /// without re-deriving the clamp.
     ///
-    /// Three guards run BEFORE anything is mutated. The first two are staleness
-    /// guards, both because the coordinator only drains its request mailbox
-    /// once per 15-second slot, so a lot can happen between an action being
-    /// raised and committed; the third rejects a move that isn't one:
+    /// Four guards run BEFORE anything is mutated. The first three are
+    /// staleness guards, all because the coordinator only drains its request
+    /// mailbox once per 15-second slot, so a lot can happen between an action
+    /// being raised and committed; the fourth rejects a move that isn't one:
     ///
     /// 1. **Terminal QSO** (Codex round 1 on PR #350, finding 3). Completed
     ///    entries are retained in the map, and completion deliberately keeps
@@ -2834,7 +2908,19 @@ impl QsoManager {
     ///    move us off the offset that just demonstrably worked. Pass `None`
     ///    for an operator-forced nudge, which is current by construction and
     ///    must never be discarded this way.
-    /// 3. **No-op relocation** (PAN-79; Codex round 3, finding 2). The
+    /// 3. **Outside the live Hound region** (Codex round 4, finding 2). A
+    ///    Hound's TX offset is procedurally pinned to the calling region before
+    ///    the Fox answers and to the response region after the QSY, and the
+    ///    coordinator picks that window from a `get_qso` snapshot taken before
+    ///    the allocator runs. The QSY can land in between — and for an
+    ///    operator-forced `u` nudge, which carries no generation, guard 2
+    ///    cannot catch it — so the window is re-derived here from the locked
+    ///    `progress` (through the same [`hound_switch_range_hz`] the
+    ///    coordinator resolved with) and an out-of-region offset is refused
+    ///    rather than committed. Refusing, not re-clamping: the stall evidence
+    ///    survives and the detector re-raises against the correct region on its
+    ///    own, whereas a clamp would park us on a region edge nothing ranked.
+    /// 4. **No-op relocation** (PAN-79; Codex round 3, finding 2). The
     ///    allocator's "no valid relocation exists" signal is `avoid_hz`
     ///    returned unchanged, which reaches this method as a requested offset
     ///    equal (within [`TX_OFFSET_NOOP_TOLERANCE_HZ`]) to the QSO's current
@@ -2845,7 +2931,7 @@ impl QsoManager {
     ///    `qso_stall_switch_after` window, while `TxOffsetApplied` would
     ///    announce a move that never happened.
     ///
-    /// All three refusals are expected outcomes, not faults — see
+    /// All four refusals are expected outcomes, not faults — see
     /// [`QsoManagerError::is_expected_offset_action_refusal`].
     pub async fn apply_tx_offset_switch(
         &self,
@@ -2872,8 +2958,31 @@ impl QsoManager {
                 });
             }
         }
+        // 3. **Outside the live Hound region** (Codex round 4 on PR #350,
+        //    finding 2). The coordinator picks the window from a `get_qso`
+        //    snapshot taken BEFORE the allocator runs, and the Fox's first
+        //    report performs the mandatory calling-region -> response-region
+        //    QSY (`process_message_for_qso`'s Hound block, which flips
+        //    `hound_qsyed`). An operator-forced `u` nudge deliberately carries
+        //    no `raised_at_generation`, so guard 2 above cannot catch that
+        //    advance — the low, calling-region offset would commit and undo the
+        //    QSY, putting our R+report where the Fox is not listening.
+        //    Re-deriving the window HERE, from the same locked `progress` this
+        //    method is about to mutate and through the same
+        //    `hound_switch_range_hz` the coordinator resolved with, makes the
+        //    check and the commit atomic by construction.
+        if let Some((min_hz, max_hz)) = hound_switch_range_for(&progress.metadata, &self.config) {
+            if applied_hz < min_hz || applied_hz > max_hz {
+                return Err(QsoManagerError::OffsetActionOutsideHoundRegion {
+                    qso_id,
+                    offset_hz: applied_hz,
+                    min_hz,
+                    max_hz,
+                });
+            }
+        }
         let old_off = progress.metadata.frequency;
-        // 3. **Nothing to relocate** (PAN-79; Codex round 3 on PR #350, finding
+        // 4. **Nothing to relocate** (PAN-79; Codex round 3 on PR #350, finding
         //    2). The allocator returns `avoid_hz` unchanged when every
         //    candidate is excluded, and the drain passes that straight here, so
         //    a "switch" can resolve back onto the offset the QSO is already on.
@@ -14755,6 +14864,123 @@ mod pan72_stall_detection_tests {
     /// The default Hound calling-region ceiling, for the precondition above.
     fn config_call_max() -> f64 {
         HoundRegions::default().call_max_hz
+    }
+
+    /// PAN-72 (Codex round 4 on PR #350, finding 2): the Hound-region
+    /// constraint must be revalidated INSIDE the commit, not merely used to
+    /// steer the coordinator's earlier resolution.
+    ///
+    /// The drain reads the QSO (and therefore its Hound phase) with `get_qso`,
+    /// resolves against that snapshot, and only then awaits
+    /// `apply_tx_offset_switch`. For an operator-forced `u` nudge there is
+    /// deliberately no `raised_at_generation`, so the advance guard cannot
+    /// catch a QSY that lands in that window either. This test drives exactly
+    /// that sequence: resolve a calling-region offset, let the Fox's report
+    /// perform the QSY, then commit the now-stale offset.
+    #[tokio::test]
+    async fn a_hound_qsy_across_the_commit_window_refuses_the_stale_calling_offset() {
+        let manager = manager_auto(test_config());
+        let fox_rx_hz = 300.0;
+        let qso_id = manager
+            .engage_hound(DX, fox_rx_hz, None, None)
+            .await
+            .unwrap();
+
+        // What the coordinator's pre-resolution `get_qso` would have seen: a
+        // pre-QSY Hound, pinned to the low calling region. Pick a different
+        // in-region offset — a legitimate calling-region relocation.
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert!(!before.metadata.hound_qsyed, "precondition: pre-QSY");
+        let regions = HoundRegions::default();
+        let resolved_hz = (before.metadata.frequency + 100.0).min(regions.call_max_hz);
+        assert!(
+            (resolved_hz - before.metadata.frequency).abs() > TX_OFFSET_NOOP_TOLERANCE_HZ
+                && resolved_hz >= regions.call_min_hz
+                && resolved_hz <= regions.call_max_hz,
+            "precondition: the resolved offset is a real move inside the calling region"
+        );
+
+        // ...and now the Fox answers, before the awaited commit runs: the
+        // mandatory calling-region -> response-region QSY fires.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -12,
+                },
+                format!("{OUR} {DX} -12"),
+                fox_rx_hz,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let qsyed_hz = manager.get_qso(qso_id).await.unwrap().metadata.frequency;
+        assert!(
+            qsyed_hz >= regions.response_min_hz,
+            "precondition: the QSY moved us into the response region, got {qsyed_hz}"
+        );
+
+        // Operator-forced (no generation token), exactly as the `u` nudge is.
+        let err = manager
+            .apply_tx_offset_switch(qso_id, resolved_hz, None)
+            .await
+            .expect_err("a calling-region offset must not commit onto a QSY'd Hound");
+        assert!(
+            matches!(
+                err,
+                QsoManagerError::OffsetActionOutsideHoundRegion { qso_id: id, .. } if id == qso_id
+            ),
+            "expected OffsetActionOutsideHoundRegion, got {err:?}"
+        );
+        assert!(
+            err.is_expected_offset_action_refusal(),
+            "a QSY racing the commit is an ordinary race, not a fault"
+        );
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.frequency,
+            qsyed_hz,
+            "the refused action must leave the procedure-mandated QSY intact"
+        );
+    }
+
+    /// The control: an in-region relocation on a QSY'd Hound still commits.
+    #[tokio::test]
+    async fn a_hound_switch_inside_the_live_response_region_still_commits() {
+        let manager = manager_auto(test_config());
+        let fox_rx_hz = 300.0;
+        let qso_id = manager
+            .engage_hound(DX, fox_rx_hz, None, None)
+            .await
+            .unwrap();
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -12,
+                },
+                format!("{OUR} {DX} -12"),
+                fox_rx_hz,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let regions = HoundRegions::default();
+        let qsyed_hz = manager.get_qso(qso_id).await.unwrap().metadata.frequency;
+        let target = (qsyed_hz + 200.0).min(regions.response_max_hz);
+        assert!(
+            (target - qsyed_hz).abs() > TX_OFFSET_NOOP_TOLERANCE_HZ,
+            "precondition: the target is a real move inside the response region"
+        );
+
+        assert_eq!(
+            manager
+                .apply_tx_offset_switch(qso_id, target, None)
+                .await
+                .expect("an in-region relocation must still commit"),
+            target
+        );
     }
 
     /// PAN-72 (Codex round 1 on PR #350, finding 3): a queued action drained
