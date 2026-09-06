@@ -226,9 +226,17 @@ const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
 /// so the last pre-switch transmission is at most one slot old when the QSO
 /// changes offset, its answer occupies the next slot, and that answer is
 /// decoded and processed by the end of it. Two slots covers exactly that
-/// round trip. It deliberately stops short of the ~3 slots it would take for an
-/// answer to our first POST-switch transmission to arrive, so the two can never
-/// be confused for one another.
+/// round trip.
+///
+/// Round 5, finding 2: the window does NOT by itself separate a reply to the
+/// pre-switch frame from a reply to a post-switch one. That reasoning holds
+/// only for a stall-triggered switch; an operator-forced `u` nudge is not
+/// coupled to a triggering resend, so our first POST-switch transmission can go
+/// out immediately and be answered comfortably inside this grace. The offset a
+/// reply actually decoded at is what disambiguates the two — see the
+/// `dx_frame_advanced` crediting block in `process_message_for_qso`. The
+/// window's job is only to bound how long the vacated offset stays worth
+/// considering at all.
 const PRE_SWITCH_OFFSET_GRACE: chrono::Duration = chrono::Duration::seconds(30);
 
 /// The offset this QSO moved away from, if it did so recently enough for a
@@ -3289,6 +3297,18 @@ impl QsoManager {
         // very first missed report slot — with no known-good offset recorded.
         let dx_frame_advanced = Self::progress_rank(&new_state) > Self::progress_rank(&old_state);
 
+        // PAN-72 (Codex round 5 on PR #350, finding 2): the RX tolerance the
+        // relevance gate actually judged THIS frame with, captured from the
+        // PRE-transition state — `is_message_relevant`/`classify_relevance` ran
+        // against `old_state`, and the advance we are about to record may well
+        // have just latched a contra callsign, which would widen the bound
+        // retroactively. Used below to decide which offset the advance proves.
+        let rx_tolerance_hz = if old_state.their_callsign().is_some() {
+            ESTABLISHED_FREQ_TOLERANCE_HZ
+        } else {
+            FREQ_TOLERANCE_HZ
+        };
+
         // Hound QSY gate: computed here while both `old_state` and `new_state`
         // are still in scope (before `old_state` is consumed by `emit_state_change`
         // below). The QSY fires after the state-update block where we can access
@@ -3546,21 +3566,41 @@ impl QsoManager {
             if dx_frame_advanced {
                 progress.metadata.stall_cycles = 0;
                 // PAN-72 (Codex round 4 on PR #350, finding 3): credit the
-                // offset the DX actually heard us on. A relocation is committed
-                // AFTER the frame that triggered it has gone out on the old
-                // offset, so an advance arriving inside
-                // `PRE_SWITCH_OFFSET_GRACE` of that move is answering the
+                // offset the DX actually heard us on. A STALL-triggered
+                // relocation is committed AFTER the frame that triggered it has
+                // gone out on the old offset, so an advance arriving inside
+                // `PRE_SWITCH_OFFSET_GRACE` of such a move is answering the
                 // PRE-switch transmission — the new offset has not been
                 // transmitted on even once. Crediting it would record an
                 // unproven offset as known-good and poison the Revert target: a
                 // later stall would "revert" to the offset it is already on
                 // (refused as a no-op) and the genuinely proven one is lost.
                 //
+                // Round 5, finding 2: but the clock alone does not identify
+                // which frame was answered. An operator-forced `u` nudge is NOT
+                // coupled to an old-offset triggering resend — it can land on a
+                // QSO that is about to transmit, the next rearm goes out on the
+                // NEW offset, and the answer to THAT lands well inside the same
+                // grace. So the decisive evidence is where the reply actually
+                // decoded: the vacated offset is credited only when the frame
+                // matches that baseline, judged with the SAME tolerance the
+                // relevance gate admitted it under (`rx_tolerance_hz`, taken
+                // from the pre-transition state so a callsign latched by this
+                // very advance cannot widen it retroactively). Anything else —
+                // the new offset, or a `partner_freq` split matching neither —
+                // credits the offset we are on now, which is where we are
+                // actually transmitting. Where the two baselines overlap (a
+                // move smaller than the tolerance) the vacated one still wins:
+                // it is the offset with a proven history.
+                //
                 // Consumed here either way: the first advance after a switch is
                 // the one that resolves the ambiguity, and everything after it
                 // is unambiguously about the current offset.
                 progress.metadata.last_known_good_offset_hz = Some(
                     live_pre_switch_offset_at(&progress.metadata, message.timestamp)
+                        .filter(|pre_switch_hz| {
+                            (pre_switch_hz - message.frequency).abs() <= rx_tolerance_hz
+                        })
                         .unwrap_or(progress.metadata.frequency),
                 );
                 progress.metadata.pre_switch_offset = None;
@@ -15792,6 +15832,71 @@ mod pan72_stall_detection_tests {
             Some(FREQ),
             "the DX answered the frame we sent on {FREQ} Hz — that, not the \
              never-transmitted {new_offset} Hz, is the proven offset"
+        );
+    }
+
+    /// PAN-72 (Codex round 5 on PR #350, finding 2): the mirror image of the
+    /// test above. Round 4 credited the vacated offset on ANY forward advance
+    /// inside the grace, checking only the clock — never which offset the
+    /// reply actually arrived on.
+    ///
+    /// That assumption holds for a STALL-triggered switch (the triggering
+    /// resend went out on the old offset one slot before the commit, so its
+    /// answer cannot be about the new one), but an operator-forced `u` nudge
+    /// is not coupled to any such resend: it can land on a QSO that is about
+    /// to transmit, the very next rearm goes out on the NEW offset, and the
+    /// answer to THAT arrives well inside the 30 s grace. Crediting the
+    /// vacated offset there records an offset that just demonstrably failed
+    /// as known-good, and a later stall then emits `Revert` back onto it —
+    /// undoing the nudge that had just been proven to work.
+    #[tokio::test]
+    async fn an_advance_at_the_post_switch_offset_credits_the_new_offset() {
+        const CALLER: &str = "W9XYZ";
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+
+        // Operator `u` nudge: no triggering resend, no raised generation.
+        let new_offset = FREQ + 400.0;
+        assert_eq!(
+            manager
+                .apply_tx_offset_switch(qso_id, new_offset, None)
+                .await
+                .unwrap(),
+            new_offset
+        );
+
+        // The next CQ goes out on the NEW offset and a caller answers it
+        // there, still inside `PRE_SWITCH_OFFSET_GRACE`.
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.into(),
+                    responding_station: CALLER.into(),
+                    grid: Some("FN31".into()),
+                },
+                format!("{OUR} {CALLER} FN31"),
+                new_offset,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.state.their_callsign(),
+            Some(CALLER),
+            "precondition: the answer advanced this QSO"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(new_offset),
+            "the caller answered us on {new_offset} Hz — crediting the vacated \
+             {FREQ} Hz would aim a later Revert at the offset the nudge escaped"
+        );
+        assert_eq!(
+            after.metadata.pre_switch_offset, None,
+            "the ambiguity is resolved either way — the grace is consumed"
         );
     }
 }

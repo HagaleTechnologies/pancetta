@@ -614,11 +614,22 @@ pub struct QsoMetadata {
     ///   but credits [`Self::last_known_good_offset_hz`] to an offset that has
     ///   never been transmitted on, poisoning the Revert target.
     ///
-    /// So the vacated offset stays a valid RX baseline, and stays the offset an
-    /// advance is credited to, for `PRE_SWITCH_OFFSET_GRACE` — two FT8 slots,
-    /// long enough for the reply to the last pre-switch frame to be decoded and
-    /// processed, and short enough to lapse before a reply to our first
-    /// POST-switch frame could arrive.
+    /// So the vacated offset stays a valid RX baseline, and stays a CANDIDATE
+    /// for the offset an advance is credited to, for `PRE_SWITCH_OFFSET_GRACE`
+    /// — two FT8 slots, long enough for the reply to the last pre-switch frame
+    /// to be decoded and processed.
+    ///
+    /// Round 5, finding 2: a candidate, not a foregone conclusion. The grace
+    /// bounds how long the vacated offset is worth considering; it does not
+    /// establish that a reply inside it was answering the pre-switch frame.
+    /// That reasoning is specific to a STALL-triggered switch, whose trigger is
+    /// the old-offset resend itself. An operator-forced `u` nudge has no such
+    /// coupling — the next rearm transmits on the NEW offset and can be
+    /// answered well inside the same window — so the crediting site picks
+    /// between the two baselines by the frequency the reply actually decoded
+    /// at, and only falls back to the vacated offset when the frame matches it.
+    /// Crediting it blindly would record an offset that had just failed as
+    /// known-good and aim a later `Revert` straight back at it.
     #[serde(default)]
     pub pre_switch_offset: Option<(f64, DateTime<Utc>)>,
 
