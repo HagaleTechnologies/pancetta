@@ -236,6 +236,45 @@ tested.
     `QsoCompleted`/`QsoFailed` push sites). Without it the banner and the TX-placement
     stream marker keep the pre-switch offset through multiple switch/revert cycles — a
     stalled exchange is precisely where no further state transition arrives.
+- **Amended by Codex round 2 on PR #350.** Three more, all on the same drain:
+  - *Finding 1 — Hound picks stay in the Hound region.* Round 1's known-good re-anchor fixed
+    `Revert`, but a `Switch` still resolved through the general 300–2800 Hz allocator, which
+    knows nothing about the Hound calling/response regions. A post-QSY pick below
+    `response_min_hz` puts our R+report where the Fox is not listening. The drain now takes one
+    `get_qso` read per request and derives a hard Hz window from `metadata.hound` /
+    `metadata.hound_qsyed` (the calling region before the QSY, the response region after), passed
+    to the new `AutonomousOperator::allocate_smart_frequency_in_range`. That method filters the
+    ranked candidates to the window alongside the existing hard exclusions, returns `avoid_hz`
+    (the established "no valid relocation" signal) when the window empties the list, and clamps
+    the window-blind legacy `allocate_cq_frequency` fallback into it. Bounds come from the live
+    `QsoManagerConfig` (operator `[hound]` TOML); a non-finite or inverted window degrades to no
+    constraint rather than panicking in `f64::clamp`.
+  - *Finding 2 — validate revert targets against current occupancy.* With `max_concurrent_qsos
+    > 1` another QSO can occupy the known-good offset after we switch away from it; the
+    allocator-free `Revert` would commit anyway, placing two of our own streams inside
+    `min_separation_hz` (the TX coalescer then excludes one from the bundle). The drain checks
+    the target against `active_tx_offsets` — the QSO's own entry excluded — plus this batch's
+    reservations, using the allocator's own `min_separation_hz` (exposed as
+    `AutonomousOperator::min_own_separation_hz`), and on a hit resolves a fresh `Switch`
+    avoiding both the stalled offset and the occupied target instead. Fails OPEN on a poisoned
+    lock: this is placement quality, not a TX-safety gate.
+  - *Finding 3 — drain on this slot's inputs.* The drain ran BEFORE `update_spectral`,
+    `update_live_spots` and `feed_decoded_messages` consumed the just-finished slot, so every
+    `Switch` ranked against the preceding slot's occupancy and the placement instrument computed
+    later in the tick could disagree with the decision. It now runs immediately after those
+    three — still ahead of `set_own_frequencies` (so the committed-offset mirror lands in time
+    for the same tick's sync) and still ahead of the `auto_config_enabled` gate (so a
+    manual-only operator's `u` nudge still drains).
+- **Amended by Codex round 2 on PR #350 (finding 5) — muted cycles are not stalls.** Under
+  `TxPolicy::Disabled` the coordinator's `tx_hard_mute_reason` blocks every frame
+  `rearm_manual_calls_at` re-emits, but the keep-calling loop still re-armed each slot and counted
+  each blocked re-send as a silent on-air cycle — four of them in Auto moved an established QSO
+  off a known-good offset nothing had transmitted on. `QsoManager` now observes the global policy
+  through a shared `Arc<AtomicU8>` (`set_tx_policy_source`, mirroring `set_tx_freq_mode_source`,
+  wired in `start_qso_component`, defaulting to a private `Full` so existing callers are
+  unchanged), and gates both the `stall_cycles` increment and the action emission on
+  `allows_any_tx()`. Accumulated cycles are kept rather than reset — they came from real
+  transmissions and remain valid evidence once TX resumes.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 
@@ -263,6 +302,17 @@ tested.
     that cycle). The outcome is instead named `CqNudgeArmed` and the status line says
     "CQ-offset nudge armed — applies on the next CQ cycle". Finding 9 additionally stops such
     a request being lost when that cycle arrives with thin decode history.
+  - **Amended by Codex round 2 on PR #350 (finding 4):** `active_tx_qsos` deliberately retains a
+    completed QSO for 45 seconds so its trailing 73 can transmit, so the blind first-entry pick
+    could name a terminal QSO — or shadow a genuinely live concurrent one — and report "Nudging
+    active QSO" for a request the drain then refused with `QsoNotActive`. `resolve_nudge_tx_offset`
+    now takes the engine's authoritative live-QSO id set (read at keypress time from the same
+    restart-safe `qso_manager_watch` handle the drain re-borrows each tick — read-only; commits
+    still happen only in the drain) and skips any snapshot entry missing from it, so a
+    grace-window-only entry falls through to the CQ fallback. `None` (Qso component not up)
+    preserves the pre-filter behavior. This is a SELECTION-time filter complementing round 1's
+    commit-time refusal: the commit check keeps the engine correct, this one keeps the status
+    line honest.
   - Else, if the Autonomous task's current state is `CallingCq` (hunting), trigger today's
     CQ-switch immediately: a new `pending_cq_offset_nudge: Arc<AtomicBool>` flag, set here and
     checked by the tick loop alongside its existing `should_switch` computation — same

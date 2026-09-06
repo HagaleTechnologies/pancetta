@@ -31,6 +31,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nudge pressed before enough decode history has accumulated is retried rather
   than dropped; and an applied move refreshes the QSO banner immediately
   instead of waiting for the next state change.
+  Further safeguards: a Hound's switch stays inside the Hound region it is
+  currently pinned to (the low calling region before the QSY, the response
+  region after), never wandering somewhere the Fox is not listening; a revert
+  whose known-good offset another QSO has since taken allocates a fresh offset
+  instead of stacking two streams; every switch is decided against the current
+  slot's own waterfall and decodes rather than the previous slot's; `u` only
+  reports "nudging active QSO" for a QSO the engine still has running, not one
+  inside its trailing-73 grace window; and while TX is `DISABLED` the stall
+  counter no longer advances, so a muted station never drifts off a working
+  offset it never transmitted on.
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
