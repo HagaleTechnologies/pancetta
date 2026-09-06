@@ -355,6 +355,55 @@ tested.
     neither — credits the current offset. Overlapping baselines (a move smaller than the
     tolerance) still resolve to the vacated one, which has the proven history. The grace is
     consumed either way, as before.
+- **Amended by Codex round 6 on PR #350.** Four findings, all fixed inline:
+  - *Finding 1 — the report sub-rung is forward progress.* `progress_rank` ranked both
+    `SendingReport { their_report: None }` and `{ Some(_) }` at rung 1, so the DX's first
+    `SignalReport` — the advance that turns our outbound from a plain report into an R-report —
+    left `advance_generation` unmoved. A switch queued by the preceding threshold-hitting rearm
+    then passed the commit-time stale-action guard and relocated the QSO at the exact moment the
+    DX answered; below the threshold, the partial stall streak carried forward instead of
+    resetting. The rung is split (and `Contest(ExchangingInfo)` gets the analogous `their_serial`
+    split so the dormant contest wiring cannot inherit the bug), with the rungs above renumbered.
+    `ladder_rank` is deliberately untouched — the manual regression predicate depends on both
+    `SendingReport` shapes comparing equal there — and a repeated report (`Some -> Some`, the
+    "the DX never copied our R" arm) still correctly reads as no progress.
+  - *Finding 2 — credit the NEW offset when an operator nudge moved a pre-existing split.*
+    Round 5's decode-frequency check is evidence only on a Tx=Rx QSO. On a QSO that already
+    carried a `partner_freq` the DX transmits there no matter where we key, so its reply cannot
+    discriminate our vacated offset from our new one, and the round-5 correction therefore fell
+    back to crediting the vacated offset unconditionally. That is right for a STALL-triggered
+    switch — it only fires because the old offset demonstrably stopped working, and the frame
+    that triggered it went out on that offset a slot before the commit — and wrong for an
+    OPERATOR-forced `u` nudge, which indicts nothing and after which our very next frame goes
+    out on the new offset. Provenance is now carried rather than inferred:
+    `OffsetRelocationOrigin` (`StallDetected { raised_at_generation }` | `OperatorForced`)
+    replaces the bare `Option<u32>` on `OffsetActionRequest` and in `apply_tx_offset_switch`'s
+    signature, and `QsoMetadata::pre_switch_offset` becomes a `PreSwitchOffset { offset_hz,
+    left_at, operator_forced }`. The Tx=Rx path is unchanged.
+  - *Finding 3 — generate candidates across the configured Hound window.* A `[hound]` response
+    region above the allocator's own 200–2800 Hz range (2850–2900 Hz, say) was only ever a
+    FILTER over candidates already generated from that range, so it emptied both the ranked
+    spectral list and the legacy fallback scan: the allocator returned `avoid_hz` unchanged and
+    every post-QSY Hound stall switch or `u` nudge was refused as a no-op, with the configured
+    region never searched. Both scans now take their bounds from one shared
+    `frequency::sweep_bounds`, which WIDENS the sweep to cover the supplied window and never
+    narrows it, with the grid still anchored at the configured floor — so every offset the old
+    sweep produced is still produced and an in-range window ranks exactly as before. Ceiling
+    reconciled at the same time: `[hound]` validation capped at 3000 Hz, admitting a
+    (2900, 3000] region that no relocation could ever land in (`apply_tx_offset_switch` clamps
+    to `ACTIVE_QSO_TX_OFFSET_MAX_HZ` = 2900 and its region guard then refuses its own clamped
+    value) and that `hound_offset_for`'s QSY would write into `metadata.frequency` with no clamp
+    at all. The bound is now 200–2900 Hz, the real transmittable envelope.
+  - *Finding 4 — score a switch against the QSO's own TX parity.* The drain passed `None` for
+    `target_parity`, so `rank_candidates_with_parity` took its slot-blind scoring path even
+    though the QSO's `metadata.tx_parity` is latched at creation and every frame it emits goes
+    out on it. Slot-blind, a frequency quiet only in the OPPOSITE (listening) slot can outrank
+    one genuinely clear in the slot we will actually key in, so adaptive recovery could move a
+    colliding QSO straight into another collision. The `get_qso` snapshot the Hound-region and
+    revert-occupancy checks already take carries the authoritative parity; it now feeds both the
+    ordinary `Switch` resolution and the occupied-target `Revert` fallback. Parity only weights
+    scoring — it never filters a candidate out — so the search can never fail more often, and a
+    QSO with no latched parity degrades to exactly the previous behaviour.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 

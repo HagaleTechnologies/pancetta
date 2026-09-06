@@ -54,6 +54,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arrives after a move credits whichever offset it actually came back on — so a
   hand-forced `u` nudge that immediately works is no longer "reverted" away
   moments later.
+  Final pass: the DX's first signal report now counts as forward progress (it
+  could previously be mistaken for a stall and the QSO moved away just as the DX
+  answered), an operator-forced nudge on a split QSO credits the offset it moved
+  TO rather than the one it left, a Hound response region above 2800 Hz is now
+  actually searched instead of silently refusing every move, and a switch is
+  scored against the slot the QSO really transmits in rather than slot-blind.
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
