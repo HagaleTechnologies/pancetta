@@ -1026,6 +1026,7 @@ pub struct ApplicationCoordinator {
     /// except that one (established QSO, no pre-switch offset, or grace
     /// expired), so `compute_narrow_filter_bins_default_dual(primary, None,
     /// ..)` behaves byte-identically to the old single-frequency form.
+    #[allow(clippy::type_complexity)]
     active_qso_freq_hz: std::sync::Arc<std::sync::RwLock<Option<(f64, Option<f64>)>>>,
 
     /// hb-062 FP filter: applied between decode merge and broadcast in the

@@ -15396,7 +15396,10 @@ mod pan72_stall_detection_tests {
     #[test]
     fn the_default_pre_switch_offset_grace_is_unchanged() {
         let manager = QsoManager::new(test_config());
-        assert_eq!(manager.pre_switch_offset_grace(), Duration::milliseconds(30_000));
+        assert_eq!(
+            manager.pre_switch_offset_grace(),
+            Duration::milliseconds(30_000)
+        );
     }
 
     /// Injecting the coordinator's `active_slot_ns` atomic (FT4's 7.5 s in ns)

@@ -3011,33 +3011,34 @@ impl super::ApplicationCoordinator {
                                     // still-in-grace vacated offset of an
                                     // unanswered `CallingCq` relocation — see
                                     // `secondary_decoder_hint_freq_for`.
-                                    let decoder_hint_pair: Option<(f64, Option<f64>)> =
-                                        if new_state.is_active() {
-                                            // Fetch the QSO's current progress
-                                            // once. This is a cheap read-lock
-                                            // on the already-updated QSO map;
-                                            // it fires once per state-change
-                                            // (not per decode window). On
-                                            // error (QSO vanished between the
-                                            // event and the lookup — extremely
-                                            // rare) we fall back to the
-                                            // state's own TX frequency and no
-                                            // secondary.
-                                            let progress =
-                                                snapshot_qso_manager.get_qso(qso_id).await.ok();
-                                            let partner =
-                                                progress.as_ref().and_then(|p| p.metadata.partner_freq);
-                                            let primary = partner.or_else(|| new_state.frequency());
-                                            let secondary = progress.as_ref().and_then(|p| {
-                                                secondary_decoder_hint_freq_for(
-                                                    p,
-                                                    qso_freq_slot_ns.load(Ordering::Relaxed),
-                                                )
-                                            });
-                                            primary.map(|p| (p, secondary))
-                                        } else {
-                                            None
-                                        };
+                                    let decoder_hint_pair: Option<(f64, Option<f64>)> = if new_state
+                                        .is_active()
+                                    {
+                                        // Fetch the QSO's current progress
+                                        // once. This is a cheap read-lock
+                                        // on the already-updated QSO map;
+                                        // it fires once per state-change
+                                        // (not per decode window). On
+                                        // error (QSO vanished between the
+                                        // event and the lookup — extremely
+                                        // rare) we fall back to the
+                                        // state's own TX frequency and no
+                                        // secondary.
+                                        let progress =
+                                            snapshot_qso_manager.get_qso(qso_id).await.ok();
+                                        let partner =
+                                            progress.as_ref().and_then(|p| p.metadata.partner_freq);
+                                        let primary = partner.or_else(|| new_state.frequency());
+                                        let secondary = progress.as_ref().and_then(|p| {
+                                            secondary_decoder_hint_freq_for(
+                                                p,
+                                                qso_freq_slot_ns.load(Ordering::Relaxed),
+                                            )
+                                        });
+                                        primary.map(|p| (p, secondary))
+                                    } else {
+                                        None
+                                    };
                                     // Acquire the guard synchronously (no await
                                     // in this scope) and write.
                                     if let Ok(mut guard) = qso_freq_state.write() {

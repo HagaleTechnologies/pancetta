@@ -1801,9 +1801,14 @@ impl super::ApplicationCoordinator {
                                     let mut lo = center.saturating_sub(SCOPED_HALF_WIDTH);
                                     let mut hi = center.saturating_add(SCOPED_HALF_WIDTH);
                                     if let Some(secondary_hz) = secondary_freq_hz {
-                                        let secondary_center = (secondary_hz / 6.25).round() as usize;
-                                        lo = lo.min(secondary_center.saturating_sub(SCOPED_HALF_WIDTH));
-                                        hi = hi.max(secondary_center.saturating_add(SCOPED_HALF_WIDTH));
+                                        let secondary_center =
+                                            (secondary_hz / 6.25).round() as usize;
+                                        lo = lo.min(
+                                            secondary_center.saturating_sub(SCOPED_HALF_WIDTH),
+                                        );
+                                        hi = hi.max(
+                                            secondary_center.saturating_add(SCOPED_HALF_WIDTH),
+                                        );
                                     }
                                     let scoped_call_start = Instant::now();
                                     let (messages, report) = decoder
@@ -1969,7 +1974,8 @@ impl super::ApplicationCoordinator {
                         let qso_freq_pair: Option<(f64, Option<f64>)> =
                             active_qso_freq_hz.read().ok().and_then(|g| *g);
                         let partner_freq_for_main = qso_freq_pair.map(|(primary, _)| primary);
-                        let secondary_freq_for_main = qso_freq_pair.and_then(|(_, secondary)| secondary);
+                        let secondary_freq_for_main =
+                            qso_freq_pair.and_then(|(_, secondary)| secondary);
                         let narrow_filter_bins =
                             super::qso_filter::compute_narrow_filter_bins_default_dual(
                                 partner_freq_for_main,

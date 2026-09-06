@@ -3067,8 +3067,7 @@ fn resolve_nudge_tx_offset(
     });
     if let Some(key) = target {
         if let Ok(qso_id) = key.parse::<pancetta_qso::QsoId>() {
-            let is_auto_calling_cq =
-                auto_calling_cq_ids.is_some_and(|ids| ids.contains(&qso_id));
+            let is_auto_calling_cq = auto_calling_cq_ids.is_some_and(|ids| ids.contains(&qso_id));
             if !is_auto_calling_cq {
                 let current = active_tx_offsets
                     .read()

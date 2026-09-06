@@ -358,8 +358,8 @@ mod tests {
         // center = round(1900/6.25) = 304, half_bins = 10 -> 294..=314.
         // Union must span the low end of the primary through the high end
         // of the secondary.
-        let dual = compute_narrow_filter_bins_dual(Some(1500.0), Some(1900.0), 60.0, 6.25, false)
-            .unwrap();
+        let dual =
+            compute_narrow_filter_bins_dual(Some(1500.0), Some(1900.0), 60.0, 6.25, false).unwrap();
         assert_eq!(*dual.start(), 230);
         assert_eq!(*dual.end(), 314);
     }
@@ -370,8 +370,8 @@ mod tests {
         // inclusive range spanning both (the caller narrows the decoder to
         // one contiguous band, not two disjoint ones) but must not include
         // anything closer than each side's own window.
-        let dual = compute_narrow_filter_bins_dual(Some(500.0), Some(3000.0), 60.0, 6.25, false)
-            .unwrap();
+        let dual =
+            compute_narrow_filter_bins_dual(Some(500.0), Some(3000.0), 60.0, 6.25, false).unwrap();
         let expected_low = partner_freq_to_bin_range(500.0, 6.25, 60.0).unwrap();
         let expected_high = partner_freq_to_bin_range(3000.0, 6.25, 60.0).unwrap();
         assert_eq!(*dual.start(), *expected_low.start());
