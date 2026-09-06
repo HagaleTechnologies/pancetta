@@ -2617,8 +2617,7 @@ impl CoalesceOutcome {
 /// `fox_max_streams + 1` (the `+1` for Fox's independent CQ stream, which
 /// occupies a slot alongside — not carved out of — the Hound-answer count;
 /// see `maybe_answer_caller`'s "Capacity bound" comment in `coordinator/qso.rs`)
-/// whenever Fox mode is active, and additionally floored at the number of
-/// QSOs ALREADY legitimately active (`active_tx_qsos`).
+/// whenever Fox mode is active.
 ///
 /// Both `fox_mode` and `fox_max_streams` are live `Atomic`s the operator/
 /// engine can flip at runtime, so this must be recomputed per cycle rather
@@ -2627,49 +2626,36 @@ impl CoalesceOutcome {
 /// limit would truncate its own intended multi-stream Hound-answer bundle
 /// down to one signal.
 ///
-/// The active-count floor (PR #348 review round 4, Codex P1) closes a
-/// distinct gap: `SetFoxMode(false)` only cancels the `CallingCq` QSO
-/// (`coordinator/qso.rs`'s Fox-disengage handling) — active Hound (caller-
-/// answer) QSOs are left running. Without this floor, the cap drops back to
-/// the normal ceiling (typically 1) the instant Fox mode disengages, and
-/// their next same-parity backlog cycle truncates every Hound but one, even
-/// though nothing asked those exchanges to end. This cap's actual job is to
-/// restrict ADMITTING a NEW stream beyond the configured/Fox limit — it must
-/// never evict a stream that's already legitimately active. Fails open
-/// (floors at the `MAX_RETAINED_TX_STREAMS` hard backstop, not 0) on a
-/// poisoned `active_tx_qsos` lock, matching this file's other reads of it
-/// (`tx_qso_is_live`) — the failure mode of "briefly don't truncate anything"
-/// is far safer here than "wrongly truncate active QSOs because the count
-/// couldn't be read."
+/// PR #348 review round 4 (Codex P1) proposed additionally flooring this at
+/// `active_tx_qsos.len()`, to protect active Hound exchanges left running
+/// after `SetFoxMode(false)` (which only cancels the `CallingCq` QSO —
+/// `coordinator/qso.rs`'s Fox-disengage handling). Round 5 review found that
+/// floor defeats the cap entirely for ordinary manual QSOs: `StartQso`
+/// inserts a QSO into `active_tx_qsos` before its first `TransmitRequest` is
+/// even coalesced, so simply opening `max_concurrent_qsos + N` manual QSOs
+/// in quick succession would raise `active_count` to admit all of them —
+/// exactly the pileup this cap exists to prevent. The floor was reverted;
+/// the Fox-disengage gap is tracked separately (a real fix needs `qso.rs` to
+/// distinguish Fox-admitted QSOs from ordinary ones, e.g. by explicitly
+/// tearing them down on disengage or tracking them in a dedicated set — not
+/// something `active_tx_qsos`'s undifferentiated membership can answer).
 fn effective_max_concurrent_qsos(
     max_concurrent_qsos: u32,
     fox_mode: &std::sync::atomic::AtomicBool,
     fox_max_streams: &std::sync::atomic::AtomicUsize,
-    active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
 ) -> u32 {
-    let base = if fox_mode.load(Ordering::Relaxed) {
+    if fox_mode.load(Ordering::Relaxed) {
         let fox_total = fox_max_streams.load(Ordering::Relaxed) as u32 + 1;
         max_concurrent_qsos.max(fox_total)
     } else {
         max_concurrent_qsos
-    };
-    let active_count = match active_tx_qsos.read() {
-        Ok(set) => set.len() as u32,
-        Err(_) => MAX_RETAINED_TX_STREAMS as u32,
-    };
-    base.max(active_count)
+    }
 }
 
 #[cfg(test)]
 mod effective_max_concurrent_qsos_tests {
     use super::*;
-    use std::collections::HashSet;
     use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use std::sync::{Arc, RwLock};
-
-    fn active_set(ids: &[&str]) -> Arc<RwLock<HashSet<String>>> {
-        Arc::new(RwLock::new(ids.iter().map(|s| s.to_string()).collect()))
-    }
 
     /// PR #348 review (Codex P1): Fox mode admits up to `fox.max_streams`
     /// Hound-answer QSOs plus its own independent CQ stream. Passing only
@@ -2680,9 +2666,8 @@ mod effective_max_concurrent_qsos_tests {
     fn fox_mode_raises_the_cap_above_the_normal_configured_value() {
         let fox_mode = AtomicBool::new(true);
         let fox_max_streams = AtomicUsize::new(5);
-        let active = active_set(&[]);
         assert_eq!(
-            effective_max_concurrent_qsos(1, &fox_mode, &fox_max_streams, &active),
+            effective_max_concurrent_qsos(1, &fox_mode, &fox_max_streams),
             6,
             "Fox mode must raise the cap to fox_max_streams (Hounds) + 1 (its own CQ stream)"
         );
@@ -2692,9 +2677,8 @@ mod effective_max_concurrent_qsos_tests {
     fn non_fox_mode_is_unaffected() {
         let fox_mode = AtomicBool::new(false);
         let fox_max_streams = AtomicUsize::new(5);
-        let active = active_set(&[]);
         assert_eq!(
-            effective_max_concurrent_qsos(2, &fox_mode, &fox_max_streams, &active),
+            effective_max_concurrent_qsos(2, &fox_mode, &fox_max_streams),
             2,
             "outside Fox mode the cap must be exactly the configured max_concurrent_qsos"
         );
@@ -2704,66 +2688,10 @@ mod effective_max_concurrent_qsos_tests {
     fn fox_mode_never_lowers_a_higher_configured_value() {
         let fox_mode = AtomicBool::new(true);
         let fox_max_streams = AtomicUsize::new(2);
-        let active = active_set(&[]);
         assert_eq!(
-            effective_max_concurrent_qsos(10, &fox_mode, &fox_max_streams, &active),
+            effective_max_concurrent_qsos(10, &fox_mode, &fox_max_streams),
             10,
             "Fox mode raises the cap, it must never lower an already-higher configured value"
-        );
-    }
-
-    /// PR #348 review round 4 (Codex P1): `SetFoxMode(false)` only cancels
-    /// the `CallingCq` QSO — active Hound QSOs are left running, but the cap
-    /// drops back to the normal ceiling immediately. The cap must never fall
-    /// below the count of QSOs already legitimately active.
-    #[test]
-    fn floors_at_the_currently_active_qso_count_even_outside_fox_mode() {
-        let fox_mode = AtomicBool::new(false);
-        let fox_max_streams = AtomicUsize::new(5);
-        // Fox mode just disengaged (fox_mode=false), but 3 Hound QSOs from
-        // before are still active.
-        let active = active_set(&["qso-a", "qso-b", "qso-c"]);
-        assert_eq!(
-            effective_max_concurrent_qsos(1, &fox_mode, &fox_max_streams, &active),
-            3,
-            "the cap must not drop below the 3 still-active Hound QSOs just because Fox mode \
-             disengaged"
-        );
-    }
-
-    #[test]
-    fn active_count_floor_never_lowers_a_higher_cap() {
-        let fox_mode = AtomicBool::new(false);
-        let fox_max_streams = AtomicUsize::new(5);
-        let active = active_set(&["qso-a"]);
-        assert_eq!(
-            effective_max_concurrent_qsos(4, &fox_mode, &fox_max_streams, &active),
-            4,
-            "1 active QSO must not lower an already-higher configured cap of 4"
-        );
-    }
-
-    /// Fails open (assume the hard backstop, not 0) on a poisoned lock,
-    /// matching this file's other reads of `active_tx_qsos` (`tx_qso_is_live`)
-    /// — briefly not truncating anything is far safer than wrongly
-    /// truncating active QSOs because the count couldn't be read.
-    #[test]
-    fn poisoned_active_set_lock_fails_open_to_the_hard_backstop() {
-        let fox_mode = AtomicBool::new(false);
-        let fox_max_streams = AtomicUsize::new(5);
-        let active = active_set(&[]);
-        {
-            let active_clone = active.clone();
-            let _ = std::thread::spawn(move || {
-                let _guard = active_clone.write().unwrap();
-                panic!("deliberately poison the lock");
-            })
-            .join();
-        }
-        assert_eq!(
-            effective_max_concurrent_qsos(1, &fox_mode, &fox_max_streams, &active),
-            MAX_RETAINED_TX_STREAMS as u32,
-            "a poisoned active-set lock must fail open to the hard backstop, not 0"
         );
     }
 }
@@ -4122,7 +4050,6 @@ impl super::ApplicationCoordinator {
                                         max_concurrent_qsos,
                                         &fox_mode,
                                         &fox_max_streams,
-                                        &active_tx_qsos,
                                     ),
                                 )
                                 .await;
@@ -5067,7 +4994,6 @@ impl super::ApplicationCoordinator {
                                                         max_concurrent_qsos,
                                                         &fox_mode,
                                                         &fox_max_streams,
-                                                        &active_tx_qsos,
                                                     ),
                                                     origin,
                                                     &in_flight_items,
@@ -5387,7 +5313,6 @@ impl super::ApplicationCoordinator {
                                                         max_concurrent_qsos,
                                                         &fox_mode,
                                                         &fox_max_streams,
-                                                        &active_tx_qsos,
                                                     ),
                                                     origin,
                                                     &in_flight_items,
@@ -6961,7 +6886,6 @@ impl super::ApplicationCoordinator {
                                                     max_concurrent_qsos,
                                                     &fox_mode,
                                                     &fox_max_streams,
-                                                    &active_tx_qsos,
                                                 ),
                                             )
                                             .await;
@@ -7080,7 +7004,6 @@ impl super::ApplicationCoordinator {
                                                     max_concurrent_qsos,
                                                     &fox_mode,
                                                     &fox_max_streams,
-                                                    &active_tx_qsos,
                                                 ),
                                             )
                                             .await;
