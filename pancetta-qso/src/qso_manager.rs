@@ -215,6 +215,36 @@ const FREQ_TOLERANCE_HZ: f64 = 15.0;
 /// [`FREQ_TOLERANCE_HZ`] for the shared-definition rationale (PAN-15 item 6).
 const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
 
+/// How long the offset a QSO just moved away from
+/// ([`crate::states::QsoMetadata::pre_switch_offset`]) stays a valid RX
+/// baseline, and stays the offset a forward advance is credited to.
+///
+/// PAN-72 (Codex round 4 on PR #350, finding 3). Two FT8 slots. The frame that
+/// TRIGGERS a relocation is emitted on the old offset by the very
+/// [`QsoManager::rearm_manual_calls_at`] pass that trips the stall threshold,
+/// and the coordinator's once-per-slot drain commits the move only afterwards —
+/// so the last pre-switch transmission is at most one slot old when the QSO
+/// changes offset, its answer occupies the next slot, and that answer is
+/// decoded and processed by the end of it. Two slots covers exactly that
+/// round trip. It deliberately stops short of the ~3 slots it would take for an
+/// answer to our first POST-switch transmission to arrive, so the two can never
+/// be confused for one another.
+const PRE_SWITCH_OFFSET_GRACE: chrono::Duration = chrono::Duration::seconds(30);
+
+/// The offset this QSO moved away from, if it did so recently enough for a
+/// reply to the last frame we sent there to still be arriving — see
+/// [`PRE_SWITCH_OFFSET_GRACE`] and
+/// [`crate::states::QsoMetadata::pre_switch_offset`].
+fn live_pre_switch_offset_at(
+    metadata: &crate::states::QsoMetadata,
+    now: DateTime<Utc>,
+) -> Option<f64> {
+    metadata
+        .pre_switch_offset
+        .filter(|(_, left_at)| now.signed_duration_since(*left_at) <= PRE_SWITCH_OFFSET_GRACE)
+        .map(|(hz, _)| hz)
+}
+
 /// FIX B (one-QSO-per-(callsign,band) close idempotency,
 /// docs/qso-tx-deep-review-2026-07-18.md): how long after a manual QSO
 /// COMPLETES a subsequent close-step (`Rr73`/`SeventyThree`) reply for the
@@ -1303,6 +1333,7 @@ impl QsoManager {
             stall_cycles: 0,
             last_known_good_offset_hz: None,
             advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -1438,6 +1469,7 @@ impl QsoManager {
             stall_cycles: 0,
             last_known_good_offset_hz: None,
             advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -1833,6 +1865,7 @@ impl QsoManager {
             stall_cycles: 0,
             last_known_good_offset_hz: None,
             advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             // When our TX offset != the DX's RX offset (Hold mode / de-conflict),
             // the caller supplies `partner_freq = Some(dx_freq)` so the relevance
@@ -2193,6 +2226,7 @@ impl QsoManager {
             stall_cycles: 0,
             last_known_good_offset_hz: None,
             advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             // When our TX offset != the DX's RX offset (Hold mode / de-conflict),
             // the caller supplies `partner_freq = Some(dx_freq)` so the relevance
@@ -3000,6 +3034,17 @@ impl QsoManager {
         progress.metadata.frequency = applied_hz;
         progress.metadata.pending_freq_drift = None;
         progress.metadata.stall_cycles = 0;
+        // PAN-72 (Codex round 4 on PR #350, finding 3): remember the offset we
+        // are vacating, and when. The frame that triggered this move went out
+        // on it — `rearm_manual_calls_at` re-sends and trips the stall
+        // threshold in the same pass, and this commit only happens on the
+        // coordinator's next drain — so any answer to that frame arrives at
+        // `old_off` AFTER this mutation. For `PRE_SWITCH_OFFSET_GRACE` the
+        // vacated offset therefore stays a valid RX baseline
+        // (`is_message_relevant`) and stays the offset a forward advance
+        // credits as known-good (`process_message_for_qso`). See
+        // `QsoMetadata::pre_switch_offset`.
+        progress.metadata.pre_switch_offset = Some((old_off, Utc::now()));
         // Mirror the Hound QSY block's state write (see `process_message_for_
         // qso`'s `QsoState::SendingReport` fix-up): several transitions —
         // `Completed` above all — are built from the PRECEDING state's own
@@ -3500,7 +3545,25 @@ impl QsoManager {
         if let Some(progress) = qsos.get_mut(&qso_id) {
             if dx_frame_advanced {
                 progress.metadata.stall_cycles = 0;
-                progress.metadata.last_known_good_offset_hz = Some(progress.metadata.frequency);
+                // PAN-72 (Codex round 4 on PR #350, finding 3): credit the
+                // offset the DX actually heard us on. A relocation is committed
+                // AFTER the frame that triggered it has gone out on the old
+                // offset, so an advance arriving inside
+                // `PRE_SWITCH_OFFSET_GRACE` of that move is answering the
+                // PRE-switch transmission — the new offset has not been
+                // transmitted on even once. Crediting it would record an
+                // unproven offset as known-good and poison the Revert target: a
+                // later stall would "revert" to the offset it is already on
+                // (refused as a no-op) and the genuinely proven one is lost.
+                //
+                // Consumed here either way: the first advance after a switch is
+                // the one that resolves the ambiguity, and everything after it
+                // is unambiguously about the current offset.
+                progress.metadata.last_known_good_offset_hz = Some(
+                    live_pre_switch_offset_at(&progress.metadata, message.timestamp)
+                        .unwrap_or(progress.metadata.frequency),
+                );
+                progress.metadata.pre_switch_offset = None;
                 // PAN-72 (Codex round 1 on PR #350, finding 8): bump the
                 // staleness token in lockstep with the two fields above, so a
                 // TX-offset action queued BEFORE this advance is recognized as
@@ -4812,6 +4875,9 @@ impl QsoManager {
         // close enough to be entangled with this QSO.  Otherwise ordinary
         // traffic elsewhere in the passband would be classified against every
         // active QSO.
+        // Mirrors `is_message_relevant`'s gate exactly, including the
+        // recently-vacated-offset baseline (PAN-72, round 4, finding 3) — the
+        // two must agree on what counts as "entangled with this QSO".
         let within_frequency_gate = state.frequency().is_none_or(|qso_frequency| {
             let match_frequency = metadata.partner_freq.unwrap_or(qso_frequency);
             let tolerance = if state.their_callsign().is_some() {
@@ -4819,7 +4885,9 @@ impl QsoManager {
             } else {
                 FREQ_TOLERANCE_HZ
             };
-            (match_frequency - frequency).abs() <= tolerance
+            let matches_baseline = |baseline: f64| (baseline - frequency).abs() <= tolerance;
+            matches_baseline(match_frequency)
+                || live_pre_switch_offset_at(metadata, Utc::now()).is_some_and(matches_baseline)
         });
         if !within_frequency_gate {
             return Relevance {
@@ -5068,6 +5136,18 @@ impl QsoManager {
         // Match incoming frames against where we hear the DX (`partner_freq`),
         // not our TX offset. When it is `None`, `unwrap_or(qso_freq)` preserves
         // the ordinary Tx=Rx path byte-for-byte.
+        //
+        // PAN-72 (Codex round 4 on PR #350, finding 3): an offset we moved away
+        // from moments ago is a SECOND valid baseline for the length of
+        // `PRE_SWITCH_OFFSET_GRACE`. The frame that triggered the relocation was
+        // transmitted there, so its answer necessarily arrives after the move —
+        // and for an unanswered `CallingCq`, where `partner_freq` is
+        // deliberately `None` and the gate is only 15 Hz wide, judging that
+        // answer against the new offset rejects it outright and
+        // `maybe_answer_caller` spawns a duplicate QSO in its place. The window
+        // is bounded in time, uses the SAME tolerance, and is on top of (never
+        // instead of) the current baseline; the callsign/state match above still
+        // gates who may use it.
         if let Some(qso_freq) = state.frequency() {
             let match_freq = metadata.partner_freq.unwrap_or(qso_freq);
             let tolerance = if state.their_callsign().is_some() {
@@ -5075,7 +5155,10 @@ impl QsoManager {
             } else {
                 FREQ_TOLERANCE_HZ
             };
-            if (match_freq - frequency).abs() > tolerance {
+            let matches_baseline = |baseline: f64| (baseline - frequency).abs() <= tolerance;
+            if !matches_baseline(match_freq)
+                && !live_pre_switch_offset_at(metadata, Utc::now()).is_some_and(matches_baseline)
+            {
                 return false;
             }
         }
@@ -9796,6 +9879,7 @@ mod tests {
                 stall_cycles: 0,
                 last_known_good_offset_hz: None,
                 advance_generation: 0,
+                pre_switch_offset: None,
                 hound: false,
                 partner_freq: None,
                 pending_freq_drift: None,
@@ -10344,6 +10428,7 @@ mod sender_verification_tests {
             stall_cycles: 0,
             last_known_good_offset_hz: None,
             advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -15508,6 +15593,207 @@ mod pan72_stall_detection_tests {
              not spawn a duplicate QSO"
         );
     }
+
+    /// PAN-72 (Codex round 4 on PR #350, finding 3): the resend that CROSSES
+    /// the stall threshold goes out on the PRE-switch offset — the same
+    /// `rearm_manual_calls_at` pass emits it and raises the action — and the
+    /// coordinator's once-per-slot drain then moves the QSO. A caller who
+    /// answers that transmission is answering the offset we have just left.
+    ///
+    /// For an unanswered manual CQ that is fatal: `CallingCq` now carries the
+    /// NEW offset, round 1's fix deliberately leaves `partner_freq` `None`
+    /// (there is no DX at the abandoned offset to point the RX gates at), and
+    /// the pre-establishment gate is only 15 Hz wide — so the answer is
+    /// rejected outright and `maybe_answer_caller` spawns a duplicate QSO in
+    /// its place.
+    ///
+    /// This drives the real sequence rather than the pieces: rearm to the
+    /// threshold, commit the switch the threshold raised, then deliver the
+    /// caller's answer at the offset the triggering resend actually used.
+    #[tokio::test]
+    async fn a_caller_answering_the_pre_switch_resend_still_routes_to_the_cq() {
+        const CALLER: &str = "W9XYZ";
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // Two silent rearm cycles. The SECOND one both re-emits our CQ at FREQ
+        // (the frame a caller can answer) and trips the stall threshold.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .await;
+        let events = drain(&mut rx);
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                QsoEvent::MessageToSend { frequency, .. } if (*frequency - FREQ).abs() < f64::EPSILON
+            )),
+            "precondition: the threshold-crossing rearm re-sends our CQ on the \
+             PRE-switch offset, {events:?}"
+        );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                QsoEvent::TxOffsetActionNeeded {
+                    action: OffsetAction::Switch { avoid_hz },
+                    ..
+                } if (*avoid_hz - FREQ).abs() < f64::EPSILON
+            )),
+            "precondition: the same pass raises the Switch, {events:?}"
+        );
+
+        // The coordinator's drain commits the switch a moment later.
+        let new_offset = FREQ + 400.0;
+        assert_eq!(
+            manager
+                .apply_tx_offset_switch(qso_id, new_offset, None)
+                .await
+                .unwrap(),
+            new_offset
+        );
+
+        // ...and only now does the caller who heard our PRE-switch CQ answer,
+        // on the offset that CQ actually went out on.
+        let answer = MessageType::CqResponse {
+            calling_station: OUR.into(),
+            responding_station: CALLER.into(),
+            grid: Some("FN31".into()),
+        };
+        assert_eq!(
+            manager.find_qsos_for_message(&answer, FREQ).await,
+            vec![qso_id],
+            "an answer to the frame we transmitted on the pre-switch offset \
+             must still route to this CQ, not be gated away into a duplicate QSO"
+        );
+
+        // And it must actually advance the QSO, not merely route.
+        manager
+            .process_message(answer, format!("{OUR} {CALLER} FN31"), FREQ, Some(-12.0))
+            .await
+            .unwrap();
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.state.their_callsign(),
+            Some(CALLER),
+            "the pre-switch answer must establish the QSO, got {:?}",
+            after.state
+        );
+    }
+
+    /// The pre-switch RX baseline is a bounded grace, not a permanent second
+    /// window: once `PRE_SWITCH_OFFSET_GRACE` lapses, an answer at the
+    /// abandoned offset is judged against the current offset again — otherwise
+    /// the QSO would keep accepting traffic at a frequency it no longer uses.
+    #[tokio::test]
+    async fn the_pre_switch_rx_baseline_lapses_with_its_grace() {
+        const CALLER: &str = "W9XYZ";
+
+        let manager = manager_auto(test_config());
+        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let new_offset = FREQ + 400.0;
+        manager
+            .apply_tx_offset_switch(qso_id, new_offset, None)
+            .await
+            .unwrap();
+
+        let mut progress = manager.get_qso(qso_id).await.unwrap();
+        let answer = MessageType::CqResponse {
+            calling_station: OUR.into(),
+            responding_station: CALLER.into(),
+            grid: Some("FN31".into()),
+        };
+        assert!(
+            manager.is_message_relevant(&progress.state, &progress.metadata, &answer, FREQ, false),
+            "precondition: inside the grace the vacated offset is still accepted"
+        );
+
+        progress.metadata.pre_switch_offset = Some((
+            FREQ,
+            Utc::now() - PRE_SWITCH_OFFSET_GRACE - Duration::seconds(1),
+        ));
+        assert!(
+            !manager.is_message_relevant(&progress.state, &progress.metadata, &answer, FREQ, false),
+            "a lapsed pre-switch baseline must stop accepting traffic at the \
+             abandoned offset"
+        );
+        assert!(
+            manager.is_message_relevant(
+                &progress.state,
+                &progress.metadata,
+                &answer,
+                new_offset,
+                false
+            ),
+            "the current offset must keep matching regardless"
+        );
+    }
+
+    /// The other half of round 4, finding 3: an ESTABLISHED QSO's reply to the
+    /// pre-switch frame does route (the switch latches `partner_freq` to the
+    /// vacated offset), but the advance it drives must NOT record the brand-new
+    /// offset — which has never been transmitted on — as `last_known_good`.
+    /// Doing so poisons the Revert target: a later stall would "revert" to the
+    /// offset it is already on, and the genuinely-proven one is lost.
+    #[tokio::test]
+    async fn an_advance_answering_the_pre_switch_frame_credits_the_old_offset() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // Stall out on FREQ; the threshold-crossing rearm re-sends there.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .await;
+        let new_offset = FREQ + 400.0;
+        manager
+            .apply_tx_offset_switch(qso_id, new_offset, None)
+            .await
+            .unwrap();
+
+        // The DX answers the pre-switch frame — still transmitting where it
+        // always was, which the switch latched as `partner_freq`.
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, new_offset,
+            "precondition: the QSO is on the post-switch offset"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(FREQ),
+            "the DX answered the frame we sent on {FREQ} Hz — that, not the \
+             never-transmitted {new_offset} Hz, is the proven offset"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -15560,6 +15846,7 @@ mod has_active_or_recent_qso_tests {
             stall_cycles: 0,
             last_known_good_offset_hz: None,
             advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -15796,6 +16083,7 @@ mod hound_tests {
             stall_cycles: 0,
             last_known_good_offset_hz: None,
             advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,

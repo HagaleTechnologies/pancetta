@@ -1955,6 +1955,7 @@ mod qso_logged_tests {
             stall_cycles: 0,
             last_known_good_offset_hz: None,
             advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,

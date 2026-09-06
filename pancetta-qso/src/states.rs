@@ -592,6 +592,36 @@ pub struct QsoMetadata {
     #[serde(default)]
     pub pending_freq_drift: Option<(f64, DateTime<Utc>)>,
 
+    /// The TX offset this QSO most recently moved AWAY from, together with the
+    /// instant it left — `None` normally, set by
+    /// `QsoManager::apply_tx_offset_switch` on every committed relocation and
+    /// cleared on the next forward advance (or once the grace below lapses).
+    ///
+    /// PAN-72 (Codex round 4 on PR #350, finding 3). A relocation is decided
+    /// and committed AFTER the frame that triggered it has already been emitted
+    /// on the old offset: `QsoManager::rearm_manual_calls_at` re-sends at
+    /// `metadata.frequency` and trips the stall threshold in the same pass, and
+    /// the coordinator's once-per-slot drain only commits the switch afterwards.
+    /// Whoever answers that transmission answers the offset we have just left,
+    /// and their reply lands after the move. Without this field:
+    ///
+    /// - an unanswered manual CQ rejects the answer outright — `CallingCq` now
+    ///   carries the new offset, [`Self::partner_freq`] is deliberately `None`
+    ///   pre-establishment (there is no DX at the abandoned offset to aim the
+    ///   RX gates at), and the pre-establishment gate is only 15 Hz wide — and
+    ///   `maybe_answer_caller` then spawns a duplicate QSO in its place;
+    /// - an established QSO's reply routes (the switch latches `partner_freq`)
+    ///   but credits [`Self::last_known_good_offset_hz`] to an offset that has
+    ///   never been transmitted on, poisoning the Revert target.
+    ///
+    /// So the vacated offset stays a valid RX baseline, and stays the offset an
+    /// advance is credited to, for `PRE_SWITCH_OFFSET_GRACE` — two FT8 slots,
+    /// long enough for the reply to the last pre-switch frame to be decoded and
+    /// processed, and short enough to lapse before a reply to our first
+    /// POST-switch frame could arrive.
+    #[serde(default)]
+    pub pre_switch_offset: Option<(f64, DateTime<Utc>)>,
+
     /// Hound: whether we have already QSY'd up to the response region after the
     /// Fox answered us (so the QSY fires exactly once).
     #[serde(default)]
