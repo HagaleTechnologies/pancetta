@@ -10,15 +10,17 @@ happens on Mac. Tickets are `PAN-<n>`.
 
 - **pancetta-core** — shared types, error handling. Stable.
 - **pancetta-audio** — real-time audio I/O (cpal + ringbuf).
-- **pancetta-ft8** — FT8 encoder/decoder/modulator/OSD; bit-exact with
-  ft8_lib/WSJT-X. The encoder is feature-gated behind `transmit`. Vendors the
-  upstream C reference decoder as a git submodule at `pancetta-ft8/vendor/ft8_lib`
-  — usually uninitialized, and outside this project's index.
 - **pancetta-dsp** — DSP pipeline (FFT, filtering, resampling).
 - **pancetta-config** — configuration with hot-reload. Production-ready.
+- **pancetta-agent** — remote-TX security: arm gating, session binding.
 
 ## Layer 1 — build on core/ft8
 
+- **pancetta-ft8** — FT8 encoder/decoder/modulator/OSD; bit-exact with
+  ft8_lib/WSJT-X. The encoder is feature-gated behind `transmit`. Vendors the
+  upstream C reference decoder as a git submodule at `pancetta-ft8/vendor/ft8_lib`
+  — usually uninitialized, and outside this project's index. Depends on
+  `pancetta-core`.
 - **pancetta-qso** — QSO management, priority scoring, frequency allocation,
   autonomous operator. The core logic crate.
 - **pancetta-hamlib** — Hamlib CAT control FFI. Bindings done, integration stub.
@@ -27,7 +29,6 @@ happens on Mac. Tickets are `PAN-<n>`.
 - **pancetta-cqdx** — cqdx.io HTTP client, cache, types. cqdx.io is a first-party
   service; custom endpoints can be built for pancetta.
 - **pancetta-tui** — terminal UI; the default UI (`--headless` disables it).
-- **pancetta-agent** — remote-TX security: arm gating, session binding.
 - **pancetta-protocol** — remote-operation wire protocol.
 - **pancetta-research** — local-only decoder-iteration harness. Excluded from CI
   and from `default-members`; never builds in GitHub Actions.
@@ -53,7 +54,8 @@ happens on Mac. Tickets are `PAN-<n>`.
 - **training/neural_osd/**, **scripts/** — this repo's Python: the neural-OSD
   training harness and one-off research batch scripts. Not part of the Rust
   symbol graph; reachable via `search_for_pattern`, not `find_symbol`.
-- **assets/** — binary demo media only (WAV/PNG/GIF/SVG). Excluded from the index.
+- **assets/** — demo media (WAV/PNG/GIF/SVG) plus one README under demo-wav/;
+  no symbols, negligible text value. Excluded from the index.
 
 ## Conventions
 

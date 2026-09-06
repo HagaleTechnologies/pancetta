@@ -9,7 +9,7 @@ sources:
   - .serena/.gitignore
   - pancetta-core/tests/serena_project_config.rs
 verified:
-  commit: 568c2d1
+  commit: 2f676fb
   date: 2026-09-06
 links:
   - overview
@@ -60,8 +60,8 @@ agent session that never touched it.
    (`project_yml_declares_rust` looked for a `languages` key that no longer
    existed). The committed file now already uses the current key names for
    exactly this reason — activating against it produces **zero** diff — and
-   the guard test accepts either key name so a future Serena schema change
-   doesn't retrigger the same break silently.
+   the guard test fails loudly if the legacy `languages:` key reappears, so a
+   revert that would retrigger this rewrite is caught before it lands.
 
 ## Where the invariant lives
 
@@ -69,9 +69,10 @@ agent session that never touched it.
   for the `ignored_paths` rationale and the migration note next to
   `language_servers:`.
 - `pancetta-core/tests/serena_project_config.rs` — the CI-visible guard: file
-  presence, `project_name`, `read_only`, `language_servers`/`languages`,
-  the three load-bearing `ignored_paths` entries, that no `ignored_paths`
-  entry (literal or glob) shadows a workspace member's `src/`, and that
+  presence, `project_name`, `read_only`, `language_servers` (rejecting the
+  legacy `languages` key), the three load-bearing `ignored_paths` entries,
+  that no `ignored_paths` entry (literal or glob) shadows a workspace
+  member's `src/` directory or its `lib.rs`/`main.rs` crate root, and that
   `.serena/memories/codebase_map.md` names every workspace crate.
 - `.serena/.gitignore` — keeps the generated `cache/` and an optional
   machine-local `project.local.yml` override out of git.

@@ -109,6 +109,21 @@ fn parse_flat_yaml(src: &str) -> FlatYaml {
     out
 }
 
+/// Strips a TOML `#` comment from a line, honoring `"..."` quoting so a `#`
+/// inside a quoted string is not mistaken for one. Everything from the first
+/// unquoted `#` onward is dropped.
+fn strip_toml_comment(line: &str) -> &str {
+    let mut in_quotes = false;
+    for (i, c) in line.char_indices() {
+        match c {
+            '"' => in_quotes = !in_quotes,
+            '#' if !in_quotes => return &line[..i],
+            _ => {}
+        }
+    }
+    line
+}
+
 /// Extracts a `key = [ "a", "b", ... ]` TOML array's entries. Used for
 /// `Cargo.toml`'s `members = [...]` block, which is TOML, not the YAML subset
 /// `parse_flat_yaml` understands.
@@ -131,7 +146,15 @@ fn parse_toml_string_array(src: &str, key: &str) -> Vec<String> {
         search_from = abs + marker.len();
     };
     let end = after.find(']').expect("unterminated members array");
-    after[..end]
+    // Strip trailing `# comment`s line-by-line before splitting on commas, so
+    // e.g. `"pancetta-core", # core types` doesn't fold the comment text into
+    // a bogus member entry.
+    let cleaned: String = after[..end]
+        .lines()
+        .map(strip_toml_comment)
+        .collect::<Vec<_>>()
+        .join(",");
+    cleaned
         .split(',')
         .map(|s| s.trim().trim_matches('"').to_string())
         .filter(|s| !s.is_empty())
@@ -208,15 +231,22 @@ fn project_yml_identifies_this_repo_and_stays_navigation_only() {
 #[test]
 fn project_yml_declares_rust() {
     let cfg = parse_flat_yaml(&read(&serena_dir().join("project.yml")));
-    // Accept both the current schema key (`language_servers`) and the legacy
-    // one (`languages`, migrated away from by Serena on activation) so this
-    // guard survives a Serena version that changes which key is current —
-    // see PAN-77 header and .serena/project.yml's own comment on this.
+    // The legacy `languages:` key must not be present: reverting to it keeps
+    // this file loading, but retriggers Serena's in-place migration rewrite
+    // on next activation, which strips every hand-written rationale comment
+    // in the file (wiki/pages/serena-project-config.md trap 4). Prefer
+    // `language_servers:` and fail loudly if the old key creeps back in,
+    // rather than silently accepting either.
+    assert!(
+        !cfg.lists.contains_key("languages"),
+        "legacy `languages:` key is present in .serena/project.yml — this \
+         retriggers Serena's migration rewrite (which strips the file's \
+         rationale comments) on next activation; use `language_servers:` instead"
+    );
     let languages = cfg
         .lists
         .get("language_servers")
-        .or_else(|| cfg.lists.get("languages"))
-        .expect("neither language_servers nor languages key present");
+        .expect("language_servers key missing from .serena/project.yml");
     assert!(
         languages.iter().any(|l| l == "rust"),
         "dropping `rust` from language_servers silently disables symbol search \
@@ -262,10 +292,23 @@ fn no_ignored_path_shadows_a_workspace_member_source_root() {
             repo_root().join(&src).is_dir(),
             "{src} should exist in the checkout"
         );
+        // Every crate has exactly one of these as its crate root file. Probing
+        // a real file path (not just the directory) catches a file-glob entry
+        // like `- "*.rs"` that would de-index every Rust file in the workspace
+        // while still returning false for glob_shadows(pattern, ".../src").
+        let crate_root = ["lib.rs", "main.rs"]
+            .into_iter()
+            .map(|f| format!("{src}/{f}"))
+            .find(|f| repo_root().join(f).is_file())
+            .unwrap_or_else(|| panic!("{src} has neither lib.rs nor main.rs"));
         for pattern in ignored {
             assert!(
                 !glob_shadows(pattern, &src),
                 "ignored_paths entry {pattern:?} shadows workspace source root {src}"
+            );
+            assert!(
+                !glob_shadows(pattern, &crate_root),
+                "ignored_paths entry {pattern:?} shadows workspace source file {crate_root}"
             );
         }
     }

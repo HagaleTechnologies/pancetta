@@ -24,11 +24,12 @@ ignored_paths:
 - ".catalyst"
 # Transient parallel-work checkouts (.gitignore:91), not canonical source.
 - ".worktrees"
-# 3.8 MB of pure binary demo media (WAV/PNG/GIF/SVG) at the repo root. No
-# symbols, no text value. Anchored with a leading slash: a slash-less entry
-# also matches at any depth under gitignore semantics, which would silently
-# de-index pancetta-ft8/assets/neural_osd_weights.provenance.json too — a
-# real text file inside a workspace crate, not root-level demo media.
+# 3.8 MB of demo media (WAV/PNG/GIF/SVG) at the repo root, plus one README
+# under demo-wav/ — no symbols, negligible text value. Anchored with a leading
+# slash: a slash-less entry also matches at any depth under gitignore
+# semantics, which would silently de-index
+# pancetta-ft8/assets/neural_osd_weights.provenance.json too — a real text
+# file inside a workspace crate, not root-level demo media.
 - "/assets"
 # Vendored upstream C reference decoder (git submodule, .gitmodules:1-3; usually
 # uninitialized). Different language, not code contributors edit.
@@ -38,8 +39,8 @@ initial_prompt: |
   pancetta: autonomous FT8 ham radio station in Rust — decode, call, complete
   QSOs, and log, with priority-based station selection, multi-stream TX, and
   cqdx.io integration. 14-crate Cargo workspace, layered: pancetta-core /
-  -audio / -ft8 / -dsp / -config have no internal deps; pancetta-qso / -hamlib /
-  -dx / -cqdx / -tui / -agent / -protocol build on them; the `pancetta` binary
+  -audio / -dsp / -config / -agent have no internal deps; pancetta-ft8 / -qso /
+  -hamlib / -dx / -cqdx / -tui / -protocol build on them; the `pancetta` binary
   (coordinator, message bus, runtime) depends on all. Read AGENTS.md first —
   especially its "Key Invariants" section — then docs/DECISIONS/ (subsystem
   decision digests) and docs/ARCHITECTURE.md before broad exploration;
