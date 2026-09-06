@@ -267,8 +267,14 @@ fn live_pre_switch_offset_at(
 /// vice versa.
 pub const COMPLETED_QSO_REWORK_GRACE: chrono::Duration = chrono::Duration::seconds(45);
 
-/// One transmit slot, in milliseconds, for the station's active operating
-/// mode (PAN-72; Codex round 7 on PR #350, finding 5).
+/// The rearm/stall cadence used when no slot-length source was ever injected:
+/// FT8's historical 15-second transmit slot. See
+/// [`QsoManager::set_active_slot_ns_source`].
+pub const DEFAULT_SLOT_NS: i64 = 15_000_000_000;
+
+/// One transmit slot in milliseconds, converted from the coordinator's
+/// `active_slot_ns` atomic (PAN-72; Codex round 7 on PR #350, finding 5, plus
+/// the round-7 re-review's staleness fix).
 ///
 /// [`QsoManager::rearm_manual_calls_at`] re-emits at most one frame per slot
 /// and — since PAN-72 — counts each such re-send as one silent cycle against
@@ -279,22 +285,22 @@ pub const COMPLETED_QSO_REWORK_GRACE: chrono::Duration = chrono::Duration::secon
 /// took ~60 s (8 real slots) instead of 4, and under FT2 far worse, delaying
 /// adaptive recovery until the ordinary QSO watchdog had already won.
 ///
-/// Values come from `pancetta_ft8::ProtocolParams::{ft8,ft4,ft2}()`'s
-/// `cycle_duration` (15.0 / 7.5 / 3.2 s). They are duplicated as literals
-/// rather than imported because `pancetta-qso` deliberately does not depend on
-/// `pancetta-ft8` outside the optional `sim` feature; the unit test
-/// `slot_millis_match_the_ft8_crates_protocol_params` pins them.
+/// The input is the LIVE slot length the coordinator derives from the active
+/// protocol (`pancetta_ft8::Protocol::slot_ns()`, i.e. `cycle_duration * 1e9`:
+/// FT8 → 15e9, FT4 → 7.5e9, FT2 → 3.2e9) and rewrites on every runtime mode
+/// switch. Deriving it from a per-mode lookup table keyed on the *cloned*
+/// `config.active_mode` string was the bug this replaced: see
+/// [`QsoManager::set_active_slot_ns_source`].
 ///
-/// Anything unrecognized — including the `"FT8"` default — resolves to 15 s,
-/// so **mode=FT8 behavior is byte-identical** (see AGENTS.md's invariant).
-/// Matching is case-insensitive and trims surrounding whitespace, mirroring
-/// `pancetta_config::RigConfig::operating_mode`'s parse.
-pub fn rearm_slot_millis_for_mode(active_mode: &str) -> i64 {
-    match active_mode.trim().to_ascii_uppercase().as_str() {
-        "FT4" => 7_500,
-        "FT2" => 3_200,
-        // "FT8" and anything unrecognized: the historical 15-second slot.
-        _ => 15_000,
+/// A non-positive or sub-millisecond value (never produced in practice) falls
+/// back to [`DEFAULT_SLOT_NS`]'s 15 s rather than to a shorter cadence, so a
+/// bogus atomic can never make the stall detector fire *faster* than FT8.
+pub fn rearm_slot_millis_from_ns(slot_ns: i64) -> i64 {
+    let millis = slot_ns / 1_000_000;
+    if millis <= 0 {
+        DEFAULT_SLOT_NS / 1_000_000
+    } else {
+        millis
     }
 }
 
@@ -1005,6 +1011,28 @@ pub struct QsoManager {
     /// never injects a source keep the pre-existing behavior — the same
     /// convention `tx_policy`'s private `Full` default uses.
     remote_tx_permitted: Arc<dyn Fn() -> bool + Send + Sync>,
+
+    /// Live length of one transmit slot in NANOSECONDS for the station's
+    /// active protocol (FT8 → 15e9, FT4 → 7.5e9, FT2 → 3.2e9), shared from the
+    /// coordinator's `active_slot_ns`.
+    ///
+    /// PAN-72 (PR #350 round-7 re-review). This is an `Arc` atomic and not a
+    /// `config` field for a specific, load-bearing reason:
+    /// [`QsoManager::start`] spawns `timeout_check_loop` — the loop that runs
+    /// the whole rearm/stall cadence — on a `self.clone()`, and [`Clone`]
+    /// copies `config` BY VALUE while every shared knob here is `Arc`-shared.
+    /// The coordinator's Shift+M handler (`QsoMessage::SetOperatingMode` →
+    /// [`QsoManager::set_active_mode`]) mutates only its own task-owned
+    /// binding, so a config-derived cadence never saw a runtime mode switch at
+    /// all: switching INTO FT4/FT2 left stall detection under-firing, and
+    /// switching FT4 → FT8 left the loop stuck on a 7.5 s cadence for a QSO
+    /// that was by then genuinely FT8 — a deviation from FT8's historical
+    /// behavior in violation of AGENTS.md's byte-identity invariant.
+    ///
+    /// Defaults to a private [`DEFAULT_SLOT_NS`] (FT8) atomic, so unit tests
+    /// and any caller that never injects a source keep exactly the historical
+    /// 15 s cadence.
+    active_slot_ns: Arc<std::sync::atomic::AtomicI64>,
 }
 
 /// Outcome of the half-duplex parity-admission check for a *new* QSO.
@@ -1224,6 +1252,9 @@ impl QsoManager {
             // frame reached the air — the pre-existing behavior (see the
             // field's doc comment).
             remote_tx_permitted: Arc::new(|| true),
+            // Default FT8 slot: with no injected source the rearm/stall
+            // cadence is the historical 15 s (see the field's doc comment).
+            active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS)),
         }
     }
 
@@ -1280,6 +1311,33 @@ impl QsoManager {
     /// behaves exactly as before.
     pub fn set_remote_tx_permitted_source(&mut self, source: Arc<dyn Fn() -> bool + Send + Sync>) {
         self.remote_tx_permitted = source;
+    }
+
+    /// Share the coordinator's `active_slot_ns` atomic so the keep-calling
+    /// rearm gate and the `stall_cycles` counter it drives run on the ACTIVE
+    /// protocol's transmit slot (FT8 → 15e9 ns, FT4 → 7.5e9, FT2 → 3.2e9).
+    ///
+    /// PAN-72 (PR #350 round-7 re-review) — see the `active_slot_ns` field's
+    /// doc comment for the staleness bug this closes. Pass the same
+    /// `Arc<AtomicI64>` the coordinator derives at startup from `[rig].mode`
+    /// and rewrites in `try_switch_operating_mode` on every runtime Shift+M
+    /// switch; because it is shared (not copied into `config`), the clone
+    /// [`Self::start`] spawns the rearm loop on observes later switches too.
+    ///
+    /// Must be called BEFORE [`Self::start`], like the other `set_*_source`
+    /// injectors. If never called, the manager keeps its private
+    /// [`DEFAULT_SLOT_NS`] (FT8) atomic and behaves exactly as before.
+    pub fn set_active_slot_ns_source(&mut self, source: Arc<std::sync::atomic::AtomicI64>) {
+        self.active_slot_ns = source;
+    }
+
+    /// One transmit slot in milliseconds for the live active protocol — the
+    /// rearm/stall cadence. See [`rearm_slot_millis_from_ns`].
+    fn rearm_slot_millis(&self) -> i64 {
+        rearm_slot_millis_from_ns(
+            self.active_slot_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
     }
 
     /// Create a new QSO manager with a database for persistent duplicate checking
@@ -6041,10 +6099,16 @@ impl QsoManager {
         // ACTIVE MODE's, not a hardcoded 15 s. FT4 (7.5 s) and FT2 (3.2 s)
         // previously advanced this gate — and with it the `stall_cycles`
         // counter below, which the documented threshold measures in *slots* —
-        // only every other (or every fifth) real slot. `"FT8"` and anything
-        // unrecognized resolve to the historical 15_000 ms, so mode=FT8 stays
-        // byte-identical; see [`rearm_slot_millis_for_mode`].
-        let slot_millis = rearm_slot_millis_for_mode(&self.config.active_mode);
+        // only every other (or every fifth) real slot.
+        //
+        // Round-7 re-review: read the coordinator's LIVE `active_slot_ns`
+        // atomic, never the cloned `config.active_mode` string. This loop runs
+        // on a `start()`-time clone, and `Clone` copies `config` by value, so
+        // a config-derived cadence silently missed every runtime Shift+M
+        // switch in both directions. With no injected source the atomic holds
+        // `DEFAULT_SLOT_NS`, so mode=FT8 stays byte-identical; see
+        // [`QsoManager::set_active_slot_ns_source`].
+        let slot_millis = self.rearm_slot_millis();
 
         // SM-F6: bounded resend cap for AUTONOMOUS QSOs. This is deliberately
         // NOT `manual_call_max_calls` (25 calls, an operator-supervised,
@@ -6697,6 +6761,10 @@ impl Clone for QsoManager {
             tx_freq_mode: Arc::clone(&self.tx_freq_mode),
             tx_policy: Arc::clone(&self.tx_policy),
             remote_tx_permitted: Arc::clone(&self.remote_tx_permitted),
+            // Arc-shared, deliberately: `start()` runs the rearm/stall loop on
+            // this clone and must observe runtime mode switches (see the
+            // field's doc comment).
+            active_slot_ns: Arc::clone(&self.active_slot_ns),
         }
     }
 }
@@ -15171,7 +15239,12 @@ mod pan72_stall_detection_tests {
         let mut config = test_config();
         config.timeouts.qso_stall_switch_after = 2;
         config.active_mode = "FT4".to_string();
-        let manager = manager_auto(config);
+        let mut manager = manager_auto(config);
+        // Round-7 re-review: the cadence comes from the coordinator's shared
+        // `active_slot_ns` atomic, not the `active_mode` string above (which
+        // only stamps `QsoMetadata::mode`). This is FT4's slot in ns.
+        manager
+            .set_active_slot_ns_source(Arc::new(std::sync::atomic::AtomicI64::new(7_500_000_000)));
         let qso_id = manager
             .respond_to_cq_manual(DX.into(), FREQ, None)
             .await
@@ -15242,19 +15315,178 @@ mod pan72_stall_detection_tests {
         );
     }
 
-    /// The per-mode slot table must agree with `pancetta_ft8`'s
-    /// `ProtocolParams::{ft8,ft4,ft2}().cycle_duration` — duplicated as
-    /// literals only because `pancetta-qso` does not depend on that crate.
+    /// The ns → ms conversion must agree with `pancetta_ft8`'s
+    /// `ProtocolParams::{ft8,ft4,ft2}().slot_ns()` (`cycle_duration * 1e9`),
+    /// spelled as literals only because `pancetta-qso` does not depend on that
+    /// crate outside the optional `sim` feature.
     #[test]
     fn slot_millis_match_the_ft8_crates_protocol_params() {
-        assert_eq!(rearm_slot_millis_for_mode("FT8"), 15_000);
-        assert_eq!(rearm_slot_millis_for_mode("FT4"), 7_500);
-        assert_eq!(rearm_slot_millis_for_mode("FT2"), 3_200);
-        // Case-insensitive + trimmed, like the config-side parse.
-        assert_eq!(rearm_slot_millis_for_mode(" ft4 "), 7_500);
-        // Unknown modes fall back to the FT8 slot — never to a shorter one.
-        assert_eq!(rearm_slot_millis_for_mode("JS8"), 15_000);
-        assert_eq!(rearm_slot_millis_for_mode(""), 15_000);
+        assert_eq!(rearm_slot_millis_from_ns(15_000_000_000), 15_000);
+        assert_eq!(rearm_slot_millis_from_ns(7_500_000_000), 7_500);
+        // FT2's 3.2 s: `(3.2f64 * 1e9) as i64` is exactly 3_200_000_000, so
+        // the truncating divide is exact too (no 3_199 ms surprise).
+        assert_eq!(rearm_slot_millis_from_ns(3_200_000_000), 3_200);
+        // Defensive: a nonsensical / sub-millisecond value falls back to the
+        // FT8 slot — never to a shorter one.
+        assert_eq!(rearm_slot_millis_from_ns(0), 15_000);
+        assert_eq!(rearm_slot_millis_from_ns(-1), 15_000);
+        assert_eq!(rearm_slot_millis_from_ns(999_999), 15_000);
+    }
+
+    /// The never-injected default is FT8's 15 s slot, so every existing caller
+    /// (unit tests, the sim harness, any embedder that skips the setter) keeps
+    /// byte-identical FT8 behavior.
+    #[test]
+    fn the_default_slot_source_is_exactly_the_ft8_slot() {
+        let manager = QsoManager::new(test_config());
+        assert_eq!(manager.rearm_slot_millis(), 15_000);
+    }
+
+    /// Injecting the coordinator's `active_slot_ns` atomic (FT4's 7.5 s in ns)
+    /// drives the rearm/stall cadence — and does so WITHOUT touching
+    /// `config.active_mode`, proving the atomic, not the cloned config, is the
+    /// source of truth.
+    #[tokio::test]
+    async fn injected_active_slot_ns_drives_the_rearm_cadence() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        assert_eq!(
+            config.active_mode, "FT8",
+            "precondition: the cloned config still says FT8"
+        );
+        let mut manager = manager_auto(config);
+        manager
+            .set_active_slot_ns_source(Arc::new(std::sync::atomic::AtomicI64::new(7_500_000_000)));
+
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        for slot in 1..=2i64 {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500 * slot))
+                .await;
+        }
+
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2,
+            "the injected FT4 slot atomic must set the cadence even though the \
+             config string still reads FT8"
+        );
+    }
+
+    /// The whole point of using an `Arc` atomic rather than a config field: a
+    /// mode switch that happens AFTER `start()` took its clone is observed by
+    /// the already-running rearm loop, in BOTH directions.
+    #[tokio::test]
+    async fn a_live_slot_change_after_the_clone_is_observed_by_the_rearm_loop() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 4;
+        let mut manager = manager_auto(config);
+        let slot_ns = Arc::new(std::sync::atomic::AtomicI64::new(15_000_000_000));
+        manager.set_active_slot_ns_source(Arc::clone(&slot_ns));
+        // Exactly what `start()` does: the rearm/stall loop runs on a CLONE.
+        let rearm_loop = manager.clone();
+
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // FT8 → FT4 while the loop is already running.
+        slot_ns.store(7_500_000_000, std::sync::atomic::Ordering::Relaxed);
+        rearm_loop
+            .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "the running loop must pick up the live switch INTO FT4"
+        );
+
+        // FT4 → FT8 while the loop is already running: another 7.5 s is now a
+        // sub-slot rearm and must not count.
+        slot_ns.store(15_000_000_000, std::sync::atomic::Ordering::Relaxed);
+        rearm_loop
+            .rearm_manual_calls_at(opened_at + Duration::milliseconds(15_000))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "the running loop must pick up the live switch BACK to FT8"
+        );
+
+        // A full FT8 slot after the last counted call does count again.
+        rearm_loop
+            .rearm_manual_calls_at(opened_at + Duration::milliseconds(22_500))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2
+        );
+    }
+
+    /// PAN-72 (PR #350 round 7 re-review): the REGRESSION the shared atomic
+    /// fixes. `QsoManager::start()` spawns `timeout_check_loop` on a `clone()`,
+    /// and `Clone` copies `config` BY VALUE. The coordinator's Shift+M handler
+    /// (`QsoMessage::SetOperatingMode` → `set_active_mode`) mutates only its
+    /// OWN binding, so a runtime FT4 → FT8 switch left the running rearm loop's
+    /// cloned `config.active_mode` stuck at `"FT4"` and it kept counting stalls
+    /// on a 7.5 s cadence for a QSO that was by then genuinely FT8 — a real
+    /// deviation from FT8's historical behavior (AGENTS.md's byte-identity
+    /// invariant).
+    #[tokio::test]
+    async fn a_runtime_switch_back_to_ft8_restores_the_fifteen_second_cadence() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        config.active_mode = "FT4".to_string();
+        let mut manager = manager_auto(config);
+        // Exactly what `start()` does: the rearm/stall loop runs on a CLONE.
+        let rearm_loop = manager.clone();
+        // Operator presses Shift+M, FT4 → FT8. The coordinator calls this on
+        // its own binding only.
+        manager.set_active_mode("FT8".to_string());
+
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // One FT4 slot after the opening call. Under FT8 (the mode we are now
+        // actually operating) this is a SUB-slot rearm and must not count.
+        rearm_loop
+            .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500))
+            .await;
+
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "after a runtime switch to FT8 the running rearm loop must use the \
+             15 s FT8 slot, not the stale cloned config's 7.5 s FT4 slot"
+        );
     }
 
     /// PAN-72 (Codex round 2 on PR #350, finding 5): while `TxPolicy` is

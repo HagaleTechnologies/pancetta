@@ -2508,6 +2508,18 @@ impl super::ApplicationCoordinator {
         // whose re-send the `TxPolicy::Disabled` hard mute blocked outright —
         // the DX cannot answer a frame that never went on the air.
         qso_manager.set_tx_policy_source(tx_policy.clone());
+        // PAN-72 (PR #350 round-7 re-review): share the LIVE active-slot-length
+        // atomic so the keep-calling rearm gate and the `stall_cycles` counter
+        // it drives run on the active protocol's transmit slot. This must be
+        // the shared `Arc`, not `qso_config.active_mode`: `QsoManager::start()`
+        // runs that loop on a `clone()`, `Clone` copies `config` by value, and
+        // the `SetOperatingMode` handler below only mutates this task's own
+        // binding — so a config-derived cadence never saw a Shift+M switch and
+        // an FT4 → FT8 switch left the loop on a 7.5 s cadence for what was by
+        // then a genuine FT8 QSO. `try_switch_operating_mode` rewrites this
+        // atomic on every switch, so the running loop tracks it in both
+        // directions.
+        qso_manager.set_active_slot_ns_source(self.active_slot_ns());
         // PAN-72 (Codex round 7 on PR #350, finding 3): the policy above is
         // only ONE of the two gates a rearmed frame must clear. A QSO with
         // `remote_origin` emits every frame as `TxOrigin::Remote`, and the TX

@@ -466,13 +466,25 @@ tested.
   - *Finding 5 — count on the active mode's slot cadence.* The rearm gate hardcoded 15 s, which
     is FT8's period alone, while `qso_stall_switch_after` is documented in slots: under FT4
     (7.5 s) a threshold of 4 took ~60 s / 8 real slots, and under FT2 (3.2 s) far worse, often
-    letting the ordinary QSO watchdog win first. `rearm_slot_millis_for_mode` derives the period
-    from `QsoManagerConfig::active_mode` (15_000 / 7_500 / 3_200 ms, matching
-    `pancetta_ft8::ProtocolParams`'s `cycle_duration`; duplicated as literals because
-    `pancetta-qso` does not depend on `pancetta-ft8` outside the `sim` feature, and pinned by a
-    unit test), and the gate moved to millisecond resolution so 7.5 s is expressible. `"FT8"` and
-    anything unrecognized resolve to 15_000 ms, and the comparison is arithmetically identical to
-    the old `num_seconds() < 15`, so mode=FT8 stays byte-identical.
+    letting the ordinary QSO watchdog win first. The gate moved to millisecond resolution so
+    7.5 s is expressible, and `rearm_slot_millis_from_ns` converts the period from the
+    coordinator's **shared** `active_slot_ns` atomic (FT8 → 15e9 ns, FT4 → 7.5e9, FT2 → 3.2e9,
+    derived from `pancetta_ft8::Protocol::slot_ns()`), injected via
+    `QsoManager::set_active_slot_ns_source` and defaulting to FT8's 15 s so every unwired caller
+    stays byte-identical. The comparison is arithmetically identical to the old
+    `num_seconds() < 15` under FT8.
+
+    *Round-7 re-review correction.* The first cut keyed a 15_000 / 7_500 / 3_200 lookup table off
+    `QsoManagerConfig::active_mode`. That is stale by construction: `QsoManager::start()` spawns
+    `timeout_check_loop` on a `self.clone()`, `Clone` copies `config` BY VALUE (every other shared
+    knob is an `Arc`), and `set_active_mode` — the coordinator's `SetOperatingMode`/Shift+M
+    handler — mutates only its own task-owned binding. So a runtime switch INTO FT4/FT2 never
+    retuned the cadence, and a switch FT4 → FT8 left the running loop on the 7.5 s cadence for a
+    QSO that was by then genuinely FT8 — a real deviation from FT8's historical behavior, i.e. an
+    AGENTS.md byte-identity violation in that sequence. The shared atomic is the fix and makes the
+    lookup table redundant: it is already the authoritative live slot length (it also correctly
+    reports 15 s for a `mode=FT2` config on a build without the `ft2` feature, where the decoder
+    really is running FT8 timing — the table said 3.2 s there).
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 
