@@ -49,6 +49,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   keeps accepting replies (and stays the offset credited as "known good") for
   two slots, so the caller who answers the very transmission that triggered the
   move is no longer rejected — or answered with a duplicate QSO.
+  Last pass: a frame already queued for transmission now follows the QSO to its
+  new offset instead of going out on the one it just left, and an answer that
+  arrives after a move credits whichever offset it actually came back on — so a
+  hand-forced `u` nudge that immediately works is no longer "reverted" away
+  moments later.
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 

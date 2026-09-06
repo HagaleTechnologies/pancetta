@@ -325,6 +325,36 @@ tested.
     accepted RX baseline in `is_message_relevant`/`classify_relevance`, at the same tolerance
     and on top of (never instead of) the current one, and it is the offset a forward advance
     credits as known-good. Consumed on the first advance after a switch.
+- **Amended by Codex round 5 on PR #350.** Two refinements to round 4's `pre_switch_offset`
+  mechanism, both about a relocation that is NOT a stall-triggered one:
+  - *Finding 1 — a deferred frame pivots when only its offset changed.*
+    `coordinator::tx_pivot_target` — the "freshest `MessageToSend` at key-time" check the TX
+    worker's Step 4c and `pivot_bundle_items` both run — compared only `message_text`, so a
+    frame that advanced by MOVING rather than by re-rendering was invisible to it. A switch
+    relocates the QSO without changing what the frame says, so the next rearm publishes the same
+    text at the new `applied_hz`; an older request for that QSO still in the worker's (up to
+    ~30 s) pre-PTT wait therefore got `None` back and keyed on the offset the switch existed to
+    leave. Round 4's receive-side grace does not help here — it makes a reply to the stale
+    offset ROUTE, it does not make the transmitted frame fresh — and the exposure outlives the
+    triggering-resend window, since any later post-switch rearm hits it once a new-frequency
+    intent exists. `frequency_offset` now joins `message_text` in the comparison (matching
+    `is_pivot_duplicate`'s tombstone identity and `classify_incoming_during_tx`'s duplicate
+    check, PAN-73 rounds 3 and 6), with a `PIVOT_OFFSET_EPSILON_HZ` (0.5 Hz) guard so f64
+    round-tripping cannot report an unchanged re-send as a pivot.
+  - *Finding 2 — credit the offset the advancing reply actually decoded at.* Round 4's crediting
+    rule checked only the clock, so any advance inside `PRE_SWITCH_OFFSET_GRACE` recorded the
+    VACATED offset. Sound for a stall-triggered switch (its trigger IS the old-offset resend),
+    but an operator-forced `u` nudge has no such coupling: it can land on a QSO about to
+    transmit, the next rearm goes out on the NEW offset, and the answer to that lands well
+    inside the same 30 s window — crediting an offset that had just demonstrably failed, and
+    aiming a later `Revert` straight back at it. The reply's decode frequency is the evidence
+    that separates the two: the vacated offset is credited only when `message.frequency`
+    matches that baseline under the SAME tolerance the relevance gate admitted the frame with
+    (captured from the PRE-transition state so a callsign latched by this very advance cannot
+    widen it retroactively); anything else — the new offset, or a `partner_freq` split matching
+    neither — credits the current offset. Overlapping baselines (a move smaller than the
+    tolerance) still resolve to the vacated one, which has the proven history. The grace is
+    consumed either way, as before.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 
