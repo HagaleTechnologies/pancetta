@@ -759,7 +759,12 @@ pub struct QsoManager {
     /// Defaults to a private `Full` atomic so unit tests and any caller that
     /// never injects a source keep the pre-existing behavior (TX assumed
     /// live). `Full` and `RespondOnly` both `allows_any_tx()`; only `Disabled`
-    /// suppresses the count, matching exactly what the hard mute blocks.
+    /// suppresses the count. This covers the operator-visible mute only —
+    /// `tx_hard_mute_reason`'s other causes (e.g. `restart_inhibit` during a
+    /// Hamlib supervisor restart, which AGENTS.md documents as spanning
+    /// multiple slots) are not visible to `QsoManager` today and can still
+    /// let a muted cycle count as a stall. Narrower than "the hard mute" as a
+    /// whole; PAN follow-up filed to thread the full predicate through.
     tx_policy: Arc<std::sync::atomic::AtomicU8>,
 }
 

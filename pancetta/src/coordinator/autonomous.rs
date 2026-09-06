@@ -1625,10 +1625,18 @@ impl super::ApplicationCoordinator {
                             // CQ-nudge forward, the waterfall/spot/decode
                             // refreshes and the placement snapshot all read
                             // operator state the drain never touches. The
-                            // placement instrument below is now computed
-                            // AFTER the decisions it is supposed to
-                            // visualize, which is the other half of the
-                            // finding.
+                            // placement instrument below now shares this
+                            // tick's fresh spectral/decode inputs with the
+                            // drain -- but its own-frequency overlay
+                            // (`own_frequencies()`) is only refreshed by
+                            // `set_own_frequencies` further below, so a
+                            // switch this same drain just committed isn't
+                            // reflected in the instrument until NEXT tick.
+                            // Closing that fully would need the drain's
+                            // `active_tx_offsets` mirror synced before the
+                            // snapshot too, ahead of `set_own_frequencies`'s
+                            // own ordering constraint above -- out of scope
+                            // for this finding, left as-is.
                             //
                             // Re-borrow the watch channel FRESH every tick
                             // (not a captured clone) so a Qso-only
