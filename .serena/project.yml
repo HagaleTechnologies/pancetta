@@ -62,9 +62,12 @@ ignored_memory_patterns: []
 ls_specific_settings: {}
 ls_additional_workspace_folders: []
 # Workspace folders indexed for symbol search; "." covers the whole repo. Set
-# explicitly (rather than left absent) because an absent key is what
-# triggered Serena's one-time schema migration that stripped this file's
-# rationale comments on first activation — see PAN-77 header above.
+# explicitly, matching what Serena's schema migration adds automatically when
+# it rewrites a config still using the legacy `languages:` /
+# `additional_workspace_folders:` keys (see `language_servers:` below) — that
+# migration is what strips this file's rationale comments on first
+# activation, not an absent key here. See PAN-77 header above and
+# wiki/pages/serena-project-config.md trap 4.
 ls_workspace_folders:
 - .
 # No pre-activation shell setup needed for a pure-Rust workspace; left unset.

@@ -49,6 +49,32 @@ fn read(path: &Path) -> String {
         .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()))
 }
 
+/// Recursively collects every `mod.rs` under `dir`, returned as slash-joined
+/// paths relative to `repo_root()`. `crate_root` (lib.rs/main.rs) only probes
+/// the crate's top level, so it stays blind to an `ignored_paths` entry like
+/// `- "mod.rs"` that would silently de-index every legacy module root nested
+/// deeper in the tree; this lets the shadow guard probe those too.
+fn find_mod_rs_files(dir: &Path) -> Vec<String> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return out;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            out.extend(find_mod_rs_files(&path));
+        } else if path.file_name().and_then(|f| f.to_str()) == Some("mod.rs") {
+            let relative = path
+                .strip_prefix(repo_root())
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .replace('\\', "/");
+            out.push(relative);
+        }
+    }
+    out
+}
+
 fn unquote(value: &str) -> String {
     value.trim().trim_matches(['\'', '"']).to_string()
 }
@@ -333,6 +359,14 @@ fn no_ignored_path_shadows_a_workspace_member_source_root() {
                 "ignored_paths entry {pattern:?} shadows workspace source file {crate_root}"
             );
         }
+        for mod_rs in find_mod_rs_files(&repo_root().join(&src)) {
+            for pattern in ignored {
+                assert!(
+                    !glob_shadows(pattern, &mod_rs),
+                    "ignored_paths entry {pattern:?} shadows workspace source file {mod_rs}"
+                );
+            }
+        }
     }
 }
 
@@ -353,8 +387,23 @@ fn glob_shadows_treats_trailing_slash_as_any_depth_directory_match() {
 #[test]
 fn serena_ignore_wiring_keeps_cache_and_local_override_out_of_git() {
     let nested = read(&serena_dir().join(".gitignore"));
-    assert!(nested.contains("/cache"), "{nested}");
-    assert!(nested.contains("/project.local.yml"), "{nested}");
+    // Line-wise, not a raw substring search: `nested.contains("/cache")` would
+    // also pass for a commented-out `# /cache` or a negated `!/cache`, either
+    // of which would let the generated cache directory back into git while
+    // this guard stayed green.
+    let active_lines: Vec<&str> = nested
+        .lines()
+        .map(strip_comment)
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('!'))
+        .collect();
+    for required in ["/cache", "/project.local.yml"] {
+        assert!(
+            active_lines.contains(&required),
+            "{required} must be an active (non-commented, non-negated) entry in \
+             .serena/.gitignore; got lines {active_lines:?}"
+        );
+    }
 }
 
 #[test]
@@ -381,24 +430,15 @@ fn codebase_map_names_every_workspace_crate() {
         "workspace member count changed; got {members:?}"
     );
     for crate_name in &members {
+        // Match the map's own bullet shape rather than a bare word: `pancetta`
+        // is itself a substring of the title line ("# pancetta — codebase
+        // map") and of other crates' prose, so a whole-word search alone
+        // would report `pancetta` as "named" even with its own bullet deleted.
+        let bullet = format!("- **{crate_name}** —");
         assert!(
-            contains_whole_word(&map, crate_name),
-            "codebase_map.md does not mention crate {crate_name} — a new crate was \
+            map.contains(&bullet),
+            "codebase_map.md has no {bullet:?} bullet — a new crate was \
              added without updating the orientation memory"
         );
     }
-}
-
-/// Whole-word substring search: a plain `str::contains` would let a crate
-/// whose name is a prefix of another (e.g. `pancetta` inside `pancetta-core`)
-/// pass without ever being mentioned on its own.
-fn contains_whole_word(haystack: &str, needle: &str) -> bool {
-    let is_word_byte = |b: u8| (b as char).is_alphanumeric() || b == b'-' || b == b'_';
-    let bytes = haystack.as_bytes();
-    haystack.match_indices(needle).any(|(idx, matched)| {
-        let before_ok = idx == 0 || !is_word_byte(bytes[idx - 1]);
-        let end = idx + matched.len();
-        let after_ok = end == bytes.len() || !is_word_byte(bytes[end]);
-        before_ok && after_ok
-    })
 }
