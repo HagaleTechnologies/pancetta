@@ -537,7 +537,10 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// skipped, not propagated — a request for a QSO that has since completed,
 /// gone terminal or been superseded by a DX advance is an expected race
 /// (`QsoManagerError::is_expected_offset_action_refusal`, logged at `debug!`),
-/// not this task's problem to recover from.
+/// not this task's problem to recover from. `OffsetActionNoOp` — the allocator
+/// found no candidate at all, so the QSO stays put with its stall evidence
+/// intact (PAN-79 / round 3, finding 2) — is expected too, but gets its own
+/// arm: `info!`, and the unchanged offset is still reserved for the batch.
 ///
 /// **Hold is re-read here, per request** (Codex round 1 on PR #350, finding
 /// 6). A stall or `u` nudge can be queued while the mode is Auto and the
@@ -790,6 +793,30 @@ async fn drain_pending_qso_offset_requests(
                         *slot = applied_hz;
                     }
                 }
+            }
+            Err(pancetta_qso::QsoManagerError::OffsetActionNoOp { offset_hz, .. }) => {
+                // PAN-79 / round 3, finding 2: every candidate was excluded, so
+                // the allocator handed back the QSO's own offset and
+                // `apply_tx_offset_switch` refused it rather than committing a
+                // phantom move (which would have cleared the QSO's accumulated
+                // stall evidence). Nothing to mirror — the QSO never left the
+                // offset `active_tx_offsets` already records for it — but that
+                // offset IS still occupied, so it is reserved for the rest of
+                // the batch exactly as a committed one would be.
+                //
+                // Deliberately not requeued: with the same inputs the next
+                // drain would resolve identically, so a retry loop would spin
+                // forever. The stall detector re-raises on its own once the
+                // streak rebuilds (and, thanks to the refusal above, from the
+                // evidence it had already accumulated rather than from zero),
+                // and the operator's `u` is always available.
+                reserved_hz.push(offset_hz);
+                info!(
+                    target: "tx.freq",
+                    qso_id = %qso_id,
+                    offset_hz,
+                    "PAN-72: no relocation available — QSO stays on its current offset"
+                );
             }
             Err(err) if err.is_expected_offset_action_refusal() => {
                 // The QSO completed, went terminal, or advanced between the
@@ -4032,6 +4059,105 @@ mod drain_pending_qso_offset_requests_tests {
                 .frequency,
             1200.0,
             "a free revert target must still be applied exactly"
+        );
+    }
+
+    /// PAN-79 / PAN-72 (Codex round 3 on PR #350, finding 2): when every
+    /// candidate is excluded the allocator hands back `avoid_hz` unchanged, and
+    /// the drain must not let that land as a successful move.
+    ///
+    /// Nothing relocates, so the QSO's accumulated stall evidence has to
+    /// survive — otherwise an operator `u` nudge over a partial streak silently
+    /// costs the QSO another full `qso_stall_switch_after` window before
+    /// automatic recovery retries. The offset it never left is still occupied,
+    /// so the batch keeps reserving it.
+    #[tokio::test]
+    async fn a_no_op_resolution_preserves_the_stall_evidence() {
+        // An operator whose exclusion separation is impossible to honor, so
+        // every candidate is filtered out and the allocator returns avoid_hz.
+        let mut op = {
+            #[allow(clippy::field_reassign_with_default)]
+            let mut config = pancetta_qso::AutonomousConfig::default();
+            config.enabled = true;
+            config.frequency.min_separation_hz = 10_000.0;
+            let mut op =
+                pancetta_qso::AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+            op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+                pancetta_core::TxFreqMode::Auto.as_u8(),
+            )));
+            op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
+                power_bins: vec![0.0f32; 140],
+                freq_min_hz: 200.0,
+                freq_max_hz: 2800.0,
+            });
+            op
+        };
+        let qso_manager = manager();
+        // A manual answer (not `start_cq`): `rearm_manual_calls_at` re-sends —
+        // and therefore counts a silent cycle against — a `RespondingToCq` QSO,
+        // which is the shape a real stall streak accumulates on.
+        let qso_id = qso_manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
+            .await
+            .unwrap();
+
+        // Accumulate a partial (below-threshold) stall streak — the state an
+        // operator `u` nudge lands on top of.
+        let opened_at = qso_manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .expect("start_cq records the first call");
+        for i in 1..=2i64 {
+            qso_manager
+                .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(15 * i))
+                .await;
+        }
+        let streak = qso_manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .stall_cycles;
+        assert!(
+            streak > 0,
+            "test premise: the QSO must carry real stall evidence to lose"
+        );
+
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 1500.0)]));
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+        ]);
+
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+        )
+        .await;
+
+        let after = qso_manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, 1500.0,
+            "nothing relocated, so the QSO stays exactly where it was"
+        );
+        assert_eq!(
+            after.metadata.stall_cycles, streak,
+            "a no-op relocation must not clear the accumulated stall evidence"
+        );
+        assert_eq!(
+            active_tx_offsets.read().unwrap().get(&key),
+            Some(&1500.0),
+            "the mirror keeps the offset the QSO never left"
         );
     }
 

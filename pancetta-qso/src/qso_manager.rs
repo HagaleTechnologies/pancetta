@@ -44,6 +44,17 @@ pub const ACTIVE_QSO_TX_OFFSET_MIN_HZ: f64 = 200.0;
 /// Upper bound of [`ACTIVE_QSO_TX_OFFSET_MIN_HZ`]'s band. See its doc comment.
 pub const ACTIVE_QSO_TX_OFFSET_MAX_HZ: f64 = 2900.0;
 
+/// Below this much movement (Hz), an "offset switch" relocates nothing.
+///
+/// The pre-existing float-noise tolerance
+/// [`QsoManager::apply_tx_offset_switch`]'s `partner_freq` latch already used
+/// (borrowed in turn from `compute_manual_tx_offset`'s `tx_off != dx_freq`
+/// test), promoted to a named constant so the no-op REFUSAL added for PAN-79 /
+/// PAN-72 round 3 and that latch can never disagree about what counts as a
+/// real move. Well below the allocator's `min_separation_hz` (75 Hz default),
+/// so it can never reject a genuine relocation.
+const TX_OFFSET_NOOP_TOLERANCE_HZ: f64 = 1.0;
+
 /// Hound calling region (low): Hounds call the Fox in 300–900 Hz.
 const HOUND_CALL_MIN_HZ: f64 = 300.0;
 const HOUND_CALL_MAX_HZ: f64 = 900.0;
@@ -306,19 +317,34 @@ pub enum QsoManagerError {
         raised_at: u32,
         current: u32,
     },
+
+    /// PAN-79 / PAN-72 (Codex round 3 on PR #350, finding 2): the resolved
+    /// offset is the one the QSO is already on, so there is nothing to
+    /// relocate. The allocator returns `avoid_hz` unchanged when every
+    /// candidate is excluded (its documented "no valid relocation" signal) and
+    /// the drain passes that straight through; committing it as a move would
+    /// clear valid accumulated `stall_cycles` evidence and announce a
+    /// `TxOffsetApplied` for a move that never happened. Expected, not a fault.
+    #[error(
+        "TX-offset action for QSO {qso_id} resolves to its current offset \
+         ({offset_hz:.0} Hz) — nothing to relocate"
+    )]
+    OffsetActionNoOp { qso_id: QsoId, offset_hz: f64 },
 }
 
 impl QsoManagerError {
     /// PAN-72: is this an *expected* refusal of a queued TX-offset action
     /// (the QSO finished, or advanced, between the action being raised and
-    /// the once-per-slot drain committing it) rather than a real fault? The
-    /// coordinator's drain logs these at `debug!` instead of `warn!`.
+    /// the once-per-slot drain committing it, or the allocator found no
+    /// candidate to relocate to at all) rather than a real fault? The
+    /// coordinator's drain logs these at `debug!`/`info!` instead of `warn!`.
     pub fn is_expected_offset_action_refusal(&self) -> bool {
         matches!(
             self,
             QsoManagerError::QsoNotFound { .. }
                 | QsoManagerError::QsoNotActive { .. }
                 | QsoManagerError::OffsetActionStale { .. }
+                | QsoManagerError::OffsetActionNoOp { .. }
         )
     }
 }
@@ -2786,9 +2812,10 @@ impl QsoManager {
     /// coordinator can mirror it into its own `active_tx_offsets` snapshot
     /// without re-deriving the clamp.
     ///
-    /// Two staleness guards run BEFORE anything is mutated, both because the
-    /// coordinator only drains its request mailbox once per 15-second slot,
-    /// so a lot can happen between an action being raised and committed:
+    /// Three guards run BEFORE anything is mutated. The first two are staleness
+    /// guards, both because the coordinator only drains its request mailbox
+    /// once per 15-second slot, so a lot can happen between an action being
+    /// raised and committed; the third rejects a move that isn't one:
     ///
     /// 1. **Terminal QSO** (Codex round 1 on PR #350, finding 3). Completed
     ///    entries are retained in the map, and completion deliberately keeps
@@ -2807,8 +2834,18 @@ impl QsoManager {
     ///    move us off the offset that just demonstrably worked. Pass `None`
     ///    for an operator-forced nudge, which is current by construction and
     ///    must never be discarded this way.
+    /// 3. **No-op relocation** (PAN-79; Codex round 3, finding 2). The
+    ///    allocator's "no valid relocation exists" signal is `avoid_hz`
+    ///    returned unchanged, which reaches this method as a requested offset
+    ///    equal (within [`TX_OFFSET_NOOP_TOLERANCE_HZ`]) to the QSO's current
+    ///    one. Nothing relocates, so nothing may be committed: clearing
+    ///    `stall_cycles` here would throw away valid accumulated stall evidence
+    ///    — the operator's `u` nudge over a partial streak is the live case —
+    ///    and push automatic recovery out by another full
+    ///    `qso_stall_switch_after` window, while `TxOffsetApplied` would
+    ///    announce a move that never happened.
     ///
-    /// Both refusals are expected races, not faults — see
+    /// All three refusals are expected outcomes, not faults — see
     /// [`QsoManagerError::is_expected_offset_action_refusal`].
     pub async fn apply_tx_offset_switch(
         &self,
@@ -2836,6 +2873,21 @@ impl QsoManager {
             }
         }
         let old_off = progress.metadata.frequency;
+        // 3. **Nothing to relocate** (PAN-79; Codex round 3 on PR #350, finding
+        //    2). The allocator returns `avoid_hz` unchanged when every
+        //    candidate is excluded, and the drain passes that straight here, so
+        //    a "switch" can resolve back onto the offset the QSO is already on.
+        //    Committing it would clear `stall_cycles` — valid evidence, and on
+        //    an operator `u` nudge over a partial streak the ONLY evidence, so
+        //    automatic recovery would be pushed out by another full
+        //    `qso_stall_switch_after` window — and emit a `TxOffsetApplied`
+        //    announcing a move that never happened. Refuse before mutating.
+        if (applied_hz - old_off).abs() <= TX_OFFSET_NOOP_TOLERANCE_HZ {
+            return Err(QsoManagerError::OffsetActionNoOp {
+                qso_id,
+                offset_hz: old_off,
+            });
+        }
         progress.metadata.frequency = applied_hz;
         progress.metadata.pending_freq_drift = None;
         progress.metadata.stall_cycles = 0;
@@ -2857,8 +2909,10 @@ impl QsoManager {
         // the DX while `metadata.frequency`/the state frequency track our new
         // TX offset — the same bookkeeping `compute_manual_tx_offset` performs
         // for the analogous case (`partner = (tx_off != dx_freq).then_some(
-        // dx_freq)`), and it borrows that site's 1.0 Hz float-noise tolerance
-        // so a no-op switch never manufactures a split. Without it the DX's
+        // dx_freq)`), and it borrows that site's float-noise tolerance
+        // ([`TX_OFFSET_NOOP_TOLERANCE_HZ`]) so a no-op switch never manufactures
+        // a split — belt and braces now that guard 3 above refuses such a
+        // switch outright. Without it the DX's
         // real replies fall outside `ESTABLISHED_FREQ_TOLERANCE_HZ` of our new
         // offset and stop routing to this QSO altogether, and the drift gate
         // then reads the DX's unchanged frequency as a confirmed drift and
@@ -2882,7 +2936,7 @@ impl QsoManager {
         // and spawning a duplicate QSO object in its place.
         if progress.metadata.partner_freq.is_none()
             && progress.state.their_callsign().is_some()
-            && (applied_hz - old_off).abs() > 1.0
+            && (applied_hz - old_off).abs() > TX_OFFSET_NOOP_TOLERANCE_HZ
         {
             progress.metadata.partner_freq = Some(old_off);
         }
@@ -14836,6 +14890,95 @@ mod pan72_stall_detection_tests {
         assert_eq!(forced, FREQ + 500.0);
     }
 
+    /// PAN-79 / PAN-72 (Codex round 3 on PR #350, finding 2): a resolution that
+    /// lands back on the QSO's CURRENT offset relocated nothing, so it must not
+    /// be committed as a successful move.
+    ///
+    /// The allocator returns `avoid_hz` unchanged when every candidate is
+    /// excluded — its documented "no valid relocation" signal — and the drain
+    /// hands that straight to this method. Treating it as a success cleared
+    /// `stall_cycles`, destroying valid accumulated stall evidence (an operator
+    /// `u` nudge on a QSO with a partial streak is the live case), delaying the
+    /// automatic recovery by another full `qso_stall_switch_after` window, and
+    /// emitting a `TxOffsetApplied` that claims a move that never happened.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_refuses_a_no_op_and_keeps_the_stall_evidence() {
+        let manager = manager_auto(test_config());
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        // A partial (below-threshold) stall streak, exactly what an operator
+        // `u` nudge lands on top of.
+        {
+            let mut qsos = manager.qsos.write().await;
+            qsos.get_mut(&qso_id).unwrap().metadata.stall_cycles = 3;
+        }
+        let _ = drain(&mut rx);
+
+        let err = manager
+            .apply_tx_offset_switch(qso_id, FREQ, None)
+            .await
+            .expect_err("a resolution equal to the current offset relocates nothing");
+        assert!(
+            matches!(
+                err,
+                QsoManagerError::OffsetActionNoOp { qso_id: id, offset_hz }
+                    if id == qso_id && offset_hz == FREQ
+            ),
+            "expected OffsetActionNoOp, got {err:?}"
+        );
+        assert!(
+            err.is_expected_offset_action_refusal(),
+            "an exhausted candidate space is an expected outcome, not a fault — \
+             the drain must log+skip it, not warn"
+        );
+        assert!(
+            !matches!(
+                err,
+                QsoManagerError::QsoNotActive { .. } | QsoManagerError::OffsetActionStale { .. }
+            ),
+            "a no-op must stay distinguishable from the staleness refusals"
+        );
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.stall_cycles, 3,
+            "the accumulated stall evidence must survive a no-op relocation, or \
+             automatic recovery is delayed by another full threshold"
+        );
+        assert_eq!(after.metadata.frequency, FREQ);
+        assert_eq!(
+            after.metadata.partner_freq, None,
+            "a no-op must not manufacture a Tx/Rx split"
+        );
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::TxOffsetApplied { .. })),
+            "a no-op must not announce a move that never happened, got {events:?}"
+        );
+
+        // A float-noise-sized "move" is the same no-op (the 1.0 Hz tolerance
+        // this method already uses for its partner_freq latch)...
+        let err = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 0.5, None)
+            .await
+            .expect_err("a sub-Hz move is still a no-op");
+        assert!(matches!(err, QsoManagerError::OffsetActionNoOp { .. }));
+
+        // ...while a real relocation still commits, and clears the streak.
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, None)
+            .await
+            .expect("a real move must still commit");
+        assert_eq!(applied, FREQ + 400.0);
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(after.metadata.stall_cycles, 0);
+    }
+
     /// In the default Hold mode, `stall_cycles` may still tick (cheap
     /// tracking) but `TxOffsetActionNeeded` must never be emitted, no matter
     /// how many silent rearm cycles elapse.
@@ -15026,6 +15169,11 @@ mod pan72_stall_detection_tests {
     /// must not manufacture a `partner_freq` — the QSO is still plainly Tx=Rx,
     /// and inventing a split would change nothing but add a field the drift
     /// gate then treats as a deliberate divergence.
+    ///
+    /// Since PAN-79 / round 3 finding 2 such a switch is refused outright
+    /// (`OffsetActionNoOp`) rather than committed as a mutation-free success,
+    /// which subsumes this guarantee — asserted here as well so the
+    /// partner_freq contract stays pinned at its own level.
     #[tokio::test]
     async fn no_op_switch_leaves_partner_freq_none() {
         let manager = manager_auto(test_config());
@@ -15034,10 +15182,11 @@ mod pan72_stall_detection_tests {
             .await
             .unwrap();
 
-        manager
+        let err = manager
             .apply_tx_offset_switch(qso_id, FREQ, None)
             .await
-            .unwrap();
+            .expect_err("a no-op switch is refused, not committed");
+        assert!(matches!(err, QsoManagerError::OffsetActionNoOp { .. }));
 
         let after = manager.get_qso(qso_id).await.unwrap();
         assert_eq!(
