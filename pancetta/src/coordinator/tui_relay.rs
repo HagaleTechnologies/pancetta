@@ -851,11 +851,19 @@ impl super::ApplicationCoordinator {
         // Autonomous task via `apply_tx_offset_switch`, same as a stall-
         // detected switch; `pending_cq_offset_nudge` is drained into
         // `AutonomousOperator::request_manual_switch` for the CQ-hunting
-        // fallback when no QSO is active) — this relay never holds a
-        // `QsoManager` handle of its own, matching the established
-        // AbortQso/ResendQso pattern of forwarding rather than mutating
-        // QsoManager directly from this task.
+        // fallback when no QSO is active) — this relay never MUTATES
+        // `QsoManager` itself, matching the established AbortQso/ResendQso
+        // pattern of forwarding rather than mutating QsoManager directly from
+        // this task.
+        //
+        // Round 2 finding 4 does add a READ-ONLY handle (via the same
+        // restart-safe watch channel the Autonomous task's drain re-borrows
+        // every tick) purely to ask which QSOs are genuinely non-terminal:
+        // `active_tx_qsos` alone cannot answer that, since it retains a
+        // completed QSO for its 45s trailing-73 grace window. Commits still
+        // happen only in the Autonomous drain.
         let cmd_active_tx_offsets = self.active_tx_offsets.clone();
+        let cmd_qso_manager_watch = self.qso_manager_watch.subscribe();
         let cmd_pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
         let cmd_pending_cq_offset_nudge = self.pending_cq_offset_nudge.clone();
         let cmd_ft8_config = self.ft8_config.clone();
@@ -1880,9 +1888,34 @@ impl super::ApplicationCoordinator {
                                 .read()
                                 .map(|s| s.clone())
                                 .unwrap_or_default();
+                            // Round 2 finding 4: `active` still contains a
+                            // completed QSO for its 45s trailing-73 grace
+                            // window, so it cannot be trusted to answer
+                            // "is there a QSO to nudge?". Ask the QSO
+                            // engine itself. Clone the handle out of the
+                            // watch `Ref` and drop it BEFORE the `.await`
+                            // (same reason as the autonomous drain's own
+                            // borrow), and re-borrow fresh each press so a
+                            // Qso-component restart is picked up. `None`
+                            // (component not up) preserves the pre-filter
+                            // behavior -- see `resolve_nudge_tx_offset`.
+                            let live_qso_ids = {
+                                let manager = cmd_qso_manager_watch.borrow().clone();
+                                match manager {
+                                    Some(m) => Some(
+                                        m.get_active_qsos()
+                                            .await
+                                            .into_iter()
+                                            .map(|(id, _)| id)
+                                            .collect::<std::collections::HashSet<_>>(),
+                                    ),
+                                    None => None,
+                                }
+                            };
                             let switched = resolve_nudge_tx_offset(
                                 &cmd_tx_freq_mode,
                                 &active,
+                                live_qso_ids.as_ref(),
                                 &cmd_active_tx_offsets,
                                 &cmd_pending_qso_offset_requests,
                                 &cmd_pending_cq_offset_nudge,
@@ -2937,10 +2970,32 @@ fn map_recent_qso_outcome(
 /// additionally stops such a request being lost when that cycle arrives with
 /// thin decode history.)
 ///
+/// Terminal-QSO filtering (Codex round 2 on PR #350, finding 4): `active` is
+/// the coordinator's `active_tx_qsos` snapshot, which deliberately RETAINS a
+/// completed QSO for 45 seconds so its trailing 73 can still transmit. Picking
+/// out of it blind means the `u` key can name a QSO that is already terminal —
+/// either the only entry, or one chosen ahead of a genuinely live concurrent
+/// QSO — and the operator is told "Nudging active QSO" while the drain's
+/// `apply_tx_offset_switch` later refuses it with `QsoNotActive` and nothing
+/// moves. `live_qso_ids` is the authoritative set (from
+/// `QsoManager::get_active_qsos`, i.e. `QsoState::is_active`) that the caller
+/// reads at keypress time; only keys present in it are eligible, so a
+/// grace-window-only snapshot correctly falls through to the CQ fallback.
+///
+/// `None` means the caller could not consult a `QsoManager` at all (the Qso
+/// component is not up), which is exactly the situation where nothing could
+/// commit anyway — it preserves the pre-filter behavior rather than inventing
+/// a different one for a state the operator cannot act in.
+///
+/// This is deliberately a SELECTION-time filter, complementing (not replacing)
+/// the drain's commit-time refusal: the commit-time check is what keeps the
+/// engine correct, this one is what keeps the status line honest.
+///
 /// Returns [`NudgeOutcome`] for the caller's status echo/logging.
 fn resolve_nudge_tx_offset(
     tx_freq_mode: &std::sync::atomic::AtomicU8,
     active: &std::collections::HashSet<String>,
+    live_qso_ids: Option<&std::collections::HashSet<pancetta_qso::QsoId>>,
     active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
     pending_qso_offset_requests: &std::sync::Mutex<
         Vec<pancetta_qso::qso_manager::OffsetActionRequest>,
@@ -2952,7 +3007,14 @@ fn resolve_nudge_tx_offset(
     {
         return NudgeOutcome::HeldNoOp;
     }
-    if let Some(key) = active.iter().next() {
+    // Skip past terminal/grace-window entries rather than stopping at the
+    // first key: with concurrent QSOs a completed one must never shadow a
+    // live one.
+    let target = active.iter().find(|key| {
+        key.parse::<pancetta_qso::QsoId>()
+            .is_ok_and(|id| live_qso_ids.is_none_or(|live| live.contains(&id)))
+    });
+    if let Some(key) = target {
         if let Ok(qso_id) = key.parse::<pancetta_qso::QsoId>() {
             let current = active_tx_offsets
                 .read()
@@ -3437,6 +3499,7 @@ mod tui_relay_tests {
         let result = resolve_nudge_tx_offset(
             &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
             &active,
+            Some(&std::collections::HashSet::from([qso_id])),
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
@@ -3491,6 +3554,7 @@ mod tui_relay_tests {
         let result = resolve_nudge_tx_offset(
             &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Hold),
             &active,
+            Some(&std::collections::HashSet::from([qso_id])),
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
@@ -3513,6 +3577,91 @@ mod tui_relay_tests {
         );
     }
 
+    /// PAN-72 (Codex round 2 on PR #350, finding 4): `active_tx_qsos` retains
+    /// a COMPLETED QSO for 45 seconds so its trailing 73 can transmit. Nudging
+    /// that entry told the operator "Nudging active QSO" while the drain later
+    /// refused it with `QsoNotActive` and nothing moved. With the QSO engine
+    /// reporting no live QSOs, `u` must fall through to the CQ fallback.
+    #[test]
+    fn nudge_ignores_a_completed_qso_still_inside_its_trailing_73_grace() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 920.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        // The QSO engine says nothing is active: the snapshot entry is
+        // grace-window-only.
+        let live: std::collections::HashSet<pancetta_qso::QsoId> = std::collections::HashSet::new();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::CqNudgeArmed,
+            "a terminal grace-window entry must not be reported as an active QSO"
+        );
+        assert!(
+            pending_qso_offset_requests.lock().unwrap().is_empty(),
+            "no offset request may be queued for a QSO the drain will refuse"
+        );
+    }
+
+    /// The concurrent-QSO half of the same finding: a completed entry must not
+    /// SHADOW a genuinely live one just because it happens to come first out
+    /// of the snapshot set.
+    #[test]
+    fn nudge_picks_the_live_qso_over_a_completed_one() {
+        let dead = pancetta_qso::QsoId::new_v4();
+        let alive = pancetta_qso::QsoId::new_v4();
+        let dead_key = crate::coordinator::active_tx_qso_key(&dead.to_string());
+        let alive_key = crate::coordinator::active_tx_qso_key(&alive.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([dead_key.clone(), alive_key.clone()]);
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
+            (dead_key, 920.0),
+            (alive_key, 1650.0),
+        ]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        let live: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([alive]);
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::ActiveQso(alive),
+            "the live QSO must be selected regardless of set iteration order"
+        );
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].qso_id, alive);
+        assert!(
+            matches!(
+                pending[0].action,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } if avoid_hz == 1650.0
+            ),
+            "avoid_hz must be the LIVE QSO's own offset, got {:?}",
+            pending[0].action
+        );
+        assert!(!pending_cq_offset_nudge.load(Ordering::Relaxed));
+    }
+
     /// PAN-72 (Codex round 1 on PR #350, finding 4): with NO active QSO and
     /// the mode on Hold, `u` must report a declared no-op too -- not a
     /// phantom CQ nudge.
@@ -3530,6 +3679,7 @@ mod tui_relay_tests {
         let result = resolve_nudge_tx_offset(
             &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Hold),
             &active,
+            None,
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
@@ -3564,6 +3714,7 @@ mod tui_relay_tests {
         let result = resolve_nudge_tx_offset(
             &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
             &active,
+            None,
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
