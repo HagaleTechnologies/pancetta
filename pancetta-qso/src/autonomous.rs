@@ -780,14 +780,23 @@ impl FrequencyAllocator {
     ///
     /// `separation_hz` governs only the exclusions; the candidate grid still
     /// steps by this allocator's own `min_separation_hz`, unchanged.
+    ///
+    /// PAN-72 (Codex round 6 on PR #350, finding 3): `range_hz` now WIDENS the
+    /// scan when it reaches outside `allocation_range`, rather than only
+    /// filtering a fixed 200–2800 Hz sweep down. A Hound response region above
+    /// 2800 Hz is valid operator configuration and used to empty this scan (and
+    /// the ranked branch above it) outright, so every post-QSY stall switch and
+    /// `u` nudge resolved back to `avoid_hz` and was refused as a no-op. See
+    /// [`crate::frequency::sweep_bounds`], which both scans share so they can
+    /// never disagree about what is searchable.
     pub fn allocate_cq_frequency_excluding(
         &self,
         exclude_hz: &[f64],
         separation_hz: f64,
         range_hz: Option<(f64, f64)>,
     ) -> Option<f64> {
-        let (min_f, max_f) = self.allocation_range;
         let step = self.min_separation_hz;
+        let (min_f, max_f) = crate::frequency::sweep_bounds(self.allocation_range, step, range_hz);
 
         let mut best: Option<f64> = None;
         let mut best_clearance = f64::NEG_INFINITY;
@@ -1932,12 +1941,17 @@ impl AutonomousOperator {
         });
 
         if let Some(ref spectral) = self.spectral_snapshot {
-            let mut candidates = self.smart_allocator.rank_candidates_with_parity(
+            // Round 6, finding 3: the window is what the candidate grid is
+            // GENERATED over, not merely filtered by afterwards — a Hound
+            // response region above the allocator's own range would otherwise
+            // empty the list and turn every switch into a refused no-op.
+            let mut candidates = self.smart_allocator.rank_candidates_in_range(
                 spectral,
                 &self.decode_history,
                 &own_freqs,
                 dx_target_hz,
                 target_slot,
+                range_hz,
             );
 
             // When calling CQ, prefer frequencies near rare DX spots.
@@ -3611,6 +3625,107 @@ mod tests {
         assert!(
             (1000.0..=2700.0).contains(&chosen),
             "the legacy fallback must be clamped into the window, got {chosen}"
+        );
+    }
+
+    /// PAN-72 (Codex round 6 on PR #350, finding 3): a Hound response region
+    /// ABOVE the allocator's own 200-2800 Hz range — e.g. 2850-2900 Hz, which
+    /// `[hound]` validation accepts and `ACTIVE_QSO_TX_OFFSET_MAX_HZ` (2900)
+    /// admits — must actually be SEARCHED, not merely used to filter candidates
+    /// that were already generated from 200-2800.
+    ///
+    /// Before this fix such a window emptied the ranked list AND the legacy
+    /// fallback scan, so the allocator returned `avoid_hz` unchanged and every
+    /// post-QSY Hound stall switch or `u` nudge was refused as a no-op — the
+    /// configured region never reached at all. Both resolution paths are
+    /// exercised: with a spectral snapshot (ranked) and without one (legacy).
+    #[test]
+    fn allocate_smart_frequency_in_range_searches_a_window_above_the_default_range() {
+        const WINDOW: (f64, f64) = (2850.0, 2900.0);
+        const AVOID: f64 = 1500.0;
+
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+
+        // 1. Legacy fallback (no waterfall yet — the path EVERY resolution
+        //    takes until the first spectral snapshot lands).
+        let fallback =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID), &[], Some(WINDOW));
+        assert!(
+            (WINDOW.0..=WINDOW.1).contains(&fallback),
+            "the legacy fallback must search the configured region, not resolve \
+             back onto the avoided {AVOID} Hz, got {fallback}"
+        );
+
+        // 2. Ranked spectral branch.
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        let ranked =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID), &[], Some(WINDOW));
+        assert!(
+            (WINDOW.0..=WINDOW.1).contains(&ranked),
+            "the ranked branch must generate candidates across the configured \
+             region, not filter a 200-2800 list down to nothing, got {ranked}"
+        );
+    }
+
+    /// The widening above must be strictly additive: an ordinary in-range
+    /// window still ranks exactly as it did, so no previously-reachable offset
+    /// moves and no new one appears inside the configured range.
+    #[test]
+    fn widening_the_sweep_does_not_disturb_an_in_range_window() {
+        let grid: Vec<f64> = {
+            let (lo, hi) = crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, None);
+            let mut out = Vec::new();
+            let mut f = lo;
+            while f <= hi {
+                out.push(f);
+                f += 25.0;
+            }
+            out
+        };
+        let (lo, hi) =
+            crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, Some((1000.0, 2700.0)));
+        assert_eq!(
+            (lo, hi),
+            (200.0, 2800.0),
+            "a window inside the configured range must leave the sweep untouched"
+        );
+
+        let (wide_lo, wide_hi) =
+            crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, Some((2850.0, 2900.0)));
+        assert_eq!(wide_lo, 200.0, "the grid stays anchored at the range floor");
+        assert_eq!(wide_hi, 2900.0, "the ceiling extends to cover the window");
+        assert!(
+            grid.iter().all(|&f| f >= wide_lo && f <= wide_hi),
+            "every offset the old sweep produced must still be inside the widened one"
+        );
+
+        // A window reaching BELOW the range floor walks the grid down in whole
+        // steps, so the pre-existing offsets keep their exact values.
+        let (below_lo, _) =
+            crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, Some((140.0, 500.0)));
+        assert_eq!(below_lo, 125.0, "200 - ceil(60/25)*25 = 125");
+        assert!(
+            ((200.0 - below_lo) / 25.0).fract() == 0.0,
+            "the widened floor must sit on the original grid"
+        );
+
+        // Garbage windows are ignored, exactly as the caller sanitizes them.
+        assert_eq!(
+            crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, Some((2700.0, 1000.0))),
+            (200.0, 2800.0)
+        );
+        assert_eq!(
+            crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, Some((f64::NAN, 2900.0))),
+            (200.0, 2800.0)
         );
     }
 
