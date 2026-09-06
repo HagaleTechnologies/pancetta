@@ -1791,6 +1791,66 @@ impl AutonomousOperator {
         avoid_hz: Option<f64>,
         also_avoid_hz: &[f64],
     ) -> f64 {
+        self.allocate_smart_frequency_in_range(
+            dx_target_hz,
+            target_parity,
+            avoid_hz,
+            also_avoid_hz,
+            None,
+        )
+    }
+
+    /// The configured minimum separation (Hz) between our OWN concurrent TX
+    /// offsets — `FrequencyAllocatorConfig::min_separation_hz`, the same value
+    /// [`Self::allocate_smart_frequency_avoiding`] enforces as a hard exclusion
+    /// around `avoid_hz`/`also_avoid_hz`.
+    ///
+    /// Exposed for the coordinator's PAN-72 offset drain (Codex round 2 on PR
+    /// #350, finding 2): a queued `OffsetAction::Revert` never consults the
+    /// allocator, so the drain has to answer "is this revert target still free?"
+    /// itself, and it must answer it with the SAME separation the allocator
+    /// would have applied rather than a second, independently-chosen constant.
+    pub fn min_own_separation_hz(&self) -> f64 {
+        self.smart_allocator.config().min_separation_hz
+    }
+
+    /// [`Self::allocate_smart_frequency_avoiding`] restricted to a caller-supplied
+    /// `[lo, hi]` Hz window.
+    ///
+    /// PAN-72 (Codex round 2 on PR #350, finding 1). The general allocation
+    /// range is the whole `FrequencyAllocatorConfig::range` (300–2800 Hz by
+    /// default), which is the right search space for a normal QSO but NOT for a
+    /// **Hound**: the Hound procedure pins our TX into the low calling region
+    /// while we are calling the Fox, and into the response region once the Fox
+    /// has answered and we have QSY'd. A stall switch that ranks across the full
+    /// range can move a post-QSY Hound back below `response_min_hz`, where the
+    /// Fox is not listening at all — the adaptive move would then guarantee the
+    /// QSO fails rather than rescue it.
+    ///
+    /// `range_hz` is sanitized here rather than trusted: it ultimately comes
+    /// from operator TOML (`[hound]`), so a non-finite or inverted window is
+    /// treated as "no constraint" instead of panicking in `f64::clamp` or
+    /// filtering every candidate away.
+    ///
+    /// Two paths have to honor the window, not just the ranked one:
+    /// - the spectral branch filters candidates to the window alongside the
+    ///   existing `avoid_hz`/`also_avoid_hz` hard exclusions, and when that
+    ///   empties the list it returns `avoid_hz` unchanged — the caller's
+    ///   established "no valid relocation" signal;
+    /// - the legacy fallback (`allocate_cq_frequency`, taken when no spectral
+    ///   snapshot has landed yet) is window-blind, so its result is clamped
+    ///   into the window. Clamping rather than rejecting keeps the fallback
+    ///   useful — the clamped edge is still inside the region the Fox listens
+    ///   in, which is the property that actually matters here.
+    pub fn allocate_smart_frequency_in_range(
+        &self,
+        dx_target_hz: Option<f64>,
+        target_parity: Option<pancetta_core::slot::SlotParity>,
+        avoid_hz: Option<f64>,
+        also_avoid_hz: &[f64],
+        range_hz: Option<(f64, f64)>,
+    ) -> f64 {
+        let range_hz = range_hz.filter(|(lo, hi)| lo.is_finite() && hi.is_finite() && *lo <= *hi);
         // Hold mode (default): pancetta does not choose the offset — every
         // autonomous transmission goes out on the operator's pinned offset.
         // Prefer the LIVE parked offset (set via the TUI's `o` modal) over
@@ -1860,7 +1920,12 @@ impl AutonomousOperator {
             let excluded: Vec<_> = candidates
                 .iter()
                 .filter(|c| {
-                    avoid_hz.is_none_or(|avoid| (c.offset_hz - avoid).abs() >= min_separation_hz)
+                    // PAN-72 round 2 finding 1: the Hound region window, when
+                    // the caller supplied one, is as hard a constraint as the
+                    // avoid exclusions below.
+                    range_hz.is_none_or(|(lo, hi)| c.offset_hz >= lo && c.offset_hz <= hi)
+                        && avoid_hz
+                            .is_none_or(|avoid| (c.offset_hz - avoid).abs() >= min_separation_hz)
                         && also_avoid_hz
                             .iter()
                             .all(|&other| (c.offset_hz - other).abs() >= min_separation_hz)
@@ -1892,8 +1957,13 @@ impl AutonomousOperator {
             }
         }
 
-        // Fallback: legacy allocator
-        self.frequency_allocator.allocate_cq_frequency()
+        // Fallback: legacy allocator (range-blind — clamp into the caller's
+        // window when there is one, see this method's doc comment).
+        let legacy_hz = self.frequency_allocator.allocate_cq_frequency();
+        match range_hz {
+            Some((lo, hi)) => legacy_hz.clamp(lo, hi),
+            None => legacy_hz,
+        }
     }
 
     /// Rank the current band openness for the TX-placement instrument.
@@ -3386,6 +3456,126 @@ mod tests {
         assert!(
             (chosen - 1500.0).abs() >= 75.0,
             "expected a frequency at least 75 Hz from the avoided 1500 Hz, got {chosen}"
+        );
+    }
+
+    /// PAN-72 (Codex round 2 on PR #350, finding 1): a Hound stall switch must
+    /// stay inside the Hound response region — a pick below `response_min_hz`
+    /// puts our R+report where the Fox is not listening.
+    #[test]
+    fn allocate_smart_frequency_in_range_never_leaves_the_window() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        // Make everything ABOVE 1000 Hz look busy, so the unconstrained
+        // allocator would prefer the (clear, and for a post-QSY Hound
+        // fatal) low calling region.
+        let mut records = Vec::new();
+        let mut freq = 1000.0f64;
+        while freq <= 2800.0 {
+            records.push(DecodeRecord {
+                frequency_hz: freq,
+                time_slot: TimeSlot::First,
+            });
+            records.push(DecodeRecord {
+                frequency_hz: freq,
+                time_slot: TimeSlot::Second,
+            });
+            freq += 25.0;
+        }
+        op.decode_history.push_cycle(records);
+
+        let unconstrained = op.allocate_smart_frequency(None, None, Some(1500.0));
+        assert!(
+            unconstrained < 1000.0,
+            "test premise broken: the unconstrained allocator must prefer the \
+             low region here, got {unconstrained}"
+        );
+
+        let constrained = op.allocate_smart_frequency_in_range(
+            None,
+            None,
+            Some(1500.0),
+            &[],
+            Some((1000.0, 2700.0)),
+        );
+        assert!(
+            (1000.0..=2700.0).contains(&constrained),
+            "a range-constrained allocation must stay inside the window, got {constrained}"
+        );
+        assert!(
+            (constrained - 1500.0).abs() >= 75.0,
+            "the window must not weaken the avoid_hz hard exclusion, got {constrained}"
+        );
+    }
+
+    /// The legacy (no-spectral-snapshot) fallback is range-blind, so its
+    /// result is clamped into the caller's window rather than escaping it.
+    #[test]
+    fn allocate_smart_frequency_in_range_clamps_the_legacy_fallback() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        // Deliberately NO `update_spectral` — this exercises the
+        // `allocate_cq_frequency()` fallback path.
+        let chosen =
+            op.allocate_smart_frequency_in_range(None, None, None, &[], Some((1000.0, 2700.0)));
+        assert!(
+            (1000.0..=2700.0).contains(&chosen),
+            "the legacy fallback must be clamped into the window, got {chosen}"
+        );
+    }
+
+    /// An inverted or non-finite window (operator TOML can produce either) is
+    /// ignored, not honored and not a panic in `f64::clamp`.
+    #[test]
+    fn allocate_smart_frequency_in_range_ignores_a_nonsensical_window() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+
+        let inverted = op.allocate_smart_frequency_in_range(
+            None,
+            None,
+            Some(1500.0),
+            &[],
+            Some((2700.0, 1000.0)),
+        );
+        let unconstrained = op.allocate_smart_frequency(None, None, Some(1500.0));
+        assert_eq!(
+            inverted, unconstrained,
+            "an inverted window must degrade to no constraint"
+        );
+
+        let nan = op.allocate_smart_frequency_in_range(
+            None,
+            None,
+            Some(1500.0),
+            &[],
+            Some((f64::NAN, 2700.0)),
+        );
+        assert_eq!(
+            nan, unconstrained,
+            "a non-finite window must degrade to no constraint"
         );
     }
 

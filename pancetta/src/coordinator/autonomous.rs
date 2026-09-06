@@ -530,8 +530,10 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// PAN-72: resolves and commits every queued mid-QSO TX-offset action once
 /// per tick, mirroring `drain_pending_autonomous_cq_dispatch_failures`'s
 /// mailbox shape. `Switch` is resolved via the SAME `allocate_smart_frequency`
-/// the CQ-hunting switch uses (single-scorer invariant); `Revert` needs no
-/// allocator call. Errors from `apply_tx_offset_switch` are logged and
+/// the CQ-hunting switch uses (single-scorer invariant); `Revert` normally
+/// needs no allocator call at all — it only falls back to one when its target
+/// has since been taken (round 2, finding 2, below). Errors from
+/// `apply_tx_offset_switch` are logged and
 /// skipped, not propagated — a request for a QSO that has since completed,
 /// gone terminal or been superseded by a DX advance is an expected race
 /// (`QsoManagerError::is_expected_offset_action_refusal`, logged at `debug!`),
@@ -570,6 +572,14 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// entirely, so two same-batch `Switch` actions could still collide in that
 /// fallback case (see that function's own doc comment).
 ///
+/// **Hound picks stay inside the Hound region** (round 2, finding 1) and
+/// **revert targets are re-checked for occupancy** (round 2, finding 2) — see
+/// [`hound_switch_range_hz`] and [`revert_target_is_taken`]. Both hang off a
+/// single `get_qso` read taken before the action is resolved; it is a plain
+/// read-lock clone that is dropped before `apply_tx_offset_switch` takes the
+/// write lock, and it is advisory only — every authoritative refusal (unknown,
+/// terminal, superseded) still comes from `apply_tx_offset_switch` itself.
+///
 /// On success the QSO's entry in `active_tx_offsets` is rewritten to the
 /// offset `apply_tx_offset_switch` actually applied (post-clamp). That map is
 /// otherwise refreshed only on a `QsoEvent::StateChanged` carrying a
@@ -592,6 +602,79 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// entries that already exist are updated — an absent key means the
 /// forwarder does not consider this QSO TX-active, and resurrecting it here
 /// would re-admit a QSO the `Failed`/completion purge just removed.
+/// The Hz window a queued TX-offset action for this QSO is allowed to resolve
+/// inside, or `None` for the general 300–2800 Hz allocation range.
+///
+/// PAN-72 (Codex round 2 on PR #350, finding 1). A **Hound**'s TX offset is
+/// procedurally pinned, not free: while calling the Fox we must sit in the low
+/// calling region, and once the Fox has answered and we have QSY'd we must sit
+/// in the response region — that is where the Fox is listening, and nowhere
+/// else. The generic allocator knows nothing about either region, so a stall
+/// switch (or a finding-2 fallback switch) resolved through it could move a
+/// post-QSY Hound back down into the calling region and guarantee the QSO dies.
+///
+/// `hound_qsyed` is the discriminator rather than the QSO's state, because it
+/// is exactly the flag the QSY itself sets (`process_message_for_qso`'s Hound
+/// block): before it flips we are calling low, after it flips we are answering
+/// high. Non-Hound QSOs are unconstrained, exactly as before.
+///
+/// The bounds come from the live `QsoManagerConfig` — the operator's own
+/// `[hound]` TOML, wired in by `coordinator/qso.rs` — not from the module
+/// constants, so a customized region is honored here too.
+fn hound_switch_range_hz(
+    progress: &pancetta_qso::states::QsoProgress,
+    config: &pancetta_qso::QsoManagerConfig,
+) -> Option<(f64, f64)> {
+    if !progress.metadata.hound {
+        return None;
+    }
+    Some(if progress.metadata.hound_qsyed {
+        (config.hound.response_min_hz, config.hound.response_max_hz)
+    } else {
+        (config.hound.call_min_hz, config.hound.call_max_hz)
+    })
+}
+
+/// Is `target_hz` — a queued `OffsetAction::Revert`'s known-good offset — now
+/// within `min_separation_hz` of some OTHER live TX stream of ours?
+///
+/// PAN-72 (Codex round 2 on PR #350, finding 2). `active_tx_offsets` is the
+/// coordinator's own id→offset snapshot of every TX-active QSO (kept in sync
+/// with `active_tx_qsos`, including its 45 s completed-grace window — a QSO
+/// still inside that window is still keying its trailing 73, so its slot is
+/// genuinely still taken). `reserved_hz` covers offsets committed earlier in
+/// THIS drain batch, which the snapshot cannot know about yet.
+///
+/// The QSO's own entry is excluded: reverting onto the offset we ourselves
+/// already hold in the map is not a collision, and a `Revert` whose target
+/// equals our current offset is a harmless no-op the commit handles.
+///
+/// Fails OPEN (returns `false`) on a poisoned lock, matching every other read
+/// of this map in this task: this is a placement-quality check, not a TX-safety
+/// gate, and refusing every revert because a lock is poisoned would strand
+/// stalled QSOs on offsets that demonstrably are not working.
+fn revert_target_is_taken(
+    target_hz: f64,
+    qso_id: pancetta_qso::states::QsoId,
+    active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
+    reserved_hz: &[f64],
+    min_separation_hz: f64,
+) -> bool {
+    if reserved_hz
+        .iter()
+        .any(|&other| (target_hz - other).abs() < min_separation_hz)
+    {
+        return true;
+    }
+    let own_key = super::active_tx_qso_key(&qso_id.to_string());
+    match active_tx_offsets.read() {
+        Ok(offsets) => offsets
+            .iter()
+            .any(|(key, &hz)| *key != own_key && (target_hz - hz).abs() < min_separation_hz),
+        Err(_) => false,
+    }
+}
+
 async fn drain_pending_qso_offset_requests(
     op: &mut pancetta_qso::AutonomousOperator,
     qso_manager: &pancetta_qso::QsoManager,
@@ -623,17 +706,73 @@ async fn drain_pending_qso_offset_requests(
     // Finding 1: offsets this batch has already committed, hard-excluded from
     // every subsequent resolution so two QSOs can't collapse onto one slot.
     let mut reserved_hz: Vec<f64> = Vec::new();
+    let min_separation_hz = op.min_own_separation_hz();
     for request in requests {
         let pancetta_qso::qso_manager::OffsetActionRequest {
             qso_id,
             action,
             raised_at_generation,
         } = request;
+        // Round 2, findings 1 + 2: one authoritative read of the QSO before
+        // anything is resolved. It answers two questions the queued action
+        // itself cannot: is this a Hound (⇒ the pick is confined to the Hound
+        // region it is currently procedurally pinned to), and what offset is
+        // the QSO actually sitting on right now (⇒ what a fallback Switch must
+        // move away from). `Err` here means the QSO is gone entirely — leave
+        // both answers unset and let `apply_tx_offset_switch` below produce the
+        // authoritative refusal rather than second-guessing it here.
+        let progress = qso_manager.get_qso(qso_id).await.ok();
+        let range_hz = progress
+            .as_ref()
+            .and_then(|p| hound_switch_range_hz(p, qso_manager.config()));
+        let current_hz = progress.as_ref().map(|p| p.metadata.frequency);
         let resolved_hz = match action {
-            pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } => {
-                op.allocate_smart_frequency_avoiding(None, None, Some(avoid_hz), &reserved_hz)
+            pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } => op
+                .allocate_smart_frequency_in_range(
+                    None,
+                    None,
+                    Some(avoid_hz),
+                    &reserved_hz,
+                    range_hz,
+                ),
+            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz } => {
+                // Finding 2: a `Revert` bypasses the allocator entirely, so
+                // nothing else checks whether the known-good offset is STILL
+                // free. With `max_concurrent_qsos > 1` another QSO can have
+                // taken it in the meantime; committing anyway would put two of
+                // our own streams inside `min_separation_hz` and the TX
+                // coalescer would then drop one of them from the bundle.
+                if revert_target_is_taken(
+                    target_hz,
+                    qso_id,
+                    active_tx_offsets,
+                    &reserved_hz,
+                    min_separation_hz,
+                ) {
+                    info!(
+                        target: "tx.freq",
+                        qso_id = %qso_id,
+                        target_hz,
+                        "PAN-72: revert target is occupied by another active QSO — \
+                         allocating a fresh offset instead"
+                    );
+                    // Resolve exactly as a `Switch` would: avoid the offset the
+                    // QSO is stalling on (its live one, not the stale revert
+                    // target), and treat the now-occupied target as one more
+                    // hard exclusion on top of this batch's reservations.
+                    let mut also_avoid = reserved_hz.clone();
+                    also_avoid.push(target_hz);
+                    op.allocate_smart_frequency_in_range(
+                        None,
+                        None,
+                        Some(current_hz.unwrap_or(target_hz)),
+                        &also_avoid,
+                        range_hz,
+                    )
+                } else {
+                    target_hz
+                }
             }
-            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz } => target_hz,
         };
         match qso_manager
             .apply_tx_offset_switch(qso_id, resolved_hz, raised_at_generation)
@@ -1413,36 +1552,6 @@ impl super::ApplicationCoordinator {
                                 &mut rolled_back_attempt_tombstones,
                             );
 
-                            // PAN-72: resolve and commit any mid-QSO
-                            // TX-offset actions the QSO event-forwarder
-                            // queued this cycle (stall-switch/revert).
-                            // Re-borrow the watch channel FRESH every tick
-                            // (not a captured clone) so a Qso-only
-                            // component restart is picked up immediately --
-                            // see the doc comment on `qso_manager_watch`'s
-                            // subscribe site above. A `None` value here
-                            // means the Qso component isn't up yet, which
-                            // also means nothing could have been queued --
-                            // true no-op, not a bug. Clone out of the
-                            // `Ref` and drop it (a plain owned-value `let`,
-                            // not `borrow().clone()` inline in the `if
-                            // let`'s scrutinee) BEFORE the `.await` below --
-                            // otherwise the watch channel's internal read
-                            // lock would be held across the drain's own
-                            // `.await` points, needlessly blocking a
-                            // concurrent `start_qso_component`'s `.send()`.
-                            let current_qso_manager = qso_manager_watch.borrow().clone();
-                            if let Some(qso_manager) = current_qso_manager {
-                                drain_pending_qso_offset_requests(
-                                    &mut op,
-                                    &qso_manager,
-                                    &pending_qso_offset_requests,
-                                    &active_tx_offsets,
-                                    &tx_freq_mode_for_drain,
-                                )
-                                .await;
-                            }
-
                             // PAN-72: the `u` nudge's CQ-hunting fallback --
                             // forwarded into `request_manual_switch`, which
                             // is itself only consumed inside `decide_at`
@@ -1490,6 +1599,63 @@ impl super::ApplicationCoordinator {
                             }
 
                             op.feed_decoded_messages(&slot_messages, evaluator.as_ref());
+
+                            // PAN-72: resolve and commit any mid-QSO
+                            // TX-offset actions the QSO event-forwarder
+                            // queued this cycle (stall-switch/revert).
+                            //
+                            // ORDERING (Codex round 2 on PR #350, finding
+                            // 3): this MUST come after `update_spectral`,
+                            // `update_live_spots` and
+                            // `feed_decoded_messages` above -- those three
+                            // are what refresh the allocator's inputs for
+                            // this tick, and a `Switch` resolved before them
+                            // ranks against the PRECEDING slot's occupancy,
+                            // so it can move a QSO onto a frequency this
+                            // slot's own waterfall/decodes already show as
+                            // busy. It also has to stay AHEAD of
+                            // `set_own_frequencies` further below, which
+                            // syncs the allocator's own-frequency registry
+                            // from `active_tx_offsets` -- the drain writes
+                            // each committed offset into that map, and this
+                            // position is what lets the mirror land in time
+                            // for the SAME tick's sync (see the drain's own
+                            // doc comment). Nothing between the old position
+                            // and here depends on the drain having run: the
+                            // CQ-nudge forward, the waterfall/spot/decode
+                            // refreshes and the placement snapshot all read
+                            // operator state the drain never touches. The
+                            // placement instrument below is now computed
+                            // AFTER the decisions it is supposed to
+                            // visualize, which is the other half of the
+                            // finding.
+                            //
+                            // Re-borrow the watch channel FRESH every tick
+                            // (not a captured clone) so a Qso-only
+                            // component restart is picked up immediately --
+                            // see the doc comment on `qso_manager_watch`'s
+                            // subscribe site above. A `None` value here
+                            // means the Qso component isn't up yet, which
+                            // also means nothing could have been queued --
+                            // true no-op, not a bug. Clone out of the
+                            // `Ref` and drop it (a plain owned-value `let`,
+                            // not `borrow().clone()` inline in the `if
+                            // let`'s scrutinee) BEFORE the `.await` below --
+                            // otherwise the watch channel's internal read
+                            // lock would be held across the drain's own
+                            // `.await` points, needlessly blocking a
+                            // concurrent `start_qso_component`'s `.send()`.
+                            let current_qso_manager = qso_manager_watch.borrow().clone();
+                            if let Some(qso_manager) = current_qso_manager {
+                                drain_pending_qso_offset_requests(
+                                    &mut op,
+                                    &qso_manager,
+                                    &pending_qso_offset_requests,
+                                    &active_tx_offsets,
+                                    &tx_freq_mode_for_drain,
+                                )
+                                .await;
+                            }
 
                             // DX watchlist (#197): housekeeping broadcast every
                             // tick, same cadence as the TX-placement instrument
@@ -3600,6 +3766,263 @@ mod drain_pending_qso_offset_requests_tests {
             a, b,
             "two concurrent switches resolved in one batch must not land on \
              the same TX offset ({a} Hz)"
+        );
+    }
+
+    /// PAN-72 (Codex round 2 on PR #350, finding 1): a post-QSY Hound's stall
+    /// switch is resolved by the SAME general allocator every other switch
+    /// uses, which knows nothing about the Hound response region. A pick below
+    /// `response_min_hz` puts our R+report back in the calling region, where
+    /// the Fox is not listening — the "rescue" would kill the QSO.
+    ///
+    /// The band here is rigged so the unconstrained allocator genuinely prefers
+    /// the low region (everything at/above ~950 Hz is noisy), which is what
+    /// makes the constraint observable rather than incidentally satisfied.
+    #[tokio::test]
+    async fn a_hound_switch_stays_inside_the_hound_response_region() {
+        let mut op = operator_with_live_allocator();
+        // Hot above ~950 Hz, quiet below: without the region constraint the
+        // allocator's noise/neighbor terms (35 points combined) dominate the
+        // 10-point center bias and it picks low.
+        let bins = 140usize;
+        let (fmin, fmax) = (200.0f64, 2800.0f64);
+        let width = (fmax - fmin) / bins as f64;
+        let power: Vec<f32> = (0..bins)
+            .map(|i| {
+                let f = fmin + (i as f64 + 0.5) * width;
+                if f >= 950.0 {
+                    1.0
+                } else {
+                    0.0
+                }
+            })
+            .collect();
+        op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
+            power_bins: power,
+            freq_min_hz: fmin,
+            freq_max_hz: fmax,
+        });
+
+        let qso_manager = manager();
+        let fox_rx_hz = 300.0;
+        let qso_id = qso_manager
+            .engage_hound("D2UY", fox_rx_hz, None, None)
+            .await
+            .expect("engage_hound should succeed");
+        // The Fox answers: RespondingToCq -> SendingReport triggers the
+        // one-shot QSY up into the response region.
+        qso_manager
+            .process_message(
+                pancetta_qso::MessageType::SignalReport {
+                    to_station: "W1ABC".into(),
+                    from_station: "D2UY".into(),
+                    report: -12,
+                },
+                "W1ABC D2UY -12".to_string(),
+                fox_rx_hz,
+                Some(-12.0),
+            )
+            .await
+            .expect("the Fox's report must process");
+        let after = qso_manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            after.metadata.hound_qsyed,
+            "precondition: the Fox's report must trigger the Hound QSY"
+        );
+        let qsyed_hz = after.metadata.frequency;
+        let regions = &qso_manager.config().hound;
+        assert!(
+            qsyed_hz >= regions.response_min_hz,
+            "precondition: the QSY must land in the response region, got {qsyed_hz}"
+        );
+        assert!(
+            op.allocate_smart_frequency(None, None, Some(qsyed_hz)) < regions.response_min_hz,
+            "test premise broken: the UNCONSTRAINED allocator must prefer the \
+             low calling region on this rigged band"
+        );
+
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: qsyed_hz },
+            ),
+        ]);
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+        )
+        .await;
+
+        let moved_to = qso_manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .frequency;
+        assert!(
+            moved_to >= regions.response_min_hz && moved_to <= regions.response_max_hz,
+            "a post-QSY Hound switch must stay inside the Hound response region \
+             ({}-{} Hz), got {moved_to}",
+            regions.response_min_hz,
+            regions.response_max_hz
+        );
+    }
+
+    /// The pre-QSY half of finding 1: while still calling the Fox, a Hound is
+    /// pinned to the LOW calling region, so a stall switch must stay there too
+    /// — a "better" offset up in the response region is one the Fox is not
+    /// listening on either.
+    #[tokio::test]
+    async fn a_pre_qsy_hound_switch_stays_inside_the_calling_region() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .engage_hound("D2UY", 300.0, None, None)
+            .await
+            .expect("engage_hound should succeed");
+        let calling_hz = qso_manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .frequency;
+        let regions = &qso_manager.config().hound;
+        assert!(
+            calling_hz <= regions.call_max_hz,
+            "precondition: a Hound opens in the calling region, got {calling_hz}"
+        );
+
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch {
+                    avoid_hz: calling_hz,
+                },
+            ),
+        ]);
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+        )
+        .await;
+
+        let moved_to = qso_manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .frequency;
+        assert!(
+            moved_to >= regions.call_min_hz && moved_to <= regions.call_max_hz,
+            "a pre-QSY Hound switch must stay inside the Hound calling region \
+             ({}-{} Hz), got {moved_to}",
+            regions.call_min_hz,
+            regions.call_max_hz
+        );
+    }
+
+    /// PAN-72 (Codex round 2 on PR #350, finding 2): a `Revert` bypasses the
+    /// allocator, so nothing else notices that another concurrent QSO has
+    /// taken the known-good offset since we switched away from it. Committing
+    /// anyway puts two of our own streams inside `min_separation_hz` and the TX
+    /// coalescer drops one of them from the bundle.
+    #[tokio::test]
+    async fn a_revert_onto_an_offset_another_qso_now_holds_reallocates_instead() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let stalled = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        let occupier = qso_manager.start_cq(1200.0, None, false).await.unwrap();
+        let stalled_key = crate::coordinator::active_tx_qso_key(&stalled.to_string());
+        let occupier_key = crate::coordinator::active_tx_qso_key(&occupier.to_string());
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
+            (stalled_key.clone(), 1500.0),
+            (occupier_key, 1200.0),
+        ]));
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                stalled,
+                // 1200 Hz was this QSO's known-good offset — and is now the
+                // other QSO's live offset.
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+            ),
+        ]);
+
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+        )
+        .await;
+
+        let moved_to = qso_manager
+            .get_qso(stalled)
+            .await
+            .unwrap()
+            .metadata
+            .frequency;
+        assert!(
+            (moved_to - 1200.0).abs() >= op.min_own_separation_hz(),
+            "a revert onto an occupied offset must reallocate clear of it, \
+             got {moved_to} Hz against an occupied 1200 Hz"
+        );
+        assert_eq!(
+            active_tx_offsets.read().unwrap().get(&stalled_key).copied(),
+            Some(moved_to),
+            "the mirror must follow the reallocated offset, not the stale target"
+        );
+    }
+
+    /// The control for the case above: an unoccupied revert target still
+    /// commits verbatim, with no allocator involvement.
+    #[tokio::test]
+    async fn a_revert_onto_a_free_offset_still_commits_verbatim() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let stalled = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        let other = qso_manager.start_cq(2400.0, None, false).await.unwrap();
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
+            (
+                crate::coordinator::active_tx_qso_key(&stalled.to_string()),
+                1500.0,
+            ),
+            (
+                crate::coordinator::active_tx_qso_key(&other.to_string()),
+                2400.0,
+            ),
+        ]));
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                stalled,
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+            ),
+        ]);
+
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+        )
+        .await;
+
+        assert_eq!(
+            qso_manager
+                .get_qso(stalled)
+                .await
+                .unwrap()
+                .metadata
+                .frequency,
+            1200.0,
+            "a free revert target must still be applied exactly"
         );
     }
 
