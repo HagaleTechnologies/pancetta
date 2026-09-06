@@ -2871,16 +2871,21 @@ impl QsoManager {
             )
             .await?;
 
-        // Did this received frame advance us up the responder ladder? Computed
-        // here (before `old_state`/`new_state` are moved into emit_state_change)
-        // for the forward-advance tracking below, which resets `stall_cycles`
-        // and records `last_known_good_offset_hz` on a real advance. Off-ladder
-        // advances (CQer flow) read as `false`, which is harmless: `stall_cycles`
-        // is driven purely by `rearm_manual_calls_at`'s silence check (a real
-        // per-slot re-send with no DX response), not by inspecting this frame's
-        // content, so a non-advancing frame here just leaves the counter to
-        // keep accumulating rather than being falsely reset.
-        let dx_frame_advanced = Self::ladder_rank(&new_state) > Self::ladder_rank(&old_state);
+        // Did this received frame advance the QSO? Computed here (before
+        // `old_state`/`new_state` are moved into emit_state_change) for the
+        // forward-advance tracking below, which resets `stall_cycles`, bumps
+        // `advance_generation` and records `last_known_good_offset_hz` on a
+        // real advance.
+        //
+        // PAN-72 (Codex round 1 on PR #350, finding 2): this uses the
+        // role-agnostic `progress_rank`, NOT the Caller-shaped `ladder_rank`
+        // the manual context-reply path compares against `ResponseStep`. See
+        // `progress_rank`'s doc comment: with `ladder_rank`, the CQer's real
+        // `CallingCq -> WaitingForReport` advance read as "no progress", so a
+        // stall streak built up over unanswered CQs carried into the
+        // established exchange and could trip the switch threshold on the
+        // very first missed report slot — with no known-good offset recorded.
+        let dx_frame_advanced = Self::progress_rank(&new_state) > Self::progress_rank(&old_state);
 
         // Hound QSY gate: computed here while both `old_state` and `new_state`
         // are still in scope (before `old_state` is consumed by `emit_state_change`
@@ -3176,6 +3181,25 @@ impl QsoManager {
                 progress.metadata.frequency = qsy;
                 progress.metadata.pending_freq_drift = None;
                 progress.metadata.hound_qsyed = true;
+                // PAN-72 (Codex round 1 on PR #350, finding 5): re-anchor the
+                // known-good offset onto the POST-QSY offset. The
+                // `dx_frame_advanced` block a few lines above just recorded
+                // the pre-QSY LOW CALLING offset as known-good (this QSY is
+                // driven by the very same RespondingToCq -> SendingReport
+                // advance), and this block then moves us into the mandatory
+                // response region. Left as-is, a subsequent `SendingReport`
+                // stall would read `frequency != last_known_good` as "we're
+                // sitting on a previously-switched offset" and emit a
+                // `Revert` back to the low calling offset — undoing the
+                // procedure-mandated QSY and putting our R+report where the
+                // Fox is no longer listening.
+                //
+                // Re-anchoring (rather than exempting Hound from the
+                // mechanism) keeps the stall switch/revert ping-pong working
+                // WITHIN the response region for a merely slow Fox, while
+                // making the QSY'd offset the thing a later revert returns
+                // TO.
+                progress.metadata.last_known_good_offset_hz = Some(qsy);
                 // Keep the ReportAck emitted this cycle on the QSY'd offset.
                 qso_frequency = qsy;
                 // Update the SendingReport state's frequency so the Completed
@@ -3306,6 +3330,16 @@ impl QsoManager {
         true
     }
 
+    /// The **responder-flow** ladder, deliberately aligned 1:1 with
+    /// [`Self::step_ladder_rank`]'s [`pancetta_core::ResponseStep`] mapping so
+    /// an operator's context reply can be compared against where an existing
+    /// manual QSO currently sits. It is Caller-role-shaped by construction —
+    /// there is no `ResponseStep` for "I called CQ" or "I sent my report as
+    /// the CQer", so `CallingCq`/`WaitingForReport` have no rung here and
+    /// must not gain one.
+    ///
+    /// For "did this QSO make forward progress?" use [`Self::progress_rank`]
+    /// instead — see its doc comment for why the two ladders are separate.
     fn ladder_rank(state: &QsoState) -> Option<u8> {
         match state {
             QsoState::RespondingToCq { .. } => Some(0),
@@ -3314,6 +3348,55 @@ impl QsoManager {
             QsoState::SendingConfirmation { .. } => Some(2),
             QsoState::Completed { .. } => Some(3),
             _ => None,
+        }
+    }
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 2): the **role-agnostic**
+    /// forward-progress ladder, covering the CQer flow as well as the Caller
+    /// flow. Used solely by `process_message_for_qso`'s `dx_frame_advanced`
+    /// predicate, which resets [`QsoMetadata::stall_cycles`] and records
+    /// [`QsoMetadata::last_known_good_offset_hz`] on a genuine advance.
+    ///
+    /// This is deliberately NOT [`Self::ladder_rank`]. That ladder exists to
+    /// be compared against a [`pancetta_core::ResponseStep`] in the manual
+    /// context-reply path and is Caller-role-shaped for that reason; widening
+    /// it would silently change which context replies advance an existing QSO
+    /// versus re-send its current outbound. Stall detection needs the
+    /// opposite property — every real advance in EITHER role must count —
+    /// so it gets its own function.
+    ///
+    /// The CQer rungs mirror the Caller's stage for stage:
+    ///   0. opening sent (`CallingCq` / `RespondingToCq`)
+    ///   1. our report is on the air (`WaitingForReport` — the CQer's report
+    ///      goes out on the `CallingCq -> WaitingForReport` transition — /
+    ///      `SendingReport`)
+    ///   2. exchange rogered (`WaitingForConfirmation` / `SendingConfirmation`)
+    ///   3. `Completed`
+    ///
+    /// Without rung 0/1 for the CQer, the real `CallingCq -> WaitingForReport`
+    /// advance (a caller finally answering an unanswered CQ) read as "no
+    /// progress": the stall streak accumulated during the unanswered CQs
+    /// carried straight into the established exchange, so a single missed
+    /// report slot could trip the threshold immediately — and without ever
+    /// recording the just-proven offset as known-good, so the resulting action
+    /// was a blind `Switch` rather than the intended anchored ping-pong.
+    ///
+    /// `Failed` and `Idle` stay `None`: `None` is ordered below every `Some`,
+    /// so a QSO going terminal-`Failed` can never read as an advance.
+    fn progress_rank(state: &QsoState) -> Option<u8> {
+        match state {
+            QsoState::CallingCq { .. } | QsoState::RespondingToCq { .. } => Some(0),
+            QsoState::WaitingForReport { .. } | QsoState::SendingReport { .. } => Some(1),
+            // Not currently constructed by `determine_state_transition`, but
+            // ranked here so contest wiring inherits correct stall detection
+            // rather than re-introducing this same bug.
+            QsoState::Contest(ContestState::ExchangingInfo { .. }) => Some(1),
+            QsoState::WaitingForConfirmation { .. } | QsoState::SendingConfirmation { .. } => {
+                Some(2)
+            }
+            QsoState::Completed { .. } => Some(3),
+            QsoState::Contest(ContestState::ContestCompleted { .. }) => Some(3),
+            QsoState::Idle | QsoState::Failed { .. } => None,
         }
     }
 
@@ -14142,6 +14225,168 @@ mod pan72_stall_detection_tests {
             Some(OffsetAction::Revert { target_hz: FREQ }),
             "second stall (now off the known-good offset) must Revert, not Switch"
         );
+    }
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 2): the CQer's real
+    /// `CallingCq -> WaitingForReport` advance — a caller finally answering
+    /// our CQ — must reset `stall_cycles` and record the offset as
+    /// known-good, exactly like the Caller flow's
+    /// `RespondingToCq -> SendingReport`.
+    ///
+    /// Before the fix `dx_frame_advanced` was computed from `ladder_rank`,
+    /// which ranks neither `CallingCq` nor `WaitingForReport`, so the streak
+    /// accumulated over unanswered CQs carried straight into the established
+    /// exchange.
+    #[tokio::test]
+    async fn cqer_flow_advance_resets_stall_cycles_and_records_known_good_offset() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 4;
+        let manager = manager_auto(config);
+        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // Three unanswered CQ slots: stall_cycles -> 3 (still below the
+        // default-shaped threshold of 4).
+        for i in 1..=3i64 {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * i))
+                .await;
+        }
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            3,
+            "precondition: three unanswered CQ slots accumulated a streak"
+        );
+
+        // A caller finally answers: CallingCq -> WaitingForReport. This is a
+        // genuine forward advance and must clear the accumulated streak.
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.into(),
+                    responding_station: DX.into(),
+                    grid: Some("FN31".into()),
+                },
+                format!("{OUR} {DX} FN31"),
+                FREQ,
+                Some(-9.0),
+            )
+            .await
+            .unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(after.state, QsoState::WaitingForReport { .. }),
+            "precondition: the answer must advance the CQer to WaitingForReport, got {:?}",
+            after.state
+        );
+        assert_eq!(
+            after.metadata.stall_cycles, 0,
+            "a caller answering our CQ is forward progress — the unanswered-CQ \
+             streak must not carry into the established exchange"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(after.metadata.frequency),
+            "the offset the caller demonstrably heard us on must be recorded \
+             as known-good so a later stall Reverts here instead of Switching blind"
+        );
+    }
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 5): after the Hound's
+    /// procedure-mandated QSY into the response region, the POST-QSY offset —
+    /// not the pre-QSY low calling offset — must be the recorded known-good.
+    ///
+    /// The QSY is driven by the very same `RespondingToCq -> SendingReport`
+    /// advance that records known-good, so without the re-anchor a later
+    /// `SendingReport` stall would read "we are off our known-good offset"
+    /// and emit `Revert` straight back to the low calling offset, undoing the
+    /// QSY and putting our R+report where the Fox is no longer listening.
+    #[tokio::test]
+    async fn hound_qsy_reanchors_the_known_good_offset_so_a_stall_never_reverts_it() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let mut rx = manager.subscribe();
+
+        // A Hound QSO calls the Fox low (calling region) with the Fox's own
+        // frequency latched as `partner_freq`.
+        let fox_rx_hz = 300.0;
+        let qso_id = manager
+            .engage_hound(DX, fox_rx_hz, None, None)
+            .await
+            .unwrap();
+        let before = manager.get_qso(qso_id).await.unwrap();
+        let calling_offset = before.metadata.frequency;
+        assert!(
+            calling_offset <= config_call_max(),
+            "precondition: the Hound calls inside the low calling region, got {calling_offset}"
+        );
+
+        // The Fox answers with a signal report: RespondingToCq ->
+        // SendingReport, which triggers the one-shot QSY.
+        manager
+            .process_message(
+                MessageType::SignalReport {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                    report: -12,
+                },
+                format!("{OUR} {DX} -12"),
+                fox_rx_hz,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            after.metadata.hound_qsyed,
+            "precondition: the Fox's report must trigger the Hound QSY"
+        );
+        let qsyed = after.metadata.frequency;
+        assert!(
+            (qsyed - calling_offset).abs() > f64::EPSILON,
+            "precondition: the QSY must actually move us out of the calling region"
+        );
+        assert_eq!(
+            after.metadata.last_known_good_offset_hz,
+            Some(qsyed),
+            "the known-good anchor must follow the QSY into the response region"
+        );
+
+        // Now the Fox goes silent. Two stalled `SendingReport` rearm cycles
+        // must produce a Switch (we're still on our known-good offset), NOT a
+        // Revert to the abandoned low calling offset.
+        let entered_at = after.metadata.last_call_at.unwrap();
+        let _ = drain(&mut rx);
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(entered_at + Duration::seconds(30))
+            .await;
+        let action = drain(&mut rx).into_iter().find_map(|e| match e {
+            QsoEvent::TxOffsetActionNeeded { action, .. } => Some(action),
+            _ => None,
+        });
+        assert_eq!(
+            action,
+            Some(OffsetAction::Switch { avoid_hz: qsyed }),
+            "a stalled Hound must search within the response region, never \
+             Revert to the pre-QSY calling offset"
+        );
+    }
+
+    /// The default Hound calling-region ceiling, for the precondition above.
+    fn config_call_max() -> f64 {
+        HoundRegions::default().call_max_hz
     }
 
     /// In the default Hold mode, `stall_cycles` may still tick (cheap
