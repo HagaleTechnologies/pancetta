@@ -527,6 +527,86 @@ fn drain_pending_autonomous_cq_dispatch_failures(
     }
 }
 
+/// Every offset in `active_tx_offsets` that belongs to some OTHER live QSO of
+/// ours — i.e. the whole current occupancy view minus the QSO being resolved.
+///
+/// PAN-72 (Codex round 4 on PR #350, finding 1). Round 1 gave the drain a
+/// batch-local `reserved_hz` so two QSOs switching in the SAME batch can't
+/// collapse onto one offset, but that set is empty for the very common shape
+/// where several QSOs are live and only one of them is switching: the others
+/// never enter the batch at all. Their offsets then reach the allocator only as
+/// [`crate::coordinator::autonomous`]'s soft `own_frequencies` `-50` score
+/// penalty (`frequency.rs`'s `score_candidate`), which that site's own comment
+/// admits is "effectively eliminates" rather than *does* eliminate — on a
+/// crowded band a clean candidate sitting on top of an existing stream can
+/// still outrank every alternative. Worse, the operator's own-frequency
+/// snapshot is only synced from this map LATER in the same tick
+/// (`set_own_frequencies`), so at drain time even that soft penalty is applied
+/// against the PREVIOUS tick's view.
+///
+/// Feeding these through the same hard `also_avoid_hz` channel the batch
+/// reservations use makes a switching QSO hard-avoid every other live stream,
+/// exactly as [`revert_target_is_taken`] already does for a `Revert` target.
+///
+/// Fails OPEN (empty list) on a poisoned lock, matching every other read of
+/// this map in this task: this is placement quality, not a TX-safety gate, and
+/// refusing to relocate stalled QSOs because a lock is poisoned would strand
+/// them on offsets that demonstrably are not working.
+fn other_live_tx_offsets(
+    qso_id: pancetta_qso::states::QsoId,
+    active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
+) -> Vec<f64> {
+    let own_key = super::active_tx_qso_key(&qso_id.to_string());
+    match active_tx_offsets.read() {
+        Ok(offsets) => offsets
+            .iter()
+            .filter(|(key, _)| **key != own_key)
+            .map(|(_, &hz)| hz)
+            .collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Is `target_hz` — a queued `OffsetAction::Revert`'s known-good offset — now
+/// within `min_separation_hz` of some OTHER live TX stream of ours?
+///
+/// PAN-72 (Codex round 2 on PR #350, finding 2). `active_tx_offsets` is the
+/// coordinator's own id→offset snapshot of every TX-active QSO (kept in sync
+/// with `active_tx_qsos`, including its 45 s completed-grace window — a QSO
+/// still inside that window is still keying its trailing 73, so its slot is
+/// genuinely still taken). `reserved_hz` covers offsets committed earlier in
+/// THIS drain batch, which the snapshot cannot know about yet.
+///
+/// The QSO's own entry is excluded: reverting onto the offset we ourselves
+/// already hold in the map is not a collision, and a `Revert` whose target
+/// equals our current offset is a harmless no-op the commit handles.
+///
+/// Fails OPEN (returns `false`) on a poisoned lock, matching every other read
+/// of this map in this task: this is a placement-quality check, not a TX-safety
+/// gate, and refusing every revert because a lock is poisoned would strand
+/// stalled QSOs on offsets that demonstrably are not working.
+fn revert_target_is_taken(
+    target_hz: f64,
+    qso_id: pancetta_qso::states::QsoId,
+    active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
+    reserved_hz: &[f64],
+    min_separation_hz: f64,
+) -> bool {
+    if reserved_hz
+        .iter()
+        .any(|&other| (target_hz - other).abs() < min_separation_hz)
+    {
+        return true;
+    }
+    let own_key = super::active_tx_qso_key(&qso_id.to_string());
+    match active_tx_offsets.read() {
+        Ok(offsets) => offsets
+            .iter()
+            .any(|(key, &hz)| *key != own_key && (target_hz - hz).abs() < min_separation_hz),
+        Err(_) => false,
+    }
+}
+
 /// PAN-72: resolves and commits every queued mid-QSO TX-offset action once
 /// per tick, mirroring `drain_pending_autonomous_cq_dispatch_failures`'s
 /// mailbox shape. `Switch` is resolved via the SAME `allocate_smart_frequency`
@@ -626,86 +706,6 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// stays as the *resolution* constraint — it is what keeps the allocator
 /// searching inside the region in the first place — but it is no longer what
 /// makes the outcome safe.
-/// Every offset in `active_tx_offsets` that belongs to some OTHER live QSO of
-/// ours — i.e. the whole current occupancy view minus the QSO being resolved.
-///
-/// PAN-72 (Codex round 4 on PR #350, finding 1). Round 1 gave the drain a
-/// batch-local `reserved_hz` so two QSOs switching in the SAME batch can't
-/// collapse onto one offset, but that set is empty for the very common shape
-/// where several QSOs are live and only one of them is switching: the others
-/// never enter the batch at all. Their offsets then reach the allocator only as
-/// [`crate::coordinator::autonomous`]'s soft `own_frequencies` `-50` score
-/// penalty (`frequency.rs`'s `score_candidate`), which that site's own comment
-/// admits is "effectively eliminates" rather than *does* eliminate — on a
-/// crowded band a clean candidate sitting on top of an existing stream can
-/// still outrank every alternative. Worse, the operator's own-frequency
-/// snapshot is only synced from this map LATER in the same tick
-/// (`set_own_frequencies`), so at drain time even that soft penalty is applied
-/// against the PREVIOUS tick's view.
-///
-/// Feeding these through the same hard `also_avoid_hz` channel the batch
-/// reservations use makes a switching QSO hard-avoid every other live stream,
-/// exactly as [`revert_target_is_taken`] already does for a `Revert` target.
-///
-/// Fails OPEN (empty list) on a poisoned lock, matching every other read of
-/// this map in this task: this is placement quality, not a TX-safety gate, and
-/// refusing to relocate stalled QSOs because a lock is poisoned would strand
-/// them on offsets that demonstrably are not working.
-fn other_live_tx_offsets(
-    qso_id: pancetta_qso::states::QsoId,
-    active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
-) -> Vec<f64> {
-    let own_key = super::active_tx_qso_key(&qso_id.to_string());
-    match active_tx_offsets.read() {
-        Ok(offsets) => offsets
-            .iter()
-            .filter(|(key, _)| **key != own_key)
-            .map(|(_, &hz)| hz)
-            .collect(),
-        Err(_) => Vec::new(),
-    }
-}
-
-/// Is `target_hz` — a queued `OffsetAction::Revert`'s known-good offset — now
-/// within `min_separation_hz` of some OTHER live TX stream of ours?
-///
-/// PAN-72 (Codex round 2 on PR #350, finding 2). `active_tx_offsets` is the
-/// coordinator's own id→offset snapshot of every TX-active QSO (kept in sync
-/// with `active_tx_qsos`, including its 45 s completed-grace window — a QSO
-/// still inside that window is still keying its trailing 73, so its slot is
-/// genuinely still taken). `reserved_hz` covers offsets committed earlier in
-/// THIS drain batch, which the snapshot cannot know about yet.
-///
-/// The QSO's own entry is excluded: reverting onto the offset we ourselves
-/// already hold in the map is not a collision, and a `Revert` whose target
-/// equals our current offset is a harmless no-op the commit handles.
-///
-/// Fails OPEN (returns `false`) on a poisoned lock, matching every other read
-/// of this map in this task: this is a placement-quality check, not a TX-safety
-/// gate, and refusing every revert because a lock is poisoned would strand
-/// stalled QSOs on offsets that demonstrably are not working.
-fn revert_target_is_taken(
-    target_hz: f64,
-    qso_id: pancetta_qso::states::QsoId,
-    active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
-    reserved_hz: &[f64],
-    min_separation_hz: f64,
-) -> bool {
-    if reserved_hz
-        .iter()
-        .any(|&other| (target_hz - other).abs() < min_separation_hz)
-    {
-        return true;
-    }
-    let own_key = super::active_tx_qso_key(&qso_id.to_string());
-    match active_tx_offsets.read() {
-        Ok(offsets) => offsets
-            .iter()
-            .any(|(key, &hz)| *key != own_key && (target_hz - hz).abs() < min_separation_hz),
-        Err(_) => false,
-    }
-}
-
 async fn drain_pending_qso_offset_requests(
     op: &mut pancetta_qso::AutonomousOperator,
     qso_manager: &pancetta_qso::QsoManager,
