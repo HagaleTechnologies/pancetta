@@ -520,6 +520,12 @@ pub struct QsoMetadata {
     /// state advance, and by `rearm_manual_calls_at` itself the moment it
     /// trips a switch/revert decision. See [`Self::last_known_good_offset_hz`]
     /// for what happens once this trips a switch (PAN-72).
+    ///
+    /// A rearm cycle whose re-send cannot reach the air — `TxPolicy::Disabled`,
+    /// the coordinator's hard TX mute — does NOT count (Codex round 2 on PR
+    /// #350, finding 5): silence we caused ourselves is not evidence about the
+    /// DX. Whatever was already accumulated from real transmissions is kept,
+    /// not reset.
     #[serde(default)]
     pub stall_cycles: u32,
 

@@ -2501,6 +2501,11 @@ impl super::ApplicationCoordinator {
         // stall detector only emits `TxOffsetActionNeeded` in Auto (Hold keeps
         // the offset sticky).
         qso_manager.set_tx_freq_mode_source(tx_freq_mode.clone());
+        // PAN-72 (Codex round 2 on PR #350, finding 5): share the global TX
+        // policy too, so the same stall detector does not count a rearm cycle
+        // whose re-send the `TxPolicy::Disabled` hard mute blocked outright —
+        // the DX cannot answer a frame that never went on the air.
+        qso_manager.set_tx_policy_source(tx_policy.clone());
 
         // Task 5 (QSOLogged/LoggedADIF): subscribe synchronously, before
         // `qso_manager` is moved into the spawned task below, so the WSJT-X

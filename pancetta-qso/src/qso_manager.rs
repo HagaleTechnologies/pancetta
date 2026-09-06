@@ -742,6 +742,25 @@ pub struct QsoManager {
     /// unit tests and any caller that never injects a source keep the
     /// hold-the-frequency behavior.
     tx_freq_mode: Arc<std::sync::atomic::AtomicU8>,
+
+    /// Global operator TX policy (`pancetta_core::TxPolicy` as `u8`), shared
+    /// from the coordinator.
+    ///
+    /// PAN-72 (Codex round 2 on PR #350, finding 5). The silence-driven stall
+    /// detector treats each per-slot re-send in `rearm_manual_calls_at` as
+    /// evidence that the DX heard us and did not answer. Under
+    /// `TxPolicy::Disabled` that inference is simply false: the coordinator's
+    /// `tx_hard_mute_reason` blocks the transmission outright, so the DX's
+    /// silence says nothing at all — yet the keep-calling loop still re-arms
+    /// every slot. Left uncounted... it was counted, and four muted cycles in
+    /// `TxFreqMode::Auto` moved an established QSO off a known-good offset
+    /// nothing had actually transmitted on.
+    ///
+    /// Defaults to a private `Full` atomic so unit tests and any caller that
+    /// never injects a source keep the pre-existing behavior (TX assumed
+    /// live). `Full` and `RespondOnly` both `allows_any_tx()`; only `Disabled`
+    /// suppresses the count, matching exactly what the hard mute blocks.
+    tx_policy: Arc<std::sync::atomic::AtomicU8>,
 }
 
 /// Outcome of the half-duplex parity-admission check for a *new* QSO.
@@ -952,6 +971,11 @@ impl QsoManager {
             tx_freq_mode: Arc::new(std::sync::atomic::AtomicU8::new(
                 pancetta_core::TxFreqMode::Hold.as_u8(),
             )),
+            // Default Full: with no injected source, assume TX is live — the
+            // pre-existing behavior (see the field's doc comment).
+            tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
+                pancetta_core::TxPolicy::Full.as_u8(),
+            )),
         }
     }
 
@@ -979,6 +1003,19 @@ impl QsoManager {
     /// its private `Hold` default (no autonomous frequency changes).
     pub fn set_tx_freq_mode_source(&mut self, source: Arc<std::sync::atomic::AtomicU8>) {
         self.tx_freq_mode = source;
+    }
+
+    /// Share the coordinator's global TX-policy atomic (encoded via
+    /// [`pancetta_core::TxPolicy::as_u8`]) so the silence-driven stall detector
+    /// can tell "the DX ignored us" apart from "we never actually transmitted".
+    ///
+    /// PAN-72 (Codex round 2 on PR #350, finding 5) — see the `tx_policy`
+    /// field's doc comment. Mirrors [`Self::set_tx_freq_mode_source`]: pass the
+    /// same `Arc<AtomicU8>` the TUI's policy toggle writes. If never called,
+    /// the manager keeps its private `Full` default and behaves exactly as
+    /// before.
+    pub fn set_tx_policy_source(&mut self, source: Arc<std::sync::atomic::AtomicU8>) {
+        self.tx_policy = source;
     }
 
     /// Create a new QSO manager with a database for persistent duplicate checking
@@ -5501,6 +5538,16 @@ impl QsoManager {
         // dropped — same reason `to_recall` above is collect-then-emit.
         let mut offset_actions_to_emit: Vec<(QsoId, OffsetAction, u32)> = Vec::new();
 
+        // PAN-72 (Codex round 2 on PR #350, finding 5): read the global TX
+        // policy ONCE for this pass. Under `Disabled` the coordinator's
+        // `tx_hard_mute_reason` blocks every frame this loop re-emits, so
+        // nothing goes on the air and the DX's continued silence is not
+        // evidence of anything. See the `tx_policy` field's doc comment.
+        let tx_muted = !pancetta_core::TxPolicy::from_u8(
+            self.tx_policy.load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .allows_any_tx();
+
         {
             let mut qsos = self.qsos.write().await;
             for (&qso_id, progress) in qsos.iter_mut() {
@@ -5620,14 +5667,26 @@ impl QsoManager {
                 // (`process_message_for_qso`) resets this to 0 elsewhere;
                 // this is now the sole increment site (see
                 // `QsoMetadata::stall_cycles`'s doc comment).
-                progress.metadata.stall_cycles = progress.metadata.stall_cycles.saturating_add(1);
+                //
+                // ...unless the TX path is muted (round 2, finding 5). A
+                // re-send that never leaves the rig is not a silent on-air
+                // cycle, and counting it would move the QSO off a known-good
+                // offset on the strength of silence we ourselves caused. The
+                // existing count is left INTACT rather than reset: whatever
+                // was accumulated came from real transmissions and is still
+                // valid evidence once TX resumes.
+                if !tx_muted {
+                    progress.metadata.stall_cycles =
+                        progress.metadata.stall_cycles.saturating_add(1);
+                }
 
                 let tx_auto = pancetta_core::TxFreqMode::from_u8(
                     self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
                 )
                 .allows_auto_change();
 
-                if tx_auto
+                if !tx_muted
+                    && tx_auto
                     && progress.metadata.stall_cycles >= self.config.timeouts.qso_stall_switch_after
                 {
                     let current = progress.metadata.frequency;
@@ -6051,6 +6110,7 @@ impl Clone for QsoManager {
             dial_frequency_hz: Arc::clone(&self.dial_frequency_hz),
             split_tx_frequency_hz: Arc::clone(&self.split_tx_frequency_hz),
             tx_freq_mode: Arc::clone(&self.tx_freq_mode),
+            tx_policy: Arc::clone(&self.tx_policy),
         }
     }
 }
@@ -14288,6 +14348,76 @@ mod pan72_stall_detection_tests {
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
             0,
             "stall_cycles must reset once the action is emitted"
+        );
+    }
+
+    /// PAN-72 (Codex round 2 on PR #350, finding 5): while `TxPolicy` is
+    /// `Disabled` the coordinator's hard TX mute blocks every frame this loop
+    /// re-emits. The keep-calling loop still re-arms each slot, but nothing
+    /// goes on the air — so the DX's continued silence is evidence of nothing,
+    /// and counting it used to walk an established QSO off its known-good
+    /// offset after four muted cycles without a single transmission.
+    #[tokio::test]
+    async fn a_muted_tx_path_does_not_count_rearm_cycles_as_stalls() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let mut manager = manager_auto(config);
+        let policy = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxPolicy::Disabled.as_u8(),
+        ));
+        manager.set_tx_policy_source(Arc::clone(&policy));
+        let mut rx = manager.subscribe();
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // Four muted rearm cycles — twice the switch threshold.
+        for slot in 1..=4 {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+                .await;
+        }
+
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "a rearm cycle the TX mute swallowed must not count as a silent \
+             on-air cycle"
+        );
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. })),
+            "no offset action may be raised while TX is muted, got {events:?}"
+        );
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.frequency,
+            FREQ,
+            "the QSO must still be on its original offset"
+        );
+
+        // Re-enabling TX resumes normal stall accounting from where it was.
+        policy.store(
+            pancetta_core::TxPolicy::Full.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15 * 5))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "the first genuinely transmitted cycle after the mute lifts counts"
         );
     }
 
