@@ -636,7 +636,12 @@ impl CoordSim {
             })
             .collect();
         let active = self.active_tx_qsos.clone();
-        let outcome = coalesce_transmit_requests(drained, |id| tx_qso_is_live_shared(id, &active));
+        // This harness doesn't model `max_concurrent_qsos` — pass an
+        // effectively-unbounded value so the only cap in play is the
+        // production hard backstop (`MAX_RETAINED_TX_STREAMS`), matching
+        // this simulator's pre-existing behavior.
+        let outcome =
+            coalesce_transmit_requests(drained, u32::MAX, |id| tx_qso_is_live_shared(id, &active));
 
         // Record what coalescing / the gate removed, with a best-effort reason.
         // (We can't tell apart "coalesced" vs "dropped_terminal" per-entry from
