@@ -3455,6 +3455,29 @@ mod drain_pending_qso_offset_requests_tests {
         op
     }
 
+    /// [`operator_with_live_allocator`] with `min_separation_hz` set so large
+    /// that the allocator's hard exclusions filter out every candidate on both
+    /// of its resolution paths — the state in which it returns `avoid_hz`
+    /// unchanged ("no valid relocation exists"). Mirrors `pancetta-qso`'s own
+    /// `allocate_smart_frequency_returns_avoid_hz_unchanged_when_the_hard_filter_empties_out`.
+    #[allow(clippy::field_reassign_with_default)]
+    fn operator_with_impossible_separation() -> pancetta_qso::AutonomousOperator {
+        let mut config = pancetta_qso::AutonomousConfig::default();
+        config.enabled = true;
+        config.frequency.min_separation_hz = 10_000.0;
+        let mut op =
+            pancetta_qso::AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        op
+    }
+
     use super::drain_auto_mode as auto_mode;
 
     /// Hold = every queued action is discarded at drain time, whatever the
@@ -4075,23 +4098,7 @@ mod drain_pending_qso_offset_requests_tests {
     async fn a_no_op_resolution_preserves_the_stall_evidence() {
         // An operator whose exclusion separation is impossible to honor, so
         // every candidate is filtered out and the allocator returns avoid_hz.
-        let mut op = {
-            #[allow(clippy::field_reassign_with_default)]
-            let mut config = pancetta_qso::AutonomousConfig::default();
-            config.enabled = true;
-            config.frequency.min_separation_hz = 10_000.0;
-            let mut op =
-                pancetta_qso::AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
-            op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
-                pancetta_core::TxFreqMode::Auto.as_u8(),
-            )));
-            op.update_spectral(pancetta_qso::frequency::SpectralSnapshot {
-                power_bins: vec![0.0f32; 140],
-                freq_min_hz: 200.0,
-                freq_max_hz: 2800.0,
-            });
-            op
-        };
+        let mut op = operator_with_impossible_separation();
         let qso_manager = manager();
         // A manual answer (not `start_cq`): `rearm_manual_calls_at` re-sends —
         // and therefore counts a silent cycle against — a `RespondingToCq` QSO,
