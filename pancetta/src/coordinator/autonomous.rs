@@ -695,6 +695,19 @@ fn revert_target_is_taken(
 /// forwarder does not consider this QSO TX-active, and resurrecting it here
 /// would re-admit a QSO the `Failed`/completion purge just removed.
 ///
+/// **Switches are scored against the QSO's own TX parity** (round 6, finding
+/// 4). An in-progress QSO's `metadata.tx_parity` is latched at creation and
+/// every frame it emits goes out on it, so it is authoritative — and the
+/// `None` this drain used to pass put `rank_candidates_with_parity` on its
+/// slot-blind path, where a frequency quiet only in the OPPOSITE (listening)
+/// slot can outrank one genuinely clear in the slot we will actually key in.
+/// Adaptive recovery could therefore move a colliding QSO straight into another
+/// collision. Parity affects scoring only — it never filters a candidate out —
+/// so this can improve the pick but never make the search fail, and a QSO with
+/// no latched parity (or none found at all) degrades to exactly the previous
+/// behaviour. Both resolution paths take it: the ordinary `Switch` and the
+/// occupied-target `Revert` fallback.
+///
 /// **Hound windows are revalidated at commit time** (round 4, finding 2). The
 /// window this drain resolves against comes from a `get_qso` snapshot taken
 /// before the allocator runs, and the Fox's report can perform the mandatory
@@ -757,6 +770,19 @@ async fn drain_pending_qso_offset_requests(
             pancetta_qso::qso_manager::hound_switch_range_hz(p, qso_manager.config())
         });
         let current_hz = progress.as_ref().map(|p| p.metadata.frequency);
+        // Round 6, finding 4: an in-progress QSO's TX parity is LATCHED
+        // (`respond_to_cq` flips the DX's, `start_cq` passes our own) and every
+        // frame it emits goes out on it, so it is authoritative here — and
+        // passing `None` put `rank_candidates_with_parity` on its slot-blind
+        // scoring path. Slot-blind, a frequency that is quiet only in the
+        // OPPOSITE (listening) slot outranks one genuinely clear in the slot we
+        // will actually key in, so adaptive recovery could move a colliding QSO
+        // straight into another collision. Parity affects scoring only — it
+        // never filters a candidate out — so this can make the pick better but
+        // never make the search fail. `None` stays the correct answer when the
+        // QSO is gone or has not latched a parity: that degrades to exactly the
+        // previous behaviour.
+        let target_parity = progress.as_ref().and_then(|p| p.metadata.tx_parity);
         // Round 4, finding 1: the hard exclusion set is this batch's own
         // reservations PLUS every other live QSO's current offset. The latter
         // never enter the batch when they are not themselves switching, and a
@@ -768,7 +794,7 @@ async fn drain_pending_qso_offset_requests(
             pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } => op
                 .allocate_smart_frequency_in_range(
                     None,
-                    None,
+                    target_parity,
                     Some(avoid_hz),
                     &exclusions_hz,
                     range_hz,
@@ -803,7 +829,7 @@ async fn drain_pending_qso_offset_requests(
                     also_avoid.push(target_hz);
                     op.allocate_smart_frequency_in_range(
                         None,
-                        None,
+                        target_parity,
                         Some(current_hz.unwrap_or(target_hz)),
                         &also_avoid,
                         range_hz,
@@ -3560,6 +3586,123 @@ mod drain_pending_qso_offset_requests_tests {
             "Switch must resolve to something other than the avoided 1500 Hz via the allocator, \
              got {}",
             progress.metadata.frequency
+        );
+    }
+
+    /// PAN-72 (Codex round 6 on PR #350, finding 4): an in-progress QSO's
+    /// LATCHED TX parity must reach the allocator. Passing `None` put
+    /// `rank_candidates_with_parity` on its slot-blind scoring path, where a
+    /// frequency that is quiet only in the OPPOSITE (listening) slot can
+    /// outrank one genuinely clear in the slot we will actually key in — so
+    /// adaptive recovery could move a colliding QSO straight into another
+    /// collision.
+    ///
+    /// The decode history below is built so the two scoring paths genuinely
+    /// disagree (asserted as a premise, so this test cannot silently stop
+    /// testing anything): the whole band is busy in the QSO's own First/Even TX
+    /// slot except one pocket that is busy only in the opposite slot, plus one
+    /// lightly-used pocket in our own slot that the slot-blind path prefers.
+    #[tokio::test]
+    async fn switch_scores_against_the_qsos_own_tx_parity() {
+        use pancetta_qso::DecodedMessageInfo;
+
+        fn decode(freq_hz: f64, parity: SlotParity) -> DecodedMessageInfo {
+            DecodedMessageInfo {
+                callsign: Some("W9AAA".to_string()),
+                frequency_hz: freq_hz,
+                snr: -10,
+                message_text: "CQ W9AAA EM10".to_string(),
+                slot_parity: Some(parity),
+                confidence: None,
+                time_offset_s: None,
+                decode_origin: None,
+            }
+        }
+
+        const AVOID_HZ: f64 = 1500.0;
+        // Busy only in the OPPOSITE slot: irrelevant to our transmission, so
+        // the parity-aware path should like it.
+        const OPPOSITE_SLOT_POCKET_HZ: f64 = 1200.0;
+        // Lightly used in OUR OWN slot: a real collision risk, but so lightly
+        // used that the slot-blind path scores it best of all.
+        const OWN_SLOT_POCKET_HZ: f64 = 2700.0;
+
+        let mut op = operator_with_live_allocator();
+        let mut decodes = Vec::new();
+        // Saturate our own (First/Even) slot right across the band, leaving the
+        // two pockets out.
+        let mut hz = 200.0;
+        while hz <= 2800.0 {
+            if hz != OPPOSITE_SLOT_POCKET_HZ && hz != OWN_SLOT_POCKET_HZ {
+                for _ in 0..3 {
+                    decodes.push(decode(hz, SlotParity::Even));
+                }
+            }
+            hz += 100.0;
+        }
+        for _ in 0..6 {
+            decodes.push(decode(OPPOSITE_SLOT_POCKET_HZ, SlotParity::Odd));
+        }
+        decodes.push(decode(OWN_SLOT_POCKET_HZ, SlotParity::Even));
+        op.feed_decoded_messages(&decodes, &pancetta_qso::NullDxEvaluator);
+
+        let parity_pick = op.allocate_smart_frequency_in_range(
+            None,
+            Some(SlotParity::Even),
+            Some(AVOID_HZ),
+            &[],
+            None,
+        );
+        let slot_blind_pick =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID_HZ), &[], None);
+        assert_ne!(
+            parity_pick, slot_blind_pick,
+            "test premise: this decode history must make the two scoring paths \
+             disagree, otherwise the assertion below proves nothing"
+        );
+
+        let qso_manager = manager();
+        let qso_id = qso_manager
+            .start_cq(AVOID_HZ, Some(SlotParity::Even), false)
+            .await
+            .expect("start_cq should succeed");
+        assert_eq!(
+            qso_manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .tx_parity,
+            Some(SlotParity::Even),
+            "precondition: the QSO latched the TX parity the drain must use"
+        );
+
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: AVOID_HZ },
+            ),
+        ]);
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+        )
+        .await;
+
+        let (_, progress) = qso_manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .find(|(id, _)| *id == qso_id)
+            .unwrap();
+        assert_eq!(
+            progress.metadata.frequency, parity_pick,
+            "the switch must be scored against the QSO's own TX slot ({parity_pick} Hz), \
+             not the slot-blind path ({slot_blind_pick} Hz) which prefers a pocket \
+             that is only quiet in the opposite listening slot"
         );
     }
 
