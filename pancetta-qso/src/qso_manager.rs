@@ -217,10 +217,11 @@ const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
 
 /// How long the offset a QSO just moved away from
 /// ([`crate::states::QsoMetadata::pre_switch_offset`]) stays a valid RX
-/// baseline, and stays the offset a forward advance is credited to.
+/// baseline, and stays the offset a forward advance is credited to — two
+/// transmit slots of the ACTIVE protocol.
 ///
-/// PAN-72 (Codex round 4 on PR #350, finding 3). Two FT8 slots. The frame that
-/// TRIGGERS a relocation is emitted on the old offset by the very
+/// PAN-72 (Codex round 4 on PR #350, finding 3). The frame that TRIGGERS a
+/// relocation is emitted on the old offset by the very
 /// [`QsoManager::rearm_manual_calls_at`] pass that trips the stall threshold,
 /// and the coordinator's once-per-slot drain commits the move only afterwards —
 /// so the last pre-switch transmission is at most one slot old when the QSO
@@ -237,19 +238,31 @@ const ESTABLISHED_FREQ_TOLERANCE_HZ: f64 = 100.0;
 /// `dx_frame_advanced` crediting block in `process_message_for_qso`. The
 /// window's job is only to bound how long the vacated offset stays worth
 /// considering at all.
-const PRE_SWITCH_OFFSET_GRACE: chrono::Duration = chrono::Duration::seconds(30);
+///
+/// Round 8 redesign (fix 1): originally a hardcoded `chrono::Duration::seconds(30)`
+/// constant — "two FT8 slots" only by coincidence, since FT4's slot is 7.5 s
+/// and FT2's is 3.2 s. Now derived from the SAME `active_slot_ns` atomic
+/// [`rearm_slot_millis_from_ns`] already converts, so the grace window scales
+/// with whichever protocol is actually running. A public free function
+/// (mirroring [`rearm_slot_millis_from_ns`]) so the coordinator can derive
+/// the identical value from its own copy of the `active_slot_ns` atomic —
+/// one source of truth, two call sites.
+pub fn pre_switch_offset_grace_from_slot_ns(slot_ns: i64) -> chrono::Duration {
+    chrono::Duration::milliseconds(2 * rearm_slot_millis_from_ns(slot_ns))
+}
 
 /// The offset this QSO moved away from, if it did so recently enough for a
 /// reply to the last frame we sent there to still be arriving — see
-/// [`PRE_SWITCH_OFFSET_GRACE`] and
+/// [`pre_switch_offset_grace_from_slot_ns`] and
 /// [`crate::states::QsoMetadata::pre_switch_offset`].
 fn live_pre_switch_offset_at(
     metadata: &crate::states::QsoMetadata,
     now: DateTime<Utc>,
+    grace: chrono::Duration,
 ) -> Option<crate::states::PreSwitchOffset> {
     metadata
         .pre_switch_offset
-        .filter(|pre| now.signed_duration_since(pre.left_at) <= PRE_SWITCH_OFFSET_GRACE)
+        .filter(|pre| now.signed_duration_since(pre.left_at) <= grace)
 }
 
 /// FIX B (one-QSO-per-(callsign,band) close idempotency,
@@ -1335,6 +1348,16 @@ impl QsoManager {
     /// rearm/stall cadence. See [`rearm_slot_millis_from_ns`].
     fn rearm_slot_millis(&self) -> i64 {
         rearm_slot_millis_from_ns(
+            self.active_slot_ns
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
+    /// The live [`pre_switch_offset_grace_from_slot_ns`] window for the
+    /// currently active protocol (PAN-72 round-8 redesign, fix 1) — reads the
+    /// same `active_slot_ns` atomic [`Self::rearm_slot_millis`] does.
+    fn pre_switch_offset_grace(&self) -> chrono::Duration {
+        pre_switch_offset_grace_from_slot_ns(
             self.active_slot_ns
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
@@ -3832,7 +3855,11 @@ impl QsoManager {
                 // Consumed here either way: the first advance after a switch is
                 // the one that resolves the ambiguity, and everything after it
                 // is unambiguously about the current offset.
-                let vacated = live_pre_switch_offset_at(&progress.metadata, message.timestamp);
+                let vacated = live_pre_switch_offset_at(
+                    &progress.metadata,
+                    message.timestamp,
+                    self.pre_switch_offset_grace(),
+                );
                 let current_hz = progress.metadata.frequency;
                 progress.metadata.last_known_good_offset_hz = Some(match vacated {
                     None => current_hz,
@@ -5220,7 +5247,7 @@ impl QsoManager {
             };
             let matches_baseline = |baseline: f64| (baseline - frequency).abs() <= tolerance;
             matches_baseline(match_frequency)
-                || live_pre_switch_offset_at(metadata, Utc::now())
+                || live_pre_switch_offset_at(metadata, Utc::now(), self.pre_switch_offset_grace())
                     .is_some_and(|pre| matches_baseline(pre.offset_hz))
         });
         if !within_frequency_gate {
@@ -5491,7 +5518,7 @@ impl QsoManager {
             };
             let matches_baseline = |baseline: f64| (baseline - frequency).abs() <= tolerance;
             if !matches_baseline(match_freq)
-                && !live_pre_switch_offset_at(metadata, Utc::now())
+                && !live_pre_switch_offset_at(metadata, Utc::now(), self.pre_switch_offset_grace())
                     .is_some_and(|pre| matches_baseline(pre.offset_hz))
             {
                 return false;
@@ -15342,6 +15369,36 @@ mod pan72_stall_detection_tests {
         assert_eq!(manager.rearm_slot_millis(), 15_000);
     }
 
+    /// PAN-72 round-8 redesign (fix 1): `PRE_SWITCH_OFFSET_GRACE` used to be a
+    /// hardcoded 30 s literal that only matched FT8's 15 s slot by
+    /// coincidence. It must instead be derived from the SAME `active_slot_ns`
+    /// atomic `rearm_slot_millis_from_ns` already converts, as two slot
+    /// durations, for every protocol.
+    #[test]
+    fn pre_switch_offset_grace_scales_with_the_active_slot() {
+        assert_eq!(
+            pre_switch_offset_grace_from_slot_ns(15_000_000_000),
+            Duration::milliseconds(30_000)
+        );
+        assert_eq!(
+            pre_switch_offset_grace_from_slot_ns(7_500_000_000),
+            Duration::milliseconds(15_000)
+        );
+        assert_eq!(
+            pre_switch_offset_grace_from_slot_ns(3_200_000_000),
+            Duration::milliseconds(6_400)
+        );
+    }
+
+    /// The never-injected default (FT8's 15 s slot) must still produce
+    /// today's 30 s grace, so every existing caller keeps byte-identical
+    /// behavior.
+    #[test]
+    fn the_default_pre_switch_offset_grace_is_unchanged() {
+        let manager = QsoManager::new(test_config());
+        assert_eq!(manager.pre_switch_offset_grace(), Duration::milliseconds(30_000));
+    }
+
     /// Injecting the coordinator's `active_slot_ns` atomic (FT4's 7.5 s in ns)
     /// drives the rearm/stall cadence — and does so WITHOUT touching
     /// `config.active_mode`, proving the atomic, not the cloned config, is the
@@ -16620,7 +16677,7 @@ mod pan72_stall_detection_tests {
 
         progress.metadata.pre_switch_offset = Some(crate::states::PreSwitchOffset {
             offset_hz: FREQ,
-            left_at: Utc::now() - PRE_SWITCH_OFFSET_GRACE - Duration::seconds(1),
+            left_at: Utc::now() - manager.pre_switch_offset_grace() - Duration::seconds(1),
             operator_forced: true,
         });
         assert!(
