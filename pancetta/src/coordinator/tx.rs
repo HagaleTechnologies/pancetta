@@ -3626,7 +3626,9 @@ async fn supersede_multi_reenqueue(
             }
         }
         SupersedeOutcome::Replace {
-            origin: new_origin,
+            // Round 6: no longer re-enqueued (see below), so the superseding
+            // request's own origin has nothing left to gate.
+            origin: _new_origin,
             qso_id: new_qso_id,
         } => {
             // PR #348 review round 2 (Codex P2): the multi-TX arm's in-flight
@@ -3640,10 +3642,7 @@ async fn supersede_multi_reenqueue(
             // make room for one new request would burn all of their recorded
             // attempts for nothing. Preserve the in-flight bundle unchanged
             // (re-encoding happens fresh at pickup time, so there's no
-            // staleness concern) and defer the new, over-cap request as its
-            // own request for the coalescer to retry next cycle — same
-            // "excluded, not gone" semantics as a parity/frequency conflict
-            // exclusion elsewhere in this file.
+            // staleness concern).
             if !in_flight_items.is_empty() {
                 let preserve = ComponentMessage::new(
                     ComponentId::Ft8Transmitter,
@@ -3662,27 +3661,41 @@ async fn supersede_multi_reenqueue(
                     );
                 }
             }
-            let reenqueue = ComponentMessage::new(
+            // PR #348 review round 6 (Codex P1): do NOT re-enqueue the
+            // over-cap new request behind the just-preserved bundle — the
+            // worker dequeues that bundle next, and its own pre-PTT/pre-audio
+            // wait (`interruptible_sleep_or_supersede`) would immediately
+            // find this exact request sitting right behind it and treat it
+            // as a fresh supersede of the bundle it hasn't even started
+            // transmitting yet, re-entering this same arm and re-enqueueing
+            // the identical pair forever — a livelock where the bundle never
+            // actually transmits. Drop it instead, matching this file's
+            // established "excluded, not gone" semantics for parity/
+            // frequency conflicts and cap truncation elsewhere: the QSO's
+            // own keep-call/rearm cadence produces a fresh request next
+            // cycle, evaluated fresh against whatever the in-flight bundle
+            // looks like by then.
+            info!(
+                target: "pancetta::tx.policy",
+                "supersede (multi-TX): dropping over-cap request '{}' rather than requeueing it \
+                 behind the preserved bundle (would livelock); its own cadence will retry next cycle",
+                scratch_text
+            );
+            let complete_msg = ComponentMessage::new(
                 ComponentId::Ft8Transmitter,
-                ComponentId::Ft8Transmitter,
-                MessageType::TransmitRequest {
+                ComponentId::Autonomous,
+                MessageType::TransmitComplete {
+                    success: false,
                     message_text: scratch_text,
-                    frequency_offset: scratch_freq,
-                    // PAN-38 round 4 (Codex): now threaded through
-                    // `SupersedeOutcome::Replace` instead of always `None`
-                    // ("manual (drop-stale-ungated) send").
+                    duration_ms: 0,
                     qso_id: new_qso_id,
-                    tx_parity: None,
-                    // The re-enqueued replace carries the NEW request's origin so
-                    // the pickup-time gate re-evaluates against IT, not the
-                    // aborted in-flight bundle's origin (aligns with the C1 fix).
-                    origin: new_origin,
                 },
                 Instant::now(),
             );
-            if let Err(e) = message_bus.send_message(reenqueue).await {
-                warn!("supersede (multi-TX): failed to re-enqueue replace: {}", e);
+            if let Err(e) = message_bus.send_message(complete_msg).await {
+                warn!("Failed to send TransmitComplete: {}", e);
             }
+            let _ = scratch_freq; // written by supersede_and_rekey_or_bundle, unused on this path
         }
     }
 }
@@ -5117,7 +5130,14 @@ impl super::ApplicationCoordinator {
                                                                 ComponentId::Ft8Transmitter,
                                                                 MessageType::MultiTransmitRequest {
                                                                     items,
-                                                                    tx_parity: None,
+                                                                    // PR #348 review round 6 (Codex
+                                                                    // P1): carry the in-flight
+                                                                    // single item's own established
+                                                                    // parity forward, not None --
+                                                                    // same reasoning as
+                                                                    // supersede_multi_reenqueue's
+                                                                    // bundle_tx_parity fix.
+                                                                    tx_parity,
                                                                     // Fail-safe folded origin, not
                                                                     // the aborted frame's origin.
                                                                     origin: bundle_origin,
@@ -5414,7 +5434,11 @@ impl super::ApplicationCoordinator {
                                                                 ComponentId::Ft8Transmitter,
                                                                 MessageType::MultiTransmitRequest {
                                                                     items,
-                                                                    tx_parity: None,
+                                                                    // PR #348 review round 6 (Codex
+                                                                    // P1): carry the in-flight
+                                                                    // single item's own established
+                                                                    // parity forward, not None.
+                                                                    tx_parity,
                                                                     // Fail-safe folded origin.
                                                                     origin: bundle_origin,
                                                                 },
@@ -9079,6 +9103,8 @@ mod supersede_rekey_tests {
             .create_channel(ComponentId::Ft8Transmitter)
             .await
             .unwrap();
+        let (_autonomous_tx, autonomous_rx) =
+            bus.create_channel(ComponentId::Autonomous).await.unwrap();
 
         let mut encoder = super::Ft8Encoder::new();
         let tx_params = pancetta_ft8::ProtocolParams::from_protocol(pancetta_ft8::Protocol::Ft8);
@@ -9157,25 +9183,35 @@ mod supersede_rekey_tests {
             other => panic!("expected the preserved MultiTransmitRequest, got {other:?}"),
         }
 
-        // The over-cap new request is deferred as its own request.
-        let deferred = tx_rx
+        // PR #348 review round 6 (Codex P1): the over-cap new request must
+        // NOT be re-enqueued onto the transmitter channel at all — doing so
+        // livelocks (the worker's very next pre-PTT/pre-audio wait would
+        // find it sitting right behind the just-preserved bundle and treat
+        // it as an immediate fresh supersede, re-entering this same arm
+        // forever). Nothing else goes to the transmitter channel.
+        assert!(
+            tx_rx.try_recv().is_err(),
+            "exactly one message re-enqueued to the transmitter: the preserved bundle — the \
+             over-cap request must be dropped, not requeued behind it"
+        );
+
+        // Instead, a failed TransmitComplete reports the drop.
+        let complete = autonomous_rx
             .try_recv()
-            .expect("the over-cap new request must be deferred, not dropped");
-        match deferred.message_type {
-            MessageType::TransmitRequest {
+            .expect("a failed TransmitComplete must report the dropped over-cap request");
+        match complete.message_type {
+            MessageType::TransmitComplete {
+                success,
                 message_text,
                 qso_id,
                 ..
             } => {
+                assert!(!success, "the dropped over-cap request must report failure");
                 assert_eq!(message_text, "THIRD W5AU EM10");
                 assert_eq!(qso_id.as_deref(), Some("qso-third"));
             }
-            other => panic!("expected the deferred TransmitRequest, got {other:?}"),
+            other => panic!("expected TransmitComplete, got {other:?}"),
         }
-        assert!(
-            tx_rx.try_recv().is_err(),
-            "exactly two messages re-enqueued: the preserved bundle and the deferred request"
-        );
     }
 
     /// PR #348 review round 4 (Codex P1): a raised effective cap (e.g. Fox
