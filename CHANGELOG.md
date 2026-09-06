@@ -21,6 +21,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   identical-repeat `+300 Hz` hop, which never noticed silence and ignored both
   the spectrum and our other active streams. `[autonomous]
   cq_no_response_switch_after` default lowered 5 → 4 to match.
+  Safeguards on the switch decision: concurrent QSOs resolved in the same
+  slot are reserved against each other so two streams can never collapse onto
+  one offset; a queued action is discarded if you switch to `HOLD`, if the QSO
+  finished, or if the DX answered before it could be committed; a Hound's
+  procedure-mandated QSY becomes the offset a later revert returns to (never
+  one it moves away from); a caller answering an unanswered CQ counts as
+  progress, so the CQ's stall streak does not carry into the exchange; a `u`
+  nudge pressed before enough decode history has accumulated is retried rather
+  than dropped; and an applied move refreshes the QSO banner immediately
+  instead of waiting for the next state change.
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 

@@ -122,7 +122,9 @@ tested.
 - Remove `DX_STUCK_REPEAT_THRESHOLD`, `STUCK_TX_HOP_HZ`, and `stuck_hopped_offset` — the inline
   hop in `process_message_for_qso` (currently ~qso_manager.rs:2984-3033) is replaced by the
   generalized path below. One mechanism, not two.
-- New `QsoEvent::TxOffsetActionNeeded { qso_id: QsoId, action: OffsetAction }` where:
+- New `QsoEvent::TxOffsetActionNeeded { qso_id: QsoId, action: OffsetAction,
+  raised_at_generation: u32 }` (the generation field added by Codex round 1, finding 8;
+  the coordinator's mailbox element is the matching `OffsetActionRequest` struct) where:
   ```rust
   pub enum OffsetAction {
       /// We're on the known-good offset (or none is recorded yet) — find a new one.
@@ -141,8 +143,25 @@ tested.
   last_known_good_offset_hz.unwrap()}`. This is the ping-pong: switch away from known-good on
   first stall, revert to known-good on a second stall while on the switched offset, switch away
   again if it stalls a third time, and so on.
-- New `pub async fn apply_tx_offset_switch(&self, qso_id: QsoId, new_offset_hz: f64) ->
-  Result<f64, QsoManagerError>` — the one external mutation entry point. Sets
+- New `pub async fn apply_tx_offset_switch(&self, qso_id: QsoId, new_offset_hz: f64,
+  raised_at_generation: Option<u32>) -> Result<f64, QsoManagerError>` — the one external
+  mutation entry point. **Amended by Codex round 1 on PR #350 (findings 3 and 8):** two
+  staleness guards run before ANY field is touched, because the coordinator drains its
+  mailbox only once per 15-second slot. (a) A terminal QSO is refused with
+  `QsoManagerError::QsoNotActive` — completed entries stay in the map and stay in the
+  coordinator's active snapshots for the 45s trailing-73 grace window, so a late action
+  still *finds* its QSO; `QsoState::set_frequency` already refused terminal states but
+  `metadata.frequency` did not, so the write went through and the drain mirrored a phantom
+  offset into `active_tx_offsets`. (b) `raised_at_generation` is the QSO's new
+  `QsoMetadata::advance_generation` (bumped in lockstep with the `stall_cycles` reset and
+  the `last_known_good_offset_hz` record) at the moment the action was raised; if it has
+  moved since, the DX answered in between and the request is refused with
+  `QsoManagerError::OffsetActionStale` rather than dragging the QSO off the offset that just
+  worked. `None` means operator-forced (`u`), which is current by construction. Both
+  refusals answer `true` to `QsoManagerError::is_expected_offset_action_refusal` and the
+  drain logs them at `debug!`, not `warn!`. On success it also emits the new
+  `QsoEvent::TxOffsetApplied` (finding 7) so the coordinator can rebuild the
+  `ActiveQsosSnapshot`. Sets
   `metadata.frequency` **and the QSO state's own embedded frequency** (via
   `QsoState::set_frequency`, mirroring the Hound QSY block: `Completed` is built from the
   preceding state's `frequency`, so metadata alone would log the pre-switch offset), clamps
@@ -175,9 +194,9 @@ tested.
   `AutonomousOperator`) so the coordinator — a separate crate (`pancetta`), for which
   `pub(crate)` would not suffice — can call it. No signature change.
 - New drain step in the existing tick arm, mirroring
-  `drain_pending_autonomous_cq_dispatch_failures`: for each queued `(qso_id, action)`, resolve
-  `Switch{avoid_hz}` via `op.allocate_smart_frequency(None, None, Some(avoid_hz))`, or use
-  `target_hz` directly for `Revert`; either way, call
+  `drain_pending_autonomous_cq_dispatch_failures`: for each queued `OffsetActionRequest`, resolve
+  `Switch{avoid_hz}` via `op.allocate_smart_frequency_avoiding(None, None, Some(avoid_hz),
+  &reserved_hz)`, or use `target_hz` directly for `Revert`; either way, call
   `qso_manager.apply_tx_offset_switch(qso_id, resolved_hz).await`. Runs unconditionally
   (independent of `autonomous_enabled_runtime`/`tx_policy` — a metadata write is harmless even if
   nothing will transmit on it; actual TX gating still happens downstream at dispatch time as
@@ -194,6 +213,29 @@ tested.
   refreshed only on a `StateChanged` carrying a frequency, so without the mirror the allocator's
   self-avoidance — and the manual nudge's `avoid_hz`, read from the same map — would keep seeing
   the pre-switch offset until the QSO's next state transition.
+- **Amended by Codex round 1 on PR #350.** Three further guards on the drain:
+  - *Finding 6 — re-read `tx_freq_mode` at commit time.* An action queued under Auto can be
+    drained after the operator presses `f` for Hold. A `Switch` would then resolve through
+    `allocate_smart_frequency`'s Hold early return (which ignores `avoid_hz` and hands back
+    the *parked* offset, dragging a held QSO onto it) and a `Revert` never consults the
+    allocator at all — both violate Hold's stickiness. The whole batch is discarded once the
+    mode reads Hold. The TUI's `u` handler applies the same gate at *enqueue* time; both ends
+    are needed, because the mode can flip in between.
+  - *Finding 1 — reserve each committed offset for the rest of the batch.* The operator's
+    own-frequency snapshot is synced from `active_tx_offsets` only LATER in the same tick
+    (`set_own_frequencies`), so every `Switch` in one batch would otherwise rank against the
+    identical stale view, each excluding only its own original offset — two concurrent QSOs
+    could land on the same "best" candidate. The drain accumulates every offset it actually
+    commits (`Revert` targets included) and passes them to
+    `allocate_smart_frequency_avoiding` as extra HARD exclusions, matching how `avoid_hz`
+    itself was promoted from the soft `own_frequencies` penalty in Codex round 6 on PR #276.
+    Bounded today by `max_concurrent_qsos` (default 1), but real the moment that is raised.
+  - *Finding 7 — refresh the UI snapshot.* `apply_tx_offset_switch` now emits
+    `QsoEvent::TxOffsetApplied`; the QSO event-forwarder's new arm calls the extracted
+    `push_active_qso_snapshot` helper (shared with the pre-existing `StateChanged`/
+    `QsoCompleted`/`QsoFailed` push sites). Without it the banner and the TX-placement
+    stream marker keep the pre-switch offset through multiple switch/revert cycles — a
+    stalled exchange is precisely where no further state transition arrives.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 
@@ -210,6 +252,17 @@ tested.
     no-op or drag a held QSO onto the park offset while the status line claimed a nudge; instead
     the operator gets "TX offset is Hold — press `f` for Auto to enable nudging" and neither the
     mailbox nor the CQ flag is touched.
+  - **Amended by Codex round 1 on PR #350 (finding 4):** the Hold gate is hoisted ABOVE the
+    active-QSO branch, so a Hold-mode `u` with NO active QSO also reports `HeldNoOp` instead
+    of a phantom CQ nudge (`decide_at` computes `should_switch = self.tx_freq_auto() && ...`,
+    so a flag armed in Hold is consumed and discarded). The finding's second half — "in Auto
+    but not currently CQ-hunting the request is also discarded" — is deliberately NOT gated:
+    `AutonomousOperator::state` is private to the autonomous task with no shared snapshot or
+    atomic carrying it, and any value the relay could read at keypress time would be a
+    prediction anyway (`decide_at` re-evaluates `idle_cycles >= cq_after_idle_cycles` for
+    that cycle). The outcome is instead named `CqNudgeArmed` and the status line says
+    "CQ-offset nudge armed — applies on the next CQ cycle". Finding 9 additionally stops such
+    a request being lost when that cycle arrives with thin decode history.
   - Else, if the Autonomous task's current state is `CallingCq` (hunting), trigger today's
     CQ-switch immediately: a new `pending_cq_offset_nudge: Arc<AtomicBool>` flag, set here and
     checked by the tick loop alongside its existing `should_switch` computation — same
