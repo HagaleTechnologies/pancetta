@@ -3863,11 +3863,14 @@ impl QsoManager {
     ///
     /// The CQer rungs mirror the Caller's stage for stage:
     ///   0. opening sent (`CallingCq` / `RespondingToCq`)
-    ///   1. our report is on the air (`WaitingForReport` — the CQer's report
-    ///      goes out on the `CallingCq -> WaitingForReport` transition — /
-    ///      `SendingReport`)
-    ///   2. exchange rogered (`WaitingForConfirmation` / `SendingConfirmation`)
-    ///   3. `Completed`
+    ///   1. our report is on the air but theirs has not arrived
+    ///      (`WaitingForReport` — the CQer's report goes out on the
+    ///      `CallingCq -> WaitingForReport` transition — /
+    ///      `SendingReport { their_report: None }`)
+    ///   2. the partner's report is in hand (`SendingReport { their_report:
+    ///      Some(_) }`)
+    ///   3. exchange rogered (`WaitingForConfirmation` / `SendingConfirmation`)
+    ///   4. `Completed`
     ///
     /// Without rung 0/1 for the CQer, the real `CallingCq -> WaitingForReport`
     /// advance (a caller finally answering an unanswered CQ) read as "no
@@ -3877,21 +3880,58 @@ impl QsoManager {
     /// recording the just-proven offset as known-good, so the resulting action
     /// was a blind `Switch` rather than the intended anchored ping-pong.
     ///
+    /// PAN-72 (Codex round 6 on PR #350, finding 1): `SendingReport` carries a
+    /// real sub-rung and must not be collapsed into one. `RespondingToCq +
+    /// CqResponse` lands us in `SendingReport { their_report: None }` (the DX
+    /// returned our call with no report yet); the DX's first `SignalReport`
+    /// then moves us to `SendingReport { their_report: Some(_) }`, which is
+    /// what turns our outbound from a plain report into an R-report — the
+    /// single most load-bearing advance in the whole exchange. Ranked equal,
+    /// that transition read as "no progress": a switch request queued by the
+    /// preceding threshold-hitting rearm left `advance_generation` unmoved, so
+    /// the commit-time stale-action guard accepted it and relocated the QSO at
+    /// the exact moment the DX finally answered; below the threshold, the
+    /// partial stall streak carried forward instead of resetting.
+    ///
+    /// A repeated report (`Some(_) -> Some(_)`, the "the DX never copied our
+    /// R" regression arm) still ranks equal, so it correctly reads as no
+    /// progress. [`Self::ladder_rank`] is deliberately NOT given this
+    /// sub-rung: the manual regression predicate relies on both `SendingReport`
+    /// shapes comparing equal there.
+    ///
+    /// `Contest(ExchangingInfo)` gets the analogous `their_serial`
+    /// `None`/`Some` split for the same reason — the contest wiring is not
+    /// live yet, and ranking it correctly here keeps it from inheriting the
+    /// bug when it is.
+    ///
     /// `Failed` and `Idle` stay `None`: `None` is ordered below every `Some`,
     /// so a QSO going terminal-`Failed` can never read as an advance.
     fn progress_rank(state: &QsoState) -> Option<u8> {
         match state {
             QsoState::CallingCq { .. } | QsoState::RespondingToCq { .. } => Some(0),
-            QsoState::WaitingForReport { .. } | QsoState::SendingReport { .. } => Some(1),
+            QsoState::WaitingForReport { .. }
+            | QsoState::SendingReport {
+                their_report: None, ..
+            } => Some(1),
+            QsoState::SendingReport {
+                their_report: Some(_),
+                ..
+            } => Some(2),
             // Not currently constructed by `determine_state_transition`, but
             // ranked here so contest wiring inherits correct stall detection
             // rather than re-introducing this same bug.
-            QsoState::Contest(ContestState::ExchangingInfo { .. }) => Some(1),
+            QsoState::Contest(ContestState::ExchangingInfo {
+                their_serial: None, ..
+            }) => Some(1),
+            QsoState::Contest(ContestState::ExchangingInfo {
+                their_serial: Some(_),
+                ..
+            }) => Some(2),
             QsoState::WaitingForConfirmation { .. } | QsoState::SendingConfirmation { .. } => {
-                Some(2)
+                Some(3)
             }
-            QsoState::Completed { .. } => Some(3),
-            QsoState::Contest(ContestState::ContestCompleted { .. }) => Some(3),
+            QsoState::Completed { .. } => Some(4),
+            QsoState::Contest(ContestState::ContestCompleted { .. }) => Some(4),
             QsoState::Idle | QsoState::Failed { .. } => None,
         }
     }
@@ -16004,6 +16044,144 @@ mod pan72_stall_detection_tests {
              reply cannot discriminate our two TX offsets — the vacated {FREQ} \
              Hz is the only one with a proven history, and {new_offset} Hz has \
              never been transmitted on"
+        );
+    }
+
+    /// PAN-72 (Codex round 6 on PR #350, finding 1): `SendingReport` is two
+    /// rungs, not one. `RespondingToCq + CqResponse` (the DX returned our call
+    /// with no report) lands in `SendingReport { their_report: None }`; the
+    /// DX's first `SignalReport` moves us to `SendingReport { their_report:
+    /// Some(_) }`, turning our outbound from a plain report into an R-report.
+    ///
+    /// Ranked equal, that transition read as "no progress": the partial stall
+    /// streak carried forward, `advance_generation` never moved, and a switch
+    /// request queued by the preceding threshold-hitting rearm still passed the
+    /// commit-time stale-action guard — relocating the QSO at the exact moment
+    /// the DX finally answered.
+    #[tokio::test]
+    async fn the_dx_s_first_report_advances_a_sending_report_qso() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 4;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+
+        // The DX returns our call with no report yet — `SendingReport` on the
+        // `their_report: None` rung.
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.into(),
+                    responding_station: DX.into(),
+                    grid: Some("FN31".into()),
+                },
+                format!("{OUR} {DX} FN31"),
+                FREQ,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+        let opened = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(
+                opened.state,
+                QsoState::SendingReport {
+                    their_report: None,
+                    ..
+                }
+            ),
+            "precondition: the DX answered without a report, got {:?}",
+            opened.state
+        );
+        let generation_before_stall = opened.metadata.advance_generation;
+        let answered_at = opened.metadata.last_call_at.unwrap();
+
+        // A silent slot: we re-send our report, the DX says nothing. Partial
+        // stall streak, below the threshold.
+        manager
+            .rearm_manual_calls_at(answered_at + Duration::seconds(16))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "precondition: one silent slot builds a partial stall streak"
+        );
+
+        // ...and NOW the DX's report lands. This is the exchange's single most
+        // load-bearing advance: our outbound becomes an R-report.
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(
+                after.state,
+                QsoState::SendingReport {
+                    their_report: Some(-7),
+                    ..
+                }
+            ),
+            "precondition: the DX's report latched, got {:?}",
+            after.state
+        );
+        assert_eq!(
+            after.metadata.stall_cycles, 0,
+            "the DX's first report is forward progress — the partial stall \
+             streak must reset, not carry into the established exchange"
+        );
+        assert!(
+            after.metadata.advance_generation > generation_before_stall,
+            "the None -> Some(_) report rung must bump advance_generation so a \
+             switch queued by an earlier rearm is recognized as stale at commit \
+             time (was {generation_before_stall}, now {})",
+            after.metadata.advance_generation
+        );
+    }
+
+    /// The other half of finding 1: a REPEATED report (the "DX never copied our
+    /// R" regression arm, `Some(_) -> Some(_)`) is deliberately still not
+    /// progress. Splitting the `SendingReport` rung must not turn every
+    /// re-delivered report into a fake advance that clears real stall evidence.
+    #[tokio::test]
+    async fn a_repeated_dx_report_is_still_not_forward_progress() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 4;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        let reported_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(reported_at + Duration::seconds(16))
+            .await;
+        let stalled = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            stalled.metadata.stall_cycles, 1,
+            "precondition: a silent slot after the first report"
+        );
+        let generation_before = stalled.metadata.advance_generation;
+
+        // The DX repeats the same report — they never copied our R.
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.advance_generation, generation_before,
+            "a repeated report is the DX standing still, not an advance"
+        );
+        assert_eq!(
+            after.metadata.stall_cycles, 1,
+            "the stall evidence must survive a repeated report"
         );
     }
 }
