@@ -1752,6 +1752,36 @@ impl AutonomousOperator {
         target_parity: Option<pancetta_core::slot::SlotParity>,
         avoid_hz: Option<f64>,
     ) -> f64 {
+        self.allocate_smart_frequency_avoiding(dx_target_hz, target_parity, avoid_hz, &[])
+    }
+
+    /// [`Self::allocate_smart_frequency`] with additional hard exclusions.
+    ///
+    /// PAN-72 (Codex round 1 on PR #350, finding 1): the coordinator resolves
+    /// a whole batch of queued `OffsetAction::Switch` requests inside one
+    /// tick, but this operator's own-frequency snapshot is only synced from
+    /// `active_tx_offsets` (via [`FrequencyAllocator::set_own_frequencies`])
+    /// LATER in that same tick. Two concurrent QSOs switching in the same
+    /// slot would therefore both rank against the identical stale occupancy
+    /// view — each excluding only its own original offset — and could pick
+    /// the same best candidate, collapsing two TX streams onto one frequency.
+    /// The drain accumulates each offset it has already handed out this batch
+    /// and passes them here.
+    ///
+    /// These are HARD exclusions, exactly like `avoid_hz`, deliberately not
+    /// the soft `own_frequencies` score penalty: that penalty is documented
+    /// as "effectively eliminates this candidate" but is not guaranteed to on
+    /// a crowded band — the same reason `avoid_hz` was promoted from soft to
+    /// hard in Codex round 6 on PR #276. When the exclusions empty the ranked
+    /// list, the fallback still returns `avoid_hz` unchanged so the caller's
+    /// existing "no valid relocation → skip the switch" path fires.
+    pub fn allocate_smart_frequency_avoiding(
+        &self,
+        dx_target_hz: Option<f64>,
+        target_parity: Option<pancetta_core::slot::SlotParity>,
+        avoid_hz: Option<f64>,
+        also_avoid_hz: &[f64],
+    ) -> f64 {
         // Hold mode (default): pancetta does not choose the offset — every
         // autonomous transmission goes out on the operator's pinned offset.
         // Prefer the LIVE parked offset (set via the TUI's `o` modal) over
@@ -1812,15 +1842,22 @@ impl AutonomousOperator {
             // for this specific avoid_hz, keeps the shared own_frequencies
             // soft-penalty semantics unchanged for its original callers
             // (own-QSO separation).
+            //
+            // PAN-72 finding 1: `also_avoid_hz` (offsets already handed to
+            // OTHER QSOs earlier in the same coordinator drain batch) gets the
+            // identical hard treatment — see
+            // `allocate_smart_frequency_avoiding`'s doc comment.
             let min_separation_hz = self.smart_allocator.config().min_separation_hz;
-            let excluded: Vec<_> = match avoid_hz {
-                Some(avoid) => candidates
-                    .iter()
-                    .filter(|c| (c.offset_hz - avoid).abs() >= min_separation_hz)
-                    .cloned()
-                    .collect(),
-                None => candidates.clone(),
-            };
+            let excluded: Vec<_> = candidates
+                .iter()
+                .filter(|c| {
+                    avoid_hz.is_none_or(|avoid| (c.offset_hz - avoid).abs() >= min_separation_hz)
+                        && also_avoid_hz
+                            .iter()
+                            .all(|&other| (c.offset_hz - other).abs() >= min_separation_hz)
+                })
+                .cloned()
+                .collect();
 
             if let Some(best) = excluded.first() {
                 return best.offset_hz;

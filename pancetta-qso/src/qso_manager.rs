@@ -284,6 +284,43 @@ pub enum QsoManagerError {
 
     #[error("{message}")]
     Internal { message: String },
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 3): a queued TX-offset
+    /// action was drained after the QSO went terminal. Completed QSOs are
+    /// retained in the map (and deliberately kept in the coordinator's active
+    /// snapshots for a 45-second trailing-73 grace window), so the lookup
+    /// still succeeds — but nothing may be mutated. Expected, not a fault.
+    #[error("QSO {qso_id} is no longer active — TX-offset action discarded")]
+    QsoNotActive { qso_id: QsoId },
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 8): a queued TX-offset
+    /// action was drained after the QSO made forward progress, so the offset
+    /// it wanted to move away from is the one that just demonstrably worked.
+    /// Expected (the drain runs only once per 15-second slot), not a fault.
+    #[error(
+        "TX-offset action for QSO {qso_id} is stale \
+         (raised at advance generation {raised_at}, QSO is now at {current})"
+    )]
+    OffsetActionStale {
+        qso_id: QsoId,
+        raised_at: u32,
+        current: u32,
+    },
+}
+
+impl QsoManagerError {
+    /// PAN-72: is this an *expected* refusal of a queued TX-offset action
+    /// (the QSO finished, or advanced, between the action being raised and
+    /// the once-per-slot drain committing it) rather than a real fault? The
+    /// coordinator's drain logs these at `debug!` instead of `warn!`.
+    pub fn is_expected_offset_action_refusal(&self) -> bool {
+        matches!(
+            self,
+            QsoManagerError::QsoNotFound { .. }
+                | QsoManagerError::QsoNotActive { .. }
+                | QsoManagerError::OffsetActionStale { .. }
+        )
+    }
 }
 
 /// QSO manager configuration
@@ -462,6 +499,44 @@ pub enum OffsetAction {
     Revert { target_hz: f64 },
 }
 
+/// PAN-72 (Codex round 1 on PR #350, finding 8): one queued TX-offset action
+/// plus the staleness token that guards it at commit time.
+///
+/// This is the element type of the coordinator's `pending_qso_offset_requests`
+/// mailbox. It lives here, next to [`OffsetAction`], because
+/// [`QsoManager::apply_tx_offset_switch`] is what actually validates the
+/// token — the coordinator only carries it across the once-per-slot gap
+/// between the QSO event firing and the autonomous tick draining it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OffsetActionRequest {
+    pub qso_id: QsoId,
+    pub action: OffsetAction,
+    /// [`crate::states::QsoMetadata::advance_generation`] as it stood when
+    /// this action was raised. `None` for an operator-forced `u` nudge, which
+    /// is by definition current and must never be discarded as stale.
+    pub raised_at_generation: Option<u32>,
+}
+
+impl OffsetActionRequest {
+    /// A stall-detected action, guarded by the QSO's advance generation.
+    pub fn stall_detected(qso_id: QsoId, action: OffsetAction, raised_at_generation: u32) -> Self {
+        Self {
+            qso_id,
+            action,
+            raised_at_generation: Some(raised_at_generation),
+        }
+    }
+
+    /// An operator-forced action (the `u` nudge) — never stale.
+    pub fn operator_forced(qso_id: QsoId, action: OffsetAction) -> Self {
+        Self {
+            qso_id,
+            action,
+            raised_at_generation: None,
+        }
+    }
+}
+
 /// QSO event notifications
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum QsoEvent {
@@ -539,7 +614,27 @@ pub enum QsoEvent {
     /// The coordinator resolves `OffsetAction::Switch` via the smart
     /// allocator and commits either variant via
     /// `QsoManager::apply_tx_offset_switch`.
-    TxOffsetActionNeeded { qso_id: QsoId, action: OffsetAction },
+    ///
+    /// `raised_at_generation` is the QSO's
+    /// [`crate::states::QsoMetadata::advance_generation`] at emission time —
+    /// carried through the coordinator's mailbox and re-checked at commit
+    /// time so an action raised before a DX advance that has since landed is
+    /// discarded rather than moving the QSO off the offset that just worked.
+    TxOffsetActionNeeded {
+        qso_id: QsoId,
+        action: OffsetAction,
+        raised_at_generation: u32,
+    },
+
+    /// PAN-72: a TX-offset action was actually committed by
+    /// [`QsoManager::apply_tx_offset_switch`] (post-clamp value). Purely an
+    /// announcement — nothing in `pancetta-qso` consumes it. The coordinator
+    /// uses it to rebuild the `ActiveQsosSnapshot` the TUI banner and the
+    /// remote gateway render from, which is otherwise rebuilt only on a state
+    /// transition; a stalled exchange may produce none for a long time, so
+    /// without this the displayed offset would lag through multiple
+    /// switch/revert cycles (Codex round 1 on PR #350, finding 7).
+    TxOffsetApplied { qso_id: QsoId, offset_hz: f64 },
 }
 
 /// Routing verdict plus an optional security classification.
@@ -1065,6 +1160,7 @@ impl QsoManager {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -1199,6 +1295,7 @@ impl QsoManager {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -1593,6 +1690,7 @@ impl QsoManager {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             // When our TX offset != the DX's RX offset (Hold mode / de-conflict),
             // the caller supplies `partner_freq = Some(dx_freq)` so the relevance
@@ -1952,6 +2050,7 @@ impl QsoManager {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             // When our TX offset != the DX's RX offset (Hold mode / de-conflict),
             // the caller supplies `partner_freq = Some(dx_freq)` so the relevance
@@ -2644,10 +2743,36 @@ impl QsoManager {
     /// Returns the offset that was **actually applied** (post-clamp), so the
     /// coordinator can mirror it into its own `active_tx_offsets` snapshot
     /// without re-deriving the clamp.
+    ///
+    /// Two staleness guards run BEFORE anything is mutated, both because the
+    /// coordinator only drains its request mailbox once per 15-second slot,
+    /// so a lot can happen between an action being raised and committed:
+    ///
+    /// 1. **Terminal QSO** (Codex round 1 on PR #350, finding 3). Completed
+    ///    entries are retained in the map, and completion deliberately keeps
+    ///    the QSO's id and offset in the coordinator's active snapshots for a
+    ///    45-second trailing-73 grace window — so a late action still *finds*
+    ///    its QSO. `QsoState::set_frequency` already refuses terminal states,
+    ///    but `metadata.frequency` has no such guard: writing it would leave
+    ///    the metadata disagreeing with the logged state, and the drain would
+    ///    mirror that phantom offset into `active_tx_offsets` while the queued
+    ///    final frame still goes out on the original one. Refuse outright.
+    /// 2. **Superseded by a DX advance** (finding 8). If the QSO's
+    ///    [`crate::states::QsoMetadata::advance_generation`] has moved since
+    ///    `raised_at_generation` was captured, the DX answered in the
+    ///    meantime: `stall_cycles` is already reset and the CURRENT offset is
+    ///    already recorded known-good, so applying the queued action would
+    ///    move us off the offset that just demonstrably worked. Pass `None`
+    ///    for an operator-forced nudge, which is current by construction and
+    ///    must never be discarded this way.
+    ///
+    /// Both refusals are expected races, not faults — see
+    /// [`QsoManagerError::is_expected_offset_action_refusal`].
     pub async fn apply_tx_offset_switch(
         &self,
         qso_id: QsoId,
         new_offset_hz: f64,
+        raised_at_generation: Option<u32>,
     ) -> Result<f64, QsoManagerError> {
         let applied_hz =
             new_offset_hz.clamp(ACTIVE_QSO_TX_OFFSET_MIN_HZ, ACTIVE_QSO_TX_OFFSET_MAX_HZ);
@@ -2655,6 +2780,19 @@ impl QsoManager {
         let progress = qsos
             .get_mut(&qso_id)
             .ok_or(QsoManagerError::QsoNotFound { qso_id })?;
+        if !progress.state.is_active() {
+            return Err(QsoManagerError::QsoNotActive { qso_id });
+        }
+        if let Some(raised_at) = raised_at_generation {
+            let current = progress.metadata.advance_generation;
+            if current != raised_at {
+                return Err(QsoManagerError::OffsetActionStale {
+                    qso_id,
+                    raised_at,
+                    current,
+                });
+            }
+        }
         let old_off = progress.metadata.frequency;
         progress.metadata.frequency = applied_hz;
         progress.metadata.pending_freq_drift = None;
@@ -2717,6 +2855,20 @@ impl QsoManager {
             "Adaptive TX-offset action: {:.0} Hz -> {:.0} Hz",
             old_off, applied_hz
         );
+        // PAN-72 (Codex round 1 on PR #350, finding 7): announce the applied
+        // move so the coordinator can rebuild the `ActiveQsosSnapshot` the TUI
+        // banner and the remote gateway render from. That snapshot is
+        // otherwise rebuilt only on a state transition, and a stalled exchange
+        // is precisely the case where no further transition arrives — the UI
+        // would show the pre-switch offset through several switch/revert
+        // cycles. Emitted AFTER the write guard is dropped, matching every
+        // other emit site in this file.
+        drop(qsos);
+        self.emit_event(QsoEvent::TxOffsetApplied {
+            qso_id,
+            offset_hz: applied_hz,
+        })
+        .await;
         Ok(applied_hz)
     }
 
@@ -3144,6 +3296,13 @@ impl QsoManager {
             if dx_frame_advanced {
                 progress.metadata.stall_cycles = 0;
                 progress.metadata.last_known_good_offset_hz = Some(progress.metadata.frequency);
+                // PAN-72 (Codex round 1 on PR #350, finding 8): bump the
+                // staleness token in lockstep with the two fields above, so a
+                // TX-offset action queued BEFORE this advance is recognized as
+                // stale when the coordinator's once-per-slot drain finally
+                // commits it — see `QsoMetadata::advance_generation`.
+                progress.metadata.advance_generation =
+                    progress.metadata.advance_generation.saturating_add(1);
             }
 
             // Hound QSY: when the Fox answers with a signal report
@@ -5340,7 +5499,7 @@ impl QsoManager {
         // PAN-72: TX-offset actions (Switch/Revert) a stall-tripped QSO
         // needs, collected here and emitted after the write lock below is
         // dropped — same reason `to_recall` above is collect-then-emit.
-        let mut offset_actions_to_emit: Vec<(QsoId, OffsetAction)> = Vec::new();
+        let mut offset_actions_to_emit: Vec<(QsoId, OffsetAction, u32)> = Vec::new();
 
         {
             let mut qsos = self.qsos.write().await;
@@ -5481,7 +5640,14 @@ impl QsoManager {
                         _ => OffsetAction::Switch { avoid_hz: current },
                     };
                     progress.metadata.stall_cycles = 0;
-                    offset_actions_to_emit.push((qso_id, action));
+                    offset_actions_to_emit.push((
+                        qso_id,
+                        action,
+                        // PAN-72 finding 8: the staleness token, captured
+                        // here under the same write lock that raised the
+                        // action so it can never disagree with it.
+                        progress.metadata.advance_generation,
+                    ));
                 }
 
                 // Record the re-emitted call as a Sent message so the TUI's
@@ -5524,9 +5690,13 @@ impl QsoManager {
             .await;
         }
 
-        for (qso_id, action) in offset_actions_to_emit {
-            self.emit_event(QsoEvent::TxOffsetActionNeeded { qso_id, action })
-                .await;
+        for (qso_id, action, raised_at_generation) in offset_actions_to_emit {
+            self.emit_event(QsoEvent::TxOffsetActionNeeded {
+                qso_id,
+                action,
+                raised_at_generation,
+            })
+            .await;
         }
     }
 
@@ -8021,7 +8191,7 @@ mod tests {
 
         // Apply the offset switch.
         manager
-            .apply_tx_offset_switch(qso_id, 1800.0)
+            .apply_tx_offset_switch(qso_id, 1800.0, None)
             .await
             .unwrap();
 
@@ -8053,7 +8223,7 @@ mod tests {
         );
 
         manager
-            .apply_tx_offset_switch(qso_id, 1800.0)
+            .apply_tx_offset_switch(qso_id, 1800.0, None)
             .await
             .unwrap();
 
@@ -8080,7 +8250,7 @@ mod tests {
             .unwrap();
 
         let applied = manager
-            .apply_tx_offset_switch(qso_id, 9000.0)
+            .apply_tx_offset_switch(qso_id, 9000.0, None)
             .await
             .unwrap();
         assert_eq!(applied, ACTIVE_QSO_TX_OFFSET_MAX_HZ);
@@ -8088,7 +8258,10 @@ mod tests {
         assert_eq!(after.metadata.frequency, ACTIVE_QSO_TX_OFFSET_MAX_HZ);
         assert_eq!(after.state.frequency(), Some(ACTIVE_QSO_TX_OFFSET_MAX_HZ));
 
-        let applied = manager.apply_tx_offset_switch(qso_id, -50.0).await.unwrap();
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, -50.0, None)
+            .await
+            .unwrap();
         assert_eq!(applied, ACTIVE_QSO_TX_OFFSET_MIN_HZ);
         let after = manager.get_qso(qso_id).await.unwrap();
         assert_eq!(after.metadata.frequency, ACTIVE_QSO_TX_OFFSET_MIN_HZ);
@@ -8096,7 +8269,7 @@ mod tests {
 
         // In-band values pass through untouched.
         let applied = manager
-            .apply_tx_offset_switch(qso_id, 1234.0)
+            .apply_tx_offset_switch(qso_id, 1234.0, None)
             .await
             .unwrap();
         assert_eq!(applied, 1234.0);
@@ -8120,7 +8293,7 @@ mod tests {
         // 2850 Hz: above the autonomous pick band's 2700 ceiling, but a
         // perfectly legitimate place for an in-progress QSO to be sitting.
         let applied = manager
-            .apply_tx_offset_switch(qso_id, 2850.0)
+            .apply_tx_offset_switch(qso_id, 2850.0, None)
             .await
             .unwrap();
         assert_eq!(
@@ -8131,7 +8304,10 @@ mod tests {
         assert!(applied > TX_OFFSET_MAX_HZ);
 
         // Likewise at the low end (the pick band starts at 300).
-        let applied = manager.apply_tx_offset_switch(qso_id, 250.0).await.unwrap();
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, 250.0, None)
+            .await
+            .unwrap();
         assert_eq!(applied, 250.0);
         assert!(applied < TX_OFFSET_MIN_HZ);
     }
@@ -8141,7 +8317,7 @@ mod tests {
     async fn apply_tx_offset_switch_on_unknown_qso_returns_not_found() {
         let manager = QsoManager::new(test_config());
         let result = manager
-            .apply_tx_offset_switch(QsoId::new_v4(), 1800.0)
+            .apply_tx_offset_switch(QsoId::new_v4(), 1800.0, None)
             .await;
         assert!(matches!(result, Err(QsoManagerError::QsoNotFound { .. })));
     }
@@ -9391,6 +9567,7 @@ mod tests {
                 progressed_this_cycle: false,
                 stall_cycles: 0,
                 last_known_good_offset_hz: None,
+                advance_generation: 0,
                 hound: false,
                 partner_freq: None,
                 pending_freq_drift: None,
@@ -9938,6 +10115,7 @@ mod sender_verification_tests {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -14091,6 +14269,7 @@ mod pan72_stall_detection_tests {
             if let QsoEvent::TxOffsetActionNeeded {
                 qso_id: id,
                 action: OffsetAction::Switch { avoid_hz },
+                ..
             } = event
             {
                 assert_eq!(id, qso_id);
@@ -14203,7 +14382,7 @@ mod pan72_stall_detection_tests {
         // here.
         let new_freq = FREQ + 300.0;
         let applied = manager
-            .apply_tx_offset_switch(qso_id, new_freq)
+            .apply_tx_offset_switch(qso_id, new_freq, None)
             .await
             .expect("committing the resolved Switch");
         assert_eq!(applied, new_freq);
@@ -14389,6 +14568,139 @@ mod pan72_stall_detection_tests {
         HoundRegions::default().call_max_hz
     }
 
+    /// PAN-72 (Codex round 1 on PR #350, finding 3): a queued action drained
+    /// after the QSO completed must mutate nothing.
+    ///
+    /// Completed entries stay in the map (and stay in the coordinator's
+    /// active snapshots for a 45-second trailing-73 grace window), so the
+    /// lookup still succeeds. `QsoState::set_frequency` refuses terminal
+    /// states, but `metadata.frequency` had no such guard — the write went
+    /// through, the state kept the real logged offset, and the drain then
+    /// mirrored the phantom offset into `active_tx_offsets` while the queued
+    /// final frame still went out on the original one.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_refuses_a_terminal_qso_without_mutating_it() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        // The DX closes early with 73: SendingReport -> Completed.
+        manager
+            .process_message(
+                MessageType::SeventyThree {
+                    to_station: OUR.into(),
+                    from_station: DX.into(),
+                },
+                format!("{OUR} {DX} 73"),
+                FREQ,
+                Some(-7.0),
+            )
+            .await
+            .unwrap();
+
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            before.state.is_terminal(),
+            "precondition: the QSO must be terminal, got {:?}",
+            before.state
+        );
+
+        let err = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, None)
+            .await
+            .expect_err("a terminal QSO must refuse an offset action");
+        assert!(
+            matches!(err, QsoManagerError::QsoNotActive { qso_id: id } if id == qso_id),
+            "expected QsoNotActive, got {err:?}"
+        );
+        assert!(
+            err.is_expected_offset_action_refusal(),
+            "a post-completion action is an expected race, not a fault"
+        );
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, before.metadata.frequency,
+            "metadata.frequency must not be rewritten on a terminal QSO — the \
+             coordinator mirrors this value into active_tx_offsets"
+        );
+        assert_eq!(
+            after.state.frequency(),
+            before.state.frequency(),
+            "the logged offset is the historical record and must not move"
+        );
+    }
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 8): the coordinator drains
+    /// its request mailbox only once per 15-second slot, so the DX can send
+    /// an advancing frame between an action being raised and committed. The
+    /// advance already reset `stall_cycles` and marked the CURRENT offset
+    /// known-good, so applying the stale request would move the QSO off the
+    /// offset that just demonstrably worked.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_discards_a_request_the_qso_has_advanced_past() {
+        let manager = manager_auto(test_config());
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let raised_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .advance_generation;
+        assert_eq!(raised_at, 0, "a fresh QSO starts at generation 0");
+
+        // The DX comes back before the once-per-slot drain runs.
+        send_report(&manager, -7, &format!("{OUR} {DX} -07")).await;
+        let advanced = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            advanced.metadata.advance_generation,
+            raised_at + 1,
+            "a forward advance must bump the staleness token"
+        );
+        assert_eq!(
+            advanced.metadata.last_known_good_offset_hz,
+            Some(FREQ),
+            "precondition: the current offset is now the known-good one"
+        );
+
+        let err = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, Some(raised_at))
+            .await
+            .expect_err("a superseded request must be discarded");
+        assert!(
+            matches!(
+                err,
+                QsoManagerError::OffsetActionStale { qso_id: id, raised_at: r, current: c }
+                    if id == qso_id && r == raised_at && c == raised_at + 1
+            ),
+            "expected OffsetActionStale, got {err:?}"
+        );
+        assert!(err.is_expected_offset_action_refusal());
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.frequency,
+            FREQ,
+            "the QSO must stay on the offset the DX just answered on"
+        );
+
+        // A request raised at the CURRENT generation still commits normally,
+        // and an operator-forced nudge (`None`) is never staleness-checked.
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, Some(raised_at + 1))
+            .await
+            .expect("a current-generation request must still commit");
+        assert_eq!(applied, FREQ + 400.0);
+        let forced = manager
+            .apply_tx_offset_switch(qso_id, FREQ + 500.0, None)
+            .await
+            .expect("an operator-forced nudge is never stale");
+        assert_eq!(forced, FREQ + 500.0);
+    }
+
     /// In the default Hold mode, `stall_cycles` may still tick (cheap
     /// tracking) but `TxOffsetActionNeeded` must never be emitted, no matter
     /// how many silent rearm cycles elapse.
@@ -14457,7 +14769,7 @@ mod pan72_stall_detection_tests {
 
         let new_offset = FREQ + 400.0;
         let applied = manager
-            .apply_tx_offset_switch(qso_id, new_offset)
+            .apply_tx_offset_switch(qso_id, new_offset, None)
             .await
             .unwrap();
         assert_eq!(applied, new_offset);
@@ -14506,7 +14818,7 @@ mod pan72_stall_detection_tests {
             .unwrap();
         let new_offset = FREQ + 400.0;
         manager
-            .apply_tx_offset_switch(qso_id, new_offset)
+            .apply_tx_offset_switch(qso_id, new_offset, None)
             .await
             .unwrap();
 
@@ -14561,7 +14873,7 @@ mod pan72_stall_detection_tests {
             .unwrap();
 
         manager
-            .apply_tx_offset_switch(qso_id, FREQ + 400.0)
+            .apply_tx_offset_switch(qso_id, FREQ + 400.0, None)
             .await
             .unwrap();
 
@@ -14587,7 +14899,10 @@ mod pan72_stall_detection_tests {
             .await
             .unwrap();
 
-        manager.apply_tx_offset_switch(qso_id, FREQ).await.unwrap();
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ, None)
+            .await
+            .unwrap();
 
         let after = manager.get_qso(qso_id).await.unwrap();
         assert_eq!(
@@ -14648,7 +14963,7 @@ mod pan72_stall_detection_tests {
         // on the new offset.
         let new_offset = FREQ + 400.0;
         let applied = manager
-            .apply_tx_offset_switch(qso_id, new_offset)
+            .apply_tx_offset_switch(qso_id, new_offset, None)
             .await
             .unwrap();
         assert_eq!(applied, new_offset);
@@ -14734,6 +15049,7 @@ mod has_active_or_recent_qso_tests {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -14969,6 +15285,7 @@ mod hound_tests {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,

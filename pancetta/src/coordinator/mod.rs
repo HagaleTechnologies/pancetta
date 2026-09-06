@@ -700,14 +700,13 @@ pub struct ApplicationCoordinator {
     /// Autonomous task (`coordinator/autonomous.rs`) — same
     /// push-mailbox/drain-once-per-tick shape as
     /// `pending_autonomous_cq_dispatch_failures` above.
-    pending_qso_offset_requests: Arc<
-        std::sync::Mutex<
-            Vec<(
-                pancetta_qso::states::QsoId,
-                pancetta_qso::qso_manager::OffsetAction,
-            )>,
-        >,
-    >,
+    /// Each entry carries the staleness token
+    /// (`QsoMetadata::advance_generation`) the action was raised at, so a
+    /// request the QSO has since advanced past is discarded at commit time
+    /// instead of dragging it off the offset that just worked (PAN-72,
+    /// Codex round 1 on PR #350, finding 8).
+    pending_qso_offset_requests:
+        Arc<std::sync::Mutex<Vec<pancetta_qso::qso_manager::OffsetActionRequest>>>,
 
     /// PAN-72: one-shot flag set by the TUI's `u` "nudge" keystroke when NO
     /// QSO is currently active (`active_tx_qsos` empty at dispatch time) --

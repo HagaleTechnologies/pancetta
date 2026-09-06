@@ -1902,25 +1902,29 @@ impl super::ApplicationCoordinator {
                                         },
                                     );
                                 }
-                                NudgeOutcome::CqNudge => {
+                                NudgeOutcome::CqNudgeArmed => {
                                     info!(
                                         target: "tx.freq",
-                                        "TUI NudgeTxOffset: no active QSO, requesting a CQ-offset nudge"
+                                        "TUI NudgeTxOffset: no active QSO — armed a CQ-offset nudge \
+                                         (applies on the next autonomous CQ cycle)"
                                     );
                                     let _ = cmd_tui_msg_tx.send(
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "TX".to_string(),
-                                            status: "Nudging CQ offset (once hunting)".to_string(),
+                                            status: "CQ-offset nudge armed — applies on the next CQ cycle"
+                                                .to_string(),
                                         },
                                     );
                                 }
                                 NudgeOutcome::HeldNoOp => {
-                                    // Hold mode: the downstream allocator would
+                                    // Hold mode, with or without an active QSO:
+                                    // for a QSO the downstream allocator would
                                     // ignore `avoid_hz` and hand back the parked
-                                    // offset, so queueing a Switch would be a
-                                    // no-op at best and an unwanted move onto the
-                                    // park offset at worst. Say so instead of
-                                    // claiming a nudge happened.
+                                    // offset (a no-op at best, an unwanted move
+                                    // onto the park offset at worst); for the CQ
+                                    // fallback `decide_at`'s `tx_freq_auto()`
+                                    // gate consumes and discards the flag. Say so
+                                    // instead of claiming a nudge happened.
                                     info!(
                                         target: "tx.freq",
                                         "TUI NudgeTxOffset ignored: TX-frequency mode is Hold"
@@ -2901,42 +2905,68 @@ fn map_recent_qso_outcome(
 /// either: there *is* an active QSO, so the CQ-hunting path is simply the
 /// wrong target, and arming it would be a second silent false-success.
 ///
+/// Hold gating covers the CQ fallback too (Codex round 1 on PR #350, finding
+/// 4): the mode check is hoisted ABOVE the active-QSO branch so a Hold-mode
+/// `u` with no active QSO also reports [`NudgeOutcome::HeldNoOp`] instead of
+/// claiming a CQ nudge. `decide_at` computes `should_switch =
+/// self.tx_freq_auto() && (...)`, so a flag armed in Hold is consumed and
+/// discarded with nothing to show for it — a guaranteed silent no-op that the
+/// status line used to report as a successful nudge.
+///
+/// The *second* half of that finding — "in Auto but not currently CQ-hunting,
+/// `decide_at` also consumes and discards the request" — is NOT gated here,
+/// deliberately. Nothing in the coordinator or this relay task has any view of
+/// `AutonomousOperator::state`: it is a private field of an operator owned
+/// exclusively by the autonomous task, and unlike `active_tx_qsos` /
+/// `active_tx_offsets` / `tx_freq_mode` there is no shared snapshot or atomic
+/// carrying it. Adding one would be new cross-task state-visibility plumbing
+/// for a check that still could not be authoritative: `decide_at` only enters
+/// its CQ branch after re-evaluating `idle_cycles >=
+/// cq_after_idle_cycles` for THAT cycle, so any state this relay could read at
+/// keypress time is a prediction, not a guarantee. Instead the returned
+/// outcome — and the operator-facing status line — is worded as an *armed
+/// request that applies on the next CQ cycle*, which is exactly what it is.
+/// (Finding 9's fix additionally stops such a request being lost when that
+/// cycle arrives with thin decode history.)
+///
 /// Returns [`NudgeOutcome`] for the caller's status echo/logging.
 fn resolve_nudge_tx_offset(
     tx_freq_mode: &std::sync::atomic::AtomicU8,
     active: &std::collections::HashSet<String>,
     active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
     pending_qso_offset_requests: &std::sync::Mutex<
-        Vec<(
-            pancetta_qso::states::QsoId,
-            pancetta_qso::qso_manager::OffsetAction,
-        )>,
+        Vec<pancetta_qso::qso_manager::OffsetActionRequest>,
     >,
     pending_cq_offset_nudge: &std::sync::atomic::AtomicBool,
 ) -> NudgeOutcome {
+    if !pancetta_core::TxFreqMode::from_u8(tx_freq_mode.load(Ordering::Acquire))
+        .allows_auto_change()
+    {
+        return NudgeOutcome::HeldNoOp;
+    }
     if let Some(key) = active.iter().next() {
         if let Ok(qso_id) = key.parse::<pancetta_qso::QsoId>() {
-            if !pancetta_core::TxFreqMode::from_u8(tx_freq_mode.load(Ordering::Acquire))
-                .allows_auto_change()
-            {
-                return NudgeOutcome::HeldNoOp;
-            }
             let current = active_tx_offsets
                 .read()
                 .ok()
                 .and_then(|m| m.get(key).copied())
                 .unwrap_or(1500.0);
             if let Ok(mut pending) = pending_qso_offset_requests.lock() {
-                pending.push((
-                    qso_id,
-                    pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: current },
-                ));
+                // Operator-forced: no staleness token (PAN-72 finding 8).
+                // The operator pressed `u` for the QSO as it stands right
+                // now, so there is nothing for a later advance to supersede.
+                pending.push(
+                    pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                        qso_id,
+                        pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: current },
+                    ),
+                );
             }
             return NudgeOutcome::ActiveQso(qso_id);
         }
     }
     pending_cq_offset_nudge.store(true, Ordering::Relaxed);
-    NudgeOutcome::CqNudge
+    NudgeOutcome::CqNudgeArmed
 }
 
 /// What one `TuiCommand::NudgeTxOffset` dispatch actually did — see
@@ -2944,11 +2974,19 @@ fn resolve_nudge_tx_offset(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NudgeOutcome {
     /// Forced a `Switch` onto `pending_qso_offset_requests` for this QSO.
+    /// The autonomous drain commits it on the next slot tick.
     ActiveQso(pancetta_qso::states::QsoId),
-    /// No active QSO — armed the one-shot CQ-offset nudge flag instead.
-    CqNudge,
-    /// An active QSO exists but TX-frequency mode is Hold: nothing queued,
-    /// nothing armed. The operator is told to press `f` for Auto.
+    /// No active QSO — ARMED the one-shot CQ-offset nudge flag. Deliberately
+    /// not called "CqNudge": whether it produces a real offset move depends
+    /// on the autonomous operator entering its CQ branch on a later cycle,
+    /// which nothing here can see or promise (see `resolve_nudge_tx_offset`'s
+    /// doc comment). The status line says "armed", not "nudged".
+    CqNudgeArmed,
+    /// TX-frequency mode is Hold: nothing queued, nothing armed, for an
+    /// active QSO or the CQ fallback alike. A flag armed in Hold is consumed
+    /// and discarded by `decide_at`'s `tx_freq_auto()` gate, so claiming a
+    /// nudge would be a silent false success. The operator is told to press
+    /// `f` for Auto.
     HeldNoOp,
 }
 
@@ -3361,12 +3399,7 @@ mod tui_relay_tests {
     /// mailbox and an unset CQ flag.
     #[allow(clippy::type_complexity)]
     fn nudge_fixture() -> (
-        std::sync::Mutex<
-            Vec<(
-                pancetta_qso::states::QsoId,
-                pancetta_qso::qso_manager::OffsetAction,
-            )>,
-        >,
+        std::sync::Mutex<Vec<pancetta_qso::qso_manager::OffsetActionRequest>>,
         AtomicBool,
     ) {
         (std::sync::Mutex::new(Vec::new()), AtomicBool::new(false))
@@ -3405,14 +3438,20 @@ mod tui_relay_tests {
         );
         let pending = pending_qso_offset_requests.lock().unwrap();
         assert_eq!(pending.len(), 1, "exactly one offset request queued");
-        assert_eq!(pending[0].0, qso_id);
+        assert_eq!(pending[0].qso_id, qso_id);
         assert!(
             matches!(
-                pending[0].1,
+                pending[0].action,
                 pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } if avoid_hz == 920.0
             ),
             "must be a Switch{{avoid_hz}} keyed off the QSO's CURRENT offset, got {:?}",
-            pending[0].1
+            pending[0].action
+        );
+        assert_eq!(
+            pending[0].raised_at_generation, None,
+            "an operator-forced `u` nudge carries no staleness token — it is \
+             current by construction and must never be discarded as stale \
+             (PAN-72 finding 8)"
         );
         assert!(
             !pending_cq_offset_nudge.load(Ordering::Relaxed),
@@ -3463,12 +3502,48 @@ mod tui_relay_tests {
         );
     }
 
-    /// PAN-72: `NudgeTxOffset` with no active QSO must set the one-shot
+    /// PAN-72 (Codex round 1 on PR #350, finding 4): with NO active QSO and
+    /// the mode on Hold, `u` must report a declared no-op too -- not a
+    /// phantom CQ nudge.
+    ///
+    /// `decide_at` computes `should_switch = self.tx_freq_auto() && (...)`,
+    /// so a flag armed in Hold is consumed and discarded with nothing to show
+    /// for it. Reporting `CqNudgeArmed` there told the operator a nudge was
+    /// under way when it provably could not be.
+    #[test]
+    fn nudge_is_a_declared_no_op_with_no_active_qso_in_hold_mode() {
+        let active: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::new());
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Hold),
+            &active,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::HeldNoOp,
+            "Hold with no active QSO must report a no-op, not a CQ nudge the \
+             downstream tx_freq_auto() gate will silently discard"
+        );
+        assert!(
+            !pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "Hold must not arm the CQ fallback flag at all"
+        );
+        assert!(pending_qso_offset_requests.lock().unwrap().is_empty());
+    }
+
+    /// PAN-72: `NudgeTxOffset` in Auto with no active QSO ARMS the one-shot
     /// `pending_cq_offset_nudge` flag (the CQ-hunting fallback) and must NOT
-    /// touch `pending_qso_offset_requests`. Mode-independent here: the CQ
-    /// path's own Auto gate lives downstream in `AutonomousOperator`
-    /// (`should_switch = self.tx_freq_auto() && ...`), which consumes the
-    /// one-shot flag either way -- unchanged by this fix.
+    /// touch `pending_qso_offset_requests`. Whether it produces a real move
+    /// still depends on the autonomous operator entering its CQ branch on a
+    /// later cycle -- nothing here can see or promise that, which is why the
+    /// outcome is named `CqNudgeArmed` (see `resolve_nudge_tx_offset`'s doc
+    /// comment).
     #[test]
     fn nudge_sets_cq_flag_when_no_active_qso() {
         let active: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -3483,7 +3558,11 @@ mod tui_relay_tests {
             &pending_cq_offset_nudge,
         );
 
-        assert_eq!(result, NudgeOutcome::CqNudge, "no active QSO to resolve to");
+        assert_eq!(
+            result,
+            NudgeOutcome::CqNudgeArmed,
+            "no active QSO to resolve to"
+        );
         assert!(
             pending_cq_offset_nudge.load(Ordering::Relaxed),
             "the CQ-hunting fallback flag must be set when no QSO is active"

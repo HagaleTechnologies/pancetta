@@ -10,7 +10,7 @@ use anyhow::Result;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 use tokio::time::interval;
-use tracing::{error, info, span, warn, Level};
+use tracing::{debug, error, info, span, warn, Level};
 
 use crate::message_bus::{ComponentId, ComponentMessage, MessageType};
 use pancetta_core::slot::SlotParity;
@@ -531,10 +531,38 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// per tick, mirroring `drain_pending_autonomous_cq_dispatch_failures`'s
 /// mailbox shape. `Switch` is resolved via the SAME `allocate_smart_frequency`
 /// the CQ-hunting switch uses (single-scorer invariant); `Revert` needs no
-/// allocator call. Errors from `apply_tx_offset_switch` (e.g. the QSO
-/// completed/was removed between the event firing and this drain) are logged
-/// and skipped, not propagated — a stale request for a QSO that no longer
-/// exists is not this task's problem to recover from.
+/// allocator call. Errors from `apply_tx_offset_switch` are logged and
+/// skipped, not propagated — a request for a QSO that has since completed,
+/// gone terminal or been superseded by a DX advance is an expected race
+/// (`QsoManagerError::is_expected_offset_action_refusal`, logged at `debug!`),
+/// not this task's problem to recover from.
+///
+/// **Hold is re-read here, per request** (Codex round 1 on PR #350, finding
+/// 6). A stall or `u` nudge can be queued while the mode is Auto and the
+/// operator can then press `f` for Hold before this once-per-slot drain
+/// runs. Committing anyway would violate Hold's promise that autonomous
+/// offset changes are suppressed — and in two different ways: a queued
+/// `Switch` resolves through `allocate_smart_frequency`'s Hold early return
+/// (which ignores `avoid_hz` and hands back the *parked* offset, dragging a
+/// held QSO onto it), while a queued `Revert` never consults the allocator at
+/// all and would move straight to its target. Queued actions are discarded
+/// wholesale once the mode reads Hold. This mirrors the same fail-safe the
+/// TUI's `u` handler applies at enqueue time; both ends need it, because the
+/// mode can flip in between.
+///
+/// **Each committed offset is reserved for the rest of the batch** (finding
+/// 1). This operator's own-frequency snapshot is only synced from
+/// `active_tx_offsets` later in the same tick (`set_own_frequencies`, a few
+/// statements below this drain's call site), so every `Switch` in one batch
+/// would otherwise rank against the identical stale occupancy view, each
+/// excluding only its own original offset — and two concurrent QSOs could
+/// land on the same "best" candidate, collapsing two TX streams onto one
+/// frequency. `reserved_hz` accumulates every offset this batch has actually
+/// committed and feeds it to `allocate_smart_frequency_avoiding` as an extra
+/// hard exclusion for the remaining requests. `Revert` targets are reserved
+/// too: a revert commits an offset just as surely as a switch does. Currently
+/// bounded in practice by `max_concurrent_qsos` (default 1), but it is a real
+/// bug the moment that is raised.
 ///
 /// On success the QSO's entry in `active_tx_offsets` is rewritten to the
 /// offset `apply_tx_offset_switch` actually applied (post-clamp). That map is
@@ -560,30 +588,54 @@ async fn drain_pending_qso_offset_requests(
     op: &mut pancetta_qso::AutonomousOperator,
     qso_manager: &pancetta_qso::QsoManager,
     pending_qso_offset_requests: &std::sync::Mutex<
-        Vec<(
-            pancetta_qso::states::QsoId,
-            pancetta_qso::qso_manager::OffsetAction,
-        )>,
+        Vec<pancetta_qso::qso_manager::OffsetActionRequest>,
     >,
     active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
+    tx_freq_mode: &std::sync::atomic::AtomicU8,
 ) {
     let requests: Vec<_> = std::mem::take(
         &mut *pending_qso_offset_requests
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner()),
     );
-    for (qso_id, action) in requests {
+    if requests.is_empty() {
+        return;
+    }
+    // Finding 6: authoritative re-read at commit time, not at enqueue time.
+    if !pancetta_core::TxFreqMode::from_u8(tx_freq_mode.load(Ordering::Acquire))
+        .allows_auto_change()
+    {
+        info!(
+            target: "tx.freq",
+            discarded = requests.len(),
+            "PAN-72: TX-frequency mode is Hold — discarding queued TX-offset actions"
+        );
+        return;
+    }
+    // Finding 1: offsets this batch has already committed, hard-excluded from
+    // every subsequent resolution so two QSOs can't collapse onto one slot.
+    let mut reserved_hz: Vec<f64> = Vec::new();
+    for request in requests {
+        let pancetta_qso::qso_manager::OffsetActionRequest {
+            qso_id,
+            action,
+            raised_at_generation,
+        } = request;
         let resolved_hz = match action {
             pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } => {
-                op.allocate_smart_frequency(None, None, Some(avoid_hz))
+                op.allocate_smart_frequency_avoiding(None, None, Some(avoid_hz), &reserved_hz)
             }
             pancetta_qso::qso_manager::OffsetAction::Revert { target_hz } => target_hz,
         };
         match qso_manager
-            .apply_tx_offset_switch(qso_id, resolved_hz)
+            .apply_tx_offset_switch(qso_id, resolved_hz, raised_at_generation)
             .await
         {
             Ok(applied_hz) => {
+                // Reserve only what actually landed (post-clamp) — and only
+                // once the commit succeeded, so a refused request never
+                // sterilizes a slot nothing is using.
+                reserved_hz.push(applied_hz);
                 let key = super::active_tx_qso_key(&qso_id.to_string());
                 if let Ok(mut offsets) = active_tx_offsets.write() {
                     if let Some(slot) = offsets.get_mut(&key) {
@@ -591,12 +643,23 @@ async fn drain_pending_qso_offset_requests(
                     }
                 }
             }
+            Err(err) if err.is_expected_offset_action_refusal() => {
+                // The QSO completed, went terminal, or advanced between the
+                // action being raised and this once-per-slot drain. All three
+                // are ordinary races, not faults.
+                debug!(
+                    target: "tx.freq",
+                    qso_id = %qso_id,
+                    error = %err,
+                    "PAN-72: queued TX-offset action superseded — discarded"
+                );
+            }
             Err(err) => {
                 warn!(
                     target: "tx.freq",
                     qso_id = %qso_id,
                     error = %err,
-                    "PAN-72: could not apply queued TX-offset action (QSO likely completed)"
+                    "PAN-72: could not apply queued TX-offset action"
                 );
             }
         }
@@ -1191,6 +1254,12 @@ impl super::ApplicationCoordinator {
         // push-mailbox shape as `pending_autonomous_cq_dispatch_failures`
         // above.
         let pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
+        // PAN-72 (Codex round 1 on PR #350, finding 6): the shared Hold/Auto
+        // atomic, re-read INSIDE the drain at commit time. The operator can
+        // press `f` for Hold after an action was queued but before this
+        // once-per-slot tick drains it; without the recheck the commit would
+        // move a QSO Hold had just pinned.
+        let tx_freq_mode_for_drain = self.tx_freq_mode.clone();
         // PAN-72: the `u` "nudge" keystroke's CQ-hunting fallback (no QSO
         // active at dispatch time) -- a one-shot flag the tui_relay task
         // sets; drained here once per `slot_interval` tick, alongside
@@ -1361,6 +1430,7 @@ impl super::ApplicationCoordinator {
                                     &qso_manager,
                                     &pending_qso_offset_requests,
                                     &active_tx_offsets,
+                                    &tx_freq_mode_for_drain,
                                 )
                                 .await;
                             }
@@ -3129,6 +3199,15 @@ fn no_offsets() -> std::sync::RwLock<std::collections::HashMap<String, f64>> {
     std::sync::RwLock::new(std::collections::HashMap::new())
 }
 
+/// The shared Hold/Auto atomic `drain_pending_qso_offset_requests` re-reads
+/// at commit time (PAN-72, Codex round 1 on PR #350, finding 6). Auto means
+/// queued actions are allowed to commit; see `hold_mode()` in
+/// `drain_pending_qso_offset_requests_tests` for the discard case.
+#[cfg(test)]
+fn drain_auto_mode() -> std::sync::atomic::AtomicU8 {
+    std::sync::atomic::AtomicU8::new(pancetta_core::TxFreqMode::Auto.as_u8())
+}
+
 #[cfg(test)]
 mod drain_pending_qso_offset_requests_tests {
     use super::*;
@@ -3166,6 +3245,14 @@ mod drain_pending_qso_offset_requests_tests {
         op
     }
 
+    use super::drain_auto_mode as auto_mode;
+
+    /// Hold = every queued action is discarded at drain time, whatever the
+    /// mode was when it was enqueued.
+    fn hold_mode() -> std::sync::atomic::AtomicU8 {
+        std::sync::atomic::AtomicU8::new(pancetta_core::TxFreqMode::Hold.as_u8())
+    }
+
     #[tokio::test]
     async fn switch_action_resolves_via_allocator_and_commits() {
         let mut op = operator_with_live_allocator();
@@ -3174,12 +3261,21 @@ mod drain_pending_qso_offset_requests_tests {
             .start_cq(1500.0, None, false)
             .await
             .expect("start_cq should succeed");
-        let pending = std::sync::Mutex::new(vec![(
-            qso_id,
-            pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
-        )]);
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+        ]);
 
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &no_offsets()).await;
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+        )
+        .await;
 
         assert!(
             pending.lock().unwrap().is_empty(),
@@ -3215,12 +3311,21 @@ mod drain_pending_qso_offset_requests_tests {
             .start_cq(1500.0, None, false)
             .await
             .expect("start_cq should succeed");
-        let pending = std::sync::Mutex::new(vec![(
-            qso_id,
-            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
-        )]);
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+            ),
+        ]);
 
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &no_offsets()).await;
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+        )
+        .await;
 
         assert!(pending.lock().unwrap().is_empty());
         let (_, progress) = qso_manager
@@ -3241,7 +3346,14 @@ mod drain_pending_qso_offset_requests_tests {
         let qso_manager = manager();
         let pending = std::sync::Mutex::new(Vec::new());
 
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &no_offsets()).await;
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+        )
+        .await;
 
         assert!(pending.lock().unwrap().is_empty());
     }
@@ -3269,13 +3381,21 @@ mod drain_pending_qso_offset_requests_tests {
         // Seed the map the way the real event-forwarder does on StateChanged.
         let active_tx_offsets =
             std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 1500.0)]));
-        let pending = std::sync::Mutex::new(vec![(
-            qso_id,
-            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
-        )]);
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+            ),
+        ]);
 
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &active_tx_offsets)
-            .await;
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+        )
+        .await;
 
         assert_eq!(
             active_tx_offsets.read().unwrap().get(&key).copied(),
@@ -3297,13 +3417,21 @@ mod drain_pending_qso_offset_requests_tests {
             .await
             .expect("start_cq should succeed");
         let active_tx_offsets = no_offsets();
-        let pending = std::sync::Mutex::new(vec![(
-            qso_id,
-            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
-        )]);
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+            ),
+        ]);
 
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &active_tx_offsets)
-            .await;
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+        )
+        .await;
 
         assert!(
             active_tx_offsets.read().unwrap().is_empty(),
@@ -3326,13 +3454,21 @@ mod drain_pending_qso_offset_requests_tests {
         let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
         let active_tx_offsets =
             std::sync::RwLock::new(std::collections::HashMap::from([(key.clone(), 1500.0)]));
-        let pending = std::sync::Mutex::new(vec![(
-            qso_id,
-            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 9000.0 },
-        )]);
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 9000.0 },
+            ),
+        ]);
 
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &active_tx_offsets)
-            .await;
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+        )
+        .await;
 
         let (_, progress) = qso_manager
             .get_active_qsos()
@@ -3351,17 +3487,132 @@ mod drain_pending_qso_offset_requests_tests {
         );
     }
 
+    /// PAN-72 (Codex round 1 on PR #350, finding 6): the operator can press
+    /// `f` for Hold after an action is queued but before this once-per-slot
+    /// drain runs. Committing anyway breaks Hold's promise — a `Switch`
+    /// resolves through the allocator's Hold early return onto the PARKED
+    /// offset, and a `Revert` does not consult the allocator at all.
+    #[tokio::test]
+    async fn hold_mode_at_drain_time_discards_every_queued_action() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let switching = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        let reverting = qso_manager.start_cq(1800.0, None, false).await.unwrap();
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                switching,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                reverting,
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 700.0 },
+            ),
+        ]);
+
+        // Enqueued under Auto (as the stall detector requires), drained under
+        // Hold — the exact race the operator's `f` press opens.
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &hold_mode(),
+        )
+        .await;
+
+        assert!(
+            pending.lock().unwrap().is_empty(),
+            "discarded actions must still be consumed off the mailbox, not \
+             left to fire on a later tick"
+        );
+        let offsets: std::collections::HashMap<_, _> = qso_manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .map(|(id, p)| (id, p.metadata.frequency))
+            .collect();
+        assert_eq!(
+            offsets.get(&switching),
+            Some(&1500.0),
+            "Hold must leave a queued Switch's QSO exactly where it is"
+        );
+        assert_eq!(
+            offsets.get(&reverting),
+            Some(&1800.0),
+            "Hold must leave a queued Revert's QSO exactly where it is"
+        );
+    }
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 1): two QSOs switching in
+    /// the same drain batch must not land on the same offset.
+    ///
+    /// Every `Switch` in one batch ranks against the identical allocator
+    /// occupancy view — `set_own_frequencies` only syncs from
+    /// `active_tx_offsets` LATER in the same tick — and each request only
+    /// excludes its OWN original offset, so without a batch-local reservation
+    /// both can pick the same best candidate and collapse two TX streams onto
+    /// one frequency.
+    #[tokio::test]
+    async fn concurrent_switches_in_one_batch_never_collapse_onto_one_offset() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let first = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        let second = qso_manager.start_cq(1520.0, None, false).await.unwrap();
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                first,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                second,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1520.0 },
+            ),
+        ]);
+
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+        )
+        .await;
+
+        let offsets: std::collections::HashMap<_, _> = qso_manager
+            .get_active_qsos()
+            .await
+            .into_iter()
+            .map(|(id, p)| (id, p.metadata.frequency))
+            .collect();
+        let a = *offsets.get(&first).expect("first QSO still active");
+        let b = *offsets.get(&second).expect("second QSO still active");
+        assert_ne!(
+            a, b,
+            "two concurrent switches resolved in one batch must not land on \
+             the same TX offset ({a} Hz)"
+        );
+    }
+
     #[tokio::test]
     async fn a_request_for_a_since_removed_qso_is_logged_and_skipped_not_propagated() {
         let mut op = operator_with_live_allocator();
         let qso_manager = manager();
-        let pending = std::sync::Mutex::new(vec![(
-            uuid::Uuid::new_v4(),
-            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
-        )]);
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                uuid::Uuid::new_v4(),
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+            ),
+        ]);
 
         // Must not panic even though the qso_id doesn't exist in the manager.
-        drain_pending_qso_offset_requests(&mut op, &qso_manager, &pending, &no_offsets()).await;
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+        )
+        .await;
 
         assert!(pending.lock().unwrap().is_empty());
     }
@@ -3450,11 +3701,20 @@ mod qso_manager_watch_refresh_tests {
             .expect("the receiver must observe the post-restart value");
 
         let mut op = hold_mode_operator();
-        let pending = std::sync::Mutex::new(vec![(
-            qso_id,
-            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
-        )]);
-        drain_pending_qso_offset_requests(&mut op, &current, &pending, &no_offsets()).await;
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+            ),
+        ]);
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &current,
+            &pending,
+            &no_offsets(),
+            &drain_auto_mode(),
+        )
+        .await;
 
         assert!(
             pending.lock().unwrap().is_empty(),
@@ -3493,10 +3753,12 @@ mod qso_manager_watch_refresh_tests {
             .expect("start_cq should succeed on the new manager");
 
         let mut op = hold_mode_operator();
-        let pending = std::sync::Mutex::new(vec![(
-            qso_id,
-            pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
-        )]);
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 1200.0 },
+            ),
+        ]);
 
         // Must not panic -- mirrors the drain function's documented "log
         // and skip" behavior for a QSO the handed-in manager doesn't know
@@ -3506,6 +3768,7 @@ mod qso_manager_watch_refresh_tests {
             &manager_before_restart,
             &pending,
             &no_offsets(),
+            &drain_auto_mode(),
         )
         .await;
 

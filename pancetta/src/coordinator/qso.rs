@@ -1550,6 +1550,7 @@ mod pan6_diagnostic_tests {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -2200,6 +2201,7 @@ mod ap_ranking_tests {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -2984,44 +2986,14 @@ impl super::ApplicationCoordinator {
                                 // QSOs to the TUI banner. The QSO state
                                 // machine is the source of truth; the TUI
                                 // replaces its list each push.
-                                let (snapshot, pending_snap) = build_active_qso_snapshot(
+                                push_active_qso_snapshot(
                                     &snapshot_qso_manager,
                                     &dx_activity_for_events,
                                     &pending_for_events,
+                                    &display_feed_enabled,
+                                    &snapshot_bus,
                                 )
                                 .await;
-                                // Additive: clone the snapshot for the read-only
-                                // gateway BEFORE it is moved into the →Tui send
-                                // (only when the gateway is enabled).
-                                let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
-                                    Some(MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot.clone(),
-                                        pending: pending_snap.clone(),
-                                    })
-                                } else {
-                                    None
-                                };
-                                let snap_msg = ComponentMessage::new(
-                                    ComponentId::Qso,
-                                    ComponentId::Tui,
-                                    MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot,
-                                        pending: pending_snap,
-                                    },
-                                    Instant::now(),
-                                );
-                                if let Err(e) = snapshot_bus.send_message(snap_msg).await {
-                                    debug!("Failed to push active-QSOs snapshot: {}", e);
-                                }
-                                if let Some(m) = gw_snap {
-                                    super::remote_gateway::relay_to_gateway(
-                                        &snapshot_bus,
-                                        &display_feed_enabled,
-                                        ComponentId::Qso,
-                                        m,
-                                    )
-                                    .await;
-                                }
 
                                 // Batch 2 #3: a QSO that just went terminal-Failed
                                 // is otherwise silently dropped from the snapshot.
@@ -3253,39 +3225,14 @@ impl super::ApplicationCoordinator {
                                 }
                                 // Push fresh snapshot so the banner drops
                                 // the just-completed QSO from the active list.
-                                let (snapshot, pending_snap) = build_active_qso_snapshot(
+                                push_active_qso_snapshot(
                                     &snapshot_qso_manager,
                                     &dx_activity_for_events,
                                     &pending_for_events,
+                                    &display_feed_enabled,
+                                    &snapshot_bus,
                                 )
                                 .await;
-                                let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
-                                    Some(MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot.clone(),
-                                        pending: pending_snap.clone(),
-                                    })
-                                } else {
-                                    None
-                                };
-                                let snap_msg = ComponentMessage::new(
-                                    ComponentId::Qso,
-                                    ComponentId::Tui,
-                                    MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot,
-                                        pending: pending_snap,
-                                    },
-                                    Instant::now(),
-                                );
-                                let _ = snapshot_bus.send_message(snap_msg).await;
-                                if let Some(m) = gw_snap {
-                                    super::remote_gateway::relay_to_gateway(
-                                        &snapshot_bus,
-                                        &display_feed_enabled,
-                                        ComponentId::Qso,
-                                        m,
-                                    )
-                                    .await;
-                                }
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO completed with {}, marking as worked", their_call);
 
@@ -3445,39 +3392,14 @@ impl super::ApplicationCoordinator {
                                 .await;
                                 // Push fresh snapshot so the banner drops
                                 // the failed QSO.
-                                let (snapshot, pending_snap) = build_active_qso_snapshot(
+                                push_active_qso_snapshot(
                                     &snapshot_qso_manager,
                                     &dx_activity_for_events,
                                     &pending_for_events,
+                                    &display_feed_enabled,
+                                    &snapshot_bus,
                                 )
                                 .await;
-                                let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
-                                    Some(MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot.clone(),
-                                        pending: pending_snap.clone(),
-                                    })
-                                } else {
-                                    None
-                                };
-                                let snap_msg = ComponentMessage::new(
-                                    ComponentId::Qso,
-                                    ComponentId::Tui,
-                                    MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot,
-                                        pending: pending_snap,
-                                    },
-                                    Instant::now(),
-                                );
-                                let _ = snapshot_bus.send_message(snap_msg).await;
-                                if let Some(m) = gw_snap {
-                                    super::remote_gateway::relay_to_gateway(
-                                        &snapshot_bus,
-                                        &display_feed_enabled,
-                                        ComponentId::Qso,
-                                        m,
-                                    )
-                                    .await;
-                                }
                                 // observability-diagnostics-plan.md Layer 2: surface
                                 // WHY the QSO failed instead of letting it silently
                                 // vanish from the banner — `reason` was previously
@@ -3577,10 +3499,50 @@ impl super::ApplicationCoordinator {
                                 )
                                 .await;
                             }
-                            Ok(pancetta_qso::QsoEvent::TxOffsetActionNeeded { qso_id, action }) => {
+                            Ok(pancetta_qso::QsoEvent::TxOffsetActionNeeded {
+                                qso_id,
+                                action,
+                                raised_at_generation,
+                            }) => {
                                 if let Ok(mut pending) = pending_qso_offset_requests.lock() {
-                                    pending.push((qso_id, action));
+                                    pending.push(
+                                        pancetta_qso::qso_manager::OffsetActionRequest::stall_detected(
+                                            qso_id,
+                                            action,
+                                            raised_at_generation,
+                                        ),
+                                    );
                                 }
+                            }
+                            Ok(pancetta_qso::QsoEvent::TxOffsetApplied { qso_id, offset_hz }) => {
+                                // PAN-72 (Codex round 1 on PR #350, finding 7):
+                                // an applied offset move is not a state
+                                // transition, so nothing else in this task
+                                // rebuilds the `ActiveQsosSnapshot` the TUI
+                                // banner and the TX-placement stream marker
+                                // render from. A stalled exchange is exactly
+                                // where no further transition arrives, so
+                                // without this push the UI keeps showing the
+                                // pre-switch offset through several
+                                // switch/revert cycles. The coordinator-side
+                                // `active_tx_offsets` mirror is written by the
+                                // Autonomous drain itself (it needs the value
+                                // in time for the same tick's
+                                // `set_own_frequencies`); this is the UI half.
+                                debug!(
+                                    target: "tx.freq",
+                                    qso_id = %qso_id,
+                                    offset_hz,
+                                    "PAN-72: refreshing the active-QSO snapshot after an offset move"
+                                );
+                                push_active_qso_snapshot(
+                                    &snapshot_qso_manager,
+                                    &dx_activity_for_events,
+                                    &pending_for_events,
+                                    &display_feed_enabled,
+                                    &snapshot_bus,
+                                )
+                                .await;
                             }
                             Ok(_) => {} // Other events (StateChanged, etc.)
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
@@ -4955,6 +4917,60 @@ impl super::ApplicationCoordinator {
 /// QSO-detail panel both render from this. Also snapshots the cross-parity
 /// pending-call queue (#40) so the TUI can surface "Queued" calls without
 /// a separate message.
+/// Build a fresh active-QSO snapshot and push it to the TUI (and, when the
+/// read-only display feed is enabled, to the remote gateway).
+///
+/// Extracted from the three copies that already existed inline in the QSO
+/// event-forwarding task (`StateChanged`, `QsoCompleted`, `QsoFailed`) when
+/// PAN-72 added a fourth caller: `QsoEvent::TxOffsetApplied`. A mid-QSO offset
+/// switch changes what the banner and the TX-placement stream marker must
+/// show, but it is not a state transition — during the stalled exchange that
+/// triggered the switch there may be no further transition at all, so without
+/// this push the operator would watch multiple switch/revert cycles while the
+/// UI kept displaying the pre-switch offset (Codex round 1 on PR #350,
+/// finding 7).
+async fn push_active_qso_snapshot(
+    qso_manager: &pancetta_qso::QsoManager,
+    dx_activity: &DxActivityMap,
+    pending_manual_calls: &PendingManualCalls,
+    display_feed_enabled: &std::sync::atomic::AtomicBool,
+    message_bus: &MessageBus,
+) {
+    let (snapshot, pending_snap) =
+        build_active_qso_snapshot(qso_manager, dx_activity, pending_manual_calls).await;
+    // Additive: clone for the read-only gateway BEFORE the snapshot is moved
+    // into the ->Tui send, and only when the gateway is enabled.
+    let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
+        Some(MessageType::ActiveQsosSnapshot {
+            qsos: snapshot.clone(),
+            pending: pending_snap.clone(),
+        })
+    } else {
+        None
+    };
+    let snap_msg = ComponentMessage::new(
+        ComponentId::Qso,
+        ComponentId::Tui,
+        MessageType::ActiveQsosSnapshot {
+            qsos: snapshot,
+            pending: pending_snap,
+        },
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(snap_msg).await {
+        debug!("Failed to push active-QSOs snapshot: {}", e);
+    }
+    if let Some(m) = gw_snap {
+        super::remote_gateway::relay_to_gateway(
+            message_bus,
+            display_feed_enabled,
+            ComponentId::Qso,
+            m,
+        )
+        .await;
+    }
+}
+
 async fn build_active_qso_snapshot(
     qso_manager: &pancetta_qso::QsoManager,
     dx_activity: &DxActivityMap,
@@ -6210,6 +6226,7 @@ mod snapshot_tests {
                 progressed_this_cycle: false,
                 stall_cycles: 0,
                 last_known_good_offset_hz: None,
+                advance_generation: 0,
                 hound: false,
                 partner_freq: None,
                 pending_freq_drift: None,
@@ -7688,6 +7705,7 @@ mod cqdx_upload_tests {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -7806,6 +7824,7 @@ mod qrz_enrichment_tests {
             progressed_this_cycle: false,
             stall_cycles: 0,
             last_known_good_offset_hz: None,
+            advance_generation: 0,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -8253,6 +8272,7 @@ mod replay_history_seed_tests {
                 progressed_this_cycle: false,
                 stall_cycles: 0,
                 last_known_good_offset_hz: None,
+                advance_generation: 0,
                 hound: false,
                 partner_freq: None,
                 pending_freq_drift: None,
@@ -8880,7 +8900,7 @@ mod respond_to_caller_admission_tests {
                 .lock()
                 .unwrap()
                 .iter()
-                .any(|(id, _)| *id == qso_id)
+                .any(|req| req.qso_id == qso_id)
             {
                 found = true;
                 break;
@@ -8890,6 +8910,99 @@ mod respond_to_caller_admission_tests {
         assert!(
             found,
             "TxOffsetActionNeeded must be forwarded into pending_qso_offset_requests"
+        );
+        assert!(
+            coordinator
+                .pending_qso_offset_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|req| req.qso_id == qso_id)
+                .map(|req| req.raised_at_generation.is_some())
+                .unwrap_or(false),
+            "a stall-detected request must carry the QSO's advance generation \
+             so a DX advance landing before the once-per-slot drain invalidates \
+             it (PAN-72 finding 8)"
+        );
+    }
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 7): committing an offset
+    /// action must refresh the `ActiveQsosSnapshot` the TUI banner and the
+    /// remote gateway render from.
+    ///
+    /// `apply_tx_offset_switch` is not a state transition, and the snapshot
+    /// was previously rebuilt only by the `StateChanged`/`QsoCompleted`/
+    /// `QsoFailed` arms. A stalled exchange is exactly the case where no
+    /// further transition arrives, so without the new `TxOffsetApplied` arm
+    /// the operator watches multiple switch/revert cycles while the displayed
+    /// offset never moves.
+    #[tokio::test]
+    async fn applying_an_offset_switch_pushes_a_refreshed_active_qso_snapshot() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        // Register the TUI channel so the forwarder's snapshot sends have
+        // somewhere to land (headless test coordinators have no real TUI).
+        let (_tui_tx, tui_rx) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Tui)
+            .await
+            .expect("registering a TUI channel");
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+
+        let qso_id = manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
+            .await
+            .expect("seeding the QSO");
+
+        // Let the QSO-creation StateChanged snapshot flush through, then
+        // clear it so the assertion below can only be satisfied by a NEW push.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            while tui_rx.try_recv().is_ok() {}
+            if coordinator
+                .active_tx_qsos
+                .read()
+                .unwrap()
+                .contains(&crate::coordinator::active_tx_qso_key(&qso_id.to_string()))
+                || std::time::Instant::now() > deadline
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        while tui_rx.try_recv().is_ok() {}
+
+        let new_offset = 1900.0;
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, new_offset, None)
+            .await
+            .expect("committing the offset switch");
+        assert_eq!(applied, new_offset);
+
+        let mut saw_refresh = false;
+        for _ in 0..300 {
+            while let Ok(msg) = tui_rx.try_recv() {
+                if let MessageType::ActiveQsosSnapshot { ref qsos, .. } = msg.message_type {
+                    if qsos
+                        .iter()
+                        .any(|q| q.qso_id == qso_id.to_string() && q.frequency_hz == new_offset)
+                    {
+                        saw_refresh = true;
+                    }
+                }
+            }
+            if saw_refresh {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_refresh,
+            "an applied TX-offset move must push a fresh ActiveQsosSnapshot \
+             carrying the NEW offset — no state transition follows a stall, so \
+             nothing else would ever refresh the banner"
         );
     }
 

@@ -532,6 +532,24 @@ pub struct QsoMetadata {
     #[serde(default)]
     pub last_known_good_offset_hz: Option<f64>,
 
+    /// PAN-72 (Codex round 1 on PR #350, finding 8): monotonic count of
+    /// forward advances this QSO has made. Incremented at the same single
+    /// site that resets [`Self::stall_cycles`] and records
+    /// [`Self::last_known_good_offset_hz`], so all three always move together.
+    ///
+    /// This is the staleness token for a queued TX-offset action. A
+    /// `QsoEvent::TxOffsetActionNeeded` is drained by the coordinator's
+    /// autonomous task only once per 15-second slot, so the DX can send an
+    /// advancing frame in between — which resets the stall counter and marks
+    /// the CURRENT offset known-good, while the already-queued request would
+    /// still move us off the offset that just demonstrably worked. The
+    /// request carries the generation it was raised at;
+    /// `QsoManager::apply_tx_offset_switch` discards it if this counter has
+    /// moved since. An operator-forced nudge (`u`) carries no generation and
+    /// is therefore never treated as stale.
+    #[serde(default)]
+    pub advance_generation: u32,
+
     /// Hound (DXpedition chaser) mode: this QSO calls a Fox low and QSYs up on
     /// the Fox's report. `false` for every normal QSO. This flag, rather than
     /// `partner_freq.is_some()`, is the Hound/Fox discriminator used by the
