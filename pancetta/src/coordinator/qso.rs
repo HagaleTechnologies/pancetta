@@ -2508,6 +2508,27 @@ impl super::ApplicationCoordinator {
         // whose re-send the `TxPolicy::Disabled` hard mute blocked outright —
         // the DX cannot answer a frame that never went on the air.
         qso_manager.set_tx_policy_source(tx_policy.clone());
+        // PAN-72 (Codex round 7 on PR #350, finding 3): the policy above is
+        // only ONE of the two gates a rearmed frame must clear. A QSO with
+        // `remote_origin` emits every frame as `TxOrigin::Remote`, and the TX
+        // worker independently checks the station-agent arm immediately before
+        // PTT — an arm expiry or explicit disarm drops those frames while
+        // `TxPolicy` still reads `Full`, and the stall detector was counting
+        // the resulting silence as "the DX ignored us".
+        //
+        // Read-only evidence, NOT a TX gate: the fail-CLOSED gate stays in the
+        // TX worker (AGENTS.md invariant). `remote_tx_permitted` itself denies
+        // on a poisoned lock, so a poisoned arm makes the stall detector stop
+        // counting too — the conservative direction in both places.
+        {
+            let arm_for_stall_evidence = self.remote_tx_arm();
+            qso_manager.set_remote_tx_permitted_source(std::sync::Arc::new(move || {
+                crate::coordinator::tx::remote_tx_permitted(
+                    &arm_for_stall_evidence,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            }));
+        }
 
         // Task 5 (QSOLogged/LoggedADIF): subscribe synchronously, before
         // `qso_manager` is moved into the spawned task below, so the WSJT-X
@@ -3542,6 +3563,39 @@ impl super::ApplicationCoordinator {
                                     offset_hz,
                                     "PAN-72: refreshing the active-QSO snapshot after an offset move"
                                 );
+                                // PAN-72 (Codex round 7 on PR #350, finding 6):
+                                // re-centre the DECODER too, not just the UI.
+                                // With the QSO filter on (the default) the main
+                                // decode is collapsed to ±60 Hz around
+                                // `active_qso_freq_hz`, and a relocation is at
+                                // least `min_separation_hz` (75 Hz) away — so an
+                                // unanswered CQ that switched offset could no
+                                // longer hear an answer on its NEW frequency,
+                                // and with no decode there was no StateChanged
+                                // to refresh the hint either. Self-sustaining
+                                // deafness, for the life of the QSO.
+                                //
+                                // Resolve the value BEFORE taking the std
+                                // RwLock guard so no non-Send guard is held
+                                // across an await, exactly as the StateChanged
+                                // arm does. A QSO that has gone terminal in the
+                                // meantime yields `None` and the hint is left
+                                // ALONE — the terminal arms own that clear, and
+                                // a co-active QSO's hint must not be wiped by a
+                                // late event for a dead one.
+                                {
+                                    let hint = snapshot_qso_manager
+                                        .get_qso(qso_id)
+                                        .await
+                                        .ok()
+                                        .as_ref()
+                                        .and_then(decoder_hint_freq_for);
+                                    if let Some(hint_hz) = hint {
+                                        if let Ok(mut guard) = qso_freq_state.write() {
+                                            *guard = Some(hint_hz);
+                                        }
+                                    }
+                                }
                                 push_active_qso_snapshot(
                                     &snapshot_qso_manager,
                                     &dx_activity_for_events,
@@ -4917,6 +4971,53 @@ impl super::ApplicationCoordinator {
         info!("QSO component started");
         Ok(())
     }
+}
+
+/// The decoder's narrow-band hint (`active_qso_freq_hz`) for a QSO, computed
+/// from its CURRENT state and metadata.
+///
+/// PAN-72 (Codex round 7 on PR #350, finding 6). This is the same rule the
+/// `StateChanged` arm applies inline — `partner_freq` when the DX's RX offset
+/// is known, otherwise the QSO's own state frequency — factored out so the
+/// `TxOffsetApplied` arm can apply it too, from the POST-switch QSO.
+///
+/// Why an offset switch must recompute it: the FT8 decoder's QSO filter
+/// (`coordinator::qso_filter`, on by default) collapses the main decode to
+/// ±[`DEFAULT_HALF_WINDOW_HZ`](crate::coordinator::qso_filter::DEFAULT_HALF_WINDOW_HZ)
+/// (60 Hz) around this value. A relocation is guaranteed to be at least
+/// `min_separation_hz` (75 Hz by default) away, so a hint left on the
+/// abandoned offset puts the QSO's own traffic OUTSIDE the decode window.
+///
+/// The two cases differ in which field carries the answer, and only one of
+/// them is dangerous:
+///
+/// - **Established QSO** (`partner_freq` latched, which
+///   `apply_tx_offset_switch` does for exactly this reason): the DX still
+///   transmits on the offset we vacated, so the hint must stay there. The
+///   switch changed only our TX side. Recomputing yields `partner_freq` and
+///   the hint effectively does not move — correct, and previously correct by
+///   accident, since it also did not move.
+/// - **Unanswered `CallingCq`**: no DX exists yet and `partner_freq` stays
+///   `None` on purpose, so the state frequency IS the hint — and the switch
+///   just changed it. Leaving the hint on the abandoned CQ offset meant an
+///   answer to the NEW CQ fell outside the decode search entirely. No decode
+///   ⇒ no `StateChanged` ⇒ nothing ever refreshed the hint: the station was
+///   left calling CQ on a frequency it could not hear replies on, for the life
+///   of the QSO. That is the failure PAN-72's whole mechanism exists to avoid.
+///
+/// Returns `None` for a QSO that is no longer active — the caller uses that to
+/// LEAVE the shared hint alone rather than clearing it, since the terminal
+/// paths (`StateChanged`'s inactive branch, `QsoCompleted`, `QsoFailed`)
+/// already own that transition and a co-active QSO's hint must not be wiped by
+/// a late event for a dead one.
+fn decoder_hint_freq_for(progress: &pancetta_qso::QsoProgress) -> Option<f64> {
+    if !progress.state.is_active() {
+        return None;
+    }
+    progress
+        .metadata
+        .partner_freq
+        .or_else(|| progress.state.frequency())
 }
 
 /// Build a fresh active-QSO snapshot and push it to the TUI (and, when the
@@ -9019,6 +9120,215 @@ mod respond_to_caller_admission_tests {
              carrying the NEW offset — no state transition follows a stall, so \
              nothing else would ever refresh the banner"
         );
+    }
+
+    /// Block until the QSO component's spawned event-forwarding task has
+    /// actually `.subscribe()`d, then leave no trace behind.
+    ///
+    /// The subscription happens INSIDE the spawned task, not synchronously
+    /// before `start_qso_component` returns, and a `broadcast` channel only
+    /// delivers to subscribers that already exist at send time — so a QSO
+    /// opened immediately after `start_qso_component` can have its
+    /// `StateChanged` dropped on the floor. Mirrors the probe loop in
+    /// `tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_requests`,
+    /// with one addition: the probe QSO is retired afterwards (which also
+    /// clears the shared decoder hint the probe's own `StateChanged` set), so
+    /// the caller starts from a clean slate.
+    async fn await_forwarder_subscribed(
+        coordinator: &ApplicationCoordinator,
+        manager: &pancetta_qso::QsoManager,
+    ) {
+        for i in 0..20 {
+            let probe_id = manager
+                .respond_to_cq_manual(format!("K9RD{i}"), 2400.0, None)
+                .await
+                .expect("seeding a readiness-probe QSO");
+            let key = crate::coordinator::active_tx_qso_key(&probe_id.to_string());
+            let mut seen = false;
+            for _ in 0..50 {
+                if coordinator.active_tx_qsos.read().unwrap().contains(&key) {
+                    seen = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let _ = manager
+                .fail_qso(probe_id, pancetta_qso::QsoFailureReason::UserCancelled)
+                .await;
+            if seen {
+                // Let the retiring StateChanged flush through, so the probe's
+                // own decoder-hint write cannot race the caller's.
+                for _ in 0..50 {
+                    if coordinator.active_qso_freq_hz.read().unwrap().is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                return;
+            }
+        }
+        panic!("readiness probe: the real forwarder never populated active_tx_qsos");
+    }
+
+    /// PAN-72 (Codex round 7 on PR #350, finding 6) — the CRITICAL one.
+    ///
+    /// An unanswered `CallingCq` that relocates changes the frequency callers
+    /// will answer on. With the QSO filter enabled (the default) the main FT8
+    /// decoder is collapsed to ±60 Hz around `active_qso_freq_hz`, while the
+    /// allocator guarantees the relocation is at least `min_separation_hz`
+    /// (75 Hz) away — so an answer on the NEW CQ offset landed outside the
+    /// decode search. And because only a decode can produce the `StateChanged`
+    /// that refreshes the hint, nothing ever recovered: the station kept
+    /// calling CQ on a frequency it was structurally unable to hear replies on.
+    ///
+    /// Drives the REAL forwarder end to end (real `start_qso_component`, real
+    /// spawned event task, real `apply_tx_offset_switch`) and asserts on the
+    /// coordinator's own shared decoder hint — the exact value
+    /// `coordinator::ft8`'s decode loop reads each window.
+    #[tokio::test]
+    async fn an_applied_offset_switch_recenters_the_decoder_on_an_unanswered_cq() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        let (_tui_tx, _tui_rx) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Tui)
+            .await
+            .expect("registering a TUI channel");
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        await_forwarder_subscribed(&coordinator, &manager).await;
+
+        const CQ_HZ: f64 = 1500.0;
+        const NEW_HZ: f64 = 1900.0;
+        let qso_id = manager
+            .start_cq_manual(CQ_HZ, None, false)
+            .await
+            .expect("seeding an unanswered CQ");
+
+        // The forwarder's StateChanged arm seeds the hint with the CQ offset.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if coordinator.active_qso_freq_hz.read().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the real forwarder never seeded the decoder hint"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *coordinator.active_qso_freq_hz.read().unwrap(),
+            Some(CQ_HZ),
+            "precondition: the decoder is centred on the original CQ offset"
+        );
+
+        let applied = manager
+            .apply_tx_offset_switch(
+                qso_id,
+                NEW_HZ,
+                pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+            )
+            .await
+            .expect("committing the offset switch");
+        assert_eq!(applied, NEW_HZ);
+        assert!(
+            (NEW_HZ - CQ_HZ).abs() > crate::coordinator::qso_filter::DEFAULT_HALF_WINDOW_HZ,
+            "test premise: the move must be bigger than the decoder's own \
+             half-window, or a stale hint would still cover the new offset"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if *coordinator.active_qso_freq_hz.read().unwrap() == Some(NEW_HZ) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an applied TX-offset move on an unanswered CQ must re-centre \
+                 the decoder on the NEW offset — otherwise the ±60 Hz QSO \
+                 filter stays parked on the abandoned frequency and an answer \
+                 to our own CQ can never be decoded, so no StateChanged ever \
+                 arrives to fix it; hint was {:?}",
+                *coordinator.active_qso_freq_hz.read().unwrap()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The QSO's own state must agree — the hint is derived, not invented.
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.partner_freq, None,
+            "an unanswered CQ has no DX to point partner_freq at (round 5's \
+             fix); the state frequency is the only correct hint"
+        );
+    }
+
+    /// The established-QSO half of finding 6: after a switch the DX is still
+    /// transmitting on the offset we vacated, so the decoder hint must follow
+    /// `partner_freq` (which `apply_tx_offset_switch` latches to the old
+    /// offset), NOT our new TX offset. Guards against "fixing" the CQ case by
+    /// blindly pushing the applied offset into the hint.
+    #[tokio::test]
+    async fn an_applied_offset_switch_keeps_an_established_qso_pointed_at_the_dx() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        let (_tui_tx, _tui_rx) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Tui)
+            .await
+            .expect("registering a TUI channel");
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        await_forwarder_subscribed(&coordinator, &manager).await;
+
+        const DX_HZ: f64 = 1500.0;
+        const NEW_HZ: f64 = 1900.0;
+        let qso_id = manager
+            .respond_to_cq_manual("K9ZZ".to_string(), DX_HZ, None)
+            .await
+            .expect("seeding an established QSO");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if coordinator.active_qso_freq_hz.read().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the real forwarder never seeded the decoder hint"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        manager
+            .apply_tx_offset_switch(
+                qso_id,
+                NEW_HZ,
+                pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+            )
+            .await
+            .expect("committing the offset switch");
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.partner_freq,
+            Some(DX_HZ),
+            "precondition: the switch latched the vacated offset as the DX's"
+        );
+
+        // Give the forwarder ample opportunity to get this wrong.
+        for _ in 0..30 {
+            assert_eq!(
+                *coordinator.active_qso_freq_hz.read().unwrap(),
+                Some(DX_HZ),
+                "the decoder must stay on the DX's transmit offset after OUR \
+                 side moves — the switch is TX-only"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
     }
 
     /// PAN-72 final-review CRITICAL regression: `start_qso_component` must
