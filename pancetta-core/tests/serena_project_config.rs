@@ -110,16 +110,60 @@ fn parse_flat_yaml(src: &str) -> FlatYaml {
 /// `parse_flat_yaml` understands.
 fn parse_toml_string_array(src: &str, key: &str) -> Vec<String> {
     let marker = format!("{key} = [");
-    let start = src
-        .find(&marker)
-        .unwrap_or_else(|| panic!("{key} array not found in Cargo.toml"));
-    let after = &src[start + marker.len()..];
+    // Match only at the start of a line (ignoring leading whitespace): a
+    // plain substring search for "members = [" also matches inside
+    // "default-members = [", so an unqualified `.find` can silently return
+    // the wrong array depending on which key appears first in the file.
+    let mut search_from = 0;
+    let after = loop {
+        let rel = src[search_from..]
+            .find(&marker)
+            .unwrap_or_else(|| panic!("{key} array not found in Cargo.toml"));
+        let abs = search_from + rel;
+        let line_start = src[..abs].rfind('\n').map_or(0, |i| i + 1);
+        if src[line_start..abs].trim().is_empty() {
+            break &src[abs + marker.len()..];
+        }
+        search_from = abs + marker.len();
+    };
     let end = after.find(']').expect("unterminated members array");
     after[..end]
         .split(',')
         .map(|s| s.trim().trim_matches('"').to_string())
         .filter(|s| !s.is_empty())
         .collect()
+}
+
+/// Minimal gitignore-style glob match, sufficient for `ignored_paths`: `**`
+/// matches any number of path segments (including none), `*` matches any run
+/// of non-`/` characters within one segment, and a pattern with no `/` at all
+/// matches at any depth (gitignore semantics), not just at the repo root.
+fn glob_shadows(pattern: &str, path: &str) -> bool {
+    fn segment_matches(pat: &str, seg: &str) -> bool {
+        match pat.split_once('*') {
+            None => pat == seg,
+            Some((pre, post)) => {
+                seg.len() >= pre.len() + post.len() && seg.starts_with(pre) && seg.ends_with(post)
+            }
+        }
+    }
+    fn matches(pat: &[&str], path: &[&str]) -> bool {
+        match pat.split_first() {
+            None => true, // pattern fully consumed: it shadows this path (or a prefix of it)
+            Some((&"**", rest)) => (0..=path.len()).any(|i| matches(rest, &path[i..])),
+            Some((seg, rest)) => {
+                path.first().is_some_and(|p| segment_matches(seg, p)) && matches(rest, &path[1..])
+            }
+        }
+    }
+    let normalized = if pattern.contains('/') {
+        pattern.trim_start_matches('/').to_string()
+    } else {
+        format!("**/{pattern}")
+    };
+    let pat_segs: Vec<&str> = normalized.trim_matches('/').split('/').collect();
+    let path_segs: Vec<&str> = path.trim_matches('/').split('/').collect();
+    matches(&pat_segs, &path_segs)
 }
 
 #[test]
@@ -153,11 +197,19 @@ fn project_yml_identifies_this_repo_and_stays_navigation_only() {
 #[test]
 fn project_yml_declares_rust() {
     let cfg = parse_flat_yaml(&read(&serena_dir().join("project.yml")));
-    let languages = cfg.lists.get("languages").expect("languages key missing");
+    // Accept both the current schema key (`language_servers`) and the legacy
+    // one (`languages`, migrated away from by Serena on activation) so this
+    // guard survives a Serena version that changes which key is current —
+    // see PAN-77 header and .serena/project.yml's own comment on this.
+    let languages = cfg
+        .lists
+        .get("language_servers")
+        .or_else(|| cfg.lists.get("languages"))
+        .expect("neither language_servers nor languages key present");
     assert!(
         languages.iter().any(|l| l == "rust"),
-        "dropping `rust` from languages silently disables symbol search across \
-         all 14 crates; got {languages:?}"
+        "dropping `rust` from language_servers silently disables symbol search \
+         across all 14 crates; got {languages:?}"
     );
 }
 
@@ -200,11 +252,8 @@ fn no_ignored_path_shadows_a_workspace_member_source_root() {
             "{src} should exist in the checkout"
         );
         for pattern in ignored {
-            if pattern.contains('*') {
-                continue; // glob patterns cannot shadow a literal source root here
-            }
             assert!(
-                !format!("{src}/").starts_with(&format!("{pattern}/")),
+                !glob_shadows(pattern, &src),
                 "ignored_paths entry {pattern:?} shadows workspace source root {src}"
             );
         }
@@ -236,11 +285,30 @@ fn codebase_map_names_every_workspace_crate() {
     let map = read(&serena_dir().join("memories").join("codebase_map.md"));
     let manifest = read(&repo_root().join("Cargo.toml"));
     let members = parse_toml_string_array(&manifest, "members");
+    assert_eq!(
+        members.len(),
+        14,
+        "workspace member count changed; got {members:?}"
+    );
     for crate_name in &members {
         assert!(
-            map.contains(crate_name.as_str()),
+            contains_whole_word(&map, crate_name),
             "codebase_map.md does not mention crate {crate_name} — a new crate was \
              added without updating the orientation memory"
         );
     }
+}
+
+/// Whole-word substring search: a plain `str::contains` would let a crate
+/// whose name is a prefix of another (e.g. `pancetta` inside `pancetta-core`)
+/// pass without ever being mentioned on its own.
+fn contains_whole_word(haystack: &str, needle: &str) -> bool {
+    let is_word_byte = |b: u8| (b as char).is_alphanumeric() || b == b'-' || b == b'_';
+    let bytes = haystack.as_bytes();
+    haystack.match_indices(needle).any(|(idx, matched)| {
+        let before_ok = idx == 0 || !is_word_byte(bytes[idx - 1]);
+        let end = idx + matched.len();
+        let after_ok = end == bytes.len() || !is_word_byte(bytes[end]);
+        before_ok && after_ok
+    })
 }

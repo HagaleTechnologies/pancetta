@@ -6,8 +6,6 @@
 # cache, an optional project.local.yml override) are gitignored — see
 # .serena/.gitignore.
 project_name: "pancetta"
-languages:
-- rust
 encoding: "utf-8"
 ignore_all_files_in_gitignore: true
 ignored_paths:
@@ -57,4 +55,17 @@ line_ending:
 read_only_memory_patterns: []
 ignored_memory_patterns: []
 ls_specific_settings: {}
-additional_workspace_folders: []
+ls_additional_workspace_folders: []
+# Workspace folders indexed for symbol search; "." covers the whole repo. Set
+# explicitly (rather than left absent) because an absent key is what
+# triggered Serena's one-time schema migration that stripped this file's
+# rationale comments on first activation — see PAN-77 header above.
+ls_workspace_folders:
+- .
+# No pre-activation shell setup needed for a pure-Rust workspace; left unset.
+activation_command:
+activation_command_timeout: 180.0
+# `language_servers` (not the legacy `languages` key Serena migrates away
+# from) so a fresh activation is idempotent and never rewrites this file.
+language_servers:
+- rust
