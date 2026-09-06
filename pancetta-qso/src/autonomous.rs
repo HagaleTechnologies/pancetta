@@ -1775,6 +1775,15 @@ impl AutonomousOperator {
     /// hard in Codex round 6 on PR #276. When the exclusions empty the ranked
     /// list, the fallback still returns `avoid_hz` unchanged so the caller's
     /// existing "no valid relocation → skip the switch" path fires.
+    ///
+    /// Caveat (undocumented gap, narrow and pre-existing in shape): `also_avoid_hz`
+    /// only binds inside the `self.spectral_snapshot.is_some()` branch below.
+    /// With no spectral snapshot yet, this falls through to the legacy
+    /// `allocate_cq_frequency()`, which is fully deterministic and knows
+    /// nothing about `avoid_hz` or `also_avoid_hz` — so two same-batch
+    /// `Switch` actions could still collide on that fallback path. This is the
+    /// same gap that already existed for the single-offset `avoid_hz` case
+    /// before this batch-reservation mechanism was added; it is not new.
     pub fn allocate_smart_frequency_avoiding(
         &self,
         dx_target_hz: Option<f64>,
@@ -2591,6 +2600,18 @@ impl AutonomousOperator {
                                 // the switch is retried once conditions
                                 // improve.
                                 if (new_offset - avoid).abs() < f64::EPSILON {
+                                    // Same manual-nudge-loss failure mode as the
+                                    // `!history_fresh` early return above (PAN-72
+                                    // finding 2, re-review round): a STREAK-driven
+                                    // switch retries on its own next window, but a
+                                    // MANUAL (`u`) request has no such backing state
+                                    // once `manual_switch_requested` was consumed by
+                                    // the `mem::take` at the top of `decide_at` --
+                                    // put it back so a later cycle honors it instead
+                                    // of silently dropping the operator's nudge.
+                                    if manual_switch_requested {
+                                        self.manual_switch_requested = true;
+                                    }
                                     self.state = OperatingState::Hunting;
                                     actions.push(OperatorAction::Listen);
                                     actions.push(self.status_action());
@@ -3931,6 +3952,73 @@ mod tests {
                 .iter()
                 .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
             "the retained manual nudge must fire once history fills in \
+             (streak is only 0/1, nowhere near switch_after=3)"
+        );
+    }
+
+    /// PAN-72 (re-review round on PR #350, finding 2): the sibling early
+    /// return for "no candidate honors the exclusion" (`new_offset ==
+    /// avoid`, a few lines below the thin-history check above) used to drop
+    /// a manual `u` nudge exactly the same way the thin-history return did
+    /// before finding 9's fix. Same failure mode, second site: this proves
+    /// the identical restore-the-flag guard now covers it too.
+    #[test]
+    fn manual_switch_request_survives_a_no_valid_relocation_skip_and_fires_later() {
+        // switch_after = 3 so the streak alone can never force a switch in
+        // this test -- only the retained manual request can. min_separation_hz
+        // impossibly large so allocate_smart_frequency returns avoid_hz
+        // unchanged on the first attempt (mirrors
+        // `switch_skips_and_listens_when_no_frequency_honors_the_exclusion`).
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 1;
+        config.cq_no_response_switch_after = 3;
+        config.listen_cycle.initial_interval = 100;
+        config.frequency.min_separation_hz = 10_000.0; // impossible to honor
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let even_ts: i64 = 0;
+        op.request_manual_switch();
+        let blocked = op.decide_at(even_ts); // idle_cycles 0->1 >= 1: CQ cycle, no valid relocation
+        assert!(
+            blocked.iter().any(|a| matches!(a, OperatorAction::Listen)),
+            "no valid relocation must still take the listen-instead-of-guess path"
+        );
+        assert!(
+            !blocked
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "no blind switch when no candidate honors the exclusion"
+        );
+
+        // Conditions improve: relax the exclusion so a relocation becomes
+        // possible again. `smart_allocator` is built once from
+        // `config.frequency` at construction time (see `AutonomousOperator::
+        // new`), so re-assigning it directly is how this test simulates the
+        // crowding condition clearing, exactly as
+        // `manual_switch_request_survives_a_thin_history_skip_and_fires_later`
+        // above simulates decode history filling in.
+        op.smart_allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+
+        let later = op.decide_at(even_ts);
+        assert!(
+            later
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "the retained manual nudge must fire once a valid relocation exists \
              (streak is only 0/1, nowhere near switch_after=3)"
         );
     }

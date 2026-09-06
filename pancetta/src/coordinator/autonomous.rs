@@ -564,15 +564,23 @@ fn drain_pending_autonomous_cq_dispatch_failures(
 /// bounded in practice by `max_concurrent_qsos` (default 1), but it is a real
 /// bug the moment that is raised.
 ///
+/// Caveat: this reservation only binds when `allocate_smart_frequency_avoiding`
+/// takes its spectral-snapshot branch — with no spectral snapshot yet it falls
+/// through to the deterministic legacy allocator, which ignores `reserved_hz`
+/// entirely, so two same-batch `Switch` actions could still collide in that
+/// fallback case (see that function's own doc comment).
+///
 /// On success the QSO's entry in `active_tx_offsets` is rewritten to the
 /// offset `apply_tx_offset_switch` actually applied (post-clamp). That map is
 /// otherwise refreshed only on a `QsoEvent::StateChanged` carrying a
-/// frequency, and `apply_tx_offset_switch` emits no event at all — so without
-/// this write the map keeps the PRE-switch offset until the QSO's next state
-/// transition. Two consumers read it: the allocator, every tick, via
-/// `set_own_frequencies` (a few statements below this drain's call site — so
-/// the mirror lands in time for the same tick's sync), and the `u` nudge,
-/// which builds its `avoid_hz` from it. A stale entry therefore both guards a
+/// frequency. `apply_tx_offset_switch` does emit `QsoEvent::TxOffsetApplied`
+/// on success, but purely to trigger a UI-snapshot refresh (the event carries
+/// no state transition and its handler never touches this map) — so without
+/// this direct write the map would still keep the PRE-switch offset until the
+/// QSO's next state transition. Two consumers read it: the allocator, every
+/// tick, via `set_own_frequencies` (a few statements below this drain's call
+/// site — so the mirror lands in time for the same tick's sync), and the `u`
+/// nudge, which builds its `avoid_hz` from it. A stale entry therefore both guards a
 /// slot the QSO has already vacated — leaving the allocator free to hand it to
 /// something else — and leaves the allocator blind to the offset the QSO is
 /// really on, while the next nudge would name the wrong frequency to avoid.
@@ -3361,10 +3369,12 @@ mod drain_pending_qso_offset_requests_tests {
     /// PAN-72 final review (finding 4): the drain must mirror the applied
     /// offset into `active_tx_offsets`.
     ///
-    /// `apply_tx_offset_switch` emits no `QsoEvent`, and the map is otherwise
-    /// only refreshed on a `StateChanged` carrying a frequency — so without
-    /// this write the map keeps the PRE-switch offset until the QSO's next
-    /// state transition. The allocator reads the map every tick through
+    /// `apply_tx_offset_switch` does emit `QsoEvent::TxOffsetApplied`, but
+    /// only to trigger a UI-snapshot refresh — its handler never touches this
+    /// map, which is otherwise only refreshed on a `StateChanged` carrying a
+    /// frequency — so without this write the map keeps the PRE-switch offset
+    /// until the QSO's next state transition. The allocator reads the map
+    /// every tick through
     /// `set_own_frequencies`, so a stale entry both guards a slot the QSO has
     /// already vacated and leaves the allocator blind to where the QSO really
     /// is; the next `u` nudge's `avoid_hz` (also read from this map) would

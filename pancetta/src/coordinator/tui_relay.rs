@@ -1906,13 +1906,15 @@ impl super::ApplicationCoordinator {
                                     info!(
                                         target: "tx.freq",
                                         "TUI NudgeTxOffset: no active QSO — armed a CQ-offset nudge \
-                                         (applies on the next autonomous CQ cycle)"
+                                         (takes effect only if the next autonomous cycle is CQ-hunting)"
                                     );
                                     let _ = cmd_tui_msg_tx.send(
                                         pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
                                             component: "TX".to_string(),
-                                            status: "CQ-offset nudge armed — applies on the next CQ cycle"
-                                                .to_string(),
+                                            status:
+                                                "CQ-offset nudge armed — takes effect only if the \
+                                                      next autonomous cycle is CQ-hunting"
+                                                    .to_string(),
                                         },
                                     );
                                 }
@@ -2923,11 +2925,17 @@ fn map_recent_qso_outcome(
 /// for a check that still could not be authoritative: `decide_at` only enters
 /// its CQ branch after re-evaluating `idle_cycles >=
 /// cq_after_idle_cycles` for THAT cycle, so any state this relay could read at
-/// keypress time is a prediction, not a guarantee. Instead the returned
-/// outcome — and the operator-facing status line — is worded as an *armed
-/// request that applies on the next CQ cycle*, which is exactly what it is.
-/// (Finding 9's fix additionally stops such a request being lost when that
-/// cycle arrives with thin decode history.)
+/// keypress time is a prediction, not a guarantee. Worse, `decide_at`
+/// unconditionally `mem::take`s `manual_switch_requested` at the very top of
+/// every call, so the flag survives exactly one `decide_at` invocation and
+/// only actually fires if THAT SPECIFIC call reaches the CQ-hunting branch —
+/// if it lands on `NotOurSlot`/`Listen`/paused/anything else instead, the
+/// request is silently discarded, not deferred to a later cycle. Instead the
+/// returned outcome — and the operator-facing status line — is worded as an
+/// *armed request that takes effect only if the very next autonomous cycle
+/// happens to be CQ-hunting*, which is exactly what it is. (Finding 9's fix
+/// additionally stops such a request being lost when that cycle arrives with
+/// thin decode history.)
 ///
 /// Returns [`NudgeOutcome`] for the caller's status echo/logging.
 fn resolve_nudge_tx_offset(
@@ -2978,9 +2986,12 @@ enum NudgeOutcome {
     ActiveQso(pancetta_qso::states::QsoId),
     /// No active QSO — ARMED the one-shot CQ-offset nudge flag. Deliberately
     /// not called "CqNudge": whether it produces a real offset move depends
-    /// on the autonomous operator entering its CQ branch on a later cycle,
-    /// which nothing here can see or promise (see `resolve_nudge_tx_offset`'s
-    /// doc comment). The status line says "armed", not "nudged".
+    /// on the autonomous operator's very next `decide_at` call happening to
+    /// reach its CQ-hunting branch — the flag is consumed unconditionally on
+    /// that next call regardless of which branch it reaches, so it does NOT
+    /// wait around for a later CQ cycle, which nothing here can see or
+    /// promise (see `resolve_nudge_tx_offset`'s doc comment). The status line
+    /// says "armed", not "nudged".
     CqNudgeArmed,
     /// TX-frequency mode is Hold: nothing queued, nothing armed, for an
     /// active QSO or the CQ fallback alike. A flag armed in Hold is consumed

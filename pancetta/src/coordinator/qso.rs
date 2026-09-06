@@ -4912,11 +4912,6 @@ impl super::ApplicationCoordinator {
     }
 }
 
-/// Build a flat snapshot of in-progress QSOs from the QSO manager,
-/// suitable for `MessageType::ActiveQsosSnapshot`. The TUI banner and
-/// QSO-detail panel both render from this. Also snapshots the cross-parity
-/// pending-call queue (#40) so the TUI can surface "Queued" calls without
-/// a separate message.
 /// Build a fresh active-QSO snapshot and push it to the TUI (and, when the
 /// read-only display feed is enabled, to the remote gateway).
 ///
@@ -4971,6 +4966,11 @@ async fn push_active_qso_snapshot(
     }
 }
 
+/// Build a flat snapshot of in-progress QSOs from the QSO manager,
+/// suitable for `MessageType::ActiveQsosSnapshot`. The TUI banner and
+/// QSO-detail panel both render from this. Also snapshots the cross-parity
+/// pending-call queue (#40) so the TUI can surface "Queued" calls without
+/// a separate message.
 async fn build_active_qso_snapshot(
     qso_manager: &pancetta_qso::QsoManager,
     dx_activity: &DxActivityMap,
