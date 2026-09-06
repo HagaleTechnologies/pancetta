@@ -2386,6 +2386,11 @@ impl super::ApplicationCoordinator {
         // QSO event rather than snapshotting it once at startup.
         let ft8_config_for_ap = self.ft8_config.clone();
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
+        // PAN-72 round-8 redesign (fix 2): the same live `active_slot_ns`
+        // atomic Fix 1 uses inside `pancetta-qso`, so the decoder hint's
+        // secondary-window grace agrees with the QSO engine's own crediting
+        // grace — one source of truth.
+        let qso_freq_slot_ns = self.active_slot_ns();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let split_tx_frequency_hz = self.split_tx_frequency_hz.clone();
         let tx_freq_mode = self.tx_freq_mode.clone();
@@ -2872,6 +2877,7 @@ impl super::ApplicationCoordinator {
                 let tx_callsign = our_callsign.clone();
                 let ap_state = active_qso_ap;
                 let qso_freq_state = active_qso_freq_hz;
+                let qso_freq_slot_ns = qso_freq_slot_ns.clone();
                 let active_tx_qsos = active_tx_qsos.clone();
                 let active_tx_offsets = active_tx_offsets.clone();
                 let latest_tx_intent = latest_tx_intent.clone();
@@ -2997,28 +3003,45 @@ impl super::ApplicationCoordinator {
                                 // the std::sync::RwLock guard so we never hold
                                 // a non-Send guard across an await point.
                                 {
-                                    let decoder_hint_freq: Option<f64> = if new_state.is_active() {
-                                        // Try to obtain `partner_freq` from the
-                                        // QSO metadata. This is a cheap read-lock
-                                        // on the already-updated QSO map; it fires
-                                        // once per state-change (not per decode
-                                        // window).  On error (QSO vanished between
-                                        // the event and the lookup — extremely
-                                        // rare) we fall back to the state's own
-                                        // TX frequency.
-                                        let partner = snapshot_qso_manager
-                                            .get_qso(qso_id)
-                                            .await
-                                            .ok()
-                                            .and_then(|p| p.metadata.partner_freq);
-                                        partner.or_else(|| new_state.frequency())
-                                    } else {
-                                        None
-                                    };
+                                    // PAN-72 round-8 redesign (fix 2): the
+                                    // primary hint keeps its byte-identical
+                                    // derivation (partner_freq, else our own
+                                    // TX frequency). The secondary hint
+                                    // (`decoder_hint_pair.1`) is the
+                                    // still-in-grace vacated offset of an
+                                    // unanswered `CallingCq` relocation — see
+                                    // `secondary_decoder_hint_freq_for`.
+                                    let decoder_hint_pair: Option<(f64, Option<f64>)> =
+                                        if new_state.is_active() {
+                                            // Fetch the QSO's current progress
+                                            // once. This is a cheap read-lock
+                                            // on the already-updated QSO map;
+                                            // it fires once per state-change
+                                            // (not per decode window). On
+                                            // error (QSO vanished between the
+                                            // event and the lookup — extremely
+                                            // rare) we fall back to the
+                                            // state's own TX frequency and no
+                                            // secondary.
+                                            let progress =
+                                                snapshot_qso_manager.get_qso(qso_id).await.ok();
+                                            let partner =
+                                                progress.as_ref().and_then(|p| p.metadata.partner_freq);
+                                            let primary = partner.or_else(|| new_state.frequency());
+                                            let secondary = progress.as_ref().and_then(|p| {
+                                                secondary_decoder_hint_freq_for(
+                                                    p,
+                                                    qso_freq_slot_ns.load(Ordering::Relaxed),
+                                                )
+                                            });
+                                            primary.map(|p| (p, secondary))
+                                        } else {
+                                            None
+                                        };
                                     // Acquire the guard synchronously (no await
                                     // in this scope) and write.
                                     if let Ok(mut guard) = qso_freq_state.write() {
-                                        *guard = decoder_hint_freq;
+                                        *guard = decoder_hint_pair;
                                     }
                                 }
 
@@ -3596,15 +3619,22 @@ impl super::ApplicationCoordinator {
                                 // a co-active QSO's hint must not be wiped by a
                                 // late event for a dead one.
                                 {
-                                    let hint = snapshot_qso_manager
-                                        .get_qso(qso_id)
-                                        .await
-                                        .ok()
-                                        .as_ref()
-                                        .and_then(decoder_hint_freq_for);
+                                    // PAN-72 round-8 redesign (fix 2): pair
+                                    // the primary hint (unchanged derivation)
+                                    // with the still-in-grace secondary — the
+                                    // vacated offset of an unanswered
+                                    // `CallingCq` relocation.
+                                    let progress = snapshot_qso_manager.get_qso(qso_id).await.ok();
+                                    let hint = progress.as_ref().and_then(decoder_hint_freq_for);
                                     if let Some(hint_hz) = hint {
+                                        let secondary = progress.as_ref().and_then(|p| {
+                                            secondary_decoder_hint_freq_for(
+                                                p,
+                                                qso_freq_slot_ns.load(Ordering::Relaxed),
+                                            )
+                                        });
                                         if let Ok(mut guard) = qso_freq_state.write() {
-                                            *guard = Some(hint_hz);
+                                            *guard = Some((hint_hz, secondary));
                                         }
                                     }
                                 }
@@ -5030,6 +5060,188 @@ fn decoder_hint_freq_for(progress: &pancetta_qso::QsoProgress) -> Option<f64> {
         .metadata
         .partner_freq
         .or_else(|| progress.state.frequency())
+}
+
+/// The SECONDARY decoder hint (PAN-72 round-8 redesign, fix 2): the offset a
+/// stalled, unanswered `CallingCq` relocated AWAY from, for as long as a
+/// reply to the last frame transmitted there is still credible.
+///
+/// The bug this closes (Codex round 8, finding 1): `QsoMetadata::pre_switch_offset`
+/// deliberately keeps the vacated offset "eligible" for CREDITING purposes
+/// (`live_pre_switch_offset_at` in `pancetta-qso`), but the decoder's actual
+/// band-collapse filter (`coordinator::qso_filter`, ±60 Hz around a SINGLE
+/// [`decoder_hint_freq_for`] value) got recentred onto the NEW offset by the
+/// round-7 fix, dropping the old offset outside the decode window — a caller
+/// answering the old-offset CQ was filtered out and never decoded.
+///
+/// `Some` only when ALL of:
+/// - the QSO is `CallingCq` (an established QSO already has a stable hint
+///   via `partner_freq` — the DX transmits there regardless of our TX side,
+///   so it needs no second window; touching that path is explicitly out of
+///   scope for this fix);
+/// - `metadata.pre_switch_offset` is `Some(pre)`;
+/// - `pre.left_at` is still within
+///   [`pancetta_qso::qso_manager::pre_switch_offset_grace_from_slot_ns`] of
+///   `slot_ns` — the coordinator's live `active_slot_ns` atomic, the SAME
+///   value `pancetta-qso` derives Fix 1's grace window from (one source of
+///   truth, two call sites).
+///
+/// Every other case (established QSO, no pre-switch offset, or grace
+/// expired) yields `None`.
+fn secondary_decoder_hint_freq_for(
+    progress: &pancetta_qso::QsoProgress,
+    slot_ns: i64,
+) -> Option<f64> {
+    if !matches!(
+        progress.state,
+        pancetta_qso::states::QsoState::CallingCq { .. }
+    ) {
+        return None;
+    }
+    let pre = progress.metadata.pre_switch_offset?;
+    let grace = pancetta_qso::qso_manager::pre_switch_offset_grace_from_slot_ns(slot_ns);
+    (pre.left_at + grace > chrono::Utc::now()).then_some(pre.offset_hz)
+}
+
+#[cfg(test)]
+mod secondary_decoder_hint_tests {
+    use super::secondary_decoder_hint_freq_for;
+    use chrono::{Duration, Utc};
+    use pancetta_qso::states::PreSwitchOffset;
+    use pancetta_qso::{GridSquares, QsoMetadata, QsoProgress, QsoState, SignalReports};
+
+    /// FT8's default slot (15s) -> a 30s grace, matching
+    /// `pancetta-qso`'s never-injected default.
+    const FT8_SLOT_NS: i64 = 15_000_000_000;
+
+    fn calling_cq_progress(pre_switch_offset: Option<PreSwitchOffset>) -> QsoProgress {
+        let start = Utc::now() - Duration::seconds(5);
+        QsoProgress {
+            state: QsoState::CallingCq {
+                frequency: 1900.0,
+                started_at: start,
+                call_count: 1,
+            },
+            state_history: Vec::new(),
+            messages: Vec::new(),
+            metadata: QsoMetadata {
+                qso_id: pancetta_qso::QsoId::new_v4(),
+                our_callsign: "K5ARH".to_string(),
+                their_callsign: None,
+                frequency: 1900.0,
+                completed_rf_frequency_hz: None,
+                mode: "FT8".to_string(),
+                start_time: start,
+                end_time: None,
+                reports: SignalReports::default(),
+                grids: GridSquares::default(),
+                contest_info: None,
+                tags: std::collections::HashMap::new(),
+                notes: None,
+                tx_parity: None,
+                initiated_by: Default::default(),
+                role: Default::default(),
+                call_count: 1,
+                first_call_at: None,
+                last_call_at: None,
+                progressed_this_cycle: false,
+                stall_cycles: 1,
+                last_known_good_offset_hz: None,
+                advance_generation: 0,
+                pre_switch_offset,
+                hound: false,
+                partner_freq: None,
+                pending_freq_drift: None,
+                hound_qsyed: false,
+                remote_origin: false,
+                tx_parity_provisional: false,
+            },
+        }
+    }
+
+    #[test]
+    fn no_pre_switch_offset_yields_no_secondary() {
+        let progress = calling_cq_progress(None);
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fresh_relocation_still_inside_grace_yields_the_vacated_offset() {
+        let progress = calling_cq_progress(Some(PreSwitchOffset {
+            offset_hz: 1500.0,
+            left_at: Utc::now(),
+            operator_forced: true,
+        }));
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            Some(1500.0)
+        );
+    }
+
+    /// PAN-72 round-8 redesign (fix 2) test-plan item: the secondary clears
+    /// once `left_at + grace` has passed — a bounded window, not a
+    /// permanent second decode band.
+    #[test]
+    fn a_relocation_past_its_grace_yields_no_secondary() {
+        let progress = calling_cq_progress(Some(PreSwitchOffset {
+            offset_hz: 1500.0,
+            left_at: Utc::now() - Duration::seconds(31),
+            operator_forced: true,
+        }));
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            None
+        );
+    }
+
+    /// The grace window scales with the active protocol slot (Fix 1),
+    /// so a fast FT2 slot (3.2s -> 6.4s grace) must lapse sooner than the
+    /// FT8 default.
+    #[test]
+    fn the_grace_scales_with_the_injected_slot_ns() {
+        const FT2_SLOT_NS: i64 = 3_200_000_000; // -> 6.4s grace
+        let progress = calling_cq_progress(Some(PreSwitchOffset {
+            offset_hz: 1500.0,
+            left_at: Utc::now() - Duration::seconds(10),
+            operator_forced: false,
+        }));
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT2_SLOT_NS),
+            None,
+            "10s ago must already be outside FT2's 6.4s grace"
+        );
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            Some(1500.0),
+            "the same 10s-old relocation is still inside FT8's 30s grace"
+        );
+    }
+
+    /// Scope guard: an established QSO (not `CallingCq`) never gains a
+    /// secondary hint here, even with a live `pre_switch_offset` — it
+    /// already has a stable hint via `partner_freq` (the DX transmits
+    /// there regardless of our TX side), so touching that path is
+    /// explicitly out of scope for this fix.
+    #[test]
+    fn an_established_qso_never_gets_a_secondary_hint() {
+        let mut progress = calling_cq_progress(Some(PreSwitchOffset {
+            offset_hz: 1500.0,
+            left_at: Utc::now(),
+            operator_forced: true,
+        }));
+        progress.state = QsoState::RespondingToCq {
+            target_callsign: "K9ZZ".to_string(),
+            frequency: 1900.0,
+            started_at: Utc::now(),
+        };
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            None
+        );
+    }
 }
 
 /// Build a fresh active-QSO snapshot and push it to the TUI (and, when the
@@ -9232,8 +9444,9 @@ mod respond_to_caller_admission_tests {
         }
         assert_eq!(
             *coordinator.active_qso_freq_hz.read().unwrap(),
-            Some(CQ_HZ),
-            "precondition: the decoder is centred on the original CQ offset"
+            Some((CQ_HZ, None)),
+            "precondition: the decoder is centred on the original CQ offset, \
+             with no secondary hint before any relocation has happened"
         );
 
         let applied = manager
@@ -9253,7 +9466,12 @@ mod respond_to_caller_admission_tests {
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         loop {
-            if *coordinator.active_qso_freq_hz.read().unwrap() == Some(NEW_HZ) {
+            if coordinator
+                .active_qso_freq_hz
+                .read()
+                .unwrap()
+                .is_some_and(|(primary, _)| primary == NEW_HZ)
+            {
                 break;
             }
             assert!(
@@ -9268,12 +9486,30 @@ mod respond_to_caller_admission_tests {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
 
+        // PAN-72 round-8 redesign (fix 2): the vacated CQ offset must STILL
+        // be covered by the decoder hint (as the secondary), so a caller
+        // that answered the pre-switch CQ frame is not filtered out —
+        // Codex round 8, finding 1.
+        assert_eq!(
+            *coordinator.active_qso_freq_hz.read().unwrap(),
+            Some((NEW_HZ, Some(CQ_HZ))),
+            "the vacated CQ offset must remain a live secondary decoder hint \
+             for the grace window so a reply to the pre-switch frame is not \
+             dropped by the band-collapse filter"
+        );
+
         // The QSO's own state must agree — the hint is derived, not invented.
         let progress = manager.get_qso(qso_id).await.unwrap();
         assert_eq!(
             progress.metadata.partner_freq, None,
             "an unanswered CQ has no DX to point partner_freq at (round 5's \
              fix); the state frequency is the only correct hint"
+        );
+        assert_eq!(
+            progress.metadata.pre_switch_offset.map(|p| p.offset_hz),
+            Some(CQ_HZ),
+            "precondition: the QSO's own pre_switch_offset is what the \
+             secondary hint is derived from"
         );
     }
 
@@ -9335,9 +9571,11 @@ mod respond_to_caller_admission_tests {
         for _ in 0..30 {
             assert_eq!(
                 *coordinator.active_qso_freq_hz.read().unwrap(),
-                Some(DX_HZ),
+                Some((DX_HZ, None)),
                 "the decoder must stay on the DX's transmit offset after OUR \
-                 side moves — the switch is TX-only"
+                 side moves — the switch is TX-only; an established QSO's \
+                 stable partner_freq hint never gains a PAN-72 round-8 \
+                 secondary window (that's reserved for an unanswered CallingCq)"
             );
             tokio::time::sleep(std::time::Duration::from_millis(5)).await;
         }

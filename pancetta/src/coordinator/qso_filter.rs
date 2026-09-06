@@ -124,6 +124,63 @@ pub fn compute_narrow_filter_bins_default(
     )
 }
 
+/// PAN-72 round-8 redesign (fix 2): dual-center variant of
+/// [`compute_narrow_filter_bins`]. Takes a PRIMARY center frequency (today's
+/// single hint) plus an optional SECONDARY center frequency — the offset a
+/// `CallingCq` QSO recently vacated, while a reply to the last frame
+/// transmitted there is still credible (see
+/// `pancetta_qso::qso_manager::pre_switch_offset_grace_from_slot_ns`).
+///
+/// Computes each present frequency's own `±half_window_hz` range via
+/// [`partner_freq_to_bin_range`] and returns their UNION (the smallest
+/// inclusive range covering both), not their intersection — a caller
+/// answering EITHER offset must decode. With only one frequency present
+/// (the other `None`), this is byte-identical to
+/// [`compute_narrow_filter_bins`] called with that single frequency — the
+/// existing single-frequency callers and tests are unaffected.
+pub fn compute_narrow_filter_bins_dual(
+    primary_freq_hz: Option<f64>,
+    secondary_freq_hz: Option<f64>,
+    half_window_hz: f64,
+    bin_spacing_hz: f64,
+    override_off: bool,
+) -> Option<RangeInclusive<usize>> {
+    if override_off {
+        return None;
+    }
+    let primary =
+        primary_freq_hz.and_then(|f| partner_freq_to_bin_range(f, bin_spacing_hz, half_window_hz));
+    let secondary = secondary_freq_hz
+        .and_then(|f| partner_freq_to_bin_range(f, bin_spacing_hz, half_window_hz));
+    match (primary, secondary) {
+        (Some(a), Some(b)) => {
+            let lo = *a.start().min(b.start());
+            let hi = *a.end().max(b.end());
+            Some(lo..=hi)
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// Convenience wrapper for [`compute_narrow_filter_bins_dual`] using
+/// pancetta-ft8's `TONE_SPACING` and the default 60 Hz half-window — the
+/// dual-center sibling of [`compute_narrow_filter_bins_default`].
+pub fn compute_narrow_filter_bins_default_dual(
+    primary_freq_hz: Option<f64>,
+    secondary_freq_hz: Option<f64>,
+    override_off: bool,
+) -> Option<RangeInclusive<usize>> {
+    compute_narrow_filter_bins_dual(
+        primary_freq_hz,
+        secondary_freq_hz,
+        DEFAULT_HALF_WINDOW_HZ,
+        TONE_SPACING,
+        override_off,
+    )
+}
+
 /// hb-230 — partner-aware observer for the decoder's relaxed-sync window.
 ///
 /// Returns `Some(partner_freq_hz)` when a QSO is active AND the operator
@@ -271,6 +328,75 @@ mod tests {
     fn observer_default_helper_respects_override() {
         let default = compute_narrow_filter_bins_default(Some(1500.0), true);
         assert!(default.is_none());
+    }
+
+    // ---------- compute_narrow_filter_bins_dual (PAN-72 fix 2) --------
+
+    #[test]
+    fn dual_with_only_primary_matches_single_frequency_behavior() {
+        let single = compute_narrow_filter_bins(Some(1500.0), 60.0, 6.25, false);
+        let dual = compute_narrow_filter_bins_dual(Some(1500.0), None, 60.0, 6.25, false);
+        assert_eq!(single, dual);
+    }
+
+    #[test]
+    fn dual_with_only_secondary_matches_single_frequency_behavior() {
+        let single = compute_narrow_filter_bins(Some(1500.0), 60.0, 6.25, false);
+        let dual = compute_narrow_filter_bins_dual(None, Some(1500.0), 60.0, 6.25, false);
+        assert_eq!(single, dual);
+    }
+
+    #[test]
+    fn dual_with_neither_frequency_is_none() {
+        let dual = compute_narrow_filter_bins_dual(None, None, 60.0, 6.25, false);
+        assert!(dual.is_none());
+    }
+
+    #[test]
+    fn dual_unions_two_adjacent_frequencies() {
+        // Primary 1500 Hz -> 230..=250; secondary 1500+400=1900 Hz ->
+        // center = round(1900/6.25) = 304, half_bins = 10 -> 294..=314.
+        // Union must span the low end of the primary through the high end
+        // of the secondary.
+        let dual = compute_narrow_filter_bins_dual(Some(1500.0), Some(1900.0), 60.0, 6.25, false)
+            .unwrap();
+        assert_eq!(*dual.start(), 230);
+        assert_eq!(*dual.end(), 314);
+    }
+
+    #[test]
+    fn dual_unions_two_far_apart_frequencies_without_bridging_the_gap() {
+        // Two disjoint windows far apart: the union is still a single
+        // inclusive range spanning both (the caller narrows the decoder to
+        // one contiguous band, not two disjoint ones) but must not include
+        // anything closer than each side's own window.
+        let dual = compute_narrow_filter_bins_dual(Some(500.0), Some(3000.0), 60.0, 6.25, false)
+            .unwrap();
+        let expected_low = partner_freq_to_bin_range(500.0, 6.25, 60.0).unwrap();
+        let expected_high = partner_freq_to_bin_range(3000.0, 6.25, 60.0).unwrap();
+        assert_eq!(*dual.start(), *expected_low.start());
+        assert_eq!(*dual.end(), *expected_high.end());
+    }
+
+    #[test]
+    fn dual_respects_override() {
+        let dual = compute_narrow_filter_bins_dual(Some(1500.0), Some(1900.0), 60.0, 6.25, true);
+        assert!(dual.is_none());
+    }
+
+    #[test]
+    fn default_dual_matches_explicit_dual_with_tone_spacing_and_default_window() {
+        let explicit =
+            compute_narrow_filter_bins_dual(Some(1500.0), Some(1900.0), 60.0, TONE_SPACING, false);
+        let default = compute_narrow_filter_bins_default_dual(Some(1500.0), Some(1900.0), false);
+        assert_eq!(explicit, default);
+    }
+
+    #[test]
+    fn default_dual_with_no_secondary_matches_default_single() {
+        let single = compute_narrow_filter_bins_default(Some(1500.0), false);
+        let dual = compute_narrow_filter_bins_default_dual(Some(1500.0), None, false);
+        assert_eq!(single, dual);
     }
 
     // ---------- partner_freq_for_relaxed_sync (hb-230) ----------------

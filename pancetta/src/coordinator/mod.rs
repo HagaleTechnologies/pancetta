@@ -1017,7 +1017,16 @@ pub struct ApplicationCoordinator {
     /// `active_qso_ap`; read by the FT8 decoder thread to scope an
     /// early scoped decode pass at the partner's known location.
     /// `None` when no QSO is active.
-    active_qso_freq_hz: std::sync::Arc<std::sync::RwLock<Option<f64>>>,
+    ///
+    /// PAN-72 round-8 redesign (fix 2): `.0` is the primary hint (this
+    /// field's original single-`f64` meaning, unchanged derivation); `.1` is
+    /// an optional SECONDARY hint — the still-in-grace offset an unanswered
+    /// `CallingCq` relocated away from (see `coordinator::qso`'s
+    /// `secondary_decoder_hint_freq_for`). `.1` is `None` for every case
+    /// except that one (established QSO, no pre-switch offset, or grace
+    /// expired), so `compute_narrow_filter_bins_default_dual(primary, None,
+    /// ..)` behaves byte-identically to the old single-frequency form.
+    active_qso_freq_hz: std::sync::Arc<std::sync::RwLock<Option<(f64, Option<f64>)>>>,
 
     /// hb-062 FP filter: applied between decode merge and broadcast in the
     /// FT8 thread. Inner `None` = filter disabled (default). When enabled,
