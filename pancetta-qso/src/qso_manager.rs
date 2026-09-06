@@ -267,6 +267,37 @@ fn live_pre_switch_offset_at(
 /// vice versa.
 pub const COMPLETED_QSO_REWORK_GRACE: chrono::Duration = chrono::Duration::seconds(45);
 
+/// One transmit slot, in milliseconds, for the station's active operating
+/// mode (PAN-72; Codex round 7 on PR #350, finding 5).
+///
+/// [`QsoManager::rearm_manual_calls_at`] re-emits at most one frame per slot
+/// and — since PAN-72 — counts each such re-send as one silent cycle against
+/// [`crate::states::QsoMetadata::stall_cycles`]. Both are *slot* quantities:
+/// `TimeoutConfig::qso_stall_switch_after` is documented in slots, and the
+/// keep-calling cadence is "one call per transmit period". The gate was a
+/// hardcoded 15 s, which is only FT8's period — under FT4 a threshold of 4
+/// took ~60 s (8 real slots) instead of 4, and under FT2 far worse, delaying
+/// adaptive recovery until the ordinary QSO watchdog had already won.
+///
+/// Values come from `pancetta_ft8::ProtocolParams::{ft8,ft4,ft2}()`'s
+/// `cycle_duration` (15.0 / 7.5 / 3.2 s). They are duplicated as literals
+/// rather than imported because `pancetta-qso` deliberately does not depend on
+/// `pancetta-ft8` outside the optional `sim` feature; the unit test
+/// `slot_millis_match_the_ft8_crates_protocol_params` pins them.
+///
+/// Anything unrecognized — including the `"FT8"` default — resolves to 15 s,
+/// so **mode=FT8 behavior is byte-identical** (see AGENTS.md's invariant).
+/// Matching is case-insensitive and trims surrounding whitespace, mirroring
+/// `pancetta_config::RigConfig::operating_mode`'s parse.
+pub fn rearm_slot_millis_for_mode(active_mode: &str) -> i64 {
+    match active_mode.trim().to_ascii_uppercase().as_str() {
+        "FT4" => 7_500,
+        "FT2" => 3_200,
+        // "FT8" and anything unrecognized: the historical 15-second slot.
+        _ => 15_000,
+    }
+}
+
 /// Nudge a candidate TX audio offset away from already-occupied offsets so
 /// concurrent QSOs don't stack. Returns `candidate` unchanged if it is within
 /// `[lo, hi]` AND at least `min_sep` Hz from every offset in `occupied`.
@@ -946,6 +977,34 @@ pub struct QsoManager {
     /// let a muted cycle count as a stall. Narrower than "the hard mute" as a
     /// whole; PAN follow-up filed to thread the full predicate through.
     tx_policy: Arc<std::sync::atomic::AtomicU8>,
+
+    /// "Would a **remote-origin** frame be permitted to key PTT right now?" —
+    /// the coordinator's station-agent armed-TX gate, read as a predicate.
+    ///
+    /// PAN-72 (Codex round 7 on PR #350, finding 3). `tx_policy` above closed
+    /// only ONE of the two independent gates a rearmed frame must pass. A QSO
+    /// with [`crate::states::QsoMetadata::remote_origin`] set emits every frame
+    /// as `TxOrigin::Remote`, and the TX worker additionally checks
+    /// `pancetta::coordinator::tx::remote_tx_permitted` (the
+    /// `pancetta_agent::arm::ArmState` gate) immediately before PTT. When an
+    /// arm expires — or a remote operator explicitly disarms — while global
+    /// `TxPolicy` stays `Full`, every rearmed frame is dropped there, yet the
+    /// stall detector kept counting the resulting silence as "the DX ignored
+    /// us" and moved the QSO off a known-good offset after the threshold.
+    ///
+    /// **This is not a TX gate and must never become one.** It is read-only
+    /// evidence about whether a frame reached the air, consulted solely to
+    /// decide whether a rearm cycle counts as stall evidence; the real
+    /// fail-CLOSED gate stays exactly where it is, in the TX worker (see
+    /// AGENTS.md's "armed-TX gate fails CLOSED" invariant). Nothing here can
+    /// authorize a transmission.
+    ///
+    /// Consulted only for QSOs that are actually `remote_origin`; a Local /
+    /// TUI / autonomous QSO never reads it. Defaults to a closure returning
+    /// `true` ("assume the frame went out"), so unit tests and any caller that
+    /// never injects a source keep the pre-existing behavior — the same
+    /// convention `tx_policy`'s private `Full` default uses.
+    remote_tx_permitted: Arc<dyn Fn() -> bool + Send + Sync>,
 }
 
 /// Outcome of the half-duplex parity-admission check for a *new* QSO.
@@ -1161,6 +1220,10 @@ impl QsoManager {
             tx_policy: Arc::new(std::sync::atomic::AtomicU8::new(
                 pancetta_core::TxPolicy::Full.as_u8(),
             )),
+            // Default "permitted": with no injected source, assume a remote
+            // frame reached the air — the pre-existing behavior (see the
+            // field's doc comment).
+            remote_tx_permitted: Arc::new(|| true),
         }
     }
 
@@ -1201,6 +1264,22 @@ impl QsoManager {
     /// before.
     pub fn set_tx_policy_source(&mut self, source: Arc<std::sync::atomic::AtomicU8>) {
         self.tx_policy = source;
+    }
+
+    /// Share the coordinator's station-agent armed-TX predicate so the stall
+    /// detector can tell "the DX ignored us" apart from "the arm gate dropped
+    /// every frame we rearmed" on a REMOTE-origin QSO.
+    ///
+    /// PAN-72 (Codex round 7 on PR #350, finding 3) — see the
+    /// `remote_tx_permitted` field's doc comment, especially the note that
+    /// this is read-only evidence and never a TX gate. Pass a closure that
+    /// evaluates `pancetta::coordinator::tx::remote_tx_permitted` against the
+    /// live `ArmState` (which fails CLOSED on a poisoned lock, so a poisoned
+    /// arm also stops the silence being counted — the conservative direction).
+    /// If never called, the manager keeps its private "permitted" default and
+    /// behaves exactly as before.
+    pub fn set_remote_tx_permitted_source(&mut self, source: Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.remote_tx_permitted = source;
     }
 
     /// Create a new QSO manager with a database for persistent duplicate checking
@@ -5955,16 +6034,26 @@ impl QsoManager {
     /// `first_call_at` (Manual) or the per-state `report_timeout` (Auto) to
     /// decide when to stop.
     pub async fn rearm_manual_calls_at(&self, now: DateTime<Utc>) {
-        // One FT8 slot is 15s; re-arm only when at least a slot has
-        // elapsed since the last call to keep ~one call per slot.
-        const SLOT_SECONDS: i64 = 15;
+        // Re-arm only when at least one transmit slot has elapsed since the
+        // last call, to keep ~one call per slot.
+        //
+        // PAN-72 (Codex round 7 on PR #350, finding 5): the slot length is the
+        // ACTIVE MODE's, not a hardcoded 15 s. FT4 (7.5 s) and FT2 (3.2 s)
+        // previously advanced this gate — and with it the `stall_cycles`
+        // counter below, which the documented threshold measures in *slots* —
+        // only every other (or every fifth) real slot. `"FT8"` and anything
+        // unrecognized resolve to the historical 15_000 ms, so mode=FT8 stays
+        // byte-identical; see [`rearm_slot_millis_for_mode`].
+        let slot_millis = rearm_slot_millis_for_mode(&self.config.active_mode);
 
         // SM-F6: bounded resend cap for AUTONOMOUS QSOs. This is deliberately
         // NOT `manual_call_max_calls` (25 calls, an operator-supervised,
         // long-running bound) — an Auto QSO is unattended TX and must stay
         // conservative. `call_count` starts at 1 (the opening send), so a cap
-        // of 2 allows exactly ONE resend. Combined with the SLOT_SECONDS=15s
-        // cadence below, that resend lands around the ~15s mark, safely
+        // of 2 allows exactly ONE resend. Combined with the one-slot
+        // (`slot_millis`, 15s in FT8) cadence below, that resend lands
+        // around the ~15s mark under FT8 — and earlier still under the
+        // shorter FT4/FT2 slots — safely
         // inside the existing 30s `report_timeout` (see check_timeouts_at's
         // "Phase 5" Auto branch) — we are NOT extending that 30s outer bound,
         // only making use of the window with an actual mid-window resend
@@ -5996,6 +6085,18 @@ impl QsoManager {
             self.tx_policy.load(std::sync::atomic::Ordering::Relaxed),
         )
         .allows_any_tx();
+
+        // PAN-72 (Codex round 7 on PR #350, finding 3): the SECOND, entirely
+        // independent gate a rearmed frame must clear — the station-agent
+        // armed-TX check the TX worker runs immediately before PTT for every
+        // `TxOrigin::Remote` request. `TxPolicy` staying `Full` says nothing
+        // about it: an arm expiry or an explicit remote disarm drops every
+        // frame a `remote_origin` QSO rearms while the policy above still
+        // reads "TX allowed". Read ONCE per pass, like `tx_policy`, and
+        // consulted below only for QSOs that are actually remote-origin. See
+        // the `remote_tx_permitted` field's doc comment — read-only evidence,
+        // never a TX gate.
+        let remote_tx_permitted = (self.remote_tx_permitted)();
 
         {
             let mut qsos = self.qsos.write().await;
@@ -6098,12 +6199,16 @@ impl QsoManager {
                     continue;
                 }
 
+                // Millisecond resolution so a 7.5 s FT4 slot is expressible;
+                // for FT8's whole-second 15_000 ms this is exactly the
+                // previous `num_seconds() < 15` test (both truncate toward
+                // zero, and the threshold is a whole number of seconds).
                 let elapsed_since_last = progress
                     .metadata
                     .last_call_at
-                    .map(|t| (now - t).num_seconds())
+                    .map(|t| (now - t).num_milliseconds())
                     .unwrap_or(i64::MAX);
-                if elapsed_since_last < SLOT_SECONDS {
+                if elapsed_since_last < slot_millis {
                     continue;
                 }
 
@@ -6117,14 +6222,25 @@ impl QsoManager {
                 // this is now the sole increment site (see
                 // `QsoMetadata::stall_cycles`'s doc comment).
                 //
-                // ...unless the TX path is muted (round 2, finding 5). A
+                // ...unless the frame never actually reached the air. A
                 // re-send that never leaves the rig is not a silent on-air
                 // cycle, and counting it would move the QSO off a known-good
                 // offset on the strength of silence we ourselves caused. The
                 // existing count is left INTACT rather than reset: whatever
                 // was accumulated came from real transmissions and is still
                 // valid evidence once TX resumes.
-                if !tx_muted {
+                //
+                // TWO independent gates can swallow it, and the frame has to
+                // clear BOTH before its silence means anything:
+                //   - the global TX policy hard mute (round 2, finding 5);
+                //   - for a `remote_origin` QSO only, the station-agent
+                //     armed-TX gate the TX worker applies to every
+                //     `TxOrigin::Remote` frame (round 7, finding 3). An arm
+                //     expiry or explicit disarm leaves `TxPolicy` untouched,
+                //     so the first check alone cannot see it.
+                let frame_reaches_the_air =
+                    !tx_muted && (!progress.metadata.remote_origin || remote_tx_permitted);
+                if frame_reaches_the_air {
                     progress.metadata.stall_cycles =
                         progress.metadata.stall_cycles.saturating_add(1);
                 }
@@ -6134,7 +6250,7 @@ impl QsoManager {
                 )
                 .allows_auto_change();
 
-                if !tx_muted
+                if frame_reaches_the_air
                     && tx_auto
                     && progress.metadata.stall_cycles >= self.config.timeouts.qso_stall_switch_after
                 {
@@ -6147,7 +6263,27 @@ impl QsoManager {
                         }
                         _ => OffsetAction::Switch { avoid_hz: current },
                     };
-                    progress.metadata.stall_cycles = 0;
+                    // PAN-72 (Codex round 7 on PR #350, finding 2): the streak
+                    // is deliberately NOT cleared here. Raising an action is
+                    // not relocating: the coordinator drains this mailbox once
+                    // per slot and `apply_tx_offset_switch` can still refuse
+                    // the result — most importantly with `OffsetActionNoOp`
+                    // when exclusions left the allocator no valid candidate on
+                    // a crowded band. Clearing at emission time threw the
+                    // evidence away before anything could act on it, so PAN-79's
+                    // commit-side refusal preserved a streak that had in fact
+                    // already been reset, and recovery was pushed out by
+                    // another full `qso_stall_switch_after` window even if a
+                    // slot opened up immediately.
+                    //
+                    // The reset now happens in exactly one place — the
+                    // successful commit in `apply_tx_offset_switch` (and, as
+                    // before, a genuine DX advance in `process_message_for_qso`).
+                    // Until one of those lands, the QSO stays at/above the
+                    // threshold and re-raises the action once per slot; the
+                    // coordinator's drain coalesces per QSO per batch (round 7,
+                    // finding 1), so this costs one retry per slot, not a
+                    // pile-up.
                     offset_actions_to_emit.push((
                         qso_id,
                         action,
@@ -6560,6 +6696,7 @@ impl Clone for QsoManager {
             split_tx_frequency_hz: Arc::clone(&self.split_tx_frequency_hz),
             tx_freq_mode: Arc::clone(&self.tx_freq_mode),
             tx_policy: Arc::clone(&self.tx_policy),
+            remote_tx_permitted: Arc::clone(&self.remote_tx_permitted),
         }
     }
 }
@@ -14814,11 +14951,310 @@ mod pan72_stall_detection_tests {
             saw_switch,
             "expected a Switch action after 2 silent rearm cycles"
         );
+        // PAN-72 (Codex round 7 on PR #350, finding 2): raising the action is
+        // NOT relocating. The streak survives emission and is cleared only by
+        // a successful `apply_tx_offset_switch` (or a real DX advance) — see
+        // `threshold_streak_survives_a_refused_relocation_and_clears_on_commit`
+        // below for why that matters.
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2,
+            "stall evidence must survive emission — the coordinator's commit \
+             can still be refused, and the reset belongs there"
+        );
+    }
+
+    /// PAN-72 (Codex round 7 on PR #350, finding 2): the threshold streak must
+    /// outlive a relocation that never happens, and die only when one does.
+    ///
+    /// PAN-79 taught `apply_tx_offset_switch` to REFUSE a no-op relocation
+    /// (`OffsetActionNoOp`) precisely so a crowded band — every candidate
+    /// excluded, the allocator handing `avoid_hz` straight back — would not
+    /// clear valid stall evidence. But the threshold-tripping path had already
+    /// zeroed `stall_cycles` at emission time, one slot earlier, so there was
+    /// nothing left for that refusal to preserve: recovery was pushed out by
+    /// another full `qso_stall_switch_after` window even if a slot opened up
+    /// immediately afterward.
+    #[tokio::test]
+    async fn threshold_streak_survives_a_refused_relocation_and_clears_on_commit() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        for slot in 1..=2i64 {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+                .await;
+        }
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2,
+            "precondition: two silent cycles tripped the threshold"
+        );
+
+        // The coordinator's drain resolves the Switch, but every candidate is
+        // excluded so the allocator returns the QSO's own offset unchanged —
+        // exactly the input `apply_tx_offset_switch` refuses.
+        let refused = manager
+            .apply_tx_offset_switch(qso_id, FREQ, stall_origin(&manager, qso_id).await)
+            .await;
+        assert!(
+            matches!(refused, Err(QsoManagerError::OffsetActionNoOp { .. })),
+            "precondition: a same-offset relocation must be refused, got {refused:?}"
+        );
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2,
+            "a refused relocation must leave the accumulated stall evidence \
+             intact — the QSO is still stalled and must be able to retry the \
+             moment a slot frees up, not after another full threshold window"
+        );
+
+        // A relocation that actually commits is the thing that clears it.
+        manager
+            .apply_tx_offset_switch(qso_id, FREQ + 300.0, stall_origin(&manager, qso_id).await)
+            .await
+            .expect("committing a real relocation");
         assert_eq!(
             manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
             0,
-            "stall_cycles must reset once the action is emitted"
+            "a committed relocation is what resets the streak"
         );
+    }
+
+    /// A REMOTE-origin QSO whose keep-calling frames the station-agent
+    /// armed-TX gate is dropping (PAN-72; Codex round 7 on PR #350, finding 3).
+    ///
+    /// `remote_origin` QSOs emit every frame as `TxOrigin::Remote`, and the TX
+    /// worker checks `remote_tx_permitted` (the `ArmState` gate) immediately
+    /// before PTT — an INDEPENDENT gate from `TxPolicy`. An arm expiry or an
+    /// explicit remote disarm leaves the policy at `Full`, so round 2's mute
+    /// check sees nothing and the rearm cycles counted as DX silence, moving
+    /// the QSO off a known-good offset on the strength of frames that never
+    /// left the rig.
+    async fn remote_qso_with_arm(
+        manager: &QsoManager,
+    ) -> (QsoId, Arc<std::sync::atomic::AtomicBool>) {
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let qso_id = manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                None,
+                CallInitiation::Manual,
+                None,
+                true, // remote_origin
+            )
+            .await
+            .unwrap();
+        (qso_id, armed)
+    }
+
+    #[tokio::test]
+    async fn a_disarmed_remote_qso_does_not_count_rearm_cycles_as_stalls() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let mut manager = manager_auto(config);
+        // TX policy stays FULL throughout — this is precisely the case round
+        // 2's `tx_policy` check cannot see.
+        let (qso_id, armed) = remote_qso_with_arm(&manager).await;
+        let armed_for_source = Arc::clone(&armed);
+        manager.set_remote_tx_permitted_source(Arc::new(move || {
+            armed_for_source.load(std::sync::atomic::Ordering::Relaxed)
+        }));
+        let mut rx = manager.subscribe();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        let _ = drain(&mut rx);
+
+        // The arm expires (or the remote operator disarms) before the first
+        // rearm slot. Four cycles — twice the switch threshold.
+        armed.store(false, std::sync::atomic::Ordering::Relaxed);
+        for slot in 1..=4 {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+                .await;
+        }
+
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "a rearmed frame the armed-TX gate dropped never went on the air, \
+             so the DX's silence is not evidence of a stall"
+        );
+        let events = drain(&mut rx);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::TxOffsetActionNeeded { .. })),
+            "no offset action may be raised on the strength of silence the \
+             local arm gate caused, got {events:?}"
+        );
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.frequency,
+            FREQ,
+            "the QSO must still be on its original offset"
+        );
+
+        // Re-arming resumes normal stall accounting from where it left off.
+        armed.store(true, std::sync::atomic::Ordering::Relaxed);
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15 * 5))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "the first genuinely transmitted cycle after the re-arm counts"
+        );
+    }
+
+    /// Control for the test above: a LOCAL QSO must never consult the
+    /// armed-TX predicate. The gate only applies to `TxOrigin::Remote`
+    /// frames, so a disarmed station still transmits (and still stalls)
+    /// normally on local/autonomous QSOs — if this regressed, a disarmed
+    /// remote session would silently freeze local adaptive recovery.
+    #[tokio::test]
+    async fn a_disarmed_arm_gate_does_not_suppress_local_qso_stall_counting() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let mut manager = manager_auto(config);
+        manager.set_remote_tx_permitted_source(Arc::new(|| false));
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "a LOCAL QSO's frames are never armed-TX gated, so the arm state \
+             must not affect its stall accounting"
+        );
+    }
+
+    /// PAN-72 (Codex round 7 on PR #350, finding 5): the rearm/stall cadence
+    /// is one slot of the ACTIVE MODE, not a hardcoded 15 s.
+    ///
+    /// `qso_stall_switch_after` is documented in slots. Under FT4's 7.5 s slot
+    /// the old gate advanced the counter only every OTHER real slot, so a
+    /// threshold of 2 took ~30 s (4 slots) instead of 2 — long enough for the
+    /// ordinary QSO watchdog to win first.
+    #[tokio::test]
+    async fn ft4_counts_stalls_on_its_own_75_second_slot_cadence() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        config.active_mode = "FT4".to_string();
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // Two REAL FT4 slots (7.5 s each).
+        for slot in 1..=2i64 {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::milliseconds(7_500 * slot))
+                .await;
+        }
+
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            2,
+            "two FT4 slots must count as two stall cycles — the old 15 s gate \
+             counted zero"
+        );
+    }
+
+    /// FT8 stays byte-identical (AGENTS.md invariant): the same two 15 s
+    /// cycles count exactly as before, and a sub-slot rearm still does not.
+    #[tokio::test]
+    async fn ft8_slot_cadence_is_unchanged_at_fifteen_seconds() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        assert_eq!(
+            config.active_mode, "FT8",
+            "precondition: the default active mode is FT8"
+        );
+        let manager = manager_auto(config);
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // 14.999 s: still inside the slot, must not count.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::milliseconds(14_999))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "a sub-slot rearm must not count under FT8"
+        );
+
+        // Exactly one slot: counts.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1
+        );
+    }
+
+    /// The per-mode slot table must agree with `pancetta_ft8`'s
+    /// `ProtocolParams::{ft8,ft4,ft2}().cycle_duration` — duplicated as
+    /// literals only because `pancetta-qso` does not depend on that crate.
+    #[test]
+    fn slot_millis_match_the_ft8_crates_protocol_params() {
+        assert_eq!(rearm_slot_millis_for_mode("FT8"), 15_000);
+        assert_eq!(rearm_slot_millis_for_mode("FT4"), 7_500);
+        assert_eq!(rearm_slot_millis_for_mode("FT2"), 3_200);
+        // Case-insensitive + trimmed, like the config-side parse.
+        assert_eq!(rearm_slot_millis_for_mode(" ft4 "), 7_500);
+        // Unknown modes fall back to the FT8 slot — never to a shorter one.
+        assert_eq!(rearm_slot_millis_for_mode("JS8"), 15_000);
+        assert_eq!(rearm_slot_millis_for_mode(""), 15_000);
     }
 
     /// PAN-72 (Codex round 2 on PR #350, finding 5): while `TxPolicy` is

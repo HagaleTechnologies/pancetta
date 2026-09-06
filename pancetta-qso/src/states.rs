@@ -548,16 +548,29 @@ pub struct QsoMetadata {
     /// re-send (the DX did not respond that slot) counts once; incoming
     /// frame content is no longer inspected for this (the old
     /// identical/differing-frame counting in `process_message` was replaced
-    /// by PAN-72). Reset to 0 by `process_message_for_qso` on any forward
-    /// state advance, and by `rearm_manual_calls_at` itself the moment it
-    /// trips a switch/revert decision. See [`Self::last_known_good_offset_hz`]
-    /// for what happens once this trips a switch (PAN-72).
+    /// by PAN-72). Reset to 0 in exactly two places — `process_message_for_qso`
+    /// on any forward state advance, and `QsoManager::apply_tx_offset_switch`
+    /// when a relocation actually COMMITS. See
+    /// [`Self::last_known_good_offset_hz`] for what happens once this trips a
+    /// switch (PAN-72).
     ///
-    /// A rearm cycle whose re-send cannot reach the air — `TxPolicy::Disabled`,
-    /// the coordinator's hard TX mute — does NOT count (Codex round 2 on PR
-    /// #350, finding 5): silence we caused ourselves is not evidence about the
-    /// DX. Whatever was already accumulated from real transmissions is kept,
-    /// not reset.
+    /// Raising `QsoEvent::TxOffsetActionNeeded` deliberately does NOT reset it
+    /// (Codex round 7 on PR #350, finding 2). The coordinator drains that
+    /// mailbox once per slot and the commit can still be refused — notably
+    /// `OffsetActionNoOp` when a crowded band left the allocator no valid
+    /// candidate — so clearing at emission time destroyed the evidence before
+    /// anything acted on it and delayed the next attempt by another full
+    /// `qso_stall_switch_after` window. The streak instead stays at/above the
+    /// threshold and re-raises once per slot until a commit succeeds.
+    ///
+    /// A rearm cycle whose re-send cannot reach the air does NOT count, and
+    /// two independent gates can swallow it: `TxPolicy::Disabled`, the
+    /// coordinator's hard TX mute (Codex round 2, finding 5), and — for a
+    /// [`Self::remote_origin`] QSO only — the station-agent armed-TX gate the
+    /// TX worker applies to every `TxOrigin::Remote` frame (Codex round 7,
+    /// finding 3). Silence we caused ourselves is not evidence about the DX.
+    /// Whatever was already accumulated from real transmissions is kept, not
+    /// reset.
     #[serde(default)]
     pub stall_cycles: u32,
 
