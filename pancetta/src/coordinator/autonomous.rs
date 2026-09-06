@@ -635,6 +635,22 @@ fn revert_target_is_taken(
 /// TUI's `u` handler applies at enqueue time; both ends need it, because the
 /// mode can flip in between.
 ///
+/// Round 7, finding 4 tightened that to a **per-request** re-read immediately
+/// before each commit, in addition to the batch-level one. The batch check
+/// runs once, before the loop, and each iteration then awaits twice (`get_qso`
+/// and the commit); a contended QSO lock leaves a real window in which the
+/// operator's `f` press lands after the check but before the commit, and every
+/// later request in the same batch would still commit under the stale reading.
+///
+/// **At most one relocation per QSO per batch** (round 7, finding 1). Two
+/// requests for one `qso_id` can legitimately be waiting — a double `u` press,
+/// or a manual nudge alongside an automatic stall action the detector re-raises
+/// each slot until something commits. Committing both in sequence overwrites
+/// `pre_switch_offset` with an intermediate offset nothing ever transmitted on,
+/// losing the record of where an answer to the real pre-drain frame is
+/// arriving. See [`coalesce_offset_requests_by_qso`], which also documents why
+/// the operator's nudge is the one kept.
+///
 /// **Each committed offset is reserved for the rest of the batch** (finding
 /// 1). This operator's own-frequency snapshot is only synced from
 /// `active_tx_offsets` later in the same tick (`set_own_frequencies`, a few
@@ -719,6 +735,70 @@ fn revert_target_is_taken(
 /// stays as the *resolution* constraint — it is what keeps the allocator
 /// searching inside the region in the first place — but it is no longer what
 /// makes the outcome safe.
+/// Reduce a drain batch to **at most one relocation request per QSO**
+/// (PAN-72; Codex round 7 on PR #350, finding 1).
+///
+/// The mailbox is drained once per 15-second slot, so more than one request
+/// for the same `qso_id` can legitimately be waiting in it: the operator can
+/// press `u` twice, and — since round 7's finding 2 stopped the stall detector
+/// clearing its streak at emission time — an automatic stall action can be
+/// re-raised each slot until something commits, landing alongside a manual
+/// nudge for the same QSO.
+///
+/// Committing all of them in sequence corrupts
+/// [`crate::states::PreSwitchOffset`]: each successful commit overwrites
+/// `pre_switch_offset` with the offset the PREVIOUS commit just moved to —
+/// an intermediate offset nothing ever transmitted on. The QSO then holds a
+/// vacated-offset record for a frequency no frame went out on, while the real
+/// pre-drain offset (where an answer to our last transmission is actually
+/// arriving) is forgotten. Downstream that means a reply can fall outside
+/// every RX baseline on an unanswered `CallingCq`, or credit the wrong offset
+/// as known-good on an established QSO.
+///
+/// **Which one wins:** an [`OffsetRelocationOrigin::OperatorForced`] request
+/// beats a `StallDetected` one regardless of arrival order — the `u` nudge is
+/// a deliberate operator action and is current by construction (it carries no
+/// staleness token precisely because nothing may supersede it), whereas the
+/// automatic action is a heuristic that will simply re-raise next slot if the
+/// operator's pick does not help. Between two requests of the same origin
+/// class the FIRST is kept: they are equivalent by construction (both read the
+/// same un-moved QSO offset for `avoid_hz`/`target_hz`), and keeping the first
+/// preserves the batch's arrival ordering, which the `reserved_hz` chain
+/// depends on being deterministic.
+///
+/// Discarded duplicates are dropped, not requeued — the surviving request for
+/// that QSO does the same job this same tick.
+fn coalesce_offset_requests_by_qso(
+    requests: Vec<pancetta_qso::qso_manager::OffsetActionRequest>,
+) -> Vec<pancetta_qso::qso_manager::OffsetActionRequest> {
+    let mut chosen: Vec<pancetta_qso::qso_manager::OffsetActionRequest> =
+        Vec::with_capacity(requests.len());
+    let mut discarded = 0usize;
+    for request in requests {
+        match chosen.iter_mut().find(|held| held.qso_id == request.qso_id) {
+            None => chosen.push(request),
+            Some(held) => {
+                discarded += 1;
+                // An operator nudge outranks a queued automatic action; every
+                // other combination keeps what is already held.
+                if request.origin.is_operator_forced() && !held.origin.is_operator_forced() {
+                    *held = request;
+                }
+            }
+        }
+    }
+    if discarded > 0 {
+        info!(
+            target: "tx.freq",
+            discarded,
+            kept = chosen.len(),
+            "PAN-72: coalesced duplicate TX-offset requests — at most one \
+             relocation per QSO per drain"
+        );
+    }
+    chosen
+}
+
 async fn drain_pending_qso_offset_requests(
     op: &mut pancetta_qso::AutonomousOperator,
     qso_manager: &pancetta_qso::QsoManager,
@@ -747,6 +827,8 @@ async fn drain_pending_qso_offset_requests(
         );
         return;
     }
+    // Round 7, finding 1: at most ONE relocation per QSO per batch.
+    let requests = coalesce_offset_requests_by_qso(requests);
     // Finding 1: offsets this batch has already committed, hard-excluded from
     // every subsequent resolution so two QSOs can't collapse onto one slot.
     let mut reserved_hz: Vec<f64> = Vec::new();
@@ -839,6 +921,27 @@ async fn drain_pending_qso_offset_requests(
                 }
             }
         };
+        // Round 7, finding 4: re-read Hold ONE more time, here, immediately
+        // before the commit. The batch-level check above runs once, before the
+        // loop, and every iteration then `.await`s twice (`get_qso`, and the
+        // commit itself) — a contended QSO lock makes that a real window, and
+        // the operator's `f` press lands in it for every request after the
+        // first. A `Switch` that resolved under Auto would still commit; a
+        // `Revert` never consults the allocator at all, so nothing downstream
+        // would catch it either. Discarded, not requeued — same reasoning as
+        // the batch-level check: the action is already off the mailbox, and
+        // Hold means the operator's offset is sticky until they say otherwise.
+        if !pancetta_core::TxFreqMode::from_u8(tx_freq_mode.load(Ordering::Acquire))
+            .allows_auto_change()
+        {
+            info!(
+                target: "tx.freq",
+                qso_id = %qso_id,
+                "PAN-72: TX-frequency mode switched to Hold mid-drain — \
+                 discarding this queued TX-offset action"
+            );
+            continue;
+        }
         match qso_manager
             .apply_tx_offset_switch(qso_id, resolved_hz, origin)
             .await
@@ -3953,6 +4056,269 @@ mod drain_pending_qso_offset_requests_tests {
             offsets.get(&reverting),
             Some(&1800.0),
             "Hold must leave a queued Revert's QSO exactly where it is"
+        );
+    }
+
+    /// PAN-72 (Codex round 7 on PR #350, finding 4): Hold entered *during* the
+    /// drain must stop the requests that have not committed yet.
+    ///
+    /// Round 1's check runs once, before the request loop. Each iteration then
+    /// awaits twice (`get_qso`, then `apply_tx_offset_switch`), so an operator
+    /// pressing `f` while the drain is mid-batch — entirely ordinary with a
+    /// contended QSO lock — used to have every remaining request commit anyway,
+    /// against a mode reading taken before the press.
+    ///
+    /// Determinism, with no sleeps or polling: every loop iteration reads
+    /// `active_tx_offsets` (`other_live_tx_offsets`, a blocking
+    /// `std::sync::RwLock::read`) before it reaches the commit. A separate OS
+    /// thread holds that lock in WRITE mode from before the drain is spawned
+    /// until after it publishes Hold, so the drain is parked *inside* the
+    /// request loop — past the batch-level check, which it already passed
+    /// while the mode still read Auto — and its subsequent `load(Acquire)`
+    /// is ordered after the `store(Release)` by the lock handoff itself.
+    /// Under the old batch-only check both QSOs commit; with the per-request
+    /// re-read neither does. A multi-threaded runtime is required because the
+    /// parked drain blocks a whole worker thread.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn hold_entered_mid_batch_stops_the_requests_still_to_commit() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let first = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        let second = qso_manager.start_cq(1800.0, None, false).await.unwrap();
+        let first_key = crate::coordinator::active_tx_qso_key(&first.to_string());
+        let second_key = crate::coordinator::active_tx_qso_key(&second.to_string());
+        let active_tx_offsets =
+            std::sync::Arc::new(std::sync::RwLock::new(std::collections::HashMap::from([
+                (first_key, 1500.0),
+                (second_key.clone(), 1800.0),
+            ])));
+        let mode = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        ));
+        let pending = std::sync::Arc::new(std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                first,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                second,
+                pancetta_qso::qso_manager::OffsetAction::Revert { target_hz: 700.0 },
+            ),
+        ]));
+
+        // Park the drain: take the occupancy lock BEFORE it starts, and only
+        // release it once the operator's Hold has been published.
+        let (locked_tx, locked_rx) = std::sync::mpsc::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let offsets_for_guard = std::sync::Arc::clone(&active_tx_offsets);
+        let mode_for_guard = std::sync::Arc::clone(&mode);
+        let guard_thread = std::thread::spawn(move || {
+            let guard = offsets_for_guard.write().unwrap();
+            locked_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            // The operator presses `f` while the drain is parked mid-batch.
+            mode_for_guard.store(pancetta_core::TxFreqMode::Hold.as_u8(), Ordering::Release);
+            drop(guard);
+        });
+        locked_rx
+            .recv()
+            .expect("occupancy lock held before the drain starts");
+
+        let drain_manager = qso_manager.clone();
+        let drain_pending = std::sync::Arc::clone(&pending);
+        let drain_offsets = std::sync::Arc::clone(&active_tx_offsets);
+        let drain_mode = std::sync::Arc::clone(&mode);
+        let drain = tokio::spawn(async move {
+            drain_pending_qso_offset_requests(
+                &mut op,
+                &drain_manager,
+                &drain_pending,
+                &drain_offsets,
+                &drain_mode,
+            )
+            .await;
+        });
+
+        // Sequence the flip strictly AFTER the drain's pre-loop Hold check,
+        // so this test cannot be satisfied by that check alone. Emptying the
+        // mailbox is the drain's first act and is observable; from there to
+        // the parked read is a handful of non-blocking statements, so a short
+        // settle is enough. (Getting this wrong can only make the test *less*
+        // strict — the flip landing early still leaves both QSOs in place — so
+        // it is never a flaky failure.)
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !pending.lock().unwrap().is_empty() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the drain never picked the batch off the mailbox"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        release_tx.send(()).unwrap();
+        guard_thread.join().unwrap();
+        drain.await.unwrap();
+
+        assert_eq!(
+            qso_manager.get_qso(first).await.unwrap().metadata.frequency,
+            1500.0,
+            "the batch passed the pre-loop Hold check while the mode still \
+             read Auto; once Hold arrives mid-loop, nothing may commit — the \
+             mode has to be revalidated per request, not once before the loop"
+        );
+        assert_eq!(
+            qso_manager
+                .get_qso(second)
+                .await
+                .unwrap()
+                .metadata
+                .frequency,
+            1800.0,
+            "and a Revert, which never consults the allocator at all, must be \
+             stopped by the same per-request re-read"
+        );
+        assert_eq!(
+            active_tx_offsets.read().unwrap().get(&second_key).copied(),
+            Some(1800.0),
+            "and the coordinator's own-frequency mirror must agree"
+        );
+    }
+
+    /// PAN-72 (Codex round 7 on PR #350, finding 1): only ONE relocation per
+    /// QSO may commit in a single drain.
+    ///
+    /// Two requests for one `qso_id` are ordinary — a double `u` press, or a
+    /// manual nudge landing alongside the automatic stall action the detector
+    /// now re-raises every slot until something commits (round 7, finding 2).
+    /// Committing both in sequence overwrites `pre_switch_offset` with the
+    /// FIRST switch's destination: an intermediate offset no frame ever went
+    /// out on. The record of where an answer to the real pre-drain
+    /// transmission is arriving is then gone — on an unanswered `CallingCq`
+    /// that reply is rejected outright, and on an established QSO the wrong
+    /// offset is credited known-good.
+    #[tokio::test]
+    async fn two_requests_for_one_qso_commit_at_most_one_relocation() {
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let qso_id = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+        // Two `u` presses inside one slot: the second still reads the QSO's
+        // un-moved offset, because nothing has committed yet.
+        let pending = std::sync::Mutex::new(vec![
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            ),
+        ]);
+
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &no_offsets(),
+            &auto_mode(),
+        )
+        .await;
+
+        let progress = qso_manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            (progress.metadata.frequency - 1500.0).abs() > f64::EPSILON,
+            "precondition: one relocation must still happen"
+        );
+        let pre = progress
+            .metadata
+            .pre_switch_offset
+            .expect("a committed relocation records the offset it vacated");
+        assert_eq!(
+            pre.offset_hz, 1500.0,
+            "pre_switch_offset must name the offset the QSO actually \
+             transmitted from ({} Hz), not an intermediate one a second \
+             same-batch commit moved through",
+            1500.0
+        );
+    }
+
+    /// The operator's deliberate nudge is the request that survives coalescing
+    /// when an automatic stall action is queued for the same QSO in the same
+    /// batch — whichever order they arrive in.
+    ///
+    /// Observable through `PreSwitchOffset::operator_forced`, which round 6's
+    /// known-good crediting reads back: a stall switch indicts the offset it
+    /// left, an operator nudge implies nothing about it, so keeping the wrong
+    /// request mislabels the move for every later crediting decision.
+    #[tokio::test]
+    async fn an_operator_nudge_outranks_a_queued_stall_action_for_the_same_qso() {
+        for nudge_first in [false, true] {
+            let mut op = operator_with_live_allocator();
+            let qso_manager = manager();
+            let qso_id = qso_manager.start_cq(1500.0, None, false).await.unwrap();
+            let generation = qso_manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .advance_generation;
+            let stall = pancetta_qso::qso_manager::OffsetActionRequest::stall_detected(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+                generation,
+            );
+            let nudge = pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                qso_id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            );
+            let pending = std::sync::Mutex::new(if nudge_first {
+                vec![nudge, stall]
+            } else {
+                vec![stall, nudge]
+            });
+
+            drain_pending_qso_offset_requests(
+                &mut op,
+                &qso_manager,
+                &pending,
+                &no_offsets(),
+                &auto_mode(),
+            )
+            .await;
+
+            let pre = qso_manager
+                .get_qso(qso_id)
+                .await
+                .unwrap()
+                .metadata
+                .pre_switch_offset
+                .expect("a committed relocation records the offset it vacated");
+            assert!(
+                pre.operator_forced,
+                "the operator's nudge must be the request that commits \
+                 (nudge_first = {nudge_first})"
+            );
+        }
+    }
+
+    /// Coalescing is per QSO: requests for DIFFERENT QSOs all survive, in
+    /// arrival order (the `reserved_hz` chain depends on that order being
+    /// deterministic).
+    #[test]
+    fn coalescing_keeps_every_distinct_qso_in_arrival_order() {
+        let a = uuid::Uuid::new_v4();
+        let b = uuid::Uuid::new_v4();
+        let switch = |id| {
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                id,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: 1500.0 },
+            )
+        };
+        let coalesced = coalesce_offset_requests_by_qso(vec![switch(a), switch(b), switch(a)]);
+        assert_eq!(
+            coalesced.iter().map(|r| r.qso_id).collect::<Vec<_>>(),
+            vec![a, b],
+            "one entry per QSO, first-arrival order preserved"
         );
     }
 
