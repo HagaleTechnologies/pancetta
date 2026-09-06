@@ -275,6 +275,56 @@ tested.
   unchanged), and gates both the `stall_cycles` increment and the action emission on
   `allows_any_tx()`. Accumulated cycles are kept rather than reset — they came from real
   transmissions and remain valid evidence once TX resumes.
+- **Amended by Codex round 3 on PR #350.** Two findings: the hard exclusions (`avoid_hz` plus
+  the batch reservations) bound only inside `allocate_smart_frequency_in_range`'s ranked
+  spectral branch, so the deterministic no-snapshot fallback — every resolution until the first
+  waterfall lands — could still hand two same-batch `Switch` actions the identical offset
+  (`FrequencyAllocator::allocate_cq_frequency_excluding` now enforces the same exclusions and
+  window there); and the allocator's "no valid relocation exists" signal (`avoid_hz` returned
+  unchanged) was committed as a real move, clearing accumulated `stall_cycles` evidence and
+  announcing a `TxOffsetApplied` for a relocation that never happened
+  (`apply_tx_offset_switch` refuses it as `OffsetActionNoOp`; the drain reserves the unmoved
+  offset for the rest of the batch and does not requeue — PAN-79).
+- **Amended by Codex round 4 on PR #350.** Three more:
+  - *Finding 1 — other live QSOs are hard exclusions, not a scoring penalty.* `reserved_hz`
+    only ever held offsets committed earlier in the SAME batch, so the common crowded-spectrum
+    shape (several live QSOs, exactly one switching) left the rest out of the exclusion set
+    entirely — they reached the allocator only as `score_candidate`'s soft `-50`
+    `own_frequencies` penalty, whose own comment concedes it "effectively eliminates" rather
+    than eliminates, and which at drain time is applied against a one-tick-stale occupancy view
+    (`set_own_frequencies` syncs later in the tick). The drain's new `other_live_tx_offsets`
+    folds the whole `active_tx_offsets` view — minus the QSO being resolved — into the same
+    hard `also_avoid_hz` channel, on both the `Switch` path and the `Revert` re-resolution
+    fallback. Fails open on a poisoned lock, matching `revert_target_is_taken`.
+  - *Finding 2 — revalidate the Hound region at commit time.* Round 2's window was a `get_qso`
+    snapshot taken BEFORE the allocator ran and handed to an awaited
+    `apply_tx_offset_switch`; the Fox's first report performs the mandatory
+    calling-region → response-region QSY, and an operator-forced `u` nudge deliberately carries
+    no `raised_at_generation`, so the advance guard could not catch a QSY landing in that
+    window — the resolved low offset would commit and undo the QSY. `hound_switch_range_hz`
+    moves into `pancetta-qso` so resolve and commit share one definition (and it gains the
+    inverted/non-finite sanitization the allocator already applied), and
+    `apply_tx_offset_switch` re-derives it from the locked `progress` it is about to mutate,
+    refusing an out-of-region offset with the new expected-refusal
+    `OffsetActionOutsideHoundRegion`. Refusing rather than re-clamping keeps the stall evidence
+    so the detector re-raises against the correct region.
+  - *Finding 3 — the vacated offset stays valid while its reply is in flight.* A relocation is
+    committed AFTER the frame that triggered it has gone out on the old offset:
+    `rearm_manual_calls_at` re-sends at `metadata.frequency` and trips the threshold in the same
+    pass, and the drain commits on its next tick. An unanswered manual CQ then REJECTED the
+    caller's answer — `CallingCq` carries the new offset, round 1's fix deliberately leaves
+    `partner_freq` `None` pre-establishment, and the gate is only 15 Hz wide — and
+    `maybe_answer_caller` would spawn a duplicate QSO in its place; an established QSO's reply
+    routed but credited `last_known_good_offset_hz` to an offset never transmitted on, poisoning
+    the Revert target. Fixed on the RECEIVING side rather than by resequencing the trigger: the
+    last pre-switch frame is already in flight when the move commits, so delaying either the
+    emission or the commit by a cycle only moves the same window. New
+    `QsoMetadata::pre_switch_offset` records (vacated offset, when we left it); for
+    `PRE_SWITCH_OFFSET_GRACE` (two FT8 slots — long enough for that reply's round trip, short
+    enough to lapse before a reply to our first POST-switch frame could arrive) it is a second
+    accepted RX baseline in `is_message_relevant`/`classify_relevance`, at the same tolerance
+    and on top of (never instead of) the current one, and it is the offset a forward advance
+    credits as known-good. Consumed on the first advance after a switch.
 
 ## Manual "nudge" keystroke — `pancetta-tui`
 

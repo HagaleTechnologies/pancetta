@@ -41,6 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   inside its trailing-73 grace window; and while TX is `DISABLED` the stall
   counter no longer advances, so a muted station never drifts off a working
   offset it never transmitted on.
+  Final safeguards: a switching QSO now hard-avoids every other live QSO's
+  offset — not only the ones relocating in the same slot — instead of relying
+  on a scoring penalty that a crowded band can outvote; a Hound's region is
+  re-checked at the instant the move is applied, so a Fox answering mid-decision
+  can no longer have its mandatory QSY undone; and the offset a QSO just left
+  keeps accepting replies (and stays the offset credited as "known good") for
+  two slots, so the caller who answers the very transmission that triggered the
+  move is no longer rejected — or answered with a duplicate QSO.
 
 - Saved rig-config bookmarks (PAN-61): the `i` rig picker can now save the current model/port/baud/PTT as a named bookmark (`F3`) and load one back into the form later (`F2`), without retyping. Builds on PAN-59's live rig-config switch.
 
