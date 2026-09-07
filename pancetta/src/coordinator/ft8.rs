@@ -1785,12 +1785,31 @@ impl super::ApplicationCoordinator {
                         let scoped_fast_path_enabled = scoped_fast_path.load(Ordering::Relaxed);
                         let scoped_decodes: Vec<pancetta_ft8::DecodedMessage> =
                             if scoped_fast_path_enabled {
-                                let partner_freq_hz =
+                                // PAN-72 round-8 redesign (fix 2): `.0` is the
+                                // primary hint (this scoped path's original
+                                // single-frequency meaning, unchanged); `.1`
+                                // is the still-in-grace SECONDARY hint — the
+                                // offset an unanswered `CallingCq` relocated
+                                // away from. Union both windows so a caller
+                                // answering EITHER offset is decoded by this
+                                // fast path too, not just the slower
+                                // authoritative main decode below.
+                                let partner_freq_pair: Option<(f64, Option<f64>)> =
                                     active_qso_freq_hz.read().ok().and_then(|g| *g);
-                                if let Some(freq_hz) = partner_freq_hz {
+                                if let Some((freq_hz, secondary_freq_hz)) = partner_freq_pair {
                                     let center = (freq_hz / 6.25).round() as usize;
-                                    let lo = center.saturating_sub(SCOPED_HALF_WIDTH);
-                                    let hi = center.saturating_add(SCOPED_HALF_WIDTH);
+                                    let mut lo = center.saturating_sub(SCOPED_HALF_WIDTH);
+                                    let mut hi = center.saturating_add(SCOPED_HALF_WIDTH);
+                                    if let Some(secondary_hz) = secondary_freq_hz {
+                                        let secondary_center =
+                                            (secondary_hz / 6.25).round() as usize;
+                                        lo = lo.min(
+                                            secondary_center.saturating_sub(SCOPED_HALF_WIDTH),
+                                        );
+                                        hi = hi.max(
+                                            secondary_center.saturating_add(SCOPED_HALF_WIDTH),
+                                        );
+                                    }
                                     let scoped_call_start = Instant::now();
                                     let (messages, report) = decoder
                                         .decode_window_with_ap_scoped_partner_budgeted(
@@ -1943,10 +1962,24 @@ impl super::ApplicationCoordinator {
                         // both signals (the two mechanisms compose; an
                         // operator who wants wide decode also wants the
                         // standard sync threshold).
-                        let partner_freq_for_main = active_qso_freq_hz.read().ok().and_then(|g| *g);
+                        // PAN-72 round-8 redesign (fix 2): `.0` is the
+                        // primary hint (this site's original single-frequency
+                        // meaning, unchanged); `.1` is the still-in-grace
+                        // SECONDARY hint. `compute_narrow_filter_bins_default_dual`
+                        // is byte-identical to `compute_narrow_filter_bins_default`
+                        // when the secondary is `None` (every case except an
+                        // unanswered `CallingCq` still inside its relocation
+                        // grace) — see `secondary_decoder_hint_freq_for` in
+                        // `coordinator::qso`.
+                        let qso_freq_pair: Option<(f64, Option<f64>)> =
+                            active_qso_freq_hz.read().ok().and_then(|g| *g);
+                        let partner_freq_for_main = qso_freq_pair.map(|(primary, _)| primary);
+                        let secondary_freq_for_main =
+                            qso_freq_pair.and_then(|(_, secondary)| secondary);
                         let narrow_filter_bins =
-                            super::qso_filter::compute_narrow_filter_bins_default(
+                            super::qso_filter::compute_narrow_filter_bins_default_dual(
                                 partner_freq_for_main,
+                                secondary_freq_for_main,
                                 qso_filter_override_off,
                             );
                         let partner_freq_for_relaxed_sync =

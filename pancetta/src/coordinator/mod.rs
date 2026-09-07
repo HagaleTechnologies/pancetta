@@ -118,20 +118,53 @@ pub struct LatestTxIntent {
     pub tx_parity: Option<pancetta_core::slot::SlotParity>,
 }
 
+/// Smallest offset difference (Hz) [`tx_pivot_target`] treats as a genuine
+/// relocation rather than float noise.
+///
+/// TX offsets are allocated in whole Hz and FT8's tone spacing is 6.25 Hz, so
+/// nothing below half a Hz is a real move — but `f64` round-tripping through
+/// the QSO engine, the event bus and the intent map can leave two logically
+/// identical offsets a few ULPs apart. Comparing them exactly would report an
+/// unchanged keep-call re-send as a pivot, needlessly re-modulating it and —
+/// worse — planting a [`is_pivot_duplicate`] tombstone that would swallow the
+/// next genuinely identical request.
+pub const PIVOT_OFFSET_EPSILON_HZ: f64 = 0.5;
+
 /// Decide whether the TX worker should swap the message it is about to key
 /// for a fresher one from [`LatestTxIntent`]. Returns `Some(intent)` only
-/// when there is a live intent for this `qso_id` whose `message_text`
-/// differs from what the worker currently holds (a genuine ladder advance
-/// or content change) — never for an identical keep-call re-send, and never
-/// for `qso_id == None` (manual / tune / test-TX are never pivoted).
+/// when there is a live intent for this `qso_id` that differs from what the
+/// worker currently holds in EITHER `message_text` (a genuine ladder advance
+/// or content change) or `frequency_offset` — never for an identical
+/// keep-call re-send at the same offset, and never for `qso_id == None`
+/// (manual / tune / test-TX are never pivoted).
+///
+/// PAN-72 (Codex round 5 on PR #350, finding 1): the offset is part of the
+/// freshness comparison for the same reason it is part of
+/// [`is_pivot_duplicate`]'s tombstone identity and
+/// `classify_incoming_during_tx`'s duplicate check (PAN-73 rounds 3 and 6) —
+/// a frame can advance by MOVING without re-rendering. An adaptive TX-offset
+/// switch (`QsoManager::apply_tx_offset_switch`) relocates the QSO and the
+/// next rearm then publishes the SAME rendered text at the new
+/// `applied_hz`. With a text-only comparison this function returns `None`,
+/// so an older request for the QSO still sitting in the worker's (up to
+/// ~30 s) pre-PTT wait keys on the pre-switch offset — the very offset the
+/// switch existed to leave — even though `latest_tx_intent` already holds
+/// the new frequency. That breaks the "every transmitted frame reflects the
+/// freshest `MessageToSend` at key-time" invariant, and no amount of
+/// receive-side grace (`PRE_SWITCH_OFFSET_GRACE`) makes the transmitted
+/// frame itself fresh.
 pub fn tx_pivot_target(
     qso_id: Option<&str>,
     current_text: &str,
+    current_frequency_offset: f64,
     latest: &HashMap<String, LatestTxIntent>,
 ) -> Option<LatestTxIntent> {
     let id = qso_id?;
     let intent = latest.get(&active_tx_qso_key(id))?;
-    if intent.message_text == current_text {
+    let same_text = intent.message_text == current_text;
+    let same_offset =
+        (intent.frequency_offset - current_frequency_offset).abs() < PIVOT_OFFSET_EPSILON_HZ;
+    if same_text && same_offset {
         None
     } else {
         Some(intent.clone())
@@ -198,18 +231,20 @@ pub fn is_pivot_duplicate(
 /// [`tx_pivot_target`] uses, per item, instead of for a single frame.
 ///
 /// For each item with `qso_id: Some(id)`: if `latest` has an entry for
-/// [`active_tx_qso_key`]`(id)` whose `message_text` differs from the item's
-/// current `message_text`, the item's `message_text` AND `frequency_offset`
+/// [`active_tx_qso_key`]`(id)` whose `message_text` OR `frequency_offset`
+/// differs from the item's current pair (PAN-72 round 5 — see
+/// [`tx_pivot_target`] for why an offset-only change is a genuine advance),
+/// the item's `message_text` AND `frequency_offset`
 /// are replaced with the intent's values, and `(active_tx_qso_key(id),
 /// new_text, new_frequency_offset)` is recorded in the returned pivot list
 /// — PAN-73 round 6 (Codex): the frequency is part of the pivot's identity,
 /// same as `is_pivot_duplicate`'s tombstone comparison this list feeds, so a
 /// same-text stuck-DX frequency hop can't be mistaken for the pivoted
 /// content. An item with `qso_id: None` (manual / tune / test-TX), an item
-/// whose intent text MATCHES its current text (not a genuine advance), or
-/// an item with no intent entry at all passes through completely unchanged
-/// and is never reported as a pivot — mirroring `tx_pivot_target`'s exact
-/// "differs → `Some`" semantics.
+/// whose intent text AND offset both MATCH its current pair (not a genuine
+/// advance), or an item with no intent entry at all passes through completely
+/// unchanged and is never reported as a pivot — mirroring `tx_pivot_target`'s
+/// exact "differs → `Some`" semantics.
 ///
 /// Returns `(all_items_with_pivots_applied, list_of_what_was_pivoted)`.
 pub fn pivot_bundle_items(
@@ -223,9 +258,12 @@ pub fn pivot_bundle_items(
     let pivoted_items = items
         .into_iter()
         .map(|mut item| {
-            if let Some(intent) =
-                tx_pivot_target(item.qso_id.as_deref(), &item.message_text, latest)
-            {
+            if let Some(intent) = tx_pivot_target(
+                item.qso_id.as_deref(),
+                &item.message_text,
+                item.frequency_offset,
+                latest,
+            ) {
                 // `tx_pivot_target` only returns `Some` when `qso_id` is
                 // `Some`, so this unwrap is safe.
                 let key = active_tx_qso_key(
@@ -694,6 +732,29 @@ pub struct ApplicationCoordinator {
     /// `message_bus` at all.
     pending_autonomous_cq_dispatch_failures: Arc<std::sync::Mutex<Vec<u64>>>,
 
+    /// PAN-72: mailbox of resolved-needed TX-offset actions for in-progress
+    /// QSOs, pushed by the QSO event-forwarding task (`coordinator/qso.rs`)
+    /// on `QsoEvent::TxOffsetActionNeeded`, drained once per 15s slot by the
+    /// Autonomous task (`coordinator/autonomous.rs`) — same
+    /// push-mailbox/drain-once-per-tick shape as
+    /// `pending_autonomous_cq_dispatch_failures` above.
+    /// Each entry carries the staleness token
+    /// (`QsoMetadata::advance_generation`) the action was raised at, so a
+    /// request the QSO has since advanced past is discarded at commit time
+    /// instead of dragging it off the offset that just worked (PAN-72,
+    /// Codex round 1 on PR #350, finding 8).
+    pending_qso_offset_requests:
+        Arc<std::sync::Mutex<Vec<pancetta_qso::qso_manager::OffsetActionRequest>>>,
+
+    /// PAN-72: one-shot flag set by the TUI's `u` "nudge" keystroke when NO
+    /// QSO is currently active (`active_tx_qsos` empty at dispatch time) --
+    /// the CQ-hunting fallback of `TuiCommand::NudgeTxOffset`. Drained once
+    /// per `slot_interval` tick by the Autonomous task, which forwards it
+    /// into `AutonomousOperator::request_manual_switch`. The "active QSO"
+    /// branch instead feeds `pending_qso_offset_requests` directly (the
+    /// existing Task 8/9 mailbox/drain pipeline) rather than using this flag.
+    pending_cq_offset_nudge: Arc<std::sync::atomic::AtomicBool>,
+
     /// Application state
     is_running: Arc<AtomicBool>,
     shutdown_signal: Arc<AtomicBool>,
@@ -841,8 +902,9 @@ pub struct ApplicationCoordinator {
     pub(crate) hamlib_command_in_flight: Arc<std::sync::atomic::AtomicU32>,
 
     /// Operator TX-frequency mode (`pancetta_core::TxFreqMode` as `u8`),
-    /// default `Hold`. Shared with the QSO engine (gates the stuck-DX TX-offset
-    /// hop) and the autonomous operator (gates the smart-frequency allocator and
+    /// default `Hold`. Shared with the QSO engine (gates the adaptive stall
+    /// detector's `TxOffsetActionNeeded` emission) and the autonomous operator
+    /// (gates the smart-frequency allocator, the manual `u` nudge, and
     /// collision-listen jitter). In `Hold` the operator's picked offset is
     /// sticky; `Auto` lets pancetta choose/adjust it. Toggled from the TUI
     /// (`f`). Orthogonal to [`Self::tx_policy`].
@@ -955,7 +1017,17 @@ pub struct ApplicationCoordinator {
     /// `active_qso_ap`; read by the FT8 decoder thread to scope an
     /// early scoped decode pass at the partner's known location.
     /// `None` when no QSO is active.
-    active_qso_freq_hz: std::sync::Arc<std::sync::RwLock<Option<f64>>>,
+    ///
+    /// PAN-72 round-8 redesign (fix 2): `.0` is the primary hint (this
+    /// field's original single-`f64` meaning, unchanged derivation); `.1` is
+    /// an optional SECONDARY hint — the still-in-grace offset an unanswered
+    /// `CallingCq` relocated away from (see `coordinator::qso`'s
+    /// `secondary_decoder_hint_freq_for`). `.1` is `None` for every case
+    /// except that one (established QSO, no pre-switch offset, or grace
+    /// expired), so `compute_narrow_filter_bins_default_dual(primary, None,
+    /// ..)` behaves byte-identically to the old single-frequency form.
+    #[allow(clippy::type_complexity)]
+    active_qso_freq_hz: std::sync::Arc<std::sync::RwLock<Option<(f64, Option<f64>)>>>,
 
     /// hb-062 FP filter: applied between decode merge and broadcast in the
     /// FT8 thread. Inner `None` = filter disabled (default). When enabled,
@@ -1301,6 +1373,28 @@ pub struct ApplicationCoordinator {
     /// even after the original task that constructed it has panicked.
     /// Populated by `start_qso_component`, overwritten on every (re)start.
     pub(crate) qso_manager_for_supervisor: Option<pancetta_qso::QsoManager>,
+
+    /// PAN-72 critical-finding fix: a `watch` channel mirroring
+    /// `qso_manager_for_supervisor`'s latest value, so an *independently
+    /// spawned, long-lived* task (the Autonomous task's own `tokio::spawn`,
+    /// which is NOT respawned when only the Qso component restarts) can
+    /// observe the CURRENT `QsoManager` on every tick instead of a plain
+    /// `Option<QsoManager>` clone captured once at its own spawn time.
+    /// `health.rs`'s supervisor doesn't need this: it runs inline with
+    /// `&mut self` in the single un-spawned coordinator loop, so
+    /// `self.qso_manager_for_supervisor` is always already fresh there.
+    /// `start_qso_component` calls `.send_replace()` on this alongside every
+    /// `qso_manager_for_supervisor` assignment (qso.rs); a consumer calls
+    /// `.subscribe()` once at its own spawn time and `.borrow().clone()`
+    /// fresh each tick -- `subscribe()` always seeds the new `Receiver`
+    /// with whatever value was most recently *stored*, so this is correct
+    /// regardless of whether the Qso or Autonomous component starts first.
+    /// `send_replace` (never plain `send`) is load-bearing: this channel is
+    /// constructed below with `watch::channel(None).0`, dropping the initial
+    /// `Receiver`, and `run()` starts the Qso component before the Autonomous
+    /// one -- `send` would see `receiver_count() == 0` and discard the value
+    /// instead of storing it, leaving every later subscriber seeded `None`.
+    pub(crate) qso_manager_watch: tokio::sync::watch::Sender<Option<pancetta_qso::QsoManager>>,
 }
 
 #[cfg(feature = "pancetta-hamlib")]
@@ -1867,6 +1961,8 @@ impl ApplicationCoordinator {
             hamlib_pending_split: Arc::new(std::sync::Mutex::new(None)),
             station_agent_poll: None,
             pending_autonomous_cq_dispatch_failures: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_qso_offset_requests: Arc::new(std::sync::Mutex::new(Vec::new())),
+            pending_cq_offset_nudge: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             message_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_audio_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             last_decode_timestamp: Arc::new(std::sync::atomic::AtomicU64::new(0)),
@@ -1896,6 +1992,7 @@ impl ApplicationCoordinator {
             audit_log: audit_log_init,
             wsjtx_qso_events_rx: None,
             qso_manager_for_supervisor: None,
+            qso_manager_watch: tokio::sync::watch::channel(None).0,
         };
 
         info!("Application Coordinator initialized with ID: {}", id);
@@ -2669,6 +2766,34 @@ mod pivot_bundle_tests {
         assert_eq!(pivoted[0].message_text, "C6AVD K5ARH EM10");
         assert_eq!(pivoted[0].frequency_offset, 1728.0);
         assert!(pivots.is_empty());
+    }
+
+    /// PAN-72 (Codex round 5 on PR #350, finding 1): a bundled item whose
+    /// intent carries the SAME text at a DIFFERENT offset is still a genuine
+    /// advance — an adaptive TX-offset switch relocates the QSO without
+    /// re-rendering the frame — and must pivot onto the fresher offset rather
+    /// than key on the one the switch existed to leave.
+    #[test]
+    fn matching_text_at_a_fresher_offset_is_a_pivot() {
+        let mut latest = HashMap::new();
+        latest.insert(
+            active_tx_qso_key("qso-a"),
+            intent("C6AVD K5ARH EM10", 2128.0),
+        );
+        let items = vec![item(Some("qso-a"), "C6AVD K5ARH EM10", 1728.0)];
+
+        let (pivoted, pivots) = pivot_bundle_items(items, &latest);
+
+        assert_eq!(pivoted[0].message_text, "C6AVD K5ARH EM10");
+        assert_eq!(pivoted[0].frequency_offset, 2128.0);
+        assert_eq!(
+            pivots,
+            vec![(
+                active_tx_qso_key("qso-a"),
+                "C6AVD K5ARH EM10".to_string(),
+                2128.0
+            )]
+        );
     }
 
     /// An item with no intent entry at all passes through unchanged.

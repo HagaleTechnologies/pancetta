@@ -564,7 +564,7 @@ impl Default for AutonomousConfig {
             enabled: false,
             slot_parity: SlotParityConfig::Auto,
             cq_after_idle_cycles: 10,
-            cq_no_response_switch_after: 5,
+            cq_no_response_switch_after: 4,
             max_concurrent_qsos: 1,
             tx_offset_hz: 1500.0,
             min_dx_score: 0.3,
@@ -748,41 +748,91 @@ impl FrequencyAllocator {
     }
 
     /// Find a clear frequency for a new CQ, avoiding own QSOs and busy areas.
+    ///
+    /// Unconstrained form of [`Self::allocate_cq_frequency_excluding`]: with no
+    /// exclusions and no window the scan can never come up empty, so the
+    /// `unwrap_or_else` arm is reachable only for a degenerate allocation range
+    /// (`min > max`, i.e. the scan loop never runs) — which is exactly the
+    /// `center` this method returned before the scan was factored out.
     pub fn allocate_cq_frequency(&self) -> f64 {
         let (min_f, max_f) = self.allocation_range;
-        let step = self.min_separation_hz;
+        self.allocate_cq_frequency_excluding(&[], self.min_separation_hz, None)
+            .unwrap_or_else(|| ((min_f + max_f) / 2.0).clamp(min_f, max_f))
+    }
 
-        // Try candidates from the middle outward
-        let center = (min_f + max_f) / 2.0;
-        let mut best = center;
+    /// [`Self::allocate_cq_frequency`]'s scan with the caller's hard exclusions
+    /// and optional `[lo, hi]` window applied, or `None` when they leave no
+    /// candidate at all.
+    ///
+    /// PAN-72 (Codex round 3 on PR #350, finding 1). This scan is the
+    /// no-spectral-snapshot fallback for
+    /// [`AutonomousOperator::allocate_smart_frequency_in_range`] — the path
+    /// EVERY resolution takes until the first waterfall lands (a fresh start,
+    /// or an Autonomous-task restart). It used to be exclusion-blind, so on
+    /// that path a stall relocation could hand back the very offset it was
+    /// asked to avoid, and two `Switch` requests drained in the same batch both
+    /// got the identical deterministic answer — collapsing two TX streams onto
+    /// one offset, which makes the TX coalescer omit one of them. The
+    /// exclusions are enforced with `separation_hz`, the caller's own
+    /// separation (`FrequencyAllocatorConfig::min_separation_hz`), so the
+    /// fallback and the ranked branch exclude by exactly the same rule rather
+    /// than two independently-chosen constants.
+    ///
+    /// `separation_hz` governs only the exclusions; the candidate grid still
+    /// steps by this allocator's own `min_separation_hz`, unchanged.
+    ///
+    /// PAN-72 (Codex round 6 on PR #350, finding 3): `range_hz` now WIDENS the
+    /// scan when it reaches outside `allocation_range`, rather than only
+    /// filtering a fixed 200–2800 Hz sweep down. A Hound response region above
+    /// 2800 Hz is valid operator configuration and used to empty this scan (and
+    /// the ranked branch above it) outright, so every post-QSY stall switch and
+    /// `u` nudge resolved back to `avoid_hz` and was refused as a no-op. See
+    /// [`crate::frequency::sweep_bounds`], which both scans share so they can
+    /// never disagree about what is searchable.
+    pub fn allocate_cq_frequency_excluding(
+        &self,
+        exclude_hz: &[f64],
+        separation_hz: f64,
+        range_hz: Option<(f64, f64)>,
+    ) -> Option<f64> {
+        let step = self.min_separation_hz;
+        let (min_f, max_f) = crate::frequency::sweep_bounds(self.allocation_range, step, range_hz);
+
+        let mut best: Option<f64> = None;
         let mut best_clearance = f64::NEG_INFINITY;
 
         let mut freq = min_f;
         while freq <= max_f {
-            let min_dist_own = self
-                .own_frequencies
-                .values()
-                .map(|&f| (f - freq).abs())
-                .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
-                .unwrap_or(f64::MAX);
-
-            let nearby_count = self
-                .observed_frequencies
+            let in_window = range_hz.is_none_or(|(lo, hi)| freq >= lo && freq <= hi);
+            let clear_of_exclusions = exclude_hz
                 .iter()
-                .filter(|&&f| (f - freq).abs() < 100.0)
-                .count();
+                .all(|&other| (freq - other).abs() >= separation_hz);
+            if in_window && clear_of_exclusions {
+                let min_dist_own = self
+                    .own_frequencies
+                    .values()
+                    .map(|&f| (f - freq).abs())
+                    .min_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                    .unwrap_or(f64::MAX);
 
-            // Clearance score: distance from own QSOs, penalize busy areas
-            let clearance = min_dist_own - (nearby_count as f64 * 20.0);
-            if clearance > best_clearance {
-                best_clearance = clearance;
-                best = freq;
+                let nearby_count = self
+                    .observed_frequencies
+                    .iter()
+                    .filter(|&&f| (f - freq).abs() < 100.0)
+                    .count();
+
+                // Clearance score: distance from own QSOs, penalize busy areas
+                let clearance = min_dist_own - (nearby_count as f64 * 20.0);
+                if clearance > best_clearance {
+                    best_clearance = clearance;
+                    best = Some(freq);
+                }
             }
 
             freq += step;
         }
 
-        best.clamp(min_f, max_f)
+        best.map(|hz| hz.clamp(min_f, max_f))
     }
 
     /// Get all own frequencies currently allocated.
@@ -879,9 +929,15 @@ pub struct AutonomousOperator {
     /// `CallingCq` QSO that is itself "active" until it times out, which
     /// would otherwise reset the streak against our own unanswered call.
     /// Tracked regardless of `TxFreqMode` (cheap, and ready if the operator
-    /// switches to Auto — same precedent as `QsoMetadata.dx_repeat_count`);
+    /// switches to Auto — same precedent as `QsoMetadata.stall_cycles`);
     /// only acted on in Auto mode.
     cq_no_response_streak: u32,
+    /// PAN-72: set by `request_manual_switch` (the TUI's `u` "nudge"
+    /// keystroke, relayed via the coordinator), consumed unconditionally at
+    /// the top of `decide_at` regardless of the current operating state — so
+    /// a nudge that arrives while not `CallingCq` doesn't leak into a LATER,
+    /// unrelated CQ cycle.
+    manual_switch_requested: bool,
     /// The offset actually used for the most recent self-CQ (Auto mode
     /// only). Sticky: a routine (non-switching) self-CQ reuses this value
     /// directly instead of re-ranking from scratch, so a threshold-driven
@@ -1050,6 +1106,7 @@ impl AutonomousOperator {
             state: OperatingState::Hunting,
             idle_cycles: 0,
             cq_no_response_streak: 0,
+            manual_switch_requested: false,
             current_cq_offset_hz: None,
             last_cq_snapshot: None,
             previous_cq_snapshot: None,
@@ -1732,12 +1789,120 @@ impl AutonomousOperator {
 
     /// Get the best frequency for a new QSO using the smart allocator.
     /// Falls back to the legacy allocator if no spectral data is available.
-    fn allocate_smart_frequency(
+    ///
+    /// Exposed (beyond this crate's own internal use in `decide_at`) for the
+    /// coordinator's PAN-72 mid-QSO stall-switch drain
+    /// (`pancetta::coordinator::autonomous`), which resolves an
+    /// `OffsetAction::Switch` the same way a CQ-hunting switch does — see
+    /// that call site's own doc comment. No signature change from the
+    /// pre-existing private method.
+    pub fn allocate_smart_frequency(
         &self,
         dx_target_hz: Option<f64>,
         target_parity: Option<pancetta_core::slot::SlotParity>,
         avoid_hz: Option<f64>,
     ) -> f64 {
+        self.allocate_smart_frequency_avoiding(dx_target_hz, target_parity, avoid_hz, &[])
+    }
+
+    /// [`Self::allocate_smart_frequency`] with additional hard exclusions.
+    ///
+    /// PAN-72 (Codex round 1 on PR #350, finding 1): the coordinator resolves
+    /// a whole batch of queued `OffsetAction::Switch` requests inside one
+    /// tick, but this operator's own-frequency snapshot is only synced from
+    /// `active_tx_offsets` (via [`FrequencyAllocator::set_own_frequencies`])
+    /// LATER in that same tick. Two concurrent QSOs switching in the same
+    /// slot would therefore both rank against the identical stale occupancy
+    /// view — each excluding only its own original offset — and could pick
+    /// the same best candidate, collapsing two TX streams onto one frequency.
+    /// The drain accumulates each offset it has already handed out this batch
+    /// and passes them here.
+    ///
+    /// These are HARD exclusions, exactly like `avoid_hz`, deliberately not
+    /// the soft `own_frequencies` score penalty: that penalty is documented
+    /// as "effectively eliminates this candidate" but is not guaranteed to on
+    /// a crowded band — the same reason `avoid_hz` was promoted from soft to
+    /// hard in Codex round 6 on PR #276. When the exclusions empty the ranked
+    /// list, the fallback still returns `avoid_hz` unchanged so the caller's
+    /// existing "no valid relocation → skip the switch" path fires.
+    ///
+    /// Both exclusion sets bind on BOTH resolution paths (Codex round 3 on PR
+    /// #350, finding 1). They originally applied only inside the
+    /// `self.spectral_snapshot.is_some()` branch, leaving the no-snapshot
+    /// fallback — every resolution until the first waterfall lands — free to
+    /// hand two same-batch `Switch` actions the identical deterministic offset;
+    /// [`FrequencyAllocator::allocate_cq_frequency_excluding`] now enforces the
+    /// same exclusions there, with the same `min_separation_hz`.
+    pub fn allocate_smart_frequency_avoiding(
+        &self,
+        dx_target_hz: Option<f64>,
+        target_parity: Option<pancetta_core::slot::SlotParity>,
+        avoid_hz: Option<f64>,
+        also_avoid_hz: &[f64],
+    ) -> f64 {
+        self.allocate_smart_frequency_in_range(
+            dx_target_hz,
+            target_parity,
+            avoid_hz,
+            also_avoid_hz,
+            None,
+        )
+    }
+
+    /// The configured minimum separation (Hz) between our OWN concurrent TX
+    /// offsets — `FrequencyAllocatorConfig::min_separation_hz`, the same value
+    /// [`Self::allocate_smart_frequency_avoiding`] enforces as a hard exclusion
+    /// around `avoid_hz`/`also_avoid_hz`.
+    ///
+    /// Exposed for the coordinator's PAN-72 offset drain (Codex round 2 on PR
+    /// #350, finding 2): a queued `OffsetAction::Revert` never consults the
+    /// allocator, so the drain has to answer "is this revert target still free?"
+    /// itself, and it must answer it with the SAME separation the allocator
+    /// would have applied rather than a second, independently-chosen constant.
+    pub fn min_own_separation_hz(&self) -> f64 {
+        self.smart_allocator.config().min_separation_hz
+    }
+
+    /// [`Self::allocate_smart_frequency_avoiding`] restricted to a caller-supplied
+    /// `[lo, hi]` Hz window.
+    ///
+    /// PAN-72 (Codex round 2 on PR #350, finding 1). The general allocation
+    /// range is the whole `FrequencyAllocatorConfig::range` (300–2800 Hz by
+    /// default), which is the right search space for a normal QSO but NOT for a
+    /// **Hound**: the Hound procedure pins our TX into the low calling region
+    /// while we are calling the Fox, and into the response region once the Fox
+    /// has answered and we have QSY'd. A stall switch that ranks across the full
+    /// range can move a post-QSY Hound back below `response_min_hz`, where the
+    /// Fox is not listening at all — the adaptive move would then guarantee the
+    /// QSO fails rather than rescue it.
+    ///
+    /// `range_hz` is sanitized here rather than trusted: it ultimately comes
+    /// from operator TOML (`[hound]`), so a non-finite or inverted window is
+    /// treated as "no constraint" instead of panicking in `f64::clamp` or
+    /// filtering every candidate away.
+    ///
+    /// Two paths have to honor the window, not just the ranked one:
+    /// - the spectral branch filters candidates to the window alongside the
+    ///   existing `avoid_hz`/`also_avoid_hz` hard exclusions, and when that
+    ///   empties the list it returns `avoid_hz` unchanged — the caller's
+    ///   established "no valid relocation" signal;
+    /// - the legacy fallback (taken when no spectral snapshot has landed yet)
+    ///   filters its own scan to the window, and to the same hard exclusions,
+    ///   via [`FrequencyAllocator::allocate_cq_frequency_excluding`] (round 3,
+    ///   finding 1). Only if THAT comes up empty does the old
+    ///   clamp-the-unconstrained-pick behavior apply, and only when there is no
+    ///   `avoid_hz` to return as the "no valid relocation" signal — the clamped
+    ///   edge is still inside the region the Fox listens in, which is the
+    ///   property that actually matters in that last-resort case.
+    pub fn allocate_smart_frequency_in_range(
+        &self,
+        dx_target_hz: Option<f64>,
+        target_parity: Option<pancetta_core::slot::SlotParity>,
+        avoid_hz: Option<f64>,
+        also_avoid_hz: &[f64],
+        range_hz: Option<(f64, f64)>,
+    ) -> f64 {
+        let range_hz = range_hz.filter(|(lo, hi)| lo.is_finite() && hi.is_finite() && *lo <= *hi);
         // Hold mode (default): pancetta does not choose the offset — every
         // autonomous transmission goes out on the operator's pinned offset.
         // Prefer the LIVE parked offset (set via the TUI's `o` modal) over
@@ -1776,12 +1941,17 @@ impl AutonomousOperator {
         });
 
         if let Some(ref spectral) = self.spectral_snapshot {
-            let mut candidates = self.smart_allocator.rank_candidates_with_parity(
+            // Round 6, finding 3: the window is what the candidate grid is
+            // GENERATED over, not merely filtered by afterwards — a Hound
+            // response region above the allocator's own range would otherwise
+            // empty the list and turn every switch into a refused no-op.
+            let mut candidates = self.smart_allocator.rank_candidates_in_range(
                 spectral,
                 &self.decode_history,
                 &own_freqs,
                 dx_target_hz,
                 target_slot,
+                range_hz,
             );
 
             // When calling CQ, prefer frequencies near rare DX spots.
@@ -1798,15 +1968,27 @@ impl AutonomousOperator {
             // for this specific avoid_hz, keeps the shared own_frequencies
             // soft-penalty semantics unchanged for its original callers
             // (own-QSO separation).
+            //
+            // PAN-72 finding 1: `also_avoid_hz` (offsets already handed to
+            // OTHER QSOs earlier in the same coordinator drain batch) gets the
+            // identical hard treatment — see
+            // `allocate_smart_frequency_avoiding`'s doc comment.
             let min_separation_hz = self.smart_allocator.config().min_separation_hz;
-            let excluded: Vec<_> = match avoid_hz {
-                Some(avoid) => candidates
-                    .iter()
-                    .filter(|c| (c.offset_hz - avoid).abs() >= min_separation_hz)
-                    .cloned()
-                    .collect(),
-                None => candidates.clone(),
-            };
+            let excluded: Vec<_> = candidates
+                .iter()
+                .filter(|c| {
+                    // PAN-72 round 2 finding 1: the Hound region window, when
+                    // the caller supplied one, is as hard a constraint as the
+                    // avoid exclusions below.
+                    range_hz.is_none_or(|(lo, hi)| c.offset_hz >= lo && c.offset_hz <= hi)
+                        && avoid_hz
+                            .is_none_or(|avoid| (c.offset_hz - avoid).abs() >= min_separation_hz)
+                        && also_avoid_hz
+                            .iter()
+                            .all(|&other| (c.offset_hz - other).abs() >= min_separation_hz)
+                })
+                .cloned()
+                .collect();
 
             if let Some(best) = excluded.first() {
                 return best.offset_hz;
@@ -1832,8 +2014,47 @@ impl AutonomousOperator {
             }
         }
 
-        // Fallback: legacy allocator
-        self.frequency_allocator.allocate_cq_frequency()
+        // Fallback: legacy allocator, taken whenever no spectral snapshot has
+        // landed yet (a fresh start, an Autonomous-task restart, or simply
+        // before the first waterfall) — so this is not a rare path.
+        //
+        // PAN-72 (Codex round 3 on PR #350, finding 1): it honors the SAME hard
+        // exclusions and window the ranked branch above does. Left
+        // exclusion-blind, its determinism was the bug: every caller in a batch
+        // ranks against the same stale own-frequency map, so two queued
+        // `Switch` requests both received the identical offset (the TX
+        // coalescer then omits one stream), and a stall relocation could be
+        // handed straight back the offset it was told to avoid.
+        let min_separation_hz = self.smart_allocator.config().min_separation_hz;
+        let mut exclusions: Vec<f64> = Vec::with_capacity(also_avoid_hz.len() + 1);
+        exclusions.extend_from_slice(also_avoid_hz);
+        exclusions.extend(avoid_hz);
+        if let Some(hz) = self.frequency_allocator.allocate_cq_frequency_excluding(
+            &exclusions,
+            min_separation_hz,
+            range_hz,
+        ) {
+            return hz;
+        }
+
+        // The exclusions (or a window disjoint from the allocation range) left
+        // no candidate. Mirror the ranked branch exactly rather than inventing
+        // a fallback behavior: return `avoid_hz` unchanged, the caller's
+        // established "no valid relocation → skip the switch" signal.
+        if let Some(avoid) = avoid_hz {
+            return avoid;
+        }
+
+        // No `avoid_hz` to signal with (a fresh CQ pick, not a relocation), so
+        // there is still an answer owed. Degrade to the pre-PAN-72 behavior:
+        // the unconstrained legacy pick, clamped into the caller's window — the
+        // clamped edge is at least inside the region a Hound's Fox listens in,
+        // which is the property that actually matters there.
+        let legacy_hz = self.frequency_allocator.allocate_cq_frequency();
+        match range_hz {
+            Some((lo, hi)) => legacy_hz.clamp(lo, hi),
+            None => legacy_hz,
+        }
     }
 
     /// Rank the current band openness for the TX-placement instrument.
@@ -1907,6 +2128,14 @@ impl AutonomousOperator {
     /// Tell the operator how many QSOs the auto-sequencer is currently managing.
     pub fn set_active_qso_count(&mut self, count: u32) {
         self.active_qso_count = count;
+    }
+
+    /// PAN-72: request an immediate CQ-offset switch on the next `decide_at`
+    /// call, bypassing `cq_no_response_switch_after` — used by the manual
+    /// `u` keystroke. A no-op if the next cycle isn't `CallingCq` (the flag
+    /// is still consumed, not left pending for some later cycle).
+    pub fn request_manual_switch(&mut self) {
+        self.manual_switch_requested = true;
     }
 
     /// Feed a message the auto-sequencer wants to send this cycle.
@@ -2075,6 +2304,10 @@ impl AutonomousOperator {
     pub fn decide_at(&mut self, unix_secs: i64) -> Vec<OperatorAction> {
         self.skip_log.clear();
         let mut actions = Vec::new();
+        // PAN-72: consumed unconditionally, before any state-dependent
+        // branching below, so a manual nudge that arrives while not
+        // `CallingCq` this cycle can't leak into a later, unrelated cycle.
+        let manual_switch_requested = std::mem::take(&mut self.manual_switch_requested);
 
         self.refresh_tx_freq_offset_invalidation();
 
@@ -2429,8 +2662,9 @@ impl AutonomousOperator {
                             self.refresh_tx_freq_offset_invalidation();
 
                             let should_switch = self.tx_freq_auto()
-                                && self.cq_no_response_streak
-                                    >= self.config.cq_no_response_switch_after;
+                                && (self.cq_no_response_streak
+                                    >= self.config.cq_no_response_switch_after
+                                    || manual_switch_requested);
 
                             if should_switch {
                                 let history_fresh = self.spectral_snapshot.is_some()
@@ -2442,6 +2676,24 @@ impl AutonomousOperator {
                                     // alternative — skip this window and listen instead
                                     // of guessing blind. Streak stays put; retried next
                                     // window once history fills in from ordinary RX.
+                                    //
+                                    // PAN-72 (Codex round 1 on PR #350, finding 9): a
+                                    // STREAK-driven switch retries on its own — the
+                                    // streak is untouched here, so the next window
+                                    // re-enters this branch and switches as soon as
+                                    // history fills in. A MANUAL (`u`) request has no
+                                    // such backing state: `manual_switch_requested` was
+                                    // already consumed by the `mem::take` at the top of
+                                    // `decide_at`, and the streak on the manual path is
+                                    // typically still below threshold, so returning here
+                                    // would silently drop the operator's nudge forever.
+                                    // Thin decode history is exactly the common case
+                                    // right after startup or a band hop — precisely when
+                                    // an operator is most likely to press `u`. Put the
+                                    // request back so a later cycle honors it.
+                                    if manual_switch_requested {
+                                        self.manual_switch_requested = true;
+                                    }
                                     self.state = OperatingState::Hunting;
                                     actions.push(OperatorAction::Listen);
                                     actions.push(self.status_action());
@@ -2509,6 +2761,18 @@ impl AutonomousOperator {
                                 // the switch is retried once conditions
                                 // improve.
                                 if (new_offset - avoid).abs() < f64::EPSILON {
+                                    // Same manual-nudge-loss failure mode as the
+                                    // `!history_fresh` early return above (PAN-72
+                                    // finding 2, re-review round): a STREAK-driven
+                                    // switch retries on its own next window, but a
+                                    // MANUAL (`u`) request has no such backing state
+                                    // once `manual_switch_requested` was consumed by
+                                    // the `mem::take` at the top of `decide_at` --
+                                    // put it back so a later cycle honors it instead
+                                    // of silently dropping the operator's nudge.
+                                    if manual_switch_requested {
+                                        self.manual_switch_requested = true;
+                                    }
                                     self.state = OperatingState::Hunting;
                                     actions.push(OperatorAction::Listen);
                                     actions.push(self.status_action());
@@ -2626,8 +2890,9 @@ impl AutonomousOperator {
             // offset anyway (an active QSO transmits on its own latched
             // `QsoMetadata.frequency`, not this global offset), so jittering
             // mid-QSO would surprise the operator without helping the live QSO.
-            // The QSO engine's own stuck-DX detector handles a collision on a
-            // live QSO's held offset. When idle, jitter as before so the next
+            // The QSO engine's own adaptive stall detector (`stall_cycles` ->
+            // `TxOffsetActionNeeded`) handles a collision on a live QSO's held
+            // offset. When idle, jitter as before so the next
             // CQ avoids the interferer — and only ever from a collision-LISTEN
             // slot, i.e. a slot we listened on without transmitting (exactly the
             // "new information" precondition the operator described).
@@ -3258,9 +3523,9 @@ mod tests {
     }
 
     #[test]
-    fn autonomous_config_default_cq_no_response_switch_after_is_5() {
+    fn autonomous_config_default_cq_no_response_switch_after_is_4() {
         let config = AutonomousConfig::default();
-        assert_eq!(config.cq_no_response_switch_after, 5);
+        assert_eq!(config.cq_no_response_switch_after, 4);
     }
 
     #[test]
@@ -3282,6 +3547,323 @@ mod tests {
         assert!(
             (chosen - 1500.0).abs() >= 75.0,
             "expected a frequency at least 75 Hz from the avoided 1500 Hz, got {chosen}"
+        );
+    }
+
+    /// PAN-72 (Codex round 2 on PR #350, finding 1): a Hound stall switch must
+    /// stay inside the Hound response region — a pick below `response_min_hz`
+    /// puts our R+report where the Fox is not listening.
+    #[test]
+    fn allocate_smart_frequency_in_range_never_leaves_the_window() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        // Make everything ABOVE 1000 Hz look busy, so the unconstrained
+        // allocator would prefer the (clear, and for a post-QSY Hound
+        // fatal) low calling region.
+        let mut records = Vec::new();
+        let mut freq = 1000.0f64;
+        while freq <= 2800.0 {
+            records.push(DecodeRecord {
+                frequency_hz: freq,
+                time_slot: TimeSlot::First,
+            });
+            records.push(DecodeRecord {
+                frequency_hz: freq,
+                time_slot: TimeSlot::Second,
+            });
+            freq += 25.0;
+        }
+        op.decode_history.push_cycle(records);
+
+        let unconstrained = op.allocate_smart_frequency(None, None, Some(1500.0));
+        assert!(
+            unconstrained < 1000.0,
+            "test premise broken: the unconstrained allocator must prefer the \
+             low region here, got {unconstrained}"
+        );
+
+        let constrained = op.allocate_smart_frequency_in_range(
+            None,
+            None,
+            Some(1500.0),
+            &[],
+            Some((1000.0, 2700.0)),
+        );
+        assert!(
+            (1000.0..=2700.0).contains(&constrained),
+            "a range-constrained allocation must stay inside the window, got {constrained}"
+        );
+        assert!(
+            (constrained - 1500.0).abs() >= 75.0,
+            "the window must not weaken the avoid_hz hard exclusion, got {constrained}"
+        );
+    }
+
+    /// The legacy (no-spectral-snapshot) fallback is range-blind, so its
+    /// result is clamped into the caller's window rather than escaping it.
+    #[test]
+    fn allocate_smart_frequency_in_range_clamps_the_legacy_fallback() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        // Deliberately NO `update_spectral` — this exercises the
+        // `allocate_cq_frequency()` fallback path.
+        let chosen =
+            op.allocate_smart_frequency_in_range(None, None, None, &[], Some((1000.0, 2700.0)));
+        assert!(
+            (1000.0..=2700.0).contains(&chosen),
+            "the legacy fallback must be clamped into the window, got {chosen}"
+        );
+    }
+
+    /// PAN-72 (Codex round 6 on PR #350, finding 3): a Hound response region
+    /// ABOVE the allocator's own 200-2800 Hz range — e.g. 2850-2900 Hz, which
+    /// `[hound]` validation accepts and `ACTIVE_QSO_TX_OFFSET_MAX_HZ` (2900)
+    /// admits — must actually be SEARCHED, not merely used to filter candidates
+    /// that were already generated from 200-2800.
+    ///
+    /// Before this fix such a window emptied the ranked list AND the legacy
+    /// fallback scan, so the allocator returned `avoid_hz` unchanged and every
+    /// post-QSY Hound stall switch or `u` nudge was refused as a no-op — the
+    /// configured region never reached at all. Both resolution paths are
+    /// exercised: with a spectral snapshot (ranked) and without one (legacy).
+    #[test]
+    fn allocate_smart_frequency_in_range_searches_a_window_above_the_default_range() {
+        const WINDOW: (f64, f64) = (2850.0, 2900.0);
+        const AVOID: f64 = 1500.0;
+
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+
+        // 1. Legacy fallback (no waterfall yet — the path EVERY resolution
+        //    takes until the first spectral snapshot lands).
+        let fallback =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID), &[], Some(WINDOW));
+        assert!(
+            (WINDOW.0..=WINDOW.1).contains(&fallback),
+            "the legacy fallback must search the configured region, not resolve \
+             back onto the avoided {AVOID} Hz, got {fallback}"
+        );
+
+        // 2. Ranked spectral branch.
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        let ranked =
+            op.allocate_smart_frequency_in_range(None, None, Some(AVOID), &[], Some(WINDOW));
+        assert!(
+            (WINDOW.0..=WINDOW.1).contains(&ranked),
+            "the ranked branch must generate candidates across the configured \
+             region, not filter a 200-2800 list down to nothing, got {ranked}"
+        );
+    }
+
+    /// The widening above must be strictly additive: an ordinary in-range
+    /// window still ranks exactly as it did, so no previously-reachable offset
+    /// moves and no new one appears inside the configured range.
+    #[test]
+    fn widening_the_sweep_does_not_disturb_an_in_range_window() {
+        let grid: Vec<f64> = {
+            let (lo, hi) = crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, None);
+            let mut out = Vec::new();
+            let mut f = lo;
+            while f <= hi {
+                out.push(f);
+                f += 25.0;
+            }
+            out
+        };
+        let (lo, hi) =
+            crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, Some((1000.0, 2700.0)));
+        assert_eq!(
+            (lo, hi),
+            (200.0, 2800.0),
+            "a window inside the configured range must leave the sweep untouched"
+        );
+
+        let (wide_lo, wide_hi) =
+            crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, Some((2850.0, 2900.0)));
+        assert_eq!(wide_lo, 200.0, "the grid stays anchored at the range floor");
+        assert_eq!(wide_hi, 2900.0, "the ceiling extends to cover the window");
+        assert!(
+            grid.iter().all(|&f| f >= wide_lo && f <= wide_hi),
+            "every offset the old sweep produced must still be inside the widened one"
+        );
+
+        // A window reaching BELOW the range floor walks the grid down in whole
+        // steps, so the pre-existing offsets keep their exact values.
+        let (below_lo, _) =
+            crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, Some((140.0, 500.0)));
+        assert_eq!(below_lo, 125.0, "200 - ceil(60/25)*25 = 125");
+        assert!(
+            ((200.0 - below_lo) / 25.0).fract() == 0.0,
+            "the widened floor must sit on the original grid"
+        );
+
+        // Garbage windows are ignored, exactly as the caller sanitizes them.
+        assert_eq!(
+            crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, Some((2700.0, 1000.0))),
+            (200.0, 2800.0)
+        );
+        assert_eq!(
+            crate::frequency::sweep_bounds((200.0, 2800.0), 25.0, Some((f64::NAN, 2900.0))),
+            (200.0, 2800.0)
+        );
+    }
+
+    /// PAN-72 (Codex round 3 on PR #350, finding 1): the no-spectral-snapshot
+    /// fallback must honor the SAME hard exclusions the spectral branch does.
+    /// Until a first waterfall lands (fresh start, an Autonomous restart) every
+    /// resolution takes this path, and the legacy scan is deterministic over
+    /// the same own-frequency map — so an exclusion-blind fallback both
+    /// "relocates" a stalled QSO straight back onto the offset it was told to
+    /// avoid, and hands two same-batch `Switch` requests the identical offset,
+    /// which makes the TX coalescer drop one of the two streams.
+    #[test]
+    fn legacy_fallback_honors_avoid_hz_and_batch_reservations() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        // Deliberately NO `update_spectral` — this is the legacy fallback.
+        let baseline = op.allocate_smart_frequency_in_range(None, None, None, &[], None);
+        assert_eq!(
+            baseline, 200.0,
+            "test premise: with no own/observed frequencies the legacy scan is \
+             deterministic and returns the allocation range's minimum"
+        );
+
+        // 1. `avoid_hz` binds here too: relocating a stalled QSO must not hand
+        //    back the very offset it is stalling on.
+        let avoided = op.allocate_smart_frequency_in_range(None, None, Some(baseline), &[], None);
+        assert!(
+            (avoided - baseline).abs() >= 75.0,
+            "the fallback must honor avoid_hz, got {avoided} against an avoided {baseline}"
+        );
+
+        // 2. Batch reservations bind here too: two `Switch` requests drained in
+        //    the same tick must not resolve to the same offset.
+        let first = op.allocate_smart_frequency_in_range(None, None, Some(1500.0), &[], None);
+        let second = op.allocate_smart_frequency_in_range(None, None, Some(1500.0), &[first], None);
+        assert!(
+            (second - first).abs() >= 75.0,
+            "two same-batch switches must not collapse onto one offset, got {first} and {second}"
+        );
+    }
+
+    /// The Hound window and the exclusions have to hold *together* on the
+    /// fallback path — clamping into the window (round 2's fix) must not be
+    /// able to land on an excluded offset (PAN-72, Codex round 3, finding 1).
+    #[test]
+    fn legacy_fallback_honors_the_window_and_the_exclusions_together() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        // No spectral snapshot: the legacy fallback, constrained to a Hound
+        // response region, avoiding the window's own lower edge (which is
+        // exactly where the round-2 clamp would deposit the pick).
+        let chosen = op.allocate_smart_frequency_in_range(
+            None,
+            None,
+            Some(1000.0),
+            &[],
+            Some((1000.0, 2700.0)),
+        );
+        assert!(
+            (1000.0..=2700.0).contains(&chosen),
+            "the fallback must stay inside the Hound window, got {chosen}"
+        );
+        assert!(
+            (chosen - 1000.0).abs() >= 75.0,
+            "the window must not weaken the avoid_hz exclusion on the fallback \
+             path either, got {chosen}"
+        );
+    }
+
+    /// When the exclusions genuinely empty the fallback's candidate space, it
+    /// returns `avoid_hz` unchanged — the SAME "no valid relocation" signal the
+    /// spectral branch already uses, not a fresh invented behavior and not the
+    /// exclusion-blind legacy pick (PAN-72, Codex round 3, finding 1).
+    #[test]
+    fn legacy_fallback_returns_avoid_hz_unchanged_when_every_candidate_is_excluded() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.frequency.min_separation_hz = 10_000.0; // impossible to honor
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        // No spectral snapshot.
+        let chosen = op.allocate_smart_frequency_in_range(None, None, Some(1000.0), &[], None);
+        assert_eq!(
+            chosen, 1000.0,
+            "must return avoid_hz unchanged (the caller's detectable no-op) \
+             rather than the exclusion-blind legacy 200.0"
+        );
+    }
+
+    /// An inverted or non-finite window (operator TOML can produce either) is
+    /// ignored, not honored and not a panic in `f64::clamp`.
+    #[test]
+    fn allocate_smart_frequency_in_range_ignores_a_nonsensical_window() {
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+
+        let inverted = op.allocate_smart_frequency_in_range(
+            None,
+            None,
+            Some(1500.0),
+            &[],
+            Some((2700.0, 1000.0)),
+        );
+        let unconstrained = op.allocate_smart_frequency(None, None, Some(1500.0));
+        assert_eq!(
+            inverted, unconstrained,
+            "an inverted window must degrade to no constraint"
+        );
+
+        let nan = op.allocate_smart_frequency_in_range(
+            None,
+            None,
+            Some(1500.0),
+            &[],
+            Some((f64::NAN, 2700.0)),
+        );
+        assert_eq!(
+            nan, unconstrained,
+            "a non-finite window must degrade to no constraint"
         );
     }
 
@@ -3724,6 +4306,59 @@ mod tests {
     }
 
     #[test]
+    fn request_manual_switch_forces_a_switch_below_the_streak_threshold() {
+        // switch_after=3, so streak(0) alone would never trigger a switch on
+        // the first CQ -- only `request_manual_switch()` forces it.
+        let mut op = primed_operator(2, 3, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let even_ts: i64 = 0;
+        op.decide_at(even_ts); // idle_cycles 0->1 < cq_after_idle_cycles(2): still Hunting
+        op.request_manual_switch();
+        let actions = op.decide_at(even_ts); // idle_cycles 1->2 >= 2: first CQ, entering streak=0
+
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "a manual switch request must force a FrequencyShift even though \
+             the no-response streak (0) is nowhere near switch_after (3)"
+        );
+    }
+
+    #[test]
+    fn request_manual_switch_is_consumed_even_when_not_calling_cq() {
+        // An operator not yet in CallingCq this cycle (idle_cycles still
+        // below cq_after_idle_cycles) must consume-and-discard a manual
+        // switch request the same as any other cycle -- it must NOT persist
+        // to leak into a LATER, unrelated cycle that does enter CallingCq.
+        let mut op = primed_operator(2, 3, true);
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let even_ts: i64 = 0;
+        op.request_manual_switch();
+        let _ = op.decide_at(even_ts); // idle_cycles 0->1 < 2: not CallingCq this cycle; the
+                                       // request is consumed here and discarded, not saved.
+
+        // Second, later decide_at that WOULD enter CallingCq via the routine
+        // idle-cycles path -- must NOT force a switch now that the earlier
+        // request has already been consumed.
+        let actions = op.decide_at(even_ts); // idle_cycles 1->2 >= 2: first CQ, entering streak=0
+
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "a manual switch request consumed on an earlier, non-CallingCq \
+             cycle must not leak into this later cycle's CQ decision"
+        );
+    }
+
+    #[test]
     fn auto_mode_listens_instead_of_switching_when_history_is_thin() {
         // switch_after = 1 (a reachable, config-valid threshold — 0 is
         // rejected by AutonomousConfig::validate_section): the first
@@ -3751,6 +4386,119 @@ mod tests {
             "must not switch while history is thin"
         );
         assert!(actions.iter().any(|a| matches!(a, OperatorAction::Listen)));
+    }
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 9): a manual `u` nudge that
+    /// lands while decode history is still thin must NOT be silently lost.
+    /// `manual_switch_requested` is consumed by `mem::take` at the top of
+    /// `decide_at`, so the thin-history early return used to discard it
+    /// outright — and because the no-response streak on the manual path is
+    /// typically still below threshold, no later cycle would retry. Thin
+    /// history is exactly the post-startup / post-band-hop case where an
+    /// operator is most likely to press `u`.
+    #[test]
+    fn manual_switch_request_survives_a_thin_history_skip_and_fires_later() {
+        // switch_after = 3 so the streak alone can never force a switch in
+        // this test — only the retained manual request can.
+        let mut op = primed_operator(1, 3, true);
+        // Deliberately do NOT prime decode history yet: cycles_recorded()
+        // stays below decode_history_cycles (4), so the first CQ-eligible
+        // cycle takes the thin-history early return.
+
+        let even_ts: i64 = 0;
+        op.request_manual_switch();
+        let thin = op.decide_at(even_ts); // idle_cycles 0->1 >= 1: CQ cycle, history thin
+        assert!(
+            thin.iter().any(|a| matches!(a, OperatorAction::Listen)),
+            "thin history must still take the listen-instead-of-guess path"
+        );
+        assert!(
+            !thin
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "no blind switch while history is thin"
+        );
+
+        // History now fills in from ordinary RX, exactly as it would on-air.
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let later = op.decide_at(even_ts);
+        assert!(
+            later
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "the retained manual nudge must fire once history fills in \
+             (streak is only 0/1, nowhere near switch_after=3)"
+        );
+    }
+
+    /// PAN-72 (re-review round on PR #350, finding 2): the sibling early
+    /// return for "no candidate honors the exclusion" (`new_offset ==
+    /// avoid`, a few lines below the thin-history check above) used to drop
+    /// a manual `u` nudge exactly the same way the thin-history return did
+    /// before finding 9's fix. Same failure mode, second site: this proves
+    /// the identical restore-the-flag guard now covers it too.
+    #[test]
+    fn manual_switch_request_survives_a_no_valid_relocation_skip_and_fires_later() {
+        // switch_after = 3 so the streak alone can never force a switch in
+        // this test -- only the retained manual request can. min_separation_hz
+        // impossibly large so allocate_smart_frequency returns avoid_hz
+        // unchanged on the first attempt (mirrors
+        // `switch_skips_and_listens_when_no_frequency_honors_the_exclusion`).
+        let mut config = AutonomousConfig::default();
+        config.enabled = true;
+        config.slot_parity = SlotParityConfig::Even;
+        config.cq_after_idle_cycles = 1;
+        config.cq_no_response_switch_after = 3;
+        config.listen_cycle.initial_interval = 100;
+        config.frequency.min_separation_hz = 10_000.0; // impossible to honor
+
+        let mut op = AutonomousOperator::new(config, "W1ABC".into(), Some("FN42".into()));
+        op.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        op.update_spectral(SpectralSnapshot {
+            power_bins: vec![0.0f32; 140],
+            freq_min_hz: 200.0,
+            freq_max_hz: 2800.0,
+        });
+        for _ in 0..8 {
+            op.feed_decoded_messages(&[], &NullDxEvaluator);
+        }
+
+        let even_ts: i64 = 0;
+        op.request_manual_switch();
+        let blocked = op.decide_at(even_ts); // idle_cycles 0->1 >= 1: CQ cycle, no valid relocation
+        assert!(
+            blocked.iter().any(|a| matches!(a, OperatorAction::Listen)),
+            "no valid relocation must still take the listen-instead-of-guess path"
+        );
+        assert!(
+            !blocked
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "no blind switch when no candidate honors the exclusion"
+        );
+
+        // Conditions improve: relax the exclusion so a relocation becomes
+        // possible again. `smart_allocator` is built once from
+        // `config.frequency` at construction time (see `AutonomousOperator::
+        // new`), so re-assigning it directly is how this test simulates the
+        // crowding condition clearing, exactly as
+        // `manual_switch_request_survives_a_thin_history_skip_and_fires_later`
+        // above simulates decode history filling in.
+        op.smart_allocator = SmartFrequencyAllocator::new(FrequencyAllocatorConfig::default());
+
+        let later = op.decide_at(even_ts);
+        assert!(
+            later
+                .iter()
+                .any(|a| matches!(a, OperatorAction::FrequencyShift { .. })),
+            "the retained manual nudge must fire once a valid relocation exists \
+             (streak is only 0/1, nowhere near switch_after=3)"
+        );
     }
 
     #[test]

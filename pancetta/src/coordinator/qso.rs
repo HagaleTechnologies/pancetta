@@ -1548,8 +1548,10 @@ mod pan6_diagnostic_tests {
             first_call_at: Some(now - chrono::Duration::minutes(age_minutes)),
             last_call_at: Some(now),
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
+            advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -2198,8 +2200,10 @@ mod ap_ranking_tests {
             first_call_at: Some(now),
             last_call_at: Some(now),
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
+            advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -2265,6 +2269,7 @@ impl super::ApplicationCoordinator {
         let display_feed_enabled = self.display_feed_enabled.clone();
         let pending_autonomous_cq_dispatch_failures =
             self.pending_autonomous_cq_dispatch_failures.clone();
+        let pending_qso_offset_requests = self.pending_qso_offset_requests.clone();
 
         // Read station config for callsign/grid
         let config = self.config.read().await;
@@ -2336,6 +2341,11 @@ impl super::ApplicationCoordinator {
                 atno_bonus: p.atno_bonus,
             }
         };
+        // PAN-72 (Task 7): operator-configured stall-switch threshold,
+        // threaded into pancetta_qso::TimeoutConfig below so the TOML
+        // setting (Task 6) actually reaches the QSO engine's Rust default
+        // (Task 2) instead of being silently overridden by it.
+        let qso_stall_switch_after = config.autonomous.qso_stall_switch_after;
         drop(config);
 
         // cqdx.io logbook upload is opt-in just like ClubLog/QRZ: it requires
@@ -2376,6 +2386,11 @@ impl super::ApplicationCoordinator {
         // QSO event rather than snapshotting it once at startup.
         let ft8_config_for_ap = self.ft8_config.clone();
         let active_qso_freq_hz = self.active_qso_freq_hz.clone();
+        // PAN-72 round-8 redesign (fix 2): the same live `active_slot_ns`
+        // atomic Fix 1 uses inside `pancetta-qso`, so the decoder hint's
+        // secondary-window grace agrees with the QSO engine's own crediting
+        // grace — one source of truth.
+        let qso_freq_slot_ns = self.active_slot_ns();
         let operating_frequency_hz = self.operating_frequency_hz.clone();
         let split_tx_frequency_hz = self.split_tx_frequency_hz.clone();
         let tx_freq_mode = self.tx_freq_mode.clone();
@@ -2415,7 +2430,9 @@ impl super::ApplicationCoordinator {
         // populated by the time the latter reads it — no channel, handoff, or
         // timeout needed.
         let qso_config = {
-            use pancetta_qso::{DuplicateCheckConfig, HoundRegions, QsoManagerConfig};
+            use pancetta_qso::{
+                DuplicateCheckConfig, HoundRegions, QsoManagerConfig, TimeoutConfig,
+            };
 
             QsoManagerConfig {
                 our_callsign: our_callsign.clone(),
@@ -2436,6 +2453,13 @@ impl super::ApplicationCoordinator {
                     // dead knob in the config schema.
                     ..Default::default()
                 },
+                // PAN-72 (Task 7): thread the operator's TOML
+                // autonomous.qso_stall_switch_after through; every other
+                // TimeoutConfig field keeps the qso-side default.
+                timeouts: TimeoutConfig {
+                    qso_stall_switch_after,
+                    ..Default::default()
+                },
                 ..Default::default()
             }
         };
@@ -2446,6 +2470,32 @@ impl super::ApplicationCoordinator {
         // in-flight QSOs after this component's task panics and dies. See
         // the field's doc-comment in mod.rs for why the clone stays valid.
         self.qso_manager_for_supervisor = Some(qso_manager.clone());
+        // PAN-72 critical-finding fix: also publish the fresh handle onto
+        // the watch channel so the (not respawned on a Qso-only restart)
+        // Autonomous task's drain can pick up this brand-new manager
+        // instead of staying pinned to whatever instance existed when it
+        // spawned.
+        //
+        // `send_replace`, NOT `send`: tokio's `watch::Sender::send` bails out
+        // with `Err` *without storing the value* whenever `receiver_count()`
+        // is 0, and this store MUST land unconditionally:
+        //   * On first startup `run()` awaits `start_qso_component` BEFORE
+        //     `start_autonomous_component` (the only `.subscribe()` site), so
+        //     there are genuinely zero receivers here -- a `send` would drop
+        //     the very first handle on the floor and every later
+        //     `subscribe()` would be seeded with `None`, leaving the whole
+        //     mid-QSO offset-switch feature inert until the first Qso-component
+        //     crash+restart.
+        //   * The same applies to a Qso restart that lands in the window
+        //     between the Autonomous task dying and its replacement
+        //     re-subscribing.
+        // `send_replace` has no receiver-count precondition: it always stores
+        // (and notifies whatever receivers exist), which is exactly the
+        // "latest handle is always readable via `subscribe()`" contract the
+        // field's doc comment in mod.rs promises.
+        let _ = self
+            .qso_manager_watch
+            .send_replace(Some(qso_manager.clone()));
         // Share the rig dial-frequency source so completed QSOs log the
         // real RF frequency (dial + audio offset), not the bare offset
         // (was producing ADIF FREQ ~0.001 / BAND 0MHZ).
@@ -2454,9 +2504,48 @@ impl super::ApplicationCoordinator {
         // TUI SetSplit relay; the QSO RF stamp uses this for the
         // effective TX dial frequency when split is active.
         qso_manager.set_split_tx_frequency_source(split_tx_frequency_hz.clone());
-        // Share the operator's Hold/Auto TX-frequency mode so the
-        // stuck-DX hop only fires in Auto (Hold keeps the offset sticky).
+        // Share the operator's Hold/Auto TX-frequency mode so the adaptive
+        // stall detector only emits `TxOffsetActionNeeded` in Auto (Hold keeps
+        // the offset sticky).
         qso_manager.set_tx_freq_mode_source(tx_freq_mode.clone());
+        // PAN-72 (Codex round 2 on PR #350, finding 5): share the global TX
+        // policy too, so the same stall detector does not count a rearm cycle
+        // whose re-send the `TxPolicy::Disabled` hard mute blocked outright —
+        // the DX cannot answer a frame that never went on the air.
+        qso_manager.set_tx_policy_source(tx_policy.clone());
+        // PAN-72 (PR #350 round-7 re-review): share the LIVE active-slot-length
+        // atomic so the keep-calling rearm gate and the `stall_cycles` counter
+        // it drives run on the active protocol's transmit slot. This must be
+        // the shared `Arc`, not `qso_config.active_mode`: `QsoManager::start()`
+        // runs that loop on a `clone()`, `Clone` copies `config` by value, and
+        // the `SetOperatingMode` handler below only mutates this task's own
+        // binding — so a config-derived cadence never saw a Shift+M switch and
+        // an FT4 → FT8 switch left the loop on a 7.5 s cadence for what was by
+        // then a genuine FT8 QSO. `try_switch_operating_mode` rewrites this
+        // atomic on every switch, so the running loop tracks it in both
+        // directions.
+        qso_manager.set_active_slot_ns_source(self.active_slot_ns());
+        // PAN-72 (Codex round 7 on PR #350, finding 3): the policy above is
+        // only ONE of the two gates a rearmed frame must clear. A QSO with
+        // `remote_origin` emits every frame as `TxOrigin::Remote`, and the TX
+        // worker independently checks the station-agent arm immediately before
+        // PTT — an arm expiry or explicit disarm drops those frames while
+        // `TxPolicy` still reads `Full`, and the stall detector was counting
+        // the resulting silence as "the DX ignored us".
+        //
+        // Read-only evidence, NOT a TX gate: the fail-CLOSED gate stays in the
+        // TX worker (AGENTS.md invariant). `remote_tx_permitted` itself denies
+        // on a poisoned lock, so a poisoned arm makes the stall detector stop
+        // counting too — the conservative direction in both places.
+        {
+            let arm_for_stall_evidence = self.remote_tx_arm();
+            qso_manager.set_remote_tx_permitted_source(std::sync::Arc::new(move || {
+                crate::coordinator::tx::remote_tx_permitted(
+                    &arm_for_stall_evidence,
+                    chrono::Utc::now().timestamp_millis(),
+                )
+            }));
+        }
 
         // Task 5 (QSOLogged/LoggedADIF): subscribe synchronously, before
         // `qso_manager` is moved into the spawned task below, so the WSJT-X
@@ -2788,6 +2877,7 @@ impl super::ApplicationCoordinator {
                 let tx_callsign = our_callsign.clone();
                 let ap_state = active_qso_ap;
                 let qso_freq_state = active_qso_freq_hz;
+                let qso_freq_slot_ns = qso_freq_slot_ns.clone();
                 let active_tx_qsos = active_tx_qsos.clone();
                 let active_tx_offsets = active_tx_offsets.clone();
                 let latest_tx_intent = latest_tx_intent.clone();
@@ -2797,6 +2887,7 @@ impl super::ApplicationCoordinator {
                 let pending_for_events = pending_manual_calls.clone();
                 let dx_activity_for_events = dx_activity.clone();
                 let display_feed_enabled = display_feed_enabled.clone();
+                let pending_qso_offset_requests = pending_qso_offset_requests.clone();
                 tokio::spawn(async move {
                     // Task 5 (gap 2/4): built once for this task's lifetime,
                     // mirroring the autonomous operator's own scorer
@@ -2912,28 +3003,46 @@ impl super::ApplicationCoordinator {
                                 // the std::sync::RwLock guard so we never hold
                                 // a non-Send guard across an await point.
                                 {
-                                    let decoder_hint_freq: Option<f64> = if new_state.is_active() {
-                                        // Try to obtain `partner_freq` from the
-                                        // QSO metadata. This is a cheap read-lock
-                                        // on the already-updated QSO map; it fires
-                                        // once per state-change (not per decode
-                                        // window).  On error (QSO vanished between
-                                        // the event and the lookup — extremely
-                                        // rare) we fall back to the state's own
-                                        // TX frequency.
-                                        let partner = snapshot_qso_manager
-                                            .get_qso(qso_id)
-                                            .await
-                                            .ok()
-                                            .and_then(|p| p.metadata.partner_freq);
-                                        partner.or_else(|| new_state.frequency())
+                                    // PAN-72 round-8 redesign (fix 2): the
+                                    // primary hint keeps its byte-identical
+                                    // derivation (partner_freq, else our own
+                                    // TX frequency). The secondary hint
+                                    // (`decoder_hint_pair.1`) is the
+                                    // still-in-grace vacated offset of an
+                                    // unanswered `CallingCq` relocation — see
+                                    // `secondary_decoder_hint_freq_for`.
+                                    let decoder_hint_pair: Option<(f64, Option<f64>)> = if new_state
+                                        .is_active()
+                                    {
+                                        // Fetch the QSO's current progress
+                                        // once. This is a cheap read-lock
+                                        // on the already-updated QSO map;
+                                        // it fires once per state-change
+                                        // (not per decode window). On
+                                        // error (QSO vanished between the
+                                        // event and the lookup — extremely
+                                        // rare) we fall back to the
+                                        // state's own TX frequency and no
+                                        // secondary.
+                                        let progress =
+                                            snapshot_qso_manager.get_qso(qso_id).await.ok();
+                                        let partner =
+                                            progress.as_ref().and_then(|p| p.metadata.partner_freq);
+                                        let primary = partner.or_else(|| new_state.frequency());
+                                        let secondary = progress.as_ref().and_then(|p| {
+                                            secondary_decoder_hint_freq_for(
+                                                p,
+                                                qso_freq_slot_ns.load(Ordering::Relaxed),
+                                            )
+                                        });
+                                        primary.map(|p| (p, secondary))
                                     } else {
                                         None
                                     };
                                     // Acquire the guard synchronously (no await
                                     // in this scope) and write.
                                     if let Ok(mut guard) = qso_freq_state.write() {
-                                        *guard = decoder_hint_freq;
+                                        *guard = decoder_hint_pair;
                                     }
                                 }
 
@@ -2941,44 +3050,14 @@ impl super::ApplicationCoordinator {
                                 // QSOs to the TUI banner. The QSO state
                                 // machine is the source of truth; the TUI
                                 // replaces its list each push.
-                                let (snapshot, pending_snap) = build_active_qso_snapshot(
+                                push_active_qso_snapshot(
                                     &snapshot_qso_manager,
                                     &dx_activity_for_events,
                                     &pending_for_events,
+                                    &display_feed_enabled,
+                                    &snapshot_bus,
                                 )
                                 .await;
-                                // Additive: clone the snapshot for the read-only
-                                // gateway BEFORE it is moved into the →Tui send
-                                // (only when the gateway is enabled).
-                                let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
-                                    Some(MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot.clone(),
-                                        pending: pending_snap.clone(),
-                                    })
-                                } else {
-                                    None
-                                };
-                                let snap_msg = ComponentMessage::new(
-                                    ComponentId::Qso,
-                                    ComponentId::Tui,
-                                    MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot,
-                                        pending: pending_snap,
-                                    },
-                                    Instant::now(),
-                                );
-                                if let Err(e) = snapshot_bus.send_message(snap_msg).await {
-                                    debug!("Failed to push active-QSOs snapshot: {}", e);
-                                }
-                                if let Some(m) = gw_snap {
-                                    super::remote_gateway::relay_to_gateway(
-                                        &snapshot_bus,
-                                        &display_feed_enabled,
-                                        ComponentId::Qso,
-                                        m,
-                                    )
-                                    .await;
-                                }
 
                                 // Batch 2 #3: a QSO that just went terminal-Failed
                                 // is otherwise silently dropped from the snapshot.
@@ -3210,39 +3289,14 @@ impl super::ApplicationCoordinator {
                                 }
                                 // Push fresh snapshot so the banner drops
                                 // the just-completed QSO from the active list.
-                                let (snapshot, pending_snap) = build_active_qso_snapshot(
+                                push_active_qso_snapshot(
                                     &snapshot_qso_manager,
                                     &dx_activity_for_events,
                                     &pending_for_events,
+                                    &display_feed_enabled,
+                                    &snapshot_bus,
                                 )
                                 .await;
-                                let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
-                                    Some(MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot.clone(),
-                                        pending: pending_snap.clone(),
-                                    })
-                                } else {
-                                    None
-                                };
-                                let snap_msg = ComponentMessage::new(
-                                    ComponentId::Qso,
-                                    ComponentId::Tui,
-                                    MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot,
-                                        pending: pending_snap,
-                                    },
-                                    Instant::now(),
-                                );
-                                let _ = snapshot_bus.send_message(snap_msg).await;
-                                if let Some(m) = gw_snap {
-                                    super::remote_gateway::relay_to_gateway(
-                                        &snapshot_bus,
-                                        &display_feed_enabled,
-                                        ComponentId::Qso,
-                                        m,
-                                    )
-                                    .await;
-                                }
                                 if let Some(ref their_call) = metadata.their_callsign {
                                     info!("QSO completed with {}, marking as worked", their_call);
 
@@ -3402,39 +3456,14 @@ impl super::ApplicationCoordinator {
                                 .await;
                                 // Push fresh snapshot so the banner drops
                                 // the failed QSO.
-                                let (snapshot, pending_snap) = build_active_qso_snapshot(
+                                push_active_qso_snapshot(
                                     &snapshot_qso_manager,
                                     &dx_activity_for_events,
                                     &pending_for_events,
+                                    &display_feed_enabled,
+                                    &snapshot_bus,
                                 )
                                 .await;
-                                let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
-                                    Some(MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot.clone(),
-                                        pending: pending_snap.clone(),
-                                    })
-                                } else {
-                                    None
-                                };
-                                let snap_msg = ComponentMessage::new(
-                                    ComponentId::Qso,
-                                    ComponentId::Tui,
-                                    MessageType::ActiveQsosSnapshot {
-                                        qsos: snapshot,
-                                        pending: pending_snap,
-                                    },
-                                    Instant::now(),
-                                );
-                                let _ = snapshot_bus.send_message(snap_msg).await;
-                                if let Some(m) = gw_snap {
-                                    super::remote_gateway::relay_to_gateway(
-                                        &snapshot_bus,
-                                        &display_feed_enabled,
-                                        ComponentId::Qso,
-                                        m,
-                                    )
-                                    .await;
-                                }
                                 // observability-diagnostics-plan.md Layer 2: surface
                                 // WHY the QSO failed instead of letting it silently
                                 // vanish from the banner — `reason` was previously
@@ -3531,6 +3560,91 @@ impl super::ApplicationCoordinator {
                                     ),
                                     Some(&qso_id.to_string()),
                                     from_callsign.as_deref(),
+                                )
+                                .await;
+                            }
+                            Ok(pancetta_qso::QsoEvent::TxOffsetActionNeeded {
+                                qso_id,
+                                action,
+                                raised_at_generation,
+                            }) => {
+                                if let Ok(mut pending) = pending_qso_offset_requests.lock() {
+                                    pending.push(
+                                        pancetta_qso::qso_manager::OffsetActionRequest::stall_detected(
+                                            qso_id,
+                                            action,
+                                            raised_at_generation,
+                                        ),
+                                    );
+                                }
+                            }
+                            Ok(pancetta_qso::QsoEvent::TxOffsetApplied { qso_id, offset_hz }) => {
+                                // PAN-72 (Codex round 1 on PR #350, finding 7):
+                                // an applied offset move is not a state
+                                // transition, so nothing else in this task
+                                // rebuilds the `ActiveQsosSnapshot` the TUI
+                                // banner and the TX-placement stream marker
+                                // render from. A stalled exchange is exactly
+                                // where no further transition arrives, so
+                                // without this push the UI keeps showing the
+                                // pre-switch offset through several
+                                // switch/revert cycles. The coordinator-side
+                                // `active_tx_offsets` mirror is written by the
+                                // Autonomous drain itself (it needs the value
+                                // in time for the same tick's
+                                // `set_own_frequencies`); this is the UI half.
+                                debug!(
+                                    target: "tx.freq",
+                                    qso_id = %qso_id,
+                                    offset_hz,
+                                    "PAN-72: refreshing the active-QSO snapshot after an offset move"
+                                );
+                                // PAN-72 (Codex round 7 on PR #350, finding 6):
+                                // re-centre the DECODER too, not just the UI.
+                                // With the QSO filter on (the default) the main
+                                // decode is collapsed to ±60 Hz around
+                                // `active_qso_freq_hz`, and a relocation is at
+                                // least `min_separation_hz` (75 Hz) away — so an
+                                // unanswered CQ that switched offset could no
+                                // longer hear an answer on its NEW frequency,
+                                // and with no decode there was no StateChanged
+                                // to refresh the hint either. Self-sustaining
+                                // deafness, for the life of the QSO.
+                                //
+                                // Resolve the value BEFORE taking the std
+                                // RwLock guard so no non-Send guard is held
+                                // across an await, exactly as the StateChanged
+                                // arm does. A QSO that has gone terminal in the
+                                // meantime yields `None` and the hint is left
+                                // ALONE — the terminal arms own that clear, and
+                                // a co-active QSO's hint must not be wiped by a
+                                // late event for a dead one.
+                                {
+                                    // PAN-72 round-8 redesign (fix 2): pair
+                                    // the primary hint (unchanged derivation)
+                                    // with the still-in-grace secondary — the
+                                    // vacated offset of an unanswered
+                                    // `CallingCq` relocation.
+                                    let progress = snapshot_qso_manager.get_qso(qso_id).await.ok();
+                                    let hint = progress.as_ref().and_then(decoder_hint_freq_for);
+                                    if let Some(hint_hz) = hint {
+                                        let secondary = progress.as_ref().and_then(|p| {
+                                            secondary_decoder_hint_freq_for(
+                                                p,
+                                                qso_freq_slot_ns.load(Ordering::Relaxed),
+                                            )
+                                        });
+                                        if let Ok(mut guard) = qso_freq_state.write() {
+                                            *guard = Some((hint_hz, secondary));
+                                        }
+                                    }
+                                }
+                                push_active_qso_snapshot(
+                                    &snapshot_qso_manager,
+                                    &dx_activity_for_events,
+                                    &pending_for_events,
+                                    &display_feed_enabled,
+                                    &snapshot_bus,
                                 )
                                 .await;
                             }
@@ -4902,6 +5016,289 @@ impl super::ApplicationCoordinator {
     }
 }
 
+/// The decoder's narrow-band hint (`active_qso_freq_hz`) for a QSO, computed
+/// from its CURRENT state and metadata.
+///
+/// PAN-72 (Codex round 7 on PR #350, finding 6). This is the same rule the
+/// `StateChanged` arm applies inline — `partner_freq` when the DX's RX offset
+/// is known, otherwise the QSO's own state frequency — factored out so the
+/// `TxOffsetApplied` arm can apply it too, from the POST-switch QSO.
+///
+/// Why an offset switch must recompute it: the FT8 decoder's QSO filter
+/// (`coordinator::qso_filter`, on by default) collapses the main decode to
+/// ±[`DEFAULT_HALF_WINDOW_HZ`](crate::coordinator::qso_filter::DEFAULT_HALF_WINDOW_HZ)
+/// (60 Hz) around this value. A relocation is guaranteed to be at least
+/// `min_separation_hz` (75 Hz by default) away, so a hint left on the
+/// abandoned offset puts the QSO's own traffic OUTSIDE the decode window.
+///
+/// The two cases differ in which field carries the answer, and only one of
+/// them is dangerous:
+///
+/// - **Established QSO** (`partner_freq` latched, which
+///   `apply_tx_offset_switch` does for exactly this reason): the DX still
+///   transmits on the offset we vacated, so the hint must stay there. The
+///   switch changed only our TX side. Recomputing yields `partner_freq` and
+///   the hint effectively does not move — correct, and previously correct by
+///   accident, since it also did not move.
+/// - **Unanswered `CallingCq`**: no DX exists yet and `partner_freq` stays
+///   `None` on purpose, so the state frequency IS the hint — and the switch
+///   just changed it. Leaving the hint on the abandoned CQ offset meant an
+///   answer to the NEW CQ fell outside the decode search entirely. No decode
+///   ⇒ no `StateChanged` ⇒ nothing ever refreshed the hint: the station was
+///   left calling CQ on a frequency it could not hear replies on, for the life
+///   of the QSO. That is the failure PAN-72's whole mechanism exists to avoid.
+///
+/// Returns `None` for a QSO that is no longer active — the caller uses that to
+/// LEAVE the shared hint alone rather than clearing it, since the terminal
+/// paths (`StateChanged`'s inactive branch, `QsoCompleted`, `QsoFailed`)
+/// already own that transition and a co-active QSO's hint must not be wiped by
+/// a late event for a dead one.
+fn decoder_hint_freq_for(progress: &pancetta_qso::QsoProgress) -> Option<f64> {
+    if !progress.state.is_active() {
+        return None;
+    }
+    progress
+        .metadata
+        .partner_freq
+        .or_else(|| progress.state.frequency())
+}
+
+/// The SECONDARY decoder hint (PAN-72 round-8 redesign, fix 2): the offset a
+/// stalled, unanswered `CallingCq` relocated AWAY from, for as long as a
+/// reply to the last frame transmitted there is still credible.
+///
+/// The bug this closes (Codex round 8, finding 1): `QsoMetadata::pre_switch_offset`
+/// deliberately keeps the vacated offset "eligible" for CREDITING purposes
+/// (`live_pre_switch_offset_at` in `pancetta-qso`), but the decoder's actual
+/// band-collapse filter (`coordinator::qso_filter`, ±60 Hz around a SINGLE
+/// [`decoder_hint_freq_for`] value) got recentred onto the NEW offset by the
+/// round-7 fix, dropping the old offset outside the decode window — a caller
+/// answering the old-offset CQ was filtered out and never decoded.
+///
+/// `Some` only when ALL of:
+/// - the QSO is `CallingCq` (an established QSO already has a stable hint
+///   via `partner_freq` — the DX transmits there regardless of our TX side,
+///   so it needs no second window; touching that path is explicitly out of
+///   scope for this fix);
+/// - `metadata.pre_switch_offset` is `Some(pre)`;
+/// - `pre.left_at` is still within
+///   [`pancetta_qso::qso_manager::pre_switch_offset_grace_from_slot_ns`] of
+///   `slot_ns` — the coordinator's live `active_slot_ns` atomic, the SAME
+///   value `pancetta-qso` derives Fix 1's grace window from (one source of
+///   truth, two call sites).
+///
+/// Every other case (established QSO, no pre-switch offset, or grace
+/// expired) yields `None`.
+fn secondary_decoder_hint_freq_for(
+    progress: &pancetta_qso::QsoProgress,
+    slot_ns: i64,
+) -> Option<f64> {
+    if !matches!(
+        progress.state,
+        pancetta_qso::states::QsoState::CallingCq { .. }
+    ) {
+        return None;
+    }
+    let pre = progress.metadata.pre_switch_offset?;
+    let grace = pancetta_qso::qso_manager::pre_switch_offset_grace_from_slot_ns(slot_ns);
+    (pre.left_at + grace > chrono::Utc::now()).then_some(pre.offset_hz)
+}
+
+#[cfg(test)]
+mod secondary_decoder_hint_tests {
+    use super::secondary_decoder_hint_freq_for;
+    use chrono::{Duration, Utc};
+    use pancetta_qso::states::PreSwitchOffset;
+    use pancetta_qso::{GridSquares, QsoMetadata, QsoProgress, QsoState, SignalReports};
+
+    /// FT8's default slot (15s) -> a 30s grace, matching
+    /// `pancetta-qso`'s never-injected default.
+    const FT8_SLOT_NS: i64 = 15_000_000_000;
+
+    fn calling_cq_progress(pre_switch_offset: Option<PreSwitchOffset>) -> QsoProgress {
+        let start = Utc::now() - Duration::seconds(5);
+        QsoProgress {
+            state: QsoState::CallingCq {
+                frequency: 1900.0,
+                started_at: start,
+                call_count: 1,
+            },
+            state_history: Vec::new(),
+            messages: Vec::new(),
+            metadata: QsoMetadata {
+                qso_id: pancetta_qso::QsoId::new_v4(),
+                our_callsign: "K5ARH".to_string(),
+                their_callsign: None,
+                frequency: 1900.0,
+                completed_rf_frequency_hz: None,
+                mode: "FT8".to_string(),
+                start_time: start,
+                end_time: None,
+                reports: SignalReports::default(),
+                grids: GridSquares::default(),
+                contest_info: None,
+                tags: std::collections::HashMap::new(),
+                notes: None,
+                tx_parity: None,
+                initiated_by: Default::default(),
+                role: Default::default(),
+                call_count: 1,
+                first_call_at: None,
+                last_call_at: None,
+                progressed_this_cycle: false,
+                stall_cycles: 1,
+                last_known_good_offset_hz: None,
+                advance_generation: 0,
+                pre_switch_offset,
+                hound: false,
+                partner_freq: None,
+                pending_freq_drift: None,
+                hound_qsyed: false,
+                remote_origin: false,
+                tx_parity_provisional: false,
+            },
+        }
+    }
+
+    #[test]
+    fn no_pre_switch_offset_yields_no_secondary() {
+        let progress = calling_cq_progress(None);
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            None
+        );
+    }
+
+    #[test]
+    fn a_fresh_relocation_still_inside_grace_yields_the_vacated_offset() {
+        let progress = calling_cq_progress(Some(PreSwitchOffset {
+            offset_hz: 1500.0,
+            left_at: Utc::now(),
+            operator_forced: true,
+        }));
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            Some(1500.0)
+        );
+    }
+
+    /// PAN-72 round-8 redesign (fix 2) test-plan item: the secondary clears
+    /// once `left_at + grace` has passed — a bounded window, not a
+    /// permanent second decode band.
+    #[test]
+    fn a_relocation_past_its_grace_yields_no_secondary() {
+        let progress = calling_cq_progress(Some(PreSwitchOffset {
+            offset_hz: 1500.0,
+            left_at: Utc::now() - Duration::seconds(31),
+            operator_forced: true,
+        }));
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            None
+        );
+    }
+
+    /// The grace window scales with the active protocol slot (Fix 1),
+    /// so a fast FT2 slot (3.2s -> 6.4s grace) must lapse sooner than the
+    /// FT8 default.
+    #[test]
+    fn the_grace_scales_with_the_injected_slot_ns() {
+        const FT2_SLOT_NS: i64 = 3_200_000_000; // -> 6.4s grace
+        let progress = calling_cq_progress(Some(PreSwitchOffset {
+            offset_hz: 1500.0,
+            left_at: Utc::now() - Duration::seconds(10),
+            operator_forced: false,
+        }));
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT2_SLOT_NS),
+            None,
+            "10s ago must already be outside FT2's 6.4s grace"
+        );
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            Some(1500.0),
+            "the same 10s-old relocation is still inside FT8's 30s grace"
+        );
+    }
+
+    /// Scope guard: an established QSO (not `CallingCq`) never gains a
+    /// secondary hint here, even with a live `pre_switch_offset` — it
+    /// already has a stable hint via `partner_freq` (the DX transmits
+    /// there regardless of our TX side), so touching that path is
+    /// explicitly out of scope for this fix.
+    #[test]
+    fn an_established_qso_never_gets_a_secondary_hint() {
+        let mut progress = calling_cq_progress(Some(PreSwitchOffset {
+            offset_hz: 1500.0,
+            left_at: Utc::now(),
+            operator_forced: true,
+        }));
+        progress.state = QsoState::RespondingToCq {
+            target_callsign: "K9ZZ".to_string(),
+            frequency: 1900.0,
+            started_at: Utc::now(),
+        };
+        assert_eq!(
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            None
+        );
+    }
+}
+
+/// Build a fresh active-QSO snapshot and push it to the TUI (and, when the
+/// read-only display feed is enabled, to the remote gateway).
+///
+/// Extracted from the three copies that already existed inline in the QSO
+/// event-forwarding task (`StateChanged`, `QsoCompleted`, `QsoFailed`) when
+/// PAN-72 added a fourth caller: `QsoEvent::TxOffsetApplied`. A mid-QSO offset
+/// switch changes what the banner and the TX-placement stream marker must
+/// show, but it is not a state transition — during the stalled exchange that
+/// triggered the switch there may be no further transition at all, so without
+/// this push the operator would watch multiple switch/revert cycles while the
+/// UI kept displaying the pre-switch offset (Codex round 1 on PR #350,
+/// finding 7).
+async fn push_active_qso_snapshot(
+    qso_manager: &pancetta_qso::QsoManager,
+    dx_activity: &DxActivityMap,
+    pending_manual_calls: &PendingManualCalls,
+    display_feed_enabled: &std::sync::atomic::AtomicBool,
+    message_bus: &MessageBus,
+) {
+    let (snapshot, pending_snap) =
+        build_active_qso_snapshot(qso_manager, dx_activity, pending_manual_calls).await;
+    // Additive: clone for the read-only gateway BEFORE the snapshot is moved
+    // into the ->Tui send, and only when the gateway is enabled.
+    let gw_snap = if display_feed_enabled.load(Ordering::Relaxed) {
+        Some(MessageType::ActiveQsosSnapshot {
+            qsos: snapshot.clone(),
+            pending: pending_snap.clone(),
+        })
+    } else {
+        None
+    };
+    let snap_msg = ComponentMessage::new(
+        ComponentId::Qso,
+        ComponentId::Tui,
+        MessageType::ActiveQsosSnapshot {
+            qsos: snapshot,
+            pending: pending_snap,
+        },
+        Instant::now(),
+    );
+    if let Err(e) = message_bus.send_message(snap_msg).await {
+        debug!("Failed to push active-QSOs snapshot: {}", e);
+    }
+    if let Some(m) = gw_snap {
+        super::remote_gateway::relay_to_gateway(
+            message_bus,
+            display_feed_enabled,
+            ComponentId::Qso,
+            m,
+        )
+        .await;
+    }
+}
+
 /// Build a flat snapshot of in-progress QSOs from the QSO manager,
 /// suitable for `MessageType::ActiveQsosSnapshot`. The TUI banner and
 /// QSO-detail panel both render from this. Also snapshots the cross-parity
@@ -6160,8 +6557,10 @@ mod snapshot_tests {
                 first_call_at: None,
                 last_call_at: None,
                 progressed_this_cycle: false,
-                last_rx_text: None,
-                dx_repeat_count: 0,
+                stall_cycles: 0,
+                last_known_good_offset_hz: None,
+                advance_generation: 0,
+                pre_switch_offset: None,
                 hound: false,
                 partner_freq: None,
                 pending_freq_drift: None,
@@ -7638,8 +8037,10 @@ mod cqdx_upload_tests {
             first_call_at: None,
             last_call_at: None,
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
+            advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -7756,8 +8157,10 @@ mod qrz_enrichment_tests {
             first_call_at: None,
             last_call_at: None,
             progressed_this_cycle: false,
-            last_rx_text: None,
-            dx_repeat_count: 0,
+            stall_cycles: 0,
+            last_known_good_offset_hz: None,
+            advance_generation: 0,
+            pre_switch_offset: None,
             hound: false,
             partner_freq: None,
             pending_freq_drift: None,
@@ -8203,8 +8606,10 @@ mod replay_history_seed_tests {
                 first_call_at: None,
                 last_call_at: None,
                 progressed_this_cycle: false,
-                last_rx_text: None,
-                dx_repeat_count: 0,
+                stall_cycles: 0,
+                last_known_good_offset_hz: None,
+                advance_generation: 0,
+                pre_switch_offset: None,
                 hound: false,
                 partner_freq: None,
                 pending_freq_drift: None,
@@ -8694,5 +9099,542 @@ mod respond_to_caller_admission_tests {
         let _ = manager
             .fail_qso(priming_id, pancetta_qso::QsoFailureReason::UserCancelled)
             .await;
+    }
+
+    /// PAN-72 (Task 7): `start_qso_component`'s `QsoManagerConfig` literal
+    /// must thread `config.autonomous.qso_stall_switch_after` (Task 6's
+    /// TOML-facing field) into `TimeoutConfig::qso_stall_switch_after`
+    /// (Task 2's QSO-engine field) rather than always taking the Rust
+    /// default — proven here with a non-default value (7; both sides'
+    /// defaults are 4, so a default-value test couldn't distinguish
+    /// "threaded" from "coincidentally defaulted").
+    #[tokio::test]
+    async fn qso_stall_switch_after_threads_from_autonomous_config() {
+        let mut coordinator = test_coordinator().await;
+        coordinator
+            .config
+            .write()
+            .await
+            .autonomous
+            .qso_stall_switch_after = 7;
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+
+        assert_eq!(
+            manager.config().timeouts.qso_stall_switch_after,
+            7,
+            "operator's autonomous.qso_stall_switch_after must reach the \
+             QsoManager's TimeoutConfig, not the Rust-side default"
+        );
+    }
+
+    /// PAN-72 (Task 8): the QSO event-forwarding task (this file, the
+    /// `match qso_events.recv().await { ... }` loop spawned in
+    /// `start_qso_component`) must push `QsoEvent::TxOffsetActionNeeded`
+    /// (Task 3's variant, emitted for real by `QsoManager::rearm_manual_
+    /// calls_at` once `QsoMetadata::stall_cycles` hits `TimeoutConfig::
+    /// qso_stall_switch_after` — see pancetta-qso's own
+    /// `silence_increments_stall_cycles_via_rearm_and_emits_switch_at_
+    /// threshold`) onto the new `pending_qso_offset_requests` mailbox.
+    ///
+    /// Drives the REAL forwarder end to end (real `start_qso_component`,
+    /// real spawned forwarder task, real `QsoManager` silence-driven stall
+    /// detector) rather than injecting a synthetic event — there is no
+    /// public way to inject an arbitrary `QsoEvent` onto a `QsoManager`'s
+    /// broadcast channel from outside `pancetta-qso`, so a real stall is
+    /// the only way to exercise this arm end to end.
+    ///
+    /// Readiness handshake (mirrors `coordinator::health`'s
+    /// `qso_restart_delivers_recent_qso_outcome_through_the_real_
+    /// forwarder`): the forwarder's `.subscribe()` happens inside the
+    /// spawned Qso-component task, not synchronously before
+    /// `start_qso_component` returns, and a `broadcast` channel only
+    /// delivers to subscribers already subscribed at send time. Probe with
+    /// a real `StateChanged`-producing call and poll `active_tx_qsos`
+    /// (populated by the SAME forwarder loop, same `match` block) until it
+    /// lands, before relying on the same subscription for the real
+    /// stall-and-Switch scenario below.
+    #[tokio::test]
+    async fn tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_requests() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        coordinator
+            .config
+            .write()
+            .await
+            .autonomous
+            .qso_stall_switch_after = 2;
+        // Auto TX-freq mode -- the silence-driven stall detector only fires
+        // there (Hold keeps the operator's offset sticky, no autonomous
+        // action is ever emitted).
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        coordinator.start_qso_component().await.unwrap();
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // `qso_manager_for_supervisor` is cloned INSIDE `start_qso_component`
+        // before `set_tx_freq_mode_source` reassigns the (moved-into-the-
+        // spawned-task) manager's `tx_freq_mode` to the coordinator's shared
+        // `Arc<AtomicU8>` -- so this clone's own `tx_freq_mode` field is
+        // still the manager's original Hold-default `Arc`, disconnected from
+        // `coordinator.tx_freq_mode`. Re-point it here so driving the stall
+        // through THIS clone (its `qsos` map is the same shared `Arc` either
+        // way) observes the same Auto mode the real forwarder-attached
+        // manager does.
+        manager.set_tx_freq_mode_source(coordinator.tx_freq_mode.clone());
+
+        let mut ready = false;
+        for i in 0..20 {
+            let probe_call = format!("K9RD{i}");
+            let probe_id = manager
+                .respond_to_cq_manual(probe_call.clone(), 1500.0, None)
+                .await
+                .expect("seeding a readiness-probe QSO");
+            let key = crate::coordinator::active_tx_qso_key(&probe_id.to_string());
+            for _ in 0..30 {
+                if coordinator.active_tx_qsos.read().unwrap().contains(&key) {
+                    ready = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            if ready {
+                break;
+            }
+        }
+        assert!(
+            ready,
+            "readiness probe: real forwarder never populated active_tx_qsos"
+        );
+
+        // Real scenario: a manual QSO stalls twice (threshold = 2) and the
+        // manager emits `TxOffsetActionNeeded::Switch`.
+        let qso_id = manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1501.0, None)
+            .await
+            .expect("seeding the stalling QSO");
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+        manager
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(opened_at + chrono::Duration::seconds(30))
+            .await;
+
+        let mut found = false;
+        for _ in 0..100 {
+            if coordinator
+                .pending_qso_offset_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|req| req.qso_id == qso_id)
+            {
+                found = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            found,
+            "TxOffsetActionNeeded must be forwarded into pending_qso_offset_requests"
+        );
+        assert!(
+            coordinator
+                .pending_qso_offset_requests
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|req| req.qso_id == qso_id)
+                .map(|req| req.origin.raised_at_generation().is_some())
+                .unwrap_or(false),
+            "a stall-detected request must carry the QSO's advance generation \
+             so a DX advance landing before the once-per-slot drain invalidates \
+             it (PAN-72 finding 8)"
+        );
+    }
+
+    /// PAN-72 (Codex round 1 on PR #350, finding 7): committing an offset
+    /// action must refresh the `ActiveQsosSnapshot` the TUI banner and the
+    /// remote gateway render from.
+    ///
+    /// `apply_tx_offset_switch` is not a state transition, and the snapshot
+    /// was previously rebuilt only by the `StateChanged`/`QsoCompleted`/
+    /// `QsoFailed` arms. A stalled exchange is exactly the case where no
+    /// further transition arrives, so without the new `TxOffsetApplied` arm
+    /// the operator watches multiple switch/revert cycles while the displayed
+    /// offset never moves.
+    #[tokio::test]
+    async fn applying_an_offset_switch_pushes_a_refreshed_active_qso_snapshot() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        // Register the TUI channel so the forwarder's snapshot sends have
+        // somewhere to land (headless test coordinators have no real TUI).
+        let (_tui_tx, tui_rx) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Tui)
+            .await
+            .expect("registering a TUI channel");
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+
+        let qso_id = manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
+            .await
+            .expect("seeding the QSO");
+
+        // Let the QSO-creation StateChanged snapshot flush through, then
+        // clear it so the assertion below can only be satisfied by a NEW push.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            while tui_rx.try_recv().is_ok() {}
+            if coordinator
+                .active_tx_qsos
+                .read()
+                .unwrap()
+                .contains(&crate::coordinator::active_tx_qso_key(&qso_id.to_string()))
+                || std::time::Instant::now() > deadline
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        while tui_rx.try_recv().is_ok() {}
+
+        let new_offset = 1900.0;
+        let applied = manager
+            .apply_tx_offset_switch(
+                qso_id,
+                new_offset,
+                pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+            )
+            .await
+            .expect("committing the offset switch");
+        assert_eq!(applied, new_offset);
+
+        let mut saw_refresh = false;
+        for _ in 0..300 {
+            while let Ok(msg) = tui_rx.try_recv() {
+                if let MessageType::ActiveQsosSnapshot { ref qsos, .. } = msg.message_type {
+                    if qsos
+                        .iter()
+                        .any(|q| q.qso_id == qso_id.to_string() && q.frequency_hz == new_offset)
+                    {
+                        saw_refresh = true;
+                    }
+                }
+            }
+            if saw_refresh {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            saw_refresh,
+            "an applied TX-offset move must push a fresh ActiveQsosSnapshot \
+             carrying the NEW offset — no state transition follows a stall, so \
+             nothing else would ever refresh the banner"
+        );
+    }
+
+    /// Block until the QSO component's spawned event-forwarding task has
+    /// actually `.subscribe()`d, then leave no trace behind.
+    ///
+    /// The subscription happens INSIDE the spawned task, not synchronously
+    /// before `start_qso_component` returns, and a `broadcast` channel only
+    /// delivers to subscribers that already exist at send time — so a QSO
+    /// opened immediately after `start_qso_component` can have its
+    /// `StateChanged` dropped on the floor. Mirrors the probe loop in
+    /// `tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_requests`,
+    /// with one addition: the probe QSO is retired afterwards (which also
+    /// clears the shared decoder hint the probe's own `StateChanged` set), so
+    /// the caller starts from a clean slate.
+    async fn await_forwarder_subscribed(
+        coordinator: &ApplicationCoordinator,
+        manager: &pancetta_qso::QsoManager,
+    ) {
+        for i in 0..20 {
+            let probe_id = manager
+                .respond_to_cq_manual(format!("K9RD{i}"), 2400.0, None)
+                .await
+                .expect("seeding a readiness-probe QSO");
+            let key = crate::coordinator::active_tx_qso_key(&probe_id.to_string());
+            let mut seen = false;
+            for _ in 0..50 {
+                if coordinator.active_tx_qsos.read().unwrap().contains(&key) {
+                    seen = true;
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let _ = manager
+                .fail_qso(probe_id, pancetta_qso::QsoFailureReason::UserCancelled)
+                .await;
+            if seen {
+                // Let the retiring StateChanged flush through, so the probe's
+                // own decoder-hint write cannot race the caller's.
+                for _ in 0..50 {
+                    if coordinator.active_qso_freq_hz.read().unwrap().is_none() {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+                return;
+            }
+        }
+        panic!("readiness probe: the real forwarder never populated active_tx_qsos");
+    }
+
+    /// PAN-72 (Codex round 7 on PR #350, finding 6) — the CRITICAL one.
+    ///
+    /// An unanswered `CallingCq` that relocates changes the frequency callers
+    /// will answer on. With the QSO filter enabled (the default) the main FT8
+    /// decoder is collapsed to ±60 Hz around `active_qso_freq_hz`, while the
+    /// allocator guarantees the relocation is at least `min_separation_hz`
+    /// (75 Hz) away — so an answer on the NEW CQ offset landed outside the
+    /// decode search. And because only a decode can produce the `StateChanged`
+    /// that refreshes the hint, nothing ever recovered: the station kept
+    /// calling CQ on a frequency it was structurally unable to hear replies on.
+    ///
+    /// Drives the REAL forwarder end to end (real `start_qso_component`, real
+    /// spawned event task, real `apply_tx_offset_switch`) and asserts on the
+    /// coordinator's own shared decoder hint — the exact value
+    /// `coordinator::ft8`'s decode loop reads each window.
+    #[tokio::test]
+    async fn an_applied_offset_switch_recenters_the_decoder_on_an_unanswered_cq() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        let (_tui_tx, _tui_rx) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Tui)
+            .await
+            .expect("registering a TUI channel");
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        await_forwarder_subscribed(&coordinator, &manager).await;
+
+        const CQ_HZ: f64 = 1500.0;
+        const NEW_HZ: f64 = 1900.0;
+        let qso_id = manager
+            .start_cq_manual(CQ_HZ, None, false)
+            .await
+            .expect("seeding an unanswered CQ");
+
+        // The forwarder's StateChanged arm seeds the hint with the CQ offset.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if coordinator.active_qso_freq_hz.read().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the real forwarder never seeded the decoder hint"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(
+            *coordinator.active_qso_freq_hz.read().unwrap(),
+            Some((CQ_HZ, None)),
+            "precondition: the decoder is centred on the original CQ offset, \
+             with no secondary hint before any relocation has happened"
+        );
+
+        let applied = manager
+            .apply_tx_offset_switch(
+                qso_id,
+                NEW_HZ,
+                pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+            )
+            .await
+            .expect("committing the offset switch");
+        assert_eq!(applied, NEW_HZ);
+        assert!(
+            (NEW_HZ - CQ_HZ).abs() > crate::coordinator::qso_filter::DEFAULT_HALF_WINDOW_HZ,
+            "test premise: the move must be bigger than the decoder's own \
+             half-window, or a stale hint would still cover the new offset"
+        );
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if coordinator
+                .active_qso_freq_hz
+                .read()
+                .unwrap()
+                .is_some_and(|(primary, _)| primary == NEW_HZ)
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "an applied TX-offset move on an unanswered CQ must re-centre \
+                 the decoder on the NEW offset — otherwise the ±60 Hz QSO \
+                 filter stays parked on the abandoned frequency and an answer \
+                 to our own CQ can never be decoded, so no StateChanged ever \
+                 arrives to fix it; hint was {:?}",
+                *coordinator.active_qso_freq_hz.read().unwrap()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // PAN-72 round-8 redesign (fix 2): the vacated CQ offset must STILL
+        // be covered by the decoder hint (as the secondary), so a caller
+        // that answered the pre-switch CQ frame is not filtered out —
+        // Codex round 8, finding 1.
+        assert_eq!(
+            *coordinator.active_qso_freq_hz.read().unwrap(),
+            Some((NEW_HZ, Some(CQ_HZ))),
+            "the vacated CQ offset must remain a live secondary decoder hint \
+             for the grace window so a reply to the pre-switch frame is not \
+             dropped by the band-collapse filter"
+        );
+
+        // The QSO's own state must agree — the hint is derived, not invented.
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.partner_freq, None,
+            "an unanswered CQ has no DX to point partner_freq at (round 5's \
+             fix); the state frequency is the only correct hint"
+        );
+        assert_eq!(
+            progress.metadata.pre_switch_offset.map(|p| p.offset_hz),
+            Some(CQ_HZ),
+            "precondition: the QSO's own pre_switch_offset is what the \
+             secondary hint is derived from"
+        );
+    }
+
+    /// The established-QSO half of finding 6: after a switch the DX is still
+    /// transmitting on the offset we vacated, so the decoder hint must follow
+    /// `partner_freq` (which `apply_tx_offset_switch` latches to the old
+    /// offset), NOT our new TX offset. Guards against "fixing" the CQ case by
+    /// blindly pushing the applied offset into the hint.
+    #[tokio::test]
+    async fn an_applied_offset_switch_keeps_an_established_qso_pointed_at_the_dx() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        let (_tui_tx, _tui_rx) = coordinator
+            .message_bus
+            .get_or_create_channel(ComponentId::Tui)
+            .await
+            .expect("registering a TUI channel");
+
+        coordinator.start_qso_component().await.unwrap();
+        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        await_forwarder_subscribed(&coordinator, &manager).await;
+
+        const DX_HZ: f64 = 1500.0;
+        const NEW_HZ: f64 = 1900.0;
+        let qso_id = manager
+            .respond_to_cq_manual("K9ZZ".to_string(), DX_HZ, None)
+            .await
+            .expect("seeding an established QSO");
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if coordinator.active_qso_freq_hz.read().unwrap().is_some() {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the real forwarder never seeded the decoder hint"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        manager
+            .apply_tx_offset_switch(
+                qso_id,
+                NEW_HZ,
+                pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+            )
+            .await
+            .expect("committing the offset switch");
+
+        let progress = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            progress.metadata.partner_freq,
+            Some(DX_HZ),
+            "precondition: the switch latched the vacated offset as the DX's"
+        );
+
+        // Give the forwarder ample opportunity to get this wrong.
+        for _ in 0..30 {
+            assert_eq!(
+                *coordinator.active_qso_freq_hz.read().unwrap(),
+                Some((DX_HZ, None)),
+                "the decoder must stay on the DX's transmit offset after OUR \
+                 side moves — the switch is TX-only; an established QSO's \
+                 stable partner_freq hint never gains a PAN-72 round-8 \
+                 secondary window (that's reserved for an unanswered CallingCq)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+    }
+
+    /// PAN-72 final-review CRITICAL regression: `start_qso_component` must
+    /// publish its fresh `QsoManager` onto `qso_manager_watch` in a way that
+    /// is observable by a receiver that does not yet exist.
+    ///
+    /// `ApplicationCoordinator::new` builds the channel with
+    /// `watch::channel(None).0`, immediately dropping the initial `Receiver`;
+    /// `run()` then awaits `start_qso_component` BEFORE
+    /// `start_autonomous_component` (the sole `.subscribe()` site). Tokio's
+    /// `watch::Sender::send` returns `Err` *without storing the value* when
+    /// `receiver_count() == 0`, so the original `let _ = ...send(..)` silently
+    /// discarded the very first handle: every later `subscribe()` was seeded
+    /// with `None`, the Autonomous task's per-tick `borrow()` never yielded a
+    /// manager, and `drain_pending_qso_offset_requests` never ran — the whole
+    /// mid-QSO adaptive-offset feature was inert in production until the first
+    /// Qso-component crash+restart. `send_replace` stores unconditionally.
+    ///
+    /// Deliberately asserts against the REAL production path (a real
+    /// coordinator, a real `start_qso_component`), not a test-constructed
+    /// channel with an artificially retained seed receiver — that retained
+    /// receiver is exactly what hid this bug from
+    /// `autonomous::qso_manager_watch_refresh_tests`.
+    #[tokio::test]
+    async fn start_qso_component_seeds_qso_manager_watch_with_no_receivers_yet() {
+        let mut coordinator = test_coordinator().await;
+
+        // Precondition: the coordinator ships with zero live receivers, which
+        // is precisely the condition under which `send` would no-op.
+        assert_eq!(
+            coordinator.qso_manager_watch.receiver_count(),
+            0,
+            "precondition: no receiver exists before start_autonomous_component"
+        );
+        assert!(
+            coordinator.qso_manager_watch.borrow().is_none(),
+            "precondition: the watch starts empty"
+        );
+
+        coordinator.start_qso_component().await.unwrap();
+
+        assert!(
+            coordinator.qso_manager_watch.borrow().is_some(),
+            "start_qso_component must store the fresh QsoManager on the watch \
+             channel even with zero receivers (send_replace, not send)"
+        );
+
+        // The consumer-side view: a receiver subscribing AFTER the fact (the
+        // real ordering — `start_autonomous_component` runs later) must be
+        // seeded with the stored handle, not `None`.
+        let rx = coordinator.qso_manager_watch.subscribe();
+        assert!(
+            rx.borrow().is_some(),
+            "a late subscriber (the Autonomous task) must be seeded with the \
+             stored QsoManager, or drain_pending_qso_offset_requests never runs"
+        );
     }
 }

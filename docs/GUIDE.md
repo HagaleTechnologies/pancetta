@@ -135,6 +135,11 @@ match theirs. `c` starts a repeating CQ of your own; `s` stops it.
 - `t` auto-finds a clear 25 Hz-aligned offset and moves your cursor there.
 - `←`/`→` or `[`/`]` nudge the TX offset ±50 Hz; `o` types an exact offset
   in Hz (200–2900; blank = back to Auto; setting one implies Hold).
+- `u` says "try something else, now" without leaving AUTO: it moves the
+  in-progress QSO to a freshly-scored offset, or — with no QSO running — the
+  CQ-hunting offset. AUTO only; in HOLD it reports a no-op rather than
+  breaking your pin. In AUTO, pancetta also does this on its own after
+  `[autonomous] qso_stall_switch_after` cycles with no reply.
 - `Shift+F` sets the **dial** frequency (and optional split TX dial) via CAT.
 
 ### …enable autonomous operation (the supervised way)?

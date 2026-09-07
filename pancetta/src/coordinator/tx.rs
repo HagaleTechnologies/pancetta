@@ -4768,7 +4768,12 @@ impl super::ApplicationCoordinator {
                                         // still land while this frame waited out the (up to
                                         // ~30s) pre-PTT sleep. If the QSO component has since
                                         // produced a newer message for this qso_id, swap to
-                                        // it now and re-modulate. We're at the slot boundary
+                                        // it now and re-modulate. "Newer" covers a changed
+                                        // OFFSET as well as changed text (PAN-72 round 5 —
+                                        // an adaptive TX-offset switch relocates the QSO
+                                        // without re-rendering the frame), which is why the
+                                        // current `frequency_offset` is passed in alongside
+                                        // `message_text`. We're at the slot boundary
                                         // — comfortably inside the ~1.5s switch budget — and
                                         // re-modulation is <100ms. tx_parity is unchanged (a
                                         // QSO holds one parity for its whole exchange), so the
@@ -4780,6 +4785,7 @@ impl super::ApplicationCoordinator {
                                                 super::tx_pivot_target(
                                                     qso_id.as_deref(),
                                                     &message_text,
+                                                    frequency_offset,
                                                     &m,
                                                 )
                                             })

@@ -217,6 +217,48 @@ pub struct PlacementSnapshot {
     pub range: (f64, f64),
 }
 
+/// The `[start, end]` bounds a candidate sweep must run over so it COVERS
+/// `window` as well as the allocator's own `range`.
+///
+/// PAN-72 (Codex round 6 on PR #350, finding 3). A caller-supplied window (the
+/// Hound calling/response region) is operator configuration and may legitimately
+/// reach outside the allocator's range; used only as a post-hoc filter it
+/// emptied the candidate list instead of being searched. Both scans — the ranked
+/// spectral one here and [`crate::autonomous::FrequencyAllocator::allocate_cq_frequency_excluding`]'s
+/// legacy fallback — take their bounds from this one function so they can never
+/// disagree about what "the searchable range" is.
+///
+/// Two properties matter:
+///
+/// - the result is only ever WIDER than `range`, never narrower. Narrowing is
+///   the caller's job (it still hard-filters candidates to `window`), and doing
+///   it here would silently change which offsets an ordinary in-range window
+///   ranks;
+/// - the grid stays anchored at `range.0`. `start` is walked down from there in
+///   whole `step_hz` increments, so every offset the old `range.0 .. range.1`
+///   sweep produced is still produced, bit for bit.
+///
+/// A non-finite or inverted window is ignored, matching
+/// `AutonomousOperator::allocate_smart_frequency_in_range`'s own sanitization of
+/// the same operator-supplied value.
+pub(crate) fn sweep_bounds(
+    range: (f64, f64),
+    step_hz: f64,
+    window: Option<(f64, f64)>,
+) -> (f64, f64) {
+    let (cfg_lo, cfg_hi) = range;
+    let Some((lo, hi)) = window.filter(|(lo, hi)| lo.is_finite() && hi.is_finite() && lo <= hi)
+    else {
+        return (cfg_lo, cfg_hi);
+    };
+    let start = if lo < cfg_lo && step_hz.is_finite() && step_hz > 0.0 {
+        cfg_lo - ((cfg_lo - lo) / step_hz).ceil() * step_hz
+    } else {
+        cfg_lo
+    };
+    (start, cfg_hi.max(hi))
+}
+
 /// Stateless frequency allocator. Given spectral + decode data, returns ranked candidates.
 pub struct SmartFrequencyAllocator {
     config: FrequencyAllocatorConfig,
@@ -276,8 +318,44 @@ impl SmartFrequencyAllocator {
         dx_target_hz: Option<f64>,
         target_parity: Option<TimeSlot>,
     ) -> Vec<FrequencyCandidate> {
-        let (min_f, max_f) = self.config.range;
+        self.rank_candidates_in_range(
+            spectral,
+            history,
+            own_frequencies,
+            dx_target_hz,
+            target_parity,
+            None,
+        )
+    }
+
+    /// [`Self::rank_candidates_with_parity`] over a candidate grid that is
+    /// guaranteed to COVER `window`, even where `window` reaches outside
+    /// [`FrequencyAllocatorConfig::range`].
+    ///
+    /// PAN-72 (Codex round 6 on PR #350, finding 3). The Hound response region
+    /// is operator configuration and may legitimately sit above the allocator's
+    /// own range (`200–2800 Hz` by default) — `2850–2900 Hz`, say. Callers used
+    /// to hand that window down only as a FILTER over candidates already
+    /// generated from `config.range`, so such a region emptied the ranked list
+    /// outright: every post-QSY Hound stall switch and `u` nudge resolved back
+    /// to `avoid_hz` and was refused as a no-op, with the configured region
+    /// never actually searched.
+    ///
+    /// The sweep is WIDENED, never narrowed, and stays anchored to
+    /// `config.range.0` — every offset this scan produced before is still
+    /// produced, bit for bit, so a window inside the configured range ranks
+    /// exactly as it did. See [`sweep_bounds`].
+    pub fn rank_candidates_in_range(
+        &self,
+        spectral: &SpectralSnapshot,
+        history: &DecodeHistory,
+        own_frequencies: &[f64],
+        dx_target_hz: Option<f64>,
+        target_parity: Option<TimeSlot>,
+        window: Option<(f64, f64)>,
+    ) -> Vec<FrequencyCandidate> {
         let step = self.config.step_hz;
+        let (min_f, max_f) = sweep_bounds(self.config.range, step, window);
         let mut candidates = Vec::new();
 
         let mut freq = min_f;

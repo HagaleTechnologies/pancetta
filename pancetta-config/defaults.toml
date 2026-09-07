@@ -126,12 +126,13 @@ shape = "sine"
 [autonomous]
 cq_after_idle_cycles = 10
 cq_direction = ""
-cq_no_response_switch_after = 5
+cq_no_response_switch_after = 4
 dry_run = false
 enabled = false
 max_concurrent_qsos = 1
 min_dx_score = 0.3
 min_multi_slot_score = 0.7
+qso_stall_switch_after = 4
 slot_parity = "auto"
 tx_offset_hz = 1500.0
 
