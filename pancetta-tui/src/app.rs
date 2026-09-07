@@ -2438,14 +2438,22 @@ impl App {
         self.dx_stations
             .retain(|_, station| station.last_seen > cutoff);
 
-        // Keep the state map in lockstep with the 24 h station window so it
-        // cannot grow without bound over a long session (PAN-85).
+        // Keep the state map in lockstep with the station window: an entry
+        // survives only while its station is still listed (PAN-85). Note that
+        // `dx_states` is keyed UPPERCASE while `dx_stations` is keyed by the
+        // callsign exactly as it was received, so the membership test must be
+        // case-insensitive — a plain `contains_key` would drop every state for
+        // a station spotted with lower-case characters.
+        //
+        // This bounds `dx_states` exactly as much as `cleanup_old_data` bounds
+        // `dx_stations` — no more: the function currently has no production
+        // caller, so neither map is pruned on a live station today.
         let Self {
             dx_states,
             dx_stations,
             ..
         } = self;
-        dx_states.retain(|call, _| dx_stations.contains_key(call));
+        dx_states.retain(|call, _| dx_stations.keys().any(|k| k.eq_ignore_ascii_case(call)));
     }
 
     /// Record a station's US state/territory (PAN-85), validating first. An
@@ -4716,6 +4724,26 @@ mod tests {
         // No DxStation for W5ABC -> the state entry is not retained.
         app.cleanup_old_data();
         assert_eq!(app.station_state_for("W5ABC"), None);
+    }
+
+    /// The other half of the retain: a state whose station is still live must
+    /// SURVIVE the sweep — including when `dx_stations` holds the callsign in
+    /// a different case than the UPPERCASE `dx_states` key.
+    #[tokio::test]
+    async fn cleanup_retains_states_for_live_stations() {
+        let mut app = fixture_app().await;
+        app.set_station_state("w5abc", "AR");
+        app.add_decoded_message(fixture_view("w5abc", -10))
+            .await
+            .unwrap();
+        assert!(
+            app.dx_stations.contains_key("w5abc"),
+            "fixture must key dx_stations exactly as received"
+        );
+
+        app.cleanup_old_data();
+
+        assert_eq!(app.station_state_for("W5ABC"), Some("AR"));
     }
 
     /// Regression: highlighting a CQ at scroll>0, then a new decode arrives

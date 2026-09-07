@@ -2668,7 +2668,8 @@ impl super::ApplicationCoordinator {
 
                         // PAN-85: seed the DX Hunter's US-state display from
                         // any prior contact whose log record carries a state.
-                        qso_lookup.seed_states_from_list(db.get_worked_callsigns_and_states().await);
+                        qso_lookup
+                            .seed_states_from_list(db.get_worked_callsigns_and_states().await);
                     } else {
                         warn!(
                             "Could not open QSO database for startup seed ({}) — \
@@ -7047,14 +7048,30 @@ fn merge_qrz_lookup(
     // PAN-85: QRZ's <state> is the one live source of state for a station we
     // have just worked. Fill only when missing; never override a value that
     // came from the operator's own log.
+    //
+    // The same US-related + `normalize_us_state` gate the display applies is
+    // enforced HERE, before the value is stored: `their_state` is rendered
+    // into the uploaded ADIF `STATE` field (an enumerated field), so a
+    // free-text QRZ value for a non-US station -- a Japanese prefecture, a
+    // Canadian province -- must never reach a logbook. Only the canonical
+    // two-letter code is stored.
     let state_missing = metadata
         .their_state
         .as_ref()
         .map(|s| s.trim().is_empty())
         .unwrap_or(true);
-    if state_missing {
-        if let Some(state) = lookup.state.as_ref().map(|s| s.trim()).filter(|s| !s.is_empty()) {
-            metadata.their_state = Some(state.to_string());
+    let us_related = metadata
+        .their_callsign
+        .as_deref()
+        .and_then(pancetta_tui::dxcc::entity_for_callsign)
+        .is_some_and(pancetta_tui::dxcc::is_us_related_entity);
+    if state_missing && us_related {
+        if let Some(code) = lookup
+            .state
+            .as_deref()
+            .and_then(pancetta_tui::dxcc::normalize_us_state)
+        {
+            metadata.their_state = Some(code.to_string());
             result.state_filled = true;
         }
     }
@@ -7184,7 +7201,7 @@ fn start_qso_upload_subscriber(
     station_power_watts: u32,
     mut events: tokio::sync::broadcast::Receiver<pancetta_qso::QsoEvent>,
     shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    station_lookup: crate::priority_evaluator::CachedStationLookup,
+    station_lookup: std::sync::Arc<crate::priority_evaluator::CachedStationLookup>,
 ) {
     use std::sync::Arc;
 
@@ -7944,9 +7961,17 @@ mod qrz_enrichment_tests {
 
     // --- PAN-85: state fill + widened enrichment gate ---
 
+    /// A US-related station whose state is unknown: the metadata helper
+    /// defaults to a JA call, so the US cases must set it explicitly.
+    fn us_metadata(their_grid: Option<&str>) -> QsoMetadata {
+        let mut m = metadata(their_grid, None);
+        m.their_callsign = Some("W5ABC".to_string());
+        m
+    }
+
     #[test]
     fn merge_qrz_fills_missing_state() {
-        let mut m = metadata(Some("PM95"), None);
+        let mut m = us_metadata(Some("EM34"));
         let l = QrzLookup {
             state: Some("AR".into()),
             ..lookup(None, None)
@@ -7956,9 +7981,23 @@ mod qrz_enrichment_tests {
         assert!(r.state_filled);
     }
 
+    /// QRZ's casing/padding is normalized to the canonical ADIF code before
+    /// it is stored, so the uploaded `STATE` field is always enumerated.
+    #[test]
+    fn merge_qrz_normalizes_state_case_and_padding() {
+        let mut m = us_metadata(Some("EM34"));
+        let l = QrzLookup {
+            state: Some(" ar ".into()),
+            ..lookup(None, None)
+        };
+        let r = merge_qrz_lookup(&mut m, &l);
+        assert_eq!(m.their_state.as_deref(), Some("AR"));
+        assert!(r.state_filled);
+    }
+
     #[test]
     fn merge_qrz_never_overrides_existing_state() {
-        let mut m = metadata(Some("PM95"), None);
+        let mut m = us_metadata(Some("EM34"));
         m.their_state = Some("TX".into());
         let l = QrzLookup {
             state: Some("AR".into()),
@@ -7971,13 +8010,42 @@ mod qrz_enrichment_tests {
 
     #[test]
     fn merge_qrz_ignores_blank_state() {
-        let mut m = metadata(Some("PM95"), None);
+        let mut m = us_metadata(Some("EM34"));
         let l = QrzLookup {
             state: Some("   ".into()),
             ..lookup(None, None)
         };
         merge_qrz_lookup(&mut m, &l);
         assert!(m.their_state.is_none());
+    }
+
+    /// A non-US station's free-text QRZ `<state>` (a Japanese prefecture, a
+    /// Canadian province) is never stored -- `their_state` rides into the
+    /// uploaded ADIF `STATE`, an enumerated field.
+    #[test]
+    fn merge_qrz_rejects_state_for_non_us_entity() {
+        let mut m = metadata(Some("PM95"), None); // JA1ABC
+        let l = QrzLookup {
+            state: Some("Tokyo".into()),
+            ..lookup(None, None)
+        };
+        let r = merge_qrz_lookup(&mut m, &l);
+        assert!(m.their_state.is_none());
+        assert!(!r.state_filled);
+    }
+
+    /// Even for a US station, a value that is not a known US subdivision code
+    /// is dropped rather than stored verbatim.
+    #[test]
+    fn merge_qrz_rejects_unrecognized_state_value() {
+        let mut m = us_metadata(Some("EM34"));
+        let l = QrzLookup {
+            state: Some("Arkansas".into()),
+            ..lookup(None, None)
+        };
+        let r = merge_qrz_lookup(&mut m, &l);
+        assert!(m.their_state.is_none());
+        assert!(!r.state_filled);
     }
 
     #[test]

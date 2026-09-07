@@ -101,10 +101,10 @@ pub const US_RELATED_ENTITIES: &[&str] = &[
 /// territory codes for the US-related DXCC entities above. Validation only —
 /// this maps nothing and resolves nothing; PAN-85 forbids inferring a state.
 const US_STATE_CODES: &[&str] = &[
-    "AK", "AL", "AR", "AS", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA", "GU", "HI", "IA",
-    "ID", "IL", "IN", "KS", "KY", "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MP", "MS", "MT",
-    "NC", "ND", "NE", "NH", "NJ", "NM", "NV", "NY", "OH", "OK", "OR", "PA", "PR", "RI", "SC",
-    "SD", "TN", "TX", "UT", "VA", "VI", "VT", "WA", "WI", "WV", "WY",
+    "AK", "AL", "AR", "AS", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA", "GU", "HI", "IA", "ID",
+    "IL", "IN", "KS", "KY", "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MP", "MS", "MT", "NC", "ND",
+    "NE", "NH", "NJ", "NM", "NV", "NY", "OH", "OK", "OR", "PA", "PR", "RI", "SC", "SD", "TN", "TX",
+    "UT", "VA", "VI", "VT", "WA", "WI", "WV", "WY",
 ];
 
 /// `true` when `entity` is one of the US states/territories DXCC splits out.
@@ -272,7 +272,9 @@ mod tests {
         // not silently stop suffixing states.
         for name in US_RELATED_ENTITIES {
             assert!(
-                crate::dxcc_table::PREFIX_TABLE.iter().any(|(_, n)| n == name),
+                crate::dxcc_table::PREFIX_TABLE
+                    .iter()
+                    .any(|(_, n)| n == name),
                 "{name} is no longer in the generated PREFIX_TABLE"
             );
         }
@@ -301,7 +303,10 @@ mod tests {
             format_entity_with_state("United States", Some("ar")),
             "United States - AR"
         );
-        assert_eq!(format_entity_with_state("Alaska", Some("AK")), "Alaska - AK");
+        assert_eq!(
+            format_entity_with_state("Alaska", Some("AK")),
+            "Alaska - AK"
+        );
         assert_eq!(
             format_entity_with_state("Puerto Rico", Some("PR")),
             "Puerto Rico - PR"
@@ -311,7 +316,10 @@ mod tests {
     // Gherkin scenario 2
     #[test]
     fn us_entity_without_state_is_entity_alone() {
-        assert_eq!(format_entity_with_state("United States", None), "United States");
+        assert_eq!(
+            format_entity_with_state("United States", None),
+            "United States"
+        );
         assert_eq!(
             format_entity_with_state("United States", Some("")),
             "United States"

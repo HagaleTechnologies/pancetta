@@ -307,7 +307,7 @@ impl CachedStationLookup {
         }
         tracing::info!(
             "CachedStationLookup: seeded {} station state(s) from the QSO log",
-            self.station_states.read().len() - before
+            self.station_states.read().len().saturating_sub(before)
         );
     }
 

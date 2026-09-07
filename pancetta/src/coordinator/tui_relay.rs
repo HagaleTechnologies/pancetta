@@ -167,11 +167,14 @@ impl super::ApplicationCoordinator {
             // C20 — RF-present / zero-decodes detector (mode/clock fault),
             // fed from the cumulative DSP-window + decode telemetry below.
             let mut rf_no_decode = super::health::RfNoDecodeMonitor::new();
-            // PAN-85: send a callsign's US state at most once per relay
-            // thread lifetime, and only once a value actually exists — so a
-            // state learned later (QRZ enrichment mid-session) still reaches
-            // the TUI on the next decode/spot for that callsign.
-            let mut sent_states: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // PAN-85: remember the last US state actually forwarded for each
+            // callsign (uppercased key) rather than merely that one was sent,
+            // so both a state learned later (QRZ enrichment mid-session) and a
+            // state *corrected* later (log-seeded code superseded by QRZ)
+            // reach the TUI on the next decode/spot for that callsign. Repeats
+            // of an unchanged value are still suppressed.
+            let mut sent_states: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
@@ -242,11 +245,13 @@ impl super::ApplicationCoordinator {
                                 dial_mhz * 1_000_000.0,
                             );
 
-                            // PAN-85: forward a known US state at most once
-                            // per callsign per relay lifetime.
+                            // PAN-85: forward a known US state whenever it is
+                            // new or has changed since the last one sent.
                             if let Some(call) = call_sign.as_deref() {
                                 if let Some(state) = state_for(&relay_station_lookup, Some(call)) {
-                                    if sent_states.insert(call.to_uppercase()) {
+                                    let key = call.to_uppercase();
+                                    if sent_states.get(&key) != Some(&state) {
+                                        sent_states.insert(key, state.clone());
                                         let _ = tui_msg_tx_relay.send(
                                             pancetta_tui::tui_runner::TuiMessage::StationState {
                                                 callsign: call.to_string(),
@@ -537,12 +542,14 @@ impl super::ApplicationCoordinator {
                                 Some(callsign.as_str()),
                                 frequency as f64,
                             );
-                            // PAN-85: forward a known US state at most once
-                            // per callsign per relay lifetime.
+                            // PAN-85: forward a known US state whenever it is
+                            // new or has changed since the last one sent.
                             if let Some(state) =
                                 state_for(&relay_station_lookup, Some(callsign.as_str()))
                             {
-                                if sent_states.insert(callsign.to_uppercase()) {
+                                let key = callsign.to_uppercase();
+                                if sent_states.get(&key) != Some(&state) {
+                                    sent_states.insert(key, state.clone());
                                     let _ = tui_msg_tx_relay.send(
                                         pancetta_tui::tui_runner::TuiMessage::StationState {
                                             callsign: callsign.clone(),
@@ -2892,7 +2899,9 @@ fn state_for(
     lookup: &crate::priority_evaluator::CachedStationLookup,
     callsign: Option<&str>,
 ) -> Option<String> {
-    callsign.filter(|c| !c.is_empty()).and_then(|c| lookup.state_for(c))
+    callsign
+        .filter(|c| !c.is_empty())
+        .and_then(|c| lookup.state_for(c))
 }
 
 fn map_autonomous_status(

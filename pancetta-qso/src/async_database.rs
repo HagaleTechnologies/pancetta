@@ -919,6 +919,12 @@ impl QsoDatabase {
     /// oldest first so the caller's last-write-wins seed ends on the most
     /// recent value. Mirrors `get_worked_bands_and_grids` one tier over
     /// (PAN-85). Rows with no state are filtered by the `IS NOT NULL` clause.
+    ///
+    /// Deliberately NOT `SELECT DISTINCT`, unlike its two siblings: the
+    /// last-write-wins seed depends on the `ORDER BY start_time` this query
+    /// carries, and de-duplicating (callsign, state) pairs would keep the
+    /// stale rows of a station that later moved. The cost is one redundant
+    /// `record_state` per repeat contact at startup — a map insert, paid once.
     pub async fn get_worked_callsigns_and_states(&self) -> Vec<(String, String)> {
         let result: Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
             "SELECT json_extract(metadata, '$.their_callsign'), \

@@ -183,9 +183,12 @@ impl CqdxBridge {
             // Last band we re-fetched per-band needs for. `None` until the
             // dial frequency is first observed.
             let mut last_needed_band: Option<String> = None;
-            // PAN-85: send a callsign's US state at most once per poller
-            // lifetime, and only once a value actually exists.
-            let mut sent_states: std::collections::HashSet<String> = std::collections::HashSet::new();
+            // PAN-85: remember the last US state actually forwarded for each
+            // callsign (uppercased key), so a state that is learned *or
+            // corrected* later still reaches the TUI. Repeats of an unchanged
+            // value are suppressed.
+            let mut sent_states: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
 
             loop {
                 timer.tick().await;
@@ -334,7 +337,9 @@ impl CqdxBridge {
                             // local decode.
                             for g in &groups {
                                 if let Some(state) = cached_lookup.state_for(&g.dx_call) {
-                                    if sent_states.insert(g.dx_call.to_uppercase()) {
+                                    let key = g.dx_call.to_uppercase();
+                                    if sent_states.get(&key) != Some(&state) {
+                                        sent_states.insert(key, state.clone());
                                         let _ = tx.send(
                                             pancetta_tui::tui_runner::TuiMessage::StationState {
                                                 callsign: g.dx_call.clone(),

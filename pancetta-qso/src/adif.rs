@@ -1483,8 +1483,15 @@ ADIF Export for Test Program
 
     #[test]
     fn adif_import_carries_state_into_metadata() {
-        let adif_data = "<CALL:5>W5ABC<QSO_DATE:8>20230515<TIME_ON:6>123000\
-<MODE:4>DATA<SUBMODE:3>FT8<FREQ:9>14.074000<BAND:3>20M<STATE:2>AR<EOR>";
+        // The header terminator matters: `parse_string` yields zero records
+        // without an `<EOH>`.
+        let adif_data = "Pancetta state import test\n\
+            <ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n\
+            <EOH>\n\
+            <CALL:5>W5ABC <QSO_DATE:8>20230515 <TIME_ON:6>123000 \
+            <MODE:4>DATA <SUBMODE:3>FT8 <FREQ:9>14.074000 <BAND:3>20M \
+            <STATE:2>AR\n\
+            <EOR>\n";
 
         let processor = AdifProcessor::new();
         let result = processor.parse_string(adif_data).unwrap();
