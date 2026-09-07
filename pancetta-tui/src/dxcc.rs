@@ -73,6 +73,70 @@ pub fn entity_for_callsign(call: &str) -> Option<&'static str> {
     None
 }
 
+/// The exact DXCC entity-name strings in `dxcc_table::PREFIX_TABLE` that are
+/// US states/territories. Matching is EXACT, never substring: the same table
+/// also contains "British Virgin Islands", independent "Samoa" (5W) and
+/// "Botswana", each of which contains a substring of a name below.
+/// PAN-85. Pinned against the generated table by a unit test.
+pub const US_RELATED_ENTITIES: &[&str] = &[
+    "Alaska",
+    "American Samoa",
+    "Baker & Howland Islands",
+    "Desecheo Island",
+    "Guam",
+    "Guantanamo Bay",
+    "Hawaii",
+    "Johnston Island",
+    "Mariana Islands",
+    "Midway Island",
+    "Navassa Island",
+    "Palmyra & Jarvis Islands",
+    "Puerto Rico",
+    "US Virgin Islands",
+    "United States",
+    "Wake Island",
+];
+
+/// Valid US primary administrative subdivisions (ADIF `STATE`), plus the
+/// territory codes for the US-related DXCC entities above. Validation only —
+/// this maps nothing and resolves nothing; PAN-85 forbids inferring a state.
+const US_STATE_CODES: &[&str] = &[
+    "AK", "AL", "AR", "AS", "AZ", "CA", "CO", "CT", "DC", "DE", "FL", "GA", "GU", "HI", "IA",
+    "ID", "IL", "IN", "KS", "KY", "LA", "MA", "MD", "ME", "MI", "MN", "MO", "MP", "MS", "MT",
+    "NC", "ND", "NE", "NH", "NJ", "NM", "NV", "NY", "OH", "OK", "OR", "PA", "PR", "RI", "SC",
+    "SD", "TN", "TX", "UT", "VA", "VI", "VT", "WA", "WI", "WV", "WY",
+];
+
+/// `true` when `entity` is one of the US states/territories DXCC splits out.
+pub fn is_us_related_entity(entity: &str) -> bool {
+    US_RELATED_ENTITIES.contains(&entity)
+}
+
+/// Trim + uppercase `raw` and return the canonical code iff it is a known US
+/// subdivision. `None` for anything else — an unrecognized value renders as
+/// the entity alone, never as a placeholder (PAN-85 scenario 2).
+pub fn normalize_us_state(raw: &str) -> Option<&'static str> {
+    let t = raw.trim();
+    if t.len() != 2 || !t.bytes().all(|b| b.is_ascii_alphabetic()) {
+        return None;
+    }
+    let upper = t.to_ascii_uppercase();
+    US_STATE_CODES.iter().copied().find(|c| *c == upper)
+}
+
+/// Render an entity for display, appending `" - ST"` iff the entity is
+/// US-related AND `state` validates. Every other case returns the entity
+/// unchanged — no dash, no placeholder.
+pub fn format_entity_with_state(entity: &str, state: Option<&str>) -> String {
+    match state
+        .filter(|_| is_us_related_entity(entity))
+        .and_then(normalize_us_state)
+    {
+        Some(code) => format!("{entity} - {code}"),
+        None => entity.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -161,5 +225,114 @@ mod tests {
     #[test]
     fn unresolved_hash_placeholder_has_no_entity() {
         assert_eq!(entity_for_callsign("<...>"), None);
+    }
+
+    #[test]
+    fn us_related_entities_match_exactly() {
+        for e in [
+            "United States",
+            "Alaska",
+            "Hawaii",
+            "Puerto Rico",
+            "US Virgin Islands",
+            "Guantanamo Bay",
+            "Navassa Island",
+            "Desecheo Island",
+            "Baker & Howland Islands",
+            "American Samoa",
+            "Wake Island",
+            "Guam",
+            "Midway Island",
+            "Johnston Island",
+            "Palmyra & Jarvis Islands",
+            "Mariana Islands",
+        ] {
+            assert!(is_us_related_entity(e), "{e} should be US-related");
+        }
+    }
+
+    #[test]
+    fn lookalike_entities_are_not_us_related() {
+        // Substring traps present in the real generated table.
+        for e in [
+            "British Virgin Islands",
+            "Samoa",
+            "Botswana",
+            "Japan",
+            "United Kingdom",
+            "",
+        ] {
+            assert!(!is_us_related_entity(e), "{e} must not be US-related");
+        }
+    }
+
+    #[test]
+    fn every_whitelisted_name_exists_in_the_generated_table() {
+        // Guard: a cty.dat regeneration that renames an entity must fail here,
+        // not silently stop suffixing states.
+        for name in US_RELATED_ENTITIES {
+            assert!(
+                crate::dxcc_table::PREFIX_TABLE.iter().any(|(_, n)| n == name),
+                "{name} is no longer in the generated PREFIX_TABLE"
+            );
+        }
+    }
+
+    #[test]
+    fn state_codes_normalize_and_validate() {
+        assert_eq!(normalize_us_state("ar"), Some("AR"));
+        assert_eq!(normalize_us_state("  AR "), Some("AR"));
+        assert_eq!(normalize_us_state("PR"), Some("PR"));
+        assert_eq!(normalize_us_state("Arkansas"), None); // not a 2-letter code
+        assert_eq!(normalize_us_state("ZZ"), None); // not a real subdivision
+        assert_eq!(normalize_us_state("A"), None);
+        assert_eq!(normalize_us_state(""), None);
+        assert_eq!(normalize_us_state("A1"), None);
+    }
+
+    // Gherkin scenario 1
+    #[test]
+    fn us_entity_with_known_state_gets_suffix() {
+        assert_eq!(
+            format_entity_with_state("United States", Some("AR")),
+            "United States - AR"
+        );
+        assert_eq!(
+            format_entity_with_state("United States", Some("ar")),
+            "United States - AR"
+        );
+        assert_eq!(format_entity_with_state("Alaska", Some("AK")), "Alaska - AK");
+        assert_eq!(
+            format_entity_with_state("Puerto Rico", Some("PR")),
+            "Puerto Rico - PR"
+        );
+    }
+
+    // Gherkin scenario 2
+    #[test]
+    fn us_entity_without_state_is_entity_alone() {
+        assert_eq!(format_entity_with_state("United States", None), "United States");
+        assert_eq!(
+            format_entity_with_state("United States", Some("")),
+            "United States"
+        );
+        assert_eq!(
+            format_entity_with_state("United States", Some("   ")),
+            "United States"
+        );
+        assert_eq!(
+            format_entity_with_state("United States", Some("unknown")),
+            "United States"
+        );
+    }
+
+    #[test]
+    fn non_us_entity_never_gets_a_suffix() {
+        assert_eq!(format_entity_with_state("Japan", Some("AR")), "Japan");
+        assert_eq!(
+            format_entity_with_state("British Virgin Islands", Some("VI")),
+            "British Virgin Islands"
+        );
+        assert_eq!(format_entity_with_state("Samoa", Some("AS")), "Samoa");
     }
 }

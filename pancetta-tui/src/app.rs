@@ -1301,6 +1301,12 @@ pub struct App {
     qso_pinned_id: Option<String>,
     pub station_info: StationInfo,
     pub dx_stations: HashMap<String, DxStation>,
+    /// Per-callsign US state/territory (UPPERCASE callsign → canonical
+    /// 2-letter code), fed by `TuiMessage::StationState`. Kept OUT of
+    /// `DxStation` because it is a stable per-callsign attribute rather than
+    /// a per-spot observation, and because it must survive a station
+    /// re-appearing from a different source (PAN-85 / D5).
+    pub dx_states: HashMap<String, String>,
     pub band_activity_scroll: usize,
     /// The callsign the Band Activity cursor is pinned to. The list reorders
     /// on EVERY decode window (directed-at-us pinned first, then newest-first),
@@ -1601,6 +1607,7 @@ impl App {
             qso_pinned_id: None,
             station_info,
             dx_stations: HashMap::new(),
+            dx_states: HashMap::new(),
             band_activity_scroll: 0,
             band_activity_pinned_call: None,
             dx_hunter_scroll: 0,
@@ -2430,6 +2437,32 @@ impl App {
         // Remove old DX stations
         self.dx_stations
             .retain(|_, station| station.last_seen > cutoff);
+
+        // Keep the state map in lockstep with the 24 h station window so it
+        // cannot grow without bound over a long session (PAN-85).
+        let Self {
+            dx_states,
+            dx_stations,
+            ..
+        } = self;
+        dx_states.retain(|call, _| dx_stations.contains_key(call));
+    }
+
+    /// Record a station's US state/territory (PAN-85), validating first. An
+    /// unrecognized value is silently dropped — the caller then renders the
+    /// entity alone, never a placeholder.
+    pub fn set_station_state(&mut self, callsign: &str, state: &str) {
+        if let Some(code) = crate::dxcc::normalize_us_state(state) {
+            self.dx_states
+                .insert(callsign.trim().to_uppercase(), code.to_string());
+        }
+    }
+
+    /// The station's known US state, if any.
+    pub fn station_state_for(&self, callsign: &str) -> Option<&str> {
+        self.dx_states
+            .get(&callsign.trim().to_uppercase())
+            .map(String::as_str)
     }
 
     /// Called when the radio reports its actual frequency (via hamlib/rigctld).
@@ -4663,6 +4696,26 @@ mod tests {
         App::new(Config::default(), None)
             .await
             .expect("default Config should construct App")
+    }
+
+    // --- PAN-85: per-callsign US state store ---
+
+    #[tokio::test]
+    async fn station_state_is_stored_uppercase_and_survives_lookup() {
+        let mut app = fixture_app().await;
+        app.set_station_state("w5abc", "AR");
+        assert_eq!(app.station_state_for("W5ABC"), Some("AR"));
+        assert_eq!(app.station_state_for("w5abc"), Some("AR"));
+        assert_eq!(app.station_state_for("W1XYZ"), None);
+    }
+
+    #[tokio::test]
+    async fn cleanup_drops_states_for_expired_stations() {
+        let mut app = fixture_app().await;
+        app.set_station_state("W5ABC", "AR");
+        // No DxStation for W5ABC -> the state entry is not retained.
+        app.cleanup_old_data();
+        assert_eq!(app.station_state_for("W5ABC"), None);
     }
 
     /// Regression: highlighting a CQ at scroll>0, then a new decode arrives

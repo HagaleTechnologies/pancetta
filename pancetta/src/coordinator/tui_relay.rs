@@ -167,6 +167,11 @@ impl super::ApplicationCoordinator {
             // C20 — RF-present / zero-decodes detector (mode/clock fault),
             // fed from the cumulative DSP-window + decode telemetry below.
             let mut rf_no_decode = super::health::RfNoDecodeMonitor::new();
+            // PAN-85: send a callsign's US state at most once per relay
+            // thread lifetime, and only once a value actually exists — so a
+            // state learned later (QRZ enrichment mid-session) still reaches
+            // the TUI on the next decode/spot for that callsign.
+            let mut sent_states: std::collections::HashSet<String> = std::collections::HashSet::new();
             while !relay_shutdown.load(Ordering::Acquire) {
                 if !ft8_disconnected {
                     match ft8_to_tui_rx.try_recv() {
@@ -236,6 +241,21 @@ impl super::ApplicationCoordinator {
                                 call_sign.as_deref(),
                                 dial_mhz * 1_000_000.0,
                             );
+
+                            // PAN-85: forward a known US state at most once
+                            // per callsign per relay lifetime.
+                            if let Some(call) = call_sign.as_deref() {
+                                if let Some(state) = state_for(&relay_station_lookup, Some(call)) {
+                                    if sent_states.insert(call.to_uppercase()) {
+                                        let _ = tui_msg_tx_relay.send(
+                                            pancetta_tui::tui_runner::TuiMessage::StationState {
+                                                callsign: call.to_string(),
+                                                state,
+                                            },
+                                        );
+                                    }
+                                }
+                            }
 
                             // Compute the #164 tiered priority score via the
                             // real PriorityScorer's classification (ATNO >
@@ -517,6 +537,20 @@ impl super::ApplicationCoordinator {
                                 Some(callsign.as_str()),
                                 frequency as f64,
                             );
+                            // PAN-85: forward a known US state at most once
+                            // per callsign per relay lifetime.
+                            if let Some(state) =
+                                state_for(&relay_station_lookup, Some(callsign.as_str()))
+                            {
+                                if sent_states.insert(callsign.to_uppercase()) {
+                                    let _ = tui_msg_tx_relay.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StationState {
+                                            callsign: callsign.clone(),
+                                            state,
+                                        },
+                                    );
+                                }
+                            }
                             let _ = tui_msg_tx_relay.send(
                                 pancetta_tui::tui_runner::TuiMessage::DxSpot {
                                     callsign,
@@ -2849,6 +2883,16 @@ fn dxcc_needed_on_band_for(
         Some(c) if !c.is_empty() => lookup.is_dxcc_needed_on_band(c, freq_hz),
         _ => false,
     }
+}
+
+/// The station's known US state, from the same `CachedStationLookup` the
+/// scorer uses. `None` when unknown — the TUI then renders the entity
+/// alone (PAN-85).
+fn state_for(
+    lookup: &crate::priority_evaluator::CachedStationLookup,
+    callsign: Option<&str>,
+) -> Option<String> {
+    callsign.filter(|c| !c.is_empty()).and_then(|c| lookup.state_for(c))
 }
 
 fn map_autonomous_status(

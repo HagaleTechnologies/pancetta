@@ -164,6 +164,13 @@ pub struct CachedStationLookup {
     /// autonomous operator a defensible signal: non-home calls are
     /// candidates, home calls aren't.
     excluded_dxcc_prefixes: Arc<RwLock<HashSet<String>>>,
+    /// Contacted stations' US state/territory, keyed by UPPERCASE callsign.
+    /// Seeded at startup from the QSO log's ADIF `STATE` and updated on QSO
+    /// completion / QRZ enrichment. Display-only (PAN-85) — deliberately NOT
+    /// a `WorkedStationLookup` method, because state has no bearing on
+    /// priority scoring. Values are pre-validated to a canonical 2-letter
+    /// code; an unvalidatable value is dropped, never stored.
+    station_states: Arc<RwLock<HashMap<String, String>>>,
 }
 
 impl Default for CachedStationLookup {
@@ -188,6 +195,7 @@ impl CachedStationLookup {
             network_snr: Arc::new(RwLock::new(HashMap::new())),
             network_last_seen: Arc::new(RwLock::new(HashMap::new())),
             excluded_dxcc_prefixes: Arc::new(RwLock::new(HashSet::new())),
+            station_states: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -276,6 +284,40 @@ impl CachedStationLookup {
             inserted,
             map.len()
         );
+    }
+
+    /// Record a station's US state/territory, validating first. An
+    /// unvalidatable value (wrong length, not a real subdivision, free text)
+    /// is silently dropped rather than stored — PAN-85 forbids ever showing
+    /// a placeholder or a guessed state.
+    pub fn record_state(&self, callsign: &str, state: &str) {
+        if let Some(code) = pancetta_tui::dxcc::normalize_us_state(state) {
+            self.station_states
+                .write()
+                .insert(callsign.trim().to_uppercase(), code.to_string());
+        }
+    }
+
+    /// Seed from `(callsign, state)` pairs loaded at startup, oldest first —
+    /// later rows overwrite earlier ones so the most recent log entry wins.
+    pub fn seed_states_from_list(&self, pairs: Vec<(String, String)>) {
+        let before = self.station_states.read().len();
+        for (call, state) in pairs {
+            self.record_state(&call, &state);
+        }
+        tracing::info!(
+            "CachedStationLookup: seeded {} station state(s) from the QSO log",
+            self.station_states.read().len() - before
+        );
+    }
+
+    /// The station's known US state, if any. `None` when unknown — the
+    /// caller then renders the entity alone (PAN-85).
+    pub fn state_for(&self, callsign: &str) -> Option<String> {
+        self.station_states
+            .read()
+            .get(&callsign.trim().to_uppercase())
+            .cloned()
     }
 
     pub fn update_recent_failures(&self, callsigns: HashSet<String>) {
@@ -1313,5 +1355,37 @@ mod tests {
 
         assert!(lookup.is_notable("K1SE"));
         assert!(lookup.is_notable("<K1SE>"));
+    }
+
+    // --- PAN-85: per-callsign US state store ---
+
+    #[test]
+    fn state_store_normalizes_and_is_case_insensitive_on_callsign() {
+        let l = CachedStationLookup::new();
+        l.record_state("w5abc", "ar");
+        assert_eq!(l.state_for("W5ABC").as_deref(), Some("AR"));
+        assert_eq!(l.state_for("w5abc").as_deref(), Some("AR"));
+        assert_eq!(l.state_for("W1XYZ"), None);
+    }
+
+    #[test]
+    fn state_store_rejects_unvalidatable_values() {
+        let l = CachedStationLookup::new();
+        l.record_state("W5ABC", "Arkansas");
+        l.record_state("W1XYZ", "");
+        assert_eq!(l.state_for("W5ABC"), None);
+        assert_eq!(l.state_for("W1XYZ"), None);
+    }
+
+    #[test]
+    fn seed_states_from_list_matches_record_state_and_last_wins() {
+        let seeded = CachedStationLookup::new();
+        seeded.seed_states_from_list(vec![
+            ("W5ABC".into(), "TX".into()),
+            ("W5ABC".into(), "AR".into()), // later log row wins
+            ("BAD".into(), "zz".into()),   // dropped by validation
+        ]);
+        assert_eq!(seeded.state_for("W5ABC").as_deref(), Some("AR"));
+        assert_eq!(seeded.state_for("BAD"), None);
     }
 }

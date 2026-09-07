@@ -521,7 +521,7 @@ impl AdifProcessor {
             dxcc: None,    // Would need callsign lookup
             cqz: None,     // Would need callsign lookup
             ituz: None,    // Would need callsign lookup
-            state: None,   // Would need callsign lookup
+            state: metadata.their_state.clone(),
             contest_id: contest_info.map(|c| c.contest_name.clone()),
             stx: contest_info.and_then(|c| c.serials.sent),
             stx_string: None,
@@ -577,6 +577,7 @@ impl AdifProcessor {
                 ours: adif_qso.my_gridsquare.clone(),
                 theirs: adif_qso.gridsquare.clone(),
             },
+            their_state: adif_qso.state.clone(),
             contest_info: adif_qso
                 .contest_id
                 .as_ref()
@@ -1228,6 +1229,7 @@ ADIF Export for Test Program
                 ours: Some("EM20".into()),
                 theirs: Some("JI64".into()),
             },
+            their_state: None,
             contest_info: None,
             tags: HashMap::new(),
             notes: notes.map(|s| s.to_string()),
@@ -1475,5 +1477,53 @@ ADIF Export for Test Program
         assert!(comment.contains("Big pile-up!"));
         assert!(comment.contains("HOUND"));
         assert!(comment.contains(ATTRIBUTION_FULL));
+    }
+
+    // ── PAN-85: state round-trip through ADIF ───────────────────────────────
+
+    #[test]
+    fn adif_import_carries_state_into_metadata() {
+        let adif_data = "<CALL:5>W5ABC<QSO_DATE:8>20230515<TIME_ON:6>123000\
+<MODE:4>DATA<SUBMODE:3>FT8<FREQ:9>14.074000<BAND:3>20M<STATE:2>AR<EOR>";
+
+        let processor = AdifProcessor::new();
+        let result = processor.parse_string(adif_data).unwrap();
+        let adif_qso = processor.record_to_qso(&result.records[0]).unwrap();
+        assert_eq!(adif_qso.state.as_deref(), Some("AR"));
+
+        let metadata = processor.adif_to_qso(&adif_qso);
+        assert_eq!(
+            metadata.their_state.as_deref(),
+            Some("AR"),
+            "STATE must survive adif_to_qso"
+        );
+    }
+
+    #[test]
+    fn adif_export_emits_state_when_known() {
+        let processor = AdifProcessor::new();
+        let mut metadata = hound_adif_metadata(false, None);
+        metadata.their_state = Some("AR".into());
+
+        let adif_qso = processor.qso_to_adif(&metadata, None);
+        assert_eq!(adif_qso.state.as_deref(), Some("AR"));
+
+        let record = processor.qso_to_record(&adif_qso);
+        assert_eq!(
+            record.fields.get("STATE").map(|f| f.value.as_str()),
+            Some("AR")
+        );
+    }
+
+    #[test]
+    fn adif_export_omits_state_when_unknown() {
+        let processor = AdifProcessor::new();
+        let metadata = hound_adif_metadata(false, None);
+
+        let adif_qso = processor.qso_to_adif(&metadata, None);
+        assert!(adif_qso.state.is_none());
+
+        let record = processor.qso_to_record(&adif_qso);
+        assert!(!record.fields.contains_key("STATE"));
     }
 }

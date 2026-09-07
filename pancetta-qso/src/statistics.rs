@@ -2293,6 +2293,7 @@ mod tests {
                     ours: Some("FN42".to_string()),
                     theirs: Some(format!("FN{}{}", 30 + i, 10 + i)),
                 },
+                their_state: None,
                 contest_info: None,
                 tags: HashMap::new(),
                 notes: None,

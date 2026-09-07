@@ -183,6 +183,7 @@ mod tests {
                 ours: Some("EM10".to_string()),
                 theirs: Some("FN42".to_string()),
             },
+            their_state: None,
             contest_info: None,
             tags: HashMap::new(),
             notes: None,

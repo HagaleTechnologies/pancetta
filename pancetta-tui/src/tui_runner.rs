@@ -321,6 +321,10 @@ pub enum TuiMessage {
     /// Currently-watchlisted callsigns (#197 DX watchlist). Full resync each
     /// time — `App::apply_dx_watchlist` bulk-replaces, never diffs.
     DxWatchlistUpdate { callsigns: Vec<String> },
+    /// A station's US state/territory became known (PAN-85). Sent at most
+    /// once per callsign per sender, and only when a value actually exists,
+    /// so a state learned later in the session still propagates.
+    StationState { callsign: String, state: String },
 }
 
 /// Commands sent from TUI
@@ -968,6 +972,9 @@ impl TuiRunner {
             }
             TuiMessage::DxWatchlistUpdate { callsigns } => {
                 app.apply_dx_watchlist(&callsigns);
+            }
+            TuiMessage::StationState { callsign, state } => {
+                app.set_station_state(&callsign, &state);
             }
         }
 

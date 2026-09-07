@@ -915,6 +915,34 @@ impl QsoDatabase {
         }
     }
 
+    /// Every (callsign, state) pair in the log that carries an ADIF `STATE`,
+    /// oldest first so the caller's last-write-wins seed ends on the most
+    /// recent value. Mirrors `get_worked_bands_and_grids` one tier over
+    /// (PAN-85). Rows with no state are filtered by the `IS NOT NULL` clause.
+    pub async fn get_worked_callsigns_and_states(&self) -> Vec<(String, String)> {
+        let result: Result<Vec<(String, String)>, sqlx::Error> = sqlx::query_as(
+            "SELECT json_extract(metadata, '$.their_callsign'), \
+                    json_extract(metadata, '$.their_state') \
+             FROM qsos \
+             WHERE json_extract(metadata, '$.their_callsign') IS NOT NULL \
+               AND json_extract(metadata, '$.their_state') IS NOT NULL \
+             ORDER BY json_extract(metadata, '$.start_time') ASC",
+        )
+        .fetch_all(&self.pool)
+        .await;
+
+        match result {
+            Ok(pairs) => pairs,
+            Err(e) => {
+                tracing::warn!(
+                    "get_worked_callsigns_and_states: query failed: {} — treating as empty",
+                    e
+                );
+                Vec::new()
+            }
+        }
+    }
+
     /// Build a fresh index at `db_path` by replaying every record in `adif_path`.
     ///
     /// If `db_path` exists, it is deleted first — caller should only invoke this
@@ -1284,6 +1312,7 @@ mod tests {
                 end_time: None,
                 reports: SignalReports::default(),
                 grids: GridSquares::default(),
+                their_state: None,
                 contest_info: None,
                 tags: HashMap::new(),
                 notes: None,
@@ -1409,6 +1438,7 @@ mod tests {
                 end_time: None,
                 reports: SignalReports::default(),
                 grids: GridSquares::default(),
+                their_state: None,
                 contest_info: None,
                 tags: HashMap::new(),
                 notes: None,
@@ -1524,6 +1554,7 @@ mod tests {
                 end_time: None,
                 reports: SignalReports::default(),
                 grids: GridSquares::default(),
+                their_state: None,
                 contest_info: None,
                 tags: HashMap::new(),
                 notes: None,
@@ -1604,6 +1635,31 @@ mod tests {
             "missing K9DEF in {:?}",
             calls
         );
+    }
+
+    /// PAN-85: a replayed ADIF record's `STATE` field must survive the
+    /// parse -> `adif_to_qso` -> insert chain, so a previously-logged
+    /// contact's state is available to seed `CachedStationLookup` at startup.
+    #[tokio::test]
+    async fn replay_from_adif_preserves_state() {
+        let tmp = tempfile::tempdir().unwrap();
+        let adif_path = tmp.path().join("qsos.adi");
+        let db_path = tmp.path().join("qsos.db");
+
+        let adif_contents = "Pancetta state round-trip test\n\
+            <ADIF_VER:5>3.1.4 <PROGRAMID:8>pancetta\n\
+            <EOH>\n\
+            \n\
+            <CALL:5>W5ABC <QSO_DATE:8>20250101 <TIME_ON:6>120000 \
+            <MODE:3>FT8 <FREQ:9>14.074000 <BAND:3>20m <STATE:2>AR\n\
+            <EOR>\n";
+        tokio::fs::write(&adif_path, adif_contents).await.unwrap();
+
+        let db = QsoDatabase::replay_from_adif(&db_path, &adif_path)
+            .await
+            .unwrap();
+        let pairs = db.get_worked_callsigns_and_states().await;
+        assert_eq!(pairs, vec![("W5ABC".to_string(), "AR".to_string())]);
     }
 
     /// PAN-41 round 3 (Codex on the round-2 `open_read_only` fix): a real

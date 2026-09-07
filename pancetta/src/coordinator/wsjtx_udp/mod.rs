@@ -1942,6 +1942,7 @@ mod qso_logged_tests {
                 ours: Some("EM12".to_string()),
                 theirs: Some("FN42".to_string()),
             },
+            their_state: None,
             contest_info: None,
             tags: std::collections::HashMap::new(),
             notes: None,

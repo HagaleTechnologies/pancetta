@@ -947,6 +947,7 @@ impl QsoLogger {
                     ours: adif_qso.my_gridsquare.clone(),
                     theirs: adif_qso.gridsquare.clone(),
                 },
+                their_state: adif_qso.state.clone(),
                 contest_info: if adif_qso.contest_id.is_some() {
                     Some(ContestInfo {
                         contest_name: adif_qso.contest_id.clone().unwrap_or_default(),
@@ -1056,6 +1057,7 @@ mod tests {
                 received: Some(-12),
             },
             grids: GridSquares::default(),
+            their_state: None,
             contest_info: None,
             tags: HashMap::new(),
             notes: None,
