@@ -35,8 +35,15 @@ on:
 # cancellation. github.run_id is unique per run, so falling back to it for
 # any non-pull_request event makes cancellation a no-op there: each such run
 # gets its own group and nothing else in it can ever match.
+#
+# Hardened per the bug Codex caught reviewing this identical pattern on vanity#325: a stale
+# rerun of an old failed attempt still joined this same PR-number group unconditionally --
+# GitHub's concurrency model holds one RUNNING and one PENDING member per group, so an
+# unconditional cancel-in-progress: true let a stale rerun cancel (or, if only queued, evict
+# from the pending slot) a legitimately newer, currently-running revision. Non-first attempts
+# now key on github.run_id instead, isolating every rerun into its own private group.
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.run_id }}
+  group: ci-${{ github.run_attempt == 1 && (github.event.pull_request.number || github.run_id) || github.run_id }}
   cancel-in-progress: true
 
 permissions:
