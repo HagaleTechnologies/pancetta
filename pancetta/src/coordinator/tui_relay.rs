@@ -1911,7 +1911,15 @@ impl super::ApplicationCoordinator {
                             // so that path would silently update metadata
                             // with no frame ever re-sent. See
                             // `resolve_nudge_tx_offset`'s doc comment.
-                            let (live_qso_ids, auto_calling_cq_ids) = {
+                            // PAN-72 round-9 fix (Codex round 9, finding 2):
+                            // `rearm_eligible_ids` derived from the SAME
+                            // `get_active_qsos()` result as the two sets
+                            // above -- the live QSOs whose CURRENT state
+                            // `QsoManager::rearm_manual_calls_at` will
+                            // actually retransmit a frame for. See
+                            // `qso_state_is_rearm_eligible` and
+                            // `resolve_nudge_tx_offset`'s doc comment.
+                            let (live_qso_ids, auto_calling_cq_ids, rearm_eligible_ids) = {
                                 let manager = cmd_qso_manager_watch.borrow().clone();
                                 match manager {
                                     Some(m) => {
@@ -1931,9 +1939,17 @@ impl super::ApplicationCoordinator {
                                                 })
                                                 .map(|(id, _)| *id)
                                                 .collect();
-                                        (Some(live), Some(auto_calling_cq))
+                                        let rearm_eligible: std::collections::HashSet<_> =
+                                            active_qsos
+                                                .iter()
+                                                .filter(|(_, progress)| {
+                                                    qso_state_is_rearm_eligible(progress)
+                                                })
+                                                .map(|(id, _)| *id)
+                                                .collect();
+                                        (Some(live), Some(auto_calling_cq), Some(rearm_eligible))
                                     }
-                                    None => (None, None),
+                                    None => (None, None, None),
                                 }
                             };
                             let switched = resolve_nudge_tx_offset(
@@ -1941,6 +1957,7 @@ impl super::ApplicationCoordinator {
                                 &active,
                                 live_qso_ids.as_ref(),
                                 auto_calling_cq_ids.as_ref(),
+                                rearm_eligible_ids.as_ref(),
                                 &cmd_active_tx_offsets,
                                 &cmd_pending_qso_offset_requests,
                                 &cmd_pending_cq_offset_nudge,
@@ -1994,6 +2011,26 @@ impl super::ApplicationCoordinator {
                                             component: "TX".to_string(),
                                             status: "TX offset is Hold — press `f` for Auto to \
                                                      enable nudging"
+                                                .to_string(),
+                                        },
+                                    );
+                                }
+                                NudgeOutcome::NoEligibleTarget => {
+                                    // PAN-72 round-9 fix (Codex round 9,
+                                    // finding 2): a live QSO exists but its
+                                    // current state cannot retransmit a
+                                    // frame -- say so instead of claiming a
+                                    // nudge happened.
+                                    info!(
+                                        target: "tx.freq",
+                                        "TUI NudgeTxOffset ignored: the active QSO's current \
+                                         state cannot retransmit a frame"
+                                    );
+                                    let _ = cmd_tui_msg_tx.send(
+                                        pancetta_tui::tui_runner::TuiMessage::StatusUpdate {
+                                            component: "TX".to_string(),
+                                            status: "Nudge ignored — the active QSO's current \
+                                                     state can't retransmit a frame"
                                                 .to_string(),
                                         },
                                     );
@@ -3041,12 +3078,42 @@ fn map_recent_qso_outcome(
 /// which DOES retransmit) keeps the `pending_qso_offset_requests` path
 /// unchanged.
 ///
+/// PAN-72 round-9 fix (Codex round 9, finding 2): does `progress`'s CURRENT
+/// state belong to the exact set `QsoManager::rearm_manual_calls_at`
+/// actually retransmits a frame for? Mirrors that function's `match
+/// &progress.state` block (`pancetta-qso/src/qso_manager.rs`) — including
+/// its Manual/Auto conditioning for `CallingCq`/`WaitingForReport` — rather
+/// than re-deriving the list independently, so the two can never drift
+/// apart silently.
+///
+/// `RespondingToCq` and `SendingReport` are eligible for EITHER initiation
+/// (`rearm_manual_calls_at` re-sends an autonomous pounce's call/report
+/// too, per SM-F6); `CallingCq` and `WaitingForReport` are Manual-only
+/// (an autonomous self-CQ's keep-calling is deliberately routed through the
+/// separate `pending_cq_offset_nudge` mechanism instead — see
+/// `auto_calling_cq_ids` above). Every other state (`WaitingForConfirmation`,
+/// `SendingConfirmation`, a contest-exchange state, `Idle`, terminal states,
+/// etc.) falls to `rearm_manual_calls_at`'s own `_ => continue` and is
+/// therefore NOT eligible here either.
+fn qso_state_is_rearm_eligible(progress: &pancetta_qso::QsoProgress) -> bool {
+    let is_manual = progress.metadata.initiated_by == pancetta_qso::states::CallInitiation::Manual;
+    match &progress.state {
+        pancetta_qso::states::QsoState::CallingCq { .. } => is_manual,
+        pancetta_qso::states::QsoState::WaitingForReport { .. } => is_manual,
+        pancetta_qso::states::QsoState::RespondingToCq { .. } => true,
+        pancetta_qso::states::QsoState::SendingReport { .. } => true,
+        _ => false,
+    }
+}
+
 /// Returns [`NudgeOutcome`] for the caller's status echo/logging.
+#[allow(clippy::too_many_arguments)]
 fn resolve_nudge_tx_offset(
     tx_freq_mode: &std::sync::atomic::AtomicU8,
     active: &std::collections::HashSet<String>,
     live_qso_ids: Option<&std::collections::HashSet<pancetta_qso::QsoId>>,
     auto_calling_cq_ids: Option<&std::collections::HashSet<pancetta_qso::QsoId>>,
+    rearm_eligible_ids: Option<&std::collections::HashSet<pancetta_qso::QsoId>>,
     active_tx_offsets: &std::sync::RwLock<std::collections::HashMap<String, f64>>,
     pending_qso_offset_requests: &std::sync::Mutex<
         Vec<pancetta_qso::qso_manager::OffsetActionRequest>,
@@ -3069,6 +3136,24 @@ fn resolve_nudge_tx_offset(
         if let Ok(qso_id) = key.parse::<pancetta_qso::QsoId>() {
             let is_auto_calling_cq = auto_calling_cq_ids.is_some_and(|ids| ids.contains(&qso_id));
             if !is_auto_calling_cq {
+                // PAN-72 round-9 fix (Codex round 9, finding 2): a live QSO
+                // whose CURRENT state `rearm_manual_calls_at` would never
+                // retransmit a frame for (its own `match` falls to `_ =>
+                // continue`) must not be reported as a successful nudge —
+                // the old code queued a `Switch` anyway, silently updating
+                // offset metadata with nothing ever transmitted at the new
+                // offset. `None` here (the caller couldn't build the set,
+                // e.g. the Qso component isn't up) preserves prior
+                // behavior, same convention as `live_qso_ids: None` above.
+                let is_rearm_eligible = rearm_eligible_ids.is_none_or(|ids| ids.contains(&qso_id));
+                if !is_rearm_eligible {
+                    // Deliberately NOT falling through to the CQ-nudge
+                    // fallback: that flag is for CQ-hunting, and arming it
+                    // here would silently consume `pending_cq_offset_nudge`
+                    // against an unrelated future CQ-hunting cycle while
+                    // implying something was armed for THIS QSO.
+                    return NudgeOutcome::NoEligibleTarget;
+                }
                 let current = active_tx_offsets
                     .read()
                     .ok()
@@ -3117,6 +3202,17 @@ enum NudgeOutcome {
     /// nudge would be a silent false success. The operator is told to press
     /// `f` for Auto.
     HeldNoOp,
+    /// PAN-72 round-9 fix (Codex round 9, finding 2): there IS a live QSO,
+    /// but its CURRENT state is not one `QsoManager::rearm_manual_calls_at`
+    /// will ever retransmit a frame for (e.g. `WaitingForConfirmation`) —
+    /// nothing queued, nothing armed. The old code queued a `Switch` anyway,
+    /// silently updating offset metadata while reporting success with
+    /// nothing ever transmitted at the new offset. Deliberately does NOT
+    /// fall through to the CQ-nudge fallback either — that flag is for
+    /// CQ-hunting, and arming it here would silently consume it against an
+    /// unrelated future CQ-hunting cycle while implying something was armed
+    /// for this QSO. The status line explains why, mirroring `HeldNoOp`.
+    NoEligibleTarget,
 }
 
 /// The dial frequency (MHz) to stamp on this decode's `DecodedMessageView`.
@@ -3557,6 +3653,7 @@ mod tui_relay_tests {
             &active,
             Some(&std::collections::HashSet::from([qso_id])),
             None,
+            None,
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
@@ -3614,6 +3711,7 @@ mod tui_relay_tests {
             &active,
             Some(&std::collections::HashSet::from([qso_id])),
             None,
+            None,
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
@@ -3659,6 +3757,7 @@ mod tui_relay_tests {
             &active,
             Some(&live),
             None,
+            None,
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
@@ -3698,6 +3797,7 @@ mod tui_relay_tests {
             &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
             &active,
             Some(&live),
+            None,
             None,
             &active_tx_offsets,
             &pending_qso_offset_requests,
@@ -3742,6 +3842,7 @@ mod tui_relay_tests {
             &active,
             None,
             None,
+            None,
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
@@ -3776,6 +3877,7 @@ mod tui_relay_tests {
         let result = resolve_nudge_tx_offset(
             &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
             &active,
+            None,
             None,
             None,
             &active_tx_offsets,
@@ -3825,6 +3927,7 @@ mod tui_relay_tests {
             &active,
             Some(&live),
             Some(&auto_calling_cq),
+            None,
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
@@ -3867,12 +3970,17 @@ mod tui_relay_tests {
         // NOT in auto_calling_cq_ids.
         let auto_calling_cq: std::collections::HashSet<pancetta_qso::QsoId> =
             std::collections::HashSet::new();
+        // A Manual-initiated CallingCq IS one of `rearm_manual_calls_at`'s
+        // eligible states.
+        let rearm_eligible: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
 
         let result = resolve_nudge_tx_offset(
             &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
             &active,
             Some(&live),
             Some(&auto_calling_cq),
+            Some(&rearm_eligible),
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
@@ -3888,6 +3996,134 @@ mod tui_relay_tests {
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].qso_id, qso_id);
         assert!(!pending_cq_offset_nudge.load(Ordering::Relaxed));
+    }
+
+    /// PAN-72 round-9 fix (Codex round 9, finding 2): the only live QSO is in
+    /// `WaitingForConfirmation` -- present in `live_qso_ids` (it IS active)
+    /// but NOT in `rearm_eligible_ids`, because
+    /// `QsoManager::rearm_manual_calls_at`'s `match &progress.state` block
+    /// falls to `_ => continue` for this state -- no frame would ever be
+    /// re-sent. The old code selected it as an ordinary `ActiveQso` target
+    /// anyway, silently updating offset metadata while reporting success
+    /// with nothing ever transmitted at the new offset. Must report
+    /// `NoEligibleTarget` and touch NEITHER mailbox -- not
+    /// `pending_qso_offset_requests` (there is nothing to commit), and not
+    /// the CQ-nudge fallback either (there IS a live QSO; CQ-hunting is
+    /// simply the wrong target for it, same reasoning as the Hold-mode
+    /// no-op).
+    #[test]
+    fn nudge_reports_no_eligible_target_for_a_non_rearmable_state() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key, 920.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        let live: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
+        // Live, but WaitingForConfirmation is not one of
+        // `rearm_manual_calls_at`'s eligible states -- the set built at the
+        // call site would never include it.
+        let rearm_eligible: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::new();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            None,
+            Some(&rearm_eligible),
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::NoEligibleTarget,
+            "a live QSO whose current state cannot retransmit must not be \
+             reported as a successful nudge"
+        );
+        assert!(
+            pending_qso_offset_requests.lock().unwrap().is_empty(),
+            "nothing to commit -- rearm_manual_calls_at would never re-send \
+             a frame for this state"
+        );
+        assert!(
+            !pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "must not consume the CQ-hunting fallback either -- there IS a \
+             live QSO, so CQ hunting is the wrong target for it"
+        );
+    }
+
+    /// Regression companion: `RespondingToCq` and `SendingReport` ARE in
+    /// `rearm_manual_calls_at`'s eligible-state list for any initiation, so
+    /// they must keep resolving to `ActiveQso` exactly as before -- the
+    /// round-9 restriction must not become an over-broad `None`-by-default
+    /// that blocks every state.
+    #[test]
+    fn nudge_still_resolves_active_qso_for_rearm_eligible_states() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key, 1650.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        let live: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
+        let rearm_eligible: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([qso_id]);
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            None,
+            Some(&rearm_eligible),
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::ActiveQso(qso_id),
+            "RespondingToCq/SendingReport (or any other rearm-eligible \
+             state) must still nudge normally"
+        );
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].qso_id, qso_id);
+        assert!(!pending_cq_offset_nudge.load(Ordering::Relaxed));
+    }
+
+    /// `rearm_eligible_ids: None` (the Qso component wasn't up to build the
+    /// set) must preserve pre-round-9 behavior -- same convention as
+    /// `live_qso_ids: None` above -- not retroactively block every nudge.
+    #[test]
+    fn nudge_with_no_rearm_eligibility_info_preserves_prior_behavior() {
+        let qso_id = pancetta_qso::QsoId::new_v4();
+        let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([key.clone()]);
+        let active_tx_offsets =
+            std::sync::RwLock::new(std::collections::HashMap::from([(key, 920.0)]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&std::collections::HashSet::from([qso_id])),
+            None,
+            None,
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(result, NudgeOutcome::ActiveQso(qso_id));
     }
 
     /// An empty pending slot -- the common case (nothing carried over from
