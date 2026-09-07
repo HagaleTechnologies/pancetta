@@ -3011,9 +3011,18 @@ impl super::ApplicationCoordinator {
                                     // still-in-grace vacated offset of an
                                     // unanswered `CallingCq` relocation — see
                                     // `secondary_decoder_hint_freq_for`.
-                                    let decoder_hint_pair: Option<(f64, Option<f64>)> = if new_state
-                                        .is_active()
-                                    {
+                                    //
+                                    // PAN-72 round-9 fix (finding 1): the
+                                    // secondary now also carries its own
+                                    // `expires_at` so the FT8 decode loop can
+                                    // re-check freshness on every READ
+                                    // instead of trusting a value latched
+                                    // once at this write.
+                                    #[allow(clippy::type_complexity)]
+                                    let decoder_hint_pair: Option<(
+                                        f64,
+                                        Option<(f64, chrono::DateTime<chrono::Utc>)>,
+                                    )> = if new_state.is_active() {
                                         // Fetch the QSO's current progress
                                         // once. This is a cheap read-lock
                                         // on the already-updated QSO map;
@@ -5089,10 +5098,21 @@ fn decoder_hint_freq_for(progress: &pancetta_qso::QsoProgress) -> Option<f64> {
 ///
 /// Every other case (established QSO, no pre-switch offset, or grace
 /// expired) yields `None`.
+///
+/// PAN-72 round-9 fix (Codex round 9, finding 1): returns the pair
+/// `(offset_hz, expires_at)` rather than just the frequency. The old
+/// single-`f64` return let the shared `active_qso_freq_hz` state carry a
+/// secondary hint with NO way for a later reader to tell whether it was
+/// still within grace — the expiry check only ever ran HERE, at write
+/// time (when a `StateChanged`/`TxOffsetApplied` event happened to fire),
+/// so a secondary that expired with no further event kept widening the
+/// decoder's filter forever. Carrying `expires_at` through lets
+/// `coordinator::qso_filter::compute_narrow_filter_bins_dual_with_expiry`
+/// re-derive freshness at every decode-loop READ instead.
 fn secondary_decoder_hint_freq_for(
     progress: &pancetta_qso::QsoProgress,
     slot_ns: i64,
-) -> Option<f64> {
+) -> Option<(f64, chrono::DateTime<chrono::Utc>)> {
     if !matches!(
         progress.state,
         pancetta_qso::states::QsoState::CallingCq { .. }
@@ -5101,7 +5121,8 @@ fn secondary_decoder_hint_freq_for(
     }
     let pre = progress.metadata.pre_switch_offset?;
     let grace = pancetta_qso::qso_manager::pre_switch_offset_grace_from_slot_ns(slot_ns);
-    (pre.left_at + grace > chrono::Utc::now()).then_some(pre.offset_hz)
+    let expires_at = pre.left_at + grace;
+    (expires_at > chrono::Utc::now()).then_some((pre.offset_hz, expires_at))
 }
 
 #[cfg(test)]
@@ -5171,14 +5192,20 @@ mod secondary_decoder_hint_tests {
 
     #[test]
     fn a_fresh_relocation_still_inside_grace_yields_the_vacated_offset() {
+        let left_at = Utc::now();
         let progress = calling_cq_progress(Some(PreSwitchOffset {
             offset_hz: 1500.0,
-            left_at: Utc::now(),
+            left_at,
             operator_forced: true,
         }));
+        let expected_expiry =
+            left_at + pancetta_qso::qso_manager::pre_switch_offset_grace_from_slot_ns(FT8_SLOT_NS);
         assert_eq!(
             secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
-            Some(1500.0)
+            Some((1500.0, expected_expiry)),
+            "PAN-72 round-9: the secondary now carries its expires_at \
+             alongside the frequency, so a later READ can re-evaluate \
+             freshness without needing another write-time event"
         );
     }
 
@@ -5215,7 +5242,7 @@ mod secondary_decoder_hint_tests {
             "10s ago must already be outside FT2's 6.4s grace"
         );
         assert_eq!(
-            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS),
+            secondary_decoder_hint_freq_for(&progress, FT8_SLOT_NS).map(|(freq, _)| freq),
             Some(1500.0),
             "the same 10s-old relocation is still inside FT8's 30s grace"
         );
@@ -9491,13 +9518,30 @@ mod respond_to_caller_admission_tests {
         // be covered by the decoder hint (as the secondary), so a caller
         // that answered the pre-switch CQ frame is not filtered out —
         // Codex round 8, finding 1.
-        assert_eq!(
-            *coordinator.active_qso_freq_hz.read().unwrap(),
-            Some((NEW_HZ, Some(CQ_HZ))),
-            "the vacated CQ offset must remain a live secondary decoder hint \
-             for the grace window so a reply to the pre-switch frame is not \
-             dropped by the band-collapse filter"
-        );
+        //
+        // PAN-72 round-9 fix (finding 1): the secondary now also carries an
+        // `expires_at` (real wall-clock, so not asserted for an exact
+        // value) alongside the frequency — destructure rather than a plain
+        // tuple `assert_eq!`.
+        match *coordinator.active_qso_freq_hz.read().unwrap() {
+            Some((primary, Some((secondary_hz, expires_at)))) => {
+                assert_eq!(primary, NEW_HZ, "primary must be the new offset");
+                assert_eq!(
+                    secondary_hz, CQ_HZ,
+                    "the vacated CQ offset must remain a live secondary decoder \
+                     hint for the grace window so a reply to the pre-switch \
+                     frame is not dropped by the band-collapse filter"
+                );
+                assert!(
+                    expires_at > chrono::Utc::now(),
+                    "the secondary hint's expires_at must still be in the future \
+                     immediately after the switch"
+                );
+            }
+            other => {
+                panic!("expected a primary+secondary decoder hint after the switch, got {other:?}")
+            }
+        }
 
         // The QSO's own state must agree — the hint is derived, not invented.
         let progress = manager.get_qso(qso_id).await.unwrap();

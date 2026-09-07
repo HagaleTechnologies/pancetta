@@ -1026,8 +1026,20 @@ pub struct ApplicationCoordinator {
     /// except that one (established QSO, no pre-switch offset, or grace
     /// expired), so `compute_narrow_filter_bins_default_dual(primary, None,
     /// ..)` behaves byte-identically to the old single-frequency form.
+    ///
+    /// PAN-72 round-9 fix (Codex round 9, finding 1): the secondary's inner
+    /// `Option` now pairs the frequency with its own `expires_at`
+    /// (`(f64, DateTime<Utc>)`) rather than just the frequency. The old
+    /// shape let a secondary's grace-expiry go unevaluated forever once no
+    /// further `StateChanged`/`TxOffsetApplied` event arrived to recompute
+    /// it — carrying `expires_at` through lets the FT8 decode loop
+    /// re-derive freshness at every READ instead
+    /// (`compute_narrow_filter_bins_dual_with_expiry`), without a lock
+    /// upgrade or extra write contention.
     #[allow(clippy::type_complexity)]
-    active_qso_freq_hz: std::sync::Arc<std::sync::RwLock<Option<(f64, Option<f64>)>>>,
+    active_qso_freq_hz: std::sync::Arc<
+        std::sync::RwLock<Option<(f64, Option<(f64, chrono::DateTime<chrono::Utc>)>)>>,
+    >,
 
     /// hb-062 FP filter: applied between decode merge and broadcast in the
     /// FT8 thread. Inner `None` = filter disabled (default). When enabled,
