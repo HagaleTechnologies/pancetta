@@ -398,6 +398,47 @@ fn should_repark(
     }
 }
 
+/// PAN-72 Fix A: pure deadline arithmetic for the autonomous loop's
+/// mode-aware slot tick. `tokio::time::interval_at`'s period can't be
+/// resized once running, so the loop polls on a short fixed period (see
+/// `SLOT_POLL_PERIOD` at the call site) and gates the per-slot body on a
+/// deadline tracked here instead.
+///
+/// Given the current instant `now`, the currently-tracked `deadline`, and
+/// whatever `slot_ns` the coordinator's `active_slot_ns` atomic currently
+/// holds (read FRESH by the caller on every call, never cached), returns
+/// `(fired, next_deadline)`:
+/// - `fired` is `true` once `now >= deadline` (the per-slot body should run
+///   this poll).
+/// - `next_deadline` is the deadline to track afterward: unchanged while
+///   not yet due, or recomputed via
+///   [`pancetta_core::slot::next_slot_start_with_period`] (the same
+///   mode-aware primitive `next_slot_start`'s FT8-only wrapper delegates
+///   to) once it fires -- so a runtime mode switch that changed `slot_ns`
+///   takes effect on the very next deadline, never delayed by a stale
+///   longer period.
+///
+/// See `poll_slot_deadline_tests` for the FT8-byte-identical proof (the
+/// deadline sequence this produces for an unchanged `slot_ns` matches
+/// exactly what the old `tokio::time::interval_at(..., Duration::from_secs(15))`
+/// design ticked at) and the FT4/FT2 mid-run mode-change cases.
+fn poll_slot_deadline(
+    now: chrono::DateTime<chrono::Utc>,
+    deadline: chrono::DateTime<chrono::Utc>,
+    slot_ns: i64,
+) -> (bool, chrono::DateTime<chrono::Utc>) {
+    if now < deadline {
+        (false, deadline)
+    } else {
+        let next_deadline = pancetta_core::slot::next_slot_start_with_period(
+            now,
+            chrono::Duration::zero(),
+            slot_ns,
+        );
+        (true, next_deadline)
+    }
+}
+
 /// Looks up the parked offset's CURRENT score in a
 /// [`pancetta_qso::frequency::PlacementSnapshot`]'s top-N `slices` (the
 /// NEAREST candidate whose `offset_hz` falls within half a bin width of
@@ -1609,6 +1650,14 @@ impl super::ApplicationCoordinator {
         // THIS task and is fully re-created on an Autonomous-task restart,
         // unlike the cross-component `QsoManager` handle above).
         let pending_cq_offset_nudge = self.pending_cq_offset_nudge.clone();
+        // PAN-72 Fix A: the coordinator's mode-aware slot-period atomic
+        // (round 7, injected into `QsoManager` via
+        // `set_active_slot_ns_source`; round 8's grace-window fix in
+        // `coordinator/qso.rs` already reads it the same way). Cloned here
+        // so this task's slot-tick loop can read it fresh every poll
+        // instead of assuming FT8's fixed 15s cadence -- see the timer
+        // construction and `poll_slot_deadline` below.
+        let active_slot_ns = self.active_slot_ns();
         // PAN-72 (fixed after task-review Critical finding): the Autonomous
         // task doesn't otherwise hold any `QsoManager` handle. A plain
         // `self.qso_manager_for_supervisor.clone()` here would capture
@@ -1684,22 +1733,44 @@ impl super::ApplicationCoordinator {
                 let mut last_coverage: Option<u8> = None;
                 let mut gate_diag_state = GateDiagState::default();
                 let mut skip_seen = SkipDiagSeen::default();
-                // Align slot timer to FT8 UTC boundaries (0/15/30/45 seconds)
-                // with sub-second precision. tokio::time::interval_at then
-                // keeps the cadence exact every 15s relative to that first tick.
-                let now_utc = chrono::Utc::now();
-                let next_slot =
-                    pancetta_core::slot::next_slot_start(now_utc, chrono::Duration::zero());
-                let initial_delay = pancetta_core::slot::duration_until(next_slot, now_utc);
-                let mut slot_interval = tokio::time::interval_at(
-                    tokio::time::Instant::now() + initial_delay,
-                    Duration::from_secs(15),
+                // PAN-72 Fix A: mode-aware slot tick. `tokio::time::interval_at`
+                // bakes its period in at construction and can't be resized
+                // once running, but `active_slot_ns` (cloned above) can
+                // change at ANY time via a runtime Shift+M mode switch. So
+                // instead of one precise per-slot timer, this loop polls on
+                // a short FIXED period and gates the (comparatively
+                // expensive) per-slot body on a mode-aware deadline tracked
+                // across iterations -- see `poll_slot_deadline` for the
+                // pure arithmetic and `poll_slot_deadline_tests` for the
+                // FT8-byte-identical proof.
+                //
+                // 250ms: this loop's OTHER select arm (the decode-drain
+                // sub-future below) already busy-polls every scheduler
+                // pass, so this adds one `chrono::Utc::now()` call plus an
+                // atomic load every 250ms -- negligible next to that
+                // existing cost -- while staying comfortably under FT2's
+                // 3.2s slot length (well under half, so a mode switch to
+                // FT2 is never more than ~250ms late picking up the new
+                // cadence).
+                const SLOT_POLL_PERIOD: Duration = Duration::from_millis(250);
+                let mut slot_poll_interval = tokio::time::interval(SLOT_POLL_PERIOD);
+                slot_poll_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+                let mut next_slot_deadline = pancetta_core::slot::next_slot_start_with_period(
+                    chrono::Utc::now(),
+                    chrono::Duration::zero(),
+                    active_slot_ns.load(Ordering::Relaxed),
                 );
-                slot_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
                 loop {
                     tokio::select! {
-                        _ = slot_interval.tick() => {
+                        _ = slot_poll_interval.tick() => {
+                            let (slot_due, updated_slot_deadline) = poll_slot_deadline(
+                                chrono::Utc::now(),
+                                next_slot_deadline,
+                                active_slot_ns.load(Ordering::Relaxed),
+                            );
+                            next_slot_deadline = updated_slot_deadline;
+                            if slot_due {
                             // Report decoded spots to cqdx.io (never under
                             // `--replay` -- see `suppress_spot_reports`).
                             if let Some(bridge) =
@@ -2670,6 +2741,7 @@ impl super::ApplicationCoordinator {
                                 }
                             }
                             } // end `if auto_config_enabled` decision/dispatch gate (FQ-F9)
+                            } // end `if slot_due` (PAN-72 Fix A mode-aware gate)
                         }
 
                         _ = async {
@@ -3056,6 +3128,104 @@ mod resolve_repark_active_qsos_tests {
             None,
             "poisoned-lock read must skip the repark this tick"
         );
+    }
+}
+
+#[cfg(test)]
+mod poll_slot_deadline_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    const FT8_SLOT_NS: i64 = 15_000_000_000;
+    const FT4_SLOT_NS: i64 = 7_500_000_000;
+
+    fn at(millis: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::Utc.timestamp_nanos(0) + chrono::Duration::milliseconds(millis)
+    }
+
+    #[test]
+    fn no_fire_before_deadline() {
+        let (fired, deadline) = poll_slot_deadline(at(10_000), at(15_000), FT8_SLOT_NS);
+        assert!(!fired);
+        assert_eq!(
+            deadline,
+            at(15_000),
+            "deadline must be unchanged while not yet due"
+        );
+    }
+
+    #[test]
+    fn fires_exactly_at_deadline_and_recomputes_next_ft8_boundary() {
+        let (fired, next_deadline) = poll_slot_deadline(at(15_000), at(15_000), FT8_SLOT_NS);
+        assert!(fired);
+        assert_eq!(next_deadline, at(30_000));
+    }
+
+    #[test]
+    fn ft8_cadence_unchanged_across_repeated_250ms_polls() {
+        // Simulate the production loop's 250ms poll period starting from an
+        // arbitrary mid-slot instant, proving the deadline SEQUENCE this
+        // helper produces lands on the exact same FT8 slot boundaries
+        // (0/15/30/45s) that the old `tokio::time::interval_at(...,
+        // Duration::from_secs(15))` design ticked at -- the
+        // FT8-byte-identical requirement, verified deterministically rather
+        // than via a flaky real-time test.
+        let mut now = at(3_200); // arbitrary mid-slot start, matches the old
+                                 // design's arbitrary first-poll instant
+        let mut deadline = pancetta_core::slot::next_slot_start_with_period(
+            now,
+            chrono::Duration::zero(),
+            FT8_SLOT_NS,
+        );
+        assert_eq!(deadline, at(15_000));
+
+        let mut fired_at = Vec::new();
+        for _ in 0..400 {
+            now += chrono::Duration::milliseconds(250);
+            let (fired, next_deadline) = poll_slot_deadline(now, deadline, FT8_SLOT_NS);
+            if fired {
+                fired_at.push(deadline);
+            }
+            deadline = next_deadline;
+        }
+
+        assert_eq!(
+            fired_at,
+            vec![
+                at(15_000),
+                at(30_000),
+                at(45_000),
+                at(60_000),
+                at(75_000),
+                at(90_000),
+            ],
+            "deadline sequence must land on exact 15s-aligned FT8 slot boundaries"
+        );
+    }
+
+    #[test]
+    fn mid_run_mode_change_to_ft4_shortens_the_next_deadline() {
+        // A runtime mode switch (Shift+M) flips `active_slot_ns` to FT4's
+        // 7.5s period. The very next deadline computed after the CURRENT
+        // deadline fires must reflect the shorter period immediately, not
+        // wait out a stale 15s interval.
+        let (fired, next_deadline) = poll_slot_deadline(at(15_000), at(15_000), FT4_SLOT_NS);
+        assert!(fired);
+        assert_eq!(
+            next_deadline,
+            at(22_500),
+            "must shorten to FT4's 7.5s cadence on the very next deadline, not 30_000"
+        );
+    }
+
+    #[test]
+    fn mid_run_mode_change_to_ft2_shortens_the_next_deadline() {
+        const FT2_SLOT_NS: i64 = 3_200_000_000;
+        let (fired, next_deadline) = poll_slot_deadline(at(15_000), at(15_000), FT2_SLOT_NS);
+        assert!(fired);
+        // 3.2s-period boundaries land at 0, 3.2, 6.4, ..., 12.8, 16.0s -- the
+        // next one strictly after 15.0s is 16.0s, not 15.0 + 3.2.
+        assert_eq!(next_deadline, at(16_000));
     }
 }
 
