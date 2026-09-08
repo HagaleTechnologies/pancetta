@@ -3418,6 +3418,68 @@ impl QsoManager {
             "Adaptive TX-offset action: {:.0} Hz -> {:.0} Hz",
             old_off, applied_hz
         );
+        // PAN-72 Fix A (Codex round 10, thread on `autonomous.rs:1829`): an
+        // operator-forced nudge of an autonomous self-CQ's `CallingCq` needs
+        // an IMMEDIATE one-shot retransmission at the new offset.
+        // `rearm_manual_calls_at`'s periodic cadence deliberately never
+        // re-sends a `CallingCq` for `CallInitiation::Auto` (its own
+        // `is_manual` guard — a separate, intentional design decision this
+        // fix does NOT touch), so without this the commit above would
+        // silently relocate the QSO with nothing ever sent at the new
+        // offset while `AutonomousOperator::current_cq_offset_hz` stays on
+        // the old one. This is a narrow, one-shot exception for a
+        // deliberate, operator-supervised action — never for a
+        // `StallDetected` origin, which is gated out below exactly like the
+        // silence-driven stall detector's own dormancy for an Auto
+        // `CallingCq` remains.
+        //
+        // Deliberately keyed on the CURRENT state only, not
+        // `CallInitiation`: for a MANUAL `CallingCq` this is a harmless
+        // redundant resend layered on top of the existing periodic cadence
+        // (the double-send guard below keeps it harmless).
+        let cq_retransmit = if origin.is_operator_forced() {
+            if matches!(progress.state, QsoState::CallingCq { .. }) {
+                // Reuse EXACTLY the same construction
+                // `rearm_manual_calls_at`'s own `QsoState::CallingCq { .. }
+                // if is_manual` arm uses — see that match block.
+                let message = MessageType::Cq {
+                    callsign: self.config.our_callsign.clone(),
+                    grid: self.config.our_grid.clone(),
+                };
+                let now = Utc::now();
+                // Double-send guard (Fix A, step 4): bump
+                // call_count/last_call_at exactly as `rearm_manual_calls_at`
+                // would after a normal resend, so the VERY NEXT rearm pass
+                // sees "at least one slot hasn't elapsed yet" and does not
+                // immediately re-fire a second resend on top of this one.
+                // This matters for a Manual `CallingCq` (which DOES get a
+                // periodic rearm); an Auto `CallingCq` never gets one
+                // regardless, so this bookkeeping is a no-op safety measure
+                // there — done unconditionally for consistency, so the two
+                // code paths can never silently diverge in behavior.
+                progress.metadata.call_count += 1;
+                progress.metadata.last_call_at = Some(now);
+                let raw_text = self.render_sent_text(&message);
+                progress.messages.push(QsoMessage {
+                    timestamp: now,
+                    direction: MessageDirection::Sent,
+                    message_type: message.clone(),
+                    raw_text,
+                    signal_strength: None,
+                    frequency: progress.metadata.frequency,
+                });
+                Some((
+                    message,
+                    progress.metadata.frequency,
+                    progress.metadata.tx_parity,
+                    progress.metadata.remote_origin,
+                ))
+            } else {
+                None
+            }
+        } else {
+            None
+        };
         // PAN-72 (Codex round 1 on PR #350, finding 7): announce the applied
         // move so the coordinator can rebuild the `ActiveQsosSnapshot` the TUI
         // banner and the remote gateway render from. That snapshot is
@@ -3432,6 +3494,19 @@ impl QsoManager {
             offset_hz: applied_hz,
         })
         .await;
+        // The one-shot CQ retransmission (if any), also emitted after the
+        // lock is released — same collect-then-emit-after-lock-drop pattern
+        // `rearm_manual_calls_at`'s own `to_recall` uses.
+        if let Some((message, frequency, tx_parity, remote_origin)) = cq_retransmit {
+            self.emit_event(QsoEvent::MessageToSend {
+                qso_id,
+                message,
+                frequency,
+                tx_parity,
+                remote_origin,
+            })
+            .await;
+        }
         Ok(applied_hz)
     }
 
@@ -9246,6 +9321,122 @@ mod tests {
         assert_eq!(
             after.metadata.pre_switch_offset, before.metadata.pre_switch_offset,
             "no pre-switch-offset bookkeeping may be written for a refused switch"
+        );
+    }
+
+    /// PAN-72 Fix A (Codex round 10, thread on `autonomous.rs:1829`): an
+    /// operator-forced nudge (`u` keypress) of an autonomous self-CQ's
+    /// `CallingCq` must actually retransmit the CQ at the new offset.
+    /// `rearm_manual_calls_at`'s periodic cadence deliberately never
+    /// re-sends a `CallingCq` for `CallInitiation::Auto` (an independent,
+    /// untouched design decision), so without this one-shot path the
+    /// commit above would silently relocate the QSO with nothing ever sent
+    /// at the new offset.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_retransmits_cq_for_an_operator_forced_auto_calling_cq() {
+        let manager = auto_manager(test_config());
+        let mut events = manager.subscribe();
+        let qso_id = manager.start_cq(1500.0, None, false).await.unwrap();
+        // Drain the initial CQ MessageToSend `start_cq` itself emits.
+        let _ = drain(&mut events);
+
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert!(
+            matches!(before.state, QsoState::CallingCq { .. }),
+            "precondition: an Auto self-CQ is a CallingCq"
+        );
+        assert_eq!(before.metadata.initiated_by, CallInitiation::Auto);
+        let call_count_before = before.metadata.call_count;
+        let last_call_at_before = before.metadata.last_call_at;
+
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, 1900.0, OffsetRelocationOrigin::OperatorForced)
+            .await
+            .expect("committing the operator-forced nudge");
+        assert_eq!(applied, 1900.0);
+
+        let events = drain(&mut events);
+        let mut saw_cq_at_new_offset = false;
+        for event in &events {
+            if let QsoEvent::MessageToSend {
+                message: MessageType::Cq { callsign, .. },
+                frequency,
+                ..
+            } = event
+            {
+                assert_eq!(callsign, "W1ABC");
+                assert_eq!(*frequency, 1900.0, "must retransmit at the NEW offset");
+                saw_cq_at_new_offset = true;
+            }
+        }
+        assert!(
+            saw_cq_at_new_offset,
+            "expected an immediate CQ retransmission at the new offset, got {events:?}"
+        );
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.call_count,
+            call_count_before + 1,
+            "call_count must be bumped exactly like a normal rearm resend \
+             (double-send guard)"
+        );
+        assert!(
+            after.metadata.last_call_at.is_some(),
+            "last_call_at must be stamped"
+        );
+        assert_ne!(
+            after.metadata.last_call_at, last_call_at_before,
+            "last_call_at must actually be updated, not left stale"
+        );
+    }
+
+    /// Regression companion (PAN-72 Fix A): the SAME call with a
+    /// STALL-triggered (not operator-forced) origin on an Auto `CallingCq`
+    /// must NOT retransmit anything. Proves this fix does not accidentally
+    /// reopen the protected `rearm_manual_calls_at` `is_manual` gate --
+    /// the silence-driven stall detector's dormancy for Auto self-CQs
+    /// remains exactly as it was.
+    #[tokio::test]
+    async fn apply_tx_offset_switch_does_not_retransmit_cq_for_a_stall_triggered_auto_calling_cq() {
+        let manager = auto_manager(test_config());
+        let mut events = manager.subscribe();
+        let qso_id = manager.start_cq(1500.0, None, false).await.unwrap();
+        let _ = drain(&mut events);
+
+        let before = manager.get_qso(qso_id).await.unwrap();
+        assert!(matches!(before.state, QsoState::CallingCq { .. }));
+        assert_eq!(before.metadata.initiated_by, CallInitiation::Auto);
+        let call_count_before = before.metadata.call_count;
+        let last_call_at_before = before.metadata.last_call_at;
+
+        let origin = OffsetRelocationOrigin::StallDetected {
+            raised_at_generation: before.metadata.advance_generation,
+        };
+        let applied = manager
+            .apply_tx_offset_switch(qso_id, 1900.0, origin)
+            .await
+            .expect("committing the stall-triggered switch");
+        assert_eq!(applied, 1900.0, "the relocation itself must still commit");
+
+        let events = drain(&mut events);
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, QsoEvent::MessageToSend { .. })),
+            "a STALL-triggered relocation on an Auto CallingCq must not \
+             emit any retransmission -- Auto self-CQs stay exactly as \
+             dormant as before this fix, got {events:?}"
+        );
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.call_count, call_count_before,
+            "call_count must be untouched by a non-operator-forced relocation"
+        );
+        assert_eq!(
+            after.metadata.last_call_at, last_call_at_before,
+            "last_call_at must be untouched by a non-operator-forced relocation"
         );
     }
 

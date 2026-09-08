@@ -3053,30 +3053,40 @@ fn map_recent_qso_outcome(
 /// the drain's commit-time refusal: the commit-time check is what keeps the
 /// engine correct, this one is what keeps the status line honest.
 ///
-/// PAN-72 round-8 redesign (fix 3, Codex round 8 finding 3): an autonomous
-/// self-CQ (`CallInitiation::Auto`, `QsoState::CallingCq`) is live and
-/// present in `active`/`live_qso_ids`, so without `auto_calling_cq_ids` it
-/// would be picked as an ordinary active-QSO target and routed through
-/// `pending_qso_offset_requests` (the `operator_forced` `Switch` path).
-/// But `QsoManager::rearm_manual_calls_at` only retransmits `CallingCq` for
-/// `CallInitiation::Manual` — Auto stays deliberately dormant there (a
-/// separate, intentional design decision this fix does NOT touch) — so that
-/// request would silently update metadata with no frame ever re-sent, while
-/// `AutonomousOperator::current_cq_offset_hz` stays on the old offset and
-/// gets reused by the next autonomous CQ attempt: the `u` key would do
-/// nothing visible for this state, while the status line and drain both
-/// report success.
+/// PAN-72 round-8 redesign (fix 3, Codex round 8 finding 3), SUPERSEDED by
+/// round 10's Fix A below: an autonomous self-CQ (`CallInitiation::Auto`,
+/// `QsoState::CallingCq`) is live and present in `active`/`live_qso_ids`, so
+/// without `auto_calling_cq_ids` it would be picked as an ordinary
+/// active-QSO target and routed through `pending_qso_offset_requests` (the
+/// `operator_forced` `Switch` path). But `QsoManager::rearm_manual_calls_at`
+/// only retransmits `CallingCq` for `CallInitiation::Manual` — Auto stays
+/// deliberately dormant there (a separate, intentional design decision this
+/// fix does NOT touch) — so that request used to silently update metadata
+/// with no frame ever re-sent, while `AutonomousOperator::current_cq_offset_
+/// hz` stayed on the old offset and got reused by the next autonomous CQ
+/// attempt: the `u` key did nothing visible for this state, while the status
+/// line and drain both reported success.
 ///
-/// The fix routes AROUND that gate instead of touching it, using the
-/// mechanism that already exists for exactly this job:
-/// `pending_cq_offset_nudge` — the same one-shot flag the "no active QSO"
-/// fallback below already sets, already wired end-to-end into
-/// `AutonomousOperator::decide_at` via `manual_switch_requested`. When the
-/// selected target's `QsoId` is in `auto_calling_cq_ids`, this function
-/// falls through to that same fallback instead of pushing a `Switch`. Every
-/// other target (an established QSO, or a Manual-initiated `CallingCq`,
-/// which DOES retransmit) keeps the `pending_qso_offset_requests` path
-/// unchanged.
+/// Round 8's fix routed AROUND that gate by falling through to
+/// `pending_cq_offset_nudge` instead — the same one-shot flag the "no active
+/// QSO" fallback below sets. Round 10's Fix A (Codex round 10, thread on
+/// `autonomous.rs:1829`) found that mechanism structurally could never fire
+/// for the exact case it existed for: `AutonomousOperator::decide_at` only
+/// consumes `manual_switch_requested` from its CQ-hunting branch, gated on
+/// `active_qso_count == 0` — and the `CallingCq` being nudged IS that one
+/// active QSO, so the count is never 0 while it's open. The flag was
+/// silently discarded by `decide_at`'s unconditional `mem::take` every time.
+///
+/// Fix A routes an auto-CQ target through `pending_qso_offset_requests`
+/// instead — the SAME path an ordinary target uses — relying on
+/// `QsoManager::apply_tx_offset_switch` (round 10) to supply the missing
+/// piece: when it commits an `OperatorForced` switch for a `CallingCq` QSO,
+/// it now ALSO emits a one-shot CQ retransmission at the new offset,
+/// independent of (and without touching) `rearm_manual_calls_at`'s own
+/// Manual-only periodic cadence. This is a narrow, project-owner-approved
+/// exception for a deliberate, one-shot, operator-supervised action — NOT a
+/// loosening of the protected `is_manual` gate, which stays exactly as it
+/// was for unsupervised, cadence-driven keep-calling.
 ///
 /// PAN-72 round-9 fix (Codex round 9, finding 2): does `progress`'s CURRENT
 /// state belong to the exact set `QsoManager::rearm_manual_calls_at`
@@ -3088,10 +3098,12 @@ fn map_recent_qso_outcome(
 ///
 /// `RespondingToCq` and `SendingReport` are eligible for EITHER initiation
 /// (`rearm_manual_calls_at` re-sends an autonomous pounce's call/report
-/// too, per SM-F6); `CallingCq` and `WaitingForReport` are Manual-only
-/// (an autonomous self-CQ's keep-calling is deliberately routed through the
-/// separate `pending_cq_offset_nudge` mechanism instead — see
-/// `auto_calling_cq_ids` above). Every other state (`WaitingForConfirmation`,
+/// too, per SM-F6); `CallingCq` and `WaitingForReport` are Manual-only in
+/// THIS predicate — `rearm_manual_calls_at`'s own periodic cadence still
+/// never re-sends an Auto `CallingCq`/`WaitingForReport`, unchanged. An Auto
+/// `CallingCq` is still selectable as a nudge target, just through the
+/// separate `auto_calling_cq_ids` set (Fix A, above), not through this
+/// predicate. Every other state (`WaitingForConfirmation`,
 /// `SendingConfirmation`, a contest-exchange state, `Idle`, terminal states,
 /// etc.) falls to `rearm_manual_calls_at`'s own `_ => continue` and is
 /// therefore NOT eligible here either.
@@ -3144,39 +3156,37 @@ fn resolve_nudge_tx_offset(
     });
     if let Some(key) = target {
         if let Ok(qso_id) = key.parse::<pancetta_qso::QsoId>() {
-            let is_auto_calling_cq = auto_calling_cq_ids.is_some_and(|ids| ids.contains(&qso_id));
-            if !is_auto_calling_cq {
-                // The combined predicate above already guarantees this
-                // branch is reached only when `rearm_eligible_ids` says so
-                // (or is `None`, preserving the pre-round-9 behavior) — no
-                // separate eligibility re-check needed here.
-                let current = active_tx_offsets
-                    .read()
-                    .ok()
-                    .and_then(|m| m.get(key).copied())
-                    .unwrap_or(1500.0);
-                if let Ok(mut pending) = pending_qso_offset_requests.lock() {
-                    // Operator-forced: no staleness token (PAN-72 finding 8).
-                    // The operator pressed `u` for the QSO as it stands right
-                    // now, so there is nothing for a later advance to supersede.
-                    pending.push(
-                        pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
-                            qso_id,
-                            pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: current },
-                        ),
-                    );
-                }
-                return NudgeOutcome::ActiveQso(qso_id);
+            // PAN-72 Fix A (Codex round 10, thread on `autonomous.rs:1829`):
+            // an autonomous self-CQ (`auto_calling_cq_ids`) is routed through
+            // this SAME `pending_qso_offset_requests` path now too, exactly
+            // like any other rearm-eligible target — see this function's doc
+            // comment for why round 8's CQ-nudge-fallback routing could never
+            // actually fire for the case it existed for, and how
+            // `QsoManager::apply_tx_offset_switch` now supplies the missing
+            // one-shot retransmission `rearm_manual_calls_at`'s Manual-only
+            // cadence deliberately never does for an Auto `CallingCq`. The
+            // combined predicate above already guarantees this branch is
+            // reached only when `rearm_eligible_ids` or `auto_calling_cq_ids`
+            // says so (or `rearm_eligible_ids` is `None`, preserving the
+            // pre-round-9 behavior) — no separate eligibility re-check
+            // needed here.
+            let current = active_tx_offsets
+                .read()
+                .ok()
+                .and_then(|m| m.get(key).copied())
+                .unwrap_or(1500.0);
+            if let Ok(mut pending) = pending_qso_offset_requests.lock() {
+                // Operator-forced: no staleness token (PAN-72 finding 8).
+                // The operator pressed `u` for the QSO as it stands right
+                // now, so there is nothing for a later advance to supersede.
+                pending.push(
+                    pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                        qso_id,
+                        pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz: current },
+                    ),
+                );
             }
-            // An autonomous self-CQ: fall through to the CQ-nudge fallback
-            // below instead — see this function's doc comment. Returned
-            // directly here (not via the "no live QSO" fallback further
-            // down) because a live QSO unambiguously DOES exist; this is
-            // the auto-CQ case's own dedicated routing, unrelated to
-            // whether some OTHER live QSO in the same snapshot happens to
-            // be ineligible.
-            pending_cq_offset_nudge.store(true, Ordering::Relaxed);
-            return NudgeOutcome::CqNudgeArmed;
+            return NudgeOutcome::ActiveQso(qso_id);
         }
     }
     // PAN-72 round-9 fix (Codex round 9, finding 2), preserved by Fix D:
@@ -3919,16 +3929,28 @@ mod tui_relay_tests {
         );
     }
 
-    /// PAN-72 round-8 redesign (fix 3, Codex round 8 finding 3): the target
-    /// is a live, active QSO AND an autonomous self-CQ (`CallInitiation::Auto`,
-    /// `QsoState::CallingCq`). Routing it through `pending_qso_offset_requests`
-    /// would silently update metadata with no frame ever re-sent, because
+    /// PAN-72 Fix A (Codex round 10, thread on `autonomous.rs:1829`),
+    /// superseding round 8's redesign: the target is a live, active QSO AND
+    /// an autonomous self-CQ (`CallInitiation::Auto`, `QsoState::CallingCq`).
+    /// Round 8 routed this through `pending_cq_offset_nudge` instead of
+    /// `pending_qso_offset_requests`, reasoning that
     /// `rearm_manual_calls_at` only retransmits `CallingCq` for
-    /// `CallInitiation::Manual`. The fix must fall through to the SAME
-    /// `pending_cq_offset_nudge` fallback the "no active QSO" case uses,
-    /// leaving `pending_qso_offset_requests` untouched.
+    /// `CallInitiation::Manual` — but round 10 found `pending_cq_offset_
+    /// nudge` structurally can never fire for this exact case (`decide_at`'s
+    /// CQ-hunting branch is gated on `active_qso_count == 0`, and the
+    /// `CallingCq` being nudged IS that one active QSO). Fix A routes an
+    /// auto-CQ target through the SAME `pending_qso_offset_requests` path as
+    /// any other target instead, relying on `QsoManager::
+    /// apply_tx_offset_switch`'s new one-shot retransmission (independent of
+    /// `rearm_manual_calls_at`'s own Manual-only cadence, which this fix does
+    /// NOT touch) to actually resend the CQ at the new offset.
+    ///
+    /// `rearm_eligible_ids: Some(empty)` isolates this: the only way this
+    /// target can match is through `auto_calling_cq_ids`, proving Fix A's
+    /// routing specifically, not the unrelated `rearm_eligible_ids: None`
+    /// pass-through convention another test covers.
     #[test]
-    fn nudge_routes_an_autonomous_self_cq_through_the_cq_nudge_fallback() {
+    fn nudge_forces_switch_for_an_autonomous_self_cq_too() {
         let qso_id = pancetta_qso::QsoId::new_v4();
         let key = crate::coordinator::active_tx_qso_key(&qso_id.to_string());
         let active: std::collections::HashSet<String> =
@@ -3940,13 +3962,15 @@ mod tui_relay_tests {
             std::collections::HashSet::from([qso_id]);
         let auto_calling_cq: std::collections::HashSet<pancetta_qso::QsoId> =
             std::collections::HashSet::from([qso_id]);
+        let rearm_eligible: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::new();
 
         let result = resolve_nudge_tx_offset(
             &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
             &active,
             Some(&live),
             Some(&auto_calling_cq),
-            None,
+            Some(&rearm_eligible),
             &active_tx_offsets,
             &pending_qso_offset_requests,
             &pending_cq_offset_nudge,
@@ -3954,18 +3978,26 @@ mod tui_relay_tests {
 
         assert_eq!(
             result,
-            NudgeOutcome::CqNudgeArmed,
-            "an autonomous self-CQ must be routed through the CQ-nudge \
-             fallback, not treated as an ordinary ActiveQso target"
+            NudgeOutcome::ActiveQso(qso_id),
+            "an autonomous self-CQ must now be nudged like an ordinary \
+             active QSO -- the CQ-nudge fallback could never actually fire \
+             for this case"
+        );
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1, "exactly one offset request queued");
+        assert_eq!(pending[0].qso_id, qso_id);
+        assert!(
+            matches!(
+                pending[0].action,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } if avoid_hz == 920.0
+            ),
+            "must be a Switch{{avoid_hz}} keyed off the QSO's CURRENT offset, got {:?}",
+            pending[0].action
         );
         assert!(
-            pending_qso_offset_requests.lock().unwrap().is_empty(),
-            "no offset request may be queued for an autonomous self-CQ -- \
-             the Auto/Manual retransmit gate would silently discard it"
-        );
-        assert!(
-            pending_cq_offset_nudge.load(Ordering::Relaxed),
-            "the CQ-hunting fallback flag must be set instead"
+            !pending_cq_offset_nudge.load(Ordering::Relaxed),
+            "the CQ-hunting fallback flag must NOT be set -- this QSO IS \
+             the active QSO being nudged, not a CQ-hunting cycle"
         );
     }
 
