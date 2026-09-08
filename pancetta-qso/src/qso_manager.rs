@@ -4033,6 +4033,35 @@ impl QsoManager {
                             // The decode frequency IS evidence here: it is the
                             // same number as our own TX offset.
                             if (pre.offset_hz - message.frequency).abs() <= rx_tolerance_hz {
+                                // PAN-72 round-12 P1 fix (Codex round 12,
+                                // thread on `qso_manager.rs:4047`): this
+                                // sub-case is exactly a rescued, unanswered
+                                // `CallingCq` — the caller's decoded frame
+                                // matched the vacated baseline, which is only
+                                // possible when there was no DX (and so no
+                                // `partner_freq`) to latch at switch time.
+                                // `apply_tx_offset_switch` deliberately left
+                                // `partner_freq` at `None` then (see its own
+                                // `their_callsign().is_some()` guard), but THIS
+                                // advance is the establishing one: a caller has
+                                // just answered on the offset we vacated. Latch
+                                // it now, or the next hint-recompute reads the
+                                // QSO's brand-new TX offset instead of where
+                                // the caller actually is, and a relocation
+                                // bigger than the decoder's narrow window
+                                // stalls the exchange right after rescuing it.
+                                //
+                                // Gated on `partner_freq` still being `None`
+                                // here — an already-established QSO (Hound, an
+                                // `o` hold, a de-conflict nudge, a passband
+                                // clamp) reaches this same sub-case with
+                                // `partner_freq` already latched to
+                                // `pre.offset_hz` by `apply_tx_offset_switch`
+                                // itself, and must come out of this block
+                                // exactly as that switch left it.
+                                if progress.metadata.partner_freq.is_none() {
+                                    progress.metadata.partner_freq = Some(pre.offset_hz);
+                                }
                                 pre.offset_hz
                             } else {
                                 current_hz
@@ -17117,6 +17146,107 @@ mod pan72_stall_detection_tests {
         );
     }
 
+    /// PAN-72 round-12 P1 fix (Codex round 12, thread on
+    /// `qso_manager.rs:4047`): the routing test above establishes the QSO but
+    /// never checks `partner_freq` — the piece this fix closes. An
+    /// unanswered `CallingCq`'s switch deliberately leaves `partner_freq`
+    /// `None` (there is no DX yet to latch it to), and the credit block
+    /// unconditionally clears `pre_switch_offset` once a genuine advance is
+    /// recognized. If it does not ALSO latch `partner_freq` to the offset the
+    /// caller actually answered on, the next `StateChanged` recomputes the
+    /// decoder hint from the QSO's brand-new TX offset instead — a caller who
+    /// has no way to know we moved keeps replying at the vacated offset, and
+    /// for a relocation bigger than the decoder's narrow window the rescue
+    /// stalls again immediately after succeeding.
+    #[tokio::test]
+    async fn an_advance_rescuing_the_pre_switch_cq_latches_the_callers_frequency() {
+        const CALLER: &str = "W9XYZ";
+
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config);
+        let qso_id = manager.start_cq_manual(FREQ, None, false).await.unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // Two silent rearm cycles: the second re-sends our CQ at FREQ and
+        // trips the stall threshold.
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(30))
+            .await;
+
+        let new_offset = FREQ + 400.0;
+        assert_eq!(
+            manager
+                .apply_tx_offset_switch(qso_id, new_offset, stall_origin(&manager, qso_id).await)
+                .await
+                .unwrap(),
+            new_offset
+        );
+        let switched = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            switched.metadata.partner_freq, None,
+            "precondition: an unanswered CallingCq's switch deliberately \
+             leaves partner_freq unset — there is no DX to latch it to yet"
+        );
+
+        // The caller who heard our PRE-switch CQ answers, still on the
+        // offset that CQ actually went out on — establishing the QSO.
+        manager
+            .process_message(
+                MessageType::CqResponse {
+                    calling_station: OUR.into(),
+                    responding_station: CALLER.into(),
+                    grid: Some("FN31".into()),
+                },
+                format!("{OUR} {CALLER} FN31"),
+                FREQ,
+                Some(-12.0),
+            )
+            .await
+            .unwrap();
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.state.their_callsign(),
+            Some(CALLER),
+            "precondition: the pre-switch answer establishes the QSO"
+        );
+        assert_eq!(
+            after.metadata.frequency, new_offset,
+            "precondition: we are now TX-ing on the new offset"
+        );
+        assert_eq!(
+            after.metadata.partner_freq,
+            Some(FREQ),
+            "the caller answered at {FREQ} Hz (the vacated offset) — \
+             partner_freq must latch there instead of staying None, or the \
+             decoder hint recentres onto our new TX offset instead of where \
+             the caller actually is"
+        );
+        // Mirrors `coordinator::qso::decoder_hint_freq_for` (a different
+        // crate, out of this fix's scope) without depending on it: that
+        // helper resolves the decoder hint as
+        // `partner_freq.or_else(|| state.frequency())`. With the latch, that
+        // now resolves to the caller's real frequency rather than the
+        // never-heard-from-there new TX offset.
+        let decoder_hint = after.metadata.partner_freq.or(after.state.frequency());
+        assert_eq!(
+            decoder_hint,
+            Some(FREQ),
+            "the decoder hint must resolve to the caller's actual frequency \
+             ({FREQ} Hz), not the new TX offset ({new_offset} Hz)"
+        );
+    }
+
     /// The pre-switch RX baseline is a bounded grace, not a permanent second
     /// window: once `PRE_SWITCH_OFFSET_GRACE` lapses, an answer at the
     /// abandoned offset is judged against the current offset again — otherwise
@@ -17216,6 +17346,20 @@ mod pan72_stall_detection_tests {
             Some(FREQ),
             "the DX answered the frame we sent on {FREQ} Hz — that, not the \
              never-transmitted {new_offset} Hz, is the proven offset"
+        );
+        // PAN-72 round-12 P1 fix, regression: this QSO was ALREADY
+        // established (`respond_to_cq_manual`) before the switch, so
+        // `apply_tx_offset_switch` itself latched `partner_freq = Some(FREQ)`
+        // at switch-commit time — `partner_freq` is non-`None` going into
+        // the credit block above. The CallingCq-rescue latch must not touch
+        // an already-established QSO's `partner_freq`; it must come out
+        // exactly as the switch left it.
+        assert_eq!(
+            after.metadata.partner_freq,
+            Some(FREQ),
+            "an already-established QSO's partner_freq must be left exactly \
+             as apply_tx_offset_switch latched it, untouched by the \
+             CallingCq-rescue latch"
         );
     }
 
