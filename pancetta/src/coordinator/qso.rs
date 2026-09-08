@@ -2546,6 +2546,36 @@ impl super::ApplicationCoordinator {
                 )
             }));
         }
+        // PAN-72 Fix E (Codex round 10, thread on `qso_manager.rs:6335`): the
+        // stall detector's combined "frame reached the air" check above
+        // accounts for the `TxPolicy` mute and the remote-arm gate, but not
+        // the TX worker's own pre-PTT Hamlib-specific hard-mute reasons (a
+        // Hamlib restart, the command loop not yet ready, an undelivered
+        // pending frequency/split command, or an in-flight Hamlib command —
+        // `tx_hard_mute_reason`, `coordinator/tx.rs`). During any of these a
+        // "rearmed" frame never reaches the air, so it must not count as
+        // stall evidence either — reuses the EXACT SAME atomics/handles that
+        // function's own call sites already read for the TX worker's pre-PTT
+        // check; no new state.
+        {
+            let tx_policy_for_hard_mute = self.tx_policy.clone();
+            let tx_restart_inhibit_for_hard_mute = self.tx_restart_inhibit.clone();
+            let hamlib_command_loop_ready_for_hard_mute = self.hamlib_command_loop_ready.clone();
+            let hamlib_pending_frequency_for_hard_mute = self.hamlib_pending_frequency.clone();
+            let hamlib_pending_split_for_hard_mute = self.hamlib_pending_split.clone();
+            let hamlib_command_in_flight_for_hard_mute = self.hamlib_command_in_flight.clone();
+            qso_manager.set_hamlib_hard_muted_source(std::sync::Arc::new(move || {
+                crate::coordinator::tx::tx_hard_mute_reason(
+                    &tx_policy_for_hard_mute,
+                    &tx_restart_inhibit_for_hard_mute,
+                    &hamlib_command_loop_ready_for_hard_mute,
+                    &hamlib_pending_frequency_for_hard_mute,
+                    &hamlib_pending_split_for_hard_mute,
+                    &hamlib_command_in_flight_for_hard_mute,
+                )
+                .is_some()
+            }));
+        }
 
         // Task 5 (QSOLogged/LoggedADIF): subscribe synchronously, before
         // `qso_manager` is moved into the spawned task below, so the WSJT-X

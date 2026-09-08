@@ -1040,6 +1040,34 @@ pub struct QsoManager {
     /// convention `tx_policy`'s private `Full` default uses.
     remote_tx_permitted: Arc<dyn Fn() -> bool + Send + Sync>,
 
+    /// "Is a rearmed frame currently blocked by a Hamlib-specific hard mute?"
+    /// — `pancetta::coordinator::tx::tx_hard_mute_reason(...).is_some()`, read
+    /// as a predicate.
+    ///
+    /// PAN-72 (Codex round 10, thread on `qso_manager.rs:6335`). The combined
+    /// "frame reaches the air" check in [`Self::rearm_manual_calls_at`]
+    /// already accounts for the global `tx_policy` mute (round 2) and the
+    /// remote-arm gate (round 7, `remote_tx_permitted` above), but neither of
+    /// those sees the TX worker's OWN pre-PTT Hamlib checks: a Hamlib
+    /// supervisor restart, the command loop not yet ready, an undelivered
+    /// pending frequency/split command, or an in-flight Hamlib command. A
+    /// "rearmed" frame never reaches the air during any of these, yet
+    /// `stall_cycles` was still incrementing as if the DX had ignored a real
+    /// transmission — after `qso_stall_switch_after` such cycles this could
+    /// relocate a QSO that was never actually unreachable, only temporarily
+    /// blocked by rig-control state.
+    ///
+    /// **This is not a TX gate and must never become one** — same convention
+    /// as `remote_tx_permitted` above: read-only evidence about whether a
+    /// frame reached the air, consulted solely to decide whether a rearm
+    /// cycle counts as stall evidence. The real fail-CLOSED gate stays
+    /// exactly where it is, in the TX worker.
+    ///
+    /// Defaults to a closure returning `false` ("not muted"), so unit tests
+    /// and any caller that never injects a source keep the pre-existing
+    /// (mode=FT8-byte-identical) behavior.
+    hamlib_hard_muted: Arc<dyn Fn() -> bool + Send + Sync>,
+
     /// Live length of one transmit slot in NANOSECONDS for the station's
     /// active protocol (FT8 → 15e9, FT4 → 7.5e9, FT2 → 3.2e9), shared from the
     /// coordinator's `active_slot_ns`.
@@ -1280,6 +1308,10 @@ impl QsoManager {
             // frame reached the air — the pre-existing behavior (see the
             // field's doc comment).
             remote_tx_permitted: Arc::new(|| true),
+            // Default "not muted": with no injected source, assume no
+            // Hamlib-specific hard mute is in effect — the pre-existing
+            // behavior (see the field's doc comment).
+            hamlib_hard_muted: Arc::new(|| false),
             // Default FT8 slot: with no injected source the rearm/stall
             // cadence is the historical 15 s (see the field's doc comment).
             active_slot_ns: Arc::new(std::sync::atomic::AtomicI64::new(DEFAULT_SLOT_NS)),
@@ -1339,6 +1371,22 @@ impl QsoManager {
     /// behaves exactly as before.
     pub fn set_remote_tx_permitted_source(&mut self, source: Arc<dyn Fn() -> bool + Send + Sync>) {
         self.remote_tx_permitted = source;
+    }
+
+    /// Share a predicate for "is a rearmed frame currently blocked by a
+    /// Hamlib-specific hard mute?" so the stall detector can tell "the DX
+    /// ignored us" apart from "the TX worker's own pre-PTT Hamlib checks
+    /// dropped every frame we rearmed".
+    ///
+    /// PAN-72 (Codex round 10, thread on `qso_manager.rs:6335`) — see the
+    /// `hamlib_hard_muted` field's doc comment, especially the note that this
+    /// is read-only evidence and never a TX gate. Pass a closure that
+    /// evaluates `pancetta::coordinator::tx::tx_hard_mute_reason(...).
+    /// is_some()` against the SAME atomics/handles the TX worker's own
+    /// pre-PTT check already reads. If never called, the manager keeps its
+    /// private "not muted" default and behaves exactly as before.
+    pub fn set_hamlib_hard_muted_source(&mut self, source: Arc<dyn Fn() -> bool + Send + Sync>) {
+        self.hamlib_hard_muted = source;
     }
 
     /// Share the coordinator's `active_slot_ns` atomic so the keep-calling
@@ -6227,6 +6275,15 @@ impl QsoManager {
         // never a TX gate.
         let remote_tx_permitted = (self.remote_tx_permitted)();
 
+        // PAN-72 Fix E (Codex round 10, thread on `qso_manager.rs:6335`): the
+        // THIRD independent "did this frame actually reach the air" check —
+        // the TX worker's own pre-PTT Hamlib hard-mute (restart, command loop
+        // not ready, an undelivered pending frequency/split command, or an
+        // in-flight Hamlib command). Read ONCE per pass, like `tx_policy` and
+        // `remote_tx_permitted` above. See the `hamlib_hard_muted` field's
+        // doc comment.
+        let hamlib_hard_muted = (self.hamlib_hard_muted)();
+
         {
             let mut qsos = self.qsos.write().await;
             for (&qso_id, progress) in qsos.iter_mut() {
@@ -6359,16 +6416,22 @@ impl QsoManager {
                 // was accumulated came from real transmissions and is still
                 // valid evidence once TX resumes.
                 //
-                // TWO independent gates can swallow it, and the frame has to
-                // clear BOTH before its silence means anything:
+                // THREE independent gates can swallow it, and the frame has
+                // to clear ALL of them before its silence means anything:
                 //   - the global TX policy hard mute (round 2, finding 5);
                 //   - for a `remote_origin` QSO only, the station-agent
                 //     armed-TX gate the TX worker applies to every
                 //     `TxOrigin::Remote` frame (round 7, finding 3). An arm
                 //     expiry or explicit disarm leaves `TxPolicy` untouched,
-                //     so the first check alone cannot see it.
-                let frame_reaches_the_air =
-                    !tx_muted && (!progress.metadata.remote_origin || remote_tx_permitted);
+                //     so the first check alone cannot see it;
+                //   - the TX worker's own pre-PTT Hamlib hard mute (round 10,
+                //     Fix E) — a Hamlib restart, the command loop not ready,
+                //     an undelivered pending frequency/split command, or an
+                //     in-flight Hamlib command. Neither of the first two
+                //     checks can see this either.
+                let frame_reaches_the_air = !tx_muted
+                    && !hamlib_hard_muted
+                    && (!progress.metadata.remote_origin || remote_tx_permitted);
                 if frame_reaches_the_air {
                     progress.metadata.stall_cycles =
                         progress.metadata.stall_cycles.saturating_add(1);
@@ -6826,6 +6889,7 @@ impl Clone for QsoManager {
             tx_freq_mode: Arc::clone(&self.tx_freq_mode),
             tx_policy: Arc::clone(&self.tx_policy),
             remote_tx_permitted: Arc::clone(&self.remote_tx_permitted),
+            hamlib_hard_muted: Arc::clone(&self.hamlib_hard_muted),
             // Arc-shared, deliberately: `start()` runs the rearm/stall loop on
             // this clone and must observe runtime mode switches (see the
             // field's doc comment).
@@ -15369,6 +15433,99 @@ mod pan72_stall_detection_tests {
             1,
             "a LOCAL QSO's frames are never armed-TX gated, so the arm state \
              must not affect its stall accounting"
+        );
+    }
+
+    /// PAN-72 Fix E (Codex round 10, thread on `qso_manager.rs:6335`): a
+    /// Hamlib-hard-muted rearm (a Hamlib restart, the command loop not yet
+    /// ready, an undelivered pending frequency/split command, or an
+    /// in-flight Hamlib command -- `pancetta::coordinator::tx::
+    /// tx_hard_mute_reason`) never reaches the air either, exactly like the
+    /// `TxPolicy`/remote-arm cases above, and must not be counted as stall
+    /// evidence.
+    #[tokio::test]
+    async fn a_hamlib_hard_muted_rearm_does_not_count_as_a_stall_cycle() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let mut manager = manager_auto(config);
+        let muted = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let muted_for_source = Arc::clone(&muted);
+        manager.set_hamlib_hard_muted_source(Arc::new(move || {
+            muted_for_source.load(std::sync::atomic::Ordering::Relaxed)
+        }));
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        // Four muted cycles -- twice the switch threshold -- must not tick
+        // stall_cycles at all.
+        for slot in 1..=4 {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+                .await;
+        }
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "a rearmed frame the Hamlib hard-mute dropped never went on the \
+             air, so the DX's silence is not evidence of a stall"
+        );
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.frequency,
+            FREQ,
+            "the QSO must still be on its original offset"
+        );
+
+        // Once the mute clears, stall accounting resumes from zero.
+        muted.store(false, std::sync::atomic::Ordering::Relaxed);
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15 * 5))
+            .await;
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "the first genuinely transmitted cycle after the mute clears counts"
+        );
+    }
+
+    /// The never-injected default (`Arc::new(|| false)`, i.e. "not muted")
+    /// must leave every existing stall_cycles-related test passing
+    /// unmodified -- the FT8/no-Hamlib-wiring-byte-identical check for this
+    /// fix specifically.
+    #[tokio::test]
+    async fn the_default_hamlib_hard_muted_source_never_suppresses_stall_counting() {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let manager = manager_auto(config); // no set_hamlib_hard_muted_source call
+        let qso_id = manager
+            .respond_to_cq_manual(DX.into(), FREQ, None)
+            .await
+            .unwrap();
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        manager
+            .rearm_manual_calls_at(opened_at + Duration::seconds(15))
+            .await;
+
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            1,
+            "with no Hamlib-mute source injected, stall counting must behave \
+             exactly as before this fix"
         );
     }
 
