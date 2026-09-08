@@ -777,6 +777,19 @@ fn revert_target_is_taken(
 /// bounded in practice by `max_concurrent_qsos` (default 1), but it is a real
 /// bug the moment that is raised.
 ///
+/// **The offset a successful `Switch`/`Revert` VACATES is reserved too**
+/// (round 12 P1 fix). Reserving only `applied_hz` left the offset a QSO just
+/// moved AWAY from free for the rest of the same batch, even though the
+/// `MessageToSend` that triggered the relocation went out on it and may not
+/// yet be superseded/consumed by the TX pipeline — a later request in the
+/// same batch could select it and collide with that still-pending frame,
+/// which the TX coalescer then resolves by dropping one of the two. This
+/// closes only the SAME-batch window; the cross-batch case (a brand-new
+/// request in the NEXT drain pass picking the vacated offset before the old
+/// frame has actually transmitted) needs real key/`TransmitComplete`
+/// feedback threaded into the allocator's exclusion set and is deliberately
+/// out of scope here — see the reservation site's own comment.
+///
 /// **Every OTHER live QSO's offset is hard-excluded too** (round 4, finding 1).
 /// `reserved_hz` alone covers only batch-mates, and the overwhelmingly common
 /// crowded-spectrum shape is several live QSOs of which exactly one is
@@ -1063,6 +1076,30 @@ async fn drain_pending_qso_offset_requests(
                 // once the commit succeeded, so a refused request never
                 // sterilizes a slot nothing is using.
                 reserved_hz.push(applied_hz);
+                // PAN-72 (Codex round 12, thread on `autonomous.rs:1069`): ALSO
+                // reserve the offset this commit just VACATED, for the
+                // remainder of this same batch. `current_hz` is the QSO's
+                // pre-switch offset, read from the `get_qso` snapshot above
+                // before `apply_tx_offset_switch` ran — the `MessageToSend`
+                // that triggered this relocation (the evidence the
+                // stall/nudge is reacting to) went out on it, and if the TX
+                // pipeline has not superseded or consumed that frame yet, a
+                // LATER request in this same batch (a different QSO's
+                // Switch/Revert) must not be allowed to select it out from
+                // under that still-pending frame — the TX coalescer would
+                // then resolve the collision by silently dropping one of the
+                // two frames.
+                //
+                // Scoped to the SAME batch on purpose: this does not close
+                // the cross-batch window, where a brand-new request in the
+                // NEXT drain pass could still pick this vacated offset before
+                // the old frame has actually gone out over the air. Closing
+                // that would need real key/`TransmitComplete` feedback
+                // threaded into the allocator's exclusion set — a larger
+                // undertaking than this fix, deliberately not attempted here.
+                if let Some(vacated_hz) = current_hz {
+                    reserved_hz.push(vacated_hz);
+                }
                 let key = super::active_tx_qso_key(&qso_id.to_string());
                 if let Ok(mut offsets) = active_tx_offsets.write() {
                     if let Some(slot) = offsets.get_mut(&key) {
@@ -4981,6 +5018,81 @@ mod drain_pending_qso_offset_requests_tests {
             (moved_to - OCCUPIED_HZ).abs() >= separation,
             "the re-resolved revert must also clear every OTHER live QSO's \
              offset, got {moved_to} Hz against an occupied {OCCUPIED_HZ} Hz"
+        );
+    }
+
+    /// PAN-72 round-12 P1 fix (Codex round 12, thread on `autonomous.rs:1069`):
+    /// a successful commit reserves only the offset it landed ON, not the one
+    /// it VACATED — so a LATER request in this same batch can select the
+    /// just-freed offset while the frame that went out there is still
+    /// pending, and the TX coalescer resolves that collision by dropping one
+    /// of the two frames.
+    ///
+    /// QSO A's revert vacates 1500 Hz by moving to a clear target; QSO B's
+    /// revert then targets exactly 1500 Hz, in the SAME batch. Without
+    /// reserving the vacated offset, `active_tx_offsets` no longer shows
+    /// 1500 Hz as occupied (A's entry was rewritten to its new offset) and
+    /// `reserved_hz` holds only A's new offset — so B's revert target reads
+    /// as free and commits straight onto it. With the fix, 1500 Hz is also in
+    /// `reserved_hz` after A's commit, so B's revert target reads as taken
+    /// and falls back to a fresh allocator pick instead.
+    #[tokio::test]
+    async fn a_same_batch_revert_excludes_an_offset_another_revert_just_vacated() {
+        const VACATED_HZ: f64 = 1500.0;
+        const A_NEW_TARGET_HZ: f64 = 1200.0;
+        let mut op = operator_with_live_allocator();
+        let qso_manager = manager();
+        let a = qso_manager.start_cq(VACATED_HZ, None, false).await.unwrap();
+        let b = qso_manager.start_cq(1900.0, None, false).await.unwrap();
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
+            (
+                crate::coordinator::active_tx_qso_key(&a.to_string()),
+                VACATED_HZ,
+            ),
+            (
+                crate::coordinator::active_tx_qso_key(&b.to_string()),
+                1900.0,
+            ),
+        ]));
+        let pending = std::sync::Mutex::new(vec![
+            // A first: its revert commits and vacates 1500 Hz.
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                a,
+                pancetta_qso::qso_manager::OffsetAction::Revert {
+                    target_hz: A_NEW_TARGET_HZ,
+                },
+            ),
+            // B second, in the SAME batch: its revert target is the offset A
+            // just vacated, which is otherwise a perfectly valid candidate.
+            pancetta_qso::qso_manager::OffsetActionRequest::operator_forced(
+                b,
+                pancetta_qso::qso_manager::OffsetAction::Revert {
+                    target_hz: VACATED_HZ,
+                },
+            ),
+        ]);
+
+        drain_pending_qso_offset_requests(
+            &mut op,
+            &qso_manager,
+            &pending,
+            &active_tx_offsets,
+            &auto_mode(),
+        )
+        .await;
+
+        let separation = op.min_own_separation_hz();
+        let a_offset = qso_manager.get_qso(a).await.unwrap().metadata.frequency;
+        let b_offset = qso_manager.get_qso(b).await.unwrap().metadata.frequency;
+        assert!(
+            (a_offset - A_NEW_TARGET_HZ).abs() < f64::EPSILON,
+            "precondition: A's revert lands on its clear target, got {a_offset} Hz"
+        );
+        assert!(
+            (b_offset - VACATED_HZ).abs() >= separation,
+            "B's revert must not land on the offset A just vacated in this \
+             same batch ({VACATED_HZ} Hz) while A's pre-revert frame there may \
+             still be pending — got {b_offset} Hz"
         );
     }
 
