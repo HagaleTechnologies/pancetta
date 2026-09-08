@@ -439,6 +439,53 @@ fn poll_slot_deadline(
     }
 }
 
+/// PAN-72 Fix B (Codex round 10, thread on `autonomous.rs:431`): wraps
+/// [`poll_slot_deadline`] with a staleness check on the `slot_ns` the
+/// CURRENTLY-tracked `deadline` was computed for.
+///
+/// `poll_slot_deadline` alone only recomputes the deadline once `now` has
+/// actually reached it -- if a runtime mode switch (Shift+M) changes
+/// `active_slot_ns` WHILE the loop is still waiting out an already-computed,
+/// longer, stale-mode deadline, that branch never runs at all: `now <
+/// deadline` short-circuits before `slot_ns` is ever consulted. A mode
+/// switch's effect on cadence was therefore delayed by up to one full STALE
+/// slot period instead of the new one.
+///
+/// Given `deadline_slot_ns` (the `slot_ns` the tracked `deadline` was
+/// actually computed for) and `current_slot_ns` (read fresh every poll,
+/// exactly as the call site already does), this recomputes `deadline`
+/// immediately -- via the same [`pancetta_core::slot::next_slot_start_with_period`]
+/// primitive -- the moment the two disagree, BEFORE deferring to
+/// `poll_slot_deadline`'s own due-time check. Returns `(fired,
+/// next_deadline, next_deadline_slot_ns)`; the caller tracks
+/// `next_deadline_slot_ns` across iterations exactly like `next_deadline`.
+///
+/// When `current_slot_ns` never changes, the mismatch check never trips and
+/// this reproduces `poll_slot_deadline`'s deadline sequence exactly --
+/// FT8-byte-identical (see `mode_aware_wrapper_is_a_no_op_when_slot_ns_
+/// never_changes`).
+fn poll_slot_deadline_mode_aware(
+    now: chrono::DateTime<chrono::Utc>,
+    deadline: chrono::DateTime<chrono::Utc>,
+    deadline_slot_ns: i64,
+    current_slot_ns: i64,
+) -> (bool, chrono::DateTime<chrono::Utc>, i64) {
+    let (deadline, deadline_slot_ns) = if current_slot_ns != deadline_slot_ns {
+        (
+            pancetta_core::slot::next_slot_start_with_period(
+                now,
+                chrono::Duration::zero(),
+                current_slot_ns,
+            ),
+            current_slot_ns,
+        )
+    } else {
+        (deadline, deadline_slot_ns)
+    };
+    let (fired, next_deadline) = poll_slot_deadline(now, deadline, current_slot_ns);
+    (fired, next_deadline, deadline_slot_ns)
+}
+
 /// Looks up the parked offset's CURRENT score in a
 /// [`pancetta_qso::frequency::PlacementSnapshot`]'s top-N `slices` (the
 /// NEAREST candidate whose `offset_hz` falls within half a bin width of
@@ -1760,16 +1807,27 @@ impl super::ApplicationCoordinator {
                     chrono::Duration::zero(),
                     active_slot_ns.load(Ordering::Relaxed),
                 );
+                // PAN-72 Fix B (Codex round 10, thread on `autonomous.rs:431`):
+                // the `slot_ns` value `next_slot_deadline` above was actually
+                // computed for. Tracked so a mode change occurring WHILE this
+                // loop is still waiting out an already-computed deadline is
+                // picked up on the very next poll rather than only once that
+                // stale deadline is reached -- see
+                // `poll_slot_deadline_mode_aware`.
+                let mut deadline_slot_ns = active_slot_ns.load(Ordering::Relaxed);
 
                 loop {
                     tokio::select! {
                         _ = slot_poll_interval.tick() => {
-                            let (slot_due, updated_slot_deadline) = poll_slot_deadline(
-                                chrono::Utc::now(),
-                                next_slot_deadline,
-                                active_slot_ns.load(Ordering::Relaxed),
-                            );
+                            let (slot_due, updated_slot_deadline, updated_deadline_slot_ns) =
+                                poll_slot_deadline_mode_aware(
+                                    chrono::Utc::now(),
+                                    next_slot_deadline,
+                                    deadline_slot_ns,
+                                    active_slot_ns.load(Ordering::Relaxed),
+                                );
                             next_slot_deadline = updated_slot_deadline;
+                            deadline_slot_ns = updated_deadline_slot_ns;
                             if slot_due {
                             // Report decoded spots to cqdx.io (never under
                             // `--replay` -- see `suppress_spot_reports`).
@@ -3226,6 +3284,95 @@ mod poll_slot_deadline_tests {
         // 3.2s-period boundaries land at 0, 3.2, 6.4, ..., 12.8, 16.0s -- the
         // next one strictly after 15.0s is 16.0s, not 15.0 + 3.2.
         assert_eq!(next_deadline, at(16_000));
+    }
+
+    /// PAN-72 Fix B (Codex round 10, thread on `autonomous.rs:431`): round
+    /// 9's tests above only exercise a mode change that lands EXACTLY when
+    /// the stale deadline fires (`now == deadline`). The real bug is a mode
+    /// change landing MID-WAIT, while `now < deadline` still holds --
+    /// `poll_slot_deadline` alone ignores `slot_ns` entirely on that branch,
+    /// so the loop would keep waiting out the stale, longer-mode deadline.
+    /// `poll_slot_deadline_mode_aware` must detect the `slot_ns` mismatch
+    /// and recompute immediately, on the very next poll, regardless of how
+    /// far from the stale deadline `now` still is.
+    #[test]
+    fn mid_wait_mode_change_shortens_the_deadline_before_it_would_have_fired() {
+        // Deadline computed for FT8 at an early poll: next boundary is 15s
+        // away, nowhere near due yet.
+        let now0 = at(1_000);
+        let deadline0 =
+            pancetta_core::slot::next_slot_start_with_period(now0, chrono::Duration::zero(), FT8_SLOT_NS);
+        assert_eq!(deadline0, at(15_000));
+
+        // A later poll, still well before the stale FT8 deadline, observes
+        // `active_slot_ns` has flipped to FT4 (a mid-wait Shift+M switch).
+        let now1 = at(5_000);
+        let (fired, next_deadline, next_deadline_slot_ns) =
+            poll_slot_deadline_mode_aware(now1, deadline0, FT8_SLOT_NS, FT4_SLOT_NS);
+
+        assert!(
+            !fired,
+            "not yet due under the new (shorter) cadence either -- 5s < 7.5s"
+        );
+        assert_eq!(
+            next_deadline,
+            at(7_500),
+            "must shrink immediately to the FT4-appropriate boundary rather \
+             than staying at the stale FT8 deadline (15s)"
+        );
+        assert_eq!(next_deadline_slot_ns, FT4_SLOT_NS);
+
+        // The next poll, once the new (shorter) deadline is actually due,
+        // fires and advances on the FT4 cadence from there.
+        let now2 = at(7_500);
+        let (fired2, next_deadline2, next_deadline_slot_ns2) =
+            poll_slot_deadline_mode_aware(now2, next_deadline, FT4_SLOT_NS, FT4_SLOT_NS);
+        assert!(fired2);
+        assert_eq!(next_deadline2, at(15_000), "advances by one FT4 slot (7.5s)");
+        assert_eq!(next_deadline_slot_ns2, FT4_SLOT_NS);
+    }
+
+    /// FT8-byte-identical companion: when `active_slot_ns` never changes,
+    /// `poll_slot_deadline_mode_aware`'s mismatch check never trips, so its
+    /// deadline sequence must be identical to plain `poll_slot_deadline`'s
+    /// (already proven FT8-exact by `ft8_cadence_unchanged_across_repeated_
+    /// 250ms_polls` above).
+    #[test]
+    fn mode_aware_wrapper_is_a_no_op_when_slot_ns_never_changes() {
+        let mut now = at(3_200);
+        let mut deadline = pancetta_core::slot::next_slot_start_with_period(
+            now,
+            chrono::Duration::zero(),
+            FT8_SLOT_NS,
+        );
+        let mut deadline_slot_ns = FT8_SLOT_NS;
+        assert_eq!(deadline, at(15_000));
+
+        let mut fired_at = Vec::new();
+        for _ in 0..400 {
+            now += chrono::Duration::milliseconds(250);
+            let (fired, next_deadline, next_deadline_slot_ns) =
+                poll_slot_deadline_mode_aware(now, deadline, deadline_slot_ns, FT8_SLOT_NS);
+            if fired {
+                fired_at.push(deadline);
+            }
+            deadline = next_deadline;
+            deadline_slot_ns = next_deadline_slot_ns;
+        }
+
+        assert_eq!(
+            fired_at,
+            vec![
+                at(15_000),
+                at(30_000),
+                at(45_000),
+                at(60_000),
+                at(75_000),
+                at(90_000),
+            ],
+            "unchanged slot_ns must reproduce the exact FT8-byte-identical \
+             deadline sequence"
+        );
     }
 }
 
