@@ -1745,9 +1745,21 @@ impl super::ApplicationCoordinator {
         // with whatever's most recently been sent, so this is correct
         // whether Qso started before or after this component. The tick
         // loop below re-reads it fresh via `.borrow().clone()` every
-        // cycle, not just once here. `apply_tx_offset_switch` doesn't read
-        // `tx_freq_mode`, so Task 8's disconnected-tx_freq_mode-Arc caveat
-        // is unrelated to this handle.
+        // cycle, not just once here.
+        //
+        // Round 11 correction: `apply_tx_offset_switch` DOES read
+        // `tx_freq_mode` as of Fix 5 (Codex round 10) -- this comment
+        // previously claimed otherwise, which is exactly how a real bug hid
+        // here. `start_qso_component` used to publish the clone onto
+        // `qso_manager_watch` BEFORE calling `set_tx_freq_mode_source` (and
+        // every other `set_*_source`), so every clone this task ever reads
+        // via `.borrow().clone()` had its `tx_freq_mode` (and every other
+        // injected atomic) permanently pinned to `QsoManager::new`'s private
+        // defaults -- `Hold`, refusing every offset switch outright,
+        // regardless of the coordinator's real `TxFreqMode`. Fixed by moving
+        // `send_replace` to after every setter in `start_qso_component`
+        // (qso.rs); see `qso_manager_watch_publishes_a_clone_with_injected_
+        // sources_not_defaults` (qso.rs) for the regression test.
         let qso_manager_watch = self.qso_manager_watch.subscribe();
         let auto_handle = {
             let shutdown = self.shutdown_signal.clone();

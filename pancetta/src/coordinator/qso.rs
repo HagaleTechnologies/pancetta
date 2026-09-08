@@ -2470,32 +2470,6 @@ impl super::ApplicationCoordinator {
         // in-flight QSOs after this component's task panics and dies. See
         // the field's doc-comment in mod.rs for why the clone stays valid.
         self.qso_manager_for_supervisor = Some(qso_manager.clone());
-        // PAN-72 critical-finding fix: also publish the fresh handle onto
-        // the watch channel so the (not respawned on a Qso-only restart)
-        // Autonomous task's drain can pick up this brand-new manager
-        // instead of staying pinned to whatever instance existed when it
-        // spawned.
-        //
-        // `send_replace`, NOT `send`: tokio's `watch::Sender::send` bails out
-        // with `Err` *without storing the value* whenever `receiver_count()`
-        // is 0, and this store MUST land unconditionally:
-        //   * On first startup `run()` awaits `start_qso_component` BEFORE
-        //     `start_autonomous_component` (the only `.subscribe()` site), so
-        //     there are genuinely zero receivers here -- a `send` would drop
-        //     the very first handle on the floor and every later
-        //     `subscribe()` would be seeded with `None`, leaving the whole
-        //     mid-QSO offset-switch feature inert until the first Qso-component
-        //     crash+restart.
-        //   * The same applies to a Qso restart that lands in the window
-        //     between the Autonomous task dying and its replacement
-        //     re-subscribing.
-        // `send_replace` has no receiver-count precondition: it always stores
-        // (and notifies whatever receivers exist), which is exactly the
-        // "latest handle is always readable via `subscribe()`" contract the
-        // field's doc comment in mod.rs promises.
-        let _ = self
-            .qso_manager_watch
-            .send_replace(Some(qso_manager.clone()));
         // Share the rig dial-frequency source so completed QSOs log the
         // real RF frequency (dial + audio offset), not the bare offset
         // (was producing ADIF FREQ ~0.001 / BAND 0MHZ).
@@ -2576,6 +2550,46 @@ impl super::ApplicationCoordinator {
                 .is_some()
             }));
         }
+
+        // PAN-72 critical-finding fix: also publish the fresh handle onto
+        // the watch channel so the (not respawned on a Qso-only restart)
+        // Autonomous task's drain can pick up this brand-new manager
+        // instead of staying pinned to whatever instance existed when it
+        // spawned.
+        //
+        // This MUST come after every `set_*_source` call above, not before:
+        // each setter does `self.field = new_arc`, reassigning a field on
+        // `qso_manager` to one of the coordinator's own live shared `Arc`s.
+        // `QsoManager::clone()` copies each field's `Arc` handle as it stood
+        // at clone time -- cloning before the setters run publishes a
+        // snapshot still holding whatever private default `Arc`s
+        // `QsoManager::new()` created (e.g. `tx_freq_mode` defaults to
+        // `Hold`), permanently disconnected from the coordinator's real
+        // shared atomics, because reassigning the field on the original
+        // `qso_manager` afterwards has no effect on a clone already taken.
+        // Publishing here, after every source injection, is what makes the
+        // clone the Autonomous task actually consumes carry the live state.
+        //
+        // `send_replace`, NOT `send`: tokio's `watch::Sender::send` bails out
+        // with `Err` *without storing the value* whenever `receiver_count()`
+        // is 0, and this store MUST land unconditionally:
+        //   * On first startup `run()` awaits `start_qso_component` BEFORE
+        //     `start_autonomous_component` (the only `.subscribe()` site), so
+        //     there are genuinely zero receivers here -- a `send` would drop
+        //     the very first handle on the floor and every later
+        //     `subscribe()` would be seeded with `None`, leaving the whole
+        //     mid-QSO offset-switch feature inert until the first Qso-component
+        //     crash+restart.
+        //   * The same applies to a Qso restart that lands in the window
+        //     between the Autonomous task dying and its replacement
+        //     re-subscribing.
+        // `send_replace` has no receiver-count precondition: it always stores
+        // (and notifies whatever receivers exist), which is exactly the
+        // "latest handle is always readable via `subscribe()`" contract the
+        // field's doc comment in mod.rs promises.
+        let _ = self
+            .qso_manager_watch
+            .send_replace(Some(qso_manager.clone()));
 
         // Task 5 (QSOLogged/LoggedADIF): subscribe synchronously, before
         // `qso_manager` is moved into the spawned task below, so the WSJT-X
@@ -9317,6 +9331,92 @@ mod respond_to_caller_admission_tests {
             "a stall-detected request must carry the QSO's advance generation \
              so a DX advance landing before the once-per-slot drain invalidates \
              it (PAN-72 finding 8)"
+        );
+    }
+
+    /// PAN-72 round 11 (P1 regression): `start_qso_component` used to call
+    /// `self.qso_manager_watch.send_replace(Some(qso_manager.clone()))`
+    /// BEFORE any `set_*_source` setter ran on `qso_manager`. Each setter
+    /// does `self.field = new_arc`, reassigning a field on the ORIGINAL
+    /// `qso_manager` -- which has no effect whatsoever on a clone already
+    /// taken, since each is an independent `Arc` handle by that point. So
+    /// the published clone's atomics (e.g. `tx_freq_mode`) stayed pinned to
+    /// `QsoManager::new`'s private defaults (`Hold`) forever, no matter what
+    /// the coordinator's real shared atomics later read.
+    ///
+    /// The Autonomous task (`autonomous.rs`) exclusively obtains its
+    /// `QsoManager` handle via `self.qso_manager_watch.subscribe()` +
+    /// `.borrow().clone()` -- confirmed at `autonomous.rs:1751` and `:2001`
+    /// -- never through `qso_manager_for_supervisor` or any other path. So
+    /// with the bug, `apply_tx_offset_switch`'s Hold re-check (Fix 5, Codex
+    /// round 10) refused EVERY offset switch in production, silently
+    /// disabling both stall-triggered relocation and operator `u`-nudges
+    /// end to end, despite this and every other mechanism already being
+    /// unit-tested in isolation.
+    ///
+    /// Existing unit tests never caught this because they either construct
+    /// a `QsoManager` directly and call `set_*_source` on the SAME instance
+    /// they read back from (no clone-then-publish step at all -- see
+    /// `qso_manager_watch_refresh_tests` in `autonomous.rs`), or they read
+    /// back through `qso_manager_for_supervisor` and manually
+    /// `set_tx_freq_mode_source` on THAT clone to work around the exact
+    /// staleness this test exists to catch (see the comment on
+    /// `manager.set_tx_freq_mode_source(...)` in the test above). Neither
+    /// path exercises the real "clone captured before injection, then
+    /// published" sequence `start_qso_component` actually runs.
+    ///
+    /// This test drives the REAL sequence: real `start_qso_component`, then
+    /// reads back through the EXACT channel Autonomous subscribes to, with
+    /// no manual re-pointing of any source. It fails on the pre-fix
+    /// ordering (`Err(OffsetActionHeld)` -- the clone's `tx_freq_mode` never
+    /// left its private `Hold` default) and passes once `send_replace` runs
+    /// after every `set_*_source` call.
+    #[tokio::test]
+    async fn qso_manager_watch_publishes_a_clone_with_injected_sources_not_defaults() {
+        let mut coordinator = test_coordinator().await;
+        coordinator.config.write().await.station.callsign = "K1TEST".to_string();
+        // The coordinator's real shared atomic -- Auto is what a normal
+        // operating station usually runs, and is the mode the stall
+        // detector and `u`-nudge both require to do anything at all.
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        coordinator.start_qso_component().await.unwrap();
+
+        // Mirror `autonomous.rs`'s ACTUAL consumption path exactly: fresh
+        // `.subscribe()` then `.borrow().clone()` -- no other accessor, no
+        // manual re-pointing of any `set_*_source`.
+        let manager = coordinator
+            .qso_manager_watch
+            .subscribe()
+            .borrow()
+            .clone()
+            .expect("start_qso_component must publish a manager onto the watch channel");
+
+        // The `qsos` map is a shared `Arc` regardless of clone timing, so
+        // seeding through this clone is unaffected by the bug either way.
+        let qso_id = manager
+            .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
+            .await
+            .expect("seeding the QSO");
+
+        let result = manager
+            .apply_tx_offset_switch(
+                qso_id,
+                1900.0,
+                pancetta_qso::qso_manager::OffsetRelocationOrigin::OperatorForced,
+            )
+            .await;
+
+        assert!(
+            result.is_ok(),
+            "the qso_manager_watch clone's tx_freq_mode must reflect the \
+             coordinator's live Auto setting injected by `set_tx_freq_mode_source`, \
+             not `QsoManager::new`'s private Hold default -- got {result:?}. An \
+             `Err(OffsetActionHeld)` here means `send_replace` is (again) \
+             publishing the clone before the `set_*_source` calls run."
         );
     }
 
