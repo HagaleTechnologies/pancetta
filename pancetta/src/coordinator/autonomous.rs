@@ -464,26 +464,50 @@ fn poll_slot_deadline(
 /// this reproduces `poll_slot_deadline`'s deadline sequence exactly --
 /// FT8-byte-identical (see `mode_aware_wrapper_is_a_no_op_when_slot_ns_
 /// never_changes`).
+///
+/// **Round-10 re-review fix**: due-ness against the CURRENTLY-tracked
+/// `deadline` is checked FIRST, before any mismatch-triggered recompute.
+/// `next_slot_start_with_period` always returns a value strictly greater
+/// than `now` by construction, so recomputing the deadline before checking
+/// due-ness would silently discard an already-earned fire whenever a mode
+/// mismatch is first observed on the EXACT SAME poll the old (stale)
+/// deadline became due -- deferring that fire by up to one full NEW-mode
+/// slot period, the same "cadence delayed by a stale deadline" bug class
+/// this wrapper exists to close, just triggered by a narrower coincidence.
+/// `poll_slot_deadline(now, deadline, current_slot_ns)`'s own due check
+/// depends only on `now < deadline` (never on which `slot_ns` recomputes
+/// what comes after), so calling it FIRST with the OLD `deadline` value
+/// correctly fires on an earned-but-stale deadline while still recomputing
+/// the NEXT deadline on the NEW cadence (`current_slot_ns`) -- see
+/// `mode_mismatch_discovered_exactly_when_the_stale_deadline_fires_still_
+/// fires`. Only once that call reports NOT yet due is it safe to perform
+/// the early mismatch-recompute for the still-waiting case (the original
+/// mid-wait bug this wrapper fixes).
 fn poll_slot_deadline_mode_aware(
     now: chrono::DateTime<chrono::Utc>,
     deadline: chrono::DateTime<chrono::Utc>,
     deadline_slot_ns: i64,
     current_slot_ns: i64,
 ) -> (bool, chrono::DateTime<chrono::Utc>, i64) {
-    let (deadline, deadline_slot_ns) = if current_slot_ns != deadline_slot_ns {
-        (
-            pancetta_core::slot::next_slot_start_with_period(
-                now,
-                chrono::Duration::zero(),
-                current_slot_ns,
-            ),
-            current_slot_ns,
-        )
-    } else {
-        (deadline, deadline_slot_ns)
-    };
     let (fired, next_deadline) = poll_slot_deadline(now, deadline, current_slot_ns);
-    (fired, next_deadline, deadline_slot_ns)
+    if fired {
+        // Already due (whether or not `slot_ns` also mismatched this same
+        // poll): fire now, adopting the current cadence for the deadline
+        // that follows -- never suppress an earned fire.
+        return (true, next_deadline, current_slot_ns);
+    }
+    if current_slot_ns != deadline_slot_ns {
+        // Not yet due under the OLD deadline, but the mode has changed --
+        // safe to shrink the deadline immediately now, since no fire is
+        // being discarded by doing so.
+        let next_deadline = pancetta_core::slot::next_slot_start_with_period(
+            now,
+            chrono::Duration::zero(),
+            current_slot_ns,
+        );
+        return (false, next_deadline, current_slot_ns);
+    }
+    (false, deadline, deadline_slot_ns)
 }
 
 /// Looks up the parked offset's CURRENT score in a
@@ -3380,6 +3404,49 @@ mod poll_slot_deadline_tests {
             "unchanged slot_ns must reproduce the exact FT8-byte-identical \
              deadline sequence"
         );
+    }
+
+    /// Round-10 re-review regression: a mode mismatch first observed on the
+    /// EXACT SAME poll the stale (old-cadence) deadline becomes due must
+    /// not suppress that earned fire. `next_slot_start_with_period` always
+    /// returns strictly-greater-than-`now`, so an early, due-ness-blind
+    /// recompute on mismatch would silently discard this fire and defer it
+    /// by up to one full new-mode slot period -- exactly the bug class this
+    /// wrapper exists to close, just triggered by a narrower coincidence.
+    ///
+    /// Mirrors what plain `poll_slot_deadline` already proves for this
+    /// exact instant in `mid_run_mode_change_to_ft4_shortens_the_next_
+    /// deadline` above (`poll_slot_deadline(at(15_000), at(15_000),
+    /// FT4_SLOT_NS)` fires and lands on `22_500`) -- the wrapper must
+    /// preserve that same outcome, not change it by recomputing early.
+    #[test]
+    fn mode_mismatch_discovered_exactly_when_the_stale_deadline_fires_still_fires() {
+        let (fired, next_deadline, next_deadline_slot_ns) =
+            poll_slot_deadline_mode_aware(at(15_000), at(15_000), FT8_SLOT_NS, FT4_SLOT_NS);
+        assert!(
+            fired,
+            "an already-due deadline must still fire even when a mode \
+             mismatch is discovered on the exact same poll"
+        );
+        assert_eq!(
+            next_deadline,
+            at(22_500),
+            "the NEXT deadline must adopt the NEW (FT4) cadence from the \
+             fire instant forward"
+        );
+        assert_eq!(next_deadline_slot_ns, FT4_SLOT_NS);
+    }
+
+    /// Companion: a poll landing AFTER the stale deadline (genuinely
+    /// overdue, not just exactly on it) in the same tick a mismatch is
+    /// discovered must also still fire, for the same reason.
+    #[test]
+    fn mode_mismatch_discovered_after_the_stale_deadline_is_overdue_still_fires() {
+        let (fired, next_deadline, next_deadline_slot_ns) =
+            poll_slot_deadline_mode_aware(at(15_250), at(15_000), FT8_SLOT_NS, FT4_SLOT_NS);
+        assert!(fired, "an overdue deadline must still fire");
+        assert_eq!(next_deadline, at(22_500));
+        assert_eq!(next_deadline_slot_ns, FT4_SLOT_NS);
     }
 }
 
