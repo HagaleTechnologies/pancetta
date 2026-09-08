@@ -1,5 +1,6 @@
 # pancetta wiki index
 
+- [What did the September 7 product assessment establish?](pages/product-assessment-2026-09-07.md) — current-source product fit, market alternatives, renderer/parser evidence, and qualification limits.
 - [pancetta — what is this and where do things live?](pages/overview.md) — pancetta is an autonomous FT8/FT4 ham-radio station in Rust: it decodes,
 - [How do operating modes (FT8/FT4/FT2, Hound) work?](pages/modes.md) — pancetta runs a single station-wide operating mode — FT8, FT4, or FT2 — chosen
 - [How does the QSO engine work and why is it shaped this way?](pages/qso-engine.md) — The QSO engine is the state machine in `pancetta-qso` that advances a contact
