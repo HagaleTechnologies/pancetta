@@ -3300,8 +3300,11 @@ mod poll_slot_deadline_tests {
         // Deadline computed for FT8 at an early poll: next boundary is 15s
         // away, nowhere near due yet.
         let now0 = at(1_000);
-        let deadline0 =
-            pancetta_core::slot::next_slot_start_with_period(now0, chrono::Duration::zero(), FT8_SLOT_NS);
+        let deadline0 = pancetta_core::slot::next_slot_start_with_period(
+            now0,
+            chrono::Duration::zero(),
+            FT8_SLOT_NS,
+        );
         assert_eq!(deadline0, at(15_000));
 
         // A later poll, still well before the stale FT8 deadline, observes
@@ -3328,7 +3331,11 @@ mod poll_slot_deadline_tests {
         let (fired2, next_deadline2, next_deadline_slot_ns2) =
             poll_slot_deadline_mode_aware(now2, next_deadline, FT4_SLOT_NS, FT4_SLOT_NS);
         assert!(fired2);
-        assert_eq!(next_deadline2, at(15_000), "advances by one FT4 slot (7.5s)");
+        assert_eq!(
+            next_deadline2,
+            at(15_000),
+            "advances by one FT4 slot (7.5s)"
+        );
         assert_eq!(next_deadline_slot_ns2, FT4_SLOT_NS);
     }
 
@@ -3904,12 +3911,30 @@ mod drain_pending_qso_offset_requests_tests {
     use super::*;
 
     /// Minimal manager config, mirroring `qso.rs`'s `replay_local_log_tests::manager()`.
+    ///
+    /// PAN-72 Fix C (Codex round 10): `apply_tx_offset_switch` now
+    /// re-validates `tx_freq_mode` inside its own commit lock (see
+    /// `QsoManagerError::OffsetActionHeld`), and `QsoManager::new`'s
+    /// never-injected default is `Hold` (the same safe-by-default convention
+    /// every other `set_*_source` field uses). This module's tests exercise
+    /// the DRAIN's own, separate Hold/Auto handling via the `tx_freq_mode`
+    /// atomic passed directly to `drain_pending_qso_offset_requests`
+    /// (`auto_mode`/`hold_mode` below) -- the manager's own internal atomic
+    /// must independently read Auto, mirroring how the real coordinator
+    /// wires the SAME atomic into both the manager and the drain
+    /// (`coordinator/qso.rs`), or every commit here would be refused by the
+    /// manager's private Hold default before the drain-level behavior under
+    /// test is ever reached.
     fn manager() -> pancetta_qso::QsoManager {
-        pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+        let mut m = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
             our_callsign: "W1ABC".to_string(),
             our_grid: Some("FN42".to_string()),
             ..Default::default()
-        })
+        });
+        m.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        m
     }
 
     /// An operator with the smart allocator actually live (Auto mode +
@@ -5267,12 +5292,22 @@ mod drain_pending_qso_offset_requests_tests {
 mod qso_manager_watch_refresh_tests {
     use super::*;
 
+    /// PAN-72 Fix C: see `drain_pending_qso_offset_requests_tests::manager`'s
+    /// doc comment -- these tests drive `apply_tx_offset_switch` via
+    /// `drain_auto_mode()`'s separate atomic, so the manager's own internal
+    /// `tx_freq_mode` must independently read Auto too, or its private Hold
+    /// default now refuses the commit before this module's actual subject
+    /// (the fresh-per-tick watch borrow) is ever exercised.
     fn manager() -> pancetta_qso::QsoManager {
-        pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
+        let mut m = pancetta_qso::QsoManager::new(pancetta_qso::QsoManagerConfig {
             our_callsign: "W1ABC".to_string(),
             our_grid: Some("FN42".to_string()),
             ..Default::default()
-        })
+        });
+        m.set_tx_freq_mode_source(std::sync::Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        m
     }
 
     fn hold_mode_operator() -> pancetta_qso::AutonomousOperator {

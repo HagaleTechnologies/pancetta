@@ -438,6 +438,20 @@ pub enum QsoManagerError {
         min_hz: f64,
         max_hz: f64,
     },
+
+    /// PAN-72 (Codex round 10, thread on `autonomous.rs:988`): the operator
+    /// switched TX-frequency mode to Hold AFTER a queued Switch/Revert was
+    /// raised but BEFORE this commit's write lock was acquired. The caller's
+    /// own Hold check (batch-level and per-request, in
+    /// `drain_pending_qso_offset_requests`) runs before the `.await` for the
+    /// lock, leaving a window in which the mode can flip underneath it.
+    /// Re-checked here, inside the same locked section that would otherwise
+    /// commit, so the two can never disagree. Expected, not a fault — Hold's
+    /// promise is that autonomous offset changes are suppressed, and this is
+    /// exactly that promise being kept a moment later than the caller alone
+    /// could guarantee.
+    #[error("TX-offset action for QSO {qso_id} refused — TX-frequency mode is Hold")]
+    OffsetActionHeld { qso_id: QsoId },
 }
 
 impl QsoManagerError {
@@ -454,6 +468,7 @@ impl QsoManagerError {
                 | QsoManagerError::OffsetActionStale { .. }
                 | QsoManagerError::OffsetActionNoOp { .. }
                 | QsoManagerError::OffsetActionOutsideHoundRegion { .. }
+                | QsoManagerError::OffsetActionHeld { .. }
         )
     }
 }
@@ -3175,8 +3190,14 @@ impl QsoManager {
     ///    and push automatic recovery out by another full
     ///    `qso_stall_switch_after` window, while `TxOffsetApplied` would
     ///    announce a move that never happened.
+    /// 5. **Hold mode, re-validated at commit time** (Codex round 10, thread
+    ///    on `autonomous.rs:988`). The caller's own Hold checks run before its
+    ///    `.await` for this method's write lock, so a contended lock leaves a
+    ///    window in which the operator's `f` press (Auto → Hold) lands after
+    ///    the caller's last check but before this commit — re-reading
+    ///    `tx_freq_mode` here, inside the same locked section, closes it.
     ///
-    /// All four refusals are expected outcomes, not faults — see
+    /// All five refusals are expected outcomes, not faults — see
     /// [`QsoManagerError::is_expected_offset_action_refusal`].
     ///
     /// `origin` is also what the known-good crediting site reads back off
@@ -3247,6 +3268,23 @@ impl QsoManager {
                 qso_id,
                 offset_hz: old_off,
             });
+        }
+        // 5. **Hold mode, re-validated inside this commit** (Codex round 10 on
+        //    PR #350, thread on `autonomous.rs:988`). The caller's own Hold
+        //    checks (`drain_pending_qso_offset_requests`'s batch-level and
+        //    per-request re-reads) run BEFORE the `.await` for this method's
+        //    write lock — a contended lock leaves a real window in which the
+        //    operator's `f` press (Auto → Hold) lands after the caller's last
+        //    check but before this commit runs. Re-checking here, inside the
+        //    SAME locked section that is about to mutate `progress`, closes
+        //    that window by construction rather than relying on the caller to
+        //    win a race against its own `.await`.
+        if !pancetta_core::TxFreqMode::from_u8(
+            self.tx_freq_mode.load(std::sync::atomic::Ordering::Relaxed),
+        )
+        .allows_auto_change()
+        {
+            return Err(QsoManagerError::OffsetActionHeld { qso_id });
         }
         progress.metadata.frequency = applied_hz;
         progress.metadata.pending_freq_drift = None;
@@ -6825,6 +6863,24 @@ mod tests {
         out
     }
 
+    /// A manager with TX-frequency mode explicitly Auto.
+    ///
+    /// PAN-72 Fix C (Codex round 10): `apply_tx_offset_switch` now
+    /// re-validates `tx_freq_mode` inside its own commit (see
+    /// `OffsetActionHeld`), and `QsoManager::new`'s never-injected default is
+    /// `Hold` (see the `tx_freq_mode` field's doc comment) — the same
+    /// convention every other `set_*_source` default follows. Direct
+    /// `apply_tx_offset_switch` callers in this module that are not
+    /// exercising Hold itself need Auto explicitly, exactly as production
+    /// callers get it from the coordinator's injected atomic.
+    fn auto_manager(config: QsoManagerConfig) -> QsoManager {
+        let mut m = QsoManager::new(config);
+        m.set_tx_freq_mode_source(Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        )));
+        m
+    }
+
     #[test]
     fn offset_action_switch_and_revert_are_distinct() {
         let switch = OffsetAction::Switch { avoid_hz: 1500.0 };
@@ -8911,7 +8967,7 @@ mod tests {
     /// apply_tx_offset_switch on a QSO updates frequency and resets stall_cycles.
     #[tokio::test]
     async fn apply_tx_offset_switch_updates_frequency_and_resets_stall_cycles() {
-        let manager = QsoManager::new(test_config());
+        let manager = auto_manager(test_config());
         let qso_id = manager
             .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
             .await
@@ -8950,7 +9006,7 @@ mod tests {
     /// would log the pre-switch offset.
     #[tokio::test]
     async fn apply_tx_offset_switch_updates_the_state_embedded_frequency_too() {
-        let manager = QsoManager::new(test_config());
+        let manager = auto_manager(test_config());
         let qso_id = manager
             .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
             .await
@@ -8984,7 +9040,7 @@ mod tests {
     /// the coordinator can mirror it into `active_tx_offsets`.
     #[tokio::test]
     async fn apply_tx_offset_switch_clamps_out_of_band_offsets() {
-        let manager = QsoManager::new(test_config());
+        let manager = auto_manager(test_config());
         let qso_id = manager
             .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
             .await
@@ -9025,7 +9081,7 @@ mod tests {
     /// defeating the point of reverting.
     #[tokio::test]
     async fn apply_tx_offset_switch_preserves_a_legitimate_high_reply_offset() {
-        let manager = QsoManager::new(test_config());
+        let manager = auto_manager(test_config());
         let qso_id = manager
             .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
             .await
@@ -9065,6 +9121,68 @@ mod tests {
             )
             .await;
         assert!(matches!(result, Err(QsoManagerError::QsoNotFound { .. })));
+    }
+
+    /// PAN-72 Fix C (Codex round 10, thread on `autonomous.rs:988`): the
+    /// Hold-mode check that gates a queued Switch/Revert currently happens
+    /// BEFORE the caller awaits `apply_tx_offset_switch`'s write-lock
+    /// acquisition. If the operator switches to Hold while that await is
+    /// blocked, the commit must still be refused -- `tx_freq_mode` is
+    /// re-checked INSIDE this method's own locked section, mirroring its
+    /// other in-lock guards (staleness, Hound region, no-op).
+    #[tokio::test]
+    async fn apply_tx_offset_switch_refuses_when_hold_flips_after_the_request_was_queued() {
+        let mut manager = QsoManager::new(test_config());
+        let tx_freq_mode = Arc::new(std::sync::atomic::AtomicU8::new(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+        ));
+        manager.set_tx_freq_mode_source(Arc::clone(&tx_freq_mode));
+
+        let qso_id = manager
+            .respond_to_cq_manual("K1DEF".to_string(), 14074000.0, None)
+            .await
+            .unwrap();
+        // The request was raised (queued) while the mode was still Auto --
+        // simulated here by simply calling `apply_tx_offset_switch` only
+        // AFTER the mode flips, which is exactly the race: the queueing
+        // decision and this commit are separated by an `.await` the operator
+        // can act inside.
+        tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Hold.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        let before = manager.get_qso(qso_id).await.unwrap();
+
+        let err = manager
+            .apply_tx_offset_switch(
+                qso_id,
+                14074000.0 + 500.0,
+                OffsetRelocationOrigin::OperatorForced,
+            )
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(&err, QsoManagerError::OffsetActionHeld { qso_id: id } if *id == qso_id),
+            "expected OffsetActionHeld, got {err:?}"
+        );
+        assert!(
+            err.is_expected_offset_action_refusal(),
+            "a Hold-mode race is an expected refusal, not a fault"
+        );
+
+        let after = manager.get_qso(qso_id).await.unwrap();
+        assert_eq!(
+            after.metadata.frequency, before.metadata.frequency,
+            "frequency must be completely unchanged"
+        );
+        assert_eq!(after.state.frequency(), before.state.frequency());
+        assert_eq!(after.metadata.stall_cycles, before.metadata.stall_cycles);
+        assert_eq!(
+            after.metadata.pre_switch_offset, before.metadata.pre_switch_offset,
+            "no pre-switch-offset bookkeeping may be written for a refused switch"
+        );
     }
 
     /// FIX 4: a manual QSO in SendingReport (we sent R, DX has not advanced)

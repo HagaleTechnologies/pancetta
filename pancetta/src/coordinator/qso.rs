@@ -9313,7 +9313,28 @@ mod respond_to_caller_admission_tests {
             .expect("registering a TUI channel");
 
         coordinator.start_qso_component().await.unwrap();
-        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // PAN-72 Fix C: apply_tx_offset_switch now re-validates tx_freq_mode
+        // inside its own commit lock, and the coordinator's real default is
+        // Hold (see the field's doc comment) -- this test drives the direct
+        // commit path outside the Auto-gated drain, so it must set Auto
+        // itself, exactly as the drain would have already confirmed before
+        // ever reaching this call in production.
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // `qso_manager_for_supervisor` is cloned INSIDE `start_qso_component`
+        // before `set_tx_freq_mode_source` reassigns the (moved-into-the-
+        // spawned-task) manager's `tx_freq_mode` to the coordinator's shared
+        // `Arc<AtomicU8>` -- so this clone's own `tx_freq_mode` field is
+        // still the manager's original Hold-default `Arc`, disconnected from
+        // `coordinator.tx_freq_mode` (see the identical re-pointing done by
+        // `tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_
+        // requests` above). Re-point it here so this clone's own
+        // `apply_tx_offset_switch` call observes the same Auto mode the real
+        // forwarder-attached manager does.
+        manager.set_tx_freq_mode_source(coordinator.tx_freq_mode.clone());
 
         let qso_id = manager
             .respond_to_cq_manual("K9ZZ".to_string(), 1500.0, None)
@@ -9448,7 +9469,28 @@ mod respond_to_caller_admission_tests {
             .expect("registering a TUI channel");
 
         coordinator.start_qso_component().await.unwrap();
-        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // PAN-72 Fix C: apply_tx_offset_switch now re-validates tx_freq_mode
+        // inside its own commit lock, and the coordinator's real default is
+        // Hold (see the field's doc comment) -- this test drives the direct
+        // commit path outside the Auto-gated drain, so it must set Auto
+        // itself, exactly as the drain would have already confirmed before
+        // ever reaching this call in production.
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // `qso_manager_for_supervisor` is cloned INSIDE `start_qso_component`
+        // before `set_tx_freq_mode_source` reassigns the (moved-into-the-
+        // spawned-task) manager's `tx_freq_mode` to the coordinator's shared
+        // `Arc<AtomicU8>` -- so this clone's own `tx_freq_mode` field is
+        // still the manager's original Hold-default `Arc`, disconnected from
+        // `coordinator.tx_freq_mode` (see the identical re-pointing done by
+        // `tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_
+        // requests` above). Re-point it here so this clone's own
+        // `apply_tx_offset_switch` call observes the same Auto mode the real
+        // forwarder-attached manager does.
+        manager.set_tx_freq_mode_source(coordinator.tx_freq_mode.clone());
         await_forwarder_subscribed(&coordinator, &manager).await;
 
         const CQ_HZ: f64 = 1500.0;
@@ -9574,7 +9616,28 @@ mod respond_to_caller_admission_tests {
             .expect("registering a TUI channel");
 
         coordinator.start_qso_component().await.unwrap();
-        let manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // PAN-72 Fix C: apply_tx_offset_switch now re-validates tx_freq_mode
+        // inside its own commit lock, and the coordinator's real default is
+        // Hold (see the field's doc comment) -- this test drives the direct
+        // commit path outside the Auto-gated drain, so it must set Auto
+        // itself, exactly as the drain would have already confirmed before
+        // ever reaching this call in production.
+        coordinator.tx_freq_mode.store(
+            pancetta_core::TxFreqMode::Auto.as_u8(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let mut manager = coordinator.qso_manager_for_supervisor.clone().unwrap();
+        // `qso_manager_for_supervisor` is cloned INSIDE `start_qso_component`
+        // before `set_tx_freq_mode_source` reassigns the (moved-into-the-
+        // spawned-task) manager's `tx_freq_mode` to the coordinator's shared
+        // `Arc<AtomicU8>` -- so this clone's own `tx_freq_mode` field is
+        // still the manager's original Hold-default `Arc`, disconnected from
+        // `coordinator.tx_freq_mode` (see the identical re-pointing done by
+        // `tx_offset_action_needed_event_is_forwarded_to_pending_qso_offset_
+        // requests` above). Re-point it here so this clone's own
+        // `apply_tx_offset_switch` call observes the same Auto mode the real
+        // forwarder-attached manager does.
+        manager.set_tx_freq_mode_source(coordinator.tx_freq_mode.clone());
         await_forwarder_subscribed(&coordinator, &manager).await;
 
         const DX_HZ: f64 = 1500.0;
