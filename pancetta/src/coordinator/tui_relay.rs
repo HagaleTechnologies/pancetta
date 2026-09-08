@@ -3125,35 +3125,31 @@ fn resolve_nudge_tx_offset(
     {
         return NudgeOutcome::HeldNoOp;
     }
-    // Skip past terminal/grace-window entries rather than stopping at the
-    // first key: with concurrent QSOs a completed one must never shadow a
-    // live one.
+    // PAN-72 Fix D (Codex round 10, thread on `tui_relay.rs:3134`): fold
+    // eligibility (round-9's rearm-eligible check, and round-8's auto-CQ
+    // check) into the SAME predicate the search uses for liveness, so it
+    // naturally continues past an ineligible live QSO to one that
+    // qualifies. The OLD code did `.find()` on liveness ALONE, then checked
+    // eligibility only on whatever arbitrary (`HashSet` iteration order)
+    // first live match came back — with two concurrent QSOs, one
+    // live-but-ineligible and one live-and-eligible, that could return
+    // `NoEligibleTarget` even though a perfectly good target existed,
+    // purely based on which key the set happened to visit first.
     let target = active.iter().find(|key| {
-        key.parse::<pancetta_qso::QsoId>()
-            .is_ok_and(|id| live_qso_ids.is_none_or(|live| live.contains(&id)))
+        key.parse::<pancetta_qso::QsoId>().is_ok_and(|id| {
+            live_qso_ids.is_none_or(|live| live.contains(&id))
+                && (rearm_eligible_ids.is_none_or(|ids| ids.contains(&id))
+                    || auto_calling_cq_ids.is_some_and(|ids| ids.contains(&id)))
+        })
     });
     if let Some(key) = target {
         if let Ok(qso_id) = key.parse::<pancetta_qso::QsoId>() {
             let is_auto_calling_cq = auto_calling_cq_ids.is_some_and(|ids| ids.contains(&qso_id));
             if !is_auto_calling_cq {
-                // PAN-72 round-9 fix (Codex round 9, finding 2): a live QSO
-                // whose CURRENT state `rearm_manual_calls_at` would never
-                // retransmit a frame for (its own `match` falls to `_ =>
-                // continue`) must not be reported as a successful nudge —
-                // the old code queued a `Switch` anyway, silently updating
-                // offset metadata with nothing ever transmitted at the new
-                // offset. `None` here (the caller couldn't build the set,
-                // e.g. the Qso component isn't up) preserves prior
-                // behavior, same convention as `live_qso_ids: None` above.
-                let is_rearm_eligible = rearm_eligible_ids.is_none_or(|ids| ids.contains(&qso_id));
-                if !is_rearm_eligible {
-                    // Deliberately NOT falling through to the CQ-nudge
-                    // fallback: that flag is for CQ-hunting, and arming it
-                    // here would silently consume `pending_cq_offset_nudge`
-                    // against an unrelated future CQ-hunting cycle while
-                    // implying something was armed for THIS QSO.
-                    return NudgeOutcome::NoEligibleTarget;
-                }
+                // The combined predicate above already guarantees this
+                // branch is reached only when `rearm_eligible_ids` says so
+                // (or is `None`, preserving the pre-round-9 behavior) — no
+                // separate eligibility re-check needed here.
                 let current = active_tx_offsets
                     .read()
                     .ok()
@@ -3173,8 +3169,31 @@ fn resolve_nudge_tx_offset(
                 return NudgeOutcome::ActiveQso(qso_id);
             }
             // An autonomous self-CQ: fall through to the CQ-nudge fallback
-            // below instead — see this function's doc comment.
+            // below instead — see this function's doc comment. Returned
+            // directly here (not via the "no live QSO" fallback further
+            // down) because a live QSO unambiguously DOES exist; this is
+            // the auto-CQ case's own dedicated routing, unrelated to
+            // whether some OTHER live QSO in the same snapshot happens to
+            // be ineligible.
+            pending_cq_offset_nudge.store(true, Ordering::Relaxed);
+            return NudgeOutcome::CqNudgeArmed;
         }
+    }
+    // PAN-72 round-9 fix (Codex round 9, finding 2), preserved by Fix D:
+    // the combined predicate above conflates "no live QSO at all" with
+    // "live QSOs exist but none are eligible" — both simply fail to match.
+    // Check `live_qso_ids` alone, separately, to tell them apart: only the
+    // former may fall through to the CQ-hunting fallback below.
+    let any_live = active.iter().any(|key| {
+        key.parse::<pancetta_qso::QsoId>()
+            .is_ok_and(|id| live_qso_ids.is_none_or(|live| live.contains(&id)))
+    });
+    if any_live {
+        // Deliberately NOT falling through to the CQ-nudge fallback: that
+        // flag is for CQ-hunting, and arming it here would silently consume
+        // `pending_cq_offset_nudge` against an unrelated future CQ-hunting
+        // cycle while implying something was armed for THIS QSO.
+        return NudgeOutcome::NoEligibleTarget;
     }
     pending_cq_offset_nudge.store(true, Ordering::Relaxed);
     NudgeOutcome::CqNudgeArmed
@@ -4124,6 +4143,78 @@ mod tui_relay_tests {
         );
 
         assert_eq!(result, NudgeOutcome::ActiveQso(qso_id));
+    }
+
+    /// PAN-72 Fix D (Codex round 10, thread on `tui_relay.rs:3134`): round
+    /// 9's Fix C added the eligibility check, but target SELECTION still did
+    /// `.find()` on liveness alone, checking eligibility only on whatever
+    /// arbitrary (`HashSet` iteration order) first live match came back. With
+    /// two concurrent live QSOs -- one ineligible
+    /// (`WaitingForConfirmation`-shaped: live, not rearm-eligible, not an
+    /// auto-CQ), one eligible (`SendingReport`-shaped) -- the function could
+    /// return `NoEligibleTarget` even though a perfectly good target exists,
+    /// purely based on which key the `HashSet` visited first.
+    ///
+    /// The fix folds eligibility into the SAME predicate the search uses, so
+    /// it naturally continues past an ineligible live QSO to one that
+    /// qualifies. This is deterministic BY CONSTRUCTION regardless of which
+    /// key `HashSet` iteration visits first -- exactly one of the two ids
+    /// satisfies the combined predicate, so `.find()` returns it no matter
+    /// which order the set is walked in.
+    #[test]
+    fn nudge_finds_the_eligible_qso_even_when_an_ineligible_one_shares_the_snapshot() {
+        let ineligible = pancetta_qso::QsoId::new_v4();
+        let eligible = pancetta_qso::QsoId::new_v4();
+        let ineligible_key = crate::coordinator::active_tx_qso_key(&ineligible.to_string());
+        let eligible_key = crate::coordinator::active_tx_qso_key(&eligible.to_string());
+        let active: std::collections::HashSet<String> =
+            std::collections::HashSet::from([ineligible_key.clone(), eligible_key.clone()]);
+        let active_tx_offsets = std::sync::RwLock::new(std::collections::HashMap::from([
+            (ineligible_key, 920.0),
+            (eligible_key, 1650.0),
+        ]));
+        let (pending_qso_offset_requests, pending_cq_offset_nudge) = nudge_fixture();
+        let live: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([ineligible, eligible]);
+        // Neither is an autonomous self-CQ.
+        let auto_calling_cq: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::new();
+        // Only `eligible` is one of `rearm_manual_calls_at`'s eligible states
+        // (e.g. `SendingReport`); `ineligible` (e.g. `WaitingForConfirmation`)
+        // is live but not rearm-eligible.
+        let rearm_eligible: std::collections::HashSet<pancetta_qso::QsoId> =
+            std::collections::HashSet::from([eligible]);
+
+        let result = resolve_nudge_tx_offset(
+            &tx_freq_mode_atomic(pancetta_core::TxFreqMode::Auto),
+            &active,
+            Some(&live),
+            Some(&auto_calling_cq),
+            Some(&rearm_eligible),
+            &active_tx_offsets,
+            &pending_qso_offset_requests,
+            &pending_cq_offset_nudge,
+        );
+
+        assert_eq!(
+            result,
+            NudgeOutcome::ActiveQso(eligible),
+            "must select the eligible QSO regardless of HashSet iteration \
+             order, never report NoEligibleTarget just because the \
+             ineligible one might be visited first"
+        );
+        let pending = pending_qso_offset_requests.lock().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].qso_id, eligible);
+        assert!(
+            matches!(
+                pending[0].action,
+                pancetta_qso::qso_manager::OffsetAction::Switch { avoid_hz } if avoid_hz == 1650.0
+            ),
+            "avoid_hz must be the ELIGIBLE QSO's own offset, got {:?}",
+            pending[0].action
+        );
+        assert!(!pending_cq_offset_nudge.load(Ordering::Relaxed));
     }
 
     /// An empty pending slot -- the common case (nothing carried over from
