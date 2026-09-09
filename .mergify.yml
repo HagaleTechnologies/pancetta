@@ -21,23 +21,25 @@
 # a queue tool with no concept of that label would silently defeat that
 # policy.
 #
-# Trusted-author gate (`author = thagale` OR `author = dependabot[bot]`):
-# this repo is public, and the ruleset this queue rule reports through has
+# Trusted-author gate (`author = thagale` OR `author =
+# catalyst-cloud-connector[bot]` OR `author = dependabot[bot]`): this repo
+# is public, and the ruleset this queue rule reports through has
 # `required_approving_review_count: 0` -- with no author condition here, ANY
 # outside contributor's PR that goes green on all three required checks
 # above would auto-queue and merge with zero human in the loop, exactly the
 # gap the now-deleted auto-merge.yml's own `author_association in (OWNER,
 # MEMBER, COLLABORATOR)` check existed to close. Mergify has no direct
 # equivalent of GitHub's `author_association` (no built-in "is this login a
-# collaborator" check), so `author = thagale` is the closest available
-# primitive: an exact-login match rather than a role lookup. Practical
-# effect is the same today -- `gh api
-# repos/HagaleTechnologies/pancetta/collaborators` lists exactly one
-# collaborator (thagale, admin) -- but the mechanism diverges once a second
-# trusted collaborator is ever added: their PRs will NOT auto-queue under
-# this condition and need either a manual `@Mergifyio queue` comment or this
-# line updated to an `or:` of logins (there is no Mergify list-of-values
-# shorthand for "any current repo collaborator" to fall back on instead).
+# collaborator" check), so an exact-login list is the closest available
+# primitive rather than a role lookup. `catalyst-cloud-connector[bot]`
+# (Catalyst Cloud's own PR author identity) is trusted equally to `thagale`
+# here -- CI/Codex review passing is the actual gate either way, the same
+# as it always was for a human author. The mechanism diverges once a
+# second trusted human collaborator is ever added: their PRs will NOT
+# auto-queue under this condition and need either a manual `@Mergifyio
+# queue` comment or this line updated to an `or:` of logins (there is no
+# Mergify list-of-values shorthand for "any current repo collaborator" to
+# fall back on instead).
 #
 # `author = dependabot[bot]` is included alongside the human-author case,
 # not a loophole in it: dependabot-auto-merge.yml's own classify step
@@ -66,6 +68,7 @@ pull_request_rules:
       - -label = needs-review
       - or:
           - author = thagale
+          - author = catalyst-cloud-connector[bot]
           - author = dependabot[bot]
       - "#review-threads-unresolved = 0"
       - check-success = CI
