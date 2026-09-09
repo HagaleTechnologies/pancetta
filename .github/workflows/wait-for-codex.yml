@@ -528,7 +528,14 @@ jobs:
             # assignment here would abort the whole step on the first gh
             # hiccup instead of ever reaching that classification).
             if ! poll=$(echo "$gh_poll_raw" | jq --arg since "$RUN_STARTED" --arg sha "$HEAD_SHA" '
-                def is_error_shaped: test("((quota|rate.?limit).{0,30}exceeded|exceeded.{0,30}(quota|rate.?limit)|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect)"; "i");
+                # "something went wrong" added (HAG-36): this file predated
+                # that phrasing, so error_head_tied below would silently stay
+                # 0 forever for the ref-not-found error (Codex Review:
+                # Something went wrong... Provided git ref <sha> does not
+                # exist) that the fail-fast check was added to catch --
+                # caught by a Codex review of the identical fix landing on
+                # coppa#106.
+                def is_error_shaped: test("((quota|rate.?limit).{0,30}exceeded|exceeded.{0,30}(quota|rate.?limit)|unable to (access|start|review)|cannot access|authentication (failed|error)|workspace error|failed to (access|clone|start)|create a codex account and connect|something went wrong)"; "i");
                 # Codex'"'"'s clean-pass response on a re-push can ALSO land as a
                 # plain issue comment (not a formal review, not a reaction) whose
                 # body embeds "**Reviewed commit:** `<10-hex-char prefix>`" — a
