@@ -3306,6 +3306,26 @@ impl QsoManager {
         }
     }
 
+    /// Read `qso_id`'s CURRENT remote-identity binding rather than trusting a
+    /// value captured before the caller released the `qsos` write lock — a
+    /// concurrent [`Self::rebind_remote_identity`] can change it in that
+    /// window, and acting on a stale snapshot afterward can misattribute a
+    /// reply's origin/client to the wrong controller (Codex P1, PR #362
+    /// round 17). Falls back to `snapshot` only if the QSO itself is gone by
+    /// the time this runs.
+    async fn current_remote_binding(
+        &self,
+        qso_id: QsoId,
+        snapshot: (bool, Option<String>),
+    ) -> (bool, Option<String>) {
+        self.qsos
+            .read()
+            .await
+            .get(&qso_id)
+            .map(|p| (p.metadata.remote_origin, p.metadata.remote_client_key_id.clone()))
+            .unwrap_or(snapshot)
+    }
+
     /// Re-send the most recent outbound message for a QSO.
     ///
     /// Looks up the QSO, finds the most-recent `Sent` message in its message
@@ -4443,13 +4463,24 @@ impl QsoManager {
         // QSO's own frequency and reuse the tx_parity latched at QSO start,
         // exactly as the initial-call MessageToSend does.
         if let Some(reply) = reply_to_emit {
+            // Re-read the remote binding here rather than trusting the
+            // pre-drop snapshot: a concurrent takeover can rebind this QSO's
+            // remote identity (`rebind_remote_identity`) and publish its own
+            // Remote resend in the window since the write lock was released
+            // above. Emitting the stale origin/client-id would misattribute
+            // this reply (e.g. advertise it as Local) and could let a later
+            // pivot/coalesce bypass the new client's arm gate (Codex P1,
+            // round 17).
+            let (remote_origin, remote_client_key_id) = self
+                .current_remote_binding(qso_id, (qso_remote_origin, qso_remote_client_key_id))
+                .await;
             self.emit_event(QsoEvent::MessageToSend {
                 qso_id,
                 message: reply,
                 frequency: qso_frequency,
                 tx_parity: qso_tx_parity,
-                remote_origin: qso_remote_origin,
-                remote_client_key_id: qso_remote_client_key_id,
+                remote_origin,
+                remote_client_key_id,
             })
             .await;
         }
@@ -19487,5 +19518,79 @@ mod timeout_config_tests {
     fn timeout_config_default_qso_stall_switch_after_is_4() {
         let config = TimeoutConfig::default();
         assert_eq!(config.qso_stall_switch_after, 4);
+    }
+}
+
+#[cfg(test)]
+mod current_remote_binding_tests {
+    //! Codex P1, PR #362 round 17: an auto-reply's origin/client-id used to
+    //! be captured from the `qsos` map before releasing the write lock, so a
+    //! takeover that rebinds the QSO's remote identity in the window before
+    //! the reply is actually emitted got silently overridden by that stale
+    //! snapshot. `current_remote_binding` re-reads live state at emission
+    //! time instead — these tests cover its two contracts directly (live
+    //! value wins; a vanished QSO falls back to the snapshot) rather than
+    //! trying to race the real async window, which isn't reproducible
+    //! deterministically.
+    use super::{
+        AutoSequenceConfig, DuplicateCheckConfig, HoundRegions, QsoId, QsoManager,
+        QsoManagerConfig, TimeoutConfig, default_active_mode,
+    };
+    use pancetta_core::slot::SlotParity;
+
+    fn test_config() -> QsoManagerConfig {
+        QsoManagerConfig {
+            our_callsign: "W1ABC".to_string(),
+            our_grid: Some("FN42".to_string()),
+            timeouts: TimeoutConfig::default(),
+            contest_mode: None,
+            auto_sequence: AutoSequenceConfig::default(),
+            duplicate_checking: DuplicateCheckConfig::default(),
+            hound: HoundRegions::default(),
+            active_mode: default_active_mode(),
+        }
+    }
+
+    #[tokio::test]
+    async fn live_binding_overrides_a_stale_snapshot() {
+        let manager = QsoManager::new(test_config());
+        let qso_id = manager
+            .respond_to_cq("K9XYZ".to_string(), 14074000.0, Some(SlotParity::Even))
+            .await
+            .unwrap();
+
+        // A locally-originated QSO starts with no remote binding at all.
+        let stale_snapshot = (false, None);
+        assert_eq!(
+            manager
+                .current_remote_binding(qso_id, stale_snapshot.clone())
+                .await,
+            (false, None)
+        );
+
+        // A concurrent takeover rebinds it to a new remote controller —
+        // simulating exactly the race the round-17 finding described.
+        manager
+            .rebind_remote_identity(qso_id, true, Some("newclient".to_string()))
+            .await;
+
+        // Reading with the OLD (pre-rebind) snapshot must still return the
+        // LIVE binding, not the stale value passed in.
+        assert_eq!(
+            manager.current_remote_binding(qso_id, stale_snapshot).await,
+            (true, Some("newclient".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn vanished_qso_falls_back_to_the_snapshot() {
+        let manager = QsoManager::new(test_config());
+        let bogus_id = QsoId::new_v4();
+        let snapshot = (true, Some("fallback-client".to_string()));
+
+        assert_eq!(
+            manager.current_remote_binding(bogus_id, snapshot.clone()).await,
+            snapshot
+        );
     }
 }
