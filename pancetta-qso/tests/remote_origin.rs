@@ -164,6 +164,75 @@ async fn repeated_manual_call_rebinds_the_existing_qso_to_the_new_controller() {
     );
 }
 
+/// Round-10 review (Codex P2): if client B repeats an accepted action for an
+/// A-bound QSO before B's own arm is actually in effect, the rebind must
+/// not charge that doomed resend to the manual-call budget — otherwise a
+/// handful of denied repeats (each rejected downstream at the TX layer)
+/// could exhaust `manual_call_max_calls` before B ever obtains a valid arm,
+/// permanently stalling the QSO for B too.
+#[tokio::test]
+async fn denied_rebound_resend_does_not_charge_the_call_budget() {
+    let mut manager = QsoManager::new(config());
+    // Nobody is ever TX-permitted in this test — simulates B's repeat
+    // landing before B's own arm takes effect.
+    manager.set_remote_tx_permitted_source(std::sync::Arc::new(|_: Option<&str>| false));
+    let mut rx = manager.subscribe();
+
+    let id_a = manager
+        .respond_to_cq_with(
+            "K9XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            None,
+            true,
+            Some("client-a".to_string()),
+        )
+        .await
+        .expect("respond_to_cq_with (client-a)");
+    let _ = first_message_to_send_remote_origin_and_client(&mut rx).await;
+
+    let call_count_before = manager
+        .get_qso(id_a)
+        .await
+        .expect("qso must exist")
+        .metadata
+        .call_count;
+
+    let id_b = manager
+        .respond_to_cq_with(
+            "K9XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Manual,
+            None,
+            true,
+            Some("client-b".to_string()),
+        )
+        .await
+        .expect("respond_to_cq_with (client-b)");
+    assert_eq!(id_a, id_b);
+
+    // No MessageToSend for the denied resend — draining with a short
+    // timeout should find nothing.
+    let drained = tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await;
+    assert!(
+        drained.is_err(),
+        "a resend the TX layer would deny anyway must not even be attempted"
+    );
+
+    let call_count_after = manager
+        .get_qso(id_a)
+        .await
+        .expect("qso must exist")
+        .metadata
+        .call_count;
+    assert_eq!(
+        call_count_before, call_count_after,
+        "a denied rebound resend must not charge the manual-call budget"
+    );
+}
+
 #[tokio::test]
 async fn remote_origin_persists_across_the_reply_ladder() {
     // The flag is latched in QsoMetadata at open, so EVERY subsequent

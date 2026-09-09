@@ -2922,6 +2922,17 @@ pub fn remote_tx_permitted_for(
 struct ArmSnapshot {
     tx_permitted: bool,
     armed_client_key_id: Option<String>,
+    /// Round-10 review (Codex P2): captured under the SAME lock as the
+    /// other two fields, so audit attribution for a denial this snapshot
+    /// decided can use this frozen value instead of re-locking the LIVE
+    /// `ArmState` later — the denial reporting this snapshot feeds is now
+    /// a detached `tokio::spawn`'d task, which can run arbitrarily later,
+    /// by which point a different operator (or the same one re-arming)
+    /// may have taken the arm. Re-locking at that point would attribute a
+    /// durable `TxDenied` record to whoever happens to be armed when the
+    /// task finally runs, not whoever was (or wasn't) armed when the
+    /// denial was actually decided.
+    operator_callsign: Option<String>,
 }
 
 impl ArmSnapshot {
@@ -2933,10 +2944,12 @@ impl ArmSnapshot {
             Ok(state) => Self {
                 tx_permitted: state.tx_permitted(now_ms),
                 armed_client_key_id: state.armed_client_key_id().map(str::to_string),
+                operator_callsign: state.operator_callsign().map(str::to_string),
             },
             Err(_) => Self {
                 tx_permitted: false,
                 armed_client_key_id: None,
+                operator_callsign: None,
             },
         }
     }
@@ -2963,6 +2976,18 @@ impl ArmSnapshot {
         self.tx_permitted
             && remote_client_key_id
                 .is_some_and(|id| self.armed_client_key_id.as_deref() != Some(id))
+    }
+
+    /// Round-10 review (Codex P2): mirrors [`tx_denied_operator_attribution`]'s
+    /// logic against this frozen snapshot instead of a fresh lock — see
+    /// this struct's `operator_callsign` field doc for why that matters
+    /// for detached denial reporting.
+    fn operator_attribution(&self, remote_client_key_id: Option<&str>) -> Option<String> {
+        if self.is_identity_mismatch(remote_client_key_id) {
+            None
+        } else {
+            self.operator_callsign.clone()
+        }
     }
 }
 
@@ -3706,7 +3731,6 @@ async fn coalesce_backlog_into(
         let message_bus = message_bus.clone();
         let audit_log = audit_log.clone();
         let display_feed_enabled = display_feed_enabled.clone();
-        let remote_tx_arm = remote_tx_arm.clone();
         let arm_snapshot = arm_snapshot.clone();
         tokio::spawn(async move {
             for entry in &identity_denied {
@@ -3741,10 +3765,12 @@ async fn coalesce_backlog_into(
                 audit_log.append(&pancetta_agent::audit::AuditEvent {
                     ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                     kind: pancetta_agent::audit::AuditKind::TxDenied,
-                    operator_callsign: tx_denied_operator_attribution(
-                        &remote_tx_arm,
-                        entry.remote_client_key_id.as_deref(),
-                    ),
+                    // Round-10 review (Codex P2): attribute from the
+                    // FROZEN snapshot, not a fresh lock — see
+                    // `ArmSnapshot::operator_callsign`'s doc for why this
+                    // detached task must not re-lock the live `ArmState`.
+                    operator_callsign: arm_snapshot
+                        .operator_attribution(entry.remote_client_key_id.as_deref()),
                     detail: denial_reason.clone(),
                 });
                 super::remote_gateway::relay_to_gateway(
@@ -12615,6 +12641,84 @@ mod remote_arm_gate_identity_tests {
         assert!(
             !remote_tx_permitted_for(&arm, NOW, Some("client-a")),
             "an unarmed station must deny regardless of the frame's bound identity"
+        );
+    }
+}
+
+#[cfg(test)]
+mod arm_snapshot_attribution_tests {
+    use super::ArmSnapshot;
+    use pancetta_agent::arm::{ArmState, VerifiedArmGrant};
+    use std::sync::{Arc, Mutex};
+
+    const NOW: i64 = 1_000_000;
+
+    fn grant_for(operator_callsign: &str, client_key_id: &str) -> VerifiedArmGrant {
+        VerifiedArmGrant {
+            operator_callsign: operator_callsign.to_string(),
+            ttl_ms: 120_000,
+            scope_tx: true,
+            jti: "tx-snapshot-test-jti".to_string(),
+            client_key_id: client_key_id.to_string(),
+        }
+    }
+
+    /// Round-10 review (Codex P2): a detached denial-reporting task must
+    /// attribute using the arm state AS IT WAS when the snapshot was taken,
+    /// not whoever happens to be armed by the time the task actually runs.
+    #[test]
+    fn attribution_reflects_the_snapshot_instant_not_a_later_live_lock() {
+        let mut st = ArmState::new();
+        st.arm(grant_for("K5ARH", "client-a"), NOW);
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+
+        let snapshot = ArmSnapshot::take(&arm, NOW);
+
+        // A DIFFERENT operator arms the live state AFTER the snapshot was
+        // taken — simulating the race a detached spawn's later re-lock
+        // would be vulnerable to.
+        arm.lock()
+            .unwrap()
+            .arm(grant_for("W1AW", "client-b"), NOW + 10);
+
+        assert_eq!(
+            snapshot.operator_attribution(Some("client-a")).as_deref(),
+            Some("K5ARH"),
+            "attribution must reflect who was armed AT THE SNAPSHOT INSTANT, \
+             not whoever armed later"
+        );
+    }
+
+    #[test]
+    fn identity_mismatch_never_attributes_to_the_armed_operator() {
+        let mut st = ArmState::new();
+        st.arm(grant_for("K5ARH", "client-a"), NOW);
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+        let snapshot = ArmSnapshot::take(&arm, NOW);
+
+        assert_eq!(
+            snapshot.operator_attribution(Some("client-b")),
+            None,
+            "a frame bound to a DIFFERENT client than the one armed must \
+             never be attributed to the armed operator"
+        );
+    }
+
+    #[test]
+    fn unbound_frame_attributes_to_whoever_is_armed() {
+        let mut st = ArmState::new();
+        st.arm(grant_for("K5ARH", "client-a"), NOW);
+        st.set_local_consent(true, NOW);
+        let arm = Arc::new(Mutex::new(st));
+        let snapshot = ArmSnapshot::take(&arm, NOW);
+
+        assert_eq!(
+            snapshot.operator_attribution(None).as_deref(),
+            Some("K5ARH"),
+            "a frame with no bound identity falls back to whoever is armed, \
+             preserving pre-PAN-91 attribution"
         );
     }
 }

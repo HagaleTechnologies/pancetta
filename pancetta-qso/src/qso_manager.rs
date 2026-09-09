@@ -2124,14 +2124,25 @@ impl QsoManager {
                     "Re-call of {} on {:.1} Hz — continuing existing QSO {} (idempotent keep-call, no new QSO)",
                     target_callsign, frequency, existing_id
                 );
+                // Round-10 review (Codex P2): decide whether this resend
+                // would even be attempted BEFORE rebinding/resending —
+                // checked here, not after, so a resend the TX layer would
+                // reject anyway never charges the manual-call budget.
+                // Mirrors the periodic rearm loop's `frame_reaches_the_air`
+                // gate (`rearm_manual_calls_at`) for the identical reason.
+                let should_resend =
+                    !remote_origin || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
                 // Round-3 review (Codex P2): rebind to whichever client's
                 // action was just accepted, BEFORE resending — see
                 // `rebind_remote_identity`'s doc.
                 self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
                     .await;
-                // Re-emit the QSO's most-recent outbound as a keep-call. This
-                // is a benign no-op if it somehow has no prior Sent message.
-                let _ = self.resend_last_tx(existing_id).await;
+                if should_resend {
+                    // Re-emit the QSO's most-recent outbound as a keep-call.
+                    // This is a benign no-op if it somehow has no prior Sent
+                    // message.
+                    let _ = self.resend_last_tx(existing_id).await;
+                }
                 return Ok(existing_id);
             }
         }
@@ -2423,11 +2434,18 @@ impl QsoManager {
                          current outbound (idempotent keep-call)",
                         target, step, existing_id
                     );
+                    // Round-10 review (Codex P2): decide before
+                    // rebinding/resending — see the analogous fix in
+                    // `respond_to_cq_with`'s idempotent keep-call branch.
+                    let should_resend = !remote_origin
+                        || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
                     // Round-3 review (Codex P2): rebind before resending —
                     // see `rebind_remote_identity`'s doc.
                     self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
                         .await;
-                    let _ = self.resend_last_tx(existing_id).await;
+                    if should_resend {
+                        let _ = self.resend_last_tx(existing_id).await;
+                    }
                     return Ok(existing_id);
                 }
             }
@@ -2461,11 +2479,18 @@ impl QsoManager {
                      grace window, re-sending existing QSO {}'s last frame",
                     target, step, existing_id
                 );
+                // Round-10 review (Codex P2): decide before
+                // rebinding/resending — see the analogous fix in
+                // `respond_to_cq_with`'s idempotent keep-call branch.
+                let should_resend =
+                    !remote_origin || (self.remote_tx_permitted)(remote_client_key_id.as_deref());
                 // Round-3 review (Codex P2): rebind before resending — see
                 // `rebind_remote_identity`'s doc.
                 self.rebind_remote_identity(existing_id, remote_origin, remote_client_key_id)
                     .await;
-                let _ = self.resend_last_tx(existing_id).await;
+                if should_resend {
+                    let _ = self.resend_last_tx(existing_id).await;
+                }
                 return Ok(existing_id);
             }
         }
