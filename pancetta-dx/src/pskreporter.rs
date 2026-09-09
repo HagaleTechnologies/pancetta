@@ -973,10 +973,52 @@ mod tests {
         assert_eq!(uploader.pending_count(), 1);
     }
 
-    /// PAN-108: the sender-info template's field specifiers must use
-    /// PSKReporter's published enterprise field IDs, not the pre-fix values
-    /// (which used the sender-template IDs 1/3/4/5 for what is actually the
-    /// receiver-info template, and field ID 2 instead of 5 for frequency).
+    /// Walks the IPFIX Sets following the 16-byte header and returns, per
+    /// Template Set encountered, the field IDs (enterprise bit masked off)
+    /// declared by its Template Record. Uses each Set's own declared length
+    /// to advance — never scans raw bytes — so it can't be fooled by
+    /// coincidental byte matches in the random export-time/session-id header
+    /// or in variable-length data payloads.
+    fn parse_template_field_ids(packet: &[u8]) -> Vec<Vec<u16>> {
+        let mut templates = Vec::new();
+        let mut pos = 16; // fixed IPFIX header size
+        while pos + 4 <= packet.len() {
+            let set_id = u16::from_be_bytes([packet[pos], packet[pos + 1]]);
+            let set_len = u16::from_be_bytes([packet[pos + 2], packet[pos + 3]]) as usize;
+            assert!(
+                set_len >= 4,
+                "Set at {pos} has implausible length {set_len}"
+            );
+            let set_end = pos + set_len;
+            assert!(set_end <= packet.len(), "Set at {pos} overruns packet");
+
+            if set_id == 2 {
+                // Template Record: template_id(2) + field_count(2), then per field:
+                // field_specifier(2) [+ enterprise_number(4) if the enterprise bit is set].
+                let mut p = pos + 4 + 2; // skip Set header (4) + Template ID (2)
+                let field_count = u16::from_be_bytes([packet[p], packet[p + 1]]);
+                p += 2;
+                let mut field_ids = Vec::new();
+                for _ in 0..field_count {
+                    let specifier = u16::from_be_bytes([packet[p], packet[p + 1]]);
+                    p += 4; // specifier(2) + field_length(2)
+                    if specifier & 0x8000 != 0 {
+                        p += 4; // enterprise_number
+                    }
+                    field_ids.push(specifier & 0x7FFF);
+                }
+                templates.push(field_ids);
+            }
+            pos = set_end;
+        }
+        templates
+    }
+
+    /// PAN-108: the receiver-info template (our station) and sender-info
+    /// template (the spotted station) must declare PSKReporter's published
+    /// enterprise field IDs, not the pre-fix values (which used the
+    /// sender-template IDs 1/3/4/5 for what is actually the receiver-info
+    /// template, and field ID 2 instead of 5 for frequency).
     #[test]
     fn test_field_ids_match_pskreporter_protocol() {
         let config = PskReporterUploadConfig {
@@ -997,32 +1039,18 @@ mod tests {
         });
 
         let packet = uploader.build_packet();
+        let templates = parse_template_field_ids(&packet);
 
-        // Enterprise-bit field specifiers (0x8000 | field_id) that must be
-        // present per https://pskreporter.info/pskdev.html.
-        let must_contain = [
-            0x8002u16, // receiverCallsign
-            0x8004u16, // receiverLocator
-            0x8008u16, // decoderSoftware
-            0x8009u16, // antennaInformation
-            0x8001u16, // senderCallsign
-            0x8005u16, // frequency
-            0x8006u16, // sNR
-            0x800Au16, // mode
-        ];
-        for field in must_contain {
-            let bytes = field.to_be_bytes();
-            assert!(
-                packet.windows(2).any(|w| w == bytes),
-                "packet missing field specifier {field:#06x}"
-            );
-        }
-
-        // The pre-fix senderLocator slot (ID=3) must be gone: it was only
-        // ever valid in the receiver-info template, which never used it.
-        assert!(
-            !packet.windows(2).any(|w| w == 0x8003u16.to_be_bytes()),
-            "packet still contains retired field specifier 0x8003 (senderLocator)"
+        assert_eq!(templates.len(), 2, "expected exactly two Template Sets");
+        assert_eq!(
+            templates[0],
+            vec![0x0002, 0x0004, 0x0008, 0x0009],
+            "receiver-info template (our station) has the wrong field IDs"
+        );
+        assert_eq!(
+            templates[1],
+            vec![0x0001, 0x0005, 0x0006, 0x000A, 0x0096],
+            "sender-info template (the spotted station) has the wrong field IDs"
         );
     }
 

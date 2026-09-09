@@ -167,7 +167,7 @@ impl super::ApplicationCoordinator {
                             if uploader.pending_count() > 0 {
                                 match uploader.flush().await {
                                     Ok(count) => {
-                                        info!("PSKReporter: uploaded {} spots", count);
+                                        info!("PSKReporter: sent {} spots (delivery unconfirmed)", count);
                                     }
                                     Err(e) => {
                                         warn!("PSKReporter upload failed: {}", e);
