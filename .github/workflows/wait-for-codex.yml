@@ -213,15 +213,21 @@ jobs:
             echo "stale=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Request re-review on a re-push
-        # Also fires on reopened (see the trigger-level comment above) and
-        # on any rerun (run_attempt > 1), not just synchronize: a
-        # maintainer rerunning a failed opened/ready_for_review attempt
-        # (e.g. after a transient Codex quota/auth error) reuses the SAME
-        # event and, without this, would reconstruct the same stale cutoff
-        # and rediscover the identical old error forever rather than asking
-        # Codex to look again (Codex P2, flagged reviewing this file).
-        if: github.event_name == 'pull_request_target' && steps.head-check.outputs.stale != 'true' && (github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1)
+      - name: Request a review
+        # Renamed from "Request re-review on a re-push" (2026-09-09): now fires
+        # unconditionally on every pull_request_target action, not just
+        # synchronize/reopened/rerun. Previously, opened/ready_for_review relied
+        # entirely on Codex's own native "reviews on open" GitHub trigger, with
+        # NO fallback here at all -- self-caught live, fleet-wide: org policy
+        # disabled that native auto-trigger permanently (see
+        # HagaleTechnologies/catalyst memory:
+        # project_codex_autotrigger_disabled_orgwide_20260908), so every
+        # opened/ready_for_review PR would now poll out the full 70-minute
+        # timeout for a signal that can never arrive. Posting this request
+        # unconditionally costs nothing on the already-working synchronize/
+        # reopened/rerun paths and fixes the now-permanent opened/ready_for_review
+        # gap the same way.
+        if: github.event_name == 'pull_request_target' && steps.head-check.outputs.stale != 'true'
         env:
           # Codex only auto-reviews on opened/ready_for_review, not on every
           # push (this repo's own AGENTS.md: "not every push. After a
@@ -393,18 +399,20 @@ jobs:
           REPO: ${{ github.repository }}
           PR: ${{ github.event.pull_request.number }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-          # reopened and a manual rerun (run_attempt>1) both post a fresh
-          # @codex review request (see the step above) — IS_SYNC drives the
-          # poll's re-review-vs-initial-review branch downstream, so it must
-          # recognize the same three cases the request step does, or a
-          # reopened/rerun round wrongly follows the initial-review branch:
-          # an unrelated fresh comment/reaction could satisfy the check
-          # without being tied to the new head, and a genuine clean
-          # re-review could fail on baselined threads it should auto-resolve
-          # instead (Codex P1, flagged reviewing this file — the reopened
-          # case; run_attempt extended proactively to close the identical
-          # gap there before it needed its own separate finding).
-          IS_SYNC: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.run_attempt > 1 }}
+          # Every action posts a fresh @codex review request now (see the step
+          # above, widened 2026-09-09 from synchronize/reopened/rerun-only to
+          # every pull_request_target action) — IS_SYNC drives the poll's
+          # re-review-vs-initial-review branch downstream, so it must recognize
+          # every case the request step does, or opened/ready_for_review would
+          # wrongly follow the loose initial-review branch below even though a
+          # request comment (and therefore a COMMENT_ID to tie comment_thumbsup/
+          # comment_head_tied against) now genuinely exists for them too. This
+          # was already true for the reopened/rerun cases before this widening
+          # (Codex P1, flagged reviewing this file — the reopened case;
+          # run_attempt extended proactively to close the identical gap there
+          # before it needed its own separate finding); opened/ready_for_review
+          # join them for the identical reason.
+          IS_SYNC: ${{ github.event.action == 'synchronize' || github.event.action == 'reopened' || github.event.action == 'opened' || github.event.action == 'ready_for_review' || github.run_attempt > 1 }}
           # Narrower than IS_SYNC on purpose: a reopened event or a rerun of
           # opened/ready_for_review has no new commit, so a clean re-review
           # of the SAME code must not auto-resolve baseline threads still
@@ -552,7 +560,6 @@ jobs:
               echo "::error::Non-transient error polling for a Codex signal — failing fast: $(cat /tmp/poll-err.log 2>/dev/null)"
               exit 1
             fi
-            comments=$(echo "$poll" | jq '.comments')
             comment_head_tied=$(echo "$poll" | jq '.comment_head_tied')
             error_comments=$(echo "$poll" | jq '.error_comments')
             reviews=$(echo "$poll" | jq '.reviews')
@@ -600,37 +607,42 @@ jobs:
               # do) could stay permanently poisoned by the first attempt's
               # failure even after Codex succeeds on the second (Codex P2,
               # flagged reviewing this file).
-              if [ "$comments" -gt 0 ] || [ "$reviews" -gt 0 ] || [ "$thumbsup" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ]; then
-                echo "Codex responded on this revision: comments=$comments reviews=$reviews thumbsup=$thumbsup comment_thumbsup=$comment_thumbsup"
+              #
+              # bare `comments -gt 0` REMOVED (self-caught live, 2026-09-09, via
+              # the identical bug on credenza's shared wait-for-codex-review.yml
+              # -- see HagaleTechnologies/catalyst memory:
+              # reference_codex_gate_nonsync_placeholder_comment_false_positive):
+              # Codex posts a "Codex Review Summary" placeholder comment (status:
+              # Running) within seconds of any review starting, well before the
+              # real review completes -- that placeholder is itself a non-error-
+              # shaped Codex comment, so a bare comment-count check can't
+              # distinguish "a review just started" from "a review finished."
+              # This also resolves the KNOWN LIMITATION previously noted here
+              # (a genuinely unrelated Codex comment, e.g. someone asking
+              # `@codex fix CI` while this gate waits, satisfying "any comment
+              # counts") -- comment_head_tied requires the comment's own text to
+              # name THIS HEAD_SHA specifically, which an unrelated comment
+              # won't. This branch is now only reachable when the "Request a
+              # review" step above couldn't post (no CODEX_REVIEW_PAT -- a fork
+              # PR, or Codex's now-disabled native trigger firing on its own).
+              if [ "$reviews" -gt 0 ] || [ "$thumbsup" -gt 0 ] || [ "$comment_thumbsup" -gt 0 ] || [ "$comment_head_tied" -gt 0 ]; then
+                echo "Codex responded on this revision: reviews=$reviews thumbsup=$thumbsup comment_thumbsup=$comment_thumbsup comment_head_tied=$comment_head_tied"
                 responded=1
                 break
               fi
               if [ "$error_comments" -gt 0 ]; then
                 # Codex replies with an issue comment for its own failures too
-                # (auth/workspace/quota/account-connection errors), which
-                # would otherwise satisfy the "any comment counts" condition
-                # above and turn this required check green with no actual
-                # review ever happening (Codex P2, flagged reviewing this
-                # file). Only reachable here (never on a re-push, see above)
-                # since this is the one branch that treats a bare comment as
-                # a success signal at all. Fail loudly and immediately rather
+                # (auth/workspace/quota/account-connection errors). This check
+                # no longer guards against those satisfying a bare "any comment
+                # counts" condition (removed above, 2026-09-09) -- it still
+                # matters because an error comment could otherwise sit
+                # unnoticed for the rest of the timeout with no other signal
+                # ever arriving (this branch's callers have no PAT to post a
+                # fresh request and retry). Fail loudly and immediately rather
                 # than either accepting it as success OR silently waiting out
                 # the remaining timeout for a different signal — Tony's own
                 # directive: don't waste wall-clock time on a wait that a
                 # Codex-reported error already tells us won't resolve itself.
-                #
-                # KNOWN LIMITATION, accepted not fixed: a fresh, genuinely
-                # unrelated Codex issue comment (e.g. someone asks
-                # `@codex fix CI` while this gate is waiting) would also
-                # satisfy the "any comment counts" condition above and pass
-                # as if it were a real review — this branch only guards
-                # against Codex's own documented error phrases, not against
-                # positively confirming a comment IS a completed review.
-                # Building a reliable positive classifier for "this comment
-                # proves a real review happened" is real ongoing work for
-                # marginal benefit on a low-traffic gate; revisit if an
-                # unrelated-comment false-pass is ever actually observed
-                # (flagged reviewing this file).
                 echo "::error::Codex reported an error (quota/auth/workspace/account-connection) instead of reviewing $HEAD_SHA — failing now rather than waiting out the remaining timeout. Re-run this check once the underlying Codex issue is resolved."
                 exit 1
               fi
