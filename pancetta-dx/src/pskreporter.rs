@@ -671,7 +671,10 @@ impl PskReporterUploader {
         packet.extend_from_slice(&self.sequence_number.to_be_bytes());
         packet.extend_from_slice(&self.session_id.to_be_bytes());
 
-        // --- Sender information descriptor (Template Set, ID=2) ---
+        // --- Receiver information descriptor (Template Set, ID=2) ---
+        // Describes fields about the station doing the receiving (us), per
+        // PSKReporter's published field IDs (https://pskreporter.info/pskdev.html):
+        // receiverCallsign=2, receiverLocator=4, decoderSoftware=8, antennaInformation=9.
         // Template Set header: Set ID=2, Length
         let sender_desc_start = packet.len();
         packet.extend_from_slice(&2u16.to_be_bytes()); // Set ID for template
@@ -679,20 +682,20 @@ impl PskReporterUploader {
                                                        // Template Record: ID=0x5002, field count=4
         packet.extend_from_slice(&0x5002u16.to_be_bytes()); // Template ID
         packet.extend_from_slice(&4u16.to_be_bytes()); // Field count
-                                                       // Field: senderCallsign (ID=1, PEN=30351, variable length)
-        packet.extend_from_slice(&(0x8001u16).to_be_bytes()); // Enterprise bit + ID 1
+                                                       // Field: receiverCallsign (ID=2, PEN=30351, variable length)
+        packet.extend_from_slice(&(0x8002u16).to_be_bytes()); // Enterprise bit + ID 2
         packet.extend_from_slice(&0xFFFFu16.to_be_bytes()); // Variable length
         packet.extend_from_slice(&30351u32.to_be_bytes()); // IANA PEN for PSKReporter
-                                                           // Field: senderLocator (ID=3, PEN=30351, variable length)
-        packet.extend_from_slice(&(0x8003u16).to_be_bytes());
-        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
-        packet.extend_from_slice(&30351u32.to_be_bytes());
-        // Field: decoderSoftware (ID=4, PEN=30351, variable length)
+                                                           // Field: receiverLocator (ID=4, PEN=30351, variable length)
         packet.extend_from_slice(&(0x8004u16).to_be_bytes());
         packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
         packet.extend_from_slice(&30351u32.to_be_bytes());
-        // Field: antennaInformation (ID=5, PEN=30351, variable length)
-        packet.extend_from_slice(&(0x8005u16).to_be_bytes());
+        // Field: decoderSoftware (ID=8, PEN=30351, variable length)
+        packet.extend_from_slice(&(0x8008u16).to_be_bytes());
+        packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
+        packet.extend_from_slice(&30351u32.to_be_bytes());
+        // Field: antennaInformation (ID=9, PEN=30351, variable length)
+        packet.extend_from_slice(&(0x8009u16).to_be_bytes());
         packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
         packet.extend_from_slice(&30351u32.to_be_bytes());
         // Patch sender descriptor length
@@ -700,19 +703,22 @@ impl PskReporterUploader {
         packet[sender_desc_start + 2..sender_desc_start + 4]
             .copy_from_slice(&sender_desc_len.to_be_bytes());
 
-        // --- Receiver information descriptor (Template Set, ID=2) ---
+        // --- Sender information descriptor (Template Set, ID=2) ---
+        // Describes fields about the spotted station's transmission, per
+        // PSKReporter's published field IDs: senderCallsign=1, frequency=5,
+        // sNR=6, mode=10.
         let rx_desc_start = packet.len();
         packet.extend_from_slice(&2u16.to_be_bytes());
         packet.extend_from_slice(&0u16.to_be_bytes()); // Length placeholder
                                                        // Template Record: ID=0x5003, field count=5
         packet.extend_from_slice(&0x5003u16.to_be_bytes());
         packet.extend_from_slice(&5u16.to_be_bytes());
-        // Field: senderCallsign (reused ID=1, PEN=30351, variable length)
+        // Field: senderCallsign (ID=1, PEN=30351, variable length)
         packet.extend_from_slice(&(0x8001u16).to_be_bytes());
         packet.extend_from_slice(&0xFFFFu16.to_be_bytes());
         packet.extend_from_slice(&30351u32.to_be_bytes());
-        // Field: frequency (ID=2, PEN=30351, 4 bytes)
-        packet.extend_from_slice(&(0x8002u16).to_be_bytes());
+        // Field: frequency (ID=5, PEN=30351, 4 bytes)
+        packet.extend_from_slice(&(0x8005u16).to_be_bytes());
         packet.extend_from_slice(&4u16.to_be_bytes());
         packet.extend_from_slice(&30351u32.to_be_bytes());
         // Field: sNR (ID=6, PEN=30351, 1 byte)
@@ -799,7 +805,7 @@ impl PskReporterUploader {
         let packet = self.build_packet();
 
         info!(
-            "Uploading {} reception reports to PSKReporter ({} bytes)",
+            "Sending {} reception reports to PSKReporter ({} bytes)",
             count,
             packet.len()
         );
@@ -821,7 +827,12 @@ impl PskReporterUploader {
 
         socket.send(&packet).await.map_err(DxError::Io)?;
 
-        info!("Successfully uploaded {} reports to PSKReporter", count);
+        // UDP is fire-and-forget: this only confirms the local socket write
+        // succeeded, not that PSKReporter's server received or accepted it.
+        info!(
+            "Sent {} reception reports to PSKReporter (delivery unconfirmed)",
+            count
+        );
         self.pending_reports.clear();
         Ok(count)
     }
@@ -960,6 +971,59 @@ mod tests {
         });
 
         assert_eq!(uploader.pending_count(), 1);
+    }
+
+    /// PAN-108: the sender-info template's field specifiers must use
+    /// PSKReporter's published enterprise field IDs, not the pre-fix values
+    /// (which used the sender-template IDs 1/3/4/5 for what is actually the
+    /// receiver-info template, and field ID 2 instead of 5 for frequency).
+    #[test]
+    fn test_field_ids_match_pskreporter_protocol() {
+        let config = PskReporterUploadConfig {
+            reporter_callsign: "W1ABC".to_string(),
+            reporter_grid: "FN42".to_string(),
+            antenna: "Dipole".to_string(),
+            software: "Pancetta/0.1".to_string(),
+            ..Default::default()
+        };
+        let mut uploader = PskReporterUploader::new(config);
+        uploader.add_report(ReceptionReport {
+            tx_callsign: "K1DEF".to_string(),
+            frequency: 14_074_000,
+            snr: Some(-5),
+            mode: "FT8".to_string(),
+            tx_grid: None,
+            timestamp: 1_600_000_000,
+        });
+
+        let packet = uploader.build_packet();
+
+        // Enterprise-bit field specifiers (0x8000 | field_id) that must be
+        // present per https://pskreporter.info/pskdev.html.
+        let must_contain = [
+            0x8002u16, // receiverCallsign
+            0x8004u16, // receiverLocator
+            0x8008u16, // decoderSoftware
+            0x8009u16, // antennaInformation
+            0x8001u16, // senderCallsign
+            0x8005u16, // frequency
+            0x8006u16, // sNR
+            0x800Au16, // mode
+        ];
+        for field in must_contain {
+            let bytes = field.to_be_bytes();
+            assert!(
+                packet.windows(2).any(|w| w == bytes),
+                "packet missing field specifier {field:#06x}"
+            );
+        }
+
+        // The pre-fix senderLocator slot (ID=3) must be gone: it was only
+        // ever valid in the receiver-info template, which never used it.
+        assert!(
+            !packet.windows(2).any(|w| w == 0x8003u16.to_be_bytes()),
+            "packet still contains retired field specifier 0x8003 (senderLocator)"
+        );
     }
 
     #[test]
