@@ -969,6 +969,11 @@ impl Default for DuplicateCheckConfig {
     }
 }
 
+/// Predicate for "would a Remote frame bound to this client (if any) be
+/// permitted to key PTT right now?" — see [`QsoManager::remote_tx_permitted`]'s
+/// doc comment.
+type RemoteTxPermittedSource = Arc<dyn Fn(Option<&str>) -> bool + Send + Sync>;
+
 /// QSO manager implementation
 pub struct QsoManager {
     /// Configuration
@@ -1065,7 +1070,14 @@ pub struct QsoManager {
     /// `true` ("assume the frame went out"), so unit tests and any caller that
     /// never injects a source keep the pre-existing behavior — the same
     /// convention `tx_policy`'s private `Full` default uses.
-    remote_tx_permitted: Arc<dyn Fn() -> bool + Send + Sync>,
+    ///
+    /// PAN-91 review follow-up: takes the QSO's own `remote_client_key_id` so
+    /// the evidence predicate matches the TX worker's actual identity-bound
+    /// gate (`remote_tx_permitted_for`) — a QSO bound to client A must not
+    /// read as "reached the air" just because client B happens to be armed.
+    /// `None` (a pre-PAN-91 remote_origin QSO with no bound identity) falls
+    /// back to the boolean-only check, exactly like the TX worker's own gate.
+    remote_tx_permitted: RemoteTxPermittedSource,
 
     /// "Is a rearmed frame currently blocked by a Hamlib-specific hard mute?"
     /// — `pancetta::coordinator::tx::tx_hard_mute_reason(...).is_some()`, read
@@ -1334,7 +1346,7 @@ impl QsoManager {
             // Default "permitted": with no injected source, assume a remote
             // frame reached the air — the pre-existing behavior (see the
             // field's doc comment).
-            remote_tx_permitted: Arc::new(|| true),
+            remote_tx_permitted: Arc::new(|_| true),
             // Default "not muted": with no injected source, assume no
             // Hamlib-specific hard mute is in effect — the pre-existing
             // behavior (see the field's doc comment).
@@ -1396,7 +1408,7 @@ impl QsoManager {
     /// arm also stops the silence being counted — the conservative direction).
     /// If never called, the manager keeps its private "permitted" default and
     /// behaves exactly as before.
-    pub fn set_remote_tx_permitted_source(&mut self, source: Arc<dyn Fn() -> bool + Send + Sync>) {
+    pub fn set_remote_tx_permitted_source(&mut self, source: RemoteTxPermittedSource) {
         self.remote_tx_permitted = source;
     }
 
@@ -6501,8 +6513,11 @@ impl QsoManager {
         // reads "TX allowed". Read ONCE per pass, like `tx_policy`, and
         // consulted below only for QSOs that are actually remote-origin. See
         // the `remote_tx_permitted` field's doc comment — read-only evidence,
-        // never a TX gate.
-        let remote_tx_permitted = (self.remote_tx_permitted)();
+        // never a TX gate. PAN-91 review follow-up: evaluated PER-QSO below
+        // (not once per pass) since it now takes the QSO's own bound client
+        // identity — a QSO bound to client A must not read as reached-the-air
+        // just because client B happens to be armed.
+        let remote_tx_permitted = &self.remote_tx_permitted;
 
         // PAN-72 Fix E (Codex round 10, thread on `qso_manager.rs:6335`): the
         // THIRD independent "did this frame actually reach the air" check —
@@ -6660,7 +6675,8 @@ impl QsoManager {
                 //     checks can see this either.
                 let frame_reaches_the_air = !tx_muted
                     && !hamlib_hard_muted
-                    && (!progress.metadata.remote_origin || remote_tx_permitted);
+                    && (!progress.metadata.remote_origin
+                        || remote_tx_permitted(progress.metadata.remote_client_key_id.as_deref()));
                 if frame_reaches_the_air {
                     progress.metadata.stall_cycles =
                         progress.metadata.stall_cycles.saturating_add(1);
@@ -16107,6 +16123,63 @@ mod pan72_stall_detection_tests {
         (qso_id, armed)
     }
 
+    /// Like [`remote_qso_with_arm`], but the QSO is bound to an explicit
+    /// client keyId (PAN-91 review follow-up: exercises the identity-bound
+    /// stall-evidence predicate, not just the boolean one).
+    async fn remote_qso_bound_to(manager: &QsoManager, client_key_id: &str) -> QsoId {
+        manager
+            .respond_to_cq_with(
+                DX.into(),
+                FREQ,
+                None,
+                CallInitiation::Manual,
+                None,
+                true, // remote_origin
+                Some(client_key_id.to_string()),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// PAN-91 review follow-up: a QSO bound to client-a must not count a
+    /// rearm cycle as reaching the air just because client-b is currently
+    /// armed — the stall-evidence predicate must check the SAME client
+    /// identity the TX worker's actual gate binds to, not just "is anyone
+    /// armed".
+    #[tokio::test]
+    async fn a_qso_bound_to_a_different_client_than_the_one_armed_does_not_count_as_reaching_the_air(
+    ) {
+        let mut config = test_config();
+        config.timeouts.qso_stall_switch_after = 2;
+        let mut manager = manager_auto(config);
+        let qso_id = remote_qso_bound_to(&manager, "client-a").await;
+        // Simulate the real gate: only "client-b" is armed.
+        manager.set_remote_tx_permitted_source(Arc::new(|client_key_id: Option<&str>| {
+            client_key_id == Some("client-b")
+        }));
+        let opened_at = manager
+            .get_qso(qso_id)
+            .await
+            .unwrap()
+            .metadata
+            .last_call_at
+            .unwrap();
+
+        for slot in 1..=4 {
+            manager
+                .rearm_manual_calls_at(opened_at + Duration::seconds(15 * slot))
+                .await;
+        }
+
+        assert_eq!(
+            manager.get_qso(qso_id).await.unwrap().metadata.stall_cycles,
+            0,
+            "client-a's frame is denied by the identity-bound gate even \
+             though client-b is armed — it never reaches the air, so this \
+             must not count as stall evidence"
+        );
+    }
+
     #[tokio::test]
     async fn a_disarmed_remote_qso_does_not_count_rearm_cycles_as_stalls() {
         let mut config = test_config();
@@ -16116,7 +16189,7 @@ mod pan72_stall_detection_tests {
         // 2's `tx_policy` check cannot see.
         let (qso_id, armed) = remote_qso_with_arm(&manager).await;
         let armed_for_source = Arc::clone(&armed);
-        manager.set_remote_tx_permitted_source(Arc::new(move || {
+        manager.set_remote_tx_permitted_source(Arc::new(move |_| {
             armed_for_source.load(std::sync::atomic::Ordering::Relaxed)
         }));
         let mut rx = manager.subscribe();
@@ -16180,7 +16253,7 @@ mod pan72_stall_detection_tests {
         let mut config = test_config();
         config.timeouts.qso_stall_switch_after = 2;
         let mut manager = manager_auto(config);
-        manager.set_remote_tx_permitted_source(Arc::new(|| false));
+        manager.set_remote_tx_permitted_source(Arc::new(|_| false));
         let qso_id = manager
             .respond_to_cq_manual(DX.into(), FREQ, None)
             .await

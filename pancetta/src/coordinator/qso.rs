@@ -2530,12 +2530,15 @@ impl super::ApplicationCoordinator {
         // counting too — the conservative direction in both places.
         {
             let arm_for_stall_evidence = self.remote_tx_arm();
-            qso_manager.set_remote_tx_permitted_source(std::sync::Arc::new(move || {
-                crate::coordinator::tx::remote_tx_permitted(
-                    &arm_for_stall_evidence,
-                    chrono::Utc::now().timestamp_millis(),
-                )
-            }));
+            qso_manager.set_remote_tx_permitted_source(std::sync::Arc::new(
+                move |remote_client_key_id: Option<&str>| {
+                    crate::coordinator::tx::remote_tx_permitted_for(
+                        &arm_for_stall_evidence,
+                        chrono::Utc::now().timestamp_millis(),
+                        remote_client_key_id,
+                    )
+                },
+            ));
         }
         // PAN-72 Fix E (Codex round 10, thread on `qso_manager.rs:6335`): the
         // stall detector's combined "frame reached the air" check above

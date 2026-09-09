@@ -2595,11 +2595,46 @@ pub fn remote_tx_permitted_for(
 /// `AuditKind::TxDenied`, and a client-visible `error` event) so an
 /// in-flight interruption is exactly as visible as a pickup-time one.
 #[allow(clippy::too_many_arguments)]
+/// Attribute a `TxDenied` audit record's `operator_callsign`, never to the
+/// CURRENTLY-armed operator when the denied frame is bound to a DIFFERENT
+/// client (PAN-91 identity mismatch) — that would misattribute an
+/// unauthorized request as if it came from whoever else happens to be
+/// armed, which is actively misleading in a durable security audit record.
+/// Falls back to the pre-PAN-91 attribution (whoever is armed, if anyone)
+/// for every other denial reason (not armed, heartbeat lost, TTL expired,
+/// local consent/kill) and for every frame with no bound identity at all.
+fn tx_denied_operator_attribution(
+    remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    remote_client_key_id: Option<&str>,
+) -> Option<String> {
+    remote_tx_arm.lock().ok().and_then(|s| {
+        let mismatched_identity =
+            remote_client_key_id.is_some_and(|id| s.armed_client_key_id() != Some(id));
+        if mismatched_identity {
+            None
+        } else {
+            s.operator_callsign().map(str::to_string)
+        }
+    })
+}
+
+/// PAN-92: shared diagnostic/audit/relay for a Remote transmission stopped
+/// mid-flight by [`SleepOutcome::AbortedByDisarm`] — mirrors the Step 0a
+/// pickup-time drop's dispensa Q-0051 Phase A/B/C signals (TUI diagnostic,
+/// `AuditKind::TxDenied`, and a client-visible `error` event) so an
+/// in-flight interruption is exactly as visible as a pickup-time one.
+///
+/// PAN-91 review follow-up: the CALLER must send PTT off and disarm its
+/// `PttGuard` BEFORE calling this — every step here awaits (diagnostic,
+/// synchronous audit-log I/O, relay), and delaying PTT release behind that
+/// work leaves a disarmed remote transmission keyed longer than necessary.
+#[allow(clippy::too_many_arguments)]
 async fn emit_disarm_interrupt_signals(
     message_bus: &MessageBus,
     audit_log: &pancetta_agent::audit::AuditLog,
     display_feed_enabled: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
+    remote_client_key_id: Option<&str>,
     message_text: &str,
     frequency_offset: f64,
     qso_id: Option<&str>,
@@ -2617,10 +2652,7 @@ async fn emit_disarm_interrupt_signals(
     audit_log.append(&pancetta_agent::audit::AuditEvent {
         ts_unix_ms: chrono::Utc::now().timestamp_millis(),
         kind: pancetta_agent::audit::AuditKind::TxDenied,
-        operator_callsign: remote_tx_arm
-            .lock()
-            .ok()
-            .and_then(|s| s.operator_callsign().map(str::to_string)),
+        operator_callsign: tx_denied_operator_attribution(remote_tx_arm, remote_client_key_id),
         detail: denial_reason.clone(),
     });
     super::remote_gateway::relay_to_gateway(
@@ -3175,6 +3207,7 @@ async fn coalesce_backlog_into(
     message_bus: &MessageBus,
     active_tx_qsos: &std::sync::Arc<std::sync::RwLock<std::collections::HashSet<String>>>,
     max_concurrent_qsos: u32,
+    remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
 ) -> MessageType {
     // Decompose the head into a CoalesceEntry. (Caller guarantees the variant.)
     let head_entry = match head {
@@ -3256,9 +3289,55 @@ async fn coalesce_backlog_into(
     }
 
     let backlog_total = drained.len();
-    let outcome = coalesce_transmit_requests(drained, max_concurrent_qsos, |id| {
+    let mut outcome = coalesce_transmit_requests(drained, max_concurrent_qsos, |id| {
         tx_qso_is_live(id, active_tx_qsos)
     });
+
+    // PAN-91 review follow-up: filter out any retained entry that is
+    // Remote-origin and bound to a DIFFERENT client than the one currently
+    // armed, BEFORE folding survivors into a single bundle/request. Without
+    // this, control transferring from client A to client B mid-session
+    // (A's still-active QSO keeps rearming while B starts new ones) could
+    // put both A-bound and B-bound entries in the same backlog; the fold
+    // below picks ONE representative identity for the whole bundle, so a
+    // B-bound entry landing first while B is armed would silently
+    // authorize A's frame too. Filtering per-entry here — using each
+    // entry's OWN bound identity, exactly like the TX worker's real
+    // per-frame gate — closes that gap; a filtered entry is reported as a
+    // failed TransmitComplete, matching the existing truncated-entry
+    // pattern below.
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let (admitted, identity_denied): (Vec<_>, Vec<_>) =
+        outcome.retained.into_iter().partition(|e| {
+            e.origin != crate::message_bus::TxOrigin::Remote
+                || remote_tx_permitted_for(remote_tx_arm, now_ms, e.remote_client_key_id.as_deref())
+        });
+    outcome.retained = admitted;
+    for entry in &identity_denied {
+        warn!(
+            target: "pancetta::tx.policy",
+            "TX backlog: dropping '{}' — bound to a different client than the one \
+             currently armed (qso: {:?})",
+            entry.message_text, entry.qso_id
+        );
+        let complete_msg = ComponentMessage::new(
+            ComponentId::Ft8Transmitter,
+            ComponentId::Autonomous,
+            MessageType::TransmitComplete {
+                success: false,
+                message_text: entry.message_text.clone(),
+                duration_ms: 0,
+                qso_id: entry.qso_id.clone(),
+            },
+            Instant::now(),
+        );
+        if let Err(e) = message_bus.send_message(complete_msg).await {
+            warn!(
+                "Failed to send TransmitComplete for an identity-denied stream: {}",
+                e
+            );
+        }
+    }
 
     if !outcome.is_noop() {
         let text = format!(
@@ -3666,7 +3745,35 @@ async fn supersede_and_rekey_or_bundle(
             .iter()
             .filter(|it| it.qso_id.is_some())
             .count();
-        if qso_count <= max_concurrent_qsos as usize
+        // PAN-91 review follow-up: if BOTH sides are Remote and bound to
+        // DIFFERENT clients, folding them into one bundle would let a
+        // single bundle-level identity check authorize the other side's
+        // frame by proxy — exactly the gap the coalescer's own per-entry
+        // filter closes for a drained backlog. This function only ever
+        // sees TWO identities (the whole in-flight side's, and the new
+        // item's own), so a genuine conflict is a straight inequality
+        // check: `None` on either side means "no bound identity" (a
+        // pre-PAN-91 producer, degrades to the boolean-only gate) and is
+        // never itself a conflict. On a real conflict, refuse to bundle —
+        // fall through to the existing over-capacity path below, which
+        // abandons the in-flight side and replaces it with just the new
+        // request; the retry loop's own key-time gate re-verifies the new
+        // request's identity independently before it actually keys.
+        let identity_conflict = in_flight_origin == crate::message_bus::TxOrigin::Remote
+            && new_origin == crate::message_bus::TxOrigin::Remote
+            && matches!(
+                (&in_flight_remote_client_key_id, &new_remote_client_key_id),
+                (Some(a), Some(b)) if a != b
+            );
+        if identity_conflict {
+            warn!(
+                target: "pancetta::tx.policy",
+                "supersede: not bundling — in-flight stream is bound to a different \
+                 remote client ({:?}) than the new request ({:?}); replacing the \
+                 in-flight transmission with just the new request instead",
+                in_flight_remote_client_key_id, new_remote_client_key_id
+            );
+        } else if qso_count <= max_concurrent_qsos as usize
             && candidate_items.len() <= MAX_RETAINED_TX_STREAMS
         {
             // Fail-safe origin fold: the bundle carries BOTH the in-flight
@@ -3679,16 +3786,12 @@ async fn supersede_and_rekey_or_bundle(
                 crate::message_bus::TxOrigin::Local
             };
             // PAN-91: mirror the origin fold — prefer whichever side is
-            // actually Remote (same defense-in-depth caveat as elsewhere: in
-            // practice at most one side is Remote here).
-            let bundle_remote_client_key_id =
-                if in_flight_origin == crate::message_bus::TxOrigin::Remote {
-                    in_flight_remote_client_key_id.clone()
-                } else if new_origin == crate::message_bus::TxOrigin::Remote {
-                    new_remote_client_key_id.clone()
-                } else {
-                    None
-                };
+            // actually Remote. Safe to pick either non-`None` identity now
+            // that `identity_conflict` above has already ruled out the two
+            // sides disagreeing.
+            let bundle_remote_client_key_id = in_flight_remote_client_key_id
+                .clone()
+                .or_else(|| new_remote_client_key_id.clone());
             return SupersedeOutcome::Bundle {
                 items: candidate_items,
                 bundle_origin,
@@ -3696,17 +3799,18 @@ async fn supersede_and_rekey_or_bundle(
                 new_origin,
                 new_remote_client_key_id,
             };
+        } else {
+            info!(
+                target: "pancetta::tx.policy",
+                "supersede: not bundling — {} QSO-keyed stream(s) of {} total would exceed \
+                 max_concurrent_qsos={} (hard cap {}); replacing the in-flight transmission \
+                 with just the new request instead",
+                qso_count,
+                candidate_items.len(),
+                max_concurrent_qsos,
+                MAX_RETAINED_TX_STREAMS
+            );
         }
-        info!(
-            target: "pancetta::tx.policy",
-            "supersede: not bundling — {} QSO-keyed stream(s) of {} total would exceed \
-             max_concurrent_qsos={} (hard cap {}); replacing the in-flight transmission \
-             with just the new request instead",
-            qso_count,
-            candidate_items.len(),
-            max_concurrent_qsos,
-            MAX_RETAINED_TX_STREAMS
-        );
     }
 
     SupersedeOutcome::Replace {
@@ -4342,6 +4446,7 @@ impl super::ApplicationCoordinator {
                                         &fox_mode,
                                         &fox_max_streams,
                                     ),
+                                    &remote_tx_arm,
                                 )
                                 .await;
 
@@ -4540,8 +4645,9 @@ impl super::ApplicationCoordinator {
                                         audit_log.append(&pancetta_agent::audit::AuditEvent {
                                             ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
-                                            operator_callsign: remote_tx_arm.lock().ok().and_then(
-                                                |s| s.operator_callsign().map(str::to_string),
+                                            operator_callsign: tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
                                             ),
                                             detail: denial_reason.clone(),
                                         });
@@ -5278,11 +5384,36 @@ impl super::ApplicationCoordinator {
                                                 warn!(
                                                     "TX aborted between PTT and slot: remote arm no longer permits it"
                                                 );
+                                                // PAN-91 review: release PTT FIRST, before any
+                                                // of this helper's awaits (diagnostic, audit-log
+                                                // I/O, relay) — a disarmed transmission must not
+                                                // stay keyed a moment longer than necessary.
+                                                let ptt_off_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Hamlib,
+                                                    MessageType::RigControl(
+                                                        crate::message_bus::RigControlMessage::SetPtt {
+                                                            state: false,
+                                                        },
+                                                    ),
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(ptt_off_msg).await
+                                                {
+                                                    warn!(
+                                                        "Remote disarm mid-TX: PTT OFF failed: {}",
+                                                        e
+                                                    );
+                                                }
+                                                ptt_active.store(false, Ordering::Release);
+                                                ptt_guard.disarm();
                                                 emit_disarm_interrupt_signals(
                                                     &message_bus,
                                                     &audit_log,
                                                     &display_feed_enabled,
                                                     &remote_tx_arm,
+                                                    remote_client_key_id.as_deref(),
                                                     &message_text,
                                                     frequency_offset,
                                                     qso_id.as_deref(),
@@ -5657,11 +5788,36 @@ impl super::ApplicationCoordinator {
                                                 warn!(
                                                     "TX aborted during playback: remote arm no longer permits it"
                                                 );
+                                                // PAN-91 review: release PTT FIRST, before any
+                                                // of this helper's awaits (diagnostic, audit-log
+                                                // I/O, relay) — a disarmed transmission must not
+                                                // stay keyed a moment longer than necessary.
+                                                let ptt_off_msg = ComponentMessage::new(
+                                                    ComponentId::Ft8Transmitter,
+                                                    ComponentId::Hamlib,
+                                                    MessageType::RigControl(
+                                                        crate::message_bus::RigControlMessage::SetPtt {
+                                                            state: false,
+                                                        },
+                                                    ),
+                                                    Instant::now(),
+                                                );
+                                                if let Err(e) =
+                                                    message_bus.send_message(ptt_off_msg).await
+                                                {
+                                                    warn!(
+                                                        "Remote disarm mid-TX: PTT OFF failed: {}",
+                                                        e
+                                                    );
+                                                }
+                                                ptt_active.store(false, Ordering::Release);
+                                                ptt_guard.disarm();
                                                 emit_disarm_interrupt_signals(
                                                     &message_bus,
                                                     &audit_log,
                                                     &display_feed_enabled,
                                                     &remote_tx_arm,
+                                                    remote_client_key_id.as_deref(),
                                                     &message_text,
                                                     frequency_offset,
                                                     qso_id.as_deref(),
@@ -6179,8 +6335,9 @@ impl super::ApplicationCoordinator {
                                         audit_log.append(&pancetta_agent::audit::AuditEvent {
                                             ts_unix_ms: chrono::Utc::now().timestamp_millis(),
                                             kind: pancetta_agent::audit::AuditKind::TxDenied,
-                                            operator_callsign: remote_tx_arm.lock().ok().and_then(
-                                                |s| s.operator_callsign().map(str::to_string),
+                                            operator_callsign: tx_denied_operator_attribution(
+                                                &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
                                             ),
                                             detail: denial_reason.clone(),
                                         });
@@ -7289,11 +7446,34 @@ impl super::ApplicationCoordinator {
                                             warn!(
                                                 "Multi-TX aborted between PTT and slot: remote arm no longer permits it"
                                             );
+                                            // PAN-91 review: release PTT FIRST — see the
+                                            // single-TX arm's identical fix for why.
+                                            let ptt_off_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Hamlib,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SetPtt {
+                                                        state: false,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(ptt_off_msg).await
+                                            {
+                                                warn!(
+                                                    "Remote disarm mid-TX: PTT OFF failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
                                                 &audit_log,
                                                 &display_feed_enabled,
                                                 &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
                                                 "<multi-TX bundle>",
                                                 0.0,
                                                 None,
@@ -7447,11 +7627,34 @@ impl super::ApplicationCoordinator {
                                             warn!(
                                                 "Multi-TX aborted during playback: remote arm no longer permits it"
                                             );
+                                            // PAN-91 review: release PTT FIRST — see the
+                                            // single-TX arm's identical fix for why.
+                                            let ptt_off_msg = ComponentMessage::new(
+                                                ComponentId::Ft8Transmitter,
+                                                ComponentId::Hamlib,
+                                                MessageType::RigControl(
+                                                    crate::message_bus::RigControlMessage::SetPtt {
+                                                        state: false,
+                                                    },
+                                                ),
+                                                Instant::now(),
+                                            );
+                                            if let Err(e) =
+                                                message_bus.send_message(ptt_off_msg).await
+                                            {
+                                                warn!(
+                                                    "Remote disarm mid-TX: PTT OFF failed: {}",
+                                                    e
+                                                );
+                                            }
+                                            ptt_active.store(false, Ordering::Release);
+                                            ptt_guard.disarm();
                                             emit_disarm_interrupt_signals(
                                                 &message_bus,
                                                 &audit_log,
                                                 &display_feed_enabled,
                                                 &remote_tx_arm,
+                                                remote_client_key_id.as_deref(),
                                                 "<multi-TX bundle>",
                                                 0.0,
                                                 None,
@@ -8895,6 +9098,96 @@ mod supersede_rekey_tests {
             "PTT must be deasserted"
         );
         // Working state also mutated to the new item (collision fallback).
+        assert_eq!(message_text, "CQ K5ARH EM12");
+        assert_eq!(frequency_offset, 1400.0);
+    }
+
+    /// PAN-91 review follow-up: an in-flight stream bound to one remote
+    /// client and a superseding request bound to a DIFFERENT remote client
+    /// must NEVER fold into one bundle — a single bundle-level identity
+    /// check would then authorize the OTHER client's frame by proxy. This
+    /// must produce `Replace` (abandon the in-flight side, key only the new
+    /// request under its OWN identity), never `Bundle`.
+    #[tokio::test]
+    async fn supersede_refuses_to_bundle_mismatched_remote_clients() {
+        let bus = MessageBus::new(16).unwrap();
+        let (_hamlib_tx, _hamlib_rx) = bus.create_channel(ComponentId::Hamlib).await.unwrap();
+
+        let now = chrono::Utc::now();
+        let cur_parity = pancetta_core::slot::SlotParity::of_with_period(
+            pancetta_core::slot::current_slot_start_with_period(now, pancetta_core::slot::SLOT_NS),
+            pancetta_core::slot::SLOT_NS,
+        );
+
+        let mut message_text = "OLD TEXT".to_string();
+        let mut frequency_offset = 1000.0;
+        let mut schedule = super::schedule_tx(
+            now,
+            cur_parity,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+        );
+        let ptt_active = Arc::new(AtomicBool::new(true));
+        let last_ptt_on_ms = Arc::new(AtomicU64::new(0));
+
+        let in_flight = [crate::message_bus::TransmitRequestItem {
+            message_text: "KA1ABC K5ARH R-15".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-1".to_string()),
+        }];
+
+        let new_request = MessageType::TransmitRequest {
+            message_text: "CQ K5ARH EM12".to_string(),
+            frequency_offset: 1400.0,
+            qso_id: Some("qso-2".to_string()),
+            tx_parity: Some(cur_parity),
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-b".to_string()),
+        };
+
+        let outcome = super::supersede_and_rekey_or_bundle(
+            new_request,
+            &mut message_text,
+            &mut frequency_offset,
+            &mut schedule,
+            &bus,
+            &ptt_active,
+            &last_ptt_on_ms,
+            20_000,
+            12_000,
+            pancetta_core::slot::SLOT_NS,
+            pancetta_config::station::TxSelfParity::Auto,
+            now,
+            2,
+            crate::message_bus::TxOrigin::Remote,
+            Some("client-a".to_string()),
+            &in_flight,
+        )
+        .await;
+
+        match outcome {
+            super::SupersedeOutcome::Replace {
+                origin,
+                remote_client_key_id,
+                qso_id,
+            } => {
+                assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
+                assert_eq!(
+                    remote_client_key_id.as_deref(),
+                    Some("client-b"),
+                    "Replace must carry the NEW request's own identity, not the \
+                     abandoned in-flight stream's"
+                );
+                assert_eq!(qso_id.as_deref(), Some("qso-2"));
+            }
+            other => panic!(
+                "mismatched-client in-flight/new streams must never fold into a \
+                 Bundle, got {other:?}"
+            ),
+        }
+        // Working state mutated to the new item, exactly like the ordinary
+        // collision-fallback Replace path.
         assert_eq!(message_text, "CQ K5ARH EM12");
         assert_eq!(frequency_offset, 1400.0);
     }
@@ -10525,7 +10818,10 @@ mod coalesce_tests {
         }
 
         // max_concurrent_qsos = 1: only "A" survives, "B" and "C" are cap-truncated.
-        let _ = coalesce_backlog_into(head, &backlog_rx, &bus, &active_tx_qsos, 1).await;
+        // Every entry here is Local, so the identity-bound arm gate never
+        // consults this — an unarmed ArmState is the neutral choice.
+        let arm = Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()));
+        let _ = coalesce_backlog_into(head, &backlog_rx, &bus, &active_tx_qsos, 1, &arm).await;
 
         let mut got = Vec::new();
         while let Ok(msg) = autonomous_rx.try_recv() {
@@ -10546,6 +10842,105 @@ mod coalesce_tests {
                 }
                 other => panic!("expected TransmitComplete, got {other:?}"),
             }
+        }
+    }
+
+    /// PAN-91 review follow-up: a backlog containing entries bound to TWO
+    /// different remote clients must never fold into one bundle authorized
+    /// under a single client's identity — the entry bound to whichever
+    /// client is NOT currently armed must be filtered out (and reported as
+    /// a failed `TransmitComplete`) before folding, not silently carried
+    /// along under the other entry's identity.
+    #[tokio::test(flavor = "current_thread")]
+    async fn backlog_into_drops_entries_bound_to_a_different_client_than_the_one_armed() {
+        use crate::message_bus::MessageBus;
+        use std::sync::Arc;
+
+        let bus = MessageBus::new(16).unwrap();
+        let (_autonomous_tx, autonomous_rx) =
+            bus.create_channel(ComponentId::Autonomous).await.unwrap();
+        let (backlog_tx, backlog_rx) = crossbeam_channel::unbounded();
+        let active_tx_qsos = Arc::new(std::sync::RwLock::new(liveset(&["qso-a", "qso-b"])));
+
+        // client-a is armed; client-b is not.
+        let mut st = pancetta_agent::arm::ArmState::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "K5ARH".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "mixed-bundle-jti".to_string(),
+                client_key_id: "client-a".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        // Head entry: bound to client-a (armed) — must survive.
+        let head = MessageType::TransmitRequest {
+            message_text: "A".to_string(),
+            frequency_offset: 1000.0,
+            qso_id: Some("qso-a".to_string()),
+            tx_parity: None,
+            origin: crate::message_bus::TxOrigin::Remote,
+            remote_client_key_id: Some("client-a".to_string()),
+        };
+        // Backlogged entry: bound to client-b (NOT armed) — must be dropped,
+        // never folded into a bundle that client-a's arm would authorize.
+        backlog_tx
+            .send(ComponentMessage::new(
+                ComponentId::Ft8Transmitter,
+                ComponentId::Ft8Transmitter,
+                MessageType::TransmitRequest {
+                    message_text: "B".to_string(),
+                    frequency_offset: 1300.0,
+                    qso_id: Some("qso-b".to_string()),
+                    tx_parity: None,
+                    origin: crate::message_bus::TxOrigin::Remote,
+                    remote_client_key_id: Some("client-b".to_string()),
+                },
+                Instant::now(),
+            ))
+            .unwrap();
+
+        let result = coalesce_backlog_into(head, &backlog_rx, &bus, &active_tx_qsos, 2, &arm).await;
+
+        match result {
+            MessageType::TransmitRequest {
+                message_text,
+                remote_client_key_id,
+                ..
+            } => {
+                assert_eq!(
+                    message_text, "A",
+                    "only client-a's (armed) entry may survive"
+                );
+                assert_eq!(remote_client_key_id.as_deref(), Some("client-a"));
+            }
+            other => panic!(
+                "expected a single TransmitRequest for client-a's surviving entry, got {other:?}"
+            ),
+        }
+
+        let mut got = Vec::new();
+        while let Ok(msg) = autonomous_rx.try_recv() {
+            got.push(msg);
+        }
+        assert_eq!(
+            got.len(),
+            1,
+            "client-b's identity-denied entry must be reported as a failed TransmitComplete"
+        );
+        match &got[0].message_type {
+            MessageType::TransmitComplete {
+                success, qso_id, ..
+            } => {
+                assert!(!success);
+                assert_eq!(qso_id.as_deref(), Some("qso-b"));
+            }
+            other => panic!("expected TransmitComplete, got {other:?}"),
         }
     }
 }
