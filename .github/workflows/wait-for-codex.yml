@@ -575,19 +575,22 @@ jobs:
               # pancetta#239, see above).
               reviewed_head=1
             fi
-            # Also require COMMENT_ID to be non-empty, not just IS_SYNC (Codex
-            # P2, self-caught live on coppa#102 -- the widened IS_SYNC above
-            # is true for opened/ready_for_review purely by event action, but
-            # the "Request a review" step it depends on skips entirely when
-            # CODEX_REVIEW_PAT is unset, in which case NO request comment
-            # (and no COMMENT_ID) was ever created. Without this guard, that
-            # combination forced the strict branch below -- which requires a
-            # comment_thumbsup/comment_head_tied signal tied to a request
-            # comment that structurally cannot exist -- so a genuine
-            # native/manual clean response landing only as a bare PR-level
-            # thumbsup (the loose branch's own signal) would be ignored and
-            # this check would wait out its full timeout for nothing.
-            if [ "$IS_SYNC" = "true" ] && [ -n "$COMMENT_ID" ]; then
+            # Deliberately does NOT also require COMMENT_ID to be non-empty
+            # here (a fix briefly applied and then reverted, coppa#102/#103 --
+            # Codex review of the identical patch on manta#156 caught the
+            # regression it introduced): when CODEX_REVIEW_PAT is unset, a
+            # missing COMMENT_ID does not actually strand this branch --
+            # `reviews` and `comment_head_tied` are both computed independent
+            # of any specific comment id, and `comment_thumbsup` alone
+            # degrades to 0 via this step's own `@include(if: $hasComment)`
+            # GraphQL guard (see HAS_COMMENT above) rather than erroring.
+            # Routing a no-COMMENT_ID *re-push* into the loose branch instead
+            # (as the reverted fix did) reintroduces exactly the stale-signal
+            # hole this strict branch exists to close: a response to the
+            # PREVIOUS head can land after the new push's own cutoff and
+            # satisfy the loose branch's untied comment/thumbsup checks with
+            # no signal ever tied to the new HEAD_SHA.
+            if [ "$IS_SYNC" = "true" ]; then
               # On a re-push specifically, a bare new issue comment or a
               # generic issue-level thumbsup is NOT proof Codex looked at
               # THIS head — either could be a stale signal from an unrelated
