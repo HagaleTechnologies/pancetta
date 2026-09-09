@@ -4126,6 +4126,18 @@ enum SupersedeOutcome {
         /// lets that caller tell the two cases apart; single-TX callers
         /// ignore it since they always key the new request either way.
         identity_conflict: bool,
+        /// Codex P1, PR #362 round 19: the NEW superseding request's OWN
+        /// `tx_parity`. Single-TX callers re-key via the already-mutated
+        /// `schedule` (resolved from this same value earlier in this
+        /// function) and don't need it separately, but the multi-TX arm's
+        /// identity-conflict path builds a fresh `TransmitRequest` from
+        /// scratch to re-enqueue — hardcoding `None` there let the next
+        /// dequeue's `TxSelfParity::Auto` recompute the nearest slot instead
+        /// (normally the opposite slot, since this fires mid-playback inside
+        /// the abandoned bundle's own slot), transmitting in sequential
+        /// windows over the DX's expected reply instead of the QSO's own
+        /// latched parity.
+        tx_parity: Option<pancetta_core::slot::SlotParity>,
     },
     /// Bundle-add is viable. The caller encodes `items` via
     /// `encode_and_modulate_multi_tx`; on success it re-enqueues a
@@ -4371,6 +4383,7 @@ async fn supersede_and_rekey_or_bundle(
         remote_client_key_id: new_remote_client_key_id,
         qso_id: new_qso_id,
         identity_conflict: replace_is_identity_conflict,
+        tx_parity: new_tx_parity,
     }
 }
 
@@ -4564,6 +4577,7 @@ async fn supersede_multi_reenqueue(
             remote_client_key_id: new_remote_client_key_id,
             qso_id: new_qso_id,
             identity_conflict,
+            tx_parity: new_tx_parity,
         } => {
             // Codex P1, PR #362 round 18: an `identity_conflict` Replace
             // means control legitimately transferred (the in-flight bundle
@@ -4603,7 +4617,7 @@ async fn supersede_multi_reenqueue(
                         message_text: scratch_text,
                         frequency_offset: scratch_freq,
                         qso_id: new_qso_id,
-                        tx_parity: None,
+                        tx_parity: new_tx_parity,
                         origin: new_origin,
                         remote_client_key_id: new_remote_client_key_id,
                     },
@@ -6239,6 +6253,7 @@ impl super::ApplicationCoordinator {
                                                             new_remote_client_key_id,
                                                         qso_id: new_qso_id,
                                                         identity_conflict: _,
+                                                        tx_parity: _,
                                                     } => {
                                                         // Viable single-item re-key (Task 6): carry
                                                         // the recomputed schedule into the retry,
@@ -6760,6 +6775,7 @@ impl super::ApplicationCoordinator {
                                                             new_remote_client_key_id,
                                                         qso_id: new_qso_id,
                                                         identity_conflict: _,
+                                                        tx_parity: _,
                                                     } => {
                                                         // Re-point `origin` at the superseding
                                                         // request's origin so the retry's Step 4b-arm
@@ -10411,6 +10427,7 @@ mod supersede_rekey_tests {
                 remote_client_key_id,
                 qso_id,
                 identity_conflict,
+                tx_parity,
             } => {
                 assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
                 assert_eq!(
@@ -10425,6 +10442,11 @@ mod supersede_rekey_tests {
                     "a mismatched-remote-client Replace must be flagged as an \
                      identity conflict, not treated as an ordinary over-capacity \
                      fallback"
+                );
+                assert_eq!(
+                    tx_parity,
+                    Some(cur_parity),
+                    "Replace must carry the NEW request's own tx_parity"
                 );
             }
             other => panic!(
@@ -10817,6 +10839,7 @@ mod supersede_rekey_tests {
                     qso_id,
                     remote_client_key_id: _,
                     identity_conflict: _,
+                    tx_parity: _,
                 } => {
                     assert_eq!(
                         origin, new_origin,
@@ -11354,12 +11377,21 @@ mod supersede_rekey_tests {
                 qso_id,
                 origin,
                 remote_client_key_id,
+                tx_parity,
                 ..
             } => {
                 assert_eq!(message_text, "K5ARH KA1ABC 73");
                 assert_eq!(qso_id.as_deref(), Some("qso-1"));
                 assert_eq!(origin, crate::message_bus::TxOrigin::Remote);
                 assert_eq!(remote_client_key_id.as_deref(), Some("client-b"));
+                assert_eq!(
+                    tx_parity,
+                    Some(cur_parity),
+                    "Codex P1, round 19: the re-enqueued identity-conflict replacement \
+                     must carry the NEW request's own latched tx_parity, not None — \
+                     otherwise TxSelfParity::Auto recomputes the nearest slot on the \
+                     next dequeue, which can pick a sequential (colliding) slot instead"
+                );
             }
             other => panic!("expected the new request as a single TransmitRequest, got {other:?}"),
         }
