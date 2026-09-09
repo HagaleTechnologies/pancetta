@@ -678,6 +678,7 @@ async fn maybe_auto_resend_73(
     completions: &RecentManualCompletions,
     tx_policy: &std::sync::atomic::AtomicU8,
     message_bus: &MessageBus,
+    remote_tx_arm: &std::sync::Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>>,
 ) {
     use pancetta_qso::states::MessageType as Mt;
 
@@ -709,6 +710,8 @@ async fn maybe_auto_resend_73(
     let entry_remote_origin;
     let entry_remote_client_key_id;
     let entry_qso_id;
+    let prev_resends;
+    let prev_last_resend_at;
     {
         let mut map = completions.lock().await;
         // Prune expired entries every time we look.
@@ -744,6 +747,13 @@ async fn maybe_auto_resend_73(
         }
         // Commit the send: increment + stamp BEFORE we drop the lock so two
         // decodes racing in the same slot can't both pass the per-slot guard.
+        // Round-14 review (Codex P1): `prev_resends`/`prev_last_resend_at`
+        // captured so this commit can be rolled back exactly (see below)
+        // if the identity-bound permission check that follows — which
+        // needs the live QSO identity, only knowable after this lock is
+        // released — finds the bound client isn't currently TX-permitted.
+        prev_resends = entry.resends;
+        prev_last_resend_at = entry.last_resend_at;
         entry.resends += 1;
         entry.last_resend_at = Some(now);
         // Prefer the freq/parity we just heard them on (fresher); fall back to
@@ -776,6 +786,32 @@ async fn maybe_auto_resend_73(
             ),
             Err(_) => (entry_remote_origin, entry_remote_client_key_id),
         };
+
+    // Round-14 review (Codex P1): `respond_to_caller`'s idempotent-resend
+    // branch silently SKIPS the resend (round-10 fix) when the bound
+    // client isn't currently TX-permitted, but still returns `Ok` — so
+    // this function can't tell "a frame went out" from "the resend was
+    // skipped" from that return value alone. Left unchecked, the counter
+    // commit above would still burn the auto-73 budget for a resend that
+    // never actually transmitted, exhausting it and leaving no automatic
+    // resend if the original controller (or a newly-authorized one)
+    // retakes control within the window. Roll the commit back to exactly
+    // what it was before, and skip calling `respond_to_caller` entirely,
+    // when the frame would be denied anyway.
+    if entry_remote_origin
+        && !crate::coordinator::tx::remote_tx_permitted_for(
+            remote_tx_arm,
+            chrono::Utc::now().timestamp_millis(),
+            entry_remote_client_key_id.as_deref(),
+        )
+    {
+        let mut map = completions.lock().await;
+        if let Some(entry) = map.get_mut(&key) {
+            entry.resends = prev_resends;
+            entry.last_resend_at = prev_last_resend_at;
+        }
+        return;
+    }
 
     // Don't fight a live QSO with this station: if one is active, skip the
     // auto-73 (the QSO state machine is handling it). The counter was already
@@ -2648,6 +2684,10 @@ impl super::ApplicationCoordinator {
 
         let qso_handle = {
             let shutdown = self.shutdown_signal.clone();
+            // Round-14 review (Codex P1): `maybe_auto_resend_73` needs this
+            // to gate its own budget commit on identity-bound TX permission
+            // — see the call site and that function's doc for why.
+            let remote_tx_arm_for_auto73 = self.remote_tx_arm();
 
             tokio::spawn(async move {
                 if let Err(e) = qso_manager.start().await {
@@ -3835,6 +3875,7 @@ impl super::ApplicationCoordinator {
                                             &recent_manual_completions,
                                             &tx_policy,
                                             &message_bus,
+                                            &remote_tx_arm_for_auto73,
                                         )
                                         .await;
 
@@ -7041,6 +7082,14 @@ mod auto_73_tests {
         MessageBus::new(1000).expect("bus")
     }
 
+    /// Every test in this module uses `remote_origin: false` (see
+    /// `map_with_dx`), so round-14's identity-bound permission check is
+    /// always short-circuited regardless of this arm's state — an unarmed
+    /// placeholder is sufficient.
+    fn unarmed() -> Arc<std::sync::Mutex<pancetta_agent::arm::ArmState>> {
+        Arc::new(std::sync::Mutex::new(pancetta_agent::arm::ArmState::new()))
+    }
+
     /// A completions map containing a single manual completion for `DX`,
     /// completed far enough in the past to clear the SM-F3/TX-F10
     /// first-resend guard (`AUTO_73_FIRST_RESEND_MIN_DELAY`) but still well
@@ -7108,6 +7157,7 @@ mod auto_73_tests {
                 &map,
                 &policy,
                 &bus,
+                &unarmed(),
             )
             .await;
             if let Some(e) = map.lock().await.get_mut(DX) {
@@ -7143,6 +7193,7 @@ mod auto_73_tests {
                 &map,
                 &policy,
                 &bus,
+                &unarmed(),
             )
             .await;
             // Do NOT reset last_resend_at — same slot.
@@ -7189,6 +7240,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7220,6 +7272,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7245,6 +7298,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7270,6 +7324,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7299,6 +7354,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7329,6 +7385,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7357,6 +7414,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7405,6 +7463,7 @@ mod auto_73_tests {
                 &map,
                 &policy,
                 &bus,
+                &unarmed(),
             )
             .await;
         }
@@ -7461,6 +7520,7 @@ mod auto_73_tests {
             &map,
             &policy,
             &bus,
+            &unarmed(),
         )
         .await;
 
@@ -7470,6 +7530,82 @@ mod auto_73_tests {
             "a genuine later resend past the guard window must still fire"
         );
         assert_eq!(map.lock().await.get(DX).map(|e| e.resends), Some(1));
+    }
+
+    /// Round-14 review (Codex P1): a remote-origin completion bound to
+    /// client-a, while a DIFFERENT client (client-b) holds the arm, must
+    /// not consume the auto-73 budget — `respond_to_caller`'s own resend
+    /// path silently skips the doomed resend (round-10 fix) but still
+    /// returns `Ok`, so this function must independently verify permission
+    /// and roll its own commit back rather than trusting that return value.
+    #[tokio::test]
+    async fn denied_identity_rolls_back_the_resend_commit() {
+        let mgr = manager().await;
+        let map = {
+            let mut m = HashMap::new();
+            m.insert(
+                DX.to_string(),
+                RecentManualCompletion {
+                    completed_at: chrono::Utc::now() - chrono::Duration::seconds(40),
+                    frequency_hz: 1500.0,
+                    dx_parity: Some(SlotParity::Even),
+                    resends: 0,
+                    last_resend_at: None,
+                    remote_origin: true,
+                    remote_client_key_id: Some("client-a".to_string()),
+                    qso_id: uuid::Uuid::new_v4(),
+                },
+            );
+            Arc::new(Mutex::new(m))
+        };
+        let policy = AtomicU8::new(TxPolicy::Full.as_u8());
+        let bus = bus();
+        let mut rx = mgr.subscribe();
+
+        // client-b holds the arm — a mismatch against the entry's client-a.
+        let mut st = pancetta_agent::arm::ArmState::new();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        st.arm(
+            pancetta_agent::arm::VerifiedArmGrant {
+                operator_callsign: "W1AW".to_string(),
+                ttl_ms: 120_000,
+                scope_tx: true,
+                jti: "auto73-rollback-test-jti".to_string(),
+                client_key_id: "client-b".to_string(),
+            },
+            now_ms,
+        );
+        st.set_local_consent(true, now_ms);
+        let arm = Arc::new(std::sync::Mutex::new(st));
+
+        maybe_auto_resend_73(
+            &rr73_to_us(),
+            OUR,
+            1500.0,
+            Some(SlotParity::Even),
+            &mgr,
+            &map,
+            &policy,
+            &bus,
+            &arm,
+        )
+        .await;
+
+        assert_eq!(
+            drain_sends(&mut rx),
+            0,
+            "a resend denied for identity mismatch must never emit a frame"
+        );
+        let entry = map.lock().await.get(DX).cloned().expect("entry retained");
+        assert_eq!(
+            entry.resends, 0,
+            "the resend commit must be rolled back exactly, not left incremented"
+        );
+        assert_eq!(
+            entry.last_resend_at, None,
+            "last_resend_at must also be rolled back, or a genuine later RR73 \
+             could be wrongly suppressed by the per-slot guard"
+        );
     }
 
     /// Guard for the [duplicate_checking] wiring: the pancetta-config defaults
