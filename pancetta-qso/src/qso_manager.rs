@@ -2509,12 +2509,14 @@ impl QsoManager {
             }
         }
 
-        // Manual: supersede any same-call QSO on this band, then build the new
-        // one (no duplicate gate — the operator explicitly chose this caller).
-        // With FIX 1 above this only fires when no ACTIVE QSO remains (e.g. a
-        // lingering terminal record), so it should rarely trigger now.
-        self.supersede_active_qsos_for(&target, frequency).await;
-
+        // Round-16 review (Codex P1): this identity-bound permission check
+        // (round-15's fix) MUST run before `supersede_active_qsos_for`
+        // below, not after — an autonomous same-call/band QSO is invisible
+        // to the manual-QSO lookups above (FIX 1), so a denied close-step
+        // request could otherwise reach here, supersede (cancel) that
+        // ongoing autonomous exchange, and ONLY THEN get refused itself —
+        // destroying a real QSO in progress and replacing it with nothing.
+        //
         // Round-15 review (Codex P1): unlike the EXISTING-QSO ladder-advance
         // fix (round 13), a brand-new QSO opened directly at a close step
         // (`SeventyThree`) is created ALREADY `Completed` — the state-build
@@ -2536,6 +2538,12 @@ impl QsoManager {
                 ),
             });
         }
+
+        // Manual: supersede any same-call QSO on this band, then build the new
+        // one (no duplicate gate — the operator explicitly chose this caller).
+        // With FIX 1 above this only fires when no ACTIVE QSO remains (e.g. a
+        // lingering terminal record), so it should rarely trigger now.
+        self.supersede_active_qsos_for(&target, frequency).await;
 
         let qso_id = Uuid::new_v4();
         let now = Utc::now();
@@ -6873,13 +6881,39 @@ impl QsoManager {
             }
         }
 
-        for (qso_id, message, frequency, tx_parity, remote_origin, remote_client_key_id) in
-            to_recall
+        for (
+            qso_id,
+            message,
+            frequency,
+            tx_parity,
+            snapshot_remote_origin,
+            snapshot_remote_client_key_id,
+        ) in to_recall
         {
             debug!(
                 "Manual keep-calling: re-emitting {:?} on {:.1} Hz (qso={})",
                 message, frequency, qso_id
             );
+            // Round-16 review (Codex P1): re-read the LIVE binding
+            // immediately before emitting, rather than trusting the
+            // snapshot taken under the write lock above (released before
+            // this loop runs) — a concurrent rebind (a remote client
+            // taking over this QSO between the snapshot and this emission)
+            // would otherwise let a stale `Local`/wrong-identity
+            // `MessageToSend` reach `LatestTxIntent`, which the TX worker's
+            // pivot mechanism can prefer over the correctly-bound request,
+            // bypassing the arm check entirely rather than merely
+            // misattributing it. Falls back to the snapshot only if the
+            // QSO has since left the active map (shouldn't happen here —
+            // `to_recall` was built from this same set moments ago — kept
+            // defensive rather than unwrapping).
+            let (remote_origin, remote_client_key_id) = match self.qsos.read().await.get(&qso_id) {
+                Some(live) => (
+                    live.metadata.remote_origin,
+                    live.metadata.remote_client_key_id.clone(),
+                ),
+                None => (snapshot_remote_origin, snapshot_remote_client_key_id),
+            };
             self.emit_event(QsoEvent::MessageToSend {
                 qso_id,
                 message,

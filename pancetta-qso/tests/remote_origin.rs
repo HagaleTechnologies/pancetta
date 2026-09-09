@@ -340,6 +340,64 @@ async fn denied_new_close_step_open_creates_no_qso_and_no_false_completion() {
     );
 }
 
+/// Round-16 review (Codex P1): the round-15 permission check ran AFTER
+/// `supersede_active_qsos_for`, so a denied close-step request could reach
+/// this function, supersede (cancel) an ongoing AUTONOMOUS QSO for the same
+/// callsign/band (invisible to the manual-QSO lookups above), and only THEN
+/// get refused itself — destroying a real in-progress exchange and
+/// replacing it with nothing. The check must run before superseding.
+#[tokio::test]
+async fn denied_close_step_open_never_supersedes_an_unrelated_active_qso() {
+    let mut manager = QsoManager::new(config());
+    manager.set_remote_tx_permitted_source(std::sync::Arc::new(|_: Option<&str>| false));
+    let mut rx = manager.subscribe();
+
+    // An ongoing AUTONOMOUS QSO for the same callsign/band — invisible to
+    // `find_active_manual_qso_for`'s `initiated_by == Manual` filter.
+    let auto_id = manager
+        .respond_to_cq_with(
+            "K9XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            CallInitiation::Auto,
+            None,
+            false,
+            None,
+        )
+        .await
+        .expect("respond_to_cq_with (autonomous)");
+    let _ = first_message_to_send_remote_origin(&mut rx).await;
+
+    let result = manager
+        .respond_to_caller(
+            "K9XYZ".to_string(),
+            1500.0,
+            Some(SlotParity::Even),
+            pancetta_core::ResponseStep::SeventyThree,
+            None,
+            None,
+            None,
+            true,
+            Some("client-a".to_string()),
+        )
+        .await;
+    assert!(
+        result.is_err(),
+        "the denied close-step open must be refused"
+    );
+
+    let progress = manager
+        .get_qso(auto_id)
+        .await
+        .expect("the autonomous QSO must still exist");
+    assert!(
+        progress.state.is_active(),
+        "a denied close-step request must never supersede/cancel an unrelated \
+         ongoing QSO before being refused itself — got {:?}",
+        progress.state
+    );
+}
+
 #[tokio::test]
 async fn remote_origin_persists_across_the_reply_ladder() {
     // The flag is latched in QsoMetadata at open, so EVERY subsequent
